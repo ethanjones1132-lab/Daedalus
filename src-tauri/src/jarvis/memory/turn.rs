@@ -347,6 +347,13 @@ pub fn render_memory_block(items: &[PreparedMemoryItem]) -> String {
 
 // ── Native hashing ──────────────────────────────────────────────────────────
 
+/// Public SHA-256 of one exact user message body, byte-identical to the
+/// persisted turn's `message_hash`. Lets the relay entry point carry the
+/// original saved source hash to the finalizer without exposing raw bytes.
+pub fn message_sha256(content: &str) -> String {
+    sha256_hex(content.as_bytes())
+}
+
 /// Lowercase, 64-character SHA-256 of the exact saved UTF-8 bytes. No trim,
 /// Unicode normalization, case folding, or history concatenation.
 fn sha256_hex(bytes: &[u8]) -> String {

@@ -309,6 +309,13 @@ pub async fn jarvis_send_message(
 
     eprintln!("[jarvis-chat] spawning stream relay session={}", session_id);
     let db_path = db.db_path.clone();
+    // Carry the ORIGINAL newly saved relay user source id and exact hash to the
+    // runner/finalizer. A public caller may reuse a turn id; the finalizer binds
+    // assistant append and capture to this exact source and refuses to mutate or
+    // republish an old canonical turn. These are internal coordination values,
+    // never public authority.
+    let source_message_id = user_message_id.clone().unwrap_or_default();
+    let source_message_hash = crate::jarvis::memory::turn::message_sha256(&message);
     run_jarvis_message(
         app,
         base_url,
@@ -317,6 +324,8 @@ pub async fn jarvis_send_message(
         history,
         db_path,
         turn_id,
+        source_message_id,
+        source_message_hash,
         memory_preparation_id,
         initial_memory_status,
     )

@@ -4,6 +4,7 @@
 
 use crate::db::AppDb;
 use crate::jarvis::memory::contracts::MemoryError;
+use rusqlite::OptionalExtension;
 use tauri::{AppHandle, Manager, State};
 
 // ── Compaction ────────────────────────────────────────────────
@@ -648,17 +649,132 @@ pub fn insert_message_row(
     tokens: i64,
 ) -> Result<String, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(&conn, session_id, role, content, tokens, None)
+}
+
+/// Read the single assistant message already associated with one turn, if any.
+fn existing_turn_message_id(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT message_id FROM memory_turn_messages WHERE turn_id = ? LIMIT 1",
+        [turn_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| format!("Failed to read turn association: {}", e))
+}
+
+/// Insert a message row inside one SQLite transaction. When `memory_turn_id` is
+/// supplied for an assistant message, the whole append is atomic at-most-once for
+/// that turn:
+///
+/// 1. The persisted Session/turn identity is validated from the canonical
+///    `memory_turn_preparations` row.
+/// 2. If the turn already owns an assistant association, an exact-content replay
+///    returns that existing DB message id with no new write; differing content is
+///    rejected as a conflict. This removes the race-prone pre-check.
+/// 3. Otherwise the row is inserted, associated, and — in the same transaction —
+///    the model-facing transcript is neutralized for any selected/applied memory
+///    the turn used that has since been invalidated.
+///
+/// This is transcript association only and never confers factual authority.
+/// Callers that omit the turn id retain the original behavior exactly.
+pub fn insert_message_row_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    tokens: i64,
+    memory_turn_id: Option<&str>,
+) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("Failed to begin message transaction: {}", e))?;
+
+    if let Some(turn_id) = memory_turn_id {
+        // Association is only defined for a persisted assistant message tied to
+        // the exact same Session/turn. A cross-Session or non-assistant pairing
+        // is rejected before any write.
+        if role != "assistant" {
+            return Err("Memory turn association requires an assistant message".to_string());
+        }
+        let persisted = crate::jarvis::memory::turn::read_memory_turn(&tx, session_id, turn_id)
+            .map_err(|_| "Memory turn does not belong to this Session".to_string())?;
+
+        // Atomic at-most-once: an already associated row is authoritative for
+        // this turn. Exact content is an idempotent replay of the same append;
+        // any other content is a conflicting append and is rejected.
+        if let Some(existing_id) = existing_turn_message_id(&tx, turn_id)? {
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT role, content FROM messages WHERE id = ? AND session_id = ?",
+                    rusqlite::params![&existing_id, session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to read associated message: {}", e))?;
+            return match existing {
+                Some((existing_role, existing_content))
+                    if existing_role == "assistant" && existing_content == content =>
+                {
+                    Ok(existing_id)
+                }
+                _ => Err(
+                    "Memory turn already has a different assistant message".to_string(),
+                ),
+            };
+        }
+
+        tx.execute(
+            "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![&id, session_id, role, content, tokens, &now],
+        )
+        .map_err(|e| format!("Failed to insert message: {}", e))?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            rusqlite::params![&now, session_id],
+        )
+        .map_err(|e| format!("Failed to update session timestamp: {}", e))?;
+
+        tx.execute(
+            "INSERT INTO memory_turn_messages (turn_id, message_id) VALUES (?, ?)",
+            rusqlite::params![turn_id, &id],
+        )
+        .map_err(|e| format!("Failed to associate assistant message with turn: {}", e))?;
+
+        // Same-transaction late-write barrier: neutralize the model-facing
+        // transcript for any invalidated memory this turn selected/applied. The
+        // operator transcript row itself stays raw.
+        crate::jarvis::memory::continuity::suppress_invalidated_turn_attachments(
+            &tx,
+            &persisted,
+            &id,
+            chrono::Utc::now(),
+        )
+        .map_err(|e| e.message)?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit message transaction: {}", e))?;
+        return Ok(id);
+    }
+
+    tx.execute(
         "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         rusqlite::params![&id, session_id, role, content, tokens, &now],
     )
     .map_err(|e| format!("Failed to insert message: {}", e))?;
-    let _ = conn.execute(
+    tx.execute(
         "UPDATE sessions SET updated_at = ? WHERE id = ?",
         rusqlite::params![&now, session_id],
-    );
+    )
+    .map_err(|e| format!("Failed to update session timestamp: {}", e))?;
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit message transaction: {}", e))?;
     Ok(id)
 }
 
@@ -669,8 +785,30 @@ pub fn append_message(
     role: String,
     content: String,
     tokens: Option<i64>,
+    memory_turn_id: Option<String>,
 ) -> Result<String, String> {
-    insert_message_row(&db, &session_id, &role, &content, tokens.unwrap_or(0))
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(
+        &conn,
+        &session_id,
+        &role,
+        &content,
+        tokens.unwrap_or(0),
+        memory_turn_id.as_deref(),
+    )
+}
+
+/// Awaited assistant append for the relay runner: run the transaction on the
+/// caller's blocking thread against the shared AppDb. Returns the generated DB
+/// message id.
+pub fn append_assistant_message_for_turn(
+    db: &AppDb,
+    session_id: &str,
+    content: &str,
+    memory_turn_id: &str,
+) -> Result<String, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(&conn, session_id, "assistant", content, 0, Some(memory_turn_id))
 }
 
 #[tauri::command]

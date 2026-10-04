@@ -1431,6 +1431,21 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         Ok(_) => {}
         Err(e) => log::warn!(target: "jarvis::startup", "memory turn recovery failed: {e:?}"),
     }
+    // Phase 3.3 recovery: capture recorded explicit user directives on any
+    // persisted turn that never received a capture receipt, through the same
+    // derived gate as the live paths. Idempotent and best-effort; a Bun that is
+    // not yet live leaves derived cleanup in the durable outbox.
+    match crate::commands::memory_capture::recover_recorded_memory_captures(
+        &db_state,
+        crate::jarvis::memory::transport::native_memory_transport(),
+        chrono::Utc::now(),
+    ) {
+        Ok(count) if count > 0 => {
+            log::info!(target: "jarvis::startup", "memory capture recovery committed {count} turn(s)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(target: "jarvis::startup", "memory capture recovery failed: {e:?}"),
+    }
     let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
     log::info!(target: "jarvis::startup", "bootstrap config load complete");
     {

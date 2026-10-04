@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::capture_contracts::{ActiveObjective, MemoryDerivedInvalidation, SessionContinuity};
 use super::contracts::{MemoryError, MemoryScope, MemoryScopeKind};
-use super::turn::PreparedMemorySelection;
+use super::turn::{MemoryTurnTerminalStatus, PersistedMemoryTurn, PreparedMemorySelection};
 use super::{engine, scoped};
 
 /// Durable outbox row reconstructed during a drain. The namespaced
@@ -624,6 +624,100 @@ fn collect_applied_assistant_message_ids(
         };
         if touched && !affected.contains(&message_id) {
             affected.push(message_id);
+        }
+    }
+    Ok(affected)
+}
+
+fn terminal_status_wire(status: MemoryTurnTerminalStatus) -> &'static str {
+    match status {
+        MemoryTurnTerminalStatus::Completed => "completed",
+        MemoryTurnTerminalStatus::Partial => "partial",
+        MemoryTurnTerminalStatus::Cancelled => "cancelled",
+        MemoryTurnTerminalStatus::Failed => "failed",
+        MemoryTurnTerminalStatus::Unterminated => "unterminated",
+    }
+}
+
+/// True when any suppression row already references this memory id, the stored
+/// proof that a correction/forget consequence was recorded for it. Combined with
+/// the live status/revision recheck below, this neutralizes a late answer that
+/// selected a memory whose source was suppressed without a row mutation (for
+/// example a historically-tombstoned forget).
+fn memory_has_prompt_suppression(
+    conn: &Connection,
+    memory_id: &str,
+) -> Result<bool, MemoryError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_prompt_suppressions WHERE memory_id = ?)",
+        [memory_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(MemoryError::from)
+}
+
+/// Neutralize a newly appended late assistant message whose turn selected or
+/// actually applied a memory that has since been tombstoned, corrected/in-place
+/// revised, or previously suppressed. The candidate ids follow the SAME
+/// authenticated-application policy as [`collect_applied_assistant_message_ids`]:
+/// an authenticated completion consults ONLY the applied union; otherwise the
+/// union of the prepared selection and the known applied ids is used. Manual
+/// facts with no recorded source ids participate because the decision is based
+/// on the selected memory lifecycle, not on source-message provenance.
+///
+/// Runs inside the caller's assistant-append transaction. Only the model-facing
+/// suppression is recorded; the operator transcript row stays raw. A missing or
+/// corrupt selection entry fails closed by neutralizing the answer rather than
+/// letting it revive an invalidated memory.
+pub fn suppress_invalidated_turn_attachments(
+    conn: &Connection,
+    turn: &PersistedMemoryTurn,
+    message_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, MemoryError> {
+    let known = preparation_application_known(
+        turn.finished_at.as_deref(),
+        turn.terminal_status.map(terminal_status_wire),
+    );
+
+    let candidate_ids: Vec<String> = if known {
+        turn.applied_selected_ids.clone()
+    } else {
+        let mut ids: Vec<String> = turn.selected.iter().map(|item| item.id.clone()).collect();
+        for id in &turn.applied_selected_ids {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    };
+
+    let mut affected: Vec<String> = Vec::new();
+    for id in candidate_ids {
+        let invalidated = match turn.selected.iter().find(|item| item.id == id) {
+            Some(selection) => match scoped::read_scoped_memory(conn, &selection.scope, &id) {
+                Ok(current) => {
+                    current.entry.status != "active"
+                        || current.revision != selection.revision
+                        || memory_has_prompt_suppression(conn, &id)?
+                }
+                Err(err) if err.code == super::contracts::MemoryErrorCode::NotFound => true,
+                Err(err) => return Err(err),
+            },
+            // An applied id absent from the prepared selection is corrupt
+            // metadata; fail closed by neutralizing the late answer.
+            None => true,
+        };
+        if invalidated {
+            insert_prompt_suppression(
+                conn,
+                message_id,
+                &id,
+                Some(&turn.session_id),
+                now,
+                &mut affected,
+            )?;
         }
     }
     Ok(affected)

@@ -24,8 +24,10 @@ use crate::jarvis::memory::contracts::{
     AuthorityKind, MemoryError, MemoryProvenance, MutationResult,
 };
 use crate::jarvis::memory::scope;
-use crate::jarvis::memory::transport::{self, native_memory_transport};
-use crate::jarvis::memory::turn::{self, MemoryTurnIdentityRequest};
+use crate::jarvis::memory::transport::{self, native_memory_transport, NativeMemoryTransport};
+use crate::jarvis::memory::turn::{
+    self, MemoryTurnDiagnostic, MemoryTurnIdentityRequest, MemoryTurnTerminalStatus,
+};
 use crate::jarvis::memory::continuity;
 
 fn join_error(context: &str, error: impl std::fmt::Display) -> MemoryError {
@@ -82,10 +84,11 @@ fn capture_turn_invalidation(
     })
 }
 
-/// Emit one metadata-only `capture_unavailable` status frame so a sync/join
-/// failure is observable without claiming assistant verification or inventing a
-/// receipt field.
-fn emit_capture_unavailable(app: &AppHandle, session_id: &str, turn_id: &str, code: &str) {
+/// Emit one metadata-only status frame so a sync/join failure is observable
+/// without claiming assistant verification, inventing a receipt field, or being
+/// mistaken for a capture failure. The code is `sync_unavailable`, never
+/// `capture_unavailable`: an eligible captured source may still commit.
+fn emit_sync_unavailable(app: &AppHandle, session_id: &str, turn_id: &str, code: &str) {
     let _ = app.emit(
         "jarvis://memory-status",
         serde_json::json!({
@@ -131,63 +134,25 @@ pub async fn memory_capture_turn(
     match &sync_result {
         Ok(Err(error)) => {
             eprintln!("[memory] capture pre-sync failed: {}", error);
-            emit_capture_unavailable(&app, &request.session_id, &request.turn_id, "capture_unavailable");
+            emit_sync_unavailable(&app, &request.session_id, &request.turn_id, "sync_unavailable");
         }
         Err(error) => {
             eprintln!("[memory] capture pre-sync join error: {}", error);
-            emit_capture_unavailable(&app, &request.session_id, &request.turn_id, "capture_unavailable");
+            emit_sync_unavailable(&app, &request.session_id, &request.turn_id, "sync_unavailable");
         }
         Ok(Ok(())) => {}
     }
 
     let session_id = request.session_id.clone();
     let turn_id = request.turn_id.clone();
-    let gate_session = session_id.clone();
-    let resolve_session = session_id.clone();
-    let resolve_turn = turn_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.state::<AppDb>();
         let transport = native_memory_transport();
-
-        transport::run_derived_mutation_gate_with_replay(
-            db.inner(),
-            transport,
-            &gate_session,
-            move |conn| {
-                let persisted = turn::read_memory_turn(conn, &resolve_session, &resolve_turn)?;
-                // An existing receipt (finalized replay, one-time terminal
-                // augmentation, or repeated pre-terminal observation) carries no
-                // new semantic mutation. The canonical 3.1 capture helper handles
-                // it (including terminal-conflict rejection) with NO HTTP cleanup
-                // and NO invalidation.
-                if capture::read_capture_receipt(conn, &resolve_session, &resolve_turn)?.is_some() {
-                    let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
-                    return Ok(transport::DerivedGatePlan::Replay(receipt));
-                }
-                // Ordinary text (`None`) or an ambiguous/quoted/multiple
-                // directive (`Pending`) has no accepted mutation authority:
-                // persist the ledger receipt without cleanup/invalidation.
-                match capture::parse_user_memory_operation(&persisted)? {
-                    None | Some(UserMemoryOperation::Pending { .. }) => {
-                        let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
-                        Ok(transport::DerivedGatePlan::Replay(receipt))
-                    }
-                    // A valid accepted user write recomputes its exact affected
-                    // ids under the gate and ACKs cleanup before committing.
-                    Some(_) => Ok(transport::DerivedGatePlan::Invalidate(
-                        capture_turn_invalidation(conn, &resolve_session, &resolve_turn)?,
-                    )),
-                }
-            },
-            move |conn, _plan| {
-                // Reload the canonical turn inside the gate and run the full
-                // validated 3.1 capture: payload/scope/terminal checks,
-                // null->terminal augmentation, and exact receipt replay all
-                // proceed through the same authority.
-                let persisted = turn::read_memory_turn(conn, &session_id, &turn_id)?;
-                capture::capture_recorded_turn(conn, &persisted, Utc::now())
-            },
-        )
+        // The ONE shared gated-capture path, identical to the relay finalizer
+        // and startup recovery. An exact replay returns the persisted result
+        // with NO cleanup; a valid accepted write recomputes and ACKs cleanup
+        // under the gate.
+        run_capture_for_turn(db.inner(), transport, &session_id, &turn_id)
     })
     .await
     .map_err(|error| join_error("memory capture task join error", error))?
@@ -400,5 +365,304 @@ pub async fn memory_stage_proposal(
         },
     )
     .await
+}
+
+// ── Relay whole-lifecycle finalization (Phase 3.3) ──────────────────────────
+//
+// The native relay owns exactly one assistant DB append per registered turn.
+// This helper runs the whole relay finalization — phase 2 sync, optional
+// assistant append (only for an authoritative completed terminal with nonempty
+// output), then capture — as independent error branches so a sync or append
+// failure still dispatches capture from the original immutable user source.
+// The caller (runner.rs) bounds the whole attempt with one 5-second wait; this
+// function never emits a late diagnostic of its own.
+
+#[derive(Debug, Clone)]
+pub struct RelayTurnFinalization {
+    /// Authenticated native diagnostic projection (metadata only). For a source
+    /// conflict this describes the OLD canonical turn and MUST NOT be published
+    /// as this relay turn's metadata.
+    pub diagnostic: MemoryTurnDiagnostic,
+    /// Generated DB id of the assistant row the relay appended, if any. UI uses
+    /// this to suppress a duplicate append; it is nullable.
+    pub assistant_message_id: Option<String>,
+    /// Committed capture receipt, if capture ran and returned one.
+    pub capture: Option<CaptureReceipt>,
+    /// True when phase 2 sync failed (subsequent capture still attempted).
+    pub sync_failed: bool,
+    /// True when the assistant append failed (capture still attempted).
+    pub append_failed: bool,
+    /// True when capture failed (observable metadata only; never alters the
+    /// ordinary inference result).
+    pub capture_failed: bool,
+    /// True when the canonical persisted turn does NOT own the newly saved relay
+    /// user source. No sync, append, or capture runs; the old turn is never
+    /// mutated or republished for a reused `turn_id`.
+    pub source_conflict: bool,
+}
+
+/// Resolve one capture-gate plan under the operation mutex. An existing receipt
+/// (finalized replay, allowed one-time terminal augmentation, or repeated
+/// pre-terminal observation) goes straight through the canonical capture helper
+/// with NO HTTP cleanup and NO invalidation. Ordinary text and an ambiguous
+/// directive likewise persist the ledger receipt without cleanup. Only a valid
+/// accepted user write recomputes its exact affected ids for cleanup.
+fn capture_gate_plan(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<transport::DerivedGatePlan<CaptureReceipt>, MemoryError> {
+    let persisted = turn::read_memory_turn(conn, session_id, turn_id)?;
+    if capture::read_capture_receipt(conn, session_id, turn_id)?.is_some() {
+        let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
+        return Ok(transport::DerivedGatePlan::Replay(receipt));
+    }
+    match capture::parse_user_memory_operation(&persisted)? {
+        None | Some(UserMemoryOperation::Pending { .. }) => {
+            let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
+            Ok(transport::DerivedGatePlan::Replay(receipt))
+        }
+        Some(_) => Ok(transport::DerivedGatePlan::Invalidate(
+            capture_turn_invalidation(conn, session_id, turn_id)?,
+        )),
+    }
+}
+
+/// ONE shared gated-capture path for the command surface, the relay finalizer,
+/// and startup recovery. Resolves the exact operation metadata under the
+/// operation mutex, ACKs derived cleanup before any accepted mutation, and runs
+/// the canonical capture helper inside the mutation savepoint. Replay and
+/// no-cleanup semantics are identical for all three callers; Part 3.4 Objective
+/// controls extend this one helper rather than duplicating parse branches.
+pub fn run_capture_for_turn(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<CaptureReceipt, MemoryError> {
+    let gate_session = session_id.to_string();
+    let resolve_session = session_id.to_string();
+    let resolve_turn = turn_id.to_string();
+    let mutation_session = session_id.to_string();
+    let mutation_turn = turn_id.to_string();
+    transport::run_derived_mutation_gate_with_replay(
+        db,
+        transport,
+        &gate_session,
+        move |conn| capture_gate_plan(conn, &resolve_session, &resolve_turn),
+        move |conn, _plan| {
+            let persisted = turn::read_memory_turn(conn, &mutation_session, &mutation_turn)?;
+            capture::capture_recorded_turn(conn, &persisted, Utc::now())
+        },
+    )
+}
+
+/// Run the whole relay finalization for one registered turn. The immutable
+/// `{session_id, turn_id}` identity plus the ORIGINAL newly saved user source
+/// id/hash are used throughout; no current UI selection participates. Capture is
+/// attempted even when sync or append fails.
+pub fn finalize_relay_turn_with_capture(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    identity: MemoryTurnIdentityRequest,
+    expected_source_message_id: &str,
+    expected_message_hash: &str,
+    answer_text: Option<&str>,
+) -> Result<RelayTurnFinalization, MemoryError> {
+    let now = Utc::now();
+    let session_id = identity.session_id.clone();
+    let turn_id = identity.turn_id.clone();
+
+    // ── 0. Bind to the ORIGINAL newly saved relay user source. A public caller
+    // may reuse a turn id; if the canonical stored turn does not own this exact
+    // source, we must not sync, append, or capture against the old turn. ─────
+    let persisted = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        turn::read_memory_turn(&conn, &session_id, &turn_id)
+    };
+    let persisted = match persisted {
+        Ok(turn) => turn,
+        Err(error) => return Err(error),
+    };
+    let source_conflict = persisted.session_id != session_id
+        || persisted.source_message_id != expected_source_message_id
+        || persisted.message_hash != expected_message_hash;
+    if source_conflict {
+        // Report the old canonical diagnostic, but the caller suppresses its
+        // publication. Nothing from the old source is mutated or captured.
+        // Ordinary inference is not stopped: the successful answer is still
+        // persisted as a plain, UNASSOCIATED transcript row so it is never
+        // attached to the old turn and no turn-scoped memory effect occurs.
+        let mut assistant_message_id: Option<String> = None;
+        let mut append_failed = false;
+        if let Some(answer) = answer_text.map(str::trim).filter(|text| !text.is_empty()) {
+            match crate::commands::sessions::insert_message_row(
+                db,
+                &session_id,
+                "assistant",
+                answer,
+                0,
+            ) {
+                Ok(id) => assistant_message_id = Some(id),
+                Err(error) => {
+                    append_failed = true;
+                    eprintln!(
+                        "[memory] plain relay append failed session={} turn={} error={}",
+                        session_id, turn_id, error
+                    );
+                }
+            }
+        }
+        let diagnostic = turn::memory_turn_diagnostic(&persisted);
+        return Ok(RelayTurnFinalization {
+            diagnostic,
+            assistant_message_id,
+            capture: None,
+            sync_failed: false,
+            append_failed,
+            capture_failed: false,
+            source_conflict: true,
+        });
+    }
+
+    // ── 1. Phase 2 sync. A failure is observable and does not stop capture. ──
+    let sync_result = transport::sync_memory_turn(db, transport, identity.clone(), now);
+    let sync_failed = sync_result.is_err();
+    if let Err(error) = &sync_result {
+        eprintln!(
+            "[memory] relay capture pre-sync failed session={} turn={} error={}",
+            session_id, turn_id, error
+        );
+    }
+
+    // Re-read the canonical persisted turn after sync so append/capture see the
+    // terminal metadata the sync just persisted.
+    let persisted = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        turn::read_memory_turn(&conn, &session_id, &turn_id)?
+    };
+
+    // ── 2. Optional assistant append. Only an authoritative completed terminal
+    // with nonempty output is persisted. The append transaction is atomic and
+    // at-most-once for the turn. Capture runs even if the append fails. ──────
+    let mut assistant_message_id: Option<String> = None;
+    let mut append_failed = false;
+    let trimmed_answer = answer_text.map(str::trim).filter(|text| !text.is_empty());
+    if persisted.terminal_status == Some(MemoryTurnTerminalStatus::Completed) {
+        if let Some(answer) = trimmed_answer {
+            match crate::commands::sessions::append_assistant_message_for_turn(
+                db,
+                &session_id,
+                answer,
+                &turn_id,
+            ) {
+                Ok(id) => assistant_message_id = Some(id),
+                Err(error) => {
+                    append_failed = true;
+                    eprintln!(
+                        "[memory] relay assistant append failed session={} turn={} error={}",
+                        session_id, turn_id, error
+                    );
+                }
+            }
+        }
+    }
+
+    // ── 3. Capture through the shared derived gate. Runs even if sync/append
+    // failed, always against the immutable user source. Capture failure is
+    // recorded independently and never alters the ordinary result. ──────────
+    let mut capture_receipt: Option<CaptureReceipt> = None;
+    let mut capture_failed = false;
+    match run_capture_for_turn(db, transport, &session_id, &turn_id) {
+        Ok(receipt) => capture_receipt = Some(receipt),
+        Err(error) => {
+            capture_failed = true;
+            eprintln!(
+                "[memory] relay capture failed session={} turn={} error={}",
+                session_id, turn_id, error
+            );
+        }
+    }
+
+    let diagnostic = match sync_result {
+        Ok(diagnostic) => diagnostic,
+        Err(_) => turn::memory_turn_diagnostic(&persisted),
+    };
+
+    Ok(RelayTurnFinalization {
+        diagnostic,
+        assistant_message_id,
+        capture: capture_receipt,
+        sync_failed,
+        append_failed,
+        capture_failed,
+        source_conflict: false,
+    })
+}
+
+// ── Startup recovery sweep (Phase 3.3) ──────────────────────────────────────
+//
+// Capture every recorded user directive on a persisted turn that never
+// received a capture receipt, using the same derived gate as the live paths.
+// A never-started preparation keeps its null terminal; a started-but-lost turn
+// is `unterminated`. No fact is ever inferred from a summary or a run outcome.
+// A cleanup failure (or an unknown live Bun state) leaves the derived outbox
+// pending rather than serving stale derived context; the next preparation/history
+// read drains it.
+
+/// One startup recovery pass over unfinalized capture turns. Selects turns with
+/// no receipt AND turns with a preterminal receipt (`terminal_hash IS NULL`)
+/// whose canonical turn now carries an authoritative terminal tuple, so the
+/// canonical capture helper performs its allowed one-time terminal augmentation
+/// WITHOUT rerunning operations. Only an authenticated `finished_at` or a
+/// `completed|partial|cancelled|failed` terminal is authoritative; a bare
+/// `unterminated` generation-loss marker is not, so a started-but-lost turn is
+/// left for a later authoritative sync rather than freezing a false terminal.
+/// Runs each turn through the shared gate (idempotent: an exact replay is a
+/// no-op) and never holds the AppDb lock while entering the operation/HTTP gate.
+/// Returns the number of turns that now have a committed receipt.
+pub fn recover_recorded_memory_captures(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    _now: chrono::DateTime<Utc>,
+) -> Result<usize, MemoryError> {
+    let candidates: Vec<(String, String)> = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.session_id, p.turn_id
+                 FROM memory_turn_preparations p
+                 LEFT JOIN memory_capture_receipts r ON r.turn_id = p.turn_id
+                 WHERE r.turn_id IS NULL
+                    OR (r.terminal_hash IS NULL
+                        AND (p.finished_at IS NOT NULL
+                             OR p.terminal_status IN
+                                 ('completed','partial','cancelled','failed')))
+                 ORDER BY p.prepared_at ASC",
+            )
+            .map_err(MemoryError::from)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(MemoryError::from)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)?
+    };
+
+    let mut captured = 0usize;
+    for (session_id, turn_id) in candidates {
+        match run_capture_for_turn(db, transport, &session_id, &turn_id) {
+            Ok(_) => captured += 1,
+            Err(error) => {
+                // Recovery is best-effort and observable; one bad turn must not
+                // abort the sweep or fabricate a receipt.
+                eprintln!(
+                    "[memory] recovery capture failed session={} turn={} error={}",
+                    session_id, turn_id, error
+                );
+            }
+        }
+    }
+    Ok(captured)
 }
 

@@ -84,6 +84,12 @@ import {
   type MemoryTurnDiagnosticView,
 } from './memory-turn-state';
 import {
+  captureReceiptState,
+  decodeCaptureReceipt,
+  type CaptureReceipt,
+  type CaptureStateView,
+} from './memory-capture-state';
+import {
   activeRelayMemoryTurn,
   clearRelayMemoryTurn,
   isRegisteredRelayMemoryTurn,
@@ -192,6 +198,21 @@ const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 // transport's own 1s connect / 3s total request bounds; on timeout the ordinary
 // result is shown with a truthful pending notice. The finalizer is not retried.
 const MEMORY_FINALIZE_TIMEOUT_MS = 5_000;
+
+// Honest capture-status label. `saved` is shown only for a committed receipt
+// with saved_count > 0; nothing here is an assistant acknowledgement.
+function captureStateLabel(view: CaptureStateView): string {
+  switch (view.state) {
+    case 'saved':
+      return `Memory saved (${view.savedCount})`;
+    case 'pending':
+      return 'Memory capture pending';
+    case 'failed':
+      return 'Memory not saved';
+    default:
+      return 'Memory unchanged';
+  }
+}
 
 // Task 7 Part C (2026-07-03 incident 1d4727cf): the server's structured
 // `error` frame carries a `code` (e.g. "first_token_timeout") that
@@ -697,6 +718,11 @@ export function ChatPanel({
   const [memoryDiagnostic, setMemoryDiagnostic] = useState<MemoryTurnDiagnosticView | null>(null);
   const [memoryHistoryWarning, setMemoryHistoryWarning] = useState<string | null>(null);
   const [memoryFinalizationNotice, setMemoryFinalizationNotice] = useState<string | null>(null);
+  // Phase 3.3 — honest capture status for the current turn. A `saved` state is
+  // shown ONLY when a committed native receipt reports saved_count > 0; an
+  // error/blocked-only receipt is `failed`. Assistant prose never acknowledges
+  // a save.
+  const [memoryCaptureState, setMemoryCaptureState] = useState<CaptureStateView | null>(null);
   // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
@@ -704,6 +730,21 @@ export function ChatPanel({
   // The owning relay memory turn currently displayed. Used to drop stale
   // warnings/diagnostics when a different relay submission becomes active.
   const memoryOwnerRef = useRef<{ sessionId: string; turnId: string } | null>(null);
+  // Phase 3.3 — relay-only aggregate of streamed answer text, held OUTSIDE
+  // React state. It backs the legacy (no turn id / unregistered) idle relay
+  // terminal persistence path: the native relay owns the append for registered
+  // turns, but a legacy terminal must still durably persist its answer from an
+  // explicit coordinator rather than from inside a `setMessages` updater.
+  const relayAssistantAggregateRef = useRef('');
+  // Monotonic conversation epoch. Bumped on every new submission and Session
+  // change so an asynchronous legacy relay append can prove it still belongs to
+  // the exact turn/session that started it and never rewrites a newer bubble.
+  const conversationEpochRef = useRef(0);
+  // Registered relay turns whose terminal has already been consumed. Late
+  // memory-status/diagnostic/capture events for a settled `{session_id, turn_id}`
+  // are rejected so they cannot repaint a finished turn. Bounded: cleared on the
+  // owning submission/Session change; keys are only the live registration.
+  const settledRelayOwnersRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     // A Session change invalidates the previous turn's memory surface and any
     // relay correlation: no old warning/diagnostic may survive it.
@@ -712,7 +753,11 @@ export function ChatPanel({
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
+    setMemoryCaptureState(null);
     memoryOwnerRef.current = null;
+    relayAssistantAggregateRef.current = '';
+    settledRelayOwnersRef.current.clear();
+    conversationEpochRef.current += 1;
     clearRelayMemoryTurn();
   }, [activeSession]);
 
@@ -971,7 +1016,7 @@ export function ChatPanel({
     });
   }, [flushPendingTokens]);
 
-  const finalizeAssistantMessage = useCallback((sid?: string, terminal?: DecodedStreamTerminal) => {
+  const finalizeAssistantMessage = useCallback((_sid?: string, terminal?: DecodedStreamTerminal) => {
     if (!mountedRef.current) return;
     // Drain rAF buffer inside the same setMessages as finalize so React
     // batching cannot drop the last ~16ms of streamed text.
@@ -982,29 +1027,14 @@ export function ChatPanel({
     clearPendingApproval();
     setUserPinnedToBottom(true);
     turnHadResponseTextRef.current = false;
-    const effectiveSid = sid || activeSessionRef.current || sessionIdRef.current;
     setMessages(prev => {
       const withTokens = applyTokenChunk(prev, pending);
-      const last = withTokens[withTokens.length - 1];
       const messageOutcome: StreamTerminalOutcome | undefined = terminal
         && terminal.outcome !== 'success'
         && terminal.outcome !== 'cancelled'
         ? terminal.outcome
         : undefined;
-      const finalizedMessages = finalizeStreamingMessages(withTokens, messageOutcome, terminal?.code);
-      const finalized = finalizedMessages[finalizedMessages.length - 1];
-      if (last?.role === 'assistant' && last.isStreaming) {
-        const shouldPersist = !terminal || terminal.outcome === 'success';
-        if (shouldPersist && effectiveSid && finalized?.role === 'assistant' && finalized.content.trim()) {
-          invoke('append_message', {
-            ...sessionInvokeArgs(effectiveSid),
-            role: 'assistant',
-            content: finalized.content,
-          }).catch((e: any) => { console.error('Failed to persist assistant message:', e); setError('Append failed: ' + (e?.message || String(e))); });
-        }
-        return finalizedMessages;
-      }
-      return withTokens;
+      return finalizeStreamingMessages(withTokens, messageOutcome, terminal?.code);
     });
     onSessionCreatedRef.current();
   }, [applyTokenChunk, clearPendingApproval, takePendingTokens]);
@@ -1193,6 +1223,9 @@ export function ChatPanel({
     track(listen<{ text: string; session_id: string }>('jarvis://token', (event) => {
       const { text, session_id } = event.payload;
       if (!text || !matchesStreamSession(session_id)) return;
+      // Native-relay aggregate, independent of React state, for the legacy
+      // no-turn-id terminal persistence path.
+      relayAssistantAggregateRef.current += text;
       appendAssistantText(text);
     }));
 
@@ -1215,11 +1248,102 @@ export function ChatPanel({
       return isRegisteredRelayMemoryTurn(sessionId, turnId);
     };
 
-    track(listen<{ session_id: string; turn_id?: string }>('jarvis://done', (event) => {
-      if (!matchesStreamSession(event.payload.session_id)) return;
-      if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
+    // Terminal-settlement guard. Once a registered relay terminal is consumed,
+    // late memory-status/diagnostic/capture events for the same exact
+    // `{session_id, turn_id}` are rejected so they cannot repaint a finished
+    // turn. A capture event legitimately arrives BEFORE the terminal and is
+    // accepted then frozen. Settlement is bounded: the only registered tuple is
+    // the live submission, and the set is cleared on the owning submission /
+    // Session change.
+    const relayOwnerKey = (sid: string, turnId: string): string => `${sid}\u0000${turnId}`;
+    const isRelayOwnerSettled = (sid: unknown, turnId: unknown): boolean => (
+      typeof sid === 'string'
+      && typeof turnId === 'string'
+      && settledRelayOwnersRef.current.has(relayOwnerKey(sid, turnId))
+    );
+    const markRelayOwnerSettled = (sid: string, turnId: string): void => {
+      const settled = settledRelayOwnersRef.current;
+      if (settled.size > 32) settled.clear();
+      settled.add(relayOwnerKey(sid, turnId));
+    };
+
+    // Transcript only: pin the native-owned assistant DB row id onto the local
+    // visible bubble so a later history reload dedupes it. Never factual
+    // verification.
+    const reconcileRelayAssistantId = (sid: string, dbId: string | null): void => {
+      if (!dbId || !mountedRef.current || !matchesStreamSession(sid)) return;
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant') {
+          return [...prev.slice(0, -1), { ...last, id: dbId }];
+        }
+        return prev;
+      });
+    };
+
+    // Legacy idle relay terminal (no turn id, unregistered): the UI still owns
+    // the assistant append. The owner epoch + local assistant id are captured
+    // BEFORE the await; a completion that lands after a Session/new-turn change
+    // makes no UI writes, and the exact originating bubble is reconciled by its
+    // stable local id. Registered turns are native-owned and never reach this.
+    const persistLegacyRelayAssistant = (sid: string): void => {
+      const aggregate = relayAssistantAggregateRef.current;
+      relayAssistantAggregateRef.current = '';
+      const content = sanitizeAssistantDisplay(aggregate).trim();
+      if (!content || !sid) return;
+      const ownerEpoch = conversationEpochRef.current;
+      const localAssistantId = crypto.randomUUID();
+      setMessages(prev => {
+        const last = prev[prev.length - 1];
+        if (last?.role === 'assistant' && !last.id) {
+          return [...prev.slice(0, -1), { ...last, id: localAssistantId }];
+        }
+        return prev;
+      });
+      void invoke<string>('append_message', {
+        ...sessionInvokeArgs(sid),
+        role: 'assistant',
+        content,
+      }).then((dbId) => {
+        if (conversationEpochRef.current !== ownerEpoch || !matchesStreamSession(sid)) return;
+        if (typeof dbId === 'string' && dbId) {
+          setMessages(prev => prev.map((m) => (
+            m.id === localAssistantId ? { ...m, id: dbId } : m
+          )));
+        }
+      }).catch((e: any) => {
+        if (conversationEpochRef.current !== ownerEpoch || !matchesStreamSession(sid)) return;
+        console.error('Failed to persist assistant message:', e);
+        setError('Append failed: ' + (e?.message || String(e)));
+      });
+    };
+
+    track(listen<{
+      session_id: string;
+      turn_id?: string;
+      assistant_message_id?: unknown;
+      native_owns_append?: unknown;
+    }>('jarvis://done', (event) => {
+      const p = event.payload;
+      if (!matchesStreamSession(p.session_id)) return;
+      if (!relayTerminalIsCorrelated(p.session_id, p.turn_id)) return;
+      if (typeof p.turn_id === 'string') markRelayOwnerSettled(p.session_id, p.turn_id);
       dispatchActivity({ kind: 'terminal', outcome: 'success' });
-      finalizeAssistantMessage(event.payload.session_id);
+      finalizeAssistantMessage(p.session_id);
+      const dbId = typeof p.assistant_message_id === 'string' && p.assistant_message_id.length > 0
+        ? p.assistant_message_id
+        : null;
+      const nativeOwned = p.native_owns_append === true
+        || (typeof p.turn_id === 'string' && isRegisteredRelayMemoryTurn(p.session_id, p.turn_id));
+      if (!nativeOwned && dbId === null) {
+        persistLegacyRelayAssistant(p.session_id);
+      } else {
+        // Native owns the append (or already persisted): clear the relay
+        // aggregate so it cannot leak into a later legacy terminal, and pin
+        // the returned row id onto the local bubble. Never a UI duplicate.
+        relayAssistantAggregateRef.current = '';
+        reconcileRelayAssistantId(p.session_id, dbId);
+      }
     }));
 
     // NOTE (Task 7 / 2026-07-03 incident 1d4727cf): this `jarvis_send_message`
@@ -1230,16 +1354,27 @@ export function ChatPanel({
     // this path. The Rust `SseFrameOutcome::Error` variant only carries a
     // message string, not a `code` (unlike the fetch path's raw JSON
     // frames) — reported as a gap below rather than changing Rust.
-    track(listen<{ error: string; session_id: string; code?: string; turn_id?: string }>('jarvis://error', (event) => {
-      if (!matchesStreamSession(event.payload.session_id)) return;
-      if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
+    track(listen<{
+      error: string;
+      session_id: string;
+      code?: string;
+      turn_id?: string;
+      assistant_message_id?: unknown;
+    }>('jarvis://error', (event) => {
+      const p = event.payload;
+      if (!matchesStreamSession(p.session_id)) return;
+      if (!relayTerminalIsCorrelated(p.session_id, p.turn_id)) return;
+      if (typeof p.turn_id === 'string') markRelayOwnerSettled(p.session_id, p.turn_id);
+      const dbId = typeof p.assistant_message_id === 'string' && p.assistant_message_id.length > 0
+        ? p.assistant_message_id
+        : null;
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
       dispatchActivity({ kind: 'terminal', outcome: 'failed' });
       setRecursionDepth(null);
       clearPendingApproval();
-      setError(event.payload.error);
+      setError(p.error);
       setUserPinnedToBottom(true);
       setMessages(prev => {
         const withTokens = applyTokenChunk(prev, pending);
@@ -1252,14 +1387,18 @@ export function ChatPanel({
           const partial = last.content.trim();
           return [...withTokens.slice(0, -1), {
             ...last,
-            content: partial ? last.content : event.payload.error,
+            content: partial ? last.content : p.error,
             isStreaming: false,
             isError: true,
-            errorCode: event.payload.code,
+            errorCode: p.code,
           }];
         }
         return withTokens;
       });
+      // A native-owned relay may have persisted the successful answer as an
+      // unassociated row (source conflict); reconcile its id, never append.
+      relayAssistantAggregateRef.current = '';
+      reconcileRelayAssistantId(p.session_id, dbId);
     }));
 
     // Rust's SseRelay maps a `cancelled` SSE frame straight to `jarvis://done`
@@ -1272,6 +1411,10 @@ export function ChatPanel({
     track(listen<{ session_id: string; turn_id?: string }>('jarvis://cancelled', (event) => {
       if (!matchesStreamSession(event.payload.session_id)) return;
       if (!relayTerminalIsCorrelated(event.payload.session_id, event.payload.turn_id)) return;
+      if (typeof event.payload.turn_id === 'string') {
+        markRelayOwnerSettled(event.payload.session_id, event.payload.turn_id);
+      }
+      relayAssistantAggregateRef.current = '';
       const pending = takePendingTokens();
       setIsStreaming(false);
       setPipelineStage('');
@@ -1418,6 +1561,7 @@ export function ChatPanel({
       setMemoryDiagnostic(null);
       setMemoryHistoryWarning(null);
       setMemoryFinalizationNotice(null);
+      setMemoryCaptureState(null);
       memoryOwnerRef.current = { sessionId: sid, turnId };
     };
     track(listen<{
@@ -1431,6 +1575,7 @@ export function ChatPanel({
       const p = event.payload;
       if (!matchesStreamSession(p.session_id)) return;
       if (!isRegisteredRelayMemoryTurn(p.session_id, p.turn_id)) return;
+      if (isRelayOwnerSettled(p.session_id, p.turn_id)) return;
       bindRelayMemoryOwner(p.session_id as string, p.turn_id as string);
       applyRelayWarning(p.code);
       const decoded = decodeMemoryStatusFrame(p);
@@ -1442,6 +1587,7 @@ export function ChatPanel({
         const p = event.payload;
         if (!matchesStreamSession(p.session_id)) return;
         if (!isRegisteredRelayMemoryTurn(p.session_id, p.turn_id)) return;
+        if (isRelayOwnerSettled(p.session_id, p.turn_id)) return;
         bindRelayMemoryOwner(p.session_id as string, p.turn_id as string);
         try {
           const view = decodeMemoryTurnDiagnostic(p);
@@ -1450,6 +1596,45 @@ export function ChatPanel({
           }
         } catch (e) {
           console.warn('[Jarvis] relay memory diagnostic was malformed:', e);
+        }
+      },
+    ));
+    // Phase 3.3 — honest relay capture status. A committed receipt is decoded
+    // and projected with `captureReceiptState`; a metadata-only error code is
+    // `failed` unless it is the bounded `capture_pending` timeout, which stays
+    // pending. A committed receipt survives a separated sync/append failure.
+    // Assistant prose never acknowledges a save.
+    track(listen<{
+      session_id?: string;
+      turn_id?: string;
+      receipt?: unknown;
+      error_code?: unknown;
+      sync_failed?: unknown;
+      append_failed?: unknown;
+    }>(
+      'jarvis://memory-capture',
+      (event) => {
+        const p = event.payload;
+        if (!matchesStreamSession(p.session_id)) return;
+        if (!isRegisteredRelayMemoryTurn(p.session_id, p.turn_id)) return;
+        if (isRelayOwnerSettled(p.session_id, p.turn_id)) return;
+        bindRelayMemoryOwner(p.session_id as string, p.turn_id as string);
+        // Decode and bind the receipt to the exact correlation tuple; a missing
+        // or mismatched receipt must never become Saved.
+        const decoded = decodeCaptureReceipt(p.receipt);
+        const receipt = decoded
+          && decoded.turn_id === p.turn_id
+          && decoded.session_id === p.session_id
+          ? decoded
+          : null;
+        const errorCode = typeof p.error_code === 'string' ? p.error_code : null;
+        setMemoryCaptureState(captureReceiptState(receipt, errorCode));
+        // Native reports sync/append failures independently from capture; they
+        // never fail a committed receipt but stay observable.
+        if (p.sync_failed === true) {
+          setMemoryFinalizationNotice('Relay memory sync unavailable; showing the ordinary result.');
+        } else if (p.append_failed === true) {
+          setMemoryFinalizationNotice('Relay assistant transcript not saved; showing the ordinary result.');
         }
       },
     ));
@@ -1483,6 +1668,7 @@ export function ChatPanel({
     sendGeneration: number,
     onAccepted: () => void,
     clientMessageId: string,
+    assistantClientMessageId: string,
     includeUserScope: boolean,
   ) => {
     streamAbortRef.current?.abort();
@@ -1518,20 +1704,34 @@ export function ChatPanel({
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
+    setMemoryCaptureState(null);
 
     let userMessageId: string | null = null;
     let inactivityTimedOut = false;
     let terminal: DecodedStreamTerminal | null = null;
 
-    // One memoized, bounded, ID-only native finalization per local turn. It is
-    // attempted on every exit path (success, error, cancellation, EOF and
-    // stale-Session teardown), even after a Session switch/abort, but it never
-    // repaints a stale Session. The exact `{session_id, turn_id}` tuple is
-    // captured and late completion after the deadline is ignored. The native
-    // diagnostic read-back is the sole authority for persisted selected/applied
-    // metadata; a timeout or failure surfaces a truthful notice and never
-    // manufactures receipt or terminal evidence.
+    // The final assistant text this direct turn should persist, and whether the
+    // observed terminal permits persistence. Updated by the terminal frame
+    // handlers below the finalizer's definition, so the finalizer reads the
+    // latest values from this mutable holder. The appended DB id is returned as
+    // worker data (never written to React state from the worker).
+    const assistantPersist: { text: string; allowed: boolean; done: boolean } = {
+      text: '',
+      allowed: false,
+      done: false,
+    };
+
+    // One memoized finalization per local turn, shared by every exit path.
+    // Direct UI owns the direct assistant append; the whole sequential
+    // append -> sync -> capture attempt shares ONE 5-second race. The worker
+    // returns DATA ONLY — it never calls setState or emits. The single winner
+    // is published once after the race under the original Session/generation/
+    // controller tuple, and the tuple is marked settled so a late worker result
+    // (or a timeout) can never repaint. Capture is attempted from the persisted
+    // immutable user turn even when append or sync fails, and a committed saved
+    // receipt stays Saved even when sync failed.
     let finalizePromise: Promise<boolean> | null = null;
+    let finalizeSettled = false;
     const finalizeMemoryTurn = (): Promise<boolean> => {
       if (finalizePromise) return finalizePromise;
       finalizePromise = (async (): Promise<boolean> => {
@@ -1540,48 +1740,139 @@ export function ChatPanel({
         const timeout = new Promise<{ kind: 'timeout' }>((resolve) => {
           timeoutHandle = setTimeout(() => resolve({ kind: 'timeout' }), MEMORY_FINALIZE_TIMEOUT_MS);
         });
-        // `memory_sync_turn` already returns the authenticated native
-        // `MemoryTurnDiagnostic`; the whole sync+decode lives inside this one
-        // bounded race, so there is no second unbounded await. A late resolve
-        // after the timeout can never reach the decode/repaint path.
-        const sync = invoke<unknown>('memory_sync_turn', {
-          request: { session_id: sid, turn_id: turnId },
-        }).then(
-          (diagnostic) => ({ kind: 'ok' as const, diagnostic }),
-          () => ({ kind: 'failed' as const, diagnostic: null }),
-        );
-        const outcome = await Promise.race([sync, timeout]);
+
+        // 1. Direct assistant append, awaited first, with the original turn id.
+        // Runs only when the observed terminal permits persistence and nonempty
+        // sanitized text exists. 2. Sync. 3. Capture. Each step is independently
+        // caught so a failed append or sync still dispatches capture from the
+        // immutable saved user source.
+        const worker = (async (): Promise<{
+          kind: 'settled';
+          diagnostic: unknown;
+          receipt: unknown;
+          appendDbId: string | null;
+          appendFailed: boolean;
+          syncFailed: boolean;
+          captureFailed: boolean;
+        }> => {
+          let appendDbId: string | null = null;
+          let appendFailed = false;
+          if (assistantPersist.allowed && !assistantPersist.done) {
+            assistantPersist.done = true;
+            const text = sanitizeAssistantDisplay(assistantPersist.text).trim();
+            if (text) {
+              try {
+                const dbId = await invoke<string>('append_message', {
+                  ...sessionInvokeArgs(sid),
+                  role: 'assistant',
+                  content: text,
+                  memory_turn_id: turnId,
+                  memoryTurnId: turnId,
+                });
+                appendDbId = typeof dbId === 'string' && dbId ? dbId : null;
+              } catch (e) {
+                appendFailed = true;
+                console.error('Failed to persist assistant message:', e);
+              }
+            }
+          }
+
+          let diagnostic: unknown = null;
+          let syncFailed = false;
+          try {
+            diagnostic = await invoke<unknown>('memory_sync_turn', {
+              request: { session_id: sid, turn_id: turnId },
+            });
+          } catch {
+            syncFailed = true;
+          }
+
+          let receipt: unknown = null;
+          let captureFailed = false;
+          try {
+            receipt = await invoke<unknown>('memory_capture_turn', {
+              request: { session_id: sid, turn_id: turnId },
+            });
+          } catch (e) {
+            captureFailed = true;
+            console.warn('[Jarvis] memory capture failed:', e);
+          }
+          return {
+            kind: 'settled',
+            diagnostic,
+            receipt,
+            appendDbId,
+            appendFailed,
+            syncFailed,
+            captureFailed,
+          };
+        })();
+
+        const outcome = await Promise.race([worker, timeout]);
         if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+        if (finalizeSettled) return false;
+        finalizeSettled = true;
+
         if (outcome.kind === 'timeout') {
           if (requestIsCurrent()) {
+            setMemoryCaptureState(captureReceiptState(null, 'capture_pending'));
             setMemoryFinalizationNotice('Memory finalization is pending; showing the ordinary result.');
           }
           return false;
         }
-        if (outcome.kind === 'failed') {
-          if (requestIsCurrent()) {
-            setMemoryFinalizationNotice('Memory sync unavailable; showing the ordinary result.');
-          }
-          return false;
+
+        // Publish the one winner under the original tuple checks. A late worker
+        // result after a timeout or Session switch is discarded here.
+        if (!requestIsCurrent()) return false;
+
+        // Reconcile the actual persisted assistant DB id onto the exact
+        // originating local assistant bubble. Only this timely winner reaches
+        // here, and only under the original Session/generation/controller guard;
+        // a late timeout worker's legitimate DB append is never repainted, and a
+        // new turn/Session bubble is never rewritten.
+        if (outcome.appendDbId && assistantClientMessageId) {
+          const persistedId = outcome.appendDbId;
+          setMessages(prev => prev.map((m) => (
+            m.id === assistantClientMessageId ? { ...m, id: persistedId } : m
+          )));
         }
-        // Success: decode the already-returned authenticated diagnostic. A
-        // tuple mismatch is an observable failure rather than a stale repaint.
-        try {
-          const view = decodeMemoryTurnDiagnostic(outcome.diagnostic);
-          if (!requestIsCurrent()) return true;
-          if (view.turnId !== turnId || view.sessionId !== sid) {
-            setMemoryFinalizationNotice('Memory status did not match this turn.');
-            return false;
+
+        // Receipt: decoded and projected independently of sync/append. It must
+        // match the immutable original {session_id, turn_id}; a missing or
+        // mismatched receipt is not Saved.
+        let receipt: CaptureReceipt | null = null;
+        if (!outcome.captureFailed) {
+          const decoded = decodeCaptureReceipt(outcome.receipt);
+          if (decoded && decoded.turn_id === turnId && decoded.session_id === sid) {
+            receipt = decoded;
           }
-          setMemoryDiagnostic(view);
-        } catch (e) {
-          console.warn('[Jarvis] memory diagnostic read-back failed:', e);
-          if (requestIsCurrent()) {
-            setMemoryFinalizationNotice('Memory status unavailable for this turn.');
-          }
-          return false;
         }
-        return true;
+        setMemoryCaptureState(captureReceiptState(receipt, receipt === null ? 'capture_unavailable' : null));
+
+        // Diagnostic: decoded separately and identity-checked. A sync failure
+        // is observable metadata and never fails a committed capture receipt.
+        let diagnosticOk = false;
+        if (!outcome.syncFailed) {
+          try {
+            const view = decodeMemoryTurnDiagnostic(outcome.diagnostic);
+            if (view.turnId === turnId && view.sessionId === sid) {
+              setMemoryDiagnostic(view);
+              diagnosticOk = true;
+            }
+          } catch (e) {
+            console.warn('[Jarvis] memory diagnostic read-back failed:', e);
+          }
+        }
+        if (!diagnosticOk) {
+          setMemoryFinalizationNotice(
+            outcome.syncFailed
+              ? 'Memory sync unavailable; showing the ordinary result.'
+              : 'Memory status unavailable for this turn.',
+          );
+        } else if (outcome.appendFailed) {
+          setMemoryFinalizationNotice('Assistant transcript not saved; showing the ordinary result.');
+        }
+        return diagnosticOk;
       })();
       return finalizePromise;
     };
@@ -1617,13 +1908,19 @@ export function ChatPanel({
         // is saved.
         throw new Error('Could not save your message: ' + (e?.message || String(e)));
       }
-      stopIfStale();
 
       // 2. Prepare native recall and load native prompt history. References
       // only; no memory text crosses the webview. A failed preparation still
       // runs ordinary inference with a typed status and no preparation
       // reference. A failed/unreadable history read sends empty prior history
       // with a visible warning rather than a stale UI cache.
+      //
+      // NB: there is deliberately NO stale guard between the saved user append
+      // and `memory_prepare_turn`. Even after a Session switch/abort, the newly
+      // saved immutable user source must be prepared/bound so the bounded
+      // finalizer can capture it with the ORIGINAL turn identity. The stale
+      // guard after preparation stops before history/fetch, so no inference is
+      // launched for a stale submission.
       let memoryPreparationId: string | null = null;
       let initialMemoryStatus: MemoryRecallStatus = 'unavailable';
       let history: Array<{ role: string; content: string }> = [];
@@ -1969,6 +2266,18 @@ export function ChatPanel({
       if (isPassiveSseFrame(frame.type)) return;
       if (frame.type === 'result') {
         const decision = decodeResultFrame(frame);
+        // Record the direct assistant text this turn may persist (and whether
+        // the terminal permits it) BEFORE the bounded finalizer runs. A
+        // non-success hard error persists nothing.
+        assistantPersist.text = streamedRawText;
+        assistantPersist.allowed = !decision.hardError;
+        if (!streamedVisibleText && decision.text && !decision.hardError) {
+          // The orchestrator aggregate never streamed as deltas: hold it as the
+          // turn's assistant text in the same accumulator used for persistence.
+          streamedRawText += decision.text;
+          assistantPersist.text = streamedRawText;
+          appendAssistantText(decision.text);
+        }
         // Phase 2.4 — finalize the native turn before any local terminal
         // publication (activity, outcome, run-record write). Re-check current
         // ownership after the await so a Session switch during the bounded wait
@@ -1982,7 +2291,6 @@ export function ChatPanel({
           const message = decision.text || String(frame.error || 'Jarvis returned a non-success result.');
           throw new JarvisStreamError(message, decision.code);
         }
-        if (!streamedVisibleText && decision.text) appendAssistantText(decision.text);
         return;
       }
       if (frame.type === 'error') {
@@ -2192,9 +2500,13 @@ export function ChatPanel({
     setMemoryDiagnostic(null);
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
+    setMemoryCaptureState(null);
     // A new submission invalidates any prior relay correlation so a late relay
     // event from a previous turn cannot bind to this one.
     clearRelayMemoryTurn();
+    relayAssistantAggregateRef.current = '';
+    settledRelayOwnersRef.current.clear();
+    conversationEpochRef.current += 1;
     memoryOwnerRef.current = null;
     // Consume the per-turn user-wide opt-in: this turn snapshots the explicit
     // choice, then the control resets to the Session default (false) so it can
@@ -2223,10 +2535,13 @@ export function ChatPanel({
     // (see streamFromJarvisApi) so dedupeMessages recognizes the reload-from-
     // history copy as the same instance rather than rendering it twice.
     const clientMessageId = crypto.randomUUID();
+    // Stable local identity for the optimistic assistant bubble. The direct
+    // finalizer reconciles the actual persisted DB id onto exactly this id.
+    const assistantClientMessageId = crypto.randomUUID();
     setMessages(prev => [
       ...prev,
       { id: clientMessageId, role: 'user', content: userMsg },
-      { role: 'assistant', content: '', isStreaming: true },
+      { id: assistantClientMessageId, role: 'assistant', content: '', isStreaming: true },
     ]);
 
     let effectiveSessionId = activeSession || sessionId;
@@ -2250,7 +2565,7 @@ export function ChatPanel({
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
         publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
-      }, clientMessageId, includeUserScopeForTurn);
+      }, clientMessageId, assistantClientMessageId, includeUserScopeForTurn);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
@@ -2921,6 +3236,15 @@ export function ChatPanel({
             className="mt-0.5 px-1 text-[10px] font-mono text-bone-faint"
           >
             {memoryFinalizationNotice}
+          </p>
+        )}
+        {memoryCaptureState && (
+          <p
+            role="status"
+            aria-label="Memory capture status"
+            className="mt-0.5 px-1 text-[10px] font-mono text-bone-faint"
+          >
+            {captureStateLabel(memoryCaptureState)}
           </p>
         )}
       </div>

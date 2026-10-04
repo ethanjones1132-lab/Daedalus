@@ -25,6 +25,12 @@ struct TerminalRunAccumulator {
     outcome: Option<String>,
     partial_output: Option<String>,
     cancelled_reason: Option<String>,
+    /// Aggregate successful answer text observed on this relay turn, held
+    /// independently of any UI React state. Includes both streamed deltas and
+    /// the orchestrator `ResultThenDone` aggregate token. It is the exact text
+    /// the native relay persists as the turn's assistant message; UI must NOT
+    /// duplicate the append.
+    answer_text: String,
 }
 
 impl TerminalRunAccumulator {
@@ -168,41 +174,91 @@ fn emit_relay_memory_failure(app: &AppHandle, session_id: &str, turn_id: &str, c
     );
 }
 
-/// One-shot wrapper around [`finalize_relay_memory_turn`] for the relay thread.
-/// Only attempts a sync when a real persisted Session/turn identity exists.
+/// Emit the honest capture status for one relay turn. The UI projects this with
+/// `captureReceiptState`: a receipt is emitted only when capture committed;
+/// otherwise a metadata-only error code is sent. `error_code` is reserved for an
+/// ACTUAL capture failure (`capture_failed`, `capture_pending`,
+/// `capture_unavailable`); a sync or append failure is reported independently
+/// via the boolean flags and never falsely fails a committed receipt. Never
+/// assistant prose.
+fn emit_relay_capture_status(
+    app: &AppHandle,
+    session_id: &str,
+    turn_id: &str,
+    receipt: Option<&crate::jarvis::memory::capture_contracts::CaptureReceipt>,
+    error_code: Option<&str>,
+    sync_failed: bool,
+    append_failed: bool,
+) {
+    let _ = app.emit(
+        "jarvis://memory-capture",
+        serde_json::json!({
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "receipt": receipt,
+            "error_code": error_code,
+            "sync_failed": sync_failed,
+            "append_failed": append_failed,
+        }),
+    );
+}
+
+/// One-shot wrapper around [`finalize_relay_turn_with_capture`] for the relay
+/// thread. Only attempts finalization when a real persisted Session/turn
+/// identity exists.
 ///
-/// The blocking authenticated sync runs on an AppHandle-owned worker so the
-/// relay caller's wait is **bounded** even if the native operation gate or the
-/// AppDb queue is backed up. The worker only returns data over a channel; it
-/// never emits a late diagnostic after the caller has timed out. The caller
-/// emits exactly one result — the actual native diagnostic projection, or a
-/// typed pending/unavailable status — before the ordinary terminal publication.
+/// The blocking finalization (sync + optional assistant append + capture) runs
+/// on an AppHandle-owned worker so the relay caller's wait is **bounded** even
+/// if the native operation gate or the AppDb queue is backed up. The worker
+/// only returns data over a channel; it never emits a late diagnostic after the
+/// caller has timed out. The caller emits exactly one result — the actual native
+/// diagnostic projection, the capture status, and the nullable assistant DB id
+/// — before the ordinary terminal publication.
+#[allow(clippy::too_many_arguments)]
 fn attempt_relay_memory_finalize(
     app: &AppHandle,
     session_id: &str,
     turn_id: &str,
+    expected_source_message_id: &str,
+    expected_message_hash: &str,
     enabled: bool,
     finalized: &mut bool,
-) -> bool {
+    run_acc: &TerminalRunAccumulator,
+) -> Option<String> {
     if !enabled || *finalized {
-        return true;
+        return None;
     }
     *finalized = true;
 
     let worker_app = app.clone();
     let worker_session = session_id.to_string();
     let worker_turn = turn_id.to_string();
-    let (tx, rx) = std::sync::mpsc::channel::<Result<MemoryTurnDiagnostic, String>>();
+    let worker_source = expected_source_message_id.to_string();
+    let worker_hash = expected_message_hash.to_string();
+    let worker_answer = {
+        let trimmed = run_acc.answer_text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(run_acc.answer_text.clone())
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<
+        Result<crate::commands::memory_capture::RelayTurnFinalization, String>,
+    >();
     std::thread::spawn(move || {
         let transport = crate::jarvis::memory::transport::native_memory_transport();
         let db_state = worker_app.state::<AppDb>();
-        let result = finalize_relay_memory_turn(
+        let result = crate::commands::memory_capture::finalize_relay_turn_with_capture(
             db_state.inner(),
             transport,
             MemoryTurnIdentityRequest {
                 session_id: worker_session,
                 turn_id: worker_turn,
             },
+            &worker_source,
+            &worker_hash,
+            worker_answer.as_deref(),
         )
         .map_err(|error| error.to_string());
         // Return data only; the receiver may already be gone.
@@ -210,10 +266,21 @@ fn attempt_relay_memory_finalize(
     });
 
     match rx.recv_timeout(std::time::Duration::from_millis(RELAY_MEMORY_FINALIZE_TIMEOUT_MS)) {
-        Ok(Ok(diagnostic)) => {
+        Ok(Ok(outcome)) => {
+            // A reused turn id whose canonical stored turn does not own this
+            // newly saved relay source is never synced, appended, or captured.
+            // Report the conflict and suppress publication of the old turn's
+            // metadata or receipt.
+            if outcome.source_conflict {
+                emit_relay_memory_failure(app, session_id, turn_id, "memory_source_conflict");
+                // The unassociated transcript row (if any) is still reported so
+                // the UI suppresses a duplicate without losing the answer.
+                return outcome.assistant_message_id;
+            }
+            let diagnostic = &outcome.diagnostic;
             if diagnostic.turn_id != turn_id || diagnostic.session_id != session_id {
                 emit_relay_memory_failure(app, session_id, turn_id, "memory_turn_mismatch");
-                return false;
+                return None;
             }
             // Authoritative native diagnostic projection: metadata and
             // selected/applied IDs only, never scope, recalled text, or the
@@ -237,7 +304,24 @@ fn attempt_relay_memory_finalize(
                     "terminal_status": diagnostic.terminal_status,
                 }),
             );
-            true
+            // `error_code` is reserved for an ACTUAL capture failure. A sync or
+            // append failure is reported independently and never falsely fails a
+            // committed receipt.
+            let capture_error = if outcome.capture_failed {
+                Some("capture_failed")
+            } else {
+                None
+            };
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                outcome.capture.as_ref(),
+                capture_error,
+                outcome.sync_failed,
+                outcome.append_failed,
+            );
+            outcome.assistant_message_id
         }
         Ok(Err(error)) => {
             eprintln!(
@@ -245,17 +329,44 @@ fn attempt_relay_memory_finalize(
                 session_id, turn_id, error
             );
             emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
-            false
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_unavailable"),
+                false,
+                false,
+            );
+            None
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             // The worker may still complete later; it only sends to a dropped
             // channel and never emits, so no late diagnostic can repaint.
             emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_pending");
-            false
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_pending"),
+                false,
+                false,
+            );
+            None
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
-            false
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_unavailable"),
+                false,
+                false,
+            );
+            None
         }
     }
 }
@@ -269,6 +380,8 @@ fn attempt_relay_memory_finalize(
 /// `POST /chat/stream` and forward frames. The previous implementation shelled out to
 /// `wsl.exe -- bash -c "bun run main.tsx …"`, which silently did nothing once the WSL
 /// distro was lost — that was why prompting appeared dead.
+#[allow(unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_jarvis_message(
     app: AppHandle,
     base_url: String,
@@ -277,6 +390,8 @@ pub fn run_jarvis_message(
     history: Vec<serde_json::Value>,
     db_path: PathBuf,
     turn_id: String,
+    source_message_id: String,
+    source_message_hash: String,
     memory_preparation_id: Option<String>,
     initial_memory_status: MemoryRecallStatus,
 ) -> Result<(), String> {
@@ -293,6 +408,10 @@ pub fn run_jarvis_message(
 
     std::thread::spawn(move || {
         let mut memory_finalized = false;
+        // One accumulator for the whole relay turn, including pre-stream
+        // failures: it holds the aggregate answer text the native relay owns and
+        // persists as the turn's assistant message.
+        let mut run_acc = TerminalRunAccumulator::default();
         eprintln!(
             "[jarvis-chat] relay thread started session={} url={}",
             sid, url
@@ -307,12 +426,35 @@ pub fn run_jarvis_message(
             }),
         );
 
-        let emit_error = |app: &AppHandle, sid: &str, turn_id: &str, msg: String| {
-            let _ = app.emit(
-                "jarvis://error",
-                serde_json::json!({ "error": msg, "session_id": sid, "turn_id": turn_id }),
-            );
-        };
+        // Every terminal path carries nullable `assistant_message_id` plus
+        // explicit native ownership metadata. `native_owns_append: true` means
+        // the native relay owns the append attempt for this turn; a null id
+        // means native did not append a row and the UI must NOT fall back.
+        let emit_error =
+            |app: &AppHandle, sid: &str, turn_id: &str, msg: String, assistant_message_id: Option<&str>| {
+                let _ = app.emit(
+                    "jarvis://error",
+                    serde_json::json!({
+                        "error": msg,
+                        "session_id": sid,
+                        "turn_id": turn_id,
+                        "assistant_message_id": assistant_message_id,
+                        "native_owns_append": true,
+                    }),
+                );
+            };
+        let emit_done =
+            |app: &AppHandle, sid: &str, turn_id: &str, assistant_message_id: Option<&str>| {
+                let _ = app.emit(
+                    "jarvis://done",
+                    serde_json::json!({
+                        "session_id": sid,
+                        "turn_id": turn_id,
+                        "assistant_message_id": assistant_message_id,
+                        "native_owns_append": true,
+                    }),
+                );
+            };
 
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(900))
@@ -327,8 +469,23 @@ pub fn run_jarvis_message(
         {
             Ok(c) => c,
             Err(e) => {
-                attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                emit_error(&app, &sid, &turn_id, format!("HTTP client error: {e}"));
+                let assistant_message_id = attempt_relay_memory_finalize(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    &source_message_id,
+                    &source_message_hash,
+                    memory_turn_enabled,
+                    &mut memory_finalized,
+                    &run_acc,
+                );
+                emit_error(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    format!("HTTP client error: {e}"),
+                    assistant_message_id.as_deref(),
+                );
                 return;
             }
         };
@@ -350,12 +507,22 @@ pub fn run_jarvis_message(
                     "[jarvis-chat] stream POST failed session={} error={}",
                     sid, e
                 );
-                attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
+                let assistant_message_id = attempt_relay_memory_finalize(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    &source_message_id,
+                    &source_message_hash,
+                    memory_turn_enabled,
+                    &mut memory_finalized,
+                    &run_acc,
+                );
                 emit_error(
                     &app,
                     &sid,
                     &turn_id,
                     format!("Could not reach the Jarvis server: {e}"),
+                    assistant_message_id.as_deref(),
                 );
                 return;
             }
@@ -370,8 +537,23 @@ pub fn run_jarvis_message(
         if !resp.status().is_success() {
             let code = resp.status();
             let body = resp.text().unwrap_or_default();
-            attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-            emit_error(&app, &sid, &turn_id, format!("Jarvis server returned {code}: {body}"));
+            let assistant_message_id = attempt_relay_memory_finalize(
+                &app,
+                &sid,
+                &turn_id,
+                &source_message_id,
+                &source_message_hash,
+                memory_turn_enabled,
+                &mut memory_finalized,
+                &run_acc,
+            );
+            emit_error(
+                &app,
+                &sid,
+                &turn_id,
+                format!("Jarvis server returned {code}: {body}"),
+                assistant_message_id.as_deref(),
+            );
             return;
         }
 
@@ -381,7 +563,9 @@ pub fn run_jarvis_message(
         let reader = BufReader::new(resp);
         let mut relay = SseRelay::new();
         let mut terminated = false;
-        let mut run_acc = TerminalRunAccumulator::default();
+        // Nullable DB id of the assistant row the relay persisted. Included in
+        // the terminal event so the UI suppresses a duplicate append.
+        let mut relay_assistant_message_id: Option<String> = None;
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -398,6 +582,7 @@ pub fn run_jarvis_message(
             match relay.handle_line(&line) {
                 SseFrameOutcome::Continue => {}
                 SseFrameOutcome::Token(text) => {
+                    run_acc.answer_text.push_str(&text);
                     let _ = app.emit(
                         "jarvis://token",
                         serde_json::json!({ "text": text, "session_id": sid }),
@@ -448,37 +633,69 @@ pub fn run_jarvis_message(
                     );
                 }
                 SseFrameOutcome::Error(err) => {
-                    attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                    emit_error(&app, &sid, &turn_id, err);
+                    let assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_error(&app, &sid, &turn_id, err, assistant_message_id.as_deref());
                     terminated = true;
                     break;
                 }
                 SseFrameOutcome::ResultThenDone { token, error } => {
                     // Orchestrator aggregate: surface the answer (or failure) that
                     // never streamed as deltas, then close the turn.
-                    if let Some(t) = token {
+                    if let Some(t) = &token {
+                        run_acc.answer_text.push_str(t);
                         let _ = app.emit(
                             "jarvis://token",
                             serde_json::json!({ "text": t, "session_id": sid }),
                         );
                     }
                     // Finalize before any terminal error/done publication.
-                    attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
                     if let Some(e) = error {
-                        emit_error(&app, &sid, &turn_id, e);
+                        emit_error(&app, &sid, &turn_id, e, relay_assistant_message_id.as_deref());
                     }
-                    let _ = app.emit(
-                        "jarvis://done",
-                        serde_json::json!({ "session_id": sid, "turn_id": turn_id }),
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
                     );
                     terminated = true;
                     break;
                 }
                 SseFrameOutcome::Done => {
-                    attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                    let _ = app.emit(
-                        "jarvis://done",
-                        serde_json::json!({ "session_id": sid, "turn_id": turn_id }),
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
                     );
                     terminated = true;
                     break;
@@ -493,10 +710,21 @@ pub fn run_jarvis_message(
                 }
                 SseFrameOutcome::Cancelled => {
                     // User-initiated stop — clear the spinner without a scary error banner.
-                    attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-                    let _ = app.emit(
-                        "jarvis://done",
-                        serde_json::json!({ "session_id": sid, "turn_id": turn_id }),
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
                     );
                     terminated = true;
                     break;
@@ -651,10 +879,21 @@ pub fn run_jarvis_message(
         // ended without an explicit terminal frame. Finalize the memory turn
         // before the EOF terminal publication.
         if !terminated {
-            attempt_relay_memory_finalize(&app, &sid, &turn_id, memory_turn_enabled, &mut memory_finalized);
-            let _ = app.emit(
-                "jarvis://done",
-                serde_json::json!({ "session_id": sid, "turn_id": turn_id }),
+            relay_assistant_message_id = attempt_relay_memory_finalize(
+                &app,
+                &sid,
+                &turn_id,
+                &source_message_id,
+                &source_message_hash,
+                memory_turn_enabled,
+                &mut memory_finalized,
+                &run_acc,
+            );
+            emit_done(
+                &app,
+                &sid,
+                &turn_id,
+                relay_assistant_message_id.as_deref(),
             );
         }
     });
