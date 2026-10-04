@@ -65,6 +65,14 @@ export interface ConsumeMemoryResult {
   code?: string;
 }
 
+export interface ResolveTurnMemoryIdentity {
+  preparationId: string;
+  turnId: string;
+  sessionId: string;
+  /** Exact current user message; hashed by the registry against the envelope. */
+  message: string;
+}
+
 export interface MemoryAppliedObservation {
   stage: string;
   selected_ids: string[];
@@ -505,6 +513,34 @@ export function createNativeMemoryRegistry(
     onInvalidate,
   });
   return registry;
+}
+
+/**
+ * Resolve one public reference into the frozen one-shot consume contract.
+ * This is the only supported entry point for inference integration: it takes
+ * references (never memory text/scope/authority) and lets the registry perform
+ * Session/turn/hash/app-instance/TTL/actual-workspace validation atomically.
+ * Any missing/invalid reference fails closed with a null envelope.
+ */
+export function resolveTurnMemory(
+  registry: NativeMemoryRegistry,
+  identity: ResolveTurnMemoryIdentity,
+  activeWorkspace: string | null,
+): ConsumeMemoryResult {
+  if (
+    typeof identity.preparationId !== "string" || identity.preparationId.length === 0 ||
+    typeof identity.turnId !== "string" || identity.turnId.length === 0 ||
+    typeof identity.sessionId !== "string" || identity.sessionId.length === 0
+  ) {
+    return { envelope: null, status: "unavailable", code: "memory_unavailable" };
+  }
+  return registry.consume({
+    preparation_id: identity.preparationId,
+    turn_id: identity.turnId,
+    session_id: identity.sessionId,
+    message: identity.message,
+    active_workspace: activeWorkspace,
+  });
 }
 
 const registryMeta = new WeakMap<NativeMemoryRegistry, RegistryMeta>();

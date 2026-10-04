@@ -182,6 +182,8 @@ import {
 } from "./mid-loop-intervention";
 import { scaleLastQueuedStageBudget } from "./turn-budget";
 import type { JarvisConfig } from "../config";
+import type { MemoryAppliedObservation } from "../native-memory";
+import type { PreparedMemoryTurn } from "../memory-contract";
 
 /**
  * The slice of the outcome collector the pipeline depends on. Injecting this
@@ -364,6 +366,14 @@ export interface PipelineExecuteOptions {
    * dispatch, and high-complexity retry share one ceiling — not 3×.
    */
   directiveBudget?: DirectiveBudget;
+  /**
+   * Ephemeral per-turn native recall snapshot for the Claude delegate path.
+   * Deliberately NOT part of TaskRun/contextMessage/caches: it is consumed
+   * only at the delegate's final invocation boundary and refit there.
+   */
+  turnMemory?: PreparedMemoryTurn;
+  /** Trusted observation that a delegate request actually carried memory. */
+  onMemoryApplied?: (observation: MemoryAppliedObservation) => void;
 }
 
 // Derived from the capability taxonomy. READ_CACHE_TOOLS is `cacheable`
@@ -2607,6 +2617,8 @@ export class PipelineExecutor {
           writeEffectRequired: requiresWriteEffect,
           nativeNoWrite,
           signal: combinedAbort.signal,
+          turnMemory: options.turnMemory,
+          onMemoryApplied: options.onMemoryApplied,
           onTextDelta: (chunk) => {
             onStateChange({ stage: "executor", status: "running", output: chunk });
             this.publishStageToken("executor", chunk);
@@ -6871,6 +6883,10 @@ export class PipelineExecutor {
         sessionGrants: options.sessionGrants,
         turnRequirement: options.turnRequirement,
         initialRecursionDepth: nextDepth,
+        // Recursive re-entry launches a fresh executor (possibly a delegate);
+        // the same ephemeral snapshot must ride along at its final boundary.
+        turnMemory: options.turnMemory,
+        onMemoryApplied: options.onMemoryApplied,
       },
     );
   }

@@ -157,6 +157,13 @@ export interface ExecutionContext {
    * orchestrator pipeline which runs autonomously and cannot block on a modal.
    */
   skip_approval_gate?: boolean;
+  /**
+   * Trusted runtime observation of one completed tool execution. Receives the
+   * raw, untruncated result envelope (before any caller context truncation)
+   * and must never block or throw into the execution path. Used by the chat
+   * stream to record bounded runtime evidence for the native memory receipt.
+   */
+  onToolResult?: (call: ToolCall, result: ToolResult) => void;
 }
 
 /**
@@ -336,7 +343,7 @@ export function createToolRuntime(): ToolRuntime {
     registry.set(name, { def, handler });
   }
 
-  async function execute(call: ToolCall, ctx: ExecutionContext): Promise<ToolResult> {
+  async function executeCore(call: ToolCall, ctx: ExecutionContext): Promise<ToolResult> {
     const start = Date.now();
     const entry = registry.get(call.name);
 
@@ -486,6 +493,23 @@ export function createToolRuntime(): ToolRuntime {
     } finally {
       control.cleanup();
     }
+  }
+
+  /**
+   * Execute through the canonical contract, then publish one trusted
+   * observation of the raw result. The observer is deliberately isolated: an
+   * observer failure must never change the tool outcome or throw to callers.
+   */
+  async function execute(call: ToolCall, ctx: ExecutionContext): Promise<ToolResult> {
+    const result = await executeCore(call, ctx);
+    if (ctx.onToolResult) {
+      try {
+        ctx.onToolResult(call, result);
+      } catch {
+        // Observation is diagnostics only; never affect execution.
+      }
+    }
+    return result;
   }
 
   function listTools(): ToolDefinition[] {

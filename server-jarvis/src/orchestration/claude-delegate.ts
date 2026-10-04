@@ -27,6 +27,13 @@ import { prepareToolResultForContext } from "../tool-result-truncation";
 import { delegateToolResultContextChars } from "./context-budget";
 import type { DelegateStageDiagnostics, ExecutorStageOutput, ToolCallRecord } from "./stage-output";
 import type { ExecutionProfile } from "./route-normalization";
+import type { MemoryAppliedObservation } from "../native-memory";
+import type { PreparedMemoryTurn } from "../memory-contract";
+import {
+  fitTurnMemory,
+  resolveTurnMemoryInputBudget,
+  type AppliedTurnMemory,
+} from "../turn-memory-context";
 
 const DELEGATE_TOOL_NAMES: Record<string, string> = {
   edit: "edit_file",
@@ -364,6 +371,12 @@ export interface BuildClaudeDelegateInvocationInput {
   stageRemainingMs: number;
   executable?: string;
   baseEnv?: NodeJS.ProcessEnv;
+  /**
+   * Ephemeral per-turn native recall snapshot. Fitted here against the
+   * delegate prompt and appended as a data-only appendix; never read from or
+   * written to TaskRun/contextMessage/cached state.
+   */
+  turnMemory?: PreparedMemoryTurn;
 }
 
 export interface ClaudeDelegateInvocation {
@@ -378,6 +391,10 @@ export interface ClaudeDelegateInvocation {
   authMode: string;
   /** ANTHROPIC_BASE_URL when the launch pins one; omitted for subscription. */
   baseUrl?: string;
+  /** Final prompt text including any fitted memory appendix (stdin delivery). */
+  promptForDelivery?: string;
+  /** Applied native memory metadata; absent when no snapshot was supplied. */
+  memoryApplied?: AppliedTurnMemory;
 }
 
 /** Claude Code 2.1.88 rejects Jarvis run/session identifiers such as `run_*`. */
@@ -421,6 +438,19 @@ export function buildClaudeDelegateInvocation(
     throw new Error("Claude delegate requires a P0-authorized primary root");
   }
   const delegate = input.config.claude_cli.delegate;
+  // Fit the ephemeral native snapshot against the delegate prompt under the
+  // conservative unknown-context fallback; CLI context is never assumed
+  // unlimited. The frozen frame is appended as data; it grants no authority.
+  const memoryApplied = input.turnMemory && input.turnMemory.selected.length > 0
+    ? fitTurnMemory(
+        input.turnMemory,
+        [{ role: "user", content: input.prompt }],
+        resolveTurnMemoryInputBudget({ contextWindowTokens: null, outputReserveTokens: null }),
+      )
+    : undefined;
+  const deliveredPrompt = memoryApplied?.block
+    ? `${input.prompt}\n\n${memoryApplied.block}`
+    : input.prompt;
   const mcpConfig = materializeDelegateMcpConfig(input.allowedRoots);
   const args = [
     "--print",
@@ -464,7 +494,7 @@ export function buildClaudeDelegateInvocation(
   const prepared = prepareClaudeCliInvocation(
     executable,
     buildLocalClaudeArgs(args, launchOptions),
-    input.prompt,
+    deliveredPrompt,
   );
   const configuredTimeout = delegate.timeout_ms > 0 ? delegate.timeout_ms : 420_000;
   const preparedCleanup = prepared.cleanup;
@@ -483,6 +513,8 @@ export function buildClaudeDelegateInvocation(
     timeoutMs: Math.max(0, Math.min(input.stageRemainingMs, configuredTimeout, 420_000)),
     authMode: launchOptions.authMode,
     baseUrl: env.ANTHROPIC_BASE_URL,
+    promptForDelivery: deliveredPrompt,
+    memoryApplied,
   };
 }
 
@@ -937,6 +969,13 @@ export interface RunClaudeDelegateInput {
    * streams the same way it supervises the native executor loop.
    */
   onToolResult?: (record: ToolCallRecord) => void | Promise<void>;
+  /** Ephemeral per-turn native recall snapshot; never stored in TaskRun/caches. */
+  turnMemory?: PreparedMemoryTurn;
+  /**
+   * Trusted observation that a delegate request actually carried memory.
+   * Called only after a delegate process has launched successfully.
+   */
+  onMemoryApplied?: (observation: MemoryAppliedObservation) => void;
 }
 
 const DELEGATE_WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
@@ -1357,6 +1396,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
         stageRemainingMs: operation.remainingMs(),
         executable: input.executable,
         baseEnv: input.baseEnv,
+        turnMemory: input.turnMemory,
       });
     } catch (error) {
       input.health.strike("spawn_error");
@@ -1392,10 +1432,11 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       ...result,
       diagnostics: stageDiagnostics(),
     });
+    const deliveredPrompt = invocation.promptForDelivery ?? input.prompt;
     const launchPromise = input.processFactory({
       ...invocation,
       env: withDelegateRequestCorrelation(invocation.env, delegateRequestId),
-      prompt: input.prompt,
+      prompt: deliveredPrompt,
       signal: operation.signal,
     });
     const launchResult = await operation.race(launchPromise);
@@ -1414,6 +1455,20 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       ));
     }
     delegatedProcess = launchResult.value;
+    // The delegate process has actually launched: this is the provider
+    // dispatch boundary. Report the exact applied IDs/status (never the
+    // prepared selection) to the authenticated native receipt.
+    if (invocation.memoryApplied) {
+      try {
+        input.onMemoryApplied?.({
+          stage: "claude_delegate",
+          selected_ids: invocation.memoryApplied.selected_ids,
+          status: invocation.memoryApplied.status,
+        });
+      } catch {
+        // Observation is diagnostics only.
+      }
+    }
     if (operation.state()) {
       records.push(cleanupRecord(await terminateDelegateProcess(
         delegatedProcess, terminationGraceMs, cleanupTimeoutMs, treeKiller,
@@ -1421,7 +1476,7 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
       processDiagnostics = delegatedProcess.diagnostics?.();
       return withDiagnostics(terminalOutput(operation.state()!, records));
     }
-    if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(input.prompt);
+    if (invocation.promptOnStdin) delegatedProcess.writeStdin?.(deliveredPrompt);
 
     const pending = new Map<string, { record: ToolCallRecord; startedAt: number }>();
     const narrative: string[] = [];
