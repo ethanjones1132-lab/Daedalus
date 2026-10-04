@@ -14,7 +14,7 @@
 - **Phase 2.4 root-review corrective commit:** `f14b275` — `fix: harden phase 2.4 persistence, finalization ordering, and relay diagnostics` (see "Root-review corrective pass").
 - **Phase 2.4 second root-review corrective commit:** `ad933bc` — `fix: bound phase 2.4 finalization, submission, and relay correlation` (see "Third root-review corrective pass").
 - **Phase 2.4 relay-adapter corrective commit:** `ca1eb94` — `feat: add executable relay memory-turn submission adapter` (executable `submitRelayMemoryTurn` adapter + legacy-direct terminal guard; see "Fourth narrow corrective pass").
-- **Phase 2.4 legacy-ownership corrective commit:** `PENDING` — added the synchronous `SendInFlightGuard` check to the idle-only legacy terminal predicate (see "Fifth narrow corrective pass").
+- **Phase 2.4 legacy-ownership corrective commit:** `7764f8f` — `fix: guard legacy relay terminals against pending direct submissions` (added the synchronous `SendInFlightGuard` check to the idle-only legacy terminal predicate; see "Fifth narrow corrective pass").
 
 ## Execution environment
 
