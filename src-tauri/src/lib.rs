@@ -1114,14 +1114,25 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let looks_like_local_bun =
         is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
 
+    // Owned-process authority: only this spawned child receives the private
+    // capability and app instance id. Never logged, never persisted to config.
+    let (cap_name, cap_value, app_name, app_value) =
+        crate::jarvis::memory::transport::owned_memory_env();
+
     let spawn_result = if is_windows && !looks_like_local_bun {
         // Original WSL path for dev / full WSL setups.
         let cmd = format!("exec {} {}", bun, entry);
         let mut command = std::process::Command::new("wsl.exe");
         command
             .args(["--", "bash", "-lc", &cmd])
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+        // WSL does not inherit the Windows environment; WSLENV lists the
+        // variables to forward. The values are passed via `.env`, never
+        // interpolated into the shell command.
+        forward_env_to_wsl(&mut command, &[cap_name, app_name]);
         crate::wsl::hide_windows_console(&mut command);
         command.spawn()
     } else if looks_like_local_bun {
@@ -1131,6 +1142,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         let mut command = std::process::Command::new(&bun);
         command
             .arg(entry)
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
         if should_hide_jarvis_server_console(is_windows, looks_like_local_bun) {
@@ -1142,6 +1155,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         std::process::Command::new(&bun)
             .arg(entry)
             .env("JARVIS_HOME", wsl_home())
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
             .spawn()
@@ -1403,6 +1418,19 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
     }
     log::info!(target: "jarvis::startup", "bootstrap config migration complete");
+    // Phase 2.2 recovery: a native restart leaves no Bun registry, so pending
+    // preparations are stale and started-but-unsynced turns are unterminated.
+    // Never re-registers an old turn; explicit retries get new turn ids.
+    match crate::jarvis::memory::transport::recover_pending_memory_turns(
+        &db_state,
+        chrono::Utc::now(),
+    ) {
+        Ok(count) if count > 0 => {
+            log::info!(target: "jarvis::startup", "memory turn recovery updated {count} stale turn(s)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(target: "jarvis::startup", "memory turn recovery failed: {e:?}"),
+    }
     let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
     log::info!(target: "jarvis::startup", "bootstrap config load complete");
     {
@@ -1637,6 +1665,10 @@ pub fn run() {
             memory_scoped_restore,
             memory_scoped_recall_preview,
             memory_adopt_legacy,
+            memory_prepare_turn,
+            memory_turn_history,
+            memory_sync_turn,
+            memory_turn_diagnostic,
             list_memory_files,
             read_memory_file,
             list_workspace_files,

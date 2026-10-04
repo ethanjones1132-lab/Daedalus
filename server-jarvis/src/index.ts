@@ -9,6 +9,13 @@
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
 import { installSelfLog } from "./self-log";
 installSelfLog();
+// Native memory bootstrap must capture and strip the owned capability from
+// `process.env` before any tool runtime or child subprocess can clone it.
+import {
+  createNativeMemoryRegistry,
+  handleNativeMemoryRequest,
+  nativeMemoryBootstrap,
+} from "./native-memory";
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
 
@@ -567,6 +574,11 @@ const PORT = Number(process.env.JARVIS_SERVER_PORT ?? 19877);
 
 /** Process-wide local conductor — maintains per-session Ollama prefix state. */
 const persistentConductor = new PersistentConductor(loadConfig);
+
+/** Ephemeral owned-registry for native memory. Empty when this server was not
+ *  launched with the native capability; internal routes then report
+ *  `memory_unavailable` instead of serving a second App-memory authority. */
+const nativeMemoryRegistry = createNativeMemoryRegistry(nativeMemoryBootstrap);
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
@@ -5278,6 +5290,11 @@ export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
   const isNoisy = path === "/status" || path === "/health" || path === "/health/readiness";
+
+  // Internal native-memory routes bypass general CORS/preflight handling and
+  // are capability-authenticated. Unknown paths fall through untouched.
+  const internalMemory = await handleNativeMemoryRequest(req, nativeMemoryRegistry);
+  if (internalMemory) return internalMemory;
 
   if (req.method === "OPTIONS") {
     return new Response(null, {

@@ -14,6 +14,10 @@ pub use sessions::*;
 pub mod memory;
 pub use memory::*;
 
+// Native memory turn commands (Phase 2.2: preparation/sync/diagnostics)
+pub mod memory_turn;
+pub use memory_turn::*;
+
 // Skills command handlers (SQLite-backed)
 pub mod skills;
 pub use skills::*;

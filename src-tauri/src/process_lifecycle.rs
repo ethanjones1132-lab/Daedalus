@@ -78,6 +78,17 @@ fn stop_slot(slot: &mut Option<Child>) {
     }
 }
 
+/// Whether the tracked Bun child started by this Tauri process is currently
+/// alive. This is the only ownership evidence a mutation gate accepts; a TCP
+/// listener on the server port is never treated as ownership.
+pub(crate) fn bun_server_is_alive() -> bool {
+    let mut children = children();
+    match children.slot(ManagedProcess::BunServer) {
+        Some(child) => matches!(child.try_wait(), Ok(None)),
+        None => false,
+    }
+}
+
 /// Start a managed child, or replace the child this process already owns.
 /// The caller must check its service port before spawning; this module does not
 /// infer ownership from a TCP listener and never terminates an unknown PID.
@@ -87,30 +98,40 @@ pub(crate) fn launch(
     spawn: impl FnOnce() -> Result<Child, String>,
 ) -> Result<StartOutcome, String> {
     let _serial = process_lock(process);
+    let should_clear;
     {
         let mut children = children();
         let slot = children.slot(process);
 
-        let mut should_clear = false;
-        if let Some(child) = slot.as_mut() {
-            match child.try_wait() {
+        should_clear = match slot.as_mut() {
+            Some(child) => match child.try_wait() {
                 Ok(None) if !replace => return Ok(StartOutcome::AlreadyRunning(child.id())),
-                Ok(None) => should_clear = true,
-                Ok(Some(_)) => should_clear = true,
+                Ok(None) => true,
+                Ok(Some(_)) => true,
                 Err(error) if !replace => {
                     return Err(format!("could not inspect the tracked child: {error}"));
                 }
-                Err(_) => should_clear = true,
-            }
-        }
+                Err(_) => true,
+            },
+            None => false,
+        };
         if should_clear {
             stop_slot(slot);
         }
+    }
+    // Drop the CHILDREN guard before touching transport state: the mutation
+    // gate acquires transport state and then probes child liveness, so the
+    // global order must be transport-state -> CHILDREN, never the reverse.
+    if should_clear && matches!(process, ManagedProcess::BunServer) {
+        crate::jarvis::memory::transport::native_memory_transport().note_owned_stop();
     }
 
     let child = spawn()?;
     let pid = child.id();
     *children().slot(process) = Some(child);
+    if matches!(process, ManagedProcess::BunServer) {
+        crate::jarvis::memory::transport::native_memory_transport().note_owned_spawn();
+    }
     Ok(StartOutcome::Started(pid))
 }
 
@@ -118,6 +139,9 @@ pub(crate) fn launch(
 pub(crate) fn stop(process: ManagedProcess) {
     let _serial = process_lock(process);
     stop_slot(children().slot(process));
+    if matches!(process, ManagedProcess::BunServer) {
+        crate::jarvis::memory::transport::native_memory_transport().note_owned_stop();
+    }
 }
 
 /// Stop and reap every child owned by this Tauri process during app shutdown.
@@ -131,4 +155,6 @@ pub(crate) fn stop_all() {
     stop_slot(&mut children.claude_proxy);
     stop_slot(&mut children.ollama);
     stop_slot(&mut children.llama_cpp);
+    drop(children);
+    crate::jarvis::memory::transport::native_memory_transport().note_owned_stop();
 }

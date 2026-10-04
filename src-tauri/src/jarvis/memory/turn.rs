@@ -926,3 +926,196 @@ pub fn history_for_memory_turn(
         .map_err(MemoryError::from)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
 }
+
+// ── Trusted runtime receipt (Bun -> native metadata only) ───────────────────
+//
+// The owned Bun process reports the tuple it actually ran plus lifecycle
+// metadata. It never carries recalled text. `applied_selected_ids` is the
+// union of items actually included, which may legitimately differ from the
+// prepared selection.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeMemoryRuntimeReceipt {
+    pub preparation_id: String,
+    pub turn_id: String,
+    pub session_id: String,
+    pub message_hash: String,
+    pub app_instance_id: String,
+    pub bun_instance_id: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub terminal_status: Option<MemoryTurnTerminalStatus>,
+    pub run_id: Option<String>,
+    pub recall_status: Option<MemoryRecallStatus>,
+    pub error_code: Option<String>,
+    pub applied_selected_ids: Vec<String>,
+    pub runtime_evidence: Vec<MemoryRuntimeEvidence>,
+}
+
+fn terminal_status_str(status: MemoryTurnTerminalStatus) -> &'static str {
+    match status {
+        MemoryTurnTerminalStatus::Completed => "completed",
+        MemoryTurnTerminalStatus::Partial => "partial",
+        MemoryTurnTerminalStatus::Cancelled => "cancelled",
+        MemoryTurnTerminalStatus::Failed => "failed",
+        MemoryTurnTerminalStatus::Unterminated => "unterminated",
+    }
+}
+
+/// Public diagnostic view of a persisted turn. Contains metadata and ids only;
+/// never recalled text or the rendered block.
+pub fn memory_turn_diagnostic(turn: &PersistedMemoryTurn) -> MemoryTurnDiagnostic {
+    MemoryTurnDiagnostic {
+        turn_id: turn.turn_id.clone(),
+        session_id: turn.session_id.clone(),
+        scope: turn.scope.clone(),
+        store_revision: turn.store_revision,
+        selected: turn.selected.clone(),
+        applied_selected_ids: turn.applied_selected_ids.clone(),
+        state: turn.state,
+        recall_status: turn.recall_status,
+        error_code: turn.error_code.clone(),
+        terminal_status: turn.terminal_status,
+    }
+}
+
+/// Persist authenticated runtime metadata for one turn. Exact immutable tuple
+/// is validated against the durable row; a mismatch is `turn_conflict`. The
+/// update is idempotent: a duplicate sync never overwrites the first terminal
+/// outcome, and only a `registered`/`started` row may advance. Never assigns
+/// verified-observation authority or durable fact status.
+pub fn apply_memory_turn_receipt(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    receipt: &NativeMemoryRuntimeReceipt,
+    now: DateTime<Utc>,
+) -> Result<MemoryTurnDiagnostic, MemoryError> {
+    let turn = read_memory_turn(conn, session_id, turn_id)?;
+
+    if turn.preparation_id.as_deref() != Some(receipt.preparation_id.as_str())
+        || turn.session_id != receipt.session_id
+        || turn.turn_id != receipt.turn_id
+        || turn.message_hash != receipt.message_hash
+        || turn.app_instance_id != receipt.app_instance_id
+    {
+        return Err(MemoryError::turn_conflict(
+            "Authenticated receipt does not match the durable turn tuple",
+        ));
+    }
+
+    if let Some(existing) = turn.bun_instance_id.as_deref() {
+        if existing != receipt.bun_instance_id {
+            return Err(MemoryError::turn_conflict(
+                "Receipt Bun generation does not match the registered generation",
+            ));
+        }
+    }
+
+    // Preserve the first terminal outcome; a duplicate sync is a no-op.
+    if matches!(turn.state, MemoryTurnState::Terminal) {
+        return Ok(memory_turn_diagnostic(&turn));
+    }
+    if !matches!(turn.state, MemoryTurnState::Registered | MemoryTurnState::Started) {
+        return Ok(memory_turn_diagnostic(&turn));
+    }
+
+    let mut applied = turn.applied_selected_ids.clone();
+    for id in &receipt.applied_selected_ids {
+        if !applied.contains(id) {
+            applied.push(id.clone());
+        }
+    }
+    let applied_json = serde_json::to_string(&applied)
+        .map_err(|_| MemoryError::storage_unavailable("Failed to serialize applied ids"))?;
+    let evidence_json = serde_json::to_string(&receipt.runtime_evidence)
+        .map_err(|_| MemoryError::storage_unavailable("Failed to serialize runtime evidence"))?;
+
+    let state = if receipt.terminal_status.is_some() {
+        MemoryTurnState::Terminal
+    } else {
+        MemoryTurnState::Started
+    };
+    let terminal_status = receipt
+        .terminal_status
+        .map(|status| terminal_status_str(status).to_string());
+    let recall_status = receipt
+        .recall_status
+        .map(recall_status_str)
+        .unwrap_or_else(|| recall_status_str(turn.recall_status));
+    let started_at = receipt.started_at.clone().or_else(|| Some(now.to_rfc3339()));
+    let error_code = receipt.error_code.clone().or_else(|| turn.error_code.clone());
+
+    conn.execute(
+        "UPDATE memory_turn_preparations
+         SET state = ?, bun_instance_id = COALESCE(bun_instance_id, ?),
+             applied_selected_ids_json = ?, started_at = COALESCE(started_at, ?),
+             finished_at = COALESCE(?, finished_at),
+             terminal_status = COALESCE(?, terminal_status),
+             recall_status = ?, error_code = ?, run_id = COALESCE(?, run_id),
+             runtime_evidence_json = ?
+         WHERE turn_id = ? AND session_id = ? AND preparation_id = ?",
+        params![
+            state_str(state),
+            &receipt.bun_instance_id,
+            &applied_json,
+            &started_at,
+            &receipt.finished_at,
+            &terminal_status,
+            recall_status,
+            &error_code,
+            &receipt.run_id,
+            &evidence_json,
+            turn_id,
+            session_id,
+            &receipt.preparation_id,
+        ],
+    )
+    .map_err(MemoryError::from)?;
+
+    let fresh = read_memory_turn(conn, session_id, turn_id)?;
+    Ok(memory_turn_diagnostic(&fresh))
+}
+
+/// Consume native pending rows as a conservative precommit invalidation. Only
+/// `prepared`/`registered` rows change; terminal/started rows are preserved.
+pub fn mark_pending_turns_invalidated(
+    conn: &Connection,
+    _now: DateTime<Utc>,
+) -> Result<usize, MemoryError> {
+    let updated = conn
+        .execute(
+            "UPDATE memory_turn_preparations
+             SET state = 'invalidated', recall_status = 'invalidated'
+             WHERE state IN ('prepared', 'registered')",
+            [],
+        )
+        .map_err(MemoryError::from)?;
+    Ok(updated)
+}
+
+/// Startup recovery. No Bun registry survives a native restart, so pending
+/// preparations are stale (`expired`) and started-but-unsynced turns are
+/// `unterminated`. Durable opaque IDs are retained; public references stay
+/// null because only a live `registered` ready/empty turn exposes one.
+pub fn recover_pending_memory_turns(
+    conn: &Connection,
+    _now: DateTime<Utc>,
+) -> Result<usize, MemoryError> {
+    let expired = conn
+        .execute(
+            "UPDATE memory_turn_preparations SET state = 'expired'
+             WHERE state IN ('prepared', 'registered')",
+            [],
+        )
+        .map_err(MemoryError::from)?;
+    let unterminated = conn
+        .execute(
+            "UPDATE memory_turn_preparations
+             SET state = 'unterminated', terminal_status = 'unterminated'
+             WHERE state = 'started'",
+            [],
+        )
+        .map_err(MemoryError::from)?;
+    Ok(expired + unterminated)
+}
