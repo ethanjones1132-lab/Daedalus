@@ -162,6 +162,9 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub archived: bool,
     pub message_count: i64,
+    /// Explicit, validated project workspace binding, if any. `None` means
+    /// the Session has no project scope (Agent scope only).
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,7 +407,8 @@ pub fn list_session_rows(db: &AppDb) -> Result<Vec<SessionSummary>, String> {
             "SELECT s.id, s.agent_id, s.title, s.backend, s.model,
                     COALESCE(s.context_tokens, 0), COALESCE(s.total_tokens, 0),
                     s.created_at, s.updated_at, COALESCE(s.archived, 0),
-                    COALESCE((SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), 0)
+                    COALESCE((SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), 0),
+                    s.project_root
              FROM sessions s
              ORDER BY s.updated_at DESC",
         )
@@ -423,6 +427,7 @@ pub fn list_session_rows(db: &AppDb) -> Result<Vec<SessionSummary>, String> {
                 updated_at: row.get(8)?,
                 archived: row.get::<_, i64>(9)? != 0,
                 message_count: row.get(10)?,
+                project_root: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -461,6 +466,7 @@ pub fn create_session_row(
         updated_at: now,
         archived: false,
         message_count: 0,
+        project_root: None,
     })
 }
 

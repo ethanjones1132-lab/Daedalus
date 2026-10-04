@@ -2,6 +2,7 @@ pub mod contracts;
 pub mod engine;
 pub mod frontmatter;
 pub mod paths;
+pub mod scope;
 pub mod types;
 
 // Legacy file-based modules kept for `learning.rs` (research output only).
