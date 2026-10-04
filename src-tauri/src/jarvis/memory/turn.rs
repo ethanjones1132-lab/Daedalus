@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::contracts::{
-    AuthorityKind, MemoryError, MemoryScope, RecallOptions, RecallPreview, ScopedMemoryEntry,
+    AuthorityKind, MemoryError, MemoryErrorCode, MemoryScope, RecallOptions, RecallPreview,
+    ScopedMemoryEntry,
 };
 use super::{scope, scoped};
 
@@ -230,26 +231,25 @@ fn parse_source_message_ids(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
-/// Local excerpt semantics for one recalled entry: warm-tier rows render their
-/// local summary and never fetch cold storage; every other tier renders its
-/// stored content. The memory title is preserved as a compact label.
-fn excerpt_for(entry: &ScopedMemoryEntry) -> String {
-    let body = if entry.entry.tier == "warm" && !entry.entry.summary.trim().is_empty() {
+/// Local excerpt body for one recalled entry: warm-tier rows render their local
+/// summary and never fetch cold storage; every other tier renders its stored
+/// content. The title is carried separately as a compact label.
+fn excerpt_body(entry: &ScopedMemoryEntry) -> String {
+    if entry.entry.tier == "warm" && !entry.entry.summary.trim().is_empty() {
         entry.entry.summary.clone()
     } else {
         entry.entry.content.clone()
-    };
-    let title = entry.entry.title.trim();
-    if title.is_empty() {
-        body
-    } else {
-        format!("{}: {}", title, body)
     }
 }
 
 /// Build the bounded prepared items from an already-ranked recall preview.
-/// Rank order is preserved; text is not truncated here (rendering enforces the
-/// per-item and total scalar limits).
+///
+/// Rank order is preserved and at most five items are produced. Each item's
+/// `text` is the exact compact ID/revision/stale/authority/title-labelled
+/// string used to build the rendered block, truncated on Unicode scalar
+/// boundaries to `MAX_ITEM_SCALARS`. The envelope selection and the Phase 2.3 TS
+/// utility consume this same string via `JSON.stringify(item.text)`; framing
+/// never adds labels a second time.
 pub fn build_prepared_memory_items(preview: &RecallPreview) -> Vec<PreparedMemoryItem> {
     preview
         .entries
@@ -268,73 +268,58 @@ pub fn build_prepared_memory_items(preview: &RecallPreview) -> Vec<PreparedMemor
                 verified_at: entry.verified_at.clone(),
                 stale: recall.stale,
             };
-            PreparedMemoryItem {
-                selection,
-                text: excerpt_for(entry),
-            }
+            let label = format!(
+                "id={} revision={} stale={} authority={} title={}",
+                selection.id,
+                selection.revision,
+                selection.stale,
+                scoped::authority_str(selection.authority_kind),
+                entry.entry.title.trim(),
+            );
+            let text = truncate_scalars(
+                &format!("{label} :: {}", excerpt_body(entry)),
+                MAX_ITEM_SCALARS,
+            );
+            PreparedMemoryItem { selection, text }
         })
         .collect()
 }
 
-/// Render a single item as a JSON-string-escaped body, bounded so that its
-/// escaped JSON element never exceeds `MAX_ITEM_SCALARS` Unicode scalar values.
-/// Compact ID/revision/stale/authority labels are included when they fit; if the
-/// label alone cannot fit, it is omitted rather than truncating the excerpt.
-fn render_item(item: &PreparedMemoryItem) -> String {
-    let sel = &item.selection;
-    let label = format!(
-        "id={} revision={} stale={} authority={}",
-        sel.id,
-        sel.revision,
-        sel.stale,
-        scoped::authority_str(sel.authority_kind),
-    );
-    let label_prefix = if scalar_len(&label) + 2 <= MAX_ITEM_SCALARS {
-        format!("{label} ")
-    } else {
-        String::new()
-    };
-    let body_budget = MAX_ITEM_SCALARS.saturating_sub(scalar_len(&label_prefix));
-    let candidate = format!("{label_prefix}{}", truncate_scalars(&item.text, body_budget));
-
-    // Guarantee the JSON-escaped element (including surrounding quotes) also
-    // respects the cap by trimming from the end at scalar boundaries.
-    let mut chars: Vec<char> = candidate.chars().collect();
-    loop {
-        let raw: String = chars.iter().collect();
-        let escaped = serde_json::to_string(&raw).unwrap_or_else(|_| "\"\"".to_string());
-        if scalar_len(&escaped) <= MAX_ITEM_SCALARS || chars.is_empty() {
-            return raw;
-        }
-        chars.pop();
-    }
-}
-
+/// JSON-string-escape already-labelled item text into the framed array body.
+/// Labels are baked into `item.text` by `build_prepared_memory_items`, so framing
+/// never adds them a second time.
 fn render_body(items: &[PreparedMemoryItem]) -> String {
-    let rendered: Vec<String> = items.iter().map(render_item).collect();
+    let rendered: Vec<&str> = items.iter().map(|item| item.text.as_str()).collect();
     serde_json::to_string(&rendered).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Render the deterministic framed memory block. Items arrive in rank order.
-/// While the complete escaped frame (including framing and item labels) exceeds
-/// `MAX_BLOCK_SCALARS`, the whole lowest-ranked item is dropped and the block is
-/// rerendered. Framing is never truncated. If no item fits, the block is empty
-/// so the caller can report `budget_omitted`; an empty item list yields an empty
-/// block.
-pub fn render_memory_block(items: &[PreparedMemoryItem]) -> String {
+/// Fit the ranked items into one framed block under `MAX_BLOCK_SCALARS`,
+/// dropping whole lowest-ranked items (from the end) until the complete escaped
+/// frame fits. Returns the block and the number of retained items. Framing is
+/// never truncated; if no item fits, the block is empty and no items are
+/// retained, so the caller can mark `budget_omitted` and keep selection aligned.
+fn fit_memory_block(items: &[PreparedMemoryItem]) -> (String, usize) {
     if items.is_empty() {
-        return String::new();
+        return (String::new(), 0);
     }
     let mut count = items.len();
     while count > 0 {
         let body = render_body(&items[..count]);
         let total = scalar_len(FRAME_PREFIX) + scalar_len(&body) + scalar_len(FRAME_SUFFIX);
         if total <= MAX_BLOCK_SCALARS {
-            return format!("{FRAME_PREFIX}{body}{FRAME_SUFFIX}");
+            return (format!("{FRAME_PREFIX}{body}{FRAME_SUFFIX}"), count);
         }
         count -= 1;
     }
-    String::new()
+    (String::new(), 0)
+}
+
+/// Render the deterministic framed memory block: the frozen frame plus the JSON
+/// array of already-bounded, already-labelled item text. While the complete
+/// escaped frame exceeds `MAX_BLOCK_SCALARS`, the whole lowest-ranked item is
+/// dropped. An empty item list yields an empty block.
+pub fn render_memory_block(items: &[PreparedMemoryItem]) -> String {
+    fit_memory_block(items).0
 }
 
 // ── Native hashing ──────────────────────────────────────────────────────────
@@ -381,6 +366,13 @@ fn recall_status_str(status: MemoryRecallStatus) -> &'static str {
         MemoryRecallStatus::BudgetOmitted => "budget_omitted",
         MemoryRecallStatus::Applied => "applied",
     }
+}
+
+fn error_code_string(code: MemoryErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "storage_unavailable".to_string())
 }
 
 fn parse_wire<T: DeserializeOwned>(raw: &str) -> Result<T, MemoryError> {
@@ -589,11 +581,44 @@ fn verify_replay_identity(
     Ok(())
 }
 
-fn preparation_from_turn(turn: &PersistedMemoryTurn) -> MemoryTurnPreparation {
+/// A preparation is expired once its 120-second TTL has elapsed. A missing or
+/// unparseable timestamp fails closed (treated as expired).
+fn turn_is_expired(turn: &PersistedMemoryTurn, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(&turn.expires_at) {
+        Ok(expires_at) => expires_at.with_timezone(&Utc) <= now,
+        Err(_) => true,
+    }
+}
+
+/// Build the public preparation view. The opaque durable preparation ID is
+/// exposed only when the turn is currently `registered` with a `ready`/`empty`
+/// status and has not expired. Failed retrieval, registration failure, expired
+/// or consumed work, and work not yet registered all report a null public
+/// reference while the durable ID remains stored for diagnostics and replay
+/// checks.
+fn preparation_from_turn(
+    turn: &PersistedMemoryTurn,
+    now: DateTime<Utc>,
+) -> MemoryTurnPreparation {
+    let expired = turn_is_expired(turn, now);
+    let eligible = matches!(turn.state, MemoryTurnState::Registered)
+        && matches!(
+            turn.recall_status,
+            MemoryRecallStatus::Ready | MemoryRecallStatus::Empty
+        )
+        && !expired;
     MemoryTurnPreparation {
         turn_id: turn.turn_id.clone(),
-        preparation_id: turn.preparation_id.clone(),
-        status: turn.recall_status,
+        preparation_id: if eligible {
+            turn.preparation_id.clone()
+        } else {
+            None
+        },
+        status: if expired {
+            MemoryRecallStatus::Expired
+        } else {
+            turn.recall_status
+        },
     }
 }
 
@@ -618,7 +643,7 @@ pub fn prepare_memory_turn_record(
         if let Some(existing) = read_turn_row_optional(conn, &request.turn_id)? {
             verify_replay_identity(conn, &existing, request, app_instance_id)?;
             return Ok(PrepareMemoryTurnOutcome::Existing {
-                preparation: preparation_from_turn(&existing),
+                preparation: preparation_from_turn(&existing, now),
             });
         }
 
@@ -634,35 +659,57 @@ pub fn prepare_memory_turn_record(
             include_user_scope: request.include_user_scope,
         };
 
-        let (recall_status, selected, block) = match scoped::recall_scoped_memories(
-            conn,
-            &scope,
-            &user_message,
-            &options,
-            now,
-        ) {
-            Ok(preview) if preview.entries.is_empty() => {
-                (MemoryRecallStatus::Empty, Vec::new(), String::new())
-            }
-            Ok(preview) => {
-                let items = build_prepared_memory_items(&preview);
-                let block = render_memory_block(&items);
-                if block.is_empty() {
-                    (MemoryRecallStatus::BudgetOmitted, items, String::new())
-                } else {
-                    (MemoryRecallStatus::Ready, items, block)
+        let (turn_state, recall_status, error_code, selected, block) =
+            match scoped::recall_scoped_memories(conn, &scope, &user_message, &options, now) {
+                Ok(preview) if preview.entries.is_empty() => (
+                    MemoryTurnState::Prepared,
+                    MemoryRecallStatus::Empty,
+                    None,
+                    Vec::new(),
+                    String::new(),
+                ),
+                Ok(preview) => {
+                    let items = build_prepared_memory_items(&preview);
+                    // Keep envelope selection and persisted metadata aligned to
+                    // exactly the whole items retained in the final block.
+                    let (block, retained) = fit_memory_block(&items);
+                    if block.is_empty() {
+                        (
+                            MemoryTurnState::Prepared,
+                            MemoryRecallStatus::BudgetOmitted,
+                            None,
+                            Vec::new(),
+                            String::new(),
+                        )
+                    } else {
+                        let retained_items: Vec<PreparedMemoryItem> =
+                            items.into_iter().take(retained).collect();
+                        (
+                            MemoryTurnState::Prepared,
+                            MemoryRecallStatus::Ready,
+                            None,
+                            retained_items,
+                            block,
+                        )
+                    }
                 }
-            }
-            Err(err) => {
-                eprintln!(
-                    "[memory] turn recall unavailable code={:?}",
-                    err.code
-                );
-                (MemoryRecallStatus::RetrievalFailed, Vec::new(), String::new())
-            }
-        };
+                Err(err) => {
+                    eprintln!("[memory] turn recall unavailable code={:?}", err.code);
+                    // Persist the typed retrieval failure as a non-live
+                    // diagnostic: no public reference is produced and Phase 2.2
+                    // must skip network registration for this turn.
+                    (
+                        MemoryTurnState::Unavailable,
+                        MemoryRecallStatus::RetrievalFailed,
+                        Some(error_code_string(err.code)),
+                        Vec::new(),
+                        String::new(),
+                    )
+                }
+            };
 
-        // Persist selection metadata only — never item text or the block.
+        // Persist selection metadata for retained items only — never item text
+        // or the block.
         let selected_metadata: Vec<PreparedMemorySelection> = selected
             .iter()
             .map(|item| item.selection.clone())
@@ -684,7 +731,7 @@ pub fn prepare_memory_turn_record(
               applied_selected_ids_json, app_instance_id, bun_instance_id, state, recall_status,
               error_code, prepared_at, expires_at, started_at, finished_at, terminal_status,
               run_id, runtime_evidence_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, NULL, ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL, '[]')",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, NULL, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '[]')",
             params![
                 &request.turn_id,
                 preparation_id,
@@ -698,8 +745,9 @@ pub fn prepare_memory_turn_record(
                 store_revision,
                 &selected_json,
                 app_instance_id,
-                state_str(MemoryTurnState::Prepared),
+                state_str(turn_state),
                 recall_status_str(recall_status),
+                &error_code,
                 &prepared_at,
                 &expires_at,
             ],
@@ -738,7 +786,6 @@ pub fn mark_memory_turn_registered(
     bun_instance_id: &str,
     now: DateTime<Utc>,
 ) -> Result<MemoryTurnPreparation, MemoryError> {
-    let _ = now;
     let turn = read_memory_turn(conn, session_id, turn_id)?;
     if turn.preparation_id.as_deref() != Some(preparation_id) {
         return Err(MemoryError::turn_conflict(
@@ -752,12 +799,15 @@ pub fn mark_memory_turn_registered(
                 "Turn was already registered by a different Bun instance",
             ));
         }
-        Some(_) => return Ok(preparation_from_turn(&turn)),
+        Some(_) => return Ok(preparation_from_turn(&turn, now)),
         None => {}
     }
 
+    // Only an original `prepared` row may advance. A retrieval failure or an
+    // earlier registration failure is returned unchanged with its typed status
+    // rather than being overwritten.
     if !matches!(turn.state, MemoryTurnState::Prepared) {
-        return Ok(preparation_from_turn(&turn));
+        return Ok(preparation_from_turn(&turn, now));
     }
 
     conn.execute(
@@ -768,7 +818,8 @@ pub fn mark_memory_turn_registered(
     )
     .map_err(MemoryError::from)?;
 
-    Ok(preparation_from_turn(&turn))
+    let fresh = read_memory_turn(conn, session_id, turn_id)?;
+    Ok(preparation_from_turn(&fresh, now))
 }
 
 /// Persist a registration failure against the durable preparation. The opaque
@@ -782,7 +833,6 @@ pub fn mark_memory_turn_registration_failed(
     code: &str,
     now: DateTime<Utc>,
 ) -> Result<MemoryTurnPreparation, MemoryError> {
-    let _ = now;
     let turn = read_memory_turn(conn, session_id, turn_id)?;
     if turn.preparation_id.as_deref() != Some(preparation_id) {
         return Err(MemoryError::turn_conflict(
@@ -791,7 +841,7 @@ pub fn mark_memory_turn_registration_failed(
     }
 
     if !matches!(turn.state, MemoryTurnState::Prepared) {
-        return Ok(preparation_from_turn(&turn));
+        return Ok(preparation_from_turn(&turn, now));
     }
 
     conn.execute(
@@ -802,11 +852,8 @@ pub fn mark_memory_turn_registration_failed(
     )
     .map_err(MemoryError::from)?;
 
-    Ok(MemoryTurnPreparation {
-        turn_id: turn_id.to_string(),
-        preparation_id: Some(preparation_id.to_string()),
-        status: MemoryRecallStatus::RegistrationFailed,
-    })
+    let fresh = read_memory_turn(conn, session_id, turn_id)?;
+    Ok(preparation_from_turn(&fresh, now))
 }
 
 /// Read the durable Phase 3 handoff record by native Session/turn identity.
@@ -859,14 +906,17 @@ pub fn history_for_memory_turn(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, role, content FROM messages
-             WHERE session_id = ?
-               AND rowid < (SELECT rowid FROM messages WHERE id = ? AND session_id = ?)
-             ORDER BY created_at, rowid",
+            "SELECT m.id, m.role, m.content
+             FROM messages m
+             JOIN messages src ON src.id = ? AND src.session_id = ?
+             WHERE m.session_id = ?
+               AND (m.created_at < src.created_at
+                    OR (m.created_at = src.created_at AND m.rowid < src.rowid))
+             ORDER BY m.created_at, m.rowid",
         )
         .map_err(MemoryError::from)?;
     let rows = stmt
-        .query_map(params![session_id, before_message_id, session_id], |row| {
+        .query_map(params![before_message_id, session_id, session_id], |row| {
             Ok(PromptHistoryMessage {
                 id: row.get(0)?,
                 role: row.get(1)?,
