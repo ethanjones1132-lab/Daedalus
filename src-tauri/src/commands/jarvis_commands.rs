@@ -155,6 +155,12 @@ pub async fn jarvis_send_message(
     // It is only a correlation identity: Native still prepares the turn against
     // its own persisted row and never treats a client id as memory authority.
     turn_id: Option<String>,
+    // Optional Goal association selected by the user. It is NOT authority by
+    // itself: native validates the Goal's current Session/Agent/canonical-
+    // project binding against this exact Session and only then registers a
+    // bounded one-shot Goal run binding with the owned Bun child. An invalid
+    // or cross-scope Goal fails closed rather than running goal-less.
+    goal_id: Option<String>,
 ) -> Result<(), String> {
     // Chat is served by the native Bun server, which loads the active config
     // (backend + model + OpenRouter key) itself. Make sure it is up, then hand the
@@ -253,6 +259,47 @@ pub async fn jarvis_send_message(
         _ => uuid::Uuid::new_v4().to_string(),
     };
 
+    // Resolve and register the native-authorized Goal run binding BEFORE the
+    // relay starts. The Goal is validated against this exact persisted Session,
+    // and native loads the exact saved user source row (the same
+    // `user_message_id` native inserted above), computes its canonical UTF-8
+    // SHA-256, and mints the stable TaskRun identity. A non-empty but
+    // invalid/cross-scope Goal fails closed (the turn is not run goal-less under
+    // a Goal the user selected). A confirmed registration is required for the
+    // terminal run record to later verify a Goal association.
+    let validated_goal_binding_id: Option<String> = match goal_id.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(candidate) => {
+            let Some(source_message_id) = user_message_id.as_deref() else {
+                return Err("a goal-linked run requires a persisted Session".to_string());
+            };
+            let transport = crate::jarvis::memory::transport::native_memory_transport();
+            let preparation = crate::jarvis::memory::transport::register_goal_run_binding(
+                db.inner(),
+                transport,
+                candidate,
+                &session_id,
+                &turn_id,
+                source_message_id,
+            )
+            .map_err(|error| error.message)?;
+            // Validation succeeded. If the owned child could not confirm the
+            // bounded one-shot, the turn proceeds goal-less rather than
+            // attributing the run to a Goal whose authority was not
+            // established. This is fail-closed for authority, not for the turn.
+            match preparation.binding_id {
+                Some(binding_id) if preparation.registered => Some(binding_id),
+                _ => {
+                    eprintln!(
+                        "[jarvis-chat] goal binding not registered turn={} goal={} (running goal-less)",
+                        turn_id, candidate
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     // Metadata-only, observable history warning tied to this turn. It does not
     // fabricate a saved row or memory readiness.
     if history_unavailable {
@@ -328,6 +375,7 @@ pub async fn jarvis_send_message(
         source_message_hash,
         memory_preparation_id,
         initial_memory_status,
+        validated_goal_binding_id,
     )
 }
 

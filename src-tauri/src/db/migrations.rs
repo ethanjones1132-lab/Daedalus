@@ -1413,6 +1413,37 @@ pub fn apply_goal_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         add_column_if_missing(conn, "cron_jobs", "goal_id", "goal_id TEXT")?;
         add_column_if_missing(conn, "cron_runs", "goal_id", "goal_id TEXT")?;
 
+        // Roadmap Priority #2, Part 2: durable native record of each registered
+        // Goal run binding. A terminal run may set `session_runs.goal_id` only
+        // when the owned Bun child's consume receipt verifies against this row
+        // (exact Session/turn/saved-user source row+hash/Goal/stable TaskRun
+        // identity/Bun run identity). `binding_id` is the native-minted opaque
+        // one-shot identity; no client value is authority. Bounded and additive.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS goal_run_bindings (
+                binding_id          TEXT PRIMARY KEY,
+                goal_id             TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                session_id          TEXT NOT NULL,
+                agent_id            TEXT NOT NULL,
+                project_root        TEXT,
+                turn_id             TEXT NOT NULL,
+                source_message_id   TEXT NOT NULL,
+                source_message_hash TEXT NOT NULL,
+                task_run_id         TEXT NOT NULL,
+                bun_instance_id     TEXT,
+                issued_at           TEXT NOT NULL,
+                expires_at          TEXT NOT NULL,
+                consumed_at         TEXT,
+                consumed_run_id     TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(session_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_run_bindings_goal    ON goal_run_bindings(goal_id);
+            CREATE INDEX IF NOT EXISTS idx_goal_run_bindings_session ON goal_run_bindings(session_id, turn_id);
+            "#,
+        )?;
+
         // A terminal goal's status is immutable at the storage layer. The
         // command layer also rejects terminal transitions; this guards against
         // any other writer silently reviving closed work.

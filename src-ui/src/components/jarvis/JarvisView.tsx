@@ -184,10 +184,17 @@ export interface RunRecordPayload extends RunRecordIntent {
   toolCount: number;
   cancelledReason: string | null;
   partialOutput: string | null;
+  /**
+   * Native-registered Goal run binding id for this turn, or null. This is a
+   * correlation identity only: native verifies its own registration plus the
+   * owned Bun child's consume receipt before associating a Goal. The UI never
+   * supplies a Goal id as authority.
+   */
+  goalBindingId: string | null;
 }
 
-const recordTerminalRun = (payload: RunRecordPayload): Promise<SessionRunWrite> =>
-  invoke('record_terminal_run', {
+const recordTerminalRun = (payload: RunRecordPayload): Promise<SessionRunWrite> => {
+  const base = {
     ...sessionInvokeArgs(payload.sessionId),
     runId: payload.runId,
     outcome: payload.outcome,
@@ -196,10 +203,23 @@ const recordTerminalRun = (payload: RunRecordPayload): Promise<SessionRunWrite> 
     toolCount: payload.toolCount,
     cancelledReason: payload.cancelledReason,
     partialOutput: payload.partialOutput,
-  }).then(
+  };
+  // A Goal-linked turn uses the Goal-specific command so native can verify the
+  // consumed binding receipt; an ordinary turn keeps the unchanged command.
+  if (payload.goalBindingId) {
+    return invoke('record_goal_terminal_run', {
+      ...base,
+      bindingId: payload.goalBindingId,
+    }).then(
+      () => ({ ok: true }) as SessionRunWrite,
+      () => ({ ok: false }) as SessionRunWrite,
+    );
+  }
+  return invoke('record_terminal_run', base).then(
     () => ({ ok: true }) as SessionRunWrite,
     () => ({ ok: false }) as SessionRunWrite,
   );
+};
 
 const readSessionRunsFor = async (sessionId: string): Promise<SessionRunRead> => {
   try {
@@ -951,6 +971,38 @@ export function ChatPanel({
           });
         }
         setSessionAgents(next);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  // Roadmap Priority #2 Part 2 — Goal-linked chat. The selected Goal id is a
+  // SUGGESTION to native only; native validates the Goal's Session/Agent/scope
+  // binding and registers a bounded one-shot binding before the run. The UI
+  // never infers scope from the Goal text and never fabricates a Goal link.
+  const [goalOptions, setGoalOptions] = useState<Array<{ id: string; objective: string; status: string }>>([]);
+  const [selectedGoalId, setSelectedGoalId] = useState<string | null>(null);
+  // The native binding id actually registered for the CURRENT turn, captured at
+  // stream start. The terminal run record uses ONLY this value, so a Goal
+  // selected mid-turn cannot be attributed to an earlier turn.
+  const linkedGoalBindingIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<unknown>('goal_list')
+      .then((rows) => {
+        if (cancelled || !Array.isArray(rows)) return;
+        const next: Array<{ id: string; objective: string; status: string }> = [];
+        for (const row of rows) {
+          if (typeof row !== 'object' || row === null) continue;
+          const record = row as Record<string, unknown>;
+          if (typeof record.id !== 'string' || typeof record.objective !== 'string') continue;
+          const status = typeof record.status === 'string' ? record.status : 'pending';
+          if (status === 'completed' || status === 'failed' || status === 'cancelled') continue;
+          next.push({ id: record.id, objective: record.objective, status });
+        }
+        setGoalOptions(next);
+        setSelectedGoalId((prev) => (prev && next.some((g) => g.id === prev) ? prev : null));
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -1871,6 +1923,7 @@ export function ChatPanel({
     clientMessageId: string,
     assistantClientMessageId: string,
     includeUserScope: boolean,
+    goalId: string | null,
   ) => {
     streamAbortRef.current?.abort();
     const controller = new AbortController();
@@ -2166,6 +2219,50 @@ export function ChatPanel({
       }
       stopIfStale();
 
+      // Roadmap Priority #2 Part 2 — Goal linkage. Native validates the
+      // selected Goal's Session/Agent/canonical-project binding, loads the
+      // exact saved user source row already used by `memory_prepare_turn`
+      // (`userMessageId`), and registers a bounded one-shot binding for this
+      // exact turn. This is INDEPENDENT of memory preparation: a Goal-linked run
+      // proceeds even when memory is unavailable. A rejected/unsupported Goal is
+      // not silently downgraded — the turn runs goal-less and the UI drops the
+      // selection. The UI never supplies a Goal id or hash as authority, and
+      // only the returned native binding id is later used for the terminal
+      // proof.
+      linkedGoalBindingIdRef.current = null;
+      if (goalId && userMessageId) {
+        try {
+          const preparation = await invoke<{
+            goal_id?: string;
+            turn_id?: string;
+            registered?: boolean;
+            binding_id?: string;
+          }>('goal_prepare_run', {
+            goalId,
+            sessionId: sid,
+            turnId,
+            sourceMessageId: userMessageId,
+          });
+          if (
+            preparation
+            && preparation.registered === true
+            && preparation.goal_id === goalId
+            && preparation.turn_id === turnId
+            && typeof preparation.binding_id === 'string'
+            && preparation.binding_id.length > 0
+          ) {
+            linkedGoalBindingIdRef.current = preparation.binding_id;
+          } else if (requestIsCurrent()) {
+            setSelectedGoalId((prev) => (prev === goalId ? null : prev));
+          }
+        } catch {
+          if (requestIsCurrent()) {
+            setSelectedGoalId((prev) => (prev === goalId ? null : prev));
+          }
+        }
+      }
+      stopIfStale();
+
       const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2176,6 +2273,13 @@ export function ChatPanel({
           turn_id: turnId,
           memory_status: initialMemoryStatus,
           ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
+          // Exact persisted user source row already bound by
+          // `goal_prepare_run`, carried only for a registered Goal turn so the
+          // server can match it against the native binding. Identity only; the
+          // server never treats it as authority and ordinary turns omit it.
+          ...(linkedGoalBindingIdRef.current && userMessageId
+            ? { source_message_id: userMessageId }
+            : {}),
         }),
         signal: controller.signal,
       });
@@ -2227,6 +2331,7 @@ export function ChatPanel({
         toolCount: runAcc.toolCount,
         cancelledReason: runAcc.cancelledReason ?? null,
         partialOutput: runAcc.partialOutput ?? null,
+        goalBindingId: linkedGoalBindingIdRef.current,
       });
     };
     const acceptTerminal = (next: DecodedStreamTerminal): boolean => {
@@ -2848,6 +2953,7 @@ export function ChatPanel({
     settledRelayOwnersRef.current.clear();
     conversationEpochRef.current += 1;
     memoryOwnerRef.current = null;
+    linkedGoalBindingIdRef.current = null;
     // Consume the per-turn user-wide opt-in: this turn snapshots the explicit
     // choice, then the control resets to the Session default (false) so it can
     // never silently carry across an Agent change within the same Session.
@@ -2946,11 +3052,12 @@ export function ChatPanel({
         onSessionsChanged();
       }
 
+      const goalForTurn = selectedGoalId;
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
         if (!override) {
           publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
         }
-      }, clientMessageId, assistantClientMessageId, includeUserScopeForTurn);
+      }, clientMessageId, assistantClientMessageId, includeUserScopeForTurn, goalForTurn);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
@@ -3003,7 +3110,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, onSessionsChanged, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope, pendingAgentId, pendingProjectRoot, bindWorkspaceForSession]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, onSessionsChanged, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope, pendingAgentId, pendingProjectRoot, selectedGoalId, bindWorkspaceForSession]);
 
   // Phase 4.4 — Resume is an explicit control that sends the exact native
   // resume directive through the ordinary turn transport. It never fabricates
@@ -3577,6 +3684,37 @@ export function ChatPanel({
           </motion.button>
         )}
       </AnimatePresence>
+
+      {/* Roadmap Priority #2 Part 2 — optional Goal linkage. The selected Goal
+          is submitted to native, which validates its Session/Agent/scope
+          binding before it becomes run authority; this control is not a grant. */}
+      {goalOptions.length > 0 && (
+        <div className="shrink-0 pb-2 flex items-center gap-2">
+          <label
+            htmlFor="jarvis-goal-select"
+            className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40"
+          >
+            Goal
+          </label>
+          <select
+            id="jarvis-goal-select"
+            value={selectedGoalId ?? ''}
+            disabled={isStreaming}
+            onChange={(e) => setSelectedGoalId(e.target.value || null)}
+            className="max-w-[320px] truncate px-2 py-1 text-xs rounded-md bg-white/5 border border-white/10 text-bone focus:outline-none focus:border-accent/50 disabled:opacity-50"
+          >
+            <option value="">No goal (ordinary turn)</option>
+            {goalOptions.map((goal) => (
+              <option key={goal.id} value={goal.id}>
+                {goal.objective}
+              </option>
+            ))}
+          </select>
+          <span className="text-[10px] text-bone/30">
+            A goal-linked run records progress and evidence against the goal.
+          </span>
+        </div>
+      )}
 
       {/* Phase 4.2 — explicit Session Agent/project identity. For an existing
           Session the Agent is fixed and Apply/Unbind bind the current Session;

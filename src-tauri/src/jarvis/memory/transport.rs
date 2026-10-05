@@ -46,6 +46,94 @@ pub struct RegistrationResult {
     pub bun_instance_id: String,
 }
 
+/// Wire shape of one native-authorized Goal run binding registered with the
+/// owned Bun child. Distinct from the memory envelope: it is registered even
+/// when no memory preparation exists, so Goal linkage never depends on memory
+/// availability. Fields are association identity only; no permission, scope,
+/// or recalled content crosses this boundary. `source_message_id`/`_hash` bind
+/// the exact native saved user source row; `task_run_id` is the stable native
+/// execution identity.
+#[derive(Debug, Clone, Serialize)]
+pub struct GoalRunBindingWire {
+    pub binding_id: String,
+    pub goal_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_root: Option<String>,
+    pub objective: String,
+    pub criteria: Vec<String>,
+    pub turn_id: String,
+    pub source_message_id: String,
+    pub source_message_hash: String,
+    pub task_run_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
+/// Registration response for a Goal run binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalBindingResult {
+    pub binding_id: String,
+    pub bun_instance_id: String,
+}
+
+/// Bounded, transcript-free checkpoint view fetched from the owned Bun child for
+/// one Goal-owned TaskRun. Only structured status/IDs/stage/effect-state and
+/// evidence *references* cross this boundary — never transcripts or memory text.
+/// Field names mirror the Bun `GoalCheckpointView` wire (camelCase).
+/// `accepted_output_evidence.pending` marks that trusted accepted-output evidence
+/// belongs to Roadmap Priority #2 Part 4 and the completion gate remains open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalCheckpointWire {
+    pub goal_id: String,
+    pub binding_id: String,
+    pub session_id: String,
+    pub task_run_id: String,
+    pub objective: String,
+    pub status: String,
+    pub state: String,
+    pub stage: Option<String>,
+    pub attempt: i64,
+    pub current_effect_id: Option<String>,
+    #[serde(default)]
+    pub effects: Vec<GoalCheckpointEffectWire>,
+    pub interrupted: bool,
+    #[serde(default)]
+    pub ambiguous_effect_id: Option<String>,
+    #[serde(default)]
+    pub progress_evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub accepted_output_evidence: GoalAcceptedOutputEvidenceWire,
+    pub started_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalCheckpointEffectWire {
+    pub effect_id: String,
+    pub kind: String,
+    pub outcome: String,
+    #[serde(default)]
+    pub r#ref: Option<String>,
+}
+
+/// Part 4 accepted-output marker. Always pending/unverified while trusted
+/// acceptance is unimplemented.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalAcceptedOutputEvidenceWire {
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub unverified: bool,
+    #[serde(default)]
+    pub refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DerivedWirePayload {
     operation_id: String,
@@ -294,6 +382,90 @@ impl NativeMemoryTransport {
         Ok(true)
     }
 
+    /// Register one native-authorized Goal run binding with the live owned
+    /// registry over the same private capability as the memory routes. This is
+    /// an independent one-shot: it never depends on memory preparation, and a
+    /// non-live/unknown owned child fails closed (returns `Ok(None)`) so the
+    /// turn proceeds as an ordinary goal-less turn with no Goal linkage.
+    ///
+    /// The response is the only evidence the current owned child accepted the
+    /// binding; the generation is re-checked after the HTTP round trip and a
+    /// replaced child is treated as unavailable.
+    fn register_goal_binding(
+        &self,
+        state: &mut TransportState,
+        binding: &GoalRunBindingWire,
+    ) -> Result<Option<GoalBindingResult>, HttpFailure> {
+        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+            return Ok(None);
+        }
+        let generation = crate::process_lifecycle::bun_generation();
+        let body = self.post_json("/internal/goals/run-bindings", binding, 200)?;
+        let parsed: GoalBindingResult =
+            serde_json::from_str(&body).map_err(|_| HttpFailure::Unavailable)?;
+        if parsed.binding_id != binding.binding_id {
+            return Err(HttpFailure::Unavailable);
+        }
+        if crate::process_lifecycle::bun_generation() != generation
+            || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        {
+            return Err(HttpFailure::Unavailable);
+        }
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+        Ok(Some(parsed))
+    }
+
+    /// Fetch the authenticated consume receipt for one Goal run binding from the
+    /// live owned child. Returns `Ok(None)` when no receipt exists (not yet
+    /// consumed, unknown, or a non-live/unavailable child); the terminal writer
+    /// then leaves the run goal-less. The raw response is validated by the
+    /// caller against the native registration row.
+    fn fetch_goal_receipt(
+        &self,
+        binding_id: &str,
+    ) -> Result<Option<crate::commands::goals::GoalRunReceipt>, HttpFailure> {
+        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+            return Ok(None);
+        }
+        let path = format!("/internal/goals/run-bindings/{}/receipt", binding_id);
+        match self.get_json(&path, 200) {
+            Ok(body) => serde_json::from_str::<crate::commands::goals::GoalRunReceipt>(&body)
+                .map(Some)
+                .map_err(|_| HttpFailure::Unavailable),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Fetch the bounded, transcript-free checkpoint view for one Goal-owned
+    /// TaskRun. Returns `Ok(None)` when the run is unknown or the child is
+    /// non-live; the caller then exposes no evidence refs rather than a
+    /// fabricated facade.
+    fn fetch_goal_checkpoint(
+        &self,
+        session_id: &str,
+        goal_id: &str,
+        binding_id: &str,
+        task_run_id: &str,
+    ) -> Result<Option<GoalCheckpointWire>, HttpFailure> {
+        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+            return Ok(None);
+        }
+        let path = format!(
+            "/internal/goals/checkpoint?session_id={}&goal_id={}&binding_id={}&task_run_id={}",
+            urlencode(session_id),
+            urlencode(goal_id),
+            urlencode(binding_id),
+            urlencode(task_run_id),
+        );
+        match self.get_json(&path, 200) {
+            Ok(body) => serde_json::from_str::<GoalCheckpointWire>(&body)
+                .map(Some)
+                .map_err(|_| HttpFailure::Unavailable),
+            Err(_) => Ok(None),
+        }
+    }
+
     fn fetch_receipt(
         &self,
         preparation_id: &str,
@@ -413,6 +585,146 @@ pub fn prepare_memory_turn(
             )
         }
     }
+}
+
+/// Native-validate and register one Goal-to-Session/turn binding with the owned
+/// Bun child. The Goal authority in `commands::goals` resolves the current
+/// Goal/Agent/canonical-project binding against the exact persisted Session and
+/// the exact native saved user source row (id + canonical UTF-8 SHA-256) and
+/// mints the stable TaskRun identity. That native binding is persisted only
+/// after the owned child confirms it, so the terminal writer has a durable row
+/// to verify the Bun consume receipt against. Registration is a bounded
+/// one-shot over the same private capability as memory; a non-live/unknown child
+/// or a rejected registration yields `registered: false` and the turn proceeds
+/// goal-less. Memory availability is never consulted here.
+pub fn register_goal_run_binding(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    goal_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    source_message_id: &str,
+) -> Result<crate::commands::goals::GoalRunPreparation, MemoryError> {
+    let binding = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        crate::commands::goals::resolve_goal_run_binding(
+            &conn,
+            goal_id,
+            session_id,
+            turn_id,
+            source_message_id,
+        )
+        .map_err(MemoryError::storage_unavailable)?
+    };
+    let wire = GoalRunBindingWire {
+        binding_id: binding.binding_id.clone(),
+        goal_id: binding.goal_id.clone(),
+        session_id: binding.session_id.clone(),
+        agent_id: binding.agent_id.clone(),
+        project_root: binding.project_root.clone(),
+        objective: binding.objective.clone(),
+        criteria: binding.criteria.clone(),
+        turn_id: binding.turn_id.clone(),
+        source_message_id: binding.source_message_id.clone(),
+        source_message_hash: binding.source_message_hash.clone(),
+        task_run_id: binding.task_run_id.clone(),
+        issued_at: binding.issued_at.clone(),
+        expires_at: binding.expires_at.clone(),
+    };
+
+    let mut state = transport.lock_state();
+    let result = transport.register_goal_binding(&mut state, &wire);
+
+    let (registered, bun_instance_id) = match result {
+        Ok(Some(parsed)) => (true, Some(parsed.bun_instance_id)),
+        _ => (false, None),
+    };
+
+    // Persist the native registration record only after the owned child
+    // confirmed it. A persistence failure fails closed (no Goal linkage) rather
+    // than leaving a registered binding the terminal writer cannot verify.
+    if registered {
+        if let Some(bun_instance_id) = bun_instance_id.as_deref() {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::commands::goals::record_goal_run_binding(&conn, &binding, bun_instance_id)
+                .map_err(MemoryError::storage_unavailable)?;
+        }
+    }
+
+    Ok(crate::commands::goals::GoalRunPreparation {
+        goal_id: binding.goal_id,
+        turn_id: binding.turn_id,
+        registered,
+        binding_id: if registered {
+            Some(binding.binding_id)
+        } else {
+            None
+        },
+        task_run_id: if registered {
+            Some(binding.task_run_id)
+        } else {
+            None
+        },
+        source_message_id: if registered {
+            Some(binding.source_message_id)
+        } else {
+            None
+        },
+    })
+}
+
+/// Verify a Goal-linked terminal run against the native registration row and
+/// the owned child's consume receipt, then return the authorized Goal id. A
+/// non-live child, missing receipt, or any mismatch fails closed with `None`
+/// (the run stays goal-less) rather than fabricating a Goal association. Takes a
+/// raw connection so the SSE relay thread (which holds only the DB path) can
+/// verify before opening its terminal write.
+pub fn resolve_goal_terminal_authority(
+    conn: &Connection,
+    transport: &NativeMemoryTransport,
+    binding_id: &str,
+    run_id: &str,
+) -> Result<Option<String>, MemoryError> {
+    let receipt = transport
+        .fetch_goal_receipt(binding_id)
+        .map_err(|_| MemoryError::storage_unavailable("Goal run receipt unavailable"))?;
+    let Some(receipt) = receipt else {
+        return Ok(None);
+    };
+    match crate::commands::goals::verify_goal_terminal_receipt(conn, binding_id, run_id, &receipt) {
+        Ok(goal_id) => Ok(Some(goal_id)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Minimal percent-encoding for query values (unreserved characters kept).
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{:02X}", byte));
+        }
+    }
+    out
+}
+
+/// Authorized durable read of one Goal-owned TaskRun checkpoint over the private
+/// capability. `binding_id`/`task_run_id` come from the native registration row
+/// (never from the client). Returns `None` when the child is non-live or the run
+/// is unknown; a caller never receives a fabricated/empty evidence facade.
+pub fn read_goal_checkpoint(
+    transport: &NativeMemoryTransport,
+    session_id: &str,
+    goal_id: &str,
+    binding_id: &str,
+    task_run_id: &str,
+) -> Option<GoalCheckpointWire> {
+    transport
+        .fetch_goal_checkpoint(session_id, goal_id, binding_id, task_run_id)
+        .ok()
+        .flatten()
 }
 
 /// A receipt may be acknowledged only after it durably represents a terminal

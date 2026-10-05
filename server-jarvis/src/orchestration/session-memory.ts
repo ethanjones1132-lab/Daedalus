@@ -6,12 +6,17 @@ import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
 import {
+  applyGoalLink,
+  buildGoalCheckpointView,
   createTaskRun,
+  reconcileRecoveredRun,
   resolveTaskRunTurn,
   setTaskPlan,
   type CreateTaskPlanItemInput,
+  type GoalCheckpointView,
   type TaskRunContract,
   type TaskRunDepth,
+  type TaskRunGoalLink,
 } from "./task-run";
 import type { TurnRequirement } from "./turn-requirements";
 import {
@@ -93,6 +98,14 @@ export interface BeginTaskRunInput {
    * replacement. Absent means ordinary behavior.
    */
   continuity?: ContinuityAction;
+  /**
+   * Optional native-authorized Goal association for this turn. Only a binding
+   * the owned native child registered (after validating the Goal's
+   * Session/Agent/scope binding) can supply this. It is independent of memory
+   * availability. Absent means the turn is goal-less; an ordinary goal-less
+   * run never inherits a prior Goal.
+   */
+  goal?: TaskRunGoalLink;
 }
 
 /** Native objective action Bun applies to TaskRun state. */
@@ -323,16 +336,22 @@ export class SessionMemory {
     }
     if (continuity?.mode === "resume") {
       const next = this.resumeTaskRun(session, input, continuity);
-      session.taskRun = next;
+      const linked = input.goal ? applyGoalLink(next, input.goal) : next;
+      session.taskRun = linked;
       session.lastActiveAt = Date.now();
       this.persist(session);
-      return next;
+      return linked;
     }
     if (continuity?.mode === "replace" || continuity?.mode === "clear") {
-      const next = applyContinuityBoundary(
+      let next = applyContinuityBoundary(
         this.boundaryBaseContract(session, input),
         continuity,
       );
+      // `replace` may carry a fresh native-authorized Goal; `clear` must not
+      // retain or absorb one — it is an explicit goal-less boundary.
+      if (continuity.mode === "replace" && input.goal) {
+        next = applyGoalLink(next, input.goal);
+      }
       session.taskRun = next;
       session.lastActiveAt = Date.now();
       this.persist(session);
@@ -350,7 +369,11 @@ export class SessionMemory {
         estimatedComplexity: input.estimatedComplexity,
       },
     );
-    const next = {
+    // Goal linkage: an explicit native binding applies to this turn. Without
+    // one, a genuine continuation retains the prior Goal, while a NEW
+    // unrelated run is goal-less (resolveTaskRunTurn mints a fresh contract
+    // with no goal), so a new request can never silently inherit a prior Goal.
+    let next: TaskRunContract = {
       ...resolved.contract,
       workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
       ...(resolved.isContinuation
@@ -361,6 +384,12 @@ export class SessionMemory {
           }),
       updatedAt: new Date().toISOString(),
     };
+    if (input.goal) {
+      next = applyGoalLink(next, input.goal);
+    } else if (!resolved.isContinuation) {
+      // A fresh run with no native binding must not carry a stale goal.
+      next = { ...next, goal: undefined, checkpoint: undefined };
+    }
     session.taskRun = next;
     session.lastActiveAt = Date.now();
     this.persist(session);
@@ -1051,6 +1080,32 @@ export class SessionMemory {
     const effectiveGeneration =
       current !== null && persistedGeneration < current ? current : persistedGeneration;
     setSessionGeneration(parsed.state, effectiveGeneration);
+
+    // Restart reconciliation for a Goal-linked live run. This is the process
+    // restart/eviction path (the carrier was not in memory), so a live run
+    // recovered here never observed its own terminal outcome. An in-flight
+    // effect whose outcome was never recorded becomes `ambiguous`/`blocked`
+    // (never blindly replayed); otherwise the run becomes resumable `paused`.
+    // Guarded by `resumedAt` so a repeated load cannot re-mark an already
+    // reconciled run.
+    const taskRun = parsed.state.taskRun;
+    if (
+      taskRun?.goal
+      && !["completed", "failed", "cancelled"].includes(taskRun.status)
+      && taskRun.checkpoint
+      && !taskRun.checkpoint.resumedAt
+    ) {
+      const { contract } = reconcileRecoveredRun(taskRun, "process_restart");
+      parsed.state.taskRun = contract;
+      parsed.state.lastActiveAt = Date.now();
+      if (this.config().persist) {
+        try {
+          writeJsonAtomic(memoryFilePath(parsed.state.sessionId, this.sessionsRoot), parsed.state);
+        } catch {
+          console.warn("[SessionMemory] Failed to persist reconciled Goal run: write_failed");
+        }
+      }
+    }
     return parsed.state;
   }
 }
@@ -1220,4 +1275,39 @@ function neutralizeTaskRunTextualCarriers(taskRun: TaskRunContract): TaskRunCont
     };
   }
   return clone;
+}
+
+/**
+ * Read the persisted per-Session TaskRun for a Goal-owned execution and build
+ * its bounded checkpoint view (Roadmap Priority #2, Part 2). This is the
+ * authorized durable read path used over the private capability: it returns only
+ * bounded structured status/IDs/stage/effect-state/evidence references, never
+ * transcripts or raw memory. A missing/corrupt file, a session/goal/binding/
+ * task-run identity mismatch, or a goal-less run yields null (fail closed).
+ *
+ * The persisted state is read WITHOUT re-running the mutating restart
+ * reconciliation; recovery identity (Goal/binding/TaskRun/effect) is preserved
+ * exactly as persisted so a read never rewrites durable progress.
+ */
+export function readPersistedGoalCheckpoint(
+  query: { sessionId: string; goalId: string; bindingId: string; taskRunId: string },
+  sessionsRoot: string = SESSIONS_DIR,
+): GoalCheckpointView | null {
+  const safe = query.sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = join(memoryDir(sessionsRoot), `${safe}.json`);
+  if (!existsSync(path)) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+  const parsed = parseSessionMemoryState(raw, query.sessionId);
+  if (!parsed.ok) return null;
+  const contract = parsed.state.taskRun;
+  if (!contract || !contract.goal || !contract.checkpoint) return null;
+  if (contract.goal.goalId !== query.goalId) return null;
+  if (contract.goal.bindingId !== query.bindingId) return null;
+  if (contract.goal.taskRunId !== query.taskRunId) return null;
+  return buildGoalCheckpointView(contract);
 }

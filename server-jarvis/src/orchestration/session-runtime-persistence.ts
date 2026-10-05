@@ -175,6 +175,23 @@ function parseTaskRun(value: unknown, sessionId: string): TaskRunContract | unde
       return undefined;
     }
   }
+  // Native-authorized Goal association and its durable checkpoint are
+  // additive. A partially-written/malformed association fails the whole read
+  // closed rather than being silently discarded as an ordinary goal-less run.
+  if (value.goal !== undefined && value.goal !== null) {
+    if (!isRecord(value.goal)) return undefined;
+    if (!isNonEmptyString(value.goal.goalId) || !isNonEmptyString(value.goal.bindingId)) return undefined;
+    if (!isNonEmptyString(value.goal.taskRunId)) return undefined;
+    if (typeof value.goal.sessionId !== "string" || typeof value.goal.agentId !== "string") return undefined;
+    if (value.goal.projectRoot !== null && typeof value.goal.projectRoot !== "string") return undefined;
+    if (typeof value.goal.objective !== "string") return undefined;
+    if (value.goal.criteria !== undefined && !isStringArray(value.goal.criteria)) return undefined;
+  }
+  if (value.checkpoint !== undefined && value.checkpoint !== null) {
+    if (!isRecord(value.checkpoint)) return undefined;
+    if (value.checkpoint.effects !== undefined && !Array.isArray(value.checkpoint.effects)) return undefined;
+    if (value.checkpoint.evidenceRefs !== undefined && !isStringArray(value.checkpoint.evidenceRefs)) return undefined;
+  }
   const normalized = normalizeTaskRunOnRead(value);
   if (!normalized || normalized.sessionId !== sessionId) return undefined;
   return normalized;

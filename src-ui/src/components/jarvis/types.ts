@@ -168,6 +168,8 @@ export interface SessionRunRecord {
   tool_count: number;
   cancelled_reason?: string;
   partial_output?: string;
+  /** Native-authorized Goal association, when this run was Goal-linked. */
+  goal_id?: string;
 }
 
 

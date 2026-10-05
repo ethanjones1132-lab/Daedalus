@@ -221,10 +221,45 @@ pub struct SessionRunRecord {
     pub tool_count: i64,
     pub cancelled_reason: Option<String>,
     pub partial_output: Option<String>,
+    /// Stable native-authorized Goal association (Roadmap Priority #2, Part 2).
+    /// Null on ordinary goal-less runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+}
+
+/// Validate a caller-supplied Goal association for a terminal Session run.
+/// The Goal must exist and its Agent/canonical-project binding must match the
+/// run's owning Session. A `goal_id` that does not resolve, belongs to a
+/// different Agent, or overstates workspace scope is refused so the run is
+/// never attributed to a Goal the user did not authorize. A terminal Goal is
+/// allowed here (a run may finish after the Goal was closed).
+fn validate_run_goal_binding(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    goal_id: &str,
+) -> Result<(), String> {
+    let goal = crate::commands::goals::load_goal_for_run_validation(conn, goal_id)?;
+    let session: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (session_agent, session_project_root) =
+        session.ok_or_else(|| format!("session not found: {}", session_id))?;
+    crate::commands::goals::validate_goal_session_scope(
+        &goal,
+        &session_agent,
+        session_project_root.as_deref(),
+        session_id,
+    )
 }
 
 /// Persist the terminal outcome of one native SSE turn. `run_id` is emitted
 /// by the Bun pipeline and is the durable idempotency key for relay retries.
+/// This is the ordinary goal-less writer; it never sets a Goal association.
 pub fn persist_terminal_run(
     db: &AppDb,
     session_id: &str,
@@ -253,6 +288,7 @@ pub fn persist_terminal_run(
         tool_count,
         cancelled_reason,
         partial_output,
+        None,
     )
 }
 
@@ -279,9 +315,80 @@ pub fn persist_terminal_run_at(
         tool_count,
         cancelled_reason,
         partial_output,
+        None,
     )
 }
 
+/// Goal-specific terminal writer. `goal_id` here is NOT client authority: the
+/// caller obtains it only after native verified the consumed private
+/// registration/receipt for this exact binding, Session, turn, saved-user
+/// row/hash, Goal, TaskRun identity, and Bun run id. A `None` goal writes the
+/// ordinary goal-less record. Kept separate so the ordinary API and its call
+/// sites/tests are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_goal_terminal_run(
+    db: &AppDb,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+    goal_id: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    if !matches!(
+        outcome,
+        "success" | "partial" | "failed" | "timed_out" | "cancelled"
+    ) {
+        return Err(format!("invalid terminal outcome: {outcome}"));
+    }
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+        goal_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn persist_goal_terminal_run_at(
+    db_path: &std::path::Path,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+    goal_id: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("Failed to open session database: {e}"))?;
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+        goal_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn persist_terminal_run_conn(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -292,6 +399,7 @@ fn persist_terminal_run_conn(
     tool_count: i64,
     cancelled_reason: Option<&str>,
     partial_output: Option<&str>,
+    goal_id: Option<&str>,
 ) -> Result<SessionRunRecord, String> {
     if !matches!(
         outcome,
@@ -299,21 +407,58 @@ fn persist_terminal_run_conn(
     ) {
         return Err(format!("invalid terminal outcome: {outcome}"));
     }
+    // `goal_id` reaches this writer only after native verified the owned child's
+    // consume receipt against the native registration. Never trust a raw client
+    // Goal id here; the caller must supply the receipt-verified value or None.
+    if let Some(goal_id) = goal_id {
+        validate_run_goal_binding(conn, session_id, goal_id)?;
+    }
+    // Never overwrite an existing run's Goal association with a conflicting
+    // one: a re-persist of the same run id keeps its original Goal (idempotent
+    // replay) and refuses a different Goal.
+    if let Some(goal_id) = goal_id {
+        let existing: Option<Option<String>> = conn
+            .query_row(
+                "SELECT goal_id FROM session_runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(Some(existing_goal)) = existing {
+            if existing_goal != goal_id {
+                return Err(format!(
+                    "session run '{}' is already associated with a different goal",
+                    run_id
+                ));
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO session_runs
-         (run_id, session_id, outcome, selected_model, token_count, tool_count, cancelled_reason, partial_output, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         (run_id, session_id, outcome, selected_model, token_count, tool_count, cancelled_reason, partial_output, goal_id, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT(run_id) DO UPDATE SET
            outcome=excluded.outcome, selected_model=excluded.selected_model,
            token_count=excluded.token_count, tool_count=excluded.tool_count,
            cancelled_reason=excluded.cancelled_reason, partial_output=excluded.partial_output,
+           goal_id=COALESCE(session_runs.goal_id, excluded.goal_id),
            finished_at=excluded.finished_at",
         rusqlite::params![
             run_id, session_id, outcome, selected_model, token_count.max(0), tool_count.max(0),
-            cancelled_reason, partial_output,
+            cancelled_reason, partial_output, goal_id,
         ],
     )
     .map_err(|e| format!("Failed to persist terminal session run: {e}"))?;
+    let stored_goal: Option<String> = conn
+        .query_row(
+            "SELECT goal_id FROM session_runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
     Ok(SessionRunRecord {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
@@ -323,6 +468,7 @@ fn persist_terminal_run_conn(
         tool_count: tool_count.max(0),
         cancelled_reason: cancelled_reason.map(str::to_string),
         partial_output: partial_output.map(str::to_string),
+        goal_id: stored_goal,
     })
 }
 
@@ -332,7 +478,7 @@ pub fn list_session_runs(db: &AppDb, session_id: &str) -> Result<Vec<SessionRunR
     let mut stmt = conn
         .prepare(
             "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
-                    cancelled_reason, partial_output, finished_at
+                    cancelled_reason, partial_output, goal_id, finished_at
              FROM session_runs WHERE session_id = ? ORDER BY finished_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -347,6 +493,7 @@ pub fn list_session_runs(db: &AppDb, session_id: &str) -> Result<Vec<SessionRunR
                 tool_count: row.get(5)?,
                 cancelled_reason: row.get(6)?,
                 partial_output: row.get(7)?,
+                goal_id: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -359,7 +506,7 @@ pub fn list_all_session_runs(db: &AppDb) -> Result<Vec<SessionRunRecord>, String
     let mut stmt = conn
         .prepare(
             "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
-                    cancelled_reason, partial_output, finished_at
+                    cancelled_reason, partial_output, goal_id, finished_at
              FROM session_runs ORDER BY finished_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -374,6 +521,7 @@ pub fn list_all_session_runs(db: &AppDb) -> Result<Vec<SessionRunRecord>, String
                 tool_count: row.get(5)?,
                 cancelled_reason: row.get(6)?,
                 partial_output: row.get(7)?,
+                goal_id: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -423,6 +571,54 @@ pub fn record_terminal_run(
         tool_count,
         cancelled_reason.as_deref(),
         partial_output.as_deref(),
+    )
+}
+
+/// Goal-specific terminal record command. `binding_id` is a correlation
+/// identity, NOT authorization: native loads its own registration row and
+/// requires the owned Bun child's consume receipt to verify the exact binding,
+/// Session, turn, saved-user row/hash, Goal, stable TaskRun identity, and Bun
+/// run id before any `session_runs.goal_id` is set. Any missing/mismatched
+/// proof fails closed and the run is written goal-less.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn record_goal_terminal_run(
+    db: State<AppDb>,
+    session_id: String,
+    run_id: String,
+    outcome: String,
+    selected_model: Option<String>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<String>,
+    partial_output: Option<String>,
+    binding_id: Option<String>,
+) -> Result<SessionRunRecord, String> {
+    let goal_id = match binding_id.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(binding_id) => {
+            let transport = crate::jarvis::memory::transport::native_memory_transport();
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::jarvis::memory::transport::resolve_goal_terminal_authority(
+                &conn,
+                transport,
+                binding_id,
+                &run_id,
+            )
+            .map_err(|error| error.message)?
+        }
+    };
+    persist_goal_terminal_run(
+        &db,
+        &session_id,
+        &run_id,
+        &outcome,
+        selected_model.as_deref(),
+        token_count,
+        tool_count,
+        cancelled_reason.as_deref(),
+        partial_output.as_deref(),
+        goal_id.as_deref(),
     )
 }
 

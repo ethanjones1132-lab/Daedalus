@@ -12,10 +12,12 @@ installSelfLog();
 // Native memory bootstrap must capture and strip the owned capability from
 // `process.env` before any tool runtime or child subprocess can clone it.
 import {
+  createGoalRunRegistry,
   createNativeMemoryRegistry,
   handleNativeMemoryRequest,
   resolveTurnMemory,
   type ConsumeMemoryResult,
+  type ConsumedGoalBinding,
   type MemoryAppliedObservation,
   type MemoryTurnTerminalStatus,
   type ScopeCandidateIdentity,
@@ -278,11 +280,14 @@ import {
   assessTaskRunAcceptance,
   getActivePlanItem,
   reconcileTaskRunStatus,
+  recordCheckpointStage,
   resolveDeepReadIntent,
+  resolveGoalExecutionState,
   recordWriteTargets,
   terminalSubtypeForRunOutcome,
   unfinishedPlanItemInputs,
   type TaskRunContract,
+  type TaskRunGoalLink,
 } from "./orchestration/task-run";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
@@ -702,6 +707,13 @@ const persistentConductor = new PersistentConductor(loadConfig);
  *  broad `sessionMemory.clearAll()` callback was removed so independent
  *  TaskRuns/tool/file/check caches survive memory mutation. */
 const nativeMemoryRegistry = createNativeMemoryRegistry();
+
+/** Ephemeral bounded one-shot registry for native-authorized Goal run
+ *  bindings. Independent of native memory; a binding becomes TaskRun/run Goal
+ *  authority only after the owned native child registered it (which itself
+ *  only happens after native validated the Goal's Session/Agent/scope binding).
+ *  A public `/chat/stream` caller cannot register or forge a binding. */
+const goalRunRegistry = createGoalRunRegistry();
 
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
@@ -1531,6 +1543,36 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const memoryPreparationId = typeof options.memoryPreparationId === "string" && options.memoryPreparationId.length > 0
     ? options.memoryPreparationId
     : undefined;
+  // Exact persisted native saved-user source row id for a native/Goal turn.
+  // Bounded at the request boundary into private turn options; identity only,
+  // never authority on its own.
+  const sourceMessageId = typeof options.sourceMessageId === "string" && options.sourceMessageId.length > 0
+    ? options.sourceMessageId
+    : undefined;
+  // Consume a native-authorized Goal run binding for this exact Session/turn
+  // and exact native saved-source row, at most once, verifying the hash of the
+  // actual message body against the native-bound value. The owned native child
+  // registered it only after validating the Goal's Agent/workspace binding and
+  // loading the exact persisted source row; no public field can create it and
+  // it is independent of memory availability. A missing source id or a
+  // null/mismatch/expired/replayed binding means a goal-less turn.
+  const consumedGoalBinding: ConsumedGoalBinding | null =
+    providedTurnId && sourceMessageId
+      ? goalRunRegistry.consume(providedTurnId, sessionId, sourceMessageId, message)
+      : null;
+  const goalLink: TaskRunGoalLink | null = consumedGoalBinding
+    ? {
+        goalId: consumedGoalBinding.goal_id,
+        bindingId: consumedGoalBinding.binding_id ?? providedTurnId,
+        taskRunId: consumedGoalBinding.task_run_id,
+        sessionId: consumedGoalBinding.session_id,
+        agentId: consumedGoalBinding.agent_id,
+        projectRoot: consumedGoalBinding.project_root,
+        objective: consumedGoalBinding.objective,
+        criteria: consumedGoalBinding.criteria,
+        linkedAt: new Date().toISOString(),
+      }
+    : null;
   const scopeCandidateIdentity: ScopeCandidateIdentity | null =
     providedTurnId && memoryPreparationId
       ? {
@@ -1746,6 +1788,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       depth: beginDepth,
       estimatedComplexity: (beginDepth === "deep" ? "high" : "medium") as "low" | "medium" | "high",
       continuity: continuityAction,
+      goal: goalLink ?? undefined,
     };
     activeTaskRun = sessionMemory.beginTaskRun(sessionId, beginInput);
     // A clear persists the terminal boundary at begin, but its own turn must
@@ -4038,6 +4081,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         const agentRunId = `run_${crypto.randomUUID()}`;
         orchestratorAgentRunId = agentRunId;
+        // Bind the stable Bun run identity to the consumed Goal binding tombstone
+        // exactly once so native can verify the terminal association. A binding
+        // already attached to a different run is refused (no run).
+        if (consumedGoalBinding) {
+          const attached = goalRunRegistry.attachRunIdentity(
+            consumedGoalBinding.binding_id,
+            agentRunId,
+          );
+          if (!attached) {
+            console.warn(
+              `[Jarvis] goal binding ${consumedGoalBinding.binding_id} could not attach run identity`,
+            );
+          }
+        }
         selfTuningProposer.initializeTunedConfigs();
         const runFinalizer = new RunFinalizer({
           agentRunId,
@@ -4266,15 +4323,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : undefined,
            onTaskPlanUpdate: (contract: TaskRunContract) => {
              if (!ownsSessionState() || turnInvalidated()) return;
+             // Goal-linked runs record a durable checkpoint stage/state so a
+             // restart can resume the exact plan position without replaying
+             // ambiguous effects. Ordinary goal-less runs are unchanged.
+             const withCheckpoint = contract.goal
+               ? recordCheckpointStage(
+                   contract,
+                   getActivePlanItem(contract)?.id ?? contract.checkpoint?.stage ?? null,
+                   resolveGoalExecutionState(contract),
+                 )
+               : contract;
              if (continuityLocalTaskRun) {
                // Side turn: keep the plan mutation ephemeral; never persist it
                // over the stored task run.
-               activeTaskRun = contract;
-               liveConductor.setPlanContext(contract);
+               activeTaskRun = withCheckpoint;
+               liveConductor.setPlanContext(withCheckpoint);
                return;
              }
-             sessionMemory.setTaskRunContract(sessionId, contract);
-             liveConductor.setPlanContext(contract);
+             sessionMemory.setTaskRunContract(sessionId, withCheckpoint);
+             liveConductor.setPlanContext(withCheckpoint);
            },
           workspaceReadScope: effectiveWorkspaceReadScope,
           turnAbort: streamAbort.signal,
@@ -6260,6 +6327,7 @@ export async function baseFetch(req: Request): Promise<Response> {
     req,
     nativeMemoryRegistry,
     invalidateMemoryDerivedState,
+    goalRunRegistry,
   );
   if (internalMemory) return internalMemory;
 

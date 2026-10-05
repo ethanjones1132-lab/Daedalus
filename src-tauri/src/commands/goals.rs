@@ -13,7 +13,7 @@
 use crate::db::AppDb;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 /// All declared lifecycle states. Terminal states remain distinct.
 const GOAL_STATUSES: &[&str] = &[
@@ -93,6 +93,95 @@ pub struct GoalDetail {
     pub criteria: Vec<GoalCriterion>,
     pub links: Vec<GoalLink>,
     pub events: Vec<GoalEvent>,
+}
+
+/// Native-authorized, single-run binding between a Goal and one prospective
+/// Session turn. It is produced only after the native authority validates the
+/// Goal's current Agent/workspace binding against the exact Session, and it is
+/// registered as a bounded one-shot with the owned Bun child. It carries no
+/// permission: it is association identity only and never widens tool/fs grants.
+/// Memory availability is deliberately not a precondition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRunBinding {
+    pub binding_id: String,
+    pub goal_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_root: Option<String>,
+    pub objective: String,
+    pub criteria: Vec<String>,
+    pub turn_id: String,
+    /// Native-authoritative saved user message row id this binding is for. It is
+    /// the exact `messages.id` native inserted for this turn — never a UI/client
+    /// identity.
+    pub source_message_id: String,
+    /// Canonical lowercase SHA-256 of that saved row's exact UTF-8 content,
+    /// computed by native from the authoritative stored bytes.
+    pub source_message_hash: String,
+    /// Stable native TaskRun identity for this execution. It is minted by
+    /// native, carried through registration/consume, and is the identity a
+    /// recovered run preserves before any retry.
+    pub task_run_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+}
+
+/// Result of registering one Goal run binding. `registered` is true only when
+/// the owned Bun child accepted the exact binding; a null preparation means the
+/// run proceeds as an ordinary goal-less turn and no Goal linkage is created.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRunPreparation {
+    pub goal_id: String,
+    pub turn_id: String,
+    pub registered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+}
+
+/// Durable native record of one registered Goal run binding. The terminal
+/// writer verifies a Bun consume receipt against this row before any
+/// `session_runs.goal_id` is set, so a client cannot fabricate Goal authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRunBindingRecord {
+    pub binding_id: String,
+    pub goal_id: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub project_root: Option<String>,
+    pub turn_id: String,
+    pub source_message_id: String,
+    pub source_message_hash: String,
+    pub task_run_id: String,
+    pub bun_instance_id: Option<String>,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub consumed_at: Option<String>,
+    pub consumed_run_id: Option<String>,
+    pub created_at: String,
+}
+
+/// Durable per-run recovery view for one Goal-linked Session run. It exposes
+/// only identifiers and structured state — never transcripts or memory text.
+/// `evidence_refs` are actual progress-evidence references from the persisted
+/// Bun TaskRun checkpoint. `accepted_output_pending` is always true while the
+/// Part 4 trusted-acceptance gate is unimplemented, so no consumer renders
+/// progress evidence as verified accepted output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRunProgress {
+    pub goal_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    pub outcome: String,
+    pub goal_status: String,
+    pub interrupted: bool,
+    pub resumable: bool,
+    pub evidence_refs: Vec<String>,
+    pub accepted_output_pending: bool,
+    pub finished_at: Option<String>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -903,4 +992,494 @@ pub fn goal_link_remove(
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(affected > 0)
+}
+
+// ── Goal-linked execution authority (Roadmap Priority #2, Part 2) ──────────
+
+/// Load a Goal for run association validation from another native module.
+/// Terminal Goals are permitted (a run may finish after its Goal closed); a
+/// missing/invalid Goal fails closed.
+pub fn load_goal_for_run_validation(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+) -> Result<Goal, String> {
+    load_goal(conn, goal_id)
+}
+
+/// Validate that a Goal's Agent and canonical workspace scope match a Session's
+/// persisted binding. Used by the terminal run writer so a run is only ever
+/// attributed to a Goal the Session could legitimately execute.
+pub fn validate_goal_session_scope(
+    goal: &Goal,
+    session_agent: &str,
+    session_project_root: Option<&str>,
+    session_id: &str,
+) -> Result<(), String> {
+    require_same_agent(session_agent, goal, "session", session_id)?;
+    require_same_workspace(session_project_root, goal, "session", session_id)
+}
+
+/// Bound on a registered Goal run binding, matching the private capability's
+/// bounded one-shot window. After this, the binding is unusable and the turn is
+/// goal-less rather than silently reusing stale authority.
+const GOAL_RUN_BINDING_TTL_SECONDS: i64 = 120;
+
+/// Load the exact native-authoritative saved user source message owned by this
+/// Session and compute its canonical UTF-8 SHA-256 from the stored content. A
+/// missing row, a non-user role, or a row owned by another Session fails closed.
+/// A client-supplied hash is never consulted.
+fn load_saved_user_source(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    source_message_id: &str,
+) -> Result<(String, String), String> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT role, content FROM messages WHERE id = ?1 AND session_id = ?2",
+            rusqlite::params![source_message_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (role, content) =
+        row.ok_or_else(|| "source message is not persisted in this Session".to_string())?;
+    if role != "user" {
+        return Err("source message must be a persisted user-role message".to_string());
+    }
+    Ok((content.clone(), crate::jarvis::memory::turn::message_sha256(&content)))
+}
+
+/// Resolve the native authority for linking one prospective Session turn to a
+/// Goal. This is the ONLY place a Goal may become TaskRun/run authority. It
+/// loads the Goal, refuses a terminal Goal, validates the Goal's Agent and
+/// canonical project scope against the exact persisted Session, and loads the
+/// exact saved user source row identity+hash. A missing Session/source row,
+/// non-user role, cross-Agent scope, cross-workspace scope, or terminal Goal
+/// fails closed. It never consults memory availability, treats no client hash
+/// or message as authority, and never grants permissions.
+pub fn resolve_goal_run_binding(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    source_message_id: &str,
+) -> Result<GoalRunBinding, String> {
+    if source_message_id.trim().is_empty() {
+        return Err("source message identity is required for a goal-linked run".to_string());
+    }
+    let goal = load_goal(conn, goal_id)?;
+    if TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str()) {
+        return Err(format!(
+            "goal is terminal ('{}'); it cannot start new execution",
+            goal.status
+        ));
+    }
+
+    let session: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (session_agent, session_project_root) =
+        session.ok_or_else(|| format!("session not found: {}", session_id))?;
+
+    require_same_agent(&session_agent, &goal, "session", session_id)?;
+    require_same_workspace(session_project_root.as_deref(), &goal, "session", session_id)?;
+
+    let (_, source_message_hash) =
+        load_saved_user_source(conn, session_id, source_message_id)?;
+
+    let criteria = load_criteria(conn, &goal.id)?
+        .into_iter()
+        .map(|criterion| criterion.text)
+        .collect::<Vec<_>>();
+
+    let issued_at = now_iso();
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(GOAL_RUN_BINDING_TTL_SECONDS))
+    .to_rfc3339();
+
+    Ok(GoalRunBinding {
+        binding_id: new_id(),
+        goal_id: goal.id,
+        session_id: session_id.to_string(),
+        agent_id: goal.agent_id,
+        project_root: goal.project_root,
+        objective: goal.objective,
+        criteria,
+        turn_id: turn_id.to_string(),
+        source_message_id: source_message_id.to_string(),
+        source_message_hash,
+        task_run_id: format!("task_{}", new_id()),
+        issued_at,
+        expires_at,
+    })
+}
+
+/// Persist the native registration record for one Goal run binding. Written
+/// only after the owned Bun child confirmed the exact binding, it is the row the
+/// terminal writer checks a Bun consume receipt against. An exact replay of the
+/// same binding id is idempotent; a conflicting row is refused.
+pub fn record_goal_run_binding(
+    conn: &rusqlite::Connection,
+    binding: &GoalRunBinding,
+    bun_instance_id: &str,
+) -> Result<(), String> {
+    let existing: Option<(String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT goal_id, session_id, turn_id, source_message_id, source_message_hash \
+             FROM goal_run_bindings WHERE binding_id = ?1",
+            [&binding.binding_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((goal_id, session_id, turn_id, source_id, source_hash)) = existing {
+        if goal_id != binding.goal_id
+            || session_id != binding.session_id
+            || turn_id != binding.turn_id
+            || source_id != binding.source_message_id
+            || source_hash != binding.source_message_hash
+        {
+            return Err(format!(
+                "goal run binding '{}' is already registered with a conflicting identity",
+                binding.binding_id
+            ));
+        }
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO goal_run_bindings
+         (binding_id, goal_id, session_id, agent_id, project_root, turn_id,
+          source_message_id, source_message_hash, task_run_id, bun_instance_id,
+          issued_at, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![
+            &binding.binding_id,
+            &binding.goal_id,
+            &binding.session_id,
+            &binding.agent_id,
+            &binding.project_root,
+            &binding.turn_id,
+            &binding.source_message_id,
+            &binding.source_message_hash,
+            &binding.task_run_id,
+            bun_instance_id,
+            &binding.issued_at,
+            &binding.expires_at,
+        ],
+    )
+    .map_err(|e| format!("Failed to record goal run binding: {e}"))?;
+    Ok(())
+}
+
+/// Load the native registration record for one Goal run binding by exact
+/// binding id. Used by the terminal writer; a missing row fails closed.
+pub fn load_goal_run_binding(
+    conn: &rusqlite::Connection,
+    binding_id: &str,
+) -> Result<GoalRunBindingRecord, String> {
+    conn.query_row(
+        "SELECT binding_id, goal_id, session_id, agent_id, project_root, turn_id, \
+                source_message_id, source_message_hash, task_run_id, bun_instance_id, \
+                issued_at, expires_at, consumed_at, consumed_run_id, created_at \
+         FROM goal_run_bindings WHERE binding_id = ?1",
+        [binding_id],
+        |row| {
+            Ok(GoalRunBindingRecord {
+                binding_id: row.get(0)?,
+                goal_id: row.get(1)?,
+                session_id: row.get(2)?,
+                agent_id: row.get(3)?,
+                project_root: row.get(4)?,
+                turn_id: row.get(5)?,
+                source_message_id: row.get(6)?,
+                source_message_hash: row.get(7)?,
+                task_run_id: row.get(8)?,
+                bun_instance_id: row.get(9)?,
+                issued_at: row.get(10)?,
+                expires_at: row.get(11)?,
+                consumed_at: row.get(12)?,
+                consumed_run_id: row.get(13)?,
+                created_at: row.get(14)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("goal run binding not found: {binding_id}"))
+}
+
+/// Mark a native binding record consumed only after the Bun receipt verified the
+/// exact pair. Idempotent for the same run; a conflicting consumed run is
+/// refused so a binding can never be reassigned to a different execution.
+pub fn mark_goal_run_binding_consumed(
+    conn: &rusqlite::Connection,
+    binding_id: &str,
+    run_id: &str,
+    consumed_at: &str,
+) -> Result<(), String> {
+    let existing: Option<Option<String>> = conn
+        .query_row(
+            "SELECT consumed_run_id FROM goal_run_bindings WHERE binding_id = ?1",
+            [binding_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match existing {
+        None => Err(format!("goal run binding not found: {binding_id}")),
+        Some(Some(existing_run)) if existing_run != run_id => Err(format!(
+            "goal run binding '{binding_id}' is already consumed by a different run"
+        )),
+        Some(_) => {
+            conn.execute(
+                "UPDATE goal_run_bindings SET consumed_at = COALESCE(consumed_at, ?2), \
+                 consumed_run_id = COALESCE(consumed_run_id, ?3) \
+                 WHERE binding_id = ?1",
+                rusqlite::params![binding_id, consumed_at, run_id],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
+}
+
+/// The exact Bun consume receipt for a Goal run binding. Returned only over the
+/// private capability; it proves the owned child consumed this exact pair and
+/// the stable TaskRun/run identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalRunReceipt {
+    pub binding_id: String,
+    pub goal_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub source_message_id: String,
+    pub source_message_hash: String,
+    pub task_run_id: String,
+    /// The Bun agent run identity, present only once the pipeline attached it.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub bun_instance_id: String,
+    pub consumed_at: String,
+}
+
+/// Native terminal proof for one Goal-linked run. Verifies the native binding
+/// record and the Bun consume receipt agree on the exact binding, Session,
+/// turn, saved-user row/hash, Goal, and stable TaskRun identity, and that the
+/// receipt's Bun run identity matches the terminal run id. Only then may
+/// `session_runs.goal_id` be set. A missing/mismatched/expired receipt fails
+/// closed and the run stays goal-less.
+pub fn verify_goal_terminal_receipt(
+    conn: &rusqlite::Connection,
+    binding_id: &str,
+    run_id: &str,
+    receipt: &GoalRunReceipt,
+) -> Result<String, String> {
+    let record = load_goal_run_binding(conn, binding_id)?;
+    if receipt.binding_id != record.binding_id {
+        return Err("goal run receipt binding mismatch".to_string());
+    }
+    if receipt.goal_id != record.goal_id
+        || receipt.session_id != record.session_id
+        || receipt.turn_id != record.turn_id
+        || receipt.source_message_id != record.source_message_id
+        || receipt.source_message_hash != record.source_message_hash
+        || receipt.task_run_id != record.task_run_id
+    {
+        return Err("goal run receipt does not match the native registration".to_string());
+    }
+    // The receipt's Bun instance must be the instance the native registration
+    // was confirmed against; a replaced child cannot authorize the run.
+    if let Some(expected) = record.bun_instance_id.as_deref() {
+        if receipt.bun_instance_id != expected {
+            return Err("goal run receipt came from an unapproved Bun instance".to_string());
+        }
+    }
+    // The terminal run id must be exactly the run identity the consumed binding
+    // recorded (the stable Bun run id), never an arbitrary caller value.
+    let Some(receipt_run_id) = receipt.run_id.as_deref() else {
+        return Err("goal run receipt has no consumed run identity".to_string());
+    };
+    if receipt_run_id != run_id {
+        return Err("goal run receipt run identity does not match the terminal run".to_string());
+    }
+    if let Some(consumed_run) = record.consumed_run_id.as_deref() {
+        if consumed_run != run_id {
+            return Err(format!(
+                "goal run binding '{}' was consumed by a different run",
+                binding_id
+            ));
+        }
+    }
+    // The saved source row must still exist with the exact bound bytes; a
+    // changed/removed source invalidates the proof.
+    let (_, source_hash) =
+        load_saved_user_source(conn, &record.session_id, &record.source_message_id)?;
+    if source_hash != record.source_message_hash {
+        return Err("goal run source message bytes changed since registration".to_string());
+    }
+    mark_goal_run_binding_consumed(conn, binding_id, run_id, &receipt.consumed_at)?;
+    Ok(record.goal_id)
+}
+
+/// Deterministic recovery view of terminal runs associated with a Goal, plus
+/// whether each is resumable. It reads only persisted facts: a non-terminal Goal
+/// status with a recorded run that ended in a non-terminal outcome is
+/// `interrupted` and `resumable`; an explicit terminal outcome is surfaced as-is
+/// and is never reported as completion.
+///
+/// Evidence references are populated only from the ACTUAL persisted Bun TaskRun
+/// checkpoint (progress evidence references), fetched over the private
+/// capability using the native binding/task-run identities. Trusted
+/// accepted-output evidence belongs to Part 4 and is surfaced as pending/
+/// unverified; the completion gate stays open. A non-live/unknown child yields
+/// no refs rather than an empty facade.
+#[tauri::command]
+pub fn goal_run_progress(
+    db: State<AppDb>,
+    goal_id: String,
+) -> Result<Vec<GoalRunProgress>, String> {
+    let (goal, rows) = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let goal = load_goal(&conn, &goal_id)?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT sr.run_id, sr.session_id, sr.outcome, sr.finished_at, \
+                        b.binding_id, b.task_run_id \
+                 FROM session_runs sr \
+                 LEFT JOIN goal_run_bindings b \
+                   ON b.session_id = sr.session_id AND b.consumed_run_id = sr.run_id \
+                 WHERE sr.goal_id = ?1 \
+                 ORDER BY sr.finished_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([&goal_id], |row| {
+                let run_id: String = row.get(0)?;
+                let session_id: String = row.get(1)?;
+                let outcome: String = row.get(2)?;
+                let finished_at: Option<String> = row.get(3)?;
+                let binding_id: Option<String> = row.get(4)?;
+                let task_run_id: Option<String> = row.get(5)?;
+                Ok((run_id, session_id, outcome, finished_at, binding_id, task_run_id))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        (goal, rows)
+    };
+
+    let goal_interrupted = !TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str());
+    let transport = crate::jarvis::memory::transport::native_memory_transport();
+    let mut out = Vec::with_capacity(rows.len());
+    for (run_id, session_id, outcome, finished_at, binding_id, task_run_id) in rows {
+        // A run that did not end in a clean success while the Goal is still
+        // live is an interruption; it is never treated as Goal completion.
+        // A deliberate cancellation is surfaced distinctly and is not
+        // advertised as resumable, while failure/timeout/partial remain
+        // resumable. The exact outcome string is preserved verbatim.
+        let interrupted = outcome != "success" && goal_interrupted;
+        let resumable = interrupted && outcome != "cancelled";
+
+        // Populate evidence refs only from the actual persisted Bun TaskRun
+        // checkpoint for the exact native binding/task-run identity. A missing
+        // child/view yields no refs (never a fabricated empty facade) and never
+        // claims Part 4 accepted-output evidence.
+        let (evidence_refs, accepted_output_pending) =
+            match (binding_id.as_deref(), task_run_id.as_deref()) {
+                (Some(binding_id), Some(task_run_id))
+                    if !binding_id.is_empty() && !task_run_id.is_empty() =>
+                {
+                    match crate::jarvis::memory::transport::read_goal_checkpoint(
+                        transport,
+                        &session_id,
+                        &goal.id,
+                        binding_id,
+                        task_run_id,
+                    ) {
+                        Some(view) => (
+                            view.progress_evidence_refs,
+                            view.accepted_output_evidence.pending,
+                        ),
+                        // No authoritative checkpoint read available: expose no
+                        // refs and keep the accepted-output gate open.
+                        None => (Vec::new(), true),
+                    }
+                }
+                _ => (Vec::new(), true),
+            };
+
+        out.push(GoalRunProgress {
+            goal_id: goal.id.clone(),
+            session_id,
+            run_id,
+            outcome,
+            goal_status: goal.status.clone(),
+            interrupted,
+            resumable,
+            evidence_refs,
+            accepted_output_pending,
+            finished_at,
+        });
+    }
+    Ok(out)
+}
+
+/// Native-validate and register a bounded one-shot Goal run binding with the
+/// owned Bun child. A non-empty Goal id, matching Session/turn, and the exact
+/// native saved user source message row are required. Native loads that source
+/// row, computes its canonical UTF-8 SHA-256, and mints the stable TaskRun
+/// identity. When registration cannot be confirmed the call still succeeds with
+/// `registered: false`, so the caller runs the turn goal-less rather than
+/// failing the user's turn; Goal linkage is never fabricated.
+#[tauri::command]
+pub async fn goal_prepare_run(
+    app: tauri::AppHandle,
+    goal_id: String,
+    session_id: String,
+    turn_id: String,
+    source_message_id: String,
+) -> Result<GoalRunPreparation, String> {
+    let goal_id = goal_id.trim().to_string();
+    let session_id = session_id.trim().to_string();
+    let turn_id = turn_id.trim().to_string();
+    let source_message_id = source_message_id.trim().to_string();
+    if goal_id.is_empty() {
+        return Err("goal id must not be empty".to_string());
+    }
+    if session_id.is_empty() || turn_id.is_empty() || source_message_id.is_empty() {
+        return Err(
+            "session, turn, and saved source message identity are required for a goal-linked run"
+                .to_string(),
+        );
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = app.state::<AppDb>();
+        let transport = crate::jarvis::memory::transport::native_memory_transport();
+        crate::jarvis::memory::transport::register_goal_run_binding(
+            db.inner(),
+            transport,
+            &goal_id,
+            &session_id,
+            &turn_id,
+            &source_message_id,
+        )
+        .map_err(|error| error.message)
+    })
+    .await
+    .map_err(|error| format!("goal run binding task join error: {error}"))?
 }

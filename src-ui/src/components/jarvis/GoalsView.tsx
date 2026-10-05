@@ -62,6 +62,19 @@ interface GoalDetail {
   events: GoalEvent[];
 }
 
+interface GoalRunProgress {
+  goal_id: string;
+  session_id: string;
+  run_id: string;
+  outcome: string;
+  goal_status: string;
+  interrupted: boolean;
+  resumable: boolean;
+  evidence_refs: string[];
+  accepted_output_pending: boolean;
+  finished_at: string | null;
+}
+
 const TRANSITION_STATUSES = ['running', 'waiting_for_user', 'blocked', 'paused', 'failed', 'cancelled'];
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
 
@@ -88,6 +101,7 @@ function allowedTransitions(status: string): string[] {
 export default function GoalsView() {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [detail, setDetail] = useState<GoalDetail | null>(null);
+  const [runs, setRuns] = useState<GoalRunProgress[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -130,6 +144,7 @@ export default function GoalsView() {
     // Clear any detail that belongs to a different Goal so the panel and the
     // list selection never disagree; re-selecting the shown Goal is preserved.
     setDetail((prev) => (prev && prev.goal.id === id ? prev : null));
+    setRuns((prev) => (prev.length > 0 ? [] : prev));
     try {
       const next = await invoke<GoalDetail>('goal_get', { id });
       if (request !== detailRequestId.current) return;
@@ -139,6 +154,16 @@ export default function GoalsView() {
       if (request !== detailRequestId.current) return;
       setDetail(null);
       setError(`Could not load goal ${id}.`);
+    }
+    // Goal-linked run/recovery view. A read failure is not fatal to the detail
+    // panel; the runs list simply stays empty rather than being inferred.
+    try {
+      const progress = await invoke<GoalRunProgress[]>('goal_run_progress', { goalId: id });
+      if (request !== detailRequestId.current) return;
+      setRuns(Array.isArray(progress) ? progress : []);
+    } catch {
+      if (request !== detailRequestId.current) return;
+      setRuns([]);
     }
   }, []);
 
@@ -391,12 +416,53 @@ export default function GoalsView() {
 
               <GlassCard className="p-4">
                 <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
+                  Goal-linked runs
+                </div>
+                {runs.length === 0 ? (
+                  <div className="text-sm text-bone/40 mt-1">
+                    No goal-linked runs recorded yet. Link a goal from Chat to record run progress
+                    and evidence here.
+                  </div>
+                ) : (
+                  <ul className="mt-2 space-y-2">
+                    {runs.map((run) => (
+                      <li key={run.run_id} className="text-sm text-bone/80">
+                        <div className="flex items-center gap-2">
+                          <Pill variant={run.interrupted ? 'warn' : statusVariant(run.outcome)}>
+                            {run.interrupted ? 'interrupted' : run.outcome}
+                          </Pill>
+                          <span className="font-mono text-xs text-bone/60 truncate">{run.run_id}</span>
+                        </div>
+                        <div className="mt-1 text-[11px] text-bone/40 font-mono">
+                          session {run.session_id}
+                          {run.finished_at ? ` · ${run.finished_at}` : ''}
+                          {run.resumable ? ' · resumable' : ''}
+                        </div>
+                        {run.evidence_refs.length > 0 && (
+                          <div className="mt-1 text-[11px] text-bone/50">
+                            Progress evidence: {run.evidence_refs.join(', ')}
+                          </div>
+                        )}
+                        {run.accepted_output_pending && (
+                          <div className="mt-1 text-[11px] text-bone/40">
+                            Accepted output: pending / unverified (trusted acceptance is not
+                            implemented; the completion gate stays open).
+                          </div>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </GlassCard>
+
+              <GlassCard className="p-4">
+                <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
                   Linked records
                 </div>
                 {detail.links.length === 0 ? (
                   <div className="text-sm text-bone/40 mt-1">
-                    No linked records yet. TaskRuns, commitments, schedules, runs, and evidence are
-                    associated in later parts.
+                    No explicit association links yet. Goal-linked runs appear above once a turn is
+                    executed under this goal.
                   </div>
                 ) : (
                   <ul className="mt-2 space-y-1.5">

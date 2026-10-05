@@ -25,6 +25,7 @@ import type {
 import { MEMORY_REVALIDATION_NOT_REQUIRED, MEMORY_REVALIDATION_REASON_CODES } from "./memory-contract";
 import { noteMemoryDerivedActivity } from "./memory-derived-state";
 import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
+import { readPersistedGoalCheckpoint } from "./orchestration/session-memory";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
@@ -168,6 +169,82 @@ export interface NativeMemoryRegistry {
    * validate; otherwise null. Never consumes or exposes recalled text.
    */
   inspectScopeCandidate(identity: ScopeCandidateIdentity): MemoryScope | null;
+}
+
+/**
+ * Native-authorized, bounded, single-consumption Goal run binding. Registered
+ * by the native one-off over the private capability BEFORE `/chat/stream`; the
+ * binding is association identity only (no permission, no memory text). A
+ * binding is consumed at most once for an exact Session/turn tuple, the exact
+ * native saved-user source row id, and the hash of the actual turn message
+ * body; it expires on its own wall clock. It is deliberately independent of
+ * memory availability and carries the stable native TaskRun identity.
+ */
+export interface GoalRunBindingRegistration {
+  binding_id: string;
+  goal_id: string;
+  session_id: string;
+  agent_id: string;
+  project_root: string | null;
+  objective: string;
+  criteria: string[];
+  turn_id: string;
+  source_message_id: string;
+  source_message_hash: string;
+  task_run_id: string;
+  issued_at: string;
+  expires_at: string;
+}
+
+/** The Goal authority a consumed binding makes available to one turn. */
+export interface ConsumedGoalBinding {
+  binding_id: string;
+  goal_id: string;
+  session_id: string;
+  agent_id: string;
+  project_root: string | null;
+  objective: string;
+  criteria: string[];
+  turn_id: string;
+  source_message_id: string;
+  source_message_hash: string;
+  task_run_id: string;
+}
+
+/** The exact consumed-pair tombstone native verifies a terminal run against. */
+export interface GoalRunReceipt {
+  binding_id: string;
+  goal_id: string;
+  session_id: string;
+  turn_id: string;
+  source_message_id: string;
+  source_message_hash: string;
+  task_run_id: string;
+  run_id: string | null;
+  bun_instance_id: string;
+  consumed_at: string;
+}
+
+export interface GoalRunRegistry {
+  register(binding: GoalRunBindingRegistration): { binding_id: string; bun_instance_id: string };
+  /**
+   * Consume the binding once for an exact Session/turn tuple, the exact
+   * native-bound saved-source row id, and the hash of the actual turn message
+   * body. The supplied source row id must equal the registration's and the
+   * actual message must hash to the native-bound value; any missing/mismatch/
+   * expiry/replay returns null and binds no run.
+   */
+  consume(
+    turnId: string,
+    sessionId: string,
+    sourceMessageId: string,
+    message: string,
+  ): ConsumedGoalBinding | null;
+  /** Attach the stable Bun run identity to a consumed binding, once. */
+  attachRunIdentity(bindingId: string, runId: string): boolean;
+  /** The authenticated consumed-pair receipt, or null. */
+  receipt(bindingId: string): GoalRunReceipt | null;
+  invalidate(): number;
 }
 
 interface UnconsumedEntry {
@@ -968,18 +1045,262 @@ function parseDerivedInvalidation(value: unknown): MemoryDerivedInvalidation {
   };
 }
 
+const GOAL_BINDING_CAP = 128;
+const MAX_GOAL_OBJECTIVE_BYTES = 4_096;
+const MAX_GOAL_CRITERIA = 64;
+const MAX_GOAL_CRITERION_BYTES = 2_048;
+const BOUNDED_ID = /^[A-Za-z0-9._:/-]{1,200}$/;
+
 /**
- * Handle one internal native-memory route. Returns `null` for every path that
- * is not an internal route so the caller can fall through to ordinary CORS
- * handling. Runs before any general OPTIONS/CORS response.
+ * Bounded native identity shape (Session/turn/binding/saved-source row id).
+ * Exported so the public request boundary can reject a malformed
+ * `source_message_id` before it becomes a private turn option; it is a shape
+ * check only and never authority.
+ */
+export function isBoundedNativeId(value: unknown): value is string {
+  return typeof value === "string" && BOUNDED_ID.test(value);
+}
+
+interface UnconsumedGoalBinding {
+  binding: GoalRunBindingRegistration;
+  expiresAtMonotonic: number;
+}
+
+function validateGoalBinding(binding: GoalRunBindingRegistration): void {
+  if (typeof binding !== "object" || binding === null || Array.isArray(binding)) {
+    throw new RegistryError("invalid_binding", 400, "goal binding is not an object");
+  }
+  for (const field of [binding.binding_id, binding.goal_id, binding.session_id, binding.agent_id, binding.turn_id, binding.source_message_id]) {
+    if (typeof field !== "string" || !BOUNDED_ID.test(field)) {
+      throw new RegistryError("invalid_binding", 400, "goal binding identity is invalid");
+    }
+  }
+  if (typeof binding.source_message_hash !== "string" || !SHA256_HEX.test(binding.source_message_hash)) {
+    throw new RegistryError("invalid_binding", 400, "goal binding source hash is invalid");
+  }
+  if (typeof binding.task_run_id !== "string" || !BOUNDED_ID.test(binding.task_run_id)) {
+    throw new RegistryError("invalid_binding", 400, "goal binding task run identity is invalid");
+  }
+  if (binding.project_root !== null && typeof binding.project_root !== "string") {
+    throw new RegistryError("invalid_binding", 400, "goal binding project root is invalid");
+  }
+  if (typeof binding.objective !== "string" || binding.objective.trim().length === 0) {
+    throw new RegistryError("invalid_binding", 400, "goal binding objective is required");
+  }
+  if (Buffer.byteLength(binding.objective, "utf8") > MAX_GOAL_OBJECTIVE_BYTES) {
+    throw new RegistryError("invalid_binding", 400, "goal binding objective exceeds the bound");
+  }
+  if (!Array.isArray(binding.criteria) || binding.criteria.length > MAX_GOAL_CRITERIA) {
+    throw new RegistryError("invalid_binding", 400, "goal binding criteria exceed the bound");
+  }
+  for (const criterion of binding.criteria) {
+    if (typeof criterion !== "string" || Buffer.byteLength(criterion, "utf8") > MAX_GOAL_CRITERION_BYTES) {
+      throw new RegistryError("invalid_binding", 400, "goal binding criterion is invalid");
+    }
+  }
+  const issued = Date.parse(binding.issued_at);
+  const expires = Date.parse(binding.expires_at);
+  if (!Number.isFinite(issued) || !Number.isFinite(expires) || expires <= issued) {
+    throw new RegistryError("invalid_binding", 400, "goal binding timestamps are invalid");
+  }
+}
+
+/**
+ * Bounded, single-consumption registry for native-authorized Goal run bindings.
+ * Independent of native memory: it holds only association identity and is
+ * consumed exactly once for an exact Session/turn/source-row tuple whose message
+ * body hashes to the native-bound value, or expires. It grants nothing and
+ * carries no recalled text. A compact authenticated tombstone retains the exact
+ * consumed pair plus the stable TaskRun/Bun run identity so native can verify a
+ * terminal association without ever trusting a client Goal id.
+ */
+export function createGoalRunRegistry(
+  bootstrap: NativeMemoryBootstrap | null = CAPTURED_BOOTSTRAP,
+): GoalRunRegistry {
+  const bunInstanceId = crypto.randomUUID();
+  const unconsumed = new Map<string, UnconsumedGoalBinding>();
+  const consumed = new Map<string, GoalRunReceipt>();
+
+  function prune(): void {
+    const now = nowMonotonic();
+    for (const [id, entry] of unconsumed) {
+      if (now >= entry.expiresAtMonotonic) unconsumed.delete(id);
+    }
+    // Bound the consumed tombstone store the same way; oldest insertion first.
+    while (consumed.size > GOAL_BINDING_CAP) {
+      const oldest = consumed.keys().next().value;
+      if (oldest === undefined) break;
+      consumed.delete(oldest);
+    }
+  }
+
+  return {
+    register(binding: GoalRunBindingRegistration): { binding_id: string; bun_instance_id: string } {
+      prune();
+      if (!bootstrap) {
+        throw new RegistryError("goal_authority_unavailable", 503, "native capability is not configured");
+      }
+      validateGoalBinding(binding);
+      if (unconsumed.size >= GOAL_BINDING_CAP) {
+        throw new RegistryError("registry_full", 507, "goal binding registry cannot reserve capacity");
+      }
+      const remaining = Math.min(NATIVE_MEMORY_TTL_MS, Date.parse(binding.expires_at) - Date.now());
+      if (remaining <= 0) {
+        throw new RegistryError("expired", 409, "goal binding is already expired");
+      }
+      unconsumed.set(binding.binding_id, {
+        binding: freezeDeep(JSON.parse(JSON.stringify(binding)) as GoalRunBindingRegistration),
+        expiresAtMonotonic: nowMonotonic() + remaining,
+      });
+      return { binding_id: binding.binding_id, bun_instance_id: bunInstanceId };
+    },
+
+    consume(
+      turnId: string,
+      sessionId: string,
+      sourceMessageId: string,
+      message: string,
+    ): ConsumedGoalBinding | null {
+      prune();
+      // The exact supplied identity and actual message body are required. A
+      // malformed/absent source id or an empty body can never consume a
+      // binding, and a shape check here mirrors the registration bound.
+      if (!isBoundedNativeId(sourceMessageId)) return null;
+      if (typeof message !== "string" || message.length === 0) return null;
+      for (const [id, entry] of unconsumed) {
+        const binding = entry.binding;
+        // Require the exact Session + turn + native saved-source row + hash of
+        // the actual message body against the registration. A mere Session/turn
+        // match is insufficient; any mismatch fails closed and binds no run.
+        if (binding.turn_id !== turnId || binding.session_id !== sessionId) continue;
+        if (binding.source_message_id !== sourceMessageId) continue;
+        if (sha256Hex(message) !== binding.source_message_hash) continue;
+        // One-shot: remove BEFORE returning so a duplicate consume for the same
+        // tuple can never bind a second run.
+        unconsumed.delete(id);
+        const consumedAt = new Date().toISOString();
+        consumed.set(binding.binding_id, {
+          binding_id: binding.binding_id,
+          goal_id: binding.goal_id,
+          session_id: binding.session_id,
+          turn_id: binding.turn_id,
+          source_message_id: binding.source_message_id,
+          source_message_hash: binding.source_message_hash,
+          task_run_id: binding.task_run_id,
+          run_id: null,
+          bun_instance_id: bunInstanceId,
+          consumed_at: consumedAt,
+        });
+        return {
+          binding_id: binding.binding_id,
+          goal_id: binding.goal_id,
+          session_id: binding.session_id,
+          agent_id: binding.agent_id,
+          project_root: binding.project_root,
+          objective: binding.objective,
+          criteria: [...binding.criteria],
+          turn_id: binding.turn_id,
+          source_message_id: binding.source_message_id,
+          source_message_hash: binding.source_message_hash,
+          task_run_id: binding.task_run_id,
+        };
+      }
+      return null;
+    },
+
+    attachRunIdentity(bindingId: string, runId: string): boolean {
+      const receipt = consumed.get(bindingId);
+      if (!receipt) return false;
+      if (receipt.run_id !== null) return receipt.run_id === runId;
+      receipt.run_id = runId;
+      return true;
+    },
+
+    receipt(bindingId: string): GoalRunReceipt | null {
+      const receipt = consumed.get(bindingId);
+      return receipt ? { ...receipt } : null;
+    },
+
+    invalidate(): number {
+      const count = unconsumed.size;
+      unconsumed.clear();
+      return count;
+    },
+  };
+}
+
+/**
+ * Handle one internal native-capability route (memory and Goal bindings).
+ * Returns `null` for every path that is not an internal route so the caller can
+ * fall through to ordinary CORS handling. Runs before any general
+ * OPTIONS/CORS response.
  */
 export async function handleNativeMemoryRequest(
   req: Request,
   registry: NativeMemoryRegistry,
   onDerivedInvalidate?: (input: MemoryDerivedInvalidation) => void,
+  goalRegistry: GoalRunRegistry | null = null,
 ): Promise<Response | null> {
   const path = new URL(req.url).pathname;
-  if (!path.startsWith("/internal/memory")) return null;
+  if (!path.startsWith("/internal/memory") && !path.startsWith("/internal/goals")) return null;
+
+  // Goal binding routes are capability-authenticated but deliberately do not
+  // depend on memory recall availability.
+  if (path.startsWith("/internal/goals")) {
+    const meta = registryMeta.get(registry);
+    if (!meta || !meta.capability) {
+      return json({ code: "goal_authority_unavailable" }, 503);
+    }
+    if (!bearerAuthorized(req, meta.capability)) {
+      return json({ code: "unauthorized" }, 401);
+    }
+    if (!goalRegistry) {
+      return json({ code: "goal_authority_unavailable" }, 503);
+    }
+    try {
+      if (path === "/internal/goals/run-bindings" && req.method === "POST") {
+        const body = (await readBoundedBody(req)) as GoalRunBindingRegistration;
+        return json(goalRegistry.register(body));
+      }
+      // Authenticated consume-pair receipt for one binding. Native fetches this
+      // to verify a terminal run before setting `session_runs.goal_id`; it
+      // contains only the exact consumed identities and never a client value.
+      const receiptMatch = path.match(/^\/internal\/goals\/run-bindings\/([^/]+)\/receipt$/);
+      if (receiptMatch && req.method === "GET") {
+        const bindingId = decodeURIComponent(receiptMatch[1]);
+        const receipt = goalRegistry.receipt(bindingId);
+        if (!receipt) return json({ code: "receipt_not_found" }, 404);
+        return json(receipt);
+      }
+      // Authorized durable checkpoint read by exact Goal/Session/binding/TaskRun
+      // identity. Returns only bounded structured status/IDs/stage/effect-state/
+      // evidence references, never transcripts or raw memory.
+      if (path === "/internal/goals/checkpoint" && req.method === "GET") {
+        const url = new URL(req.url);
+        const sessionId = url.searchParams.get("session_id") ?? "";
+        const goalId = url.searchParams.get("goal_id") ?? "";
+        const bindingId = url.searchParams.get("binding_id") ?? "";
+        const taskRunId = url.searchParams.get("task_run_id") ?? "";
+        if (!sessionId || !goalId || !bindingId || !taskRunId) {
+          return json({ code: "invalid_query" }, 400);
+        }
+        const view = readPersistedGoalCheckpoint({
+          sessionId,
+          goalId,
+          bindingId,
+          taskRunId,
+        });
+        if (!view) return json({ code: "checkpoint_not_found" }, 404);
+        return json(view);
+      }
+      return json({ code: "not_found" }, 404);
+    } catch (error) {
+      if (error instanceof RegistryError) {
+        return json({ code: error.code }, error.status);
+      }
+      return json({ code: "goal_authority_unavailable" }, 503);
+    }
+  }
 
   const meta = registryMeta.get(registry);
   if (!meta || !meta.capability) {

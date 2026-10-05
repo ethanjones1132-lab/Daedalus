@@ -1,4 +1,4 @@
-use crate::commands::sessions::persist_terminal_run_at;
+use crate::commands::sessions::{persist_goal_terminal_run_at, persist_terminal_run_at};
 use crate::db::AppDb;
 use crate::jarvis::memory::contracts::MemoryError;
 use crate::jarvis::memory::transport::NativeMemoryTransport;
@@ -391,6 +391,13 @@ pub fn run_jarvis_message(
     source_message_hash: String,
     memory_preparation_id: Option<String>,
     initial_memory_status: MemoryRecallStatus,
+    // Native-registered Goal run binding for this relay turn, if any. It is a
+    // correlation identity, NOT authorization: the terminal writer loads the
+    // native registration row and requires the owned Bun child's consume receipt
+    // to verify the exact binding/Session/turn/saved-user source/Goal/TaskRun
+    // identity before setting `session_runs.goal_id`. Never derived from the
+    // client body.
+    goal_binding_id: Option<String>,
 ) -> Result<(), String> {
     // A real persisted Session/turn identity is required for memory
     // finalization; a blank Session runs ordinary relay inference only.
@@ -496,6 +503,14 @@ pub fn run_jarvis_message(
         });
         if let Some(preparation_id) = memory_preparation_id.as_deref() {
             request_body["memory_preparation_id"] = serde_json::Value::String(preparation_id.to_string());
+        }
+        // Exact persisted saved-user source row for a Goal-linked relay turn.
+        // Association identity only: the owned Bun child matches it against the
+        // binding registered over the private capability before consuming, and
+        // an ordinary goal-less relay turn omits it.
+        if goal_binding_id.is_some() && !source_message_id.is_empty() {
+            request_body["source_message_id"] =
+                serde_json::Value::String(source_message_id.clone());
         }
         let resp = match client.post(&url).json(&request_body).send() {
             Ok(r) => r,
@@ -859,17 +874,51 @@ pub fn run_jarvis_message(
             } else {
                 run_acc.tool_use_count
             };
-            let _ = persist_terminal_run_at(
-                &db_path,
-                &sid,
-                run_id,
-                outcome,
-                run_acc.selected_model.as_deref(),
-                run_acc.token_count,
-                tool_count,
-                run_acc.cancelled_reason.as_deref(),
-                run_acc.partial_output.as_deref(),
-            );
+            // Goal proof: `goal_binding_id` is only a correlation id. Native
+            // resolves the authorized Goal itself by verifying its registration
+            // row against the owned child's consume receipt for this exact run
+            // id. A missing/mismatched receipt leaves the run goal-less.
+            let verified_goal_id = match goal_binding_id.as_deref() {
+                Some(binding_id) if !binding_id.is_empty() => {
+                    let transport =
+                        crate::jarvis::memory::transport::native_memory_transport();
+                    match rusqlite::Connection::open(&db_path) {
+                        Ok(conn) => crate::jarvis::memory::transport::
+                            resolve_goal_terminal_authority(&conn, transport, binding_id, run_id)
+                            .ok()
+                            .flatten(),
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            };
+            let _ = match verified_goal_id.as_deref() {
+                // A verified Goal association uses the Goal-specific writer.
+                Some(goal_id) => persist_goal_terminal_run_at(
+                    &db_path,
+                    &sid,
+                    run_id,
+                    outcome,
+                    run_acc.selected_model.as_deref(),
+                    run_acc.token_count,
+                    tool_count,
+                    run_acc.cancelled_reason.as_deref(),
+                    run_acc.partial_output.as_deref(),
+                    Some(goal_id),
+                ),
+                // An ordinary goal-less run keeps the unchanged writer.
+                None => persist_terminal_run_at(
+                    &db_path,
+                    &sid,
+                    run_id,
+                    outcome,
+                    run_acc.selected_model.as_deref(),
+                    run_acc.token_count,
+                    tool_count,
+                    run_acc.cancelled_reason.as_deref(),
+                    run_acc.partial_output.as_deref(),
+                ),
+            };
         }
 
         // Guarantee the UI's streaming spinner is always cleared, even if the stream

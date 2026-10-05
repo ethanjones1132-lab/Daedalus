@@ -1,5 +1,6 @@
 import type { JarvisConfig, SurfaceType } from "./config";
 import type { MemoryRecallStatus } from "./memory-contract";
+import { isBoundedNativeId } from "./native-memory";
 
 export interface ChatHistoryMessage {
   role: "user" | "assistant" | "system" | "tool" | string;
@@ -18,6 +19,14 @@ export interface ChatStreamOptions {
   turnId?: string;
   /** Opaque native-prepared reference; resolved against the owned registry only. */
   memoryPreparationId?: string;
+  /**
+   * Exact persisted native saved-user source row id for a native/Goal turn.
+   * Identity only: it can never create or widen authority, and it is matched
+   * against a Goal binding already registered through the private native
+   * capability before that binding can be consumed. Ordinary goal-less callers
+   * omit it and are unaffected.
+   */
+  sourceMessageId?: string;
   /**
    * Client-reported initial memory status. Informational only: it can never
    * manufacture readiness or application absent a trusted registry envelope.
@@ -83,6 +92,11 @@ export async function handleChatStreamRequest(
   }
   if (typeof body.memory_preparation_id === "string" && body.memory_preparation_id.length > 0) {
     options.memoryPreparationId = body.memory_preparation_id;
+  }
+  // Bounded at the request boundary: a missing or malformed source id stays
+  // absent and therefore can never consume a registered Goal binding.
+  if (isBoundedNativeId(body.source_message_id)) {
+    options.sourceMessageId = body.source_message_id;
   }
   const memoryStatus = parseMemoryRecallStatus(body.memory_status);
   if (memoryStatus !== undefined) {
