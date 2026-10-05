@@ -917,13 +917,13 @@ fn run_trusted_execution(
         // belongs to a different action it is refused outright.
         if let Some(existing) = find_execution(&conn, operation_id)? {
             if existing.action_id != action_id {
+                let bound_action = existing.action_id.clone();
                 return Ok(attach_conflict(
                     existing,
                     Some(TrustedExecutionConflict {
                         kind: "operation_action_mismatch".to_string(),
                         detail: format!(
-                            "operation '{operation_id}' is bound to action '{}'",
-                            existing.action_id
+                            "operation '{operation_id}' is bound to action '{bound_action}'"
                         ),
                     }),
                 ));
