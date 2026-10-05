@@ -495,15 +495,34 @@ fn attach_conflict(
     row
 }
 
+struct StoredProjection {
+    slug: String,
+    source_path: String,
+    source_hash: String,
+    active_source_hash: String,
+    projection_version: i64,
+    activated_at: String,
+}
+
 fn load_stored_projection(
     conn: &Connection,
     execution_id: &str,
-) -> Result<(String, String, i64), String> {
+) -> Result<StoredProjection, String> {
     conn.query_row(
-        "SELECT projection_slug, projection_source_hash, projection_version \
+        "SELECT projection_slug, projection_source_path, projection_source_hash, \
+                projection_active_source_hash, projection_version, projection_activated_at \
          FROM trusted_action_executions WHERE execution_id = ?1",
         [execution_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok(StoredProjection {
+                slug: row.get(0)?,
+                source_path: row.get(1)?,
+                source_hash: row.get(2)?,
+                active_source_hash: row.get(3)?,
+                projection_version: row.get(4)?,
+                activated_at: row.get(5)?,
+            })
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -527,6 +546,15 @@ fn conflict_for_existing(
         return conflict(
             "binding_changed",
             format!("receipt is bound to action '{}'", stored.action_id),
+        );
+    }
+    if manifest.action_id.as_deref() != Some(action_id) {
+        return conflict(
+            "binding_changed",
+            format!(
+                "requested manifest '{}' is no longer bound to action '{action_id}'",
+                manifest.manifest_id
+            ),
         );
     }
     if stored.manifest_id != manifest.manifest_id {
@@ -602,17 +630,17 @@ fn conflict_for_existing(
     }
     match crate::commands::agents::resolve_activation_boundary(conn, &manifest.agent_id) {
         Ok(snapshot) => match load_stored_projection(conn, &stored.execution_id) {
-            Ok((slug, source_hash, version)) => {
-                if slug != snapshot.slug
-                    || source_hash != snapshot.source_hash
-                    || version != snapshot.projection_version
+            Ok(stored_projection) => {
+                if stored_projection.slug != snapshot.slug
+                    || stored_projection.source_path != snapshot.source_path
+                    || stored_projection.source_hash != snapshot.source_hash
+                    || stored_projection.active_source_hash != snapshot.active_source_hash
+                    || stored_projection.projection_version != snapshot.projection_version
+                    || stored_projection.activated_at != snapshot.activated_at
                 {
                     return conflict(
                         "projection_changed",
-                        format!(
-                            "receipt projection '{}@{}' differs from current '{}@{}'",
-                            slug, version, snapshot.slug, snapshot.projection_version
-                        ),
+                        "receipt projection identity differs from the current projection".to_string(),
                     );
                 }
             }
@@ -787,9 +815,10 @@ fn insert_claimed_execution(
         "INSERT INTO trusted_action_executions
              (execution_id, idempotency_key, action_id, manifest_id, manifest_registry_version,
               manifest_content_hash, manifest_schema_version, agent_id, project_root,
-              projection_slug, projection_source_hash, projection_active_source_hash,
-              projection_version, projection_activated_at, status, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+              projection_slug, projection_source_path, projection_source_hash,
+              projection_active_source_hash, projection_version, projection_activated_at,
+              status, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                  strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![
             execution_id,
@@ -802,6 +831,7 @@ fn insert_claimed_execution(
             &manifest.agent_id,
             &authority.project_root,
             &authority.snapshot.slug,
+            &authority.snapshot.source_path,
             &authority.snapshot.source_hash,
             &authority.snapshot.active_source_hash,
             authority.snapshot.projection_version,

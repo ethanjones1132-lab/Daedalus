@@ -1713,6 +1713,7 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
                 agent_id                      TEXT NOT NULL,
                 project_root                  TEXT NOT NULL,
                 projection_slug               TEXT NOT NULL,
+                projection_source_path        TEXT NOT NULL DEFAULT '',
                 projection_source_hash        TEXT NOT NULL,
                 projection_active_source_hash TEXT NOT NULL,
                 projection_version            INTEGER NOT NULL,
@@ -1730,6 +1731,15 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
             CREATE INDEX IF NOT EXISTS idx_trusted_executions_manifest
                 ON trusted_action_executions(manifest_id);
             "#,
+        )?;
+        // Migration-safe column addition for databases created before the
+        // projection source path was captured. Existing (historical) rows keep
+        // an empty path; new rows persist the exact captured source path.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "projection_source_path",
+            "projection_source_path TEXT NOT NULL DEFAULT ''",
         )?;
         // Migration-safe index change: the earlier shape had a non-unique
         // (action_id, status) index. Replace it with a partial unique guard that
