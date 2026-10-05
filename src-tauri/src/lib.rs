@@ -1656,6 +1656,7 @@ pub fn run() {
             get_session_history,
             get_session_runs,
             get_all_session_runs,
+            get_learning_source_choices,
             record_terminal_run,
             record_goal_terminal_run,
             export_session,

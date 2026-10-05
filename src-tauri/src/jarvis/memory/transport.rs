@@ -610,6 +610,54 @@ pub fn execute_trusted_acceptance(
     Ok(Some(parsed))
 }
 
+/// Dedicated request timeout for the bounded learning research round trip.
+/// The Bun side caps its own work at `LEARNING_RESEARCH_TIMEOUT_MS`; this
+/// margin lets the request complete or surface as an explicit unavailable
+/// result rather than being cut off by the shared 3s client default.
+pub const LEARNING_RESEARCH_TIMEOUT_MS: u64 = 240_000;
+
+/// Dispatch one bounded learning research request to the live owned Bun
+/// child over the same private authenticated capability path used by memory
+/// and trusted execution. The request carries no permission and no network
+/// authority of its own: Bun runs only its registered `web_search`/`web_fetch`
+/// tools through the canonical ToolRuntime policy. Returns `Ok(None)` when no
+/// owned child is live (nothing was dispatched); `Err` means the round trip
+/// failed after the request may have been dispatched.
+pub fn execute_learning_research(
+    transport: &NativeMemoryTransport,
+    request: &crate::jarvis::learning::LearningResearchRequest,
+) -> Result<Option<crate::jarvis::learning::LearningResearchResponse>, String> {
+    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        return Ok(None);
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let body = transport
+        .post_json_with_timeout(
+            "/internal/learning/research",
+            request,
+            200,
+            std::time::Duration::from_millis(LEARNING_RESEARCH_TIMEOUT_MS),
+        )
+        .map_err(|_| "learning research transport unavailable".to_string())?;
+    let parsed: crate::jarvis::learning::LearningResearchResponse =
+        serde_json::from_str(&body)
+            .map_err(|_| "learning research response could not be read".to_string())?;
+    if parsed.request_id != request.request_id {
+        return Err("learning research response identity mismatch".to_string());
+    }
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+    {
+        return Err("owned Bun child was replaced during learning research".to_string());
+    }
+    {
+        let mut state = transport.lock_state();
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    }
+    Ok(Some(parsed))
+}
+
 /// Structured acknowledgement of one trusted-execution cancellation request.
 /// `cancelled` is true only when the exact live owned child reported aborting
 /// the real AbortSignal. `ambiguous` means the acknowledgement could not be

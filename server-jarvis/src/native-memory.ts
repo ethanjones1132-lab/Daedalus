@@ -28,6 +28,7 @@ import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 import { readPersistedGoalCheckpoint } from "./orchestration/session-memory";
 import { loadConfig } from "./config";
 import { handleTrustedExecutionRequest } from "./trusted-execution";
+import { handleLearningSessionRequest } from "./learning-session";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
@@ -1247,7 +1248,8 @@ export async function handleNativeMemoryRequest(
   if (
     !path.startsWith("/internal/memory") &&
     !path.startsWith("/internal/goals") &&
-    !path.startsWith("/internal/trusted")
+    !path.startsWith("/internal/trusted") &&
+    !path.startsWith("/internal/learning")
   ) {
     return null;
   }
@@ -1325,6 +1327,25 @@ export async function handleNativeMemoryRequest(
       return response ?? json({ code: "not_found" }, 404);
     } catch {
       return json({ code: "execution_unavailable" }, 503);
+    }
+  }
+
+  // Learning research routes. Same private capability as memory/trusted; the
+  // handler runs retrieval only through the canonical web_search/web_fetch
+  // ToolRuntime tools under the existing permission policy.
+  if (path.startsWith("/internal/learning")) {
+    const meta = registryMeta.get(registry);
+    if (!meta || !meta.capability) {
+      return json({ code: "learning_unavailable" }, 503);
+    }
+    if (!bearerAuthorized(req, meta.capability)) {
+      return json({ code: "unauthorized" }, 401);
+    }
+    try {
+      const response = await handleLearningSessionRequest(req, loadConfig(), meta.bunInstanceId);
+      return response ?? json({ code: "not_found" }, 404);
+    } catch {
+      return json({ code: "learning_unavailable" }, 503);
     }
   }
 

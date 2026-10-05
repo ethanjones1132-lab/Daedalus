@@ -541,6 +541,86 @@ pub fn get_all_session_runs(db: State<AppDb>) -> Result<Vec<SessionRunRecord>, S
     list_all_session_runs(&db)
 }
 
+/// Authoritative learning source selectors: every persisted Session that owns
+/// at least one completed (successful, terminal) run, with those exact runs.
+/// Values are identifiers only.
+///
+/// The run record is native's own durable `session_runs` mirror, written by the
+/// native SSE relay with the exact `run_id` the Bun pipeline emits as
+/// `agent_run_id`. Native `agent_runs`/`stage_runs` are created by migration but
+/// never written by native (see the SelfTuningStore comment in
+/// server-jarvis/src/self-tuning/store.ts: telemetry lives in Bun's own DB), so
+/// they cannot provide a native run authority; `session_runs` can and does. A
+/// failed read is an `Err` so the UI cannot render it as an empty eligible list;
+/// the caller still revalidates the exact tuple on submit.
+pub fn list_learning_source_choices(
+    db: &AppDb,
+) -> Result<crate::jarvis::learning::LearningSourceChoices, String> {
+    use crate::jarvis::learning::{LearningRunChoice, LearningSessionChoice, LearningSourceChoices};
+
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.agent_id, s.title, COALESCE(s.project_root, ''),
+                    r.run_id, r.outcome, r.selected_model, COALESCE(r.finished_at, '')
+             FROM sessions s
+             JOIN session_runs r ON r.session_id = s.id AND r.outcome = 'success'
+             ORDER BY s.updated_at DESC, r.finished_at DESC
+             LIMIT 1000",
+        )
+        .map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+
+    let mut sessions: Vec<LearningSessionChoice> = Vec::new();
+    for row in rows {
+        let (session_id, agent_id, title, project_root, run_id, outcome, selected_model, finished_at) =
+            row.map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+        let run = LearningRunChoice {
+            agent_run_id: run_id,
+            outcome,
+            selected_model,
+            finished_at,
+        };
+        if let Some(existing) = sessions.iter_mut().find(|s| s.session_id == session_id) {
+            existing.runs.push(run);
+            continue;
+        }
+        sessions.push(LearningSessionChoice {
+            session_id,
+            agent_id,
+            title,
+            project_root: if project_root.is_empty() {
+                None
+            } else {
+                Some(project_root)
+            },
+            runs: vec![run],
+        });
+    }
+
+    Ok(LearningSourceChoices { sessions })
+}
+
+#[tauri::command]
+pub fn get_learning_source_choices(
+    db: State<AppDb>,
+) -> Result<crate::jarvis::learning::LearningSourceChoices, String> {
+    list_learning_source_choices(&db)
+}
+
 /// Task 4.1: the webview streams `/chat/stream` directly from the Bun server
 /// (JarvisView.tsx), bypassing the Rust SSE relay in `jarvis/runner.rs` that
 /// owns terminal-run persistence — which is why `session_runs` stayed empty

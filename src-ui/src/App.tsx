@@ -37,6 +37,7 @@ import MemoryView from './components/jarvis/MemoryView';
 import { MythosCompanionSprite } from './components/jarvis/MythosCompanionSprite';
 import HealthBanner from './components/jarvis/HealthBanner';
 import SkillsView from './components/jarvis/SkillsView';
+import LearningView from './components/jarvis/LearningView';
 import ChannelsView from './components/jarvis/ChannelsView';
 import CronView from './components/jarvis/CronView';
 import AgentsView from './components/jarvis/AgentsView';
@@ -66,6 +67,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'action-registry', label: 'Actions', icon: 'R' },
       { id: 'channels', label: 'Channels', icon: 'N' },
       { id: 'skills', label: 'Skills', icon: 'K' },
+      { id: 'learning', label: 'Learning', icon: 'L' },
       { id: 'agents', label: 'Agents', icon: 'A' },
       { id: 'control', label: 'Control', icon: 'G' },
       { id: 'models', label: 'Models', icon: 'M' },
@@ -804,6 +806,7 @@ function AppInner() {
       case 'cron': return <CronView />;
       case 'action-registry': return <ActionRegistryView />;
       case 'skills': return <SkillsView />;
+      case 'learning': return <LearningView />;
       case 'agents': return <AgentsView />;
       case 'channels': return <ChannelsView />;
       case 'devices': return <ErrorBoundary><DevicesView /></ErrorBoundary>;

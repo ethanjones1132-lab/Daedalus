@@ -3,6 +3,7 @@ use crate::jarvis::memory::turn::{MemoryRecallStatus, PrepareMemoryTurnRequest};
 use crate::jarvis::runner::{check_jarvis_status, run_jarvis_message};
 use crate::jarvis::types::*;
 use crate::jarvis_types::JarvisState;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -52,21 +53,308 @@ pub struct LearningRunResult {
     pub started_at: String,
     pub finished_at: String,
     pub output_path: String,
+    pub outcome: crate::jarvis::learning::LearningOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub findings: Vec<crate::jarvis::learning::Finding>,
     pub rejected_sources: Vec<crate::jarvis::learning::SourceEvaluation>,
+    pub evidence_binding: crate::jarvis::learning::EvidenceBinding,
 }
 
+/// Native-validated learning source tuple. Every field is resolved from
+/// authoritative persisted stores at the command boundary; the caller's
+/// Session/run IDs are selectors only and are re-read here.
+struct LearningAuthority {
+    session_id: String,
+    agent_run_id: String,
+    agent_id: String,
+    project_root: String,
+}
+
+/// Resolve and validate the exact persisted Session/run/Agent/workspace tuple.
+/// Fails closed with a concrete reason on any absence, ambiguity, staleness, or
+/// unreadable authority. Never uses latest-row heuristics and never accepts
+/// caller Agent/workspace/snapshot/permission claims.
+fn resolve_learning_authority(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    agent_run_id: &str,
+) -> Result<LearningAuthority, String> {
+    let session_id = session_id.trim();
+    let agent_run_id = agent_run_id.trim();
+    if session_id.is_empty() || agent_run_id.is_empty() {
+        return Err(
+            "a persisted Session and one completed Agent run must both be selected".to_string(),
+        );
+    }
+
+    // 1. Session owner Agent + canonical, revalidated project root.
+    let scope = crate::jarvis::memory::scope::resolve_session_memory_scope(conn, session_id)
+        .map_err(|error| format!("Session authority is unavailable: {}", error.message))?;
+    let project_root = scope.project_root.clone().ok_or_else(|| {
+        "the selected Session has no canonical project root binding".to_string()
+    })?;
+
+    // 2. Exactly one native-written completed run for the exact tuple.
+    //
+    // The native durable run record is `session_runs`: the native SSE relay
+    // writes it with the exact `run_id` the Bun pipeline emits as
+    // `agent_run_id`. Native `agent_runs`/`stage_runs` are created by migration
+    // but never written by native — Bun's SelfTuningStore owns that telemetry in
+    // its own DB (server-jarvis/src/self-tuning/store.ts) — so `agent_runs`
+    // cannot be the run authority; `session_runs` is. The outcome must be the
+    // completed successful terminal state.
+    let run_outcome: Option<String> = conn
+        .query_row(
+            "SELECT outcome FROM session_runs WHERE run_id = ?1 AND session_id = ?2",
+            rusqlite::params![agent_run_id, session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not read the selected Agent run: {error}"))?;
+    match run_outcome.as_deref() {
+        Some("success") => {}
+        Some(other) => {
+            return Err(format!(
+                "the selected Agent run is not a completed successful run (outcome: {other})"
+            ))
+        }
+        None => {
+            return Err(
+                "the selected Agent run is not a persisted completed run of the selected Session"
+                    .to_string(),
+            )
+        }
+    }
+
+    // 3. Enabled Agent with a current, valid projection (builtin Jarvis has no
+    //    projection row by design; resolve_activation_boundary owns that rule).
+    crate::commands::agents::resolve_activation_boundary(conn, &scope.agent_id)
+        .map_err(|denial| format!("Agent authority is unavailable: {}", denial.reason()))?;
+
+    // 4. If the native telemetry mirror happens to hold a row for this run, it
+    //    must agree with the selected Session and be completed. The mirror is
+    //    normally schema-only, so absence is not a failure; a present-but-
+    //    inconsistent row is.
+    let mirror: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT completed, session_id FROM agent_runs WHERE id = ?1",
+            [agent_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("could not read native run mirror: {error}"))?;
+    if let Some((completed, mirror_session_id)) = mirror {
+        if completed != 1 {
+            return Err("the selected Agent run is not marked completed in the native mirror".to_string());
+        }
+        if mirror_session_id != session_id {
+            return Err(
+                "the selected Agent run belongs to a different Session in the native mirror"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(LearningAuthority {
+        session_id: session_id.to_string(),
+        agent_run_id: agent_run_id.to_string(),
+        agent_id: scope.agent_id,
+        project_root,
+    })
+}
+
+/// Build the explicit unavailable result. Carries no findings, no output path,
+/// and never a fabricated binding.
+fn unavailable_learning_result(
+    topic: String,
+    subtopic: String,
+    started_at: String,
+    rejected_sources: Vec<crate::jarvis::learning::SourceEvaluation>,
+    reason: impl Into<String>,
+) -> LearningRunResult {
+    LearningRunResult {
+        topic,
+        subtopic,
+        started_at,
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        output_path: String::new(),
+        outcome: crate::jarvis::learning::LearningOutcome::Unavailable,
+        reason: Some(reason.into()),
+        findings: Vec::new(),
+        rejected_sources,
+        evidence_binding: crate::jarvis::learning::EvidenceBinding::unavailable(
+            "no authoritative learning source binding was dispatched",
+        ),
+    }
+}
+
+/// True only for a strict lowercase SHA-256 hex value (exactly 64 characters).
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// True only for a strict `sha256:<64 lowercase hex>` digest.
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .map(is_sha256_hex)
+        .unwrap_or(false)
+}
+
+/// Validate one finding's provenance against the response-level binding. Every
+/// identity field must tie back to the verified trajectory, the producing Bun
+/// instance, and an actual `web_fetch` tool call, and the source citation must
+/// be a genuine Tier 1 HTTP(S) URL whose host/digest/reference agree.
+fn validate_learning_finding(
+    finding: &crate::jarvis::learning::Finding,
+    response: &crate::jarvis::learning::LearningResearchResponse,
+    authority: &LearningAuthority,
+) -> Result<(), String> {
+    use crate::jarvis::learning;
+
+    if finding.run_id != authority.agent_run_id {
+        return Err("a finding is not bound to the validated run".to_string());
+    }
+    let binding_digest = response
+        .evidence_binding
+        .tool_sequence_digest
+        .as_deref()
+        .unwrap_or("");
+    if finding.trajectory_digest != binding_digest {
+        return Err("a finding does not carry the validated trajectory digest".to_string());
+    }
+    if finding.bun_instance_id != response.bun_instance_id {
+        return Err("a finding was produced by a different Bun instance".to_string());
+    }
+    if finding.tool_name != "web_fetch" {
+        return Err("a finding was produced by an unexpected tool".to_string());
+    }
+    let call_suffix = finding
+        .tool_call_id
+        .strip_prefix("web_fetch-")
+        .ok_or_else(|| "a finding has an unexpected tool call id".to_string())?;
+    if call_suffix.is_empty() || uuid::Uuid::parse_str(call_suffix).is_err() {
+        return Err("a finding has an invalid tool call id".to_string());
+    }
+
+    let evaluated = learning::evaluate_source(&finding.source_url);
+    if !matches!(evaluated.tier, learning::CredibilityTier::Tier1) {
+        return Err("a finding cites a source outside the Tier 1 allowlist".to_string());
+    }
+    let parsed = reqwest::Url::parse(&finding.source_url)
+        .map_err(|_| "a finding cites a malformed source URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .map(|value| value.to_lowercase())
+        .ok_or_else(|| "a finding cites a source URL with no host".to_string())?;
+    if host != finding.source_host.to_lowercase() {
+        return Err("a finding's source host does not match its URL".to_string());
+    }
+
+    let digest = finding
+        .content_digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| "a finding has a non-SHA-256 content digest".to_string())?;
+    if !is_sha256_hex(digest) {
+        return Err("a finding has an invalid content digest".to_string());
+    }
+    let expected_reference = format!("{}#sha256={}", finding.source_url, digest);
+    if finding.reference != expected_reference {
+        return Err("a finding's reference is not bound to its URL and digest".to_string());
+    }
+    Ok(())
+}
+
+/// Validate the Bun learning response identity and every finding against the
+/// native-validated authority before anything is persisted. Any mismatch fails
+/// closed as unavailable with no output write; no evidence is synthesized.
+fn validate_learning_response(
+    response: &crate::jarvis::learning::LearningResearchResponse,
+    request_id: &str,
+    authority: &LearningAuthority,
+) -> Result<(), String> {
+    use crate::jarvis::learning;
+
+    if response.request_id != request_id {
+        return Err("Bun returned a response for a different research request".to_string());
+    }
+    if response.bun_instance_id.trim().is_empty() {
+        return Err("Bun returned no instance identity".to_string());
+    }
+    let binding = &response.evidence_binding;
+    if binding.status != learning::EvidenceBindingStatus::Bound {
+        return Err("Bun did not return a bound learning evidence binding".to_string());
+    }
+    if binding.agent_run_id.as_deref() != Some(authority.agent_run_id.as_str())
+        || binding.session_id.as_deref() != Some(authority.session_id.as_str())
+    {
+        return Err(
+            "Bun evidence binding does not match the validated run and Session".to_string(),
+        );
+    }
+    let digest = binding.tool_sequence_digest.as_deref().unwrap_or("");
+    if !is_sha256_digest(digest) {
+        return Err("Bun evidence binding has no strict SHA-256 tool-sequence digest".to_string());
+    }
+    if response.run_id != authority.agent_run_id {
+        return Err("Bun response run identity does not match the validated run".to_string());
+    }
+
+    match &response.outcome {
+        learning::LearningOutcome::Unavailable => {
+            if !response.findings.is_empty() {
+                return Err("Bun reported unavailable while returning findings".to_string());
+            }
+            return Ok(());
+        }
+        learning::LearningOutcome::Complete | learning::LearningOutcome::Partial => {}
+    }
+    if response.findings.is_empty() {
+        return Err("Bun reported a successful outcome with no findings".to_string());
+    }
+    for finding in &response.findings {
+        validate_learning_finding(finding, response, authority)?;
+    }
+    Ok(())
+}
+
+/// Run a source-grounded learning session for one user-selected persisted
+/// Session and one exact completed Agent run.
+///
+/// `session_id` and `agent_run_id` are selectors only. Native re-reads both in
+/// SQLite and resolves all authority from persisted stores: the Session's owner
+/// Agent and canonical project root, an enabled Agent projection, and the exact
+/// native `session_runs` completed-run record (with an optional consistency
+/// check against the schema-only `agent_runs` mirror). Any absent, duplicate,
+/// stale, conflicting, or unreadable record yields explicit `unavailable` with
+/// no dispatch and no file.
+///
+/// Only after that verification is a typed request (the validated tuple plus
+/// topic/seeds) sent to the owned Bun service over the private capability
+/// transport. Bun resolves the exact stored trajectory by run+session, strictly
+/// decodes it, and runs existing `web_search`/`web_fetch` ToolRuntime tools in
+/// the validated Session/workspace context under the existing permission
+/// policy. A session file is written only when genuine findings exist.
 #[tauri::command]
 pub async fn run_learning_session(
+    db: State<'_, crate::db::AppDb>,
     topic: String,
+    session_id: String,
+    agent_run_id: String,
     seed_urls: Option<Vec<String>>,
     out_dir: Option<String>,
 ) -> Result<LearningRunResult, String> {
-    use crate::jarvis::learning::{self, Finding};
+    use crate::jarvis::learning;
 
     let started_at = chrono::Utc::now().to_rfc3339();
 
-    // Resolve output directory. Default: $JARVIS_HOME/.jarvis/learning/
+    // Resolved for later use only. Nothing is created or written unless genuine
+    // findings are ready to persist; a failed authority resolution or an empty
+    // result must not leave a directory or file.
     let out_path = match out_dir {
         Some(d) => std::path::PathBuf::from(d),
         None => {
@@ -76,72 +364,157 @@ pub async fn run_learning_session(
             p
         }
     };
-    if let Some(parent) = out_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if !out_path.exists() {
-        let _ = std::fs::create_dir_all(&out_path);
-    }
 
-    // Filter seed URLs through the quality gate.
+    let subtopic = learning::next_subtopic(&[]).to_string();
+
+    // Existing Tier 1 host gate for caller feedback only.
     let mut accepted: Vec<String> = Vec::new();
-    let mut rejected: Vec<crate::jarvis::learning::SourceEvaluation> = Vec::new();
+    let mut rejected: Vec<learning::SourceEvaluation> = Vec::new();
     for url in seed_urls.unwrap_or_default() {
         let ev = learning::evaluate_source(&url);
-        if matches!(ev.tier, crate::jarvis::learning::CredibilityTier::Tier1) {
+        if matches!(ev.tier, learning::CredibilityTier::Tier1) {
             accepted.push(url);
         } else {
             rejected.push(ev);
         }
     }
 
-    // Pick the next subtopic and synthesise findings for each accepted URL.
-    // The full research loop (web fetch, summary, LLM extraction) lives in
-    // a Python sidecar in production; here we emit deterministic placeholder
-    // findings so the UI surfaces keep working end-to-end.
-    let subtopic = learning::next_subtopic(&[]).to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut findings: Vec<Finding> = Vec::new();
-    for url in &accepted {
-        findings.push(Finding {
-            subtopic: subtopic.clone(),
-            source_url: url.clone(),
-            summary: format!(
-                "Placeholder finding for topic '{}' on subtopic '{}'. The full research loop is provided by the Python sidecar.",
-                topic, subtopic
-            ),
-            captured_at: now.clone(),
-        });
+    // Resolve the exact persisted tuple. The AppDb mutex is released before any
+    // blocking Bun transport call.
+    let authority = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        match resolve_learning_authority(&conn, &session_id, &agent_run_id) {
+            Ok(authority) => authority,
+            Err(reason) => {
+                return Ok(unavailable_learning_result(
+                    topic, subtopic, started_at, rejected, reason,
+                ))
+            }
+        }
+    };
+
+    let request = learning::LearningResearchRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        agent_run_id: authority.agent_run_id.clone(),
+        session_id: authority.session_id.clone(),
+        agent_id: authority.agent_id.clone(),
+        project_root: authority.project_root.clone(),
+        topic: topic.clone(),
+        subtopic: subtopic.clone(),
+        seed_urls: accepted,
+        max_sources: 8,
+        timeout_ms: 180_000,
+    };
+    let request_id = request.request_id.clone();
+
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        let transport = crate::jarvis::memory::transport::native_memory_transport();
+        crate::jarvis::memory::transport::execute_learning_research(transport, &request)
+    })
+    .await;
+
+    let response = match response {
+        Ok(Ok(Some(response))) => response,
+        Ok(Ok(None)) => {
+            return Ok(unavailable_learning_result(
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                "owned Bun runtime is not live; research was not dispatched",
+            ))
+        }
+        Ok(Err(error)) => {
+            return Ok(unavailable_learning_result(
+                topic, subtopic, started_at, rejected, error,
+            ))
+        }
+        Err(join_error) => {
+            return Ok(unavailable_learning_result(
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                format!("learning research task join error: {join_error}"),
+            ))
+        }
+    };
+
+    // Validate the Bun response identity and every finding against the exact
+    // native-validated tuple before anything is persisted. An inconsistent
+    // response fails closed as unavailable with no output write.
+    if let Err(reason) = validate_learning_response(&response, &request_id, &authority) {
+        return Ok(unavailable_learning_result(
+            topic, subtopic, started_at, rejected, reason,
+        ));
     }
 
-    // Write a markdown session file so the result is durable.
-    let path = learning::output_path(&out_path, &topic);
-    let body = format!(
-        "# Learning Session — {}\n\n- Topic: `{}`\n- Subtopic: `{}`\n- Started: {}\n- Sources: {}\n- Rejected: {}\n\n## Findings\n\n{}\n",
-        topic,
-        topic,
-        subtopic,
-        started_at,
-        findings.len(),
-        rejected.len(),
-        findings
-            .iter()
-            .map(|f| format!("- **{}** — {}\n  <{}>\n", f.subtopic, f.summary, f.source_url))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    );
-    if let Err(e) = std::fs::write(&path, body) {
-        return Err(format!("Failed to write learning session: {}", e));
+    let binding = response.evidence_binding;
+    let mut rejected = rejected;
+    for source in response.rejected_sources {
+        rejected.push(learning::SourceEvaluation {
+            url: source.url,
+            tier: learning::CredibilityTier::Rejected,
+            credibility_note: source.reason,
+        });
+    }
+    let findings = response.findings;
+
+    // Persist only genuine source-grounded findings. The output directory is
+    // created here, after the response was validated and real findings are in
+    // hand, so unavailable/empty results leave no directory or file behind.
+    let mut output_path = String::new();
+    if !findings.is_empty() {
+        std::fs::create_dir_all(&out_path)
+            .map_err(|e| format!("Failed to create learning output directory: {}", e))?;
+        let path = learning::output_path(&out_path, &topic);
+        let body = format!(
+            "# Learning Session — {}\n\n- Topic: `{}`\n- Subtopic: `{}`\n- Started: {}\n- Outcome: `{:?}`\n- Source run: `{}`\n- Source session: `{}`\n- Trajectory digest: `{}`\n- Sources: {}\n- Rejected/unavailable: {}\n\n## Findings\n\n{}\n",
+            topic,
+            topic,
+            subtopic,
+            started_at,
+            response.outcome,
+            authority.agent_run_id,
+            authority.session_id,
+            binding.tool_sequence_digest.as_deref().unwrap_or(""),
+            findings.len(),
+            rejected.len(),
+            findings
+                .iter()
+                .map(|f| format!(
+                    "- **{}** — {} [{}]\n  {} — {}\n  digest: {} | trajectory: {} | tool: {} call: {} run: {}\n  reference: {}\n",
+                    f.subtopic,
+                    f.source_url,
+                    f.source_host,
+                    f.retrieved_at,
+                    f.excerpt,
+                    f.content_digest,
+                    f.trajectory_digest,
+                    f.tool_name,
+                    f.tool_call_id,
+                    f.run_id,
+                    f.reference,
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        std::fs::write(&path, body)
+            .map_err(|e| format!("Failed to write learning session: {}", e))?;
+        output_path = path.to_string_lossy().into_owned();
     }
 
     Ok(LearningRunResult {
         topic,
         subtopic,
-        started_at: started_at.clone(),
+        started_at,
         finished_at: chrono::Utc::now().to_rfc3339(),
-        output_path: path.to_string_lossy().into_owned(),
+        output_path,
+        outcome: response.outcome,
+        reason: response.reason,
         findings,
         rejected_sources: rejected,
+        evidence_binding: binding,
     })
 }
 
