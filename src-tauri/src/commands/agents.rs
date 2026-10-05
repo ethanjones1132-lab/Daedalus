@@ -161,6 +161,147 @@ fn valid_projection_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Classified denial for an unattended activation. `WaitingForUser` means the
+/// Agent authority exists but requires operator action (disabled); `Blocked`
+/// means the authority is missing/invalid/stale/mismatched and must not be
+/// silently substituted with a privileged default.
+#[derive(Debug, Clone)]
+pub enum ActivationDenial {
+    WaitingForUser(String),
+    Blocked(String),
+}
+
+impl ActivationDenial {
+    pub fn claim_state(&self) -> &'static str {
+        match self {
+            ActivationDenial::WaitingForUser(_) => "waiting_for_user",
+            ActivationDenial::Blocked(_) => "blocked",
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        match self {
+            ActivationDenial::WaitingForUser(reason) | ActivationDenial::Blocked(reason) => reason,
+        }
+    }
+}
+
+/// Canonical instructions for the built-in default Jarvis agent. The built-in
+/// path may run unattended only through this exact canonical identity; an
+/// arbitrary unknown Agent id is never treated as Jarvis.
+pub const BUILTIN_JARVIS_AGENT_ID: &str = "jarvis";
+
+/// Resolve and validate the Agent lifecycle authority for one unattended cron
+/// activation. Returns the canonical projection snapshot the Bun boundary can
+/// bind, or a classified denial that the caller records durably without
+/// dispatching.
+///
+/// Rules:
+///   * The job's Agent must resolve through the native Agent authority. A
+///     missing Agent is `Blocked`; a disabled Agent is `WaitingForUser`.
+///   * A custom Agent (anything other than the canonical built-in `jarvis`)
+///     must have a valid, active, non-stale projection; a missing/invalid/
+///     inactive/stale projection is `Blocked`. Its instructions are never
+///     substituted with a default.
+///   * The canonical built-in `jarvis` is allowed without a projection only
+///     because its identity is the exact built-in runtime default; it is never
+///     inferred from an arbitrary id.
+pub fn resolve_activation_boundary(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+) -> Result<crate::cron_scheduler::ProjectionSnapshot, ActivationDenial> {
+    let agent = fetch_agent(conn, agent_id)
+        .map_err(|e| ActivationDenial::Blocked(format!("agent authority unreadable: {e}")))?;
+    let is_builtin = agent_id == BUILTIN_JARVIS_AGENT_ID;
+    match agent {
+        Some(row) if !row.enabled => Err(ActivationDenial::WaitingForUser(format!(
+            "Agent '{}' is disabled; reactivate it to resume unattended activation",
+            agent_id
+        ))),
+        Some(_) => resolve_projection_snapshot(conn, agent_id, is_builtin),
+        None if is_builtin => {
+            // The built-in Jarvis identity is the default runtime authority; it
+            // is permitted without an explicit agents row. Any OTHER unknown id
+            // is not Jarvis and is blocked.
+            resolve_projection_snapshot(conn, agent_id, true)
+        }
+        None => Err(ActivationDenial::Blocked(format!(
+            "unknown Agent '{}'; no Agent authority exists",
+            agent_id
+        ))),
+    }
+}
+
+/// Validate the projection for an Agent. A built-in agent may run with no
+/// projection (legacy default); a custom agent, or any agent that has a
+/// projection row, must present a valid/active/non-stale projection.
+fn resolve_projection_snapshot(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    builtin_allowed: bool,
+) -> Result<crate::cron_scheduler::ProjectionSnapshot, ActivationDenial> {
+    match fetch_agent_projection(conn, agent_id) {
+        Err(e) => Err(ActivationDenial::Blocked(format!(
+            "agent projection authority unreadable: {e}"
+        ))),
+        Ok(Some(projection)) => {
+            if projection.status != "valid" {
+                return Err(ActivationDenial::Blocked(format!(
+                    "agent projection '{}' is invalid",
+                    agent_id
+                )));
+            }
+            if !projection.active {
+                return Err(ActivationDenial::Blocked(format!(
+                    "agent projection '{}' is inactive",
+                    agent_id
+                )));
+            }
+            let Some(activated_at) = projection.activated_at.clone() else {
+                return Err(ActivationDenial::Blocked(format!(
+                    "agent projection '{}' is stale (never activated)",
+                    agent_id
+                )));
+            };
+            if projection.source_hash.is_empty()
+                || projection.active_source_hash != projection.source_hash
+            {
+                return Err(ActivationDenial::Blocked(format!(
+                    "agent projection '{}' is stale (source hash mismatch)",
+                    agent_id
+                )));
+            }
+            Ok(crate::cron_scheduler::ProjectionSnapshot {
+                slug: projection.slug,
+                source_path: projection.source_path,
+                source_hash: projection.source_hash,
+                active_source_hash: projection.active_source_hash,
+                projection_version: projection.projection_version,
+                activated_at,
+            })
+        }
+        Ok(None) => {
+            if builtin_allowed {
+                // The canonical built-in Jarvis runs on the default runtime
+                // instructions; this is the one legacy path that needs no row.
+                Ok(crate::cron_scheduler::ProjectionSnapshot {
+                    slug: agent_id.to_string(),
+                    source_path: String::new(),
+                    source_hash: String::new(),
+                    active_source_hash: String::new(),
+                    projection_version: 0,
+                    activated_at: String::new(),
+                })
+            } else {
+                Err(ActivationDenial::Blocked(format!(
+                    "agent '{}' has no activated projection; refusing a privileged fallback",
+                    agent_id
+                )))
+            }
+        }
+    }
+}
+
 pub(crate) fn activate_projection_row(
     conn: &Connection,
     projection: AgentProjectionInput,

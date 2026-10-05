@@ -118,6 +118,48 @@ fn scheduled_occurrence_at(next_run: &str) -> Option<i64> {
         .map(|dt| dt.timestamp_millis())
 }
 
+/// Record a durable claim-time denial for an unlinked/bound-Session scope
+/// mismatch (or missing Session authority) as a schema-valid `blocked`
+/// activation and return a fail-closed error with no dispatch. Uses
+/// `INSERT OR IGNORE` on the unique `(cron_job_id, schedule_occurrence)` key so
+/// the denied occurrence can never be replayed, and returns the caller's `Err`.
+#[allow(clippy::too_many_arguments)]
+fn record_claim_denial<T>(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+    goal_id: &Option<String>,
+    agent_id: &str,
+    session_id: &Option<String>,
+    project_root: &Option<String>,
+    occurrence: &i64,
+    trigger_kind: &str,
+    claim_state: &str,
+    reason: &str,
+) -> Result<Option<T>, String> {
+    let activation_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO cron_activations \
+         (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
+          schedule_occurrence, trigger_kind, claim_state, terminal_reason, claimed_at, settled_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        rusqlite::params![
+            &activation_id,
+            job_id,
+            goal_id,
+            agent_id,
+            session_id,
+            project_root,
+            occurrence.to_string(),
+            trigger_kind,
+            claim_state,
+            reason,
+        ],
+    )
+    .map_err(|e| format!("failed to record denied activation: {e}"))?;
+    Err(format!("activation denied: {reason}"))
+}
+
 /// Claim the deterministic occurrence for one due job so a given schedule fire
 /// dispatches at most once, even across a restart or overlapping polls.
 ///
@@ -187,6 +229,129 @@ fn claim_activation(
         goal_scope = goal.project_root;
     }
 
+    // Effective activation scope. A bound Session's actual persisted workspace is
+    // the scope for an unlinked job; a linked Goal's canonical scope is the
+    // authority and a bound Session must agree with it. `None` only when there is
+    // no Goal and no Session. A Session whose Agent does not match the cron Agent,
+    // or whose workspace disagrees with the Goal, is a fail-closed denial
+    // recorded durably as `blocked` with no dispatch.
+    let bound_session_root: Option<Option<String>> = match session_id.as_deref() {
+        Some(sid) => {
+            let row: Option<(String, Option<String>)> = match conn
+                .query_row(
+                    "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+                    [sid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    // An unreadable bound-Session authority is a fail-closed
+                    // denial recorded durably, never a plain claim error.
+                    return record_claim_denial(
+                        &conn,
+                        job_id,
+                        &goal_id,
+                        &agent_id,
+                        &session_id,
+                        &goal_scope,
+                        &occurrence,
+                        trigger_kind,
+                        "blocked",
+                        &format!("bound session authority unreadable: {e}"),
+                    );
+                }
+            };
+            match row {
+                Some((session_agent, session_root)) if session_agent == agent_id => {
+                    Some(session_root)
+                }
+                Some((session_agent, _)) => {
+                    return record_claim_denial(
+                        &conn,
+                        job_id,
+                        &goal_id,
+                        &agent_id,
+                        &session_id,
+                        &goal_scope,
+                        &occurrence,
+                        trigger_kind,
+                        "blocked",
+                        &format!(
+                            "bound session '{sid}' belongs to Agent '{session_agent}', not '{agent_id}'"
+                        ),
+                    );
+                }
+                None => {
+                    return record_claim_denial(
+                        &conn,
+                        job_id,
+                        &goal_id,
+                        &agent_id,
+                        &session_id,
+                        &goal_scope,
+                        &occurrence,
+                        trigger_kind,
+                        "blocked",
+                        &format!("bound session '{sid}' no longer exists"),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let effective_scope: Option<String> = match goal_scope {
+        Some(goal_root) => match bound_session_root {
+            Some(Some(session_root)) if session_root != goal_root => {
+                return record_claim_denial(
+                    &conn,
+                    job_id,
+                    &goal_id,
+                    &agent_id,
+                    &session_id,
+                    &Some(goal_root),
+                    &occurrence,
+                    trigger_kind,
+                    "blocked",
+                    "bound session workspace does not match goal scope",
+                );
+            }
+            _ => Some(goal_root),
+        },
+        None => bound_session_root.flatten(),
+    };
+
+    // Agent lifecycle/projection boundary, re-checked before the claim. A
+    // disabled Agent becomes an explicit `waiting_for_user`; a missing/invalid/
+    // stale/mismatched authority becomes `blocked`. Neither dispatches, and
+    // neither substitutes default instructions.
+    if let Err(denial) = crate::commands::agents::resolve_activation_boundary(&conn, &agent_id) {
+        let activation_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT OR IGNORE INTO cron_activations \
+             (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
+              schedule_occurrence, trigger_kind, claim_state, terminal_reason, claimed_at, settled_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![
+                &activation_id,
+                job_id,
+                goal_id,
+                &agent_id,
+                &session_id,
+                &effective_scope,
+                occurrence.to_string(),
+                trigger_kind,
+                denial.claim_state(),
+                denial.reason(),
+            ],
+        )
+        .map_err(|e| format!("failed to record denied activation: {e}"))?;
+        return Err(format!("activation denied: {}", denial.reason()));
+    }
+
     // Dedupe: this occurrence key is unique per job. A prior claim means the
     // effect may already exist and must not be reissued.
     let existing: Option<(String, String)> = conn
@@ -226,7 +391,7 @@ fn claim_activation(
                 goal_id,
                 &agent_id,
                 &session_id,
-                &goal_scope,
+                &effective_scope,
                 occurrence.to_string(),
                 trigger_kind,
             ],
@@ -365,6 +530,67 @@ pub fn persist_cancellation_intent(app: &AppHandle, job_id: &str, reason: &str) 
         .map_err(|e| format!("failed to record cron cancellation intent: {e}"))?;
     }
     Ok(activation_id)
+}
+
+/// Durably settle a claimed activation to a fail-closed denied state
+/// (`waiting_for_user` or `blocked`) with the specific actionable reason. No run
+/// is created and no request is sent. Returns `Err` if the write fails or does
+/// not update exactly one eligible activation, so a denied occurrence is never
+/// reported as durably blocked without proof. An already-identical denial is
+/// idempotent: the update guard leaves it as-is and this succeeds.
+fn settle_activation_denied(
+    app: &AppHandle,
+    activation_id: &str,
+    claim_state: &str,
+    reason: &str,
+) -> Result<(), String> {
+    debug_assert!(claim_state == "waiting_for_user" || claim_state == "blocked");
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Read the current state so an already-recorded identical denial is treated
+    // as an idempotent success rather than a failed update.
+    let existing: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT claim_state, terminal_reason FROM cron_activations WHERE activation_id = ?1",
+            [activation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read activation {activation_id}: {e}"))?;
+    match existing {
+        None => {
+            return Err(format!(
+                "activation {activation_id} not found; denied state not persisted"
+            ))
+        }
+        Some((state, existing_reason))
+            if state == claim_state && existing_reason.as_deref() == Some(reason) =>
+        {
+            return Ok(());
+        }
+        Some((state, _)) if matches!(state.as_str(), "completed" | "failed" | "cancelled") => {
+            // A terminal activation must not be overwritten by a late denial.
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+
+    let affected = conn
+        .execute(
+            "UPDATE cron_activations SET claim_state = ?1, terminal_reason = ?2, \
+             settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE activation_id = ?3 AND claim_state NOT IN ('completed','failed','cancelled')",
+            rusqlite::params![claim_state, reason, activation_id],
+        )
+        .map_err(|e| format!("failed to record denied activation {activation_id}: {e}"))?;
+    if affected != 1 {
+        return Err(format!(
+            "denied state for activation {activation_id} was not persisted (affected {affected})"
+        ));
+    }
+    Ok(())
 }
 
 /// Mark an activation `cancelled` after its tracked execution actually
@@ -595,78 +821,17 @@ pub async fn resolve_jarvis_url(client: &Client) -> String {
 
 /// Serializable projection snapshot mirroring TypeScript's `ProjectionSnapshot`.
 /// Passed inline to the Bun server so it can call `restoreBoundary()` without
-/// needing direct access to the Tauri SQLite database.
+/// needing direct access to the Tauri SQLite database. A built-in Jarvis
+/// snapshot legitimately has empty source/hash fields (default runtime
+/// instructions); a custom Agent snapshot always carries a validated hash.
 #[derive(Debug, Clone, serde::Serialize)]
-struct ProjectionSnapshot {
-    slug: String,
-    source_path: String,
-    source_hash: String,
-    active_source_hash: String,
-    projection_version: i64,
-    activated_at: String,
-}
-
-/// Query the agent projection for `agent_id` from the native SQLite store.
-/// Returns `None` when no valid projection exists for the slug.
-fn query_projection_snapshot(
-    conn: &rusqlite::Connection,
-    agent_id: &str,
-) -> Result<Option<ProjectionSnapshot>, String> {
-    let row = conn
-        .query_row(
-            "SELECT slug, source_path, source_hash, active_source_hash, projection_version,
-                    status, active, activated_at
-             FROM agent_projections
-             WHERE slug = ?",
-            [agent_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let Some((
-        slug,
-        source_path,
-        source_hash,
-        active_source_hash,
-        projection_version,
-        status,
-        active,
-        activated_at,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    if status != "valid" {
-        return Err("projection_invalid".to_string());
-    }
-    if active == 0 {
-        return Err("projection_inactive".to_string());
-    }
-    let Some(activated_at) = activated_at else {
-        return Err("projection_stale".to_string());
-    };
-    if source_hash.is_empty() || active_source_hash != source_hash {
-        return Err("projection_stale".to_string());
-    }
-    Ok(Some(ProjectionSnapshot {
-        slug,
-        source_path,
-        source_hash,
-        active_source_hash,
-        projection_version,
-        activated_at,
-    }))
+pub struct ProjectionSnapshot {
+    pub slug: String,
+    pub source_path: String,
+    pub source_hash: String,
+    pub active_source_hash: String,
+    pub projection_version: i64,
+    pub activated_at: String,
 }
 
 /// Result of dispatching a cron job to the Bun server.
@@ -685,6 +850,27 @@ pub struct CronDispatchResult {
     pub cancelled: bool,
 }
 
+/// Failure of a cron dispatch, distinguishing a fail-closed authority denial
+/// (which must be recorded as a durable `blocked`/`waiting_for_user` activation,
+/// never a failed run) from an ordinary transport/runtime error.
+#[derive(Debug, Clone)]
+pub enum CronDispatchError {
+    /// A final-boundary authority denial: the activation must be settled to a
+    /// schema-valid denied state with this reason, and no run/request occurs.
+    Denied(crate::commands::agents::ActivationDenial),
+    /// An ordinary transport/runtime failure (HTTP, parse, timeout).
+    Transport(String),
+}
+
+impl CronDispatchError {
+    pub fn message(&self) -> &str {
+        match self {
+            CronDispatchError::Denied(denial) => denial.reason(),
+            CronDispatchError::Transport(message) => message,
+        }
+    }
+}
+
 /// Dispatch a cron job via the Bun server's `/cron/run` endpoint.
 ///
 /// Replaces the previous `/chat/stream` path:
@@ -698,27 +884,197 @@ pub async fn dispatch_cron_job(
     job_id: &str,
     activation_id: Option<&str>,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
-) -> Result<CronDispatchResult, String> {
+) -> Result<CronDispatchResult, CronDispatchError> {
     let (prompt, agent_id, snapshot) = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Query prompt and agent_id together
-        let (prompt, agent_id): (String, Option<String>) = conn
+        // Final-boundary identity revalidation. Re-read the CURRENT cron job tuple
+        // and the claimed activation row and require an exact identity match, then
+        // revalidate the Goal and Session/projection authority. Any SQL error or
+        // stale/mismatched identity fails closed. The revalidated tuple below is
+        // the one carried into the HTTP body.
+        let (prompt, job_agent, job_session, job_goal, job_enabled): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        ) = conn
             .query_row(
-                "SELECT prompt, agent_id FROM cron_jobs WHERE id = ?",
+                "SELECT prompt, agent_id, session_id, goal_id, enabled FROM cron_jobs WHERE id = ?1",
                 [job_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
-            .map_err(|e| format!("Cron job '{}' not found: {}", job_id, e))?;
+            .map_err(|e| {
+                CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                    format!("cron job authority unreadable or missing: {e}"),
+                ))
+            })?;
 
-        let snapshot = match agent_id.as_deref() {
-            Some(aid) => query_projection_snapshot(&conn, aid)?,
-            None => None,
+        // A job disabled after claim must not dispatch.
+        if job_enabled == 0 {
+            return Err(CronDispatchError::Denied(
+                crate::commands::agents::ActivationDenial::WaitingForUser(format!(
+                    "cron job '{}' was disabled before dispatch",
+                    job_id
+                )),
+            ));
+        }
+
+        let sender_agent = job_agent
+            .as_deref()
+            .ok_or_else(|| CronDispatchError::Denied(
+                crate::commands::agents::ActivationDenial::Blocked(
+                    "cron job has no Agent identity; refusing dispatch".to_string(),
+                ),
+            ))?;
+
+        // Captured claim workspace policy, if this is a claimed activation. It is
+        // compared against the current canonical Goal/Session workspace below.
+        let mut claim_root: Option<String> = None;
+
+        // When called from a claimed activation, the activation row captured at
+        // claim time must still match this job exactly. An unreadable/missing/
+        // malformed authority row is a fail-closed denial, not a runtime failure.
+        if let Some(aid) = activation_id {
+            let claimed: Option<(String, Option<String>, Option<String>, Option<String>, String)> = conn
+                .query_row(
+                    "SELECT agent_id, session_id, goal_id, project_root, claim_state \
+                     FROM cron_activations WHERE activation_id = ?1",
+                    [aid],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .optional()
+                .map_err(|e| {
+                    CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                        format!("activation authority unreadable: {e}"),
+                    ))
+                })?;
+            let Some((claim_agent, claim_session, claim_goal, claimed_root, claim_state)) = claimed
+            else {
+                return Err(CronDispatchError::Denied(
+                    crate::commands::agents::ActivationDenial::Blocked(format!(
+                        "activation '{aid}' not found at dispatch"
+                    )),
+                ));
+            };
+            if claim_state != "claimed" && claim_state != "dispatched" {
+                return Err(CronDispatchError::Denied(
+                    crate::commands::agents::ActivationDenial::Blocked(format!(
+                        "activation '{aid}' is no longer dispatchable (state '{claim_state}')"
+                    )),
+                ));
+            }
+            if claim_agent != sender_agent
+                || claim_session != job_session
+                || claim_goal != job_goal
+            {
+                return Err(CronDispatchError::Denied(
+                    crate::commands::agents::ActivationDenial::Blocked(
+                        "cron job identity changed after claim; refusing dispatch".to_string(),
+                    ),
+                ));
+            }
+            claim_root = claimed_root;
+        }
+
+        // Goal authority must still permit activation for the CURRENT job row.
+        // The canonical Goal project_root returned here is the authority the
+        // claim's captured workspace must match exactly.
+        let mut goal_root: Option<String> = None;
+        if let Some(ref gid) = job_goal {
+            let goal = crate::commands::goals::validate_cron_goal_activation(&conn, gid, job_id)
+                .map_err(|e| {
+                    CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                        format!("goal association blocks activation: {e}"),
+                    ))
+                })?;
+            goal_root = goal.project_root;
+        }
+
+        // A bound Session must still match its actual Agent/workspace authority
+        // and the job's Agent. The Session's canonical project_root is retained so
+        // the claim's captured workspace can be checked against it.
+        let mut session_root: Option<String> = None;
+        if let Some(ref sid) = job_session {
+            let session_row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+                    [sid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| {
+                    CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                        format!("bound session authority unreadable: {e}"),
+                    ))
+                })?;
+            let (session_agent, session_project_root) = session_row.ok_or_else(|| {
+                CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                    format!("bound session '{sid}' no longer exists"),
+                ))
+            })?;
+            if session_agent != sender_agent {
+                return Err(CronDispatchError::Denied(
+                    crate::commands::agents::ActivationDenial::Blocked(format!(
+                        "bound session '{sid}' belongs to Agent '{session_agent}', not '{sender_agent}'"
+                    )),
+                ));
+            }
+            session_root = session_project_root;
+        }
+
+        // The claim's captured workspace must equal the current authoritative
+        // workspace EXACTLY, including a None<->Some change. For a linked job that
+        // is the canonical Goal scope; the bound Session (if any) must also agree
+        // with it. For an unlinked job the bound Session's canonical workspace is
+        // the authority; if neither is present the authority is None. Scope is
+        // never inferred from a client-supplied value.
+        let authoritative_root: Option<&str> = match goal_root.as_deref() {
+            Some(goal_root) => {
+                if let Some(ref session_root) = session_root {
+                    if session_root != goal_root {
+                        return Err(CronDispatchError::Denied(
+                            crate::commands::agents::ActivationDenial::Blocked(
+                                "bound session workspace does not match goal scope".to_string(),
+                            ),
+                        ));
+                    }
+                }
+                Some(goal_root)
+            }
+            None => session_root.as_deref(),
+        };
+        if claim_root.as_deref() != authoritative_root {
+            return Err(CronDispatchError::Denied(
+                crate::commands::agents::ActivationDenial::Blocked(
+                    "cron activation workspace changed after claim; refusing dispatch".to_string(),
+                ),
+            ));
+        }
+
+        // Agent enabled/projection status/hash must still pass. The returned
+        // snapshot is exactly what the HTTP body will carry.
+        let snapshot = crate::commands::agents::resolve_activation_boundary(&conn, sender_agent)
+            .map_err(CronDispatchError::Denied)?;
+        let snapshot = if snapshot.source_hash.is_empty() {
+            None
+        } else {
+            Some(snapshot)
         };
 
-        (prompt, agent_id, snapshot)
+        (prompt, job_agent, snapshot)
     };
+    let agent_id = agent_id;
 
     // Each automated run gets a fresh isolated session
     let run_session = uuid::Uuid::new_v4().to_string();
@@ -761,7 +1117,7 @@ pub async fn dispatch_cron_job(
         Some(mut rx) => {
             tokio::select! {
                 biased;
-                result = request => result.map_err(|e| format!("HTTP request failed: {}", e))?,
+                result = request => result.map_err(|e| CronDispatchError::Transport(format!("HTTP request failed: {}", e)))?,
                 _ = rx.changed() => {
                     return Ok(CronDispatchResult {
                         output: String::new(),
@@ -775,13 +1131,16 @@ pub async fn dispatch_cron_job(
         }
         None => request
             .await
-            .map_err(|e| format!("HTTP request failed: {}", e))?,
+            .map_err(|e| CronDispatchError::Transport(format!("HTTP request failed: {}", e)))?,
     };
 
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(format!("Cron run server returned {}: {}", status, text));
+        return Err(CronDispatchError::Transport(format!(
+            "Cron run server returned {}: {}",
+            status, text
+        )));
     }
 
     // Read the body while racing the tracked cancel signal. Dropping the response
@@ -796,7 +1155,7 @@ pub async fn dispatch_cron_job(
             tokio::select! {
                 biased;
                 result = text_future => {
-                    result.map_err(|e| format!("Failed to read cron run response: {}", e))?
+                    result.map_err(|e| CronDispatchError::Transport(format!("Failed to read cron run response: {}", e)))?
                 }
                 _ = rx.changed() => {
                     return Ok(CronDispatchResult {
@@ -811,11 +1170,11 @@ pub async fn dispatch_cron_job(
         }
         None => text_future
             .await
-            .map_err(|e| format!("Failed to read cron run response: {}", e))?,
+            .map_err(|e| CronDispatchError::Transport(format!("Failed to read cron run response: {}", e)))?,
     };
 
-    let result: serde_json::Value =
-        serde_json::from_str(&raw_body).map_err(|e| format!("Failed to parse cron run response: {}", e))?;
+    let result: serde_json::Value = serde_json::from_str(&raw_body)
+        .map_err(|e| CronDispatchError::Transport(format!("Failed to parse cron run response: {}", e)))?;
 
     let output = result["output"].as_str().unwrap_or("").to_string();
     let error = result["error"].as_str().map(|s| s.to_string());
@@ -1159,7 +1518,20 @@ pub async fn execute_job(
                 Some(&context),
             );
         }
-        Err(err) => {
+        Err(CronDispatchError::Denied(denial)) => {
+            // A final-boundary authority denial is NOT a runtime failure. Durably
+            // settle the claimed activation to the schema-valid denied state with
+            // the specific reason; create no run and send no request. The dedupe
+            // key means reconcile never replays this occurrence. A persistence
+            // failure is surfaced rather than claiming a durable denied state.
+            if let Err(e) =
+                settle_activation_denied(app, &activation_id, denial.claim_state(), denial.reason())
+            {
+                release_in_flight(job_id);
+                return Err(e);
+            }
+        }
+        Err(CronDispatchError::Transport(err)) => {
             let context = ActivationContext {
                 activation_id: activation_id.clone(),
                 schedule_occurrence: schedule_occurrence.clone().unwrap_or_default(),
@@ -1183,7 +1555,9 @@ pub async fn execute_job(
 
     release_in_flight(job_id);
 
-    dispatch_result.map(|d| d.output)
+    dispatch_result
+        .map(|d| d.output)
+        .map_err(|err| err.message().to_string())
 }
 
 /// Remove the abort token registration for a job.
