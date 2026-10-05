@@ -22,12 +22,13 @@
 | Best single shot before tonight | 108 (gpt-oss full, 46 tok/s) / 105 (Gemma) / 101 (Qwen keep96, 274 tok/s) | 2026-10-04 |
 | Qwen best-of-N with self-tests, 8 candidates | **107** | 98 single shot. The 3-candidate recipe gave 103 and 107 in two independent runs |
 | Mixed Qwen + Gemma candidate pool, self-test pick | **108** | oracle 113 |
-| **Laya routes "depends on unseen code" tasks to Gemma, the rest to Qwen best-of-N** | **110–111** | best system; hindsight oracle over all configs 114 |
+| **Laya routes "depends on unseen code" tasks to Gemma, the rest to Qwen best-of-N** | **110–111** | best system on tier2b (hindsight oracle over all configs 114), **but it did not validate on 12 fresh hidden-package tasks** (§9) |
 
 **What helped, in order:**
-1. **A second model, routed by Laya's zero-shot task decision.** Gemma is strong where Qwen is weakest (hidden-package tasks), and Laya spots those tasks (AUC 0.96).
-2. **More candidates plus the model's own tests,** for Qwen only. Gemma's samples don't vary.
-3. **Repair from self-test feedback** for Qwen (+3). For Gemma it breaks more than it fixes.
+1. **On tier2b, a second model routed by Laya's zero-shot task decision.** Gemma is strong where Qwen is weakest (hidden-package tasks), and Laya spots those tasks (AUC 0.96). On fresh tasks the two models tie, so this did not transfer.
+2. **More candidates plus the model's own tests,** for Qwen only. Gemma's samples don't vary. It does not help when the model lacks information.
+3. **Probing before fixing, on tasks that depend on unseen code.** It was mixed on tier2b, but +5 (Qwen) and +6 (Gemma) on fresh tasks. It is the lever with the best evidence of transfer.
+4. **Repair from self-test feedback** for Qwen (+3). For Gemma it breaks more than it fixes.
 
 **What didn't help:**
 - More thinking or effort, for any of the three models.
@@ -171,15 +172,40 @@ Unlike Qwen (single 98, oracle 109), re-sampling Gemma at 0.7 never produced a c
 - In 8 task-trials a correct candidate existed but wasn't picked. That is the remaining selection headroom.
 - Laya routing (unseen-code tasks → Gemma, the rest → Qwen best-of-N, 111) still beats the pool's 108. Routing those tasks to Gemma is a better decision than asking self-tests to choose there.
 
-## 9. Next
+## 9. Validation on fresh hidden-package tasks (05:40–06:02)
 
-1. **Confirm the routing on disjoint tasks.** It needs a fresh hidden-package-style set (a module visible only as bytecode plus a bug report). The B-route rests on 7 tier2b tasks.
+The best routed system rests on tier2b's 7 hidden-package tasks. So 12 fresh tasks were written in the same shape:
+- fix `entry`; the helper module's source is unavailable;
+- the test exercises the real helper;
+- each hinges on an unseen convention: cents vs dollars, seconds vs ms, km vs m, °F vs °C, None vs raising, LIFO vs FIFO, 1-based pages, percent vs fraction, Decimal vs float, tuple order, an inclusive limit, lower-cased keys;
+- each is verified to fail on the buggy file and pass on a reference fix (`docs/benchmarks/2026-10-05/validation-b/`).
+
+| Configuration | Fresh hidden-package (12 × 3) | tier2b B (7 × 3), for comparison |
+|---|---|---|
+| Qwen keep96 single shot | 11/36 | 6/21 |
+| Gemma 26B greedy | 12/36 | 15/21 |
+| Qwen best-of-N recipe (self-test pick) | 10/36 (oracle 13) | 8–11/21 |
+| **Qwen probe-then-fix** | **16/36** | 9/21 |
+| **Gemma probe-then-fix** | **18/36** | 12/21 |
+
+**What the fresh tasks say:**
+- **Gemma's hidden-package edge does not carry over.** On fresh tasks Qwen and Gemma tie, so the 110–111 routed score is specific to tier2b's seven B tasks.
+- **Laya's `kind` rule generalizes only halfway:** "local" for 6 of 12 fresh B tasks, against 7 of 7 on tier2b. Its P(depends on unseen code) is 0.85–1.0 on every fresh task, but that checkpoint is high on everything, so it needs calibrating before use.
+- **Self-test best-of-N gains nothing when the model lacks information.** Its tests encode its own misreading of the hidden convention.
+- **Probing is the lever that generalizes:** +5 for Qwen, +6 for Gemma. Calling the hidden helper shows its convention. For example, Gemma's probes found the day-first date order and the percent tax rate, solving both tasks 3/3. On tier2b's 7 B tasks probing had hurt Gemma (−3), which shows how far 7 tasks can mislead.
+
+**Revised reading for "one-shot this feature":**
+- When the task depends on code the model can't see, let it run that code first.
+- When the model sometimes gets it right, sample several candidates and pick by self-tests.
+- Don't spend the budget on longer thinking.
+
+## 10. Next
+
+1. **Fix the probe prompt's two failure modes and make probing interactive** (more than one probe round). Then run it on both sets. It is the lever with the best evidence of transfer. The failure modes: it answers with a script instead of the file, and it copies a failed probe's imports.
 2. **Serve the routed system:** Laya (CPU, 0.7 s per decision) in front of Qwen keep96 best-of-N, with Gemma for unseen-code tasks.
    - Both models don't fit in 8 GB at once, so it needs a model swap per routed task, or batching tasks by route.
    - Measure the swap cost.
-3. **Fix the probe prompt's two failure modes,** then retest probing only where it helped: Qwen on B, Gemma on D.
-   - It sometimes answers with a script instead of the file.
-   - It copies a failed probe's imports.
+3. **Grow the fresh task set** (12 → 50+ tasks across all five categories), so lever decisions stop resting on a handful of tier2b tasks.
 4. **Calibrate Laya** (`laya.calibrate` temperature fitting) on disjoint labelled decisions, so its probabilities can be thresholded. The root checkpoint's P(hidden) is high on every task, even though it ranks them well.
 
 ## 10. Files
