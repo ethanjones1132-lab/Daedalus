@@ -854,20 +854,101 @@ fn insert_event(
     Ok(())
 }
 
+/// Exact reason recorded on the completion event; also the string verified at
+/// readback so a matching event (not merely any completed status) is required.
+pub(crate) fn accepted_completion_reason(receipt_ref: &str) -> String {
+    format!("trusted acceptance accepted all required criteria ({receipt_ref})")
+}
+
+/// Verify an already-`completed` Goal's terminal proof exactly: `completed`
+/// status, the exact evidence link, and the exact matching completion event.
+pub(crate) fn verify_goal_terminal_evidence(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+    receipt_ref: &str,
+) -> Result<(), String> {
+    let status: String = conn
+        .query_row("SELECT status FROM goals WHERE id = ?1", [goal_id], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Goal '{goal_id}' not found"))?;
+    if status != "completed" {
+        return Err(format!("Goal '{goal_id}' is not completed"));
+    }
+    let link_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_links \
+             WHERE goal_id = ?1 AND target_kind = 'evidence' AND target_id = ?2)",
+            rusqlite::params![goal_id, receipt_ref],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .map_err(|e| e.to_string())?;
+    if !link_present {
+        return Err("Goal is missing its accepted-evidence link".to_string());
+    }
+    let reason = accepted_completion_reason(receipt_ref);
+    let event_present: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_events \
+             WHERE goal_id = ?1 AND event_type = 'transition' \
+               AND to_status = 'completed' AND reason = ?2)",
+            rusqlite::params![goal_id, &reason],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .map_err(|e| e.to_string())?;
+    if !event_present {
+        return Err("Goal is missing its matching completion event".to_string());
+    }
+    Ok(())
+}
+
 /// Complete a Goal ONLY from fully persisted, verified trusted acceptance
-/// evidence. The caller must have already revalidated the accepted receipt rows
-/// inside the same transaction. This reloads the Goal, requires the current
-/// required criterion set to equal the accepted set, flips the status to
-/// `completed`, writes the lifecycle event, links the accepted evidence receipt,
-/// and returns the completed Goal. It never uses the status-only transition
-/// graph. An already-`completed` goal is returned idempotently when the exact
-/// accepted set still matches.
+/// evidence. This revalidates inside the transaction that:
+///   * the accepted-evidence rows for `acceptance_key` cover exactly
+///     `expected_check_count` checks and the complete required criterion set;
+///   * the current required criterion set equals the accepted set.
+/// It then flips the status to `completed`, writes the exact completion event,
+/// links the accepted evidence receipt, and returns the completed Goal. It never
+/// uses the status-only transition graph. An already-`completed` Goal is returned
+/// idempotently only when the exact links/events and criteria agree.
 pub(crate) fn complete_goal_from_accepted_evidence(
     tx: &rusqlite::Transaction<'_>,
     goal_id: &str,
+    acceptance_key: &str,
     accepted_criterion_ids: &[String],
+    expected_check_count: usize,
     receipt_ref: &str,
 ) -> Result<Goal, String> {
+    // Exact check-level and criterion-level coverage.
+    let accepted_count: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM trusted_acceptance_criteria \
+             WHERE acceptance_key = ?1 AND accepted = 1",
+            [acceptance_key],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if accepted_count as usize != expected_check_count {
+        return Err("accepted evidence rows do not cover every acceptance check".to_string());
+    }
+    let mut accepted_rows: Vec<String> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT criterion_id FROM trusted_acceptance_criteria \
+                 WHERE acceptance_key = ?1 AND accepted = 1 ORDER BY criterion_id",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([acceptance_key], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    accepted_rows.sort();
+
     let goal = load_goal(tx, goal_id)?;
     let mut current: Vec<String> = {
         let mut stmt = tx
@@ -883,19 +964,8 @@ pub(crate) fn complete_goal_from_accepted_evidence(
     accepted.dedup();
     current.sort();
 
-    if goal.status == "completed" {
-        if current == accepted {
-            return Ok(goal);
-        }
-        return Err(
-            "completed goal criterion set no longer matches the accepted evidence".to_string(),
-        );
-    }
-    if TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str()) {
-        return Err(format!(
-            "goal is terminal ('{}'); cannot complete from acceptance",
-            goal.status
-        ));
+    if accepted_rows != accepted {
+        return Err("accepted criterion set does not match the accepted evidence".to_string());
     }
     if current != accepted {
         return Err(
@@ -904,19 +974,31 @@ pub(crate) fn complete_goal_from_accepted_evidence(
         );
     }
 
+    if goal.status == "completed" {
+        verify_goal_terminal_evidence(tx, goal_id, receipt_ref)?;
+        return Ok(goal);
+    }
+    if TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str()) {
+        return Err(format!(
+            "goal is terminal ('{}'); cannot complete from acceptance",
+            goal.status
+        ));
+    }
+
     let now = now_iso();
     tx.execute(
         "UPDATE goals SET status = 'completed', updated_at = ?1 WHERE id = ?2",
         rusqlite::params![&now, goal_id],
     )
     .map_err(|e| e.to_string())?;
+    let reason = accepted_completion_reason(receipt_ref);
     insert_event(
         tx,
         goal_id,
         "transition",
         Some(&goal.status),
         Some("completed"),
-        "trusted acceptance accepted all required criteria",
+        &reason,
         &now,
     )?;
     tx.execute(

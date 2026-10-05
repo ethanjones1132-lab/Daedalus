@@ -85,6 +85,14 @@ pub struct TrustedAcceptanceCheckEvidenceWire {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedAcceptanceResponseWire {
     pub acceptance_id: String,
+    pub execution_id: String,
+    pub action_id: String,
+    pub manifest_id: String,
+    pub manifest_registry_version: i64,
+    pub manifest_content_hash: String,
+    pub manifest_schema_version: i64,
+    pub agent_id: String,
+    pub project_root: String,
     pub bun_instance_id: String,
     pub run_id: String,
     pub outcome: String,
@@ -555,6 +563,21 @@ fn validate_execution(
         return Err("manifest changed since execution; acceptance is stale".to_string());
     }
 
+    // Native receipt runtime identity/bounds must be present.
+    let run_id = execution.run_id.as_deref().unwrap_or("");
+    let bun_run_id = execution.bun_run_id.as_deref().unwrap_or("");
+    let runtime_started = execution.runtime_started_at.as_deref().unwrap_or("");
+    let runtime_finished = execution.runtime_finished_at.as_deref().unwrap_or("");
+    if run_id.trim().is_empty()
+        || bun_run_id.trim().is_empty()
+        || runtime_started.trim().is_empty()
+        || runtime_finished.trim().is_empty()
+    {
+        return Err(
+            "execution receipt is missing runtime run identity or bounds".to_string()
+        );
+    }
+
     let content = parse_content(&manifest)?;
     let declared = content.execution.len();
     let evidence_items = execution
@@ -566,10 +589,32 @@ fn validate_execution(
     if declared == 0 || evidence_items.len() != declared {
         return Err("execution evidence does not cover every declared execution call".to_string());
     }
-    for item in &evidence_items {
-        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status != "ok" {
+    for (index, item) in evidence_items.iter().enumerate() {
+        let item_index = item.get("index").and_then(|v| v.as_i64());
+        if item_index != Some(index as i64) {
+            return Err(format!(
+                "execution evidence at position {index} has a mismatched index; reordered or duplicated evidence is refused"
+            ));
+        }
+        let item_tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        if item_tool != content.execution[index].tool {
+            return Err(format!(
+                "execution evidence at position {index} does not match the declared tool"
+            ));
+        }
+        if item.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Err("execution evidence contains a non-successful call".to_string());
+        }
+        let output_sha = item.get("output_sha256").and_then(|v| v.as_str()).unwrap_or("");
+        if !is_sha256_hex(output_sha) {
+            return Err(format!(
+                "execution evidence at position {index} is missing a valid output hash"
+            ));
+        }
+        if item.get("output_bytes").and_then(|v| v.as_u64()).is_none() {
+            return Err(format!(
+                "execution evidence at position {index} is missing its bounded output size"
+            ));
         }
     }
 
@@ -598,6 +643,23 @@ fn content_acceptance_keys(manifest: &ManifestScope) -> Result<Vec<String>, Stri
     Ok(content.acceptance.keys().cloned().collect())
 }
 
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Record a non-terminal delivery/reconciliation reason on an already-`accepted`
+/// receipt WITHOUT changing its status. Accepted check evidence is never lost.
+fn set_delivery_reason(conn: &Connection, execution_id: &str, reason: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE trusted_acceptance_receipts
+         SET terminal_reason = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE execution_id = ?2 AND status = ?3",
+        params![reason, execution_id, STATUS_ACCEPTED],
+    )
+    .map_err(|e| format!("failed to record acceptance delivery reason: {e}"))?;
+    Ok(())
+}
+
 // ── Command ──────────────────────────────────────────────────
 
 #[tauri::command]
@@ -620,8 +682,8 @@ fn run_acceptance(
 ) -> Result<TrustedAcceptanceReceipt, String> {
     use tauri::Manager;
 
-    // Phase 1: validate, derive identity, and short-circuit idempotent retries.
-    let (manifest, goal_id, checks, acceptance_key) = {
+    // Phase 1: validate, derive identity, and detect an already-accepted attempt.
+    let (manifest, goal_id, checks, acceptance_key, already_accepted) = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
         let execution = load_execution(&conn, execution_id)?;
@@ -660,15 +722,22 @@ fn run_acceptance(
             return Err("acceptance check list is empty or exceeds the bound".to_string());
         }
 
-        // Idempotent reconciliation: a non-accepted existing attempt is returned
-        // as-is; an accepted attempt proceeds to (idempotent) terminal delivery.
-        if let Some(existing) = load_acceptance(&conn, execution_id)? {
-            if existing.status != STATUS_ACCEPTED {
-                return Ok(existing);
-            }
-        }
+        // A non-accepted attempt is returned as-is. An accepted attempt is REUSED
+        // for terminal delivery without re-running any check, so persisted
+        // accepted evidence is never lost or regenerated.
+        let already_accepted = match load_acceptance(&conn, execution_id)? {
+            Some(existing) if existing.status != STATUS_ACCEPTED => return Ok(existing),
+            Some(_) => true,
+            None => false,
+        };
 
-        (manifest, goal.id, checks, execution_id.to_string())
+        (
+            manifest,
+            goal.id,
+            checks,
+            execution_id.to_string(),
+            already_accepted,
+        )
     };
 
     let action_id = manifest
@@ -676,242 +745,292 @@ fn run_acceptance(
         .clone()
         .ok_or_else(|| "manifest has no action binding".to_string())?;
 
-    // Phase 2: dispatch acceptance checks through the private capability path.
-    let request = TrustedAcceptanceRequestWire {
-        acceptance_id: acceptance_key.clone(),
-        execution_id: execution_id.to_string(),
-        action_id: action_id.clone(),
-        manifest_id: manifest.manifest_id.clone(),
-        manifest_registry_version: manifest.registry_version,
-        manifest_content_hash: manifest.content_hash.clone(),
-        manifest_schema_version: manifest.schema_version,
-        agent_id: manifest.agent_id.clone(),
-        project_root: manifest.project_root.clone(),
-        timeout_ms: ACCEPTANCE_TIMEOUT_MS,
-        max_checks: checks.len() as u64,
-        checks: checks.clone(),
-    };
-    let transport = crate::jarvis::memory::transport::native_memory_transport();
-    let response = crate::jarvis::memory::transport::execute_trusted_acceptance(transport, &request);
-
-    // Phase 3: persist attempt + evidence and confirm by readback. The DB guard
-    // is held across terminal delivery (file I/O only in phase 4).
-    let db = app.state::<AppDb>();
-    let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-
-    let mut status = STATUS_AMBIGUOUS;
-    let mut reason: Option<String> = None;
     let mut run_id: Option<String> = None;
     let mut bun_instance_id: Option<String> = None;
     let mut runtime_started: Option<String> = None;
     let mut runtime_finished: Option<String> = None;
-    let mut evidence: Option<serde_json::Value> = None;
     let mut criteria: Vec<AcceptanceCriterionRow> = Vec::new();
 
-    match response {
-        Ok(None) => {
-            status = STATUS_BLOCKED;
-            reason = Some("owned Bun runtime is not live; acceptance was not dispatched".to_string());
+    if already_accepted {
+        // Reuse the persisted accepted evidence; never rerun checks.
+        let db = app.state::<AppDb>();
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let existing = load_acceptance(&conn, execution_id)?
+            .ok_or_else(|| "accepted receipt disappeared".to_string())?;
+        if existing.status != STATUS_ACCEPTED {
+            return Ok(existing);
         }
-        Err(err) => {
-            status = STATUS_AMBIGUOUS;
-            reason = Some(err);
+        if existing.criteria.iter().filter(|c| c.accepted).count() != checks.len() {
+            return Err(
+                "persisted accepted evidence does not cover every acceptance check".to_string(),
+            );
         }
-        Ok(Some(resp)) => {
-            if resp.acceptance_id != acceptance_key {
-                status = STATUS_AMBIGUOUS;
-                reason = Some("acceptance response identity mismatch".to_string());
-            } else {
-                let all_matched = resp.outcome == STATUS_ACCEPTED
-                    && !resp.calls.is_empty()
-                    && resp.calls.iter().all(|c| c.matched);
-                status = if all_matched {
-                    STATUS_ACCEPTED
-                } else {
-                    match resp.outcome.as_str() {
-                        STATUS_BLOCKED => STATUS_BLOCKED,
-                        STATUS_WAITING => STATUS_WAITING,
-                        STATUS_FAILED => STATUS_FAILED,
-                        STATUS_CANCELLED => STATUS_CANCELLED,
-                        STATUS_PARTIAL => STATUS_PARTIAL,
-                        _ => STATUS_REJECTED,
-                    }
-                };
-                reason = resp.reason.clone();
-                run_id = Some(resp.run_id.clone());
-                bun_instance_id = Some(resp.bun_instance_id.clone());
-                runtime_started = Some(resp.started_at.clone());
-                runtime_finished = Some(resp.finished_at.clone());
-                evidence = serde_json::to_value(&resp.calls)
-                    .map_err(|e| format!("failed to serialize acceptance evidence: {e}"))?;
+        criteria = existing
+            .criteria
+            .iter()
+            .map(|c| AcceptanceCriterionRow {
+                criterion_id: c.criterion_id.clone(),
+                tool: c.tool.clone(),
+                check_index: c.check_index,
+                expected_sha256: c.expected_sha256.clone(),
+                actual_sha256: c.actual_sha256.clone(),
+                accepted: c.accepted,
+                evidence: c.evidence.clone(),
+            })
+            .collect();
+        run_id = existing.bun_run_id.clone();
+        bun_instance_id = existing.bun_instance_id.clone();
+        runtime_started = existing.runtime_started_at.clone();
+        runtime_finished = existing.runtime_finished_at.clone();
+    } else {
+        // Phase 2: dispatch acceptance checks through the private capability path.
+        let request = TrustedAcceptanceRequestWire {
+            acceptance_id: acceptance_key.clone(),
+            execution_id: execution_id.to_string(),
+            action_id: action_id.clone(),
+            manifest_id: manifest.manifest_id.clone(),
+            manifest_registry_version: manifest.registry_version,
+            manifest_content_hash: manifest.content_hash.clone(),
+            manifest_schema_version: manifest.schema_version,
+            agent_id: manifest.agent_id.clone(),
+            project_root: manifest.project_root.clone(),
+            timeout_ms: ACCEPTANCE_TIMEOUT_MS,
+            max_checks: checks.len() as u64,
+            checks: checks.clone(),
+        };
+        let transport = crate::jarvis::memory::transport::native_memory_transport();
+        let response =
+            crate::jarvis::memory::transport::execute_trusted_acceptance(transport, &request);
 
-                let mut by_key: std::collections::BTreeMap<
-                    (String, usize),
-                    &TrustedAcceptanceCheckEvidenceWire,
-                > = std::collections::BTreeMap::new();
-                for c in &resp.calls {
-                    by_key.insert((c.criterion_id.clone(), c.index), c);
-                }
-                for check in &checks {
-                    let actual = by_key.get(&(check.criterion_id.clone(), check.index));
-                    let accepted = actual
-                        .map(|c| {
-                            c.status == "ok"
-                                && c.matched
-                                && c.output_sha256.as_deref()
-                                    == Some(check.expect_sha256.as_str())
-                        })
-                        .unwrap_or(false);
-                    criteria.push(AcceptanceCriterionRow {
-                        criterion_id: check.criterion_id.clone(),
-                        tool: check.tool.clone(),
-                        check_index: check.index as i64,
-                        expected_sha256: check.expect_sha256.clone(),
-                        actual_sha256: actual.and_then(|c| c.output_sha256.clone()),
-                        accepted,
-                        evidence: actual.and_then(|c| serde_json::to_value(c).ok()),
-                    });
+        // Phase 3: persist attempt + evidence and confirm by readback.
+        let db = app.state::<AppDb>();
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+        let mut status = STATUS_AMBIGUOUS;
+        let mut reason: Option<String> = None;
+        let mut evidence: Option<serde_json::Value> = None;
+
+        match response {
+            Ok(None) => {
+                status = STATUS_BLOCKED;
+                reason = Some(
+                    "owned Bun runtime is not live; acceptance was not dispatched".to_string(),
+                );
+            }
+            Err(err) => {
+                status = STATUS_AMBIGUOUS;
+                reason = Some(err);
+            }
+            Ok(Some(resp)) => {
+                // Exact echo + one-to-one coverage integrity. Any mismatch is
+                // nonterminal/ambiguous and never finalizes.
+                let echo_ok = resp.acceptance_id == acceptance_key
+                    && resp.execution_id == execution_id
+                    && resp.action_id == action_id
+                    && resp.manifest_id == manifest.manifest_id
+                    && resp.manifest_registry_version == manifest.registry_version
+                    && resp.manifest_content_hash == manifest.content_hash
+                    && resp.manifest_schema_version == manifest.schema_version
+                    && resp.agent_id == manifest.agent_id
+                    && resp.project_root == manifest.project_root
+                    && !resp.bun_instance_id.trim().is_empty()
+                    && !resp.run_id.trim().is_empty()
+                    && !resp.started_at.trim().is_empty()
+                    && !resp.finished_at.trim().is_empty()
+                    && resp.calls.len() == checks.len();
+
+                if !echo_ok {
+                    status = STATUS_AMBIGUOUS;
+                    reason = Some(
+                        "acceptance response did not echo the requested identity".to_string(),
+                    );
+                } else {
+                    let mut seen: std::collections::BTreeSet<(String, usize)> =
+                        std::collections::BTreeSet::new();
+                    let mut unique = true;
+                    let mut by_key: std::collections::BTreeMap<
+                        (String, usize),
+                        &TrustedAcceptanceCheckEvidenceWire,
+                    > = std::collections::BTreeMap::new();
+                    for c in &resp.calls {
+                        if !seen.insert((c.criterion_id.clone(), c.index)) {
+                            unique = false;
+                            break;
+                        }
+                        by_key.insert((c.criterion_id.clone(), c.index), c);
+                    }
+                    if !unique {
+                        status = STATUS_AMBIGUOUS;
+                        reason = Some(
+                            "acceptance response contained duplicate check identities".to_string(),
+                        );
+                    } else {
+                        let mut all_ok = true;
+                        for check in &checks {
+                            let actual = by_key.get(&(check.criterion_id.clone(), check.index));
+                            let ok = actual
+                                .map(|c| {
+                                    c.tool == check.tool
+                                        && c.status == "ok"
+                                        && c.matched
+                                        && c.output_bytes.is_some()
+                                        && c.output_sha256.as_deref()
+                                            == Some(check.expect_sha256.as_str())
+                                })
+                                .unwrap_or(false);
+                            if !ok {
+                                all_ok = false;
+                            }
+                            criteria.push(AcceptanceCriterionRow {
+                                criterion_id: check.criterion_id.clone(),
+                                tool: check.tool.clone(),
+                                check_index: check.index as i64,
+                                expected_sha256: check.expect_sha256.clone(),
+                                actual_sha256: actual.and_then(|c| c.output_sha256.clone()),
+                                accepted: ok,
+                                evidence: actual.and_then(|c| serde_json::to_value(c).ok()),
+                            });
+                        }
+                        if all_ok && resp.outcome == STATUS_ACCEPTED {
+                            status = STATUS_ACCEPTED;
+                        } else {
+                            status = match resp.outcome.as_str() {
+                                STATUS_BLOCKED => STATUS_BLOCKED,
+                                STATUS_WAITING => STATUS_WAITING,
+                                STATUS_FAILED => STATUS_FAILED,
+                                STATUS_CANCELLED => STATUS_CANCELLED,
+                                STATUS_PARTIAL => STATUS_PARTIAL,
+                                _ => STATUS_REJECTED,
+                            };
+                        }
+                        reason = resp.reason.clone();
+                        run_id = Some(resp.run_id.clone());
+                        bun_instance_id = Some(resp.bun_instance_id.clone());
+                        runtime_started = Some(resp.started_at.clone());
+                        runtime_finished = Some(resp.finished_at.clone());
+                        evidence = serde_json::to_value(&resp.calls)
+                            .map_err(|e| format!("failed to serialize acceptance evidence: {e}"))?;
+                    }
                 }
             }
         }
+
+        let receipt = write_and_confirm(
+            &conn,
+            execution_id,
+            status,
+            reason.as_deref(),
+            run_id.as_deref(),
+            bun_instance_id.as_deref(),
+            runtime_started.as_deref(),
+            runtime_finished.as_deref(),
+            evidence.as_ref(),
+            &criteria,
+            &action_id,
+            &manifest.manifest_id,
+            &goal_id,
+        )?;
+        if receipt.status != STATUS_ACCEPTED {
+            return Ok(receipt);
+        }
     }
 
-    let receipt = write_and_confirm(
-        &conn,
-        execution_id,
-        status,
-        reason.as_deref(),
-        run_id.as_deref(),
-        bun_instance_id.as_deref(),
-        runtime_started.as_deref(),
-        runtime_finished.as_deref(),
-        evidence.as_ref(),
-        &criteria,
-        &action_id,
-        &manifest.manifest_id,
-        &goal_id,
-    )?;
-
-    if receipt.status != STATUS_ACCEPTED {
-        return Ok(receipt);
-    }
-
-    // Phase 4 (E): mark the exact Action Registry action terminally done.
+    // Phase 4 (E): mark the exact Action Registry action terminally done. This
+    // performs registry file I/O (and a DB config lookup), so it MUST run with
+    // NO DB lock held.
+    let db = app.state::<AppDb>();
     let evidence_report = serde_json::json!({
-        "run_id": run_id,
+        "run_id": &run_id,
         "status": "accepted",
         "acceptance_result": "accepted",
-        "started_at": runtime_started,
-        "finished_at": runtime_finished,
+        "started_at": &runtime_started,
+        "finished_at": &runtime_finished,
         "execution_id": execution_id,
-        "manifest_id": manifest.manifest_id,
-        "goal_id": goal_id,
+        "manifest_id": &manifest.manifest_id,
+        "goal_id": &goal_id,
     });
     let terminal = crate::commands::action_registry::finalize_action_registry_done(
         db.inner(),
         &action_id,
         &evidence_report,
     )
-    .and_then(|proof| {
-        crate::commands::action_registry::verify_action_registry_done(db.inner(), &proof.action_id)
+    .and_then(|_| {
+        crate::commands::action_registry::verify_action_registry_done(
+            db.inner(),
+            &action_id,
+            &evidence_report,
+        )
     });
     if let Err(e) = terminal {
-        let ambiguous = write_and_confirm(
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = set_delivery_reason(
             &conn,
             execution_id,
-            STATUS_AMBIGUOUS,
-            Some(&format!("Action Registry terminal write not confirmed: {e}")),
-            run_id.as_deref(),
-            bun_instance_id.as_deref(),
-            runtime_started.as_deref(),
-            runtime_finished.as_deref(),
-            evidence.as_ref(),
-            &criteria,
-            &action_id,
-            &manifest.manifest_id,
-            &goal_id,
-        )?;
-        return Ok(ambiguous);
+            &format!("Action Registry terminal not confirmed: {e}"),
+        );
+        let mut receipt = load_acceptance(&conn, execution_id)?
+            .ok_or_else(|| "accepted receipt missing after registry attempt".to_string())?;
+        receipt.confirmed = false;
+        return Ok(receipt);
     }
 
-    // Phase 5 (F): complete the Goal from the persisted accepted rows in one
-    // transaction, revalidating the accepted criterion set.
+    // Phase 5 (F): revalidate persisted state, then complete the Goal from the
+    // accepted rows in one transaction.
     let accepted_criterion_ids: Vec<String> = criteria
         .iter()
         .filter(|c| c.accepted)
         .map(|c| c.criterion_id.clone())
         .collect();
+    let receipt_ref = format!("trusted_acceptance:{acceptance_key}");
     let complete_result = (|| -> Result<(), String> {
+        let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+        let receipt_now = load_acceptance(&conn, execution_id)?
+            .ok_or_else(|| "acceptance receipt missing before Goal completion".to_string())?;
+        if receipt_now.status != STATUS_ACCEPTED {
+            return Err("acceptance receipt is no longer accepted".to_string());
+        }
+        let execution_now = load_execution(&conn, execution_id)?;
+        validate_execution(&conn, &execution_now)?;
+        let manifest_now = load_manifest_scope(&conn, &manifest.manifest_id)?
+            .ok_or_else(|| "trusted manifest not found before Goal completion".to_string())?;
+        let keys_now = content_acceptance_keys(&manifest_now)?;
+        derive_goal(&conn, &manifest_now, &keys_now)?;
+
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-
-        let accepted_count: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM trusted_acceptance_criteria \
-                 WHERE acceptance_key = ?1 AND accepted = 1",
-                [&acceptance_key],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if accepted_count as usize != checks.len() {
-            return Err("accepted evidence rows do not cover every acceptance check".to_string());
-        }
-        let mut distinct: Vec<String> = {
-            let mut stmt = tx
-                .prepare(
-                    "SELECT DISTINCT criterion_id FROM trusted_acceptance_criteria \
-                     WHERE acceptance_key = ?1 AND accepted = 1 ORDER BY criterion_id",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([&acceptance_key], |row| row.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
-        };
-        distinct.sort();
-        let mut expected_criteria = content_acceptance_keys(&manifest)?;
-        expected_criteria.sort();
-        if distinct != expected_criteria {
-            return Err("accepted criterion set does not match the manifest".to_string());
-        }
-
         crate::commands::goals::complete_goal_from_accepted_evidence(
             &tx,
             &goal_id,
+            &acceptance_key,
             &accepted_criterion_ids,
-            &format!("trusted_acceptance:{acceptance_key}"),
+            checks.len(),
+            &receipt_ref,
         )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })();
 
     if let Err(e) = complete_result {
-        let ambiguous = write_and_confirm(
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = set_delivery_reason(
             &conn,
             execution_id,
-            STATUS_AMBIGUOUS,
-            Some(&format!("Goal completion not confirmed: {e}")),
-            run_id.as_deref(),
-            bun_instance_id.as_deref(),
-            runtime_started.as_deref(),
-            runtime_finished.as_deref(),
-            evidence.as_ref(),
-            &criteria,
-            &action_id,
-            &manifest.manifest_id,
-            &goal_id,
-        )?;
-        return Ok(ambiguous);
+            &format!("Goal completion not confirmed: {e}"),
+        );
+        let mut receipt = load_acceptance(&conn, execution_id)?
+            .ok_or_else(|| "accepted receipt missing after Goal attempt".to_string())?;
+        receipt.confirmed = false;
+        return Ok(receipt);
     }
 
-    // Exact readback before confirming.
-    let goal_status: String = conn
-        .query_row("SELECT status FROM goals WHERE id = ?1", [&goal_id], |row| {
-            row.get(0)
-        })
-        .map_err(|e| e.to_string())?;
+    // Exact readback before confirming: Goal terminal proof, receipt + criteria.
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    crate::commands::goals::verify_goal_terminal_evidence(&conn, &goal_id, &receipt_ref)?;
     let mut receipt = load_acceptance(&conn, execution_id)?
         .ok_or_else(|| "acceptance receipt missing after confirmation".to_string())?;
-    receipt.confirmed = receipt.status == STATUS_ACCEPTED && goal_status == "completed";
+    let accepted_ok = receipt.status == STATUS_ACCEPTED
+        && receipt.criteria.iter().filter(|c| c.accepted).count() == checks.len();
+    receipt.confirmed = accepted_ok;
     Ok(receipt)
 }
 

@@ -107,6 +107,14 @@ export interface TrustedAcceptanceCheckEvidence {
 
 export interface TrustedAcceptanceResponse {
   acceptance_id: string;
+  execution_id: string;
+  action_id: string;
+  manifest_id: string;
+  manifest_registry_version: number;
+  manifest_content_hash: string;
+  manifest_schema_version: number;
+  agent_id: string;
+  project_root: string;
   bun_instance_id: string;
   run_id: string;
   outcome:
@@ -432,6 +440,14 @@ async function executeTrustedAcceptance(
     evidence: TrustedAcceptanceCheckEvidence[],
   ): TrustedAcceptanceResponse => ({
     acceptance_id: request.acceptance_id,
+    execution_id: request.execution_id,
+    action_id: request.action_id,
+    manifest_id: request.manifest_id,
+    manifest_registry_version: request.manifest_registry_version,
+    manifest_content_hash: request.manifest_content_hash,
+    manifest_schema_version: request.manifest_schema_version,
+    agent_id: request.agent_id,
+    project_root: request.project_root,
     bun_instance_id: bunInstanceId,
     run_id: runId,
     outcome,

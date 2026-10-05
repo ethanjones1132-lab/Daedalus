@@ -1824,12 +1824,11 @@ pub fn apply_trusted_acceptance_migrations(conn: &Connection) -> Result<(), rusq
             );
             CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_criteria_key
                 ON trusted_acceptance_criteria(acceptance_key, criterion_id);
-
-            CREATE INDEX IF NOT EXISTS idx_trusted_executions_runtime
-                ON trusted_action_executions(status, runtime_finished_at);
             "#,
         )?;
-        // Migration-safe runtime-bound columns on the execution receipt.
+        // Migration-safe runtime-bound columns on the execution receipt. These
+        // MUST be added before the index that references `runtime_finished_at`,
+        // so a pre-existing database schema migrates cleanly.
         add_column_if_missing(
             conn,
             "trusted_action_executions",
@@ -1841,6 +1840,12 @@ pub fn apply_trusted_acceptance_migrations(conn: &Connection) -> Result<(), rusq
             "trusted_action_executions",
             "runtime_finished_at",
             "runtime_finished_at TEXT",
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_runtime
+                ON trusted_action_executions(status, runtime_finished_at);
+            "#,
         )?;
         Ok(())
     })();

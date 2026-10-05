@@ -492,19 +492,49 @@ fn write_bucket_value(path: &Path, value: &serde_json::Value) -> Result<(), Stri
     Ok(())
 }
 
-fn find_action<'a>(value: &'a serde_json::Value, action_id: &str) -> Option<&'a serde_json::Value> {
+/// Count the actions in a bucket with the exact id. Duplicates are surfaced, not
+/// collapsed, so callers can refuse an ambiguous registry state.
+fn matching_count(value: &serde_json::Value, action_id: &str) -> usize {
     value
         .get("actions")
         .and_then(|a| a.as_array())
-        .and_then(|actions| {
+        .map(|actions| {
             actions
                 .iter()
-                .find(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
+                .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
+                .count()
         })
+        .unwrap_or(0)
 }
 
-fn proof_for(value: &serde_json::Value, action_id: &str) -> Option<ActionRegistryTerminalProof> {
-    let action = find_action(value, action_id)?;
+/// The unique action row for `action_id`, requiring exactly one match.
+fn unique_action<'a>(
+    value: &'a serde_json::Value,
+    action_id: &str,
+    bucket: &str,
+) -> Result<&'a serde_json::Value, String> {
+    let actions = value
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| format!("{bucket} bucket is malformed"))?;
+    let mut matches = actions
+        .iter()
+        .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id));
+    let first = matches
+        .next()
+        .ok_or_else(|| format!("action '{action_id}' is not present in the {bucket} bucket"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "action '{action_id}' appears more than once in the {bucket} bucket; reconciliation required"
+        ));
+    }
+    Ok(first)
+}
+
+fn proof_from_action(
+    action: &serde_json::Value,
+    action_id: &str,
+) -> ActionRegistryTerminalProof {
     let run_id = action
         .get("execution_evidence")
         .and_then(|e| e.get("run_id"))
@@ -517,23 +547,31 @@ fn proof_for(value: &serde_json::Value, action_id: &str) -> Option<ActionRegistr
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    Some(ActionRegistryTerminalProof {
+    ActionRegistryTerminalProof {
         action_id: action_id.to_string(),
         done_present: true,
         active_absent: false,
         run_id,
         acceptance_result,
-    })
+    }
+}
+
+/// Exact persisted terminal evidence for a done row: status must be `done` and
+/// both evidence fields must equal the expected payload exactly.
+fn done_row_matches(action: &serde_json::Value, evidence: &serde_json::Value) -> bool {
+    let status_ok = action.get("status").and_then(|v| v.as_str()) == Some("done");
+    let exec_ok = action.get("execution_evidence") == Some(evidence);
+    let accept_ok = action.get("acceptance_evidence") == Some(evidence);
+    status_ok && exec_ok && accept_ok
 }
 
 /// After all trusted acceptance checks pass, mark exactly one Action Registry
 /// action terminally done. The exact existing action object is moved to the
 /// `done` bucket with its unknown JSON fields preserved; `status` and the
-/// runtime execution/acceptance evidence are updated. Both files are then
-/// re-read: the done row must be present exactly once with the expected
-/// evidence, and the action must be absent from `active`. Any mismatch returns
-/// an error (the caller persists an ambiguous/pending state and never claims
-/// terminal).
+/// runtime execution/acceptance evidence are updated. Refuses any ambiguous or
+/// duplicate registry state and never silently removes rows. Both files are
+/// re-read and must show exactly one done row with exact evidence and zero
+/// active rows before terminal is proven.
 pub fn finalize_action_registry_done(
     db: &AppDb,
     action_id: &str,
@@ -546,23 +584,39 @@ pub fn finalize_action_registry_done(
     let mut active = read_bucket_value(&active_path)?;
     let mut done = read_bucket_value(&done_path)?;
 
-    if find_action(&done, action_id).is_some() {
-        // Idempotent: already terminal. Confirm active is clear.
-        let active_absent = find_action(&active, action_id).is_none();
-        if !active_absent {
+    let active_count = matching_count(&active, action_id);
+    let done_count = matching_count(&done, action_id);
+    if done_count > 1 {
+        return Err(format!(
+            "action '{action_id}' appears {done_count} times in the done bucket; reconciliation required"
+        ));
+    }
+
+    if done_count == 1 {
+        // Idempotent: exactly one done row, no active row, and exact evidence.
+        if active_count != 0 {
             return Err(format!(
                 "action '{action_id}' is present in both done and active; reconciliation required"
             ));
         }
-        let mut proof = proof_for(&done, action_id)
-            .ok_or_else(|| format!("done row for '{action_id}' is malformed"))?;
+        let done_row = unique_action(&done, action_id, "done")?;
+        if !done_row_matches(done_row, evidence) {
+            return Err(format!(
+                "action '{action_id}' done row does not match the expected terminal evidence"
+            ));
+        }
+        let mut proof = proof_from_action(done_row, action_id);
         proof.active_absent = true;
         return Ok(proof);
     }
 
-    let action = find_action(&active, action_id)
-        .ok_or_else(|| format!("action '{action_id}' is not present in the active bucket"))?
-        .clone();
+    // Fresh terminal write requires exactly one active row.
+    if active_count != 1 {
+        return Err(format!(
+            "action '{action_id}' must have exactly one active row to terminate (found {active_count})"
+        ));
+    }
+    let action = unique_action(&active, action_id, "active")?.clone();
     let status = action
         .get("status")
         .and_then(|v| v.as_str())
@@ -582,13 +636,12 @@ pub fn finalize_action_registry_done(
     terminal["execution_evidence"] = evidence.clone();
     terminal["acceptance_evidence"] = evidence.clone();
 
-    // Move: append/replace in done, remove from active.
+    // Move the single active row into done, removing it from active.
     {
         let arr = done
             .get_mut("actions")
             .and_then(|a| a.as_array_mut())
             .ok_or_else(|| "done bucket is malformed".to_string())?;
-        arr.retain(|a| a.get("id").and_then(|id| id.as_str()) != Some(action_id));
         arr.push(terminal);
     }
     {
@@ -607,44 +660,54 @@ pub fn finalize_action_registry_done(
     // Exact readback.
     let done_after = read_bucket_value(&done_path)?;
     let active_after = read_bucket_value(&active_path)?;
-    let done_matches = done_after
-        .get("actions")
-        .and_then(|a| a.as_array())
-        .map(|actions| {
-            actions
-                .iter()
-                .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
-                .count()
-        })
-        == Some(1);
-    let active_absent = find_action(&active_after, action_id).is_none();
-    if !done_matches || !active_absent {
+    if matching_count(&done_after, action_id) != 1
+        || matching_count(&active_after, action_id) != 0
+    {
         return Err(format!(
             "action '{action_id}' terminal write could not be confirmed; reconciliation required"
         ));
     }
-    let mut proof = proof_for(&done_after, action_id)
-        .ok_or_else(|| format!("done row for '{action_id}' is missing after write"))?;
+    let done_row = unique_action(&done_after, action_id, "done")?;
+    if !done_row_matches(done_row, evidence) {
+        return Err(format!(
+            "action '{action_id}' done row evidence does not match after write"
+        ));
+    }
+    let mut proof = proof_from_action(done_row, action_id);
     proof.active_absent = true;
     Ok(proof)
 }
 
-/// Read back an already-terminal action row exactly (idempotent reconciliation).
+/// Read back an already-terminal action row and verify it exactly. Requires a
+/// single done row, zero active rows, `status = done`, and exact persisted
+/// execution/acceptance evidence equal to `evidence`; unrelated or stale done
+/// evidence is never accepted as proof.
 pub fn verify_action_registry_done(
     db: &AppDb,
     action_id: &str,
+    evidence: &serde_json::Value,
 ) -> Result<ActionRegistryTerminalProof, String> {
     let dir = data_dir(db)?;
     let done = read_bucket_value(&dir.join("done.json"))?;
     let active = read_bucket_value(&dir.join("active.json"))?;
-    let mut proof = proof_for(&done, action_id)
-        .ok_or_else(|| format!("action '{action_id}' is not in the done bucket"))?;
-    proof.active_absent = find_action(&active, action_id).is_none();
-    if !proof.active_absent {
+    if matching_count(&done, action_id) != 1 {
+        return Err(format!(
+            "action '{action_id}' does not have exactly one done row"
+        ));
+    }
+    if matching_count(&active, action_id) != 0 {
         return Err(format!(
             "action '{action_id}' is still present in the active bucket"
         ));
     }
+    let done_row = unique_action(&done, action_id, "done")?;
+    if !done_row_matches(done_row, evidence) {
+        return Err(format!(
+            "action '{action_id}' done row does not match the expected terminal evidence"
+        ));
+    }
+    let mut proof = proof_from_action(done_row, action_id);
+    proof.active_absent = true;
     Ok(proof)
 }
 
