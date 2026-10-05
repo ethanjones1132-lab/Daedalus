@@ -184,6 +184,98 @@ export async function resolveLocalTarget(
   );
 }
 
+/**
+ * A fixed, manifest-pinned Ollama target for the paired learning evaluator.
+ * Unlike `resolveLocalTarget`, this never probes fallback candidates: it contacts
+ * exactly `baseUrl` and requires the exact `model` name and installed artifact
+ * `digest`, so there is no fallback to a configured remote url, effective host
+ * IP, another daemon, another model, or a changed digest.
+ */
+export interface FixedOllamaTargetPin {
+  baseUrl: string;
+  model: string;
+  /** Immutable `/api/tags` artifact digest (`sha256:<hex>`). */
+  digest: string;
+  supportsNativeTools: boolean;
+}
+
+function normalizePinnedModelName(value: string): string {
+  return value.trim().toLowerCase().replace(/:latest$/, "");
+}
+
+function normalizePinnedArtifactDigest(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const hex = value.startsWith("sha256:") ? value.slice("sha256:".length) : value;
+  return /^[0-9a-f]{64}$/.test(hex) ? `sha256:${hex}` : null;
+}
+
+function isLoopbackBaseUrl(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Revalidate the exact pinned target against the live daemon immediately before
+ * dispatch and fail closed on any drift. Only `/api/tags` and `/api/show` are
+ * issued here — never a chat completion.
+ */
+export async function resolveFixedOllamaTarget(
+  pin: FixedOllamaTargetPin,
+  deps: OllamaTransportDeps = {},
+): Promise<LocalOllamaTarget> {
+  if (!isLoopbackBaseUrl(pin.baseUrl)) {
+    throw new Error(`fixed Ollama target refused: base url is not loopback (${pin.baseUrl})`);
+  }
+  const fetchFn = deps.fetch ?? fetch;
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 3000);
+  let tagsResp: Response;
+  try {
+    tagsResp = await fetchFn(`${pin.baseUrl}/api/tags`, { signal: ctrl.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!tagsResp.ok) {
+    throw new Error(`fixed Ollama target unreachable: ${pin.baseUrl} -> HTTP ${tagsResp.status}`);
+  }
+  const tagsJson = (await tagsResp.json()) as {
+    models?: Array<{ name?: string; model?: string; digest?: string }>;
+  };
+  const models = tagsJson.models ?? [];
+  const wanted = normalizePinnedModelName(pin.model);
+  const match = models.find((entry) => normalizePinnedModelName(entry.name ?? entry.model ?? "") === wanted);
+  if (!match) {
+    throw new Error(`fixed Ollama target refused: model ${pin.model} not installed at ${pin.baseUrl}`);
+  }
+  const liveDigest = normalizePinnedArtifactDigest(match.digest);
+  if (!liveDigest) {
+    throw new Error(`fixed Ollama target refused: model ${pin.model} has no artifact digest`);
+  }
+  if (liveDigest !== pin.digest) {
+    throw new Error(
+      `fixed Ollama target refused: model artifact digest drift (live=${liveDigest} frozen=${pin.digest})`,
+    );
+  }
+  const resolvedName = match.name ?? match.model ?? pin.model;
+  const supportsNativeTools = await probeSupportsNativeTools(fetchFn, pin.baseUrl, resolvedName);
+  if (supportsNativeTools !== pin.supportsNativeTools) {
+    throw new Error(
+      `fixed Ollama target refused: native-tools capability drift ` +
+        `(live=${supportsNativeTools} frozen=${pin.supportsNativeTools})`,
+    );
+  }
+  return {
+    baseUrl: pin.baseUrl,
+    model: resolvedName,
+    supportsNativeTools,
+    installedModels: models.map((entry) => entry.name ?? entry.model ?? "").filter(Boolean),
+  };
+}
+
 function combineAbortSignals(
   timeoutMs: number,
   stageAbort?: AbortSignal,

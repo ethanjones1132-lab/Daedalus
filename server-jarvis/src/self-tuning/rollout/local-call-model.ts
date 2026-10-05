@@ -27,7 +27,10 @@ import {
 import type { ToolDefinition } from "../../tool-types";
 import {
   callOllamaChat,
+  resolveFixedOllamaTarget,
   resolveLocalTarget,
+  type FixedOllamaTargetPin,
+  type LocalOllamaTarget,
   type OllamaTransportDeps,
 } from "./ollama-local-transport";
 import { applyAgentSystemPrompt } from "../../orchestration/agent-system-prompt";
@@ -68,6 +71,14 @@ export interface MakeLocalCallModelOptions {
    * the localModels intersection (still resolves target per call via transport).
    */
   localModelsOverride?: readonly string[];
+  /**
+   * Fixed, manifest-pinned target for the paired learning evaluator. When set,
+   * every call bypasses pool selection and `resolveLocalTarget` entirely and
+   * contacts exactly this loopback base url + model, revalidating the installed
+   * artifact digest and native-tools capability before dispatch. There is no
+   * fallback to another endpoint, daemon, or model.
+   */
+  fixedTarget?: FixedOllamaTargetPin;
 }
 
 export type LocalCallModel = CallModelFn & {
@@ -178,41 +189,50 @@ export function makeLocalCallModel(
   const callModel: LocalCallModel = async (messages, options) => {
     const stage = options?.stageLabel || "executor";
     const tools: ToolDefinition[] = (options?.tools as ToolDefinition[] | undefined) ?? [];
-    const models = await localModels();
 
-    const pool = new AgentPool(routableOrchestratorAgents(cfg));
-    const exclude = options?.excludeModels
-      ? new Set(options.excludeModels)
-      : undefined;
-    const remainingStageMs =
-      options?.stageAbort && typeof (options as { remainingStageMs?: number }).remainingStageMs === "number"
-        ? (options as { remainingStageMs?: number }).remainingStageMs
+    let target: LocalOllamaTarget;
+    if (opts.fixedTarget) {
+      // Manifest-pinned evaluator path: exact loopback endpoint + model only,
+      // with `/api/tags` artifact digest and `/api/show` capability revalidated
+      // before every dispatch. No pool selection and no fallback candidate.
+      target = await resolveFixedOllamaTarget(opts.fixedTarget, deps);
+    } else {
+      const models = await localModels();
+
+      const pool = new AgentPool(routableOrchestratorAgents(cfg));
+      const exclude = options?.excludeModels
+        ? new Set(options.excludeModels)
         : undefined;
+      const remainingStageMs =
+        options?.stageAbort && typeof (options as { remainingStageMs?: number }).remainingStageMs === "number"
+          ? (options as { remainingStageMs?: number }).remainingStageMs
+          : undefined;
 
-    // remainingStageMs is not on CallModelFn options today; compute from stageAbort
-    // is not available either. Pass undefined — pool still injects locals when
-    // ollamaAvailable is true and window is unset.
-    void remainingStageMs;
+      // remainingStageMs is not on CallModelFn options today; compute from stageAbort
+      // is not available either. Pass undefined — pool still injects locals when
+      // ollamaAvailable is true and window is unset.
+      void remainingStageMs;
 
-    const pick = pool.pickFor(
-      stage,
-      "general" as TaskType,
-      exclude,
-      {
-        ollamaAvailable: true,
-        localModels: models,
-        complexity: options?.complexity as Complexity | undefined,
-        preferStrong: options?.preferStrongModel,
-      },
-    );
+      const pick = pool.pickFor(
+        stage,
+        "general" as TaskType,
+        exclude,
+        {
+          ollamaAvailable: true,
+          localModels: models,
+          complexity: options?.complexity as Complexity | undefined,
+          preferStrong: options?.preferStrongModel,
+        },
+      );
 
-    let desiredModel = pick?.provider === "ollama" ? pick.model_id : undefined;
-    if (!desiredModel || pick?.provider !== "ollama") {
-      stats.nonLocalPickFallbacks += 1;
-      desiredModel = models[0] ?? cfg.ollama.model;
+      let desiredModel = pick?.provider === "ollama" ? pick.model_id : undefined;
+      if (!desiredModel || pick?.provider !== "ollama") {
+        stats.nonLocalPickFallbacks += 1;
+        desiredModel = models[0] ?? cfg.ollama.model;
+      }
+
+      target = await resolveLocalTarget(cfg, desiredModel, deps);
     }
-
-    const target = await resolveLocalTarget(cfg, desiredModel, deps);
     // Production semantics: native-vs-text from /api/show capability.
     const supportsNative = target.supportsNativeTools;
     const useTextTools = tools.length > 0 && !supportsNative;

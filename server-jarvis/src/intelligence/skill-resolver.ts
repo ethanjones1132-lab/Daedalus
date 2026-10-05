@@ -36,6 +36,17 @@ export interface ResolveSkillsOptions {
   stage?: StageName;
   maxSkills?: number;
   maxTokens?: number;
+  /**
+   * Explicit, evaluation-only skill override (at most one candidate).
+   *
+   * The paired learning evaluator supplies this from a frozen manifest; it is
+   * never read from a user Skill store, route payload, environment variable,
+   * or global mutable registry. When present it flows through the exact same
+   * trigger matching, ordering, rendering, and token cap as a promoted skill,
+   * and it is never persisted or promoted. A malformed override is refused
+   * loudly rather than silently degrading the arm to baseline behaviour.
+   */
+  injectedSkill?: SkillCandidate;
 }
 
 function triggerMatches(candidate: SkillCandidate, taskType: TaskType, message: string): boolean {
@@ -96,8 +107,22 @@ export function resolveSkillsForTurn(
     : stageOrOptions ?? {};
   const maxSkills = normalizeLimit(options.maxSkills, MAX_PROMOTED_SKILLS_PER_TURN);
   const maxTokens = normalizeLimit(options.maxTokens, PROMOTED_SKILL_BLOCK_BUDGET_TOKENS);
+  // Evaluation-only injection: validated up front, then matched/rendered/capped
+  // exactly like a promoted skill. It never touches the user Skill store.
+  const injected: SkillCandidate[] = [];
+  if (options.injectedSkill !== undefined) {
+    if (!isValidSkillCandidate(options.injectedSkill)) {
+      throw new Error("resolveSkillsForTurn: injectedSkill is not a valid skill candidate");
+    }
+    if (triggerMatches(options.injectedSkill, taskType, message)) {
+      injected.push(options.injectedSkill);
+    }
+  }
   const candidates = listSkillCandidates("promoted").filter((candidate) => isValidSkillCandidate(candidate) && candidate.source_run_ids.length > 0);
-  const allMatches = candidates.filter((candidate) => triggerMatches(candidate, taskType, message));
+  const allMatches = [
+    ...injected,
+    ...candidates.filter((candidate) => triggerMatches(candidate, taskType, message)),
+  ];
   if (allMatches.length === 0) return emptyResolution();
 
   const header = options.stage
