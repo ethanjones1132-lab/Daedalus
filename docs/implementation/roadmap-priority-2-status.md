@@ -2,7 +2,7 @@
 
 **As of:** 2026-10-05
 **Scope:** Roadmap Priority #2, “Connect goals, commitments, scheduling, and execution.”
-**State:** Four source plans are complete; Part 1 source checkpoint `7bf50fafe01f785252874ccb09ad8de23d4a6a45` is committed and all five allowed checks passed against that exact SHA. Part 2 is next. No Priority #2 runtime acceptance has been run.
+**State:** Four source plans are complete; Parts 1 and 2 source checkpoints are committed and all five allowed checks passed against each exact SHA. Part 3 is active. No Priority #2 runtime acceptance has been run.
 
 ## Sequencing ruling
 
@@ -44,3 +44,9 @@ Independent coordinator checks against committed source SHA `7bf50fafe01f7852528
 Luna owns plans, reviews, coordination and allowed non-test checks. Every production source change is executed only by OpenCode CLI model `opencode-go/deepseek-v4.1-flash`. Tests, fixtures, test declarations, scripted providers, live inference/runtime/restart acceptance, packaging and installation remain NOT RUN. Compiler/type/build/diff/source checks may be recorded by exact source SHA.
 
 Part 1 review and allowed-check evidence: [Part 1 progress](roadmap-priority-2-part-1-progress.md). Source commit SHA: `7bf50fafe01f785252874ccb09ad8de23d4a6a45`. Detailed sequential checkpoints are tracked in the coordinator ledger at `/Users/charlottehughes/Documents/Codex/2026-10-04/ca/work/opencode-memory/PHASE2-COORDINATION.md`.
+
+## Part 2 source checkpoint — Goal-linked execution and recovery
+
+Source commit `1157cc6fff5dd8fb09ae9af007e681ec01f2dc19` adds a native-validated Goal run registration bound to Goal/Agent/workspace, Session, turn, exact persisted user source-row ID and SHA-256 body hash, with a stable TaskRun/run identity. The Bun process consumes it once only when the actual `/chat/stream` request carries the same bounded source-row ID and exact message body. Direct UI and native relay paths transport that identity; missing or mismatched source IDs remain Goal-less. Native terminal recording verifies the private consumed receipt and rejects client-supplied Goal attribution. Goal-linked TaskRuns persist resumable checkpoints and expose authorized checkpoint references; completion remains pending trusted accepted-output evidence for Part 4.
+
+Independent coordinator checks against exact committed SHA `1157cc6fff5dd8fb09ae9af007e681ec01f2dc19`: Rust `cargo check`, server typecheck, server build, UI TypeScript + Vite build, and `git diff --check` all PASS. Rust reported two existing warnings (`src/supervisor.rs` deprecated atomic method and `src/wsl.rs` unused helper); UI emitted the existing bundle-size advisory. Focused Luna review confirmed exact source-ID transport and compare/hash/one-shot enforcement. No test file was changed and no tests were run. **NOT RUN:** tests, runtime, restart/interruption demonstration, real-goal acceptance, package, or installation. Part 2 source is checkpointed; Priority #1 remains incomplete/open; Priority #2 runtime acceptance remains open; #3–#5 remain queued.
