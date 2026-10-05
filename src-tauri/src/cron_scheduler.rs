@@ -703,8 +703,10 @@ fn settle_activation_denied(
 /// acknowledged the abort (observed the signal AND its request completed).
 /// Repeated cancels are idempotent and a completed/failed activation is never
 /// overwritten with a cancelled state. Records the acknowledgement timestamp.
-/// Returns `Err` if the durable write fails so the caller never reports a
-/// confirmed cancellation that was not persisted.
+/// The durable write is verified (exactly one eligible row plus a readback)
+/// before any notification is presented, and `Err` is returned when the
+/// cancellation was not persisted so the caller never reports a confirmed
+/// cancellation that was not durably written.
 pub fn mark_activation_cancelled(
     app: &AppHandle,
     activation_id: &str,
@@ -712,30 +714,82 @@ pub fn mark_activation_cancelled(
 ) -> Result<(), String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    // Capture the Goal/job identity (if any) so the post-write notification can
-    // be scoped to a Goal-linked activation.
-    let identity: Option<(Option<String>, Option<String>, Option<String>)> = conn
+    // Capture the current state plus the Goal/job identity (if any) so a
+    // terminal activation is never overwritten and the post-write notification
+    // can be scoped to a Goal-linked activation.
+    #[allow(clippy::type_complexity)]
+    let identity: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .query_row(
-            "SELECT goal_id, cron_job_id, run_id FROM cron_activations WHERE activation_id = ?1",
+            "SELECT claim_state, goal_id, cron_job_id, run_id \
+             FROM cron_activations WHERE activation_id = ?1",
             [activation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|e| format!("failed to read activation {activation_id}: {e}"))?;
-    conn.execute(
-        "UPDATE cron_activations SET claim_state = 'cancelled', terminal_reason = ?1, \
-         cancel_acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
-         settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-         WHERE activation_id = ?2 AND claim_state NOT IN ('completed','failed','cancelled')",
-        rusqlite::params![reason, activation_id],
-    )
-    .map_err(|e| format!("failed to persist cancellation for activation {activation_id}: {e}"))?;
+    match &identity {
+        None => {
+            return Err(format!(
+                "activation {activation_id} not found; cancellation not persisted"
+            ))
+        }
+        // Idempotent no-op: already cancelled, or a terminal state that must
+        // never be overwritten with cancelled. No new state is presented.
+        Some((state, _, _, _))
+            if matches!(state.as_str(), "cancelled" | "completed" | "failed") =>
+        {
+            return Ok(())
+        }
+        Some(_) => {}
+    }
+    let affected = conn
+        .execute(
+            "UPDATE cron_activations SET claim_state = 'cancelled', terminal_reason = ?1, \
+             cancel_acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+             settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE activation_id = ?2 AND claim_state NOT IN ('completed','failed','cancelled')",
+            rusqlite::params![reason, activation_id],
+        )
+        .map_err(|e| {
+            format!("failed to persist cancellation for activation {activation_id}: {e}")
+        })?;
+    if affected != 1 {
+        return Err(format!(
+            "cancellation for activation {activation_id} was not persisted (affected {affected})"
+        ));
+    }
+    // Read back the persisted state to prove the cancellation is durable before
+    // any notice based on it is presented.
+    let persisted_state: Option<String> = conn
+        .query_row(
+            "SELECT claim_state FROM cron_activations WHERE activation_id = ?1",
+            [activation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read back activation {activation_id}: {e}"))?;
+    match persisted_state.as_deref() {
+        Some("cancelled") => {}
+        _ => {
+            return Err(format!(
+                "cancellation for activation {activation_id} was not confirmed by readback"
+            ))
+        }
+    }
+    let (goal_id, cron_job_id, run_id) = identity
+        .map(|(_, goal_id, cron_job_id, run_id)| (goal_id, cron_job_id, run_id))
+        .unwrap_or((None, None, None));
     drop(conn);
 
     // A confirmed cancellation is a distinct terminal state (never completion).
-    // Notify only after the durable write and only when Goal-linked.
-    if let Some((Some(goal_id), Some(cron_job_id), run_id)) = identity {
+    // Notify only after the verified durable write and only when Goal-linked.
+    if let (Some(goal_id), Some(cron_job_id)) = (goal_id, cron_job_id) {
         let request = crate::notifications::cancelled_request(
             &goal_id,
             activation_id,
@@ -1451,7 +1505,11 @@ fn record_run(
         None => (None, None, None, None),
     };
 
-    if let Err(e) = conn.execute(
+    // Insert the durable run row and require proof it was written under the
+    // exact identity before any terminal notification can be derived from it.
+    // A swallowed insert error must never yield a completion notice for a run
+    // that does not exist.
+    let run_verified = match conn.execute(
         "INSERT INTO cron_runs \
          (id, cron_job_id, status, output, error, duration_ms, started_at, finished_at, \
           execution_evidence, activation_id, schedule_occurrence, goal_id, terminal_reason) \
@@ -1472,11 +1530,42 @@ fn record_run(
             error,
         ],
     ) {
-        eprintln!(
-            "[cron] Failed to insert cron run log for job {}: {}",
-            job_id, e
-        );
-    }
+        Ok(affected) if affected == 1 => conn
+            .query_row(
+                "SELECT id, cron_job_id, status, activation_id, goal_id \
+                 FROM cron_runs WHERE id = ?1",
+                [&run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map(|row| {
+                row.map(|(id, job, st, act, goal)| {
+                    id == run_id
+                        && job == job_id
+                        && st == status
+                        && act.as_deref() == activation_id
+                        && goal.as_deref() == goal_id
+                })
+                .unwrap_or(false)
+            })
+            .unwrap_or(false),
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!(
+                "[cron] Failed to insert cron run log for job {}: {}",
+                job_id, e
+            );
+            false
+        }
+    };
 
     if let Err(e) = conn.execute(
         "UPDATE cron_jobs SET \
@@ -1496,8 +1585,10 @@ fn record_run(
     // Settle the activation claim. A completed/failed/cancelled terminal state
     // is never revived: in particular a late success can never overwrite an
     // accepted cancellation. The `WHERE` guard makes late/duplicate settles
-    // idempotent no-ops. `settled` tracks whether the durable settlement write
-    // succeeded so a caller never acknowledges before persisting.
+    // idempotent no-ops. `settled` is true only when exactly one eligible row
+    // was updated AND the readback matches this exact state/run_id, so a caller
+    // never acknowledges before persisting and no terminal state is surfaced
+    // that was not durably written.
     let mut settled = true;
     if let Some(ctx) = activation {
         let claim_state = if status == "success" {
@@ -1507,7 +1598,11 @@ fn record_run(
         } else {
             "failed"
         };
-        if let Err(e) = conn.execute(
+        // Persist and verify. A late success arriving after the activation was
+        // already cancelled/completed/failed matches zero eligible rows (the
+        // `OR claim_state = ?1` arm only matches an identical state), so it is
+        // never surfaced as a completion.
+        let settle_verified = match conn.execute(
             "UPDATE cron_activations SET claim_state = ?1, run_id = ?2, bun_run_id = ?3, \
              terminal_reason = ?4, settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
@@ -1521,35 +1616,59 @@ fn record_run(
                 ctx.activation_id.as_str()
             ],
         ) {
-            eprintln!(
-                "[cron] Failed to settle activation {} for job {}: {}",
-                ctx.activation_id, job_id, e
-            );
-            settled = false;
-        }
+            Ok(affected) if affected == 1 => conn
+                .query_row(
+                    "SELECT claim_state, run_id FROM cron_activations WHERE activation_id = ?1",
+                    [ctx.activation_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map(|row| {
+                    row.map(|(state, settled_run)| {
+                        state == claim_state && settled_run.as_deref() == Some(run_id.as_str())
+                    })
+                    .unwrap_or(false)
+                })
+                .unwrap_or(false),
+            Ok(_) => false,
+            Err(e) => {
+                eprintln!(
+                    "[cron] Failed to settle activation {} for job {}: {}",
+                    ctx.activation_id, job_id, e
+                );
+                false
+            }
+        };
+        settled = settle_verified;
         // A settled non-cancelled outcome clears any stale cancel intent (both
         // the in-process flag and the durable columns) so the next legitimate
         // recurring occurrence can start clean and is never blocked by an old
-        // cancellation request.
-        if claim_state != "cancelled" {
-            take_cancel_request(job_id);
-            let _ = conn.execute(
-                "UPDATE cron_activations SET cancel_requested_at = NULL, \
-                 cancel_requested_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-                 WHERE activation_id = ?1",
-                [ctx.activation_id.as_str()],
-            );
-        } else {
-            // A proven cancellation also clears the in-process flag so a future
-            // recurring activation is permitted.
-            take_cancel_request(job_id);
+        // cancellation request. A settle that did not durably apply leaves the
+        // existing intent untouched.
+        if settle_verified {
+            if claim_state != "cancelled" {
+                take_cancel_request(job_id);
+                let _ = conn.execute(
+                    "UPDATE cron_activations SET cancel_requested_at = NULL, \
+                     cancel_requested_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                     WHERE activation_id = ?1",
+                    [ctx.activation_id.as_str()],
+                );
+            } else {
+                // A proven cancellation also clears the in-process flag so a
+                // future recurring activation is permitted.
+                take_cancel_request(job_id);
+            }
         }
 
-        // Preference-aware in-app notification, emitted ONLY after the terminal
-        // state and the durable run row are persisted, and only for a
+        // Preference-aware in-app notification, emitted ONLY after BOTH the
+        // durable run row and the terminal activation settlement have been
+        // written and read back under the exact identity, and only for a
         // Goal-linked activation. A `success` is reported as a verified
-        // scheduled-run completion, never as Goal completion or acceptance.
-        if settled && ctx.goal_id.is_some() {
+        // scheduled-run completion, never as Goal completion or acceptance. A
+        // dedupe/ledger write failure inside the notification module fails
+        // closed and presents no unpersisted state.
+        if settle_verified && run_verified && ctx.goal_id.is_some() {
             let goal_id = ctx.goal_id.as_deref().unwrap_or_default();
             let request = match claim_state {
                 "completed" => crate::notifications::completed_request(
@@ -1653,21 +1772,27 @@ pub async fn execute_job(
     let goal_id = cron_job_goal_id(app, job_id);
 
     // Transition the claim to `dispatched` before the external effect so a crash
-    // mid-dispatch is recoverable as `ambiguous`, not a silent replay.
-    update_claim_state(app, &activation_id, "dispatched", None);
+    // mid-dispatch is recoverable as `ambiguous`, not a silent replay. The
+    // transition reports persistence/readback success; a failed or unconfirmed
+    // write must not be presented as a dispatched state.
+    let dispatched = update_claim_state(app, &activation_id, "dispatched", None);
 
     // Meaningful progress notification: this fires once per claimed Goal-linked
     // occurrence (the durable `dispatched` state is the dedupe identity), not on
-    // every internal step. Only after the claim state is persisted.
-    if let Some(ref gid) = goal_id {
-        let request = crate::notifications::progress_request(
-            gid,
-            &activation_id,
-            job_id,
-            &activation_id,
-            "dispatched",
-        );
-        crate::notifications::emit_goal_notifications(app, vec![request]);
+    // every internal step — and ONLY after `claim_state = 'dispatched'` has been
+    // read back for this exact activation. No notice is presented for a progress
+    // state that was not durably persisted.
+    if dispatched.is_ok() {
+        if let Some(ref gid) = goal_id {
+            let request = crate::notifications::progress_request(
+                gid,
+                &activation_id,
+                job_id,
+                &activation_id,
+                "dispatched",
+            );
+            crate::notifications::emit_goal_notifications(app, vec![request]);
+        }
     }
 
     // Register a cancellation control for this execution and re-check the cancel
@@ -1870,22 +1995,51 @@ fn cron_job_goal_id(app: &AppHandle, job_id: &str) -> Option<String> {
     .flatten()
 }
 
-/// Move one activation claim to a new state, preserving a stable terminal reason.
-fn update_claim_state(app: &AppHandle, activation_id: &str, state: &str, reason: Option<&str>) {
+/// Move one activation claim to a new state, preserving a stable terminal
+/// reason. Returns `Ok(())` only when the UPDATE affected exactly one row and a
+/// readback confirms the persisted state, so a caller never emits a progress
+/// notice — or presents any state — that was not durably written. Returns
+/// `Err` on a write failure, a zero-row update, or an unconfirmed readback.
+fn update_claim_state(
+    app: &AppHandle,
+    activation_id: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    if let Err(e) = conn.execute(
-        "UPDATE cron_activations SET claim_state = ?1, \
-         terminal_reason = COALESCE(?2, terminal_reason), \
-         dispatched_at = CASE WHEN ?1 = 'dispatched' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE dispatched_at END, \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-         WHERE activation_id = ?3",
-        rusqlite::params![state, reason, activation_id],
-    ) {
-        eprintln!(
-            "[cron] Failed to update activation {} state to {}: {}",
-            activation_id, state, e
-        );
+    let affected = conn
+        .execute(
+            "UPDATE cron_activations SET claim_state = ?1, \
+             terminal_reason = COALESCE(?2, terminal_reason), \
+             dispatched_at = CASE WHEN ?1 = 'dispatched' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE dispatched_at END, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE activation_id = ?3",
+            rusqlite::params![state, reason, activation_id],
+        )
+        .map_err(|e| {
+            format!("failed to update activation {activation_id} state to {state}: {e}")
+        })?;
+    if affected != 1 {
+        return Err(format!(
+            "activation {activation_id} state change to {state} was not persisted (affected {affected})"
+        ));
+    }
+    // Read back the persisted state to prove the transition is durable before
+    // the caller derives any notice (e.g. the `dispatched` progress notice).
+    let persisted_state: Option<String> = conn
+        .query_row(
+            "SELECT claim_state FROM cron_activations WHERE activation_id = ?1",
+            [activation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read back activation {activation_id}: {e}"))?;
+    match persisted_state.as_deref() {
+        Some(persisted) if persisted == state => Ok(()),
+        _ => Err(format!(
+            "activation {activation_id} state change to {state} was not confirmed by readback"
+        )),
     }
 }
 
