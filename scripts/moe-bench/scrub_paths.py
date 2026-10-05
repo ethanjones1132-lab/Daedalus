@@ -5,8 +5,10 @@ import re
 import sys
 
 PATTERNS = [re.compile(r"[A-Za-z]:\\\\Users\\\\[^\\\"]+\\\\AppData\\\\Local\\\\Temp\\\\"),  # JSON-escaped
-            re.compile(r"[A-Za-z]:\\Users\\[^\\\"]+\\AppData\\Local\\Temp\\")]
-REPL = ["<tmp>\\\\", "<tmp>\\"]
+            re.compile(r"[A-Za-z]:\\Users\\[^\\\"]+\\AppData\\Local\\Temp\\"),
+            re.compile(r"[A-Za-z]:\\\\Users\\\\[^\\\"]+\\\\"),  # any other user-profile path, e.g. the uv Python
+            re.compile(r"[A-Za-z]:\\Users\\[^\\\"]+\\")]
+REPL = ["<tmp>\\\\", "<tmp>\\", "<home>\\\\", "<home>\\"]
 
 for path in sys.argv[1:]:
     text = open(path, encoding="utf-8").read()
