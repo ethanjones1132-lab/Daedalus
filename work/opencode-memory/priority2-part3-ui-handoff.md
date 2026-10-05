@@ -15,7 +15,7 @@
 - Goal detail retains the existing rule that completion is withheld pending the Part 4 trusted-acceptance gate. A successful scheduled run, a submission, or an attempted transition is never used to infer Goal completion.
 - Unlinked cron/commitment consumers and the existing `GoalRunProgress` view are preserved; no new permissions were introduced.
 
-## Final correction behaviors (`5e085baf`, refined in `015772e5` and `2b226db1`)
+## Final correction behaviors (`5e085baf`, refined in `015772e5`, `2b226db1`, and `cf7234e2`)
 
 - **Commitments availability:** a failed or malformed (non-array) `get_commitments` response is treated as unavailable. The panel shows the read error and never the authoritative "no commitments linked" empty state; if previously loaded commitments remain, they are marked possibly stale.
 - **Schedule availability:** a failed or malformed (non-array) `list_cron_jobs` or `get_in_flight_cron_jobs` response marks schedule authority unavailable. The UI never shows "no schedules linked" and never leaves stale controls actionable: previously loaded schedules are explicitly marked stale and all schedule controls are disabled while the authority is unreadable.
@@ -33,13 +33,22 @@
 - `docs/CURRENT_ROADMAP.md` Part 3 checkpoint records the final UI SHA.
 - `docs/implementation/roadmap-priority-2-status.md` Part 3 section records the final UI SHA.
 
-## Not run / open limits
+## Coordinator checks and open limits
+
+The five allowed checks were run by the coordinator against the exact final UI source SHA `cf7234e24f65bbbed69ddb844d72cfc3e819c3ce` and all passed:
+
+- Rust `cargo check` — PASS; two unrelated existing warnings: deprecated `Atomic` fetch_update and unused `shlex_join`.
+- Server `bun run typecheck` — PASS.
+- Server `bun run build` — PASS.
+- UI `bun run build` — PASS (existing >500 kB chunk advisory).
+- `git diff --check` from `2506bc0adadddec0c9ea4293368caea880a01a36` to `acfd3ee200fd645f6e3f9d523eb970e0ccf39ce2` — PASS.
+
+**NOT RUN / open:**
 
 - Tests, fixtures, scripted providers, live execution, native app instances, restart/interruption, missed-run/cancellation demonstrations, real-goal acceptance, packaging, and installation are **NOT RUN**.
-- The five allowed compiler/type/build/diff checks were **NOT RUN** by the source executor; the coordinator runs them against the exact committed source SHA.
-- Part 3 runtime/acceptance behavior remains unverified. Part 3 must not be treated as delivered until the coordinator review and checks are recorded.
+- Part 3 runtime/acceptance behavior remains unverified. Compiler checks are not runtime proof; Part 3 must not be treated as delivered until the runtime acceptance criteria have evidence.
 - Part 4 (trusted acceptance-manifest execution and verified delivery evidence) remains reserved; the Goal completion gate stays closed.
 
 ## Remaining Part 3 items
 
-With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `cf7234e24f65bbbed69ddb844d72cfc3e819c3ce`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
+With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `cf7234e24f65bbbed69ddb844d72cfc3e819c3ce`. The five allowed checks passed against the exact final UI SHA (see above); what remains is all runtime acceptance evidence, not further planned Part 3 source.
