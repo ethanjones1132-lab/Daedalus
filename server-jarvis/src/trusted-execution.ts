@@ -63,7 +63,7 @@ export interface TrustedExecutionResponse {
   execution_id: string;
   bun_instance_id: string;
   run_id: string;
-  outcome: "executed" | "blocked" | "waiting_for_user" | "failed" | "cancelled";
+  outcome: "executed" | "blocked" | "waiting_for_user" | "failed" | "cancelled" | "partial";
   reason?: string;
   calls: TrustedExecutionCallEvidence[];
   started_at: string;
@@ -326,7 +326,10 @@ async function executeTrusted(
       const outputSha256 = createHash("sha256").update(output, "utf8").digest("hex");
       evidenceBytes += Math.min(outputBytes, MAX_EVIDENCE_BYTES_PER_CALL);
       evidence.push({ index, tool, status: "ok", output_sha256: outputSha256, output_bytes: outputBytes });
-      if (evidenceBytes >= MAX_TOTAL_EVIDENCE_BYTES) {
+      if (evidenceBytes >= MAX_TOTAL_EVIDENCE_BYTES && index < calls.length - 1) {
+        // Some declared calls were skipped: never report full success, so this
+        // can never be persisted as `pending_acceptance`.
+        outcome = "partial";
         reason = "execution evidence budget reached; remaining calls were not run";
         break;
       }

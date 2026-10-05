@@ -35,14 +35,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-/// Per-call and whole-run bounds. The manifest content is already capped at
-/// 64 KiB and 50 calls, so the transport request stays bounded.
-const EXECUTION_CALL_TIMEOUT_MS: u64 = 120_000;
-const WHOLE_RUN_TIMEOUT_MS: u64 = 600_000;
+/// Whole-run bound. The manifest content is already capped at 64 KiB and 50
+/// calls, so the transport request stays bounded. This is the hard execution
+/// deadline and the basis for the dedicated trusted-execution HTTP timeout in
+/// the transport (`WHOLE_RUN_TIMEOUT_MS` + margin).
+pub const WHOLE_RUN_TIMEOUT_MS: u64 = 600_000;
 const MAX_EXECUTION_CALLS: usize = 50;
 
-/// Durable statuses. `pending_acceptance` means a tool actually ran and an
-/// acceptance decision is still outstanding; nothing here completes a Goal.
+/// Durable statuses. `pending_acceptance` means every declared call actually ran
+/// to a successful tool outcome and an acceptance decision is still outstanding;
+/// nothing here completes a Goal. `partial` means some calls were skipped after
+/// a bounded-evidence stop and must never be read as success.
 pub const STATUS_CLAIMED: &str = "claimed";
 pub const STATUS_DISPATCHED: &str = "dispatched";
 pub const STATUS_PENDING_ACCEPTANCE: &str = "pending_acceptance";
@@ -50,13 +53,14 @@ pub const STATUS_WAITING_FOR_USER: &str = "waiting_for_user";
 pub const STATUS_BLOCKED: &str = "blocked";
 pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_CANCELLED: &str = "cancelled";
+pub const STATUS_PARTIAL: &str = "partial";
 pub const STATUS_AMBIGUOUS: &str = "ambiguous";
 
 // ── DTOs ─────────────────────────────────────────────────────
 
 /// One exact execution call taken from the stored trusted manifest. Native
 /// already validated its tool allowlist and bounded arguments at registration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrustedExecutionCall {
     pub tool: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,7 +120,19 @@ pub struct TrustedExecutionResponseWire {
     pub finished_at: String,
 }
 
+/// Honest report of why a requested execution was refused in favor of an
+/// existing durable receipt for the same action. Computed at read time; never
+/// mutates the stored outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedExecutionConflict {
+    pub kind: String,
+    pub detail: String,
+}
+
 /// Durable execution receipt returned to callers and shown by the UI.
+/// `conflict` is present only when a second execution request for the same
+/// action was refused because the requested manifest/binding/projection no
+/// longer matches the durable receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedActionExecution {
     pub execution_id: String,
@@ -137,6 +153,8 @@ pub struct TrustedActionExecution {
     pub settled_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub conflict: Option<TrustedExecutionConflict>,
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -276,18 +294,13 @@ fn resolve_dispatch_authority(
     })
 }
 
-fn idempotency_key(
-    action_id: &str,
-    manifest_id: &str,
-    content_hash: &str,
-    project_root: &str,
-    snapshot: &crate::cron_scheduler::ProjectionSnapshot,
-) -> String {
-    let material = format!(
-        "trusted-action-v1\n{action_id}\n{manifest_id}\n{content_hash}\n{project_root}\n{}\n{}\n{}",
-        snapshot.slug, snapshot.source_hash, snapshot.projection_version
-    );
-    sha256(&material)
+/// Durable idempotency is anchored to the Action Registry `action_id` alone, so
+/// one approved action can produce at most one durable execution receipt no
+/// matter how the manifest is replaced/rebound or the projection changes. The
+/// exact requested manifest/binding identity is reported separately as a
+/// conflict instead of minting a new execution.
+fn idempotency_key(action_id: &str) -> String {
+    sha256(&format!("trusted-action-v1\n{action_id}"))
 }
 
 fn record_from_row(
@@ -358,6 +371,7 @@ fn record_from_row(
         settled_at,
         created_at,
         updated_at,
+        conflict: None,
     })
 }
 
@@ -444,6 +458,197 @@ fn load_execution_by_key(
         Some(row) => record_from_row(row).map(Some),
         None => Ok(None),
     }
+}
+
+fn empty_snapshot(slug: &str) -> crate::cron_scheduler::ProjectionSnapshot {
+    crate::cron_scheduler::ProjectionSnapshot {
+        slug: slug.to_string(),
+        source_path: String::new(),
+        source_hash: String::new(),
+        active_source_hash: String::new(),
+        projection_version: 0,
+        activated_at: String::new(),
+    }
+}
+
+fn attach_conflict(
+    mut row: TrustedActionExecution,
+    conflict: Option<TrustedExecutionConflict>,
+) -> TrustedActionExecution {
+    row.conflict = conflict;
+    row
+}
+
+fn load_stored_projection(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<(String, String, i64), String> {
+    conn.query_row(
+        "SELECT projection_slug, projection_source_hash, projection_version \
+         FROM trusted_action_executions WHERE execution_id = ?1",
+        [execution_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Compare a requested execution against the durable receipt for the same
+/// action, reporting the first identity drift honestly. Returns `None` only when
+/// the request exactly matches the receipt.
+fn conflict_for_existing(
+    conn: &Connection,
+    action_id: &str,
+    manifest: &ManifestScope,
+    stored: &TrustedActionExecution,
+) -> Option<TrustedExecutionConflict> {
+    let conflict = |kind: &str, detail: String| {
+        Some(TrustedExecutionConflict {
+            kind: kind.to_string(),
+            detail,
+        })
+    };
+    if stored.action_id != action_id {
+        return conflict(
+            "binding_changed",
+            format!("receipt is bound to action '{}'", stored.action_id),
+        );
+    }
+    if stored.manifest_id != manifest.manifest_id {
+        return conflict(
+            "manifest_changed",
+            format!(
+                "receipt used manifest '{}', requested '{}'",
+                stored.manifest_id, manifest.manifest_id
+            ),
+        );
+    }
+    if stored.manifest_registry_version != manifest.registry_version {
+        return conflict(
+            "manifest_changed",
+            format!(
+                "receipt used registry version {}, current is {}",
+                stored.manifest_registry_version, manifest.registry_version
+            ),
+        );
+    }
+    if stored.manifest_schema_version != manifest.schema_version {
+        return conflict(
+            "manifest_changed",
+            format!(
+                "receipt used schema version {}, current is {}",
+                stored.manifest_schema_version, manifest.schema_version
+            ),
+        );
+    }
+    let recomputed = sha256(&manifest.content_json);
+    if recomputed != manifest.content_hash {
+        return conflict(
+            "manifest_integrity",
+            "stored manifest content hash does not match its canonical content".to_string(),
+        );
+    }
+    if stored.manifest_content_hash != manifest.content_hash {
+        return conflict(
+            "payload_changed",
+            format!(
+                "receipt payload hash {} differs from current {}",
+                stored.manifest_content_hash, manifest.content_hash
+            ),
+        );
+    }
+    if stored.agent_id != manifest.agent_id {
+        return conflict(
+            "binding_changed",
+            format!(
+                "receipt Agent '{}' differs from current '{}'",
+                stored.agent_id, manifest.agent_id
+            ),
+        );
+    }
+    match crate::jarvis::memory::scope::normalize_project_root(&manifest.project_root) {
+        Ok(root) => {
+            if root != stored.project_root {
+                return conflict(
+                    "binding_changed",
+                    format!(
+                        "receipt root '{}' differs from current '{}'",
+                        stored.project_root, root
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            return conflict(
+                "binding_unavailable",
+                format!("current project root unavailable: {e}"),
+            );
+        }
+    }
+    match crate::commands::agents::resolve_activation_boundary(conn, &manifest.agent_id) {
+        Ok(snapshot) => match load_stored_projection(conn, &stored.execution_id) {
+            Ok((slug, source_hash, version)) => {
+                if slug != snapshot.slug
+                    || source_hash != snapshot.source_hash
+                    || version != snapshot.projection_version
+                {
+                    return conflict(
+                        "projection_changed",
+                        format!(
+                            "receipt projection '{}@{}' differs from current '{}@{}'",
+                            slug, version, snapshot.slug, snapshot.projection_version
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                return conflict(
+                    "projection_unavailable",
+                    format!("stored projection identity unreadable: {e}"),
+                );
+            }
+        },
+        Err(denial) => {
+            let reason = match denial {
+                crate::commands::agents::ActivationDenial::WaitingForUser(reason)
+                | crate::commands::agents::ActivationDenial::Blocked(reason) => reason,
+            };
+            return conflict("projection_unavailable", reason);
+        }
+    }
+    None
+}
+
+/// Verify the persisted manifest row still exactly matches the wire/claim
+/// identity captured when the execution was claimed. Any drift is a hard block
+/// that must happen before the execution request.
+fn verify_claimed_identity(
+    manifest: &ManifestScope,
+    wire: &TrustedExecutionRequestWire,
+) -> Result<(), String> {
+    if manifest.manifest_id != wire.manifest_id {
+        return Err("manifest id changed after claim".to_string());
+    }
+    if manifest.registry_version != wire.manifest_registry_version {
+        return Err("manifest registry version changed after claim".to_string());
+    }
+    if manifest.schema_version != wire.manifest_schema_version {
+        return Err("manifest schema version changed after claim".to_string());
+    }
+    let recomputed = sha256(&manifest.content_json);
+    if recomputed != manifest.content_hash || recomputed != wire.manifest_content_hash {
+        return Err("manifest content changed after claim".to_string());
+    }
+    if manifest.action_id.as_deref() != Some(wire.action_id.as_str()) {
+        return Err("manifest action binding changed after claim".to_string());
+    }
+    if manifest.agent_id != wire.agent_id {
+        return Err("manifest Agent changed after claim".to_string());
+    }
+    let calls = execution_calls_from_content(&manifest.content_json)?;
+    if calls != wire.calls {
+        return Err("manifest execution call payload changed after claim".to_string());
+    }
+    Ok(())
 }
 
 fn settle_execution(
@@ -551,6 +756,7 @@ fn settle_and_verify(
             settled_at: None,
             created_at: String::new(),
             updated_at: String::new(),
+            conflict: None,
         })
 }
 
@@ -645,7 +851,24 @@ fn run_trusted_execution(
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
-        let manifest = load_manifest_scope(&conn, manifest_id)?
+        // Durable idempotency is action-scoped: never mint a second execution for
+        // the same action, even if the manifest was replaced/rebound or the Agent
+        // projection changed after an ambiguous/partial run. An existing receipt
+        // is returned with an explicit conflict rather than re-executing.
+        let key = idempotency_key(action_id);
+        let existing = load_execution_by_key(&conn, &key)?;
+        let manifest = load_manifest_scope(&conn, manifest_id)?;
+        if let Some(existing) = existing {
+            let conflict = match manifest.as_ref() {
+                Some(manifest) => conflict_for_existing(&conn, action_id, manifest, &existing),
+                None => Some(TrustedExecutionConflict {
+                    kind: "manifest_unavailable".to_string(),
+                    detail: format!("trusted manifest '{manifest_id}' is not present"),
+                }),
+            };
+            return Ok(attach_conflict(existing, conflict));
+        }
+        let manifest = manifest
             .ok_or_else(|| format!("trusted manifest not found: {manifest_id}"))?;
         if manifest.action_id.as_deref() != Some(action_id) {
             return Err(format!(
@@ -673,29 +896,17 @@ fn run_trusted_execution(
                 );
             }
         }
+        if sha256(&manifest.content_json) != manifest.content_hash {
+            return Err(
+                "trusted manifest content failed its canonical integrity check".to_string(),
+            );
+        }
 
         // Resolve the exact active/approved action and current projection. A
         // denial is persisted as waiting/blocked without any dispatch.
         let authority = match resolve_dispatch_authority(&conn, action_id, &manifest) {
             Ok(authority) => authority,
             Err(denial) => {
-                let key = idempotency_key(
-                    action_id,
-                    manifest_id,
-                    &manifest.content_hash,
-                    &manifest.project_root,
-                    &crate::cron_scheduler::ProjectionSnapshot {
-                        slug: manifest.agent_id.clone(),
-                        source_path: String::new(),
-                        source_hash: String::new(),
-                        active_source_hash: String::new(),
-                        projection_version: 0,
-                        activated_at: String::new(),
-                    },
-                );
-                if let Some(existing) = load_execution_by_key(&conn, &key)? {
-                    return Ok(existing);
-                }
                 let execution_id = uuid::Uuid::new_v4().to_string();
                 insert_claimed_execution(
                     &conn,
@@ -705,14 +916,7 @@ fn run_trusted_execution(
                     &DispatchAuthority {
                         action_id: action_id.to_string(),
                         project_root: manifest.project_root.clone(),
-                        snapshot: crate::cron_scheduler::ProjectionSnapshot {
-                            slug: manifest.agent_id.clone(),
-                            source_path: String::new(),
-                            source_hash: String::new(),
-                            active_source_hash: String::new(),
-                            projection_version: 0,
-                            activated_at: String::new(),
-                        },
+                        snapshot: empty_snapshot(&manifest.agent_id),
                     },
                 )?;
                 return Ok(settle_and_verify(
@@ -727,17 +931,6 @@ fn run_trusted_execution(
             }
         };
 
-        let key = idempotency_key(
-            action_id,
-            manifest_id,
-            &manifest.content_hash,
-            &authority.project_root,
-            &authority.snapshot,
-        );
-        if let Some(existing) = load_execution_by_key(&conn, &key)? {
-            // Durable idempotency: never replay an existing receipt.
-            return Ok(existing);
-        }
         let calls = execution_calls_from_content(&manifest.content_json)?;
         let execution = uuid::Uuid::new_v4().to_string();
         insert_claimed_execution(&conn, &execution, &key, &manifest, &authority)?;
@@ -756,7 +949,7 @@ fn run_trusted_execution(
             projection_active_source_hash: authority.snapshot.active_source_hash.clone(),
             projection_version: authority.snapshot.projection_version,
             calls,
-            timeout_ms: EXECUTION_CALL_TIMEOUT_MS,
+            timeout_ms: WHOLE_RUN_TIMEOUT_MS,
             max_calls: MAX_EXECUTION_CALLS as u64,
         };
         execution_id = execution;
@@ -769,14 +962,34 @@ fn run_trusted_execution(
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
         let manifest = load_manifest_scope(&conn, manifest_id)?
             .ok_or_else(|| format!("trusted manifest not found: {manifest_id}"))?;
+
+        // Compare the complete persisted manifest identity against the wire/claim
+        // before any request: id, registry/schema version, canonical content hash
+        // (recomputed), action binding, Agent, and execution call payload.
+        if let Err(reason) = verify_claimed_identity(&manifest, &wire) {
+            return Ok(settle_and_verify(
+                &conn,
+                &execution_id,
+                STATUS_BLOCKED,
+                Some(&reason),
+                None,
+                None,
+                None,
+            ));
+        }
+
         match resolve_dispatch_authority(&conn, action_id, &manifest) {
-            Ok(authority) if authority.snapshot == captured_snapshot => {}
+            Ok(authority)
+                if authority.snapshot == captured_snapshot
+                    && authority.project_root == wire.project_root => {}
             Ok(_) => {
                 return Ok(settle_and_verify(
                     &conn,
                     &execution_id,
                     STATUS_BLOCKED,
-                    Some("Agent projection changed before dispatch; no effect was applied"),
+                    Some(
+                        "Agent projection or workspace root changed before dispatch; no effect was applied",
+                    ),
                     None,
                     None,
                     None,
@@ -828,6 +1041,7 @@ fn run_trusted_execution(
                 "waiting_for_user" => (STATUS_WAITING_FOR_USER, wire_response.reason.as_deref()),
                 "failed" => (STATUS_FAILED, wire_response.reason.as_deref()),
                 "cancelled" => (STATUS_CANCELLED, wire_response.reason.as_deref()),
+                "partial" => (STATUS_PARTIAL, wire_response.reason.as_deref()),
                 _ => (
                     STATUS_AMBIGUOUS,
                     Some("unrecognized execution outcome; receipt preserved for reconciliation"),
@@ -918,6 +1132,7 @@ pub async fn cancel_trusted_execution(
                 | STATUS_BLOCKED
                 | STATUS_FAILED
                 | STATUS_CANCELLED
+                | STATUS_PARTIAL
                 | STATUS_WAITING_FOR_USER
         ) {
             return Ok(current);

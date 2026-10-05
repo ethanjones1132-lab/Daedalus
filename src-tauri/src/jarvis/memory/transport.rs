@@ -38,6 +38,9 @@ pub const APP_INSTANCE_ENV: &str = "JARVIS_NATIVE_APP_INSTANCE_ID";
 const CONNECT_TIMEOUT_MS: u64 = 1_000;
 const REQUEST_TIMEOUT_SECS: u64 = 3;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+/// Margin added on top of the trusted whole-run deadline for the dedicated
+/// trusted-execution request timeout.
+const TRUSTED_EXECUTION_HTTP_MARGIN_MS: u64 = 60_000;
 
 /// Registration response from the owned Bun registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +252,32 @@ impl NativeMemoryTransport {
             .client()?
             .post(url)
             .bearer_auth(&self.capability)
+            .json(body)
+            .send()
+            .map_err(|_| HttpFailure::Unavailable)?;
+        if response.status().as_u16() != expected_status {
+            return Err(HttpFailure::Unavailable);
+        }
+        Self::read_bounded(response)
+    }
+
+    /// Like `post_json`, but with a per-request timeout override. The shared
+    /// client's default 3s timeout would otherwise cut off any legitimate
+    /// trusted execution that runs longer than a few seconds. Response byte caps
+    /// and status checks are identical.
+    fn post_json_with_timeout(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+        expected_status: u16,
+        timeout: std::time::Duration,
+    ) -> Result<String, HttpFailure> {
+        let url = format!("{}{}", Self::base_url(), path);
+        let response = self
+            .client()?
+            .post(url)
+            .bearer_auth(&self.capability)
+            .timeout(timeout)
             .json(body)
             .send()
             .map_err(|_| HttpFailure::Unavailable)?;
@@ -508,13 +537,20 @@ pub fn execute_trusted_manifest(
     transport: &NativeMemoryTransport,
     request: &crate::commands::trusted_execution::TrustedExecutionRequestWire,
 ) -> Result<Option<crate::commands::trusted_execution::TrustedExecutionResponseWire>, String> {
-    let mut state = transport.lock_state();
+    // Do NOT hold the shared TransportState mutex across the (potentially
+    // minutes-long) HTTP request: that mutex also gates other native transport
+    // operations. Capture the generation before the request, revalidate it after,
+    // and only then briefly update the bound metadata.
     if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
         return Ok(None);
     }
     let generation = crate::process_lifecycle::bun_generation();
+    let timeout = std::time::Duration::from_millis(
+        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS
+            + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
+    );
     let body = transport
-        .post_json("/internal/trusted/execute", request, 200)
+        .post_json_with_timeout("/internal/trusted/execute", request, 200, timeout)
         .map_err(|_| "trusted execution transport unavailable".to_string())?;
     let parsed: crate::commands::trusted_execution::TrustedExecutionResponseWire =
         serde_json::from_str(&body)
@@ -527,8 +563,11 @@ pub fn execute_trusted_manifest(
     {
         return Err("owned Bun child was replaced during trusted execution".to_string());
     }
-    state.bound_generation = Some(generation);
-    state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    {
+        let mut state = transport.lock_state();
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    }
     Ok(Some(parsed))
 }
 
