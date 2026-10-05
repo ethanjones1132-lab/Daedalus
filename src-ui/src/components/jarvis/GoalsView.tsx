@@ -134,6 +134,21 @@ interface ScheduleOp {
   message?: string;
 }
 
+/**
+ * Result of an authoritative schedule read. `ok` additionally reports which
+ * linked jobs had readable activation/run history, so a pending mutation is only
+ * cleared when the readbacks relevant to that operation actually succeeded.
+ */
+type ScheduleRefreshResult =
+  | { status: 'stale' }
+  | { status: 'unavailable' }
+  | {
+      status: 'ok';
+      linkedJobIds: Set<string>;
+      activationAvailable: Record<string, boolean>;
+      runAvailable: Record<string, boolean>;
+    };
+
 const TRANSITION_STATUSES = ['running', 'waiting_for_user', 'blocked', 'paused', 'failed', 'cancelled'];
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
 
@@ -199,6 +214,27 @@ function scheduleOpVerb(kind: ScheduleOpKind): string {
 /** A write is in flight, so a read-only reconcile must not race it. */
 function hasWritingScheduleOp(ops: Record<string, ScheduleOp>): boolean {
   return Object.values(ops).some((op) => op.phase === 'writing');
+}
+
+/**
+ * Whether the authoritative readbacks relevant to one operation succeeded.
+ * Pause/resume only depends on the native schedule list (its enabled state).
+ * Run now depends on the activation and run history that would evidence the new
+ * execution; cancel depends on the in-flight read (already required for an `ok`
+ * result) plus that same activation/run history. A job missing from the linked
+ * list cannot be confirmed and is treated as not reconcilable.
+ */
+function relevantScheduleReadsOk(
+  kind: ScheduleOpKind,
+  jobId: string,
+  result: Extract<ScheduleRefreshResult, { status: 'ok' }>,
+): boolean {
+  if (!result.linkedJobIds.has(jobId)) return false;
+  if (kind === 'pause' || kind === 'resume') return true;
+  return (
+    result.activationAvailable[jobId] === true &&
+    result.runAvailable[jobId] === true
+  );
 }
 
 export default function GoalsView() {
@@ -269,7 +305,7 @@ export default function GoalsView() {
     async (
       goalId: string,
       expectedRequest: number,
-    ): Promise<'ok' | 'unavailable' | 'stale'> => {
+    ): Promise<ScheduleRefreshResult> => {
       let jobs: CronSchedule[];
       let flight: string[];
       try {
@@ -277,65 +313,74 @@ export default function GoalsView() {
           invoke<unknown>('list_cron_jobs'),
           invoke<unknown>('get_in_flight_cron_jobs'),
         ]);
-        if (expectedRequest !== detailRequestId.current) return 'stale';
+        if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
         if (!Array.isArray(jobsResponse) || !Array.isArray(flightResponse)) {
           setScheduleUnavailable(true);
           setScheduleReadError(
             'The native schedule authority returned an unreadable response. Schedule state is unavailable; controls are disabled until it is reconciled.',
           );
-          return 'unavailable';
+          return { status: 'unavailable' };
         }
         jobs = jobsResponse as CronSchedule[];
         flight = flightResponse as string[];
       } catch {
-        if (expectedRequest !== detailRequestId.current) return 'stale';
+        if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
         setScheduleUnavailable(true);
         setScheduleReadError(
           'Could not read goal-linked schedules from the native authority. Schedule state is unavailable; controls are disabled until it is reconciled.',
         );
-        return 'unavailable';
+        return { status: 'unavailable' };
       }
-      if (expectedRequest !== detailRequestId.current) return 'stale';
+      if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
       const linked = jobs.filter((job) => job.goal_id === goalId);
+      const linkedJobIds = new Set(linked.map((job) => job.id));
       const nextActivations: Record<string, CronActivation[]> = {};
       const nextRuns: Record<string, CronRunRecord[]> = {};
       const nextActivationErrors: Record<string, boolean> = {};
       const nextRunErrors: Record<string, boolean> = {};
+      const activationAvailable: Record<string, boolean> = {};
+      const runAvailable: Record<string, boolean> = {};
       for (const job of linked) {
         try {
           const rows = await invoke<unknown>('get_cron_activations', {
             cronId: job.id,
           });
-          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           if (Array.isArray(rows)) {
             nextActivations[job.id] = rows as CronActivation[];
+            activationAvailable[job.id] = true;
           } else {
             nextActivations[job.id] = [];
             nextActivationErrors[job.id] = true;
+            activationAvailable[job.id] = false;
           }
         } catch {
-          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           nextActivations[job.id] = [];
           nextActivationErrors[job.id] = true;
+          activationAvailable[job.id] = false;
         }
         try {
           const rows = await invoke<unknown>('get_cron_runs', {
             cronId: job.id,
           });
-          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           if (Array.isArray(rows)) {
             nextRuns[job.id] = rows as CronRunRecord[];
+            runAvailable[job.id] = true;
           } else {
             nextRuns[job.id] = [];
             nextRunErrors[job.id] = true;
+            runAvailable[job.id] = false;
           }
         } catch {
-          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           nextRuns[job.id] = [];
           nextRunErrors[job.id] = true;
+          runAvailable[job.id] = false;
         }
       }
-      if (expectedRequest !== detailRequestId.current) return 'stale';
+      if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
       setSchedules(linked);
       setActivations(nextActivations);
       setCronRuns(nextRuns);
@@ -344,7 +389,7 @@ export default function GoalsView() {
       setInFlight(new Set(flight));
       setScheduleUnavailable(false);
       setScheduleReadError(null);
-      return 'ok';
+      return { status: 'ok', linkedJobIds, activationAvailable, runAvailable };
     },
     [],
   );
@@ -374,10 +419,20 @@ export default function GoalsView() {
       setReconciling(false);
       return;
     }
-    if (outcome === 'ok') {
+    if (outcome.status === 'ok') {
+      // Clear a pending failed/uncertain operation only when the readback
+      // relevant to that operation succeeded. Pause/resume only needs the native
+      // job list (enabled state); run/cancel additionally need the activation and
+      // run history that would evidence the new or settled execution. An
+      // incomplete history readback leaves the operation uncertain and the
+      // controls disabled until a later successful reconciliation.
       const next: Record<string, ScheduleOp> = {};
       for (const [jobId, op] of Object.entries(scheduleOpsRef.current)) {
-        if (op.phase === 'writing') next[jobId] = op;
+        if (op.phase === 'writing') {
+          next[jobId] = op;
+          continue;
+        }
+        if (!relevantScheduleReadsOk(op.kind, jobId, outcome)) next[jobId] = op;
       }
       scheduleOpsRef.current = next;
       setScheduleOps(next);
@@ -490,7 +545,7 @@ export default function GoalsView() {
       ) {
         return;
       }
-      if (readBack !== 'ok') {
+      if (readBack.status !== 'ok') {
         // `stale` already returned above; this is an unavailable authority or a
         // failed read. Keep the previous display and leave the operation
         // actionable through the read-only reconcile action.
@@ -500,6 +555,22 @@ export default function GoalsView() {
             ...op,
             phase: 'read-failed',
             message: `The ${scheduleOpVerb(kind)} was accepted, but the authoritative schedule state could not be re-read. Showing the previous state; it is stale. Use Refresh to reconcile the schedule status.`,
+          },
+        };
+        setScheduleOps(scheduleOpsRef.current);
+        return;
+      }
+      if (!relevantScheduleReadsOk(kind, job.id, readBack)) {
+        // The schedule list was readable, but the specific evidence this
+        // operation depends on (a new run/activation, or settled cancellation
+        // history) could not be read. Keep the operation uncertain so the UI
+        // does not claim it succeeded on incomplete evidence.
+        scheduleOpsRef.current = {
+          ...scheduleOpsRef.current,
+          [job.id]: {
+            ...op,
+            phase: 'read-failed',
+            message: `The ${scheduleOpVerb(kind)} was accepted, but the activation/run history needed to confirm it could not be read. Showing the previous state; it is stale. Use Refresh to reconcile the schedule status.`,
           },
         };
         setScheduleOps(scheduleOpsRef.current);
