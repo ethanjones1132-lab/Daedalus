@@ -450,3 +450,105 @@ export function safeJsonStringArray(raw: unknown): string[] {
     return [];
   }
 }
+
+// ── Phase 4.4 explicit objective continuity ─────────────────────────────────
+//
+// Mirrors the frozen Phase 3.4 native `SessionContinuity`/`ActiveObjective`
+// wire shape. Continuity is confirmed only by a decoded native read; a missing
+// or malformed read is unavailable, never an empty objective. The explicit
+// setter is the only durable operator write; ordinary turns preserve it.
+
+export interface ActiveObjective {
+  text: string;
+  source_message_id: string;
+  source_turn_id: string | null;
+  depends_on_memory_ids: string[];
+}
+
+export interface SessionContinuity {
+  session_id: string;
+  active_objective: ActiveObjective | null;
+  latest_turn_id: string | null;
+  revision: number;
+}
+
+/**
+ * Strict `SessionContinuity` decoder. `active_objective` and `latest_turn_id`
+ * must be explicitly present (null or the exact shape); `revision` is a
+ * positive safe integer. Any malformed value throws so the caller renders
+ * unavailable rather than a fabricated empty objective.
+ */
+export function decodeSessionContinuity(value: unknown): SessionContinuity {
+  if (!isRecord(value)) throw new Error('Invalid session continuity');
+  if (typeof value.session_id !== 'string' || value.session_id.length === 0) {
+    throw new Error('Invalid session continuity session id');
+  }
+  if (!('active_objective' in value)) {
+    throw new Error('Invalid session continuity objective');
+  }
+  let activeObjective: ActiveObjective | null = null;
+  if (value.active_objective !== null) {
+    const raw = value.active_objective;
+    if (!isRecord(raw)) throw new Error('Invalid active objective');
+    if (typeof raw.text !== 'string' || raw.text.trim().length === 0) {
+      throw new Error('Invalid active objective text');
+    }
+    if (typeof raw.source_message_id !== 'string' || raw.source_message_id.length === 0) {
+      throw new Error('Invalid active objective source message');
+    }
+    if (
+      !('source_turn_id' in raw) ||
+      (raw.source_turn_id !== null && typeof raw.source_turn_id !== 'string')
+    ) {
+      throw new Error('Invalid active objective source turn');
+    }
+    if (
+      !Array.isArray(raw.depends_on_memory_ids) ||
+      !raw.depends_on_memory_ids.every((id) => typeof id === 'string')
+    ) {
+      throw new Error('Invalid active objective dependencies');
+    }
+    activeObjective = {
+      text: raw.text,
+      source_message_id: raw.source_message_id,
+      source_turn_id: raw.source_turn_id as string | null,
+      depends_on_memory_ids: raw.depends_on_memory_ids,
+    };
+  }
+  if (
+    !('latest_turn_id' in value) ||
+    (value.latest_turn_id !== null && typeof value.latest_turn_id !== 'string')
+  ) {
+    throw new Error('Invalid session continuity latest turn');
+  }
+  if (
+    typeof value.revision !== 'number' ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision <= 0
+  ) {
+    throw new Error('Invalid session continuity revision');
+  }
+  return {
+    session_id: value.session_id,
+    active_objective: activeObjective,
+    latest_turn_id: value.latest_turn_id as string | null,
+    revision: value.revision,
+  };
+}
+
+/** The exact whole-message clear directive required by the native setter. */
+export const CLEAR_OBJECTIVE_DIRECTIVE = 'Clear active objective';
+/** The exact whole-message resume directive used by the normal turn path. */
+export const RESUME_OBJECTIVE_DIRECTIVE = 'Continue active objective';
+
+export {
+  decodeCaptureReceipt,
+  captureReceiptState,
+} from './memory-capture-state';
+export type {
+  CaptureReceipt,
+  CaptureOperationReceipt,
+  CaptureOperationStatus,
+  CaptureStateView,
+  CaptureStateName,
+} from './memory-capture-state';

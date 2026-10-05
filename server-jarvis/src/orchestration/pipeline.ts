@@ -269,6 +269,18 @@ export type StageTerminalStatus = "completed" | "failed" | "timed_out" | "cancel
 
 export type PipelineTopology = "linear" | "speculative_parallel" | "speculative_cascade" | "recursive";
 
+/**
+ * Phase 4.3 pre-synthesis memory-revalidation verdict. A `blocked` result means
+ * relevant project descriptive/unknown memory was actually applied this turn
+ * but no sufficient authenticated same-turn canonical read supports it, so the
+ * final answer must not be produced from that memory.
+ */
+export interface MemorySynthesisGateResult {
+  blocked: true;
+  error: string;
+  error_code: string;
+}
+
 export interface PipelineExecuteOptions {
   topology?: PipelineTopology;
   maxRecursionDepth?: number;
@@ -302,6 +314,17 @@ export interface PipelineExecuteOptions {
    * source evidence. Independent TaskRun/check evidence is untouched.
    */
   memoryRevalidation?: MemoryRevalidationPolicy;
+  /**
+   * Phase 4.3 fail-closed synthesis gate. Invoked at the pre-synthesis
+   * boundary (immediately before the final synthesizer runs). When it returns a
+   * blocked descriptor, final synthesis must NOT run and the turn returns the
+   * explicit unavailable result instead. The gate consumes the authenticated
+   * native `applied_selected_ids` union and the current-turn runtime evidence
+   * through the existing `assessMemoryRevalidation` contract; a `required`
+   * status alone never authorizes synthesis, and cached/historical/untrusted CLI
+   * evidence can never satisfy it.
+   */
+  memorySynthesisGate?: () => MemorySynthesisGateResult | null;
   /** Absolute filesystem roots granted by raw user messages for this Session. */
   sessionGrants?: string[];
   workspaceRoot?: string;
@@ -5456,6 +5479,31 @@ export class PipelineExecutor {
       // Full-turn accumulation — executeSegment never resets write_effects.
       writeEffects: this.ctx.write_effects,
     });
+    // Phase 4.3: the fail-closed memory gate is a property of the TURN's final
+    // answer, not of one stage. Every executeSegment exit that can surface
+    // answer text — including the no-synthesizer planner/executor fallback,
+    // reviewer/repair exits, and the post-executor checks — goes through this
+    // wrapper. A blocked descriptor replaces the segment's answer with the
+    // explicit `memory_revalidation_unavailable` result (never the gated
+    // memory). When the gate returns null (the ordinary case: no
+    // freshness-required applied memory) behavior is exactly `finish`.
+    const blockedAnswer = (
+      gate: MemorySynthesisGateResult,
+      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted" | "writeEffects">,
+    ): PipelineSegmentResult =>
+      finish({
+        ...segment,
+        synthesizerAnswer: "",
+        synthesizerFatalError: gate.error,
+        synthesizerEmptyCompletion: false,
+        fatalErrorCode: gate.error_code,
+      });
+    const finishGated = (
+      segment: Omit<PipelineSegmentResult, "checkResult" | "reviewerAccepted" | "writeEffects">,
+    ): PipelineSegmentResult => {
+      const gate = options.memorySynthesisGate?.() ?? null;
+      return gate?.blocked ? blockedAnswer(gate, segment) : finish(segment);
+    };
     const clearAcceptanceUnmetPartial = () => {
       if (partialStage?.errorCode === "plan_item_acceptance_unmet") {
         partialStage = undefined;
@@ -5601,7 +5649,7 @@ export class PipelineExecutor {
             agentRunId,
             remainingQueue: remainingNow(),
           });
-          if (post.finished) return finish(post.finished);
+          if (post.finished) return finishGated(post.finished);
           partialStage = post.partialStage;
           continue;
         }
@@ -5731,7 +5779,7 @@ export class PipelineExecutor {
           agentRunId,
           remainingQueue: remainingNow(),
         });
-        if (post.finished) return finish(post.finished);
+        if (post.finished) return finishGated(post.finished);
         partialStage = post.partialStage;
         continue;
       }
@@ -5870,7 +5918,7 @@ export class PipelineExecutor {
             `(repairs=${loopRepairsUsed}, max=${options.maxReviewRepairRounds ?? "default"}) with reviewer issues outstanding; ` +
             `skipping synthesizer to avoid a misleading best-effort answer`,
           );
-          return finish({ state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } });
+          return finishGated({ state, partialStage: { stage: "reviewer" as StageName, errorCode: "repair_cap_exhausted" } });
         }
 
         // Backstop / exhausted: fall through to synthesizer. Mid-run replan
@@ -5890,7 +5938,7 @@ export class PipelineExecutor {
             trigger: "reviewer_reject",
             detail: reviewer.feedback?.slice(0, 400) || "reviewer rejected",
           };
-          return finish({ state, replanRequested, partialStage });
+          return finishGated({ state, replanRequested, partialStage });
         }
         // Reviewer accept with active plan item → mark verified only when
         // structured grounding satisfies acceptance checks (fail closed).
@@ -5956,7 +6004,7 @@ export class PipelineExecutor {
               continue;
             }
             // No repair budget: surface partial and skip synthesizer success path.
-            return finish({
+            return finishGated({
               state,
               partialStage,
             });
@@ -5981,7 +6029,7 @@ export class PipelineExecutor {
                 stage: "reviewer" as StageName,
                 errorCode: "plan_item_acceptance_unmet",
               };
-              return finish({ state, partialStage });
+              return finishGated({ state, partialStage });
             }
           }
         }
@@ -6074,7 +6122,7 @@ export class PipelineExecutor {
     }
 
     if (isTerminalNoWriteEffect(effectGate)) {
-      return finish({ state, effectGate, partialStage });
+      return finishGated({ state, effectGate, partialStage });
     }
 
     // A reviewer/rewriter pass that still produced no requested mutation is
@@ -6094,11 +6142,15 @@ export class PipelineExecutor {
         trigger: "effect_gate_failure",
         detail: "No successful file mutation was produced after execution and repair.",
       };
-      return finish({ state, effectGate, replanRequested, partialStage });
+      return finishGated({ state, effectGate, replanRequested, partialStage });
     }
 
+    // The no-synthesizer exit is a FINAL answer path: the caller surfaces
+    // planner/executor prose as the answer (see execute()/finalizeSegment
+    // `synthesizerAnswer === undefined` fallbacks), so it must pass the same
+    // fail-closed memory gate before finish. This was the Phase 4.3 gap.
     if (!wantsSynthesizer) {
-      return finish({ state, effectGate, partialStage, replanRequested });
+      return finishGated({ state, effectGate, partialStage, replanRequested });
     }
 
     const preSynthAssessment = assessWorkspaceEvidence(
@@ -6139,6 +6191,17 @@ export class PipelineExecutor {
           `State plainly which files you actually read, answer only from them, and name what remains unread.`,
         ].filter(Boolean).join("\n"),
       };
+    }
+
+    // Phase 4.3 fail-closed memory gate: the final answer must not be produced
+    // from relevant project descriptive/unknown memory that was actually
+    // applied without a sufficient authenticated same-turn canonical read. This
+    // is separate from (and stricter than) the request/task-derived evidence
+    // fence above: that fence can pass on unrelated partial evidence while the
+    // only reason to revalidate is an applied memory fact.
+    const memoryGate = options.memorySynthesisGate?.() ?? null;
+    if (memoryGate?.blocked) {
+      return blockedAnswer(memoryGate, { state, effectGate, partialStage, replanRequested });
     }
 
     const synth = await this.runSynthesizerStage(
@@ -6424,6 +6487,14 @@ export class PipelineExecutor {
     const executorSummary = "No execution stage executed. Planner and reviewer ran speculatively without tool execution.";
     const rewriterSummary = "No rewriting stage executed.";
 
+    // Phase 4.3: same fail-closed memory gate as the linear path. Placed before
+    // ANY answer surfacing (including the planner-only return below), because
+    // the planner/reviewer stages above may have carried applied memory.
+    const memoryGate = options.memorySynthesisGate?.() ?? null;
+    if (memoryGate?.blocked) {
+      return { answer: "", error: memoryGate.error, recursion_depth: 0, outcome: "failed", error_code: memoryGate.error_code };
+    }
+
     if (!pipeline.includes("synthesizer")) {
       return { answer: plan };
     }
@@ -6596,6 +6667,12 @@ export class PipelineExecutor {
       `Cheap executor output:\n${cheapOutput}`,
       `Strong executor output:\n${strongOutput}`,
     ].join("\n\n");
+
+    // Phase 4.3: same fail-closed memory gate as the linear path.
+    const memoryGate = options.memorySynthesisGate?.() ?? null;
+    if (memoryGate?.blocked) {
+      return { answer: "", error: memoryGate.error, recursion_depth: 0, outcome: "failed", error_code: memoryGate.error_code };
+    }
 
     onStateChange({ stage: "synthesizer", status: "running" });
     const synthesizerPrompt = stageSystemPrompt("synthesizer", options);
@@ -6906,6 +6983,11 @@ export class PipelineExecutor {
         // the same ephemeral snapshot must ride along at its final boundary.
         turnMemory: options.turnMemory,
         onMemoryApplied: options.onMemoryApplied,
+        // Keep the Phase 4.3 cache-bypass and fail-closed synthesis gate armed
+        // across recursive re-entry; otherwise a critiqued turn could bypass
+        // both and synthesize from unsupported project memory.
+        memoryRevalidation: options.memoryRevalidation,
+        memorySynthesisGate: options.memorySynthesisGate,
       },
     );
   }

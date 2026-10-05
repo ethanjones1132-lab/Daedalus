@@ -282,26 +282,23 @@ fn attempt_relay_memory_finalize(
                 emit_relay_memory_failure(app, session_id, turn_id, "memory_turn_mismatch");
                 return None;
             }
-            // Authoritative native diagnostic projection: metadata and
-            // selected/applied IDs only, never scope, recalled text, or the
-            // block.
-            let selected_ids: Vec<serde_json::Value> = diagnostic
-                .selected
-                .iter()
-                .map(|selection| serde_json::json!({ "id": selection.id }))
-                .collect();
+            // Authoritative native diagnostic projection: prepared selection
+            // metadata, applied IDs, scope, and current-source revalidation
+            // availability. Never recalled text or the raw block.
             let _ = app.emit(
                 "jarvis://memory-diagnostic",
                 serde_json::json!({
                     "turn_id": diagnostic.turn_id,
                     "session_id": diagnostic.session_id,
+                    "scope": &diagnostic.scope,
                     "store_revision": diagnostic.store_revision,
-                    "selected": selected_ids,
-                    "applied_selected_ids": diagnostic.applied_selected_ids,
+                    "selected": &diagnostic.selected,
+                    "applied_selected_ids": &diagnostic.applied_selected_ids,
                     "state": diagnostic.state,
                     "recall_status": diagnostic.recall_status,
                     "error_code": diagnostic.error_code,
                     "terminal_status": diagnostic.terminal_status,
+                    "revalidation": &diagnostic.revalidation,
                 }),
             );
             // `error_code` is reserved for an ACTUAL capture failure. A sync or

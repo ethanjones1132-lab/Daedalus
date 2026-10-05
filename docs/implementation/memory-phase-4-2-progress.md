@@ -82,3 +82,9 @@ Reviewed the production diff against parent Phase 4 Task 1 and the Phase 1–3 f
 - **Phase 1–3 preserved.** Memory CRUD, scope/store revisions, provenance, capture/receipt/idempotency, suppression, objective continuity, preparation TTL/invalidation, and the derived-state gate are untouched. Part 4.1 classification fields and operator controls are unchanged.
 - **Migration/DB.** No schema, migration, or persistence change was made in 4.2; `sessions.project_root` and `sessions.agent_id` already existed.
 - No unresolved authority, grant-widening, or scope-forgery finding was found in the reviewed diff.
+
+## Phase 4.4 cross-review addendum (same source line)
+
+Part 4.4 re-reviewed the Part 4.2 Session-identity and bound-workspace source. No regression or unresolved load-bearing finding was found: Session Agent ownership remains read only from the persisted row, `jarvis_new_session` still validates an explicit enabled Agent, `resolveBoundMemoryWorkspace` still offers the authenticated candidate to `resolveSafePath` with `forWrite:true` and no candidate `workspaceOverride`, and an explicit user path still wins. The 4.4 turn-status reads pass only the active Session id and never infer or widen scope.
+
+Permitted checks on the combined Phase 4.4 working tree (unmasked exit codes): `git diff --check` → 0; `cargo check --manifest-path src-tauri/Cargo.toml` → 0 (pre-existing `supervisor.rs`/`wsl.rs` warnings only); `server-jarvis: bun run typecheck` → 0; `server-jarvis: bun run build` → 0 (200 modules); `src-ui: bun run build` → 0 (2,722 modules; existing large-chunk warning only). No tests, fixtures, or test declarations were touched. Part 4.4 did not modify any Part 4.2 native source; `MemoryScopeControls` is unchanged.

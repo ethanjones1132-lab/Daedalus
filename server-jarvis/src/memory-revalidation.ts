@@ -19,6 +19,7 @@ import type {
   MemoryRevalidationResult,
   MemoryRuntimeEvidence,
   PreparedMemorySelection,
+  PreparedMemoryTurn,
 } from "./memory-contract";
 
 /** Genuine file-content tools — the only ones that can satisfy a fresh read. */
@@ -184,4 +185,33 @@ export function unavailableForUntrustedTransport(
 ): MemoryRevalidationResult {
   if (!policy.requires_fresh_workspace_reads) return notRequired();
   return unavailable(policy.memory_ids, "unsupported_cli_evidence");
+}
+
+/**
+ * Fail-closed context filter for the pre-answer provider boundary. Given the
+ * outcome of `assessMemoryRevalidation` (or
+ * `unavailableForUntrustedTransport`), return an ephemeral envelope that
+ * retains every selection EXCEPT the project-scoped `descriptive_fact`/
+ * `unknown` items whose current-source validation was NOT satisfied this turn.
+ *
+ * Only the required IDs are removed: normative constraints, explicit user/
+ * Agent preferences, objective/continuity, and all other selections survive
+ * unchanged. The stale preformatted `block` from the native envelope is dropped
+ * so the excluded text can never ride along; the existing fitter re-renders
+ * framing solely from the retained selection. The original envelope is never
+ * mutated, and callers must continue to report the actual applied IDs so
+ * omitted data is never labelled used.
+ */
+export function filterUnrevalidatedSelections(
+  envelope: PreparedMemoryTurn,
+  policy: MemoryRevalidationPolicy,
+  result: MemoryRevalidationResult,
+): PreparedMemoryTurn {
+  if (!policy.requires_fresh_workspace_reads) return envelope;
+  if (result.state === "fresh_evidence") return envelope;
+  const excluded = new Set(policy.memory_ids);
+  if (excluded.size === 0) return envelope;
+  const retained = envelope.selected.filter((item) => !excluded.has(item.selection.id));
+  if (retained.length === envelope.selected.length) return envelope;
+  return { ...envelope, selected: retained, block: "" };
 }

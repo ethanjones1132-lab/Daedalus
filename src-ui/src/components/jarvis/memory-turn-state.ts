@@ -8,6 +8,12 @@
 // read-back is the authority for persisted selected/applied metadata. No frame
 // is ever treated as durable native evidence.
 
+import type {
+  AuthorityKind,
+  MemoryScopeKind,
+  MemoryStatementKind,
+} from './memory-control-state';
+
 /** Frozen `MemoryRecallStatus` values. Keep in lockstep with the Rust enum. */
 export type MemoryRecallStatus =
   | 'ready'
@@ -149,18 +155,45 @@ export interface MemoryStatusFrame {
   code?: string;
 }
 
+/** Decoded native `MemoryScope` (field names camel-cased). */
+export interface MemoryScopeView {
+  kind: MemoryScopeKind;
+  agentId: string;
+  projectRoot: string | null;
+}
+
+/**
+ * Decoded prepared candidate from the native `selected` metadata. This is what
+ * was *prepared*, never what was used: only the intersection with
+ * `appliedSelectedIds` may be shown as used.
+ */
+export interface PreparedMemorySelectionView {
+  id: string;
+  revision: number;
+  scope: MemoryScopeView;
+  authorityKind: AuthorityKind;
+  statementKind: MemoryStatementKind;
+  sourceSessionId: string | null;
+  sourceMessageIds: string[];
+  sourceRunId: string | null;
+  verifiedAt: string | null;
+  stale: boolean;
+}
+
 /**
  * UI projection of the authoritative native `MemoryTurnDiagnostic`. Prepared
- * `selectedIds` and actual `appliedSelectedIds` stay distinct; the latter may
- * validly be empty even after a model turn.
+ * `prepared`/`selectedIds` and actual `appliedSelectedIds` stay distinct; the
+ * latter may validly be empty even after a model turn.
  */
 export interface MemoryTurnDiagnosticView {
   turnId: string;
   sessionId: string;
+  scope: MemoryScopeView;
   state: MemoryTurnState;
   recallStatus: MemoryRecallStatus;
   errorCode: string | null;
   terminalStatus: MemoryTurnTerminalStatus | null;
+  prepared: PreparedMemorySelectionView[];
   selectedIds: string[];
   appliedSelectedIds: string[];
   storeRevision: number;
@@ -178,6 +211,108 @@ export interface MemoryRevalidationView {
   memoryIds: string[];
   evidenceToolCallIds: string[];
   reasonCode: string | null;
+}
+
+const SCOPE_KINDS: ReadonlySet<string> = new Set<MemoryScopeKind>([
+  'project',
+  'agent',
+  'user',
+  'legacy_unscoped',
+]);
+
+const AUTHORITY_KINDS: ReadonlySet<string> = new Set<AuthorityKind>([
+  'manual',
+  'user_statement',
+  'verified_observation',
+  'assistant_proposal',
+  'legacy_unknown',
+]);
+
+const STATEMENT_KINDS: ReadonlySet<string> = new Set<MemoryStatementKind>([
+  'normative_constraint',
+  'descriptive_fact',
+  'unknown',
+]);
+
+/** Present and either a string or an explicit null; missing is rejected. */
+function isPresentNullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+
+/**
+ * Strict scope decoder. `project_root` must be explicitly present as string or
+ * null; a missing field is malformed.
+ */
+export function decodeMemoryScope(value: unknown): MemoryScopeView {
+  if (!isRecord(value)) throw new Error('Invalid memory scope');
+  if (typeof value.kind !== 'string' || !SCOPE_KINDS.has(value.kind)) {
+    throw new Error('Invalid memory scope kind');
+  }
+  if (typeof value.agent_id !== 'string') throw new Error('Invalid memory scope agent');
+  if (!('project_root' in value) || !isPresentNullableString(value.project_root)) {
+    throw new Error('Invalid memory scope project root');
+  }
+  return {
+    kind: value.kind as MemoryScopeKind,
+    agentId: value.agent_id,
+    projectRoot: value.project_root as string | null,
+  };
+}
+
+/**
+ * Strict prepared-selection decoder. A missing `statement_kind` is the only
+ * legacy compatibility (decoded as `unknown`); every other field must be
+ * present and well-typed or the whole diagnostic is malformed.
+ */
+export function decodePreparedMemorySelection(value: unknown): PreparedMemorySelectionView {
+  if (!isRecord(value)) throw new Error('Invalid prepared memory selection');
+  if (typeof value.id !== 'string' || value.id.length === 0) {
+    throw new Error('Invalid prepared memory selection id');
+  }
+  if (
+    typeof value.revision !== 'number' ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision <= 0
+  ) {
+    throw new Error('Invalid prepared memory selection revision');
+  }
+  if (typeof value.authority_kind !== 'string' || !AUTHORITY_KINDS.has(value.authority_kind)) {
+    throw new Error('Invalid prepared memory authority');
+  }
+  const statementRaw = value.statement_kind;
+  const statementKind = statementRaw === undefined
+    ? 'unknown'
+    : (typeof statementRaw === 'string' && STATEMENT_KINDS.has(statementRaw)
+      ? (statementRaw as MemoryStatementKind)
+      : null);
+  if (statementKind === null) throw new Error('Invalid prepared memory classification');
+  if (!('source_session_id' in value) || !isPresentNullableString(value.source_session_id)) {
+    throw new Error('Invalid prepared memory source session');
+  }
+  if (!('source_run_id' in value) || !isPresentNullableString(value.source_run_id)) {
+    throw new Error('Invalid prepared memory source run');
+  }
+  if (!('verified_at' in value) || !isPresentNullableString(value.verified_at)) {
+    throw new Error('Invalid prepared memory verification provenance');
+  }
+  if (!isStringArray(value.source_message_ids)) {
+    throw new Error('Invalid prepared memory source messages');
+  }
+  if (typeof value.stale !== 'boolean') {
+    throw new Error('Invalid prepared memory staleness');
+  }
+  return {
+    id: value.id,
+    revision: value.revision,
+    scope: decodeMemoryScope(value.scope),
+    authorityKind: value.authority_kind as AuthorityKind,
+    statementKind,
+    sourceSessionId: value.source_session_id as string | null,
+    sourceMessageIds: value.source_message_ids,
+    sourceRunId: value.source_run_id as string | null,
+    verifiedAt: value.verified_at as string | null,
+    stale: value.stale,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -294,20 +429,22 @@ export function decodeMemoryTurnDiagnostic(value: unknown): MemoryTurnDiagnostic
   if (terminalStatus !== null && !isMemoryTurnTerminalStatus(terminalStatus)) {
     throw new Error('Invalid memory turn diagnostic');
   }
-  const selected = Array.isArray(value.selected) ? value.selected : [];
-  const selectedIds = selected
-    .map((entry) => (isRecord(entry) && typeof entry.id === 'string' ? entry.id : null))
-    .filter((id): id is string => id !== null);
-  const appliedSelectedIds = isStringArray(value.applied_selected_ids)
-    ? value.applied_selected_ids
-    : [];
+  if (!Array.isArray(value.selected)) throw new Error('Invalid memory turn diagnostic');
+  const prepared = value.selected.map(decodePreparedMemorySelection);
+  const selectedIds = prepared.map((entry) => entry.id);
+  if (!isStringArray(value.applied_selected_ids)) {
+    throw new Error('Invalid memory turn diagnostic');
+  }
+  const appliedSelectedIds = value.applied_selected_ids;
   return {
     turnId,
     sessionId,
+    scope: decodeMemoryScope(value.scope),
     state,
     recallStatus,
     errorCode: errorCode ?? null,
     terminalStatus: terminalStatus ?? null,
+    prepared,
     selectedIds,
     appliedSelectedIds,
     storeRevision,

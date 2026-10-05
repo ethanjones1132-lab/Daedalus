@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useLayoutEffect, memo } from 'react';
+import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -92,6 +92,8 @@ import {
   type CaptureReceipt,
   type CaptureStateView,
 } from './memory-capture-state';
+import MemoryTurnStatus, { type MemorySourceMessage } from './MemoryTurnStatus';
+import { decodeSessionContinuity, RESUME_OBJECTIVE_DIRECTIVE, type SessionContinuity } from './memory-control-state';
 import {
   activeRelayMemoryTurn,
   clearRelayMemoryTurn,
@@ -750,6 +752,23 @@ export function ChatPanel({
   // error/blocked-only receipt is `failed`. Assistant prose never acknowledges
   // a save.
   const [memoryCaptureState, setMemoryCaptureState] = useState<CaptureStateView | null>(null);
+  // Phase 4.4 — full committed receipt and confirmed objective for the turn
+  // status panel. The receipt is authoritative only when decoded and identity
+  // checked; the objective comes only from a native continuity read.
+  const [memoryReceipt, setMemoryReceipt] = useState<CaptureReceipt | null>(null);
+  const [memoryContinuity, setMemoryContinuity] = useState<SessionContinuity | null>(null);
+  const [memoryContinuityError, setMemoryContinuityError] = useState<string | null>(null);
+  const [memoryContinuityPending, setMemoryContinuityPending] = useState(false);
+  const [memoryTurnReadError, setMemoryTurnReadError] = useState<string | null>(null);
+  // Monotonic token: every Session/turn read (and every Session/turn change)
+  // bumps it so a late response from a previous identity is discarded.
+  const memoryReadSeqRef = useRef(0);
+  // Stable indirection so the finalizer/listener callbacks can request a
+  // post-turn read without joining their dependency arrays.
+  const refreshMemoryTurnRef = useRef<((sid: string, turnId: string | null) => void) | null>(null);
+  // Stable operation identity for an explicit continuity set: an unchanged
+  // target/payload retry reuses the same id; editing it mints a new one.
+  const continuityOperationRef = useRef<{ key: string; id: string } | null>(null);
   // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
@@ -789,6 +808,78 @@ export function ChatPanel({
   // are rejected so they cannot repaint a finished turn. Bounded: cleared on the
   // owning submission/Session change; keys are only the live registration.
   const settledRelayOwnersRef = useRef<Set<string>>(new Set());
+
+  // Phase 4.4 — one-shot native read of the confirmed objective plus, when a
+  // turn identity is known (or the continuity names the latest turn), that
+  // turn's authoritative diagnostic and committed capture receipt. Read-only:
+  // it never performs capture or exposes recalled text. Every await re-checks a
+  // monotonic token and the captured Session so a late response from a switched
+  // Session/turn is discarded.
+  const refreshMemoryTurn = useCallback(async (sid: string, turnId: string | null) => {
+    const seq = ++memoryReadSeqRef.current;
+    setMemoryContinuityPending(true);
+    setMemoryContinuityError(null);
+    setMemoryTurnReadError(null);
+    let continuity: SessionContinuity | null = null;
+    let continuityFailed = false;
+    try {
+      continuity = decodeSessionContinuity(await invoke('memory_continuity_read', {
+        request: { session_id: sid },
+      }));
+    } catch {
+      continuityFailed = true;
+    }
+    if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
+    setMemoryContinuity(continuity);
+    setMemoryContinuityError(continuityFailed ? 'Memory continuity unavailable for this Session.' : null);
+    setMemoryContinuityPending(false);
+
+    const readTurn = turnId ?? continuity?.latest_turn_id ?? null;
+    if (!readTurn) return;
+    let rawDiagnostic: unknown = null;
+    let rawReceipt: unknown = null;
+    let readFailed = false;
+    try {
+      rawDiagnostic = await invoke('memory_turn_diagnostic', {
+        request: { session_id: sid, turn_id: readTurn },
+      });
+    } catch {
+      readFailed = true;
+    }
+    try {
+      rawReceipt = await invoke('memory_capture_receipts', {
+        request: { session_id: sid, turn_id: readTurn },
+      });
+    } catch {
+      readFailed = true;
+    }
+    if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
+    if (readFailed) {
+      setMemoryTurnReadError('Memory turn detail unavailable.');
+      return;
+    }
+    try {
+      const view = decodeMemoryTurnDiagnostic(rawDiagnostic);
+      if (view.turnId === readTurn && view.sessionId === sid) setMemoryDiagnostic(view);
+    } catch {
+      setMemoryTurnReadError('Memory turn detail unavailable.');
+    }
+    // A null receipt means unavailable (no committed receipt read), never a
+    // confirmed zero-save result. Only the full receipt is updated here: the
+    // compact capture status/label is owned by the finalizer/relay handler so a
+    // pending or failed capture signal is never clobbered by this read.
+    const receipt = decodeCaptureReceipt(rawReceipt);
+    if (receipt && receipt.turn_id === readTurn && receipt.session_id === sid) {
+      setMemoryReceipt(receipt);
+    } else {
+      setMemoryReceipt(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshMemoryTurnRef.current = refreshMemoryTurn;
+  }, [refreshMemoryTurn]);
+
   useEffect(() => {
     // A Session change invalidates the previous turn's memory surface and any
     // relay correlation: no old warning/diagnostic may survive it. It also
@@ -802,12 +893,21 @@ export function ChatPanel({
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
     setMemoryCaptureState(null);
+    setMemoryReceipt(null);
+    setMemoryContinuity(null);
+    setMemoryContinuityError(null);
+    setMemoryContinuityPending(false);
+    setMemoryTurnReadError(null);
     memoryOwnerRef.current = null;
     relayAssistantAggregateRef.current = '';
     settledRelayOwnersRef.current.clear();
     conversationEpochRef.current += 1;
+    // Invalidate any in-flight read from the previous identity, then read the
+    // reopened Session's confirmed objective/latest turn once.
+    memoryReadSeqRef.current += 1;
     clearRelayMemoryTurn();
-  }, [activeSession]);
+    if (activeSession) void refreshMemoryTurn(activeSession, null);
+  }, [activeSession, refreshMemoryTurn]);
 
   // The user-wide opt-in is local to the selected Session/Agent and must never
   // carry silently across an Agent change. It also defaults off on mount and
@@ -1709,6 +1809,12 @@ export function ChatPanel({
           : null;
         const errorCode = typeof p.error_code === 'string' ? p.error_code : null;
         setMemoryCaptureState(captureReceiptState(receipt, errorCode));
+        setMemoryReceipt(receipt);
+        // Read the authoritative full diagnostic/objective for this exact relay
+        // turn (read-only; the relay event itself is metadata only).
+        if (typeof p.session_id === 'string' && typeof p.turn_id === 'string') {
+          refreshMemoryTurnRef.current?.(p.session_id, p.turn_id);
+        }
         // Native reports sync/append failures independently from capture; they
         // never fail a committed receipt but stay observable.
         if (p.sync_failed === true) {
@@ -1928,6 +2034,7 @@ export function ChatPanel({
           }
         }
         setMemoryCaptureState(captureReceiptState(receipt, receipt === null ? 'capture_unavailable' : null));
+        setMemoryReceipt(receipt);
 
         // Diagnostic: decoded separately and identity-checked. A sync failure
         // is observable metadata and never fails a committed capture receipt.
@@ -1952,6 +2059,9 @@ export function ChatPanel({
         } else if (outcome.appendFailed) {
           setMemoryFinalizationNotice('Assistant transcript not saved; showing the ordinary result.');
         }
+        // Read the confirmed objective for this exact Session/turn. This is a
+        // read-only native refresh; it never captures or mutates state.
+        refreshMemoryTurnRef.current?.(sid, turnId);
         return diagnosticOk;
       })();
       return finalizePromise;
@@ -2597,7 +2707,64 @@ export function ChatPanel({
     }
   }, [activeSession, isStreaming, onSessionsChanged]);
 
-  const handleSend = useCallback(async () => {
+  // Phase 4.4 — explicit objective set/clear. A new operation is validated
+  // natively against the exact persisted user source, the expected continuity
+  // revision, and the exact substring rule; the result is confirmed only from
+  // the decoded native `SessionContinuity` read-back. An unchanged retry reuses
+  // the same operation id so native replay is idempotent.
+  const handleSetObjective = useCallback(async (input: {
+    source_message_id: string;
+    objective: string | null;
+  }) => {
+    const sid = activeSession;
+    if (!sid || isStreaming) return;
+    const continuity = memoryContinuity;
+    if (!continuity || continuity.session_id !== sid) {
+      setMemoryContinuityError('Objective state unavailable.');
+      return;
+    }
+    const key = JSON.stringify([sid, input.source_message_id, input.objective, continuity.revision]);
+    if (!continuityOperationRef.current || continuityOperationRef.current.key !== key) {
+      continuityOperationRef.current = { key, id: crypto.randomUUID() };
+    }
+    const operation_id = continuityOperationRef.current.id;
+    const seq = ++memoryReadSeqRef.current;
+    setMemoryContinuityPending(true);
+    setMemoryContinuityError(null);
+    try {
+      const raw = await invoke<unknown>('memory_continuity_set', {
+        request: {
+          session_id: sid,
+          expected_revision: continuity.revision,
+          source_message_id: input.source_message_id,
+          objective: input.objective,
+          operation_id,
+        },
+      });
+      const decoded = decodeSessionContinuity(raw);
+      if (decoded.session_id !== sid) throw new Error('continuity identity mismatch');
+      if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
+      setMemoryContinuity(decoded);
+      setMemoryContinuityError(null);
+      setMemoryContinuityPending(false);
+      continuityOperationRef.current = null;
+    } catch {
+      if (seq === memoryReadSeqRef.current && mountedRef.current && activeSessionRef.current === sid) {
+        setMemoryContinuityError(
+          'Could not update the active objective. The previous objective is unchanged.',
+        );
+        setMemoryContinuityPending(false);
+      }
+    }
+  }, [activeSession, isStreaming, memoryContinuity]);
+
+  const handleSend = useCallback(async (overrideText?: unknown) => {
+    // Phase 4.4 — Resume passes the exact continuation directive as an explicit
+    // override; every other caller passes no argument (a DOM event is ignored).
+    // An override never clears or restores the operator's own composer draft.
+    const override = typeof overrideText === 'string' && overrideText.trim().length > 0
+      ? overrideText.trim()
+      : null;
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
     // state guard below misses rapid double-Enter presses because setState
     // is async/batched — a second handleSend in the same tick sees the
@@ -2611,7 +2778,8 @@ export function ChatPanel({
       return;
     }
     const submittedDraft = getSessionDraftSnapshot(draftStoreRef.current, activeSession);
-    if (!submittedDraft.text.trim() || isStreaming) {
+    const userMsg = override ?? submittedDraft.text.trim();
+    if (!userMsg || isStreaming) {
       sendInFlightRef.current.finish();
       return;
     }
@@ -2621,7 +2789,6 @@ export function ChatPanel({
       return;
     }
     stopRequestedRef.current = false;
-    const userMsg = submittedDraft.text.trim();
     discardPendingTokens();
     setError(null);
     // Phase 2.4 — clear the previous turn's memory surface. The native history
@@ -2631,6 +2798,13 @@ export function ChatPanel({
     setMemoryHistoryWarning(null);
     setMemoryFinalizationNotice(null);
     setMemoryCaptureState(null);
+    setMemoryReceipt(null);
+    setMemoryContinuity(null);
+    setMemoryContinuityError(null);
+    setMemoryContinuityPending(false);
+    setMemoryTurnReadError(null);
+    // Invalidate any in-flight read from a previous turn/identity.
+    memoryReadSeqRef.current += 1;
     // A new submission invalidates any prior relay correlation so a late relay
     // event from a previous turn cannot bind to this one.
     clearRelayMemoryTurn();
@@ -2714,7 +2888,9 @@ export function ChatPanel({
               setIsStreaming(false);
               setError('Could not bind the selected workspace to the new Session. The Session was created but no message was sent; choose a valid absolute directory and retry.');
               setMessages(prev => prev.filter(m => m.id !== clientMessageId && m.id !== assistantClientMessageId));
-              publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+              if (!override) {
+                publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+              }
             }
             return;
           }
@@ -2735,12 +2911,16 @@ export function ChatPanel({
       }
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
-        publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
+        if (!override) {
+          publishDraftStore(clearSubmittedSessionDraft(draftStoreRef.current, submittedDraft));
+        }
       }, clientMessageId, assistantClientMessageId, includeUserScopeForTurn);
     } catch (e) {
       if (!mountedRef.current) return;
       if (!sendGateRef.current.isCurrent(sendGeneration)) {
-        publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+        if (!override) {
+          publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+        }
         return;
       }
       streamAbortRef.current = null;
@@ -2760,7 +2940,9 @@ export function ChatPanel({
       const errorMessage = String(e instanceof Error ? e.message : e);
        const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
        setError(errorMessage);
-       publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+       if (!override) {
+         publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+       }
        setMessages(prev => {
         const withTokens = applyTokenChunk(prev, pending);
         const last = withTokens[withTokens.length - 1];
@@ -2786,6 +2968,20 @@ export function ChatPanel({
       sendInFlightRef.current.finish();
     }
   }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, onSessionsChanged, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope, pendingAgentId, pendingProjectRoot, bindWorkspaceForSession]);
+
+  // Phase 4.4 — Resume is an explicit control that sends the exact native
+  // resume directive through the ordinary turn transport. It never fabricates
+  // an objective and never touches the operator's own composer draft.
+  const handleResumeObjective = useCallback(() => {
+    if (
+      isStreaming
+      || !activeSession
+      || !memoryContinuity
+      || memoryContinuity.session_id !== activeSession
+      || !memoryContinuity.active_objective
+    ) return;
+    void handleSend(RESUME_OBJECTIVE_DIRECTIVE);
+  }, [isStreaming, activeSession, memoryContinuity, handleSend]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -2982,6 +3178,35 @@ export function ChatPanel({
     project_root: currentSession ? currentSession.project_root ?? null : pendingProjectRoot,
     include_user_scope: includeUserScope,
   };
+
+  // Phase 4.4 — persisted user rows only (real DB ids), used solely as an
+  // explicit objective source for the native setter; never a fabricated id.
+  const persistedUserMessages = useMemo<MemorySourceMessage[]>(
+    () => messages
+      .filter((message) => message.role === 'user' && typeof message.id === 'string' && message.id.length > 0)
+      .map((message) => ({ id: message.id as string, content: message.content })),
+    [messages],
+  );
+  // Guard against the single render frame after a Session switch where the
+  // passive reset effect has not yet run: never pair a new Session id with a
+  // previous Session's turn snapshot, receipt, or objective.
+  const memoryDiagnosticForSession =
+    activeSession && memoryDiagnostic && memoryDiagnostic.sessionId === activeSession
+      ? memoryDiagnostic
+      : null;
+  const memoryReceiptForSession =
+    activeSession && memoryReceipt && memoryReceipt.session_id === activeSession
+      ? memoryReceipt
+      : null;
+  const memoryContinuityForSession =
+    activeSession && memoryContinuity && memoryContinuity.session_id === activeSession
+      ? memoryContinuity
+      : null;
+  const memoryTurnId =
+    memoryDiagnosticForSession?.turnId
+    ?? memoryReceiptForSession?.turn_id
+    ?? memoryContinuityForSession?.latest_turn_id
+    ?? null;
 
   return (
     <div className="h-full flex flex-col">
@@ -3443,6 +3668,25 @@ export function ChatPanel({
             {captureStateLabel(memoryCaptureState)}
           </p>
         )}
+        {/* Phase 4.4 — actual applied memory, committed capture receipt,
+            current-source evidence, and confirmed objective. Read-only except
+            for the explicit native continuity controls. */}
+        <div className="mt-2 px-1">
+          <MemoryTurnStatus
+            session_id={activeSession}
+            turn_id={memoryTurnId}
+            diagnostic={memoryDiagnosticForSession}
+            receipt={memoryReceiptForSession}
+            continuity={memoryContinuityForSession}
+            read_error={memoryTurnReadError}
+            sourceMessages={persistedUserMessages}
+            continuityPending={memoryContinuityPending}
+            continuityError={memoryContinuityError}
+            disabled={isStreaming}
+            onSetObjective={(input) => { void handleSetObjective(input); }}
+            onResumeObjective={handleResumeObjective}
+          />
+        </div>
       </div>
 
       {/* Phase 1.1 — Tool approval modal. Rendered outside the scroll area so

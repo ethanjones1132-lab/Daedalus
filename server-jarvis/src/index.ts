@@ -36,6 +36,7 @@ import {
   appliedRevalidationPolicy,
   assessMemoryRevalidation,
   buildMemoryRevalidationPolicy,
+  filterUnrevalidatedSelections,
   unavailableForUntrustedTransport,
 } from "./memory-revalidation";
 import {
@@ -1891,16 +1892,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     /**
      * Fit the same snapshot against a CLEAN base message list and return the
      * cloned list carrying at most one carrier. Never mutate the clean base.
+     * The envelope is supplied explicitly so a caller can attach a fail-closed
+     * filtered envelope (Phase 4.3) rather than the raw prepared snapshot.
      */
     const attachTurnMemory = (
+      envelope: PreparedMemoryTurn | null,
       cleanMessages: readonly any[],
       toolSchemas: unknown,
       contextWindowTokens: number | null,
       outputReserveTokens: number | null,
     ): { messages: any[]; applied: AppliedTurnMemory | null } => {
-      if (!turnMemoryEnvelope) return { messages: cleanMessages as any[], applied: null };
+      if (!envelope) return { messages: cleanMessages as any[], applied: null };
       const applied = fitTurnMemory(
-        turnMemoryEnvelope,
+        envelope,
         cleanMessages as any,
         resolveTurnMemoryInputBudget({
           contextWindowTokens,
@@ -1913,6 +1917,61 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         applied,
       };
     };
+
+    // ── Phase 4.3 fail-closed envelope eligibility ─────────────────────────
+    // A provider must never receive project descriptive/unknown memory that
+    // requires current source unless THIS turn already produced authenticated
+    // canonical read evidence. The filtered envelope is derived from the same
+    // prepared policy and the same `assessMemoryRevalidation` contract used by
+    // the terminal receipt; omitted items remain absent from the native applied
+    // IDs so they are never labelled used.
+    const trustedEligibleEnvelope = (): PreparedMemoryTurn | null => {
+      if (!turnMemoryEnvelope) return null;
+      if (memoryRevalidationUntrusted) {
+        return filterUnrevalidatedSelections(
+          turnMemoryEnvelope,
+          memoryRevalidationPolicy,
+          unavailableForUntrustedTransport(memoryRevalidationPolicy),
+        );
+      }
+      let result: MemoryRevalidationResult;
+      try {
+        const evidence = activeTurnMemory
+          ? nativeMemoryRegistry.receipt(activeTurnMemory.preparationId)?.runtime_evidence ?? []
+          : [];
+        result = assessMemoryRevalidation(
+          memoryRevalidationPolicy,
+          observedToolCallRecords,
+          evidence,
+          message,
+          activeWorkspacePath,
+        );
+      } catch {
+        result = {
+          state: "unavailable",
+          memory_ids: memoryRevalidationPolicy.memory_ids,
+          evidence_tool_call_ids: [],
+          reason_code: "unsupported_evidence_path",
+        };
+      }
+      return filterUnrevalidatedSelections(turnMemoryEnvelope, memoryRevalidationPolicy, result);
+    };
+    // An external CLI transport (direct Claude CLI or the delegate) runs its
+    // own tools and can never produce trusted runtime refs, so freshness-
+    // required selections are always excluded from its context.
+    const untrustedEligibleEnvelope: PreparedMemoryTurn | null = turnMemoryEnvelope
+      ? filterUnrevalidatedSelections(
+          turnMemoryEnvelope,
+          memoryRevalidationPolicy,
+          unavailableForUntrustedTransport(memoryRevalidationPolicy),
+        )
+      : null;
+    // Single explicit fail-closed message shared by every blocked gate path.
+    const memorySynthesisGateError =
+      "This answer was stopped because recalled project memory was applied " +
+      "without a successful current-turn read of the workspace source that " +
+      "supports it. No answer was produced from unverified memory. Retry with " +
+      "a specific file or directory so the workspace can be read first.";
 
     const recordMemoryTerminal = (
       status: MemoryTurnTerminalStatus,
@@ -2129,7 +2188,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             { role: "user", content: basePromptBody },
           ];
           cliMemoryApplied = fitTurnMemory(
-            activeTurnMemory.envelope,
+            untrustedEligibleEnvelope ?? activeTurnMemory.envelope,
             cliBaseMessages,
             resolveTurnMemoryInputBudget({
               contextWindowTokens: null,
@@ -2790,7 +2849,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
             : undefined;
           if (turnMemoryEnvelope && !useFallback) {
-            const attached = attachTurnMemory(normalizedMessages, requestBody.tools, candidateContextWindow, orchestratorOutputReserve);
+            const attached = attachTurnMemory(turnMemoryEnvelope, normalizedMessages, requestBody.tools, candidateContextWindow, orchestratorOutputReserve);
             if (attached.applied) {
               requestBody.messages = attached.messages;
               observeTurnMemoryApplied(stageLabel ?? "orchestrator", attached.applied);
@@ -2906,7 +2965,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                   : typeof requestBody.max_completion_tokens === "number"
                     ? requestBody.max_completion_tokens
                     : cfg.max_tokens;
-                const retryAttached = attachTurnMemory(retryBase, undefined, null, retryOutputReserve);
+                const retryAttached = attachTurnMemory(turnMemoryEnvelope, retryBase, undefined, null, retryOutputReserve);
                 requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
                 if (retryAttached.applied) {
                   observeTurnMemoryApplied(`${stageLabel ?? "orchestrator"}:retry`, retryAttached.applied);
@@ -4225,6 +4284,67 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Phase 4.3: bypass the workspace read-result cache for this turn when
           // a descriptive/unknown project fact requires current source.
           memoryRevalidation: memoryRevalidationPolicy,
+          // Phase 4.3 fail-closed synthesis gate. Resolved at the pipeline's
+          // pre-synthesis boundary against the ACTUAL applied-selected IDs from
+          // the authenticated native registry plus this turn's trusted runtime
+          // evidence. A required-but-unvalidated applied selection stops final
+          // synthesis rather than letting the final answer rest on it.
+          memorySynthesisGate: activeTurnMemory
+            ? () => {
+                let receipt: ReturnType<typeof nativeMemoryRegistry.receipt> = null;
+                try {
+                  receipt = nativeMemoryRegistry.receipt(activeTurnMemory.preparationId);
+                } catch {
+                  receipt = null;
+                }
+                // Missing/invalid authenticated receipt: the actual applied
+                // subset is unknowable. If the prepared turn required current
+                // source for relevant project memory we cannot prove it was
+                // satisfied, so fail closed. No fallback identity (prepared
+                // ids, wildcard, or another turn) is substituted. Ordinary
+                // turns without such a prepared selection are unaffected.
+                if (!receipt) {
+                  if (!memoryRevalidationPolicy.requires_fresh_workspace_reads) return null;
+                  return {
+                    blocked: true as const,
+                    error: memorySynthesisGateError,
+                    error_code: "memory_revalidation_unavailable",
+                  };
+                }
+                const appliedPolicy = appliedRevalidationPolicy(
+                  memoryRevalidationPolicy,
+                  receipt.applied_selected_ids,
+                );
+                if (!appliedPolicy.requires_fresh_workspace_reads) return null;
+                let assessment: MemoryRevalidationResult;
+                if (memoryRevalidationUntrusted) {
+                  assessment = unavailableForUntrustedTransport(appliedPolicy);
+                } else {
+                  try {
+                    assessment = assessMemoryRevalidation(
+                      appliedPolicy,
+                      observedToolCallRecords,
+                      receipt.runtime_evidence,
+                      message,
+                      activeWorkspacePath,
+                    );
+                  } catch {
+                    assessment = {
+                      state: "unavailable",
+                      memory_ids: appliedPolicy.memory_ids,
+                      evidence_tool_call_ids: [],
+                      reason_code: "unsupported_evidence_path",
+                    };
+                  }
+                }
+                if (assessment.state === "fresh_evidence") return null;
+                return {
+                  blocked: true as const,
+                  error: memorySynthesisGateError,
+                  error_code: "memory_revalidation_unavailable",
+                };
+              }
+            : undefined,
           sessionGrants: activeTaskRun.sessionGrants,
           workspaceRoot: activeWorkspacePath,
           // F6 latency: a low-complexity turn's synthesis does not need the
@@ -4237,7 +4357,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           distilledSkillsBlock: resolvedSkills.promptBlock,
           // Ephemeral recall snapshot rides only to the delegate's final CLI
           // boundary (and is refit there); never TaskRun/contextMessage/caches.
-          turnMemory: turnMemoryEnvelope ?? undefined,
+          // The delegate is an external CLI that runs its own tools, so
+          // freshness-required project memory is excluded fail-closed.
+          turnMemory: untrustedEligibleEnvelope ?? undefined,
           onMemoryApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
@@ -5065,9 +5187,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : typeof requestBody.max_completion_tokens === "number"
             ? requestBody.max_completion_tokens
             : cfg.max_tokens;
-        const directMemoryFallback = turnMemoryEnvelope && directUseFallback
+        // Phase 4.3: only attach project descriptive/unknown memory that is
+        // already supported by THIS turn's authenticated canonical reads. The
+        // filtered envelope removes unsupported selections before they can
+        // reach the provider, so a streamed answer can never rest on them.
+        const directEligibleEnvelope = trustedEligibleEnvelope();
+        const directMemoryFallback = directEligibleEnvelope && directUseFallback
           ? {
-              envelope: turnMemoryEnvelope,
+              envelope: directEligibleEnvelope,
               // No stage ceiling and no primary-model fallback: each candidate
               // uses its own catalog context, otherwise the conservative floor.
               contextCeilingTokens: null,
@@ -5076,8 +5203,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
             }
           : undefined;
-        if (turnMemoryEnvelope && !directUseFallback) {
-          const attached = attachTurnMemory(normalizedMessages, requestBody.tools, num_ctx, directOutputReserve);
+        if (directEligibleEnvelope && !directUseFallback) {
+          const attached = attachTurnMemory(directEligibleEnvelope, normalizedMessages, requestBody.tools, num_ctx, directOutputReserve);
           if (attached.applied) {
             requestBody.messages = attached.messages;
             observeTurnMemoryApplied("agent_loop", attached.applied);
@@ -5195,7 +5322,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               : typeof requestBody.max_completion_tokens === "number"
                 ? requestBody.max_completion_tokens
                 : cfg.max_tokens;
-            const retryAttached = attachTurnMemory(retryBase, undefined, num_ctx, retryOutputReserve);
+            const retryAttached = attachTurnMemory(trustedEligibleEnvelope(), retryBase, undefined, num_ctx, retryOutputReserve);
             requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
             if (retryAttached.applied) {
               observeTurnMemoryApplied("agent_loop:retry", retryAttached.applied);
