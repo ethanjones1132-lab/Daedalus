@@ -24,8 +24,8 @@ use serde_json::Value as JsonValue;
 
 use super::capture_contracts::{ContinuityPreview, SessionContinuity};
 use super::contracts::{
-    AuthorityKind, MemoryError, MemoryErrorCode, MemoryScope, RecallOptions, RecallPreview,
-    ScopedMemoryEntry,
+    AuthorityKind, MemoryError, MemoryErrorCode, MemoryScope, MemoryStatementKind, RecallOptions,
+    RecallPreview, ScopedMemoryEntry,
 };
 use super::{continuity, scope, scoped};
 
@@ -125,6 +125,10 @@ pub struct PreparedMemorySelection {
     pub revision: i64,
     pub scope: MemoryScope,
     pub authority_kind: AuthorityKind,
+    /// Phase 4 conservative classification. Persisted pre-Phase-4 selected
+    /// JSON lacks the field and decodes as `unknown`.
+    #[serde(default)]
+    pub statement_kind: MemoryStatementKind,
     pub source_session_id: Option<String>,
     pub source_message_ids: Vec<String>,
     pub source_run_id: Option<String>,
@@ -274,6 +278,7 @@ pub fn build_prepared_memory_items(preview: &RecallPreview) -> Vec<PreparedMemor
                 revision: entry.revision,
                 scope: entry.scope.clone(),
                 authority_kind: entry.authority_kind,
+                statement_kind: entry.statement_kind,
                 source_session_id: entry.entry.source_session_id.clone(),
                 source_message_ids: parse_source_message_ids(&entry.entry.source_message_ids),
                 source_run_id: entry.source_run_id.clone(),

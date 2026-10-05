@@ -224,6 +224,24 @@ pub enum AuthorityKind {
     LegacyUnknown,
 }
 
+/// Phase 4 additive statement classification. Conservative three-value enum:
+/// only explicit constraint capture initializes `normative_constraint`; every
+/// other capture and every migrated row is `unknown`. Serialized snake_case and
+/// kept in exact lockstep with `server-jarvis/src/memory-contract.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryStatementKind {
+    NormativeConstraint,
+    DescriptiveFact,
+    Unknown,
+}
+
+impl Default for MemoryStatementKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct MemoryProvenance {
@@ -244,6 +262,10 @@ pub struct ScopedMemoryEntry {
     pub entry: MemoryEntry,
     pub scope: MemoryScope,
     pub authority_kind: AuthorityKind,
+    /// Conservative statement meaning. Older persisted payloads that predate
+    /// Phase 4 decode as `unknown` rather than failing.
+    #[serde(default)]
+    pub statement_kind: MemoryStatementKind,
     pub source_run_id: Option<String>,
     pub verified_at: Option<String>,
     pub revision: i64,

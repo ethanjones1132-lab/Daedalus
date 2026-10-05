@@ -24,7 +24,7 @@ use super::capture_contracts::{
 };
 use super::contracts::{
     AuthorityKind, MemoryDraft, MemoryError, MemoryErrorCode, MemoryProvenance, MemoryScope,
-    MemoryScopeKind, MutationResult,
+    MemoryScopeKind, MemoryStatementKind, MutationResult,
 };
 use super::turn::{self, MemoryTurnTerminalStatus, PersistedMemoryTurn};
 use super::{continuity, engine, scoped};
@@ -482,6 +482,7 @@ fn manual_correct_operation_hash(
     id: &str,
     expected_revision: i64,
     draft: &MemoryDraft,
+    kind: Option<MemoryStatementKind>,
 ) -> String {
     let mut parts = vec![
         json!("manual_correct"),
@@ -491,6 +492,15 @@ fn manual_correct_operation_hash(
     ];
     parts.extend(scope_parts(scope));
     parts.extend(draft_parts(draft));
+    // Phase 4: the operator may deliberately supply a replacement
+    // classification. It is appended ONLY when present so a legacy Phase 3
+    // operator correction (no `statement_kind`) keeps its exact hash and
+    // already-recorded ledger rows still replay. A supplied kind participates
+    // in conflict detection: same identity/different kind is an operation
+    // conflict.
+    if let Some(kind) = kind {
+        parts.push(json!(scoped::statement_kind_str(kind)));
+    }
     hash_parts(parts)
 }
 
@@ -727,8 +737,9 @@ pub fn manual_correct_hash(
     id: &str,
     expected_revision: i64,
     draft: &MemoryDraft,
+    kind: Option<MemoryStatementKind>,
 ) -> String {
-    manual_correct_operation_hash(session_id, scope, id, expected_revision, draft)
+    manual_correct_operation_hash(session_id, scope, id, expected_revision, draft, kind)
 }
 
 /// Canonical payload hash for an operator manual forget.
@@ -794,6 +805,7 @@ fn replace_scoped_memory(
     draft: MemoryDraft,
     provenance: &MemoryProvenance,
     reason: &str,
+    kind: Option<MemoryStatementKind>,
     now: DateTime<Utc>,
 ) -> Result<CorrectionResult, MemoryError> {
     let previous = scoped::read_scoped_memory(conn, scope, target_id)?;
@@ -808,7 +820,11 @@ fn replace_scoped_memory(
         ));
     }
 
-    let saved = scoped::save_scoped_memory(conn, scope, draft, provenance, now)?;
+    // An absent replacement kind inherits the target's prior classification;
+    // the correction never silently reclassifies established meaning.
+    let resolved_kind = kind.unwrap_or(previous.statement_kind);
+    let saved =
+        scoped::save_scoped_memory_with_kind(conn, scope, draft, provenance, resolved_kind, now)?;
     let replacement_id = saved.memory.entry.id.clone();
 
     conn.execute(
@@ -863,6 +879,7 @@ fn correct_scoped_memory_body(
     expected_revision: i64,
     draft: MemoryDraft,
     provenance: &MemoryProvenance,
+    kind: Option<MemoryStatementKind>,
     now: DateTime<Utc>,
 ) -> Result<CorrectionResult, MemoryError> {
     replace_scoped_memory(
@@ -873,6 +890,7 @@ fn correct_scoped_memory_body(
         draft,
         provenance,
         SOURCE_CORRECTION,
+        kind,
         now,
     )
 }
@@ -1056,6 +1074,7 @@ fn accept_proposal(
         draft,
         &provenance,
         SOURCE_ACCEPTED_PROPOSAL,
+        None,
         now,
     )
 }
@@ -1159,8 +1178,23 @@ fn execute_capture_operation(
         )]),
         UserMemoryOperation::Save { draft, source } => {
             let provenance = user_statement_provenance(turn, source);
+            // Phase 4: only an explicit `constraint:` capture initializes
+            // normative meaning. Explicit remember/decision captures remain
+            // conservative `unknown`; no category or title inference.
+            let kind = if source == SOURCE_CONSTRAINT {
+                MemoryStatementKind::NormativeConstraint
+            } else {
+                MemoryStatementKind::Unknown
+            };
             let attempt = scoped::with_memory_savepoint(conn, |conn| {
-                scoped::save_scoped_memory(conn, &turn.scope, draft.clone(), &provenance, now)
+                scoped::save_scoped_memory_with_kind(
+                    conn,
+                    &turn.scope,
+                    draft.clone(),
+                    &provenance,
+                    kind,
+                    now,
+                )
             });
             match attempt {
                 Ok(saved) => Ok(vec![operation_receipt(
@@ -1196,6 +1230,7 @@ fn execute_capture_operation(
                     *expected_revision,
                     draft.clone(),
                     &provenance,
+                    None,
                     now,
                 )
             });
@@ -1787,12 +1822,43 @@ pub fn correct_scoped_memory(
     operation_id: &str,
     now: DateTime<Utc>,
 ) -> Result<CorrectionResult, MemoryError> {
+    correct_scoped_memory_with_kind(
+        conn,
+        session_id,
+        scope,
+        id,
+        expected_revision,
+        draft,
+        provenance,
+        operation_id,
+        None,
+        now,
+    )
+}
+
+/// Phase 4 kind-aware operator correction. `kind: None` preserves the target's
+/// prior classification; `Some(kind)` deliberately reclassifies the replacement
+/// in the same atomic replacement/ledger transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn correct_scoped_memory_with_kind(
+    conn: &Connection,
+    session_id: &str,
+    scope: &MemoryScope,
+    id: &str,
+    expected_revision: i64,
+    draft: MemoryDraft,
+    provenance: &MemoryProvenance,
+    operation_id: &str,
+    kind: Option<MemoryStatementKind>,
+    now: DateTime<Utc>,
+) -> Result<CorrectionResult, MemoryError> {
     let payload_hash = manual_correct_operation_hash(
         session_id,
         scope,
         id,
         expected_revision,
         &draft,
+        kind,
     );
     scoped::with_memory_savepoint(conn, |conn| {
         if let Some(prior) = replay_ledger::<CorrectionResult>(
@@ -1810,6 +1876,7 @@ pub fn correct_scoped_memory(
             expected_revision,
             draft,
             provenance,
+            kind,
             now,
         )?;
         ledger_put(conn, session_id, operation_id, &payload_hash, &result, now)?;

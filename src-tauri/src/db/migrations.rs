@@ -823,6 +823,16 @@ pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite:
             "revision",
             "revision INTEGER NOT NULL DEFAULT 1",
         )?;
+        // Phase 4 additive statement classification. Existing rows and every
+        // legacy/automatic capture migrate to the conservative `unknown`; no
+        // title/category/source inference is performed.
+        let statement_kind_added = !table_has_column(conn, "memory", "statement_kind")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "statement_kind",
+            "statement_kind TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
 
         // Singleton store revision. A monotonic invalidation counter, not a
         // mutation count: it changes transactionally with knowledge/scope/
@@ -901,6 +911,22 @@ pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite:
                 SELECT RAISE(ABORT, 'invalid memory authority kind');
             END;
 
+            CREATE TRIGGER IF NOT EXISTS memory_statement_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.statement_kind NOT IN
+                ('normative_constraint','descriptive_fact','unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory statement kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_statement_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.statement_kind NOT IN
+                ('normative_constraint','descriptive_fact','unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory statement kind');
+            END;
+
             CREATE TRIGGER IF NOT EXISTS memory_revision_positive_bi
             BEFORE INSERT ON memory
             WHEN NEW.revision < 1
@@ -950,7 +976,22 @@ pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite:
              OR NEW.supersedes_id IS NOT OLD.supersedes_id
              OR NEW.metadata IS NOT OLD.metadata
              OR NEW.tier IS NOT OLD.tier
-             OR NEW.summary IS NOT OLD.summary";
+             OR NEW.summary IS NOT OLD.summary
+             OR NEW.statement_kind IS NOT OLD.statement_kind";
+
+        // The revision triggers are created with `IF NOT EXISTS`, so an
+        // existing database would keep the pre-Phase-4 trigger bodies that do
+        // not compare `statement_kind`. When the column is first introduced,
+        // drop the two revision triggers so the create block below rebuilds
+        // them with the extended `semantic_change` predicate.
+        if statement_kind_added {
+            conn.execute_batch(
+                r#"
+                DROP TRIGGER IF EXISTS memory_store_revision_au;
+                DROP TRIGGER IF EXISTS memory_row_revision_au;
+                "#,
+            )?;
+        }
 
         conn.execute_batch(&format!(
             r#"

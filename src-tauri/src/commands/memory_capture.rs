@@ -241,6 +241,7 @@ fn replay_manual_correct(
         &request.id,
         request.expected_revision,
         &request.draft,
+        request.statement_kind,
     );
     capture::replay_operation_result(
         conn,
@@ -313,7 +314,7 @@ pub async fn memory_scoped_correct(
             }
             let scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
             let provenance = manual_provenance(&request.session_id);
-            capture::correct_scoped_memory(
+            capture::correct_scoped_memory_with_kind(
                 conn,
                 &request.session_id,
                 &scope,
@@ -322,6 +323,7 @@ pub async fn memory_scoped_correct(
                 request.draft,
                 &provenance,
                 &request.operation_id,
+                request.statement_kind,
                 Utc::now(),
             )
         },

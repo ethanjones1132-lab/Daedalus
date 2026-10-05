@@ -16,8 +16,8 @@ use serde_json::Value as JsonValue;
 
 use super::contracts::{
     AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope,
-    MemoryScopeKind, MutationResult, RecallOptions, RecallPreview, ScopedMemoryEntry,
-    ScopedMemoryRecall,
+    MemoryScopeKind, MemoryStatementKind, MutationResult, RecallOptions, RecallPreview,
+    ScopedMemoryEntry, ScopedMemoryRecall,
 };
 use super::engine;
 
@@ -89,6 +89,22 @@ pub(crate) fn authority_str(kind: AuthorityKind) -> &'static str {
         AuthorityKind::VerifiedObservation => "verified_observation",
         AuthorityKind::AssistantProposal => "assistant_proposal",
         AuthorityKind::LegacyUnknown => "legacy_unknown",
+    }
+}
+
+pub(crate) fn parse_statement_kind(value: &str) -> MemoryStatementKind {
+    match value {
+        "normative_constraint" => MemoryStatementKind::NormativeConstraint,
+        "descriptive_fact" => MemoryStatementKind::DescriptiveFact,
+        _ => MemoryStatementKind::Unknown,
+    }
+}
+
+pub(crate) fn statement_kind_str(kind: MemoryStatementKind) -> &'static str {
+    match kind {
+        MemoryStatementKind::NormativeConstraint => "normative_constraint",
+        MemoryStatementKind::DescriptiveFact => "descriptive_fact",
+        MemoryStatementKind::Unknown => "unknown",
     }
 }
 
@@ -283,7 +299,7 @@ fn scope_predicate(prefix: &str, scope: &MemoryScope) -> (String, Vec<Value>) {
 
 fn scoped_select_columns() -> String {
     format!(
-        "{}, m.scope_kind, m.project_root, m.authority_kind, m.source_run_id, m.verified_at, m.revision",
+        "{}, m.scope_kind, m.project_root, m.authority_kind, m.source_run_id, m.verified_at, m.revision, m.statement_kind",
         engine::prefixed_memory_columns("m")
     )
 }
@@ -300,6 +316,7 @@ fn scoped_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopedMemoryEntr
     let source_run_id: Option<String> = row.get(28).unwrap_or(None);
     let verified_at: Option<String> = row.get(29).unwrap_or(None);
     let revision: i64 = row.get(30).unwrap_or(1);
+    let statement_kind: String = row.get(31).unwrap_or_else(|_| "unknown".to_string());
     Ok(ScopedMemoryEntry {
         scope: MemoryScope {
             kind: parse_scope_kind(&scope_kind),
@@ -308,6 +325,7 @@ fn scoped_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopedMemoryEntr
         },
         entry,
         authority_kind: parse_authority(&authority),
+        statement_kind: parse_statement_kind(&statement_kind),
         source_run_id,
         verified_at,
         revision,
@@ -373,6 +391,25 @@ pub fn save_scoped_memory(
     provenance: &MemoryProvenance,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
+    save_scoped_memory_with_kind(
+        conn,
+        scope,
+        draft,
+        provenance,
+        MemoryStatementKind::Unknown,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_scoped_memory_with_kind(
+    conn: &Connection,
+    scope: &MemoryScope,
+    draft: MemoryDraft,
+    provenance: &MemoryProvenance,
+    kind: MemoryStatementKind,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
     validate_writable_scope(scope)?;
     validate_draft(&draft)?;
     validate_provenance_for_write(conn, scope, provenance)?;
@@ -394,9 +431,10 @@ pub fn save_scoped_memory(
              (id, title, content, tags, category, relevance_score, created_at, updated_at,
               agent_id, source, source_session_id, source_message_ids, confidence, last_used_at,
               usage_count, expires_at, review_after, status, supersedes_id, metadata,
-              scope_kind, project_root, authority_kind, source_run_id, verified_at, revision)
+              scope_kind, project_root, authority_kind, source_run_id, verified_at, revision,
+              statement_kind)
              VALUES (?, ?, ?, ?, ?, 0.0, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, 'active', NULL, NULL,
-                     ?, ?, ?, ?, ?, 1)",
+                     ?, ?, ?, ?, ?, 1, ?)",
             rusqlite::params![
                 &id,
                 &draft.title,
@@ -417,6 +455,7 @@ pub fn save_scoped_memory(
                 authority_str(provenance.authority_kind),
                 &provenance.source_run_id,
                 &provenance.verified_at,
+                statement_kind_str(kind),
             ],
         )
         .map_err(MemoryError::from)?;
@@ -442,6 +481,70 @@ pub fn save_scoped_memory(
         memory: stored,
         store_revision,
         changed: true,
+    })
+}
+
+/// Phase 4: change only the conservative statement classification of one
+/// scoped record without rewriting its content or provenance. Ownership and
+/// expected revision are validated inside the same savepoint as the audit
+/// event; a same-kind request is a native no-op (`changed: false`) that writes
+/// neither a row revision nor an event. A real change increments the row
+/// revision and the store revision transactionally.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_scoped_memory(
+    conn: &Connection,
+    scope: &MemoryScope,
+    id: &str,
+    expected_revision: i64,
+    kind: MemoryStatementKind,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    validate_writable_scope(scope)?;
+    let (predicate, scope_params) = scope_predicate("memory", scope);
+    let (stored, changed) = with_memory_savepoint(conn, |conn| {
+        let before = read_scoped_memory_inner(conn, scope, id)?;
+        if before.revision != expected_revision {
+            return Err(MemoryError::revision_conflict(
+                "Memory revision no longer matches the expected revision",
+            ));
+        }
+        if before.statement_kind == kind {
+            return Ok((before, false));
+        }
+        let mut values: Vec<Value> = vec![
+            Value::from(statement_kind_str(kind).to_string()),
+            Value::from(now.to_rfc3339()),
+            Value::from(id.to_string()),
+        ];
+        values.extend(scope_params.clone());
+        let sql = format!(
+            "UPDATE memory SET statement_kind = ?, revision = revision + 1, updated_at = ?
+             WHERE id = ? AND {}",
+            predicate
+        );
+        conn.execute(&sql, rusqlite::params_from_iter(values))
+            .map_err(MemoryError::from)?;
+        let after = read_scoped_memory_inner(conn, scope, id)?;
+        engine::write_memory_event(
+            conn,
+            Some(id),
+            "classify",
+            "memory_scoped",
+            Some(serde_json::to_value(&before).unwrap_or(JsonValue::Null)),
+            Some(serde_json::to_value(&after).unwrap_or(JsonValue::Null)),
+            "Scoped memory classification",
+            1.0,
+            None,
+        )
+        .map_err(MemoryError::storage_unavailable)?;
+        Ok((after, true))
+    })?;
+
+    let store_revision = memory_store_revision(conn)?;
+    Ok(MutationResult {
+        memory: stored,
+        store_revision,
+        changed,
     })
 }
 
@@ -756,6 +859,29 @@ pub fn update_scoped_memory(
     provenance: &MemoryProvenance,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
+    update_scoped_memory_with_kind(
+        conn,
+        scope,
+        id,
+        expected_revision,
+        draft,
+        provenance,
+        None,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_scoped_memory_with_kind(
+    conn: &Connection,
+    scope: &MemoryScope,
+    id: &str,
+    expected_revision: i64,
+    draft: MemoryDraft,
+    provenance: &MemoryProvenance,
+    kind: Option<MemoryStatementKind>,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
     validate_writable_scope(scope)?;
     validate_draft(&draft)?;
     validate_provenance_for_write(conn, scope, provenance)?;
@@ -768,6 +894,10 @@ pub fn update_scoped_memory(
                 "Memory revision no longer matches the expected revision",
             ));
         }
+        // An absent update kind preserves the prior classification; the UPDATE
+        // still writes the same value so the store-revision trigger sees no
+        // semantic statement-kind change.
+        let resolved_kind = kind.unwrap_or(before.statement_kind);
         let now_str = now.to_rfc3339();
         let tags_json =
             serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
@@ -801,6 +931,7 @@ pub fn update_scoped_memory(
                 .clone()
                 .map(Value::from)
                 .unwrap_or(Value::Null),
+            Value::from(statement_kind_str(resolved_kind).to_string()),
             Value::from(now_str.clone()),
             Value::from(id.to_string()),
         ];
@@ -810,7 +941,7 @@ pub fn update_scoped_memory(
             "UPDATE memory SET title = ?, content = ?, tags = ?, category = ?,
                  expires_at = ?, review_after = ?, authority_kind = ?, source = ?,
                  source_session_id = ?, source_message_ids = ?, source_run_id = ?,
-                 verified_at = ?, revision = revision + 1, updated_at = ?
+                 verified_at = ?, statement_kind = ?, revision = revision + 1, updated_at = ?
              WHERE id = ? AND {}",
             predicate
         );

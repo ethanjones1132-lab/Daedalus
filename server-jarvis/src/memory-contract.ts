@@ -61,6 +61,17 @@ export type AuthorityKind =
   | "assistant_proposal"
   | "legacy_unknown";
 
+/**
+ * Phase 4 additive conservative statement classification. Exactly three values,
+ * snake_case, mirroring `MemoryStatementKind` in the Rust `contracts.rs`. Only
+ * explicit constraint capture initializes `normative_constraint`; migrated rows
+ * and ordinary capture stay `unknown`.
+ */
+export type MemoryStatementKind =
+  | "normative_constraint"
+  | "descriptive_fact"
+  | "unknown";
+
 export interface MemoryProvenance {
   authority_kind: AuthorityKind;
   source: string;
@@ -103,6 +114,7 @@ export interface ScopedMemoryEntry {
   entry: MemoryEntry;
   scope: MemoryScope;
   authority_kind: AuthorityKind;
+  statement_kind: MemoryStatementKind;
   source_run_id: string | null;
   verified_at: string | null;
   revision: number;
@@ -143,6 +155,8 @@ export interface ScopedSaveRequest {
   session_id: string;
   selector: ScopeSelector;
   draft: MemoryDraft;
+  /** Optional Phase 4 classification. Absent defaults to `unknown`. */
+  statement_kind?: MemoryStatementKind;
 }
 
 export interface ScopedReadRequest {
@@ -163,6 +177,16 @@ export interface ScopedUpdateRequest {
   id: string;
   expected_revision: number;
   draft: MemoryDraft;
+  /** Optional Phase 4 classification. Absent preserves the prior kind. */
+  statement_kind?: MemoryStatementKind;
+}
+
+export interface ScopedClassifyRequest {
+  session_id: string;
+  selector: ScopeSelector;
+  id: string;
+  expected_revision: number;
+  statement_kind: MemoryStatementKind;
 }
 
 export interface ScopedDeleteRequest {
@@ -263,6 +287,7 @@ export interface PreparedMemorySelection {
   revision: number;
   scope: MemoryScope;
   authority_kind: AuthorityKind;
+  statement_kind: MemoryStatementKind;
   source_session_id: string | null;
   source_message_ids: string[];
   source_run_id: string | null;
@@ -455,6 +480,8 @@ export interface ScopedCorrectRequest {
   expected_revision: number;
   draft: MemoryDraft;
   operation_id: string;
+  /** Optional Phase 4 replacement classification. Absent preserves prior kind. */
+  statement_kind?: MemoryStatementKind;
 }
 
 export interface ScopedForgetRequest {

@@ -14,7 +14,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::contracts::{MemoryDraft, MemoryScope, ScopeSelector, ScopedMemoryEntry};
+use super::contracts::{
+    MemoryDraft, MemoryScope, MemoryStatementKind, ScopeSelector, ScopedMemoryEntry,
+};
 use super::turn::MemoryTurnTerminalStatus;
 
 /// Terminal disposition of one operation inside a capture receipt.
@@ -166,6 +168,10 @@ pub struct ScopedCorrectRequest {
     pub expected_revision: i64,
     pub draft: MemoryDraft,
     pub operation_id: String,
+    /// Optional Phase 4 replacement classification. Absent preserves the
+    /// target's prior kind.
+    #[serde(default)]
+    pub statement_kind: Option<MemoryStatementKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

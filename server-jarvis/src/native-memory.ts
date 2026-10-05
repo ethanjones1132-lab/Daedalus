@@ -54,6 +54,12 @@ const CONTINUITY_MODES = new Set<ContinuityMode>([
   "replace",
   "clear",
 ]);
+/** Phase 4 conservative statement classifications accepted from native. */
+const STATEMENT_KINDS = new Set<string>([
+  "normative_constraint",
+  "descriptive_fact",
+  "unknown",
+]);
 
 interface NativeMemoryBootstrap {
   capability: string;
@@ -275,6 +281,21 @@ function validateEnvelope(envelope: PreparedMemoryTurn): void {
   for (const item of envelope.selected) {
     if (typeof item.text !== "string" || scalarLength(item.text) > MAX_ITEM_SCALARS) {
       throw new RegistryError("invalid_envelope", 400, "envelope item exceeds the scalar bound");
+    }
+    // Phase 4: a registered native envelope must carry a valid conservative
+    // statement classification on every selection. Inference and arbitrary
+    // /chat/stream fields can never supply this value.
+    const selection = item.selection as unknown;
+    if (typeof selection !== "object" || selection === null || Array.isArray(selection)) {
+      throw new RegistryError("invalid_envelope", 400, "envelope selection is not an object");
+    }
+    const statementKind = (selection as Record<string, unknown>).statement_kind;
+    if (typeof statementKind !== "string" || !STATEMENT_KINDS.has(statementKind)) {
+      throw new RegistryError(
+        "invalid_envelope",
+        400,
+        "envelope selection statement kind is invalid",
+      );
     }
   }
   // Optional private continuity preview. An HTTP-only caller must not be able to

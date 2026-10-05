@@ -3,8 +3,8 @@ use crate::jarvis::memory::capture_contracts::{
     MemoryDerivedInvalidation, NativeDerivedMutationPlan,
 };
 use crate::jarvis::memory::contracts::{
-    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MutationResult,
-    RecallOptions, RecallPreview, ScopeSelector, ScopedMemoryEntry,
+    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MemoryStatementKind,
+    MutationResult, RecallOptions, RecallPreview, ScopeSelector, ScopedMemoryEntry,
 };
 use crate::jarvis::memory::engine::{self, MemoryEntry, MemoryEvent, MemoryRecall, MemoryRun};
 use crate::jarvis::memory::{continuity, scope, scoped};
@@ -65,9 +65,9 @@ fn fresh_operation_id() -> String {
 }
 
 #[tauri::command]
-pub fn memory_list(db: State<AppDb>) -> Result<Vec<MemoryEntry>, String> {
+pub fn memory_list(db: State<AppDb>) -> Result<Vec<engine::LegacyMemoryEntry>, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    engine::list_memories(&conn)
+    engine::list_legacy_memories_with_revision(&conn)
 }
 
 #[tauri::command]
@@ -383,6 +383,9 @@ pub struct ScopedSaveRequest {
     pub session_id: String,
     pub selector: ScopeSelector,
     pub draft: MemoryDraft,
+    /// Optional Phase 4 classification. Absent defaults to `unknown`.
+    #[serde(default)]
+    pub statement_kind: Option<MemoryStatementKind>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -410,6 +413,19 @@ pub struct ScopedUpdateRequest {
     pub id: String,
     pub expected_revision: i64,
     pub draft: MemoryDraft,
+    /// Optional Phase 4 classification. Absent preserves the prior kind.
+    #[serde(default)]
+    pub statement_kind: Option<MemoryStatementKind>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ScopedClassifyRequest {
+    pub session_id: String,
+    pub selector: ScopeSelector,
+    pub id: String,
+    pub expected_revision: i64,
+    pub statement_kind: MemoryStatementKind,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -476,7 +492,8 @@ pub fn execute_scoped_save(
     let write_scope =
         scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     let provenance = manual_provenance(&request.session_id);
-    scoped::save_scoped_memory(conn, &write_scope, request.draft, &provenance, now)
+    let kind = request.statement_kind.unwrap_or(MemoryStatementKind::Unknown);
+    scoped::save_scoped_memory_with_kind(conn, &write_scope, request.draft, &provenance, kind, now)
 }
 
 pub fn execute_scoped_read(
@@ -505,13 +522,32 @@ pub fn execute_scoped_update(
     let write_scope =
         scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     let provenance = manual_provenance(&request.session_id);
-    scoped::update_scoped_memory(
+    let kind = request.statement_kind;
+    scoped::update_scoped_memory_with_kind(
         conn,
         &write_scope,
         &request.id,
         request.expected_revision,
         request.draft,
         &provenance,
+        kind,
+        now,
+    )
+}
+
+pub fn execute_scoped_classify(
+    conn: &Connection,
+    request: ScopedClassifyRequest,
+    now: DateTime<Utc>,
+) -> Result<MutationResult, MemoryError> {
+    let write_scope =
+        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::classify_scoped_memory(
+        conn,
+        &write_scope,
+        &request.id,
+        request.expected_revision,
+        request.statement_kind,
         now,
     )
 }
@@ -740,6 +776,36 @@ pub fn memory_scoped_recall_preview(
 ) -> Result<RecallPreview, MemoryError> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     execute_scoped_recall_preview(&conn, request, Utc::now())
+}
+
+/// Phase 4: deliberately reclassify one scoped record without rewriting its
+/// content or provenance. Ownership and expected revision are enforced
+/// natively; the derived gate invalidates outstanding preparations exactly as
+/// for any other knowledge mutation.
+#[tauri::command]
+pub async fn memory_scoped_classify(
+    app: AppHandle,
+    request: ScopedClassifyRequest,
+) -> Result<MutationResult, MemoryError> {
+    let session_id = request.session_id.clone();
+    let plan_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id,
+        move |conn| {
+            let write_scope =
+                scope::resolve_write_scope(conn, &plan_request.session_id, &plan_request.selector)?;
+            plan_scoped_invalidation(
+                conn,
+                &plan_request.session_id,
+                &write_scope,
+                vec![plan_request.id.clone()],
+                fresh_operation_id(),
+            )
+        },
+        move |conn, _invalidation| execute_scoped_classify(conn, request, Utc::now()),
+    )
+    .await
 }
 
 #[tauri::command]

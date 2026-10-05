@@ -41,6 +41,17 @@ pub struct MemoryEntry {
     pub updated_at_ms: i64,
 }
 
+/// Legacy (unscoped) list projection that carries the authoritative SQL row
+/// revision alongside the frozen `MemoryEntry` fields. The `MemoryEntry` fields
+/// are flattened so existing consumers keep their prior JSON shape, with
+/// `revision` added as the only new field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyMemoryEntry {
+    #[serde(flatten)]
+    pub memory: MemoryEntry,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRecall {
     pub memory: MemoryEntry,
@@ -128,6 +139,35 @@ pub fn list_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
         .query_map([], memory_from_row)
         .map_err(|e| e.to_string())?;
     collect_memories(rows)
+}
+
+/// List legacy (unscoped) memories with the authoritative SQL row revision.
+/// Selects `memory_columns()` plus the real `revision` column; `memory_from_row`
+/// maps the first 25 columns and column 25 is the actual DB revision. The
+/// shared `MemoryEntry`/`memory_columns()` shape is intentionally unchanged so
+/// scoped column indexes do not shift.
+pub fn list_legacy_memories_with_revision(
+    conn: &Connection,
+) -> Result<Vec<LegacyMemoryEntry>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}, revision FROM memory WHERE scope_kind = 'legacy_unscoped' ORDER BY status ASC, updated_at DESC",
+            memory_columns()
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LegacyMemoryEntry {
+                memory: memory_from_row(row)?,
+                revision: row.get(25)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(entries)
 }
 
 pub fn read_memory(conn: &Connection, id: &str) -> Result<MemoryEntry, String> {
