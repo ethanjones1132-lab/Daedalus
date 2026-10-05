@@ -1772,6 +1772,7 @@ pub fn run() {
             unregister_hook,
             get_commitments,
             add_commitment,
+            set_commitment_goal,
             complete_commitment,
             delete_commitment,
             get_action_registry_summary,

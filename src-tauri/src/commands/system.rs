@@ -88,11 +88,21 @@ pub struct Commitment {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub agent_id: Option<String>,
-    /// Stable optional association to a durable Goal (Roadmap Priority #2,
-    /// Part 1). Defaulted for backward compatibility with existing JSON store
-    /// rows; not populated or acted on until the association part.
+    /// Stable optional association to a durable Goal. This JSON Commitment
+    /// record is the authoritative owner of the Commitment↔Goal relationship;
+    /// the Goal view derives commitment associations from here (a `goal_links`
+    /// commitment row is only a legacy projection). Defaulted so existing JSON
+    /// store rows remain readable and unlinked.
     #[serde(default)]
     pub goal_id: Option<String>,
+    /// Backward-compatible explicit-clear marker. It is `false` for every
+    /// pre-existing JSON row (serde default) and only becomes `true` when the
+    /// association is deliberately cleared. This lets the Goal read distinguish
+    /// an old, not-yet-migrated legacy projection (`goal_id: null`,
+    /// `goal_cleared: false`) from an intentional clear, so a failed projection
+    /// cleanup can never re-display a just-cleared link.
+    #[serde(default)]
+    pub goal_cleared: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -816,6 +826,20 @@ pub fn unregister_hook(id: String) -> Result<bool, String> {
 
 // ── Commitments ─────────────────────────────────────────────
 
+/// Normalize an optional Goal id from the CRUD surface. Empty/whitespace values
+/// are treated as "no association" so a cleared or absent field never becomes a
+/// dangling empty-string id.
+fn normalize_goal_id(goal_id: Option<String>) -> Option<String> {
+    goal_id.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 #[tauri::command]
 pub fn get_commitments() -> Result<Vec<Commitment>, String> {
     let store = load_store()?;
@@ -832,8 +856,58 @@ pub(crate) fn fetch_commitment(id: &str) -> Result<Option<Commitment>, String> {
     Ok(store.commitments.into_iter().find(|c| c.id == id))
 }
 
+/// Authoritative Commitment↔Goal state for one Commitment, used by the Goal read
+/// to reconcile its legacy `goal_links` projection with the JSON authority.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitmentGoalState {
+    pub goal_id: Option<String>,
+    /// True when the association was explicitly cleared (as opposed to a legacy
+    /// row that simply predates the JSON authority and has never been migrated).
+    pub cleared: bool,
+}
+
+/// Snapshot of the authoritative Commitment↔Goal relationship: every existing
+/// Commitment id mapped to its recorded Goal state. The Goal view reads this so
+/// it never presents a commitment association that disagrees with the Commitment
+/// record itself. An unreadable store fails closed.
+pub(crate) fn commitment_goal_index(
+) -> Result<std::collections::HashMap<String, CommitmentGoalState>, String> {
+    let store = load_store()?;
+    Ok(store
+        .commitments
+        .into_iter()
+        .map(|c| {
+            (
+                c.id,
+                CommitmentGoalState {
+                    goal_id: c.goal_id,
+                    cleared: c.goal_cleared,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Add a Commitment. The optional `goal_id` is validated against the native
+/// Goal authority before it is persisted: an unknown, malformed, terminal, or
+/// project-scoped Goal is refused rather than stored as a dangling or
+/// over-scoped association. A Commitment with no Goal preserves the original
+/// unlinked behavior and JSON-store shape.
 #[tauri::command]
-pub fn add_commitment(text: String, due: Option<String>) -> Result<Commitment, String> {
+pub fn add_commitment(
+    db: State<AppDb>,
+    text: String,
+    due: Option<String>,
+    goal_id: Option<String>,
+) -> Result<Commitment, String> {
+    let goal_id = normalize_goal_id(goal_id);
+
+    // Lock order matches the Goal link path (SQLite authority first, then the
+    // JSON commitment store) so concurrent callers cannot deadlock.
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(ref gid) = goal_id {
+        crate::commands::goals::validate_commitment_goal_binding(&conn, gid, None)?;
+    }
     let mut store = load_store()?;
     let c = Commitment {
         id: new_id(),
@@ -843,13 +917,139 @@ pub fn add_commitment(text: String, due: Option<String>) -> Result<Commitment, S
         created_at: now_iso(),
         completed_at: None,
         agent_id: None,
-        goal_id: None,
+        goal_id,
+        goal_cleared: false,
     };
     store.commitments.push(c.clone());
     save_store(&store)?;
     Ok(c)
 }
 
+/// Explicitly bind or clear one Commitment's Goal association. `goal_id` is
+/// validated against the native Goal authority using the Commitment's actual
+/// stored Agent binding; a `None` (or empty) value clears the association.
+/// This records attribution only: it never dispatches work, never grants
+/// permissions, and never completes the Goal.
+#[tauri::command]
+pub fn set_commitment_goal(
+    db: State<AppDb>,
+    id: String,
+    goal_id: Option<String>,
+) -> Result<Commitment, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    apply_commitment_goal_conn(&conn, &id, goal_id)
+}
+
+/// Authoritative Commitment↔Goal setter shared by the Tauri command and the
+/// explicit Goal-link path. The caller must already hold the SQLite connection
+/// guard (so lock order is SQLite → JSON store, matching the Goal link path).
+///
+/// The Commitment JSON record is written first and is the single authority. Any
+/// legacy `goal_links` projection rows for this Commitment are then removed so a
+/// stale association cannot linger. The two stores are not updated atomically:
+/// if the projection cleanup fails after the authority write, the authority is
+/// already correct and the read path suppresses mismatched legacy rows, so the
+/// operation is safe to retry.
+pub(crate) fn apply_commitment_goal_conn(
+    conn: &rusqlite::Connection,
+    commitment_id: &str,
+    goal_id: Option<String>,
+) -> Result<Commitment, String> {
+    let goal_id = normalize_goal_id(goal_id);
+
+    let mut store = load_store()?;
+    let position = store
+        .commitments
+        .iter()
+        .position(|c| c.id == commitment_id)
+        .ok_or_else(|| format!("Commitment not found: {}", commitment_id))?;
+    let commitment_agent = store.commitments[position].agent_id.clone();
+    if let Some(ref gid) = goal_id {
+        crate::commands::goals::validate_commitment_goal_binding(
+            conn,
+            gid,
+            commitment_agent.as_deref(),
+        )?;
+    }
+    // An explicit set clears the marker; an explicit clear (None) records it so
+    // the Goal read can tell an intentional clear from an unmigrated legacy row.
+    store.commitments[position].goal_cleared = goal_id.is_none();
+    store.commitments[position].goal_id = goal_id;
+    let updated = store.commitments[position].clone();
+    save_store(&store)?;
+
+    conn.execute(
+        "DELETE FROM goal_links WHERE target_kind = 'commitment' AND target_id = ?1",
+        [commitment_id],
+    )
+    .map_err(|e| {
+        format!(
+            "Commitment '{commitment_id}' was saved, but its legacy goal link cleanup \
+             failed: {e}. The Commitment record is authoritative; re-run the link to repair."
+        )
+    })?;
+    Ok(updated)
+}
+
+/// Clear one Commitment's Goal association through the authoritative JSON record
+/// when it currently names `goal_id`, then remove any legacy projection row for
+/// that pair. Returns whether an association was actually removed. Used by the
+/// explicit Goal-link removal path so it cannot disagree with the Commitment.
+pub(crate) fn clear_commitment_goal_conn(
+    conn: &rusqlite::Connection,
+    commitment_id: &str,
+    goal_id: &str,
+) -> Result<bool, String> {
+    // Detect a matching legacy projection before any write so a legacy
+    // (goal_id: None, goal_cleared: false) record can be marked as an explicit
+    // clear even though the JSON authority has not yet recorded a binding.
+    let has_matching_legacy = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_links WHERE target_kind = 'commitment' \
+             AND target_id = ?1 AND goal_id = ?2)",
+            rusqlite::params![commitment_id, goal_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v != 0)
+        .map_err(|e| e.to_string())?;
+
+    let mut authoritative_changed = false;
+    {
+        let mut store = load_store()?;
+        if let Some(position) = store.commitments.iter().position(|c| c.id == commitment_id) {
+            let matches_authority = store.commitments[position].goal_id.as_deref() == Some(goal_id);
+            // A legacy/unmigrated null association is only marked cleared when a
+            // matching legacy row is actually being removed. A non-null binding
+            // to a different Goal must not be cleared here.
+            let clears_legacy = store.commitments[position].goal_id.is_none()
+                && !store.commitments[position].goal_cleared
+                && has_matching_legacy;
+            if matches_authority || clears_legacy {
+                store.commitments[position].goal_id = None;
+                store.commitments[position].goal_cleared = true;
+                save_store(&store)?;
+                authoritative_changed = true;
+            }
+        }
+    }
+
+    // The authority (including the explicit-clear marker) is persisted before the
+    // projection delete, so a failed SQL delete leaves the read path suppressing
+    // the stale row instead of re-displaying it.
+    let removed = conn
+        .execute(
+            "DELETE FROM goal_links WHERE target_kind = 'commitment' \
+             AND target_id = ?1 AND goal_id = ?2",
+            rusqlite::params![commitment_id, goal_id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(authoritative_changed || removed > 0)
+}
+
+/// Mark a Commitment complete. This reflects the Commitment's own lifecycle and
+/// never transitions a linked Goal: Commitment completion is not Goal
+/// acceptance. Any Goal acceptance gate belongs to a later trusted-evidence
+/// part, so a Goal's status is left untouched here.
 #[tauri::command]
 pub fn complete_commitment(id: String) -> Result<bool, String> {
     let mut store = load_store()?;
@@ -868,14 +1068,24 @@ pub fn complete_commitment(id: String) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Delete a Commitment record and remove any Goal association that referenced
+/// it, so a Goal never links to a record that no longer exists. The JSON record
+/// is authoritative; the `goal_links` cleanup is idempotent and only touches
+/// legacy projection rows.
 #[tauri::command]
-pub fn delete_commitment(id: String) -> Result<bool, String> {
+pub fn delete_commitment(db: State<AppDb>, id: String) -> Result<bool, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut store = load_store()?;
     let before = store.commitments.len();
     store.commitments.retain(|c| c.id != id);
     if store.commitments.len() == before {
         return Err(format!("Commitment not found: {}", id));
     }
+    conn.execute(
+        "DELETE FROM goal_links WHERE target_kind = 'commitment' AND target_id = ?1",
+        [&id],
+    )
+    .map_err(|e| format!("Failed to remove goal links for deleted commitment: {}", e))?;
     save_store(&store)?;
     Ok(true)
 }

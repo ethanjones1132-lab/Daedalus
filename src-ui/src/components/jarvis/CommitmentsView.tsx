@@ -23,6 +23,7 @@ interface Commitment {
   created_at: string;
   completed_at: string | null;
   agent_id: string | null;
+  goal_id?: string | null;
 }
 
 type Filter = 'open' | 'completed' | 'all';
@@ -250,6 +251,11 @@ export default function CommitmentsView() {
                       </div>
                     </div>
                     <div className="mt-1 text-[10px] font-mono text-bone/30">{formatDue(c.due)}</div>
+                    {c.goal_id && (
+                      <div className="mt-0.5 text-[10px] font-mono text-bone/30">
+                        goal {c.goal_id}
+                      </div>
+                    )}
                     {operation?.phase === 'writing' && (
                       <div role="status">{operation.action === 'complete' ? 'Completing…' : 'Deleting…'}</div>
                     )}

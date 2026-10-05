@@ -251,6 +251,19 @@ fn load_criteria(conn: &rusqlite::Connection, goal_id: &str) -> Result<Vec<GoalC
     Ok(rows)
 }
 
+/// Load the Goal's association links. Cron/Session/run links live only in
+/// `goal_links`. The Commitment↔Goal relationship, however, is owned by the
+/// Commitment JSON authority (`Commitment.goal_id`); a `goal_links` commitment
+/// row is only a legacy projection. This read therefore consults the
+/// authoritative Commitment index so the two stores can never present
+/// simultaneous conflicting associations:
+///   * a legacy commitment row is kept only while the authority still names this
+///     Goal (or records no association yet),
+///   * a legacy row is suppressed when the authority names a different Goal,
+///   * commitments linked through the JSON authority with no legacy row are
+///     surfaced here.
+/// If the Commitment authority is unreadable, the read fails closed with an
+/// error rather than falling back to a possibly stale legacy projection.
 fn load_links(conn: &rusqlite::Connection, goal_id: &str) -> Result<Vec<GoalLink>, String> {
     let mut stmt = conn
         .prepare(
@@ -271,7 +284,53 @@ fn load_links(conn: &rusqlite::Connection, goal_id: &str) -> Result<Vec<GoalLink
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    Ok(rows)
+
+    // Commitments are reconciled against their JSON authority. If that authority
+    // is unreadable we cannot prove which legacy rows are current, so fail
+    // closed rather than presenting a possibly stale or conflicting link.
+    let index = crate::commands::system::commitment_goal_index().map_err(|e| {
+        format!("goal links require the Commitment authority, which is unavailable: {e}")
+    })?;
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<GoalLink> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.target_kind == "commitment" {
+            match index.get(&row.target_id) {
+                // Authority still names this Goal: current.
+                Some(state) if state.goal_id.as_deref() == Some(goal_id) => {
+                    seen.insert(row.target_id.clone());
+                    out.push(row);
+                }
+                // Genuinely old, unmigrated null association: preserve legacy.
+                Some(state) if state.goal_id.is_none() && !state.cleared => {
+                    seen.insert(row.target_id.clone());
+                    out.push(row);
+                }
+                // Authority names a different Goal, or the association was
+                // explicitly cleared: suppress the stale projection.
+                Some(_) => {}
+                // Commitment no longer exists: drop the dangling row.
+                None => {}
+            }
+        } else {
+            out.push(row);
+        }
+    }
+
+    for (id, state) in &index {
+        if state.goal_id.as_deref() == Some(goal_id) && !seen.contains(id) {
+            out.push(GoalLink {
+                id: format!("commitment:{id}"),
+                goal_id: goal_id.to_string(),
+                target_kind: "commitment".to_string(),
+                target_id: id.clone(),
+                created_at: String::new(),
+            });
+        }
+    }
+
+    Ok(out)
 }
 
 fn load_events(conn: &rusqlite::Connection, goal_id: &str) -> Result<Vec<GoalEvent>, String> {
@@ -634,6 +693,44 @@ fn validate_commitment(goal: &Goal, target_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate that a Commitment may be bound to `goal_id` from the native
+/// Commitment CRUD flow. `commitment_agent_id` is the Commitment's own stored
+/// Agent binding (None for a user-wide Commitment); a caller-supplied Agent or
+/// project path is never consulted, so the check never widens scope.
+///
+/// The Goal is loaded through the native Goal authority: a missing or malformed
+/// Goal id fails closed, and a terminal Goal (`completed`/`failed`/`cancelled`)
+/// refuses new associations because no active work should be attached to closed
+/// objectives. A project-scoped Goal is refused because a Commitment carries no
+/// workspace association that could be proven against it, matching the existing
+/// link validation. An explicitly bound Commitment Agent must match the Goal's
+/// Agent. This only proves attribution; it never grants permissions and never
+/// treats a Commitment as Goal acceptance.
+pub fn validate_commitment_goal_binding(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+    commitment_agent_id: Option<&str>,
+) -> Result<(), String> {
+    let goal = load_goal(conn, goal_id)?;
+    if TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str()) {
+        return Err(format!(
+            "goal is terminal ('{}'); a commitment cannot be bound to a closed goal",
+            goal.status
+        ));
+    }
+    if goal.project_root.is_some() {
+        return Err(format!(
+            "commitment has no workspace association and cannot be bound to \
+             project-scoped goal '{}'",
+            goal.id
+        ));
+    }
+    if let Some(agent_id) = commitment_agent_id {
+        require_same_agent(agent_id, &goal, "commitment", "(commitment)")?;
+    }
+    Ok(())
+}
+
 /// Validate that a link target actually exists in its authoritative store and
 /// that its Agent/workspace identity is compatible with the loaded Goal before
 /// any link is persisted. Only kinds whose authority is reachable from this
@@ -943,6 +1040,25 @@ pub fn goal_link_add(
     let goal = load_goal(&conn, &goal_id)?;
     validate_link_target(&conn, &goal, &target_kind, &target_id)?;
 
+    // A Commitment owns its Goal association on its own record, so route a
+    // commitment link through that authority (which also clears any legacy
+    // `goal_links` projection) instead of inserting a second, independently
+    // editable row that could disagree with the Commitment.
+    if target_kind == "commitment" {
+        let commitment = crate::commands::system::apply_commitment_goal_conn(
+            &conn,
+            &target_id,
+            Some(goal_id.clone()),
+        )?;
+        return Ok(GoalLink {
+            id: format!("commitment:{}", commitment.id),
+            goal_id,
+            target_kind,
+            target_id: commitment.id,
+            created_at: now_iso(),
+        });
+    }
+
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = now_iso();
     let id = new_id();
@@ -982,6 +1098,20 @@ pub fn goal_link_remove(
     target_id: String,
 ) -> Result<bool, String> {
     let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Remove a commitment association through its authoritative Commitment
+    // record, matching the write path. Other target kinds use `goal_links`.
+    if target_kind.trim() == "commitment" {
+        let target_id = target_id.trim().to_string();
+        if target_id.is_empty() {
+            return Err("goal link target id must not be empty".to_string());
+        }
+        load_goal(&conn, &goal_id)?;
+        return crate::commands::system::clear_commitment_goal_conn(
+            &conn, &target_id, &goal_id,
+        );
+    }
+
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     load_goal(&tx, &goal_id)?;
     let affected = tx
