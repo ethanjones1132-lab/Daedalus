@@ -598,8 +598,22 @@ interface ActionRegistryAlert {
   count?: number;
 }
 
+// In-app Goal notification payload (Roadmap Priority #2, Part 3). Bounded:
+// identifiers and fixed copy only — never prompt/message contents.
+interface GoalNotification {
+  key: string;
+  goal_id: string;
+  activation_id?: string;
+  cron_job_id?: string;
+  run_id?: string;
+  kind: string;
+  title: string;
+  message: string;
+  created_at: string;
+}
+
 function AppInner() {
-  const { warn, error: toastError } = useToast();
+  const { info, success, warn, error: toastError } = useToast();
   const { theme, toggle: toggleTheme } = useTheme();
   const [currentView, setCurrentView] = useState<ViewId>(() => {
     try {
@@ -734,6 +748,41 @@ function AppInner() {
       void refreshCronAwareness();
     }
   }, [currentView, refreshCronAwareness]);
+
+  useEffect(() => {
+    // In-app Goal notifications (Roadmap Priority #2, Part 3). The native side
+    // emits only after the corresponding durable Goal/activation state is
+    // persisted and dedupes on persisted identity, so this listener surfaces
+    // each meaningful scheduled-run transition at most once. Payloads carry no
+    // prompt/message text. Delivery is in-app only; nothing is sent externally.
+    const unsubs: Array<() => void> = [];
+    let disposed = false;
+    listen<GoalNotification>('goal://notifications', (e) => {
+      const n = e.payload;
+      if (!n?.message) return;
+      const openGoal = {
+        label: 'Open Goals',
+        onClick: () => setCurrentView('goals'),
+      };
+      if (n.kind === 'scheduled_run_blocked' || n.kind === 'scheduled_run_failed') {
+        toastError(n.message, n.title, undefined, openGoal);
+      } else if (n.kind === 'scheduled_run_waiting_for_user' || n.kind === 'scheduled_run_cancelled') {
+        warn(n.message, n.title, undefined, openGoal);
+      } else if (n.kind === 'scheduled_run_verified_completed') {
+        success(n.message, n.title, undefined, openGoal);
+      } else {
+        info(n.message, n.title, undefined, openGoal);
+      }
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubs.push(unlisten);
+    });
+
+    return () => {
+      disposed = true;
+      unsubs.forEach((f) => f());
+    };
+  }, [warn, toastError, success, info]);
 
   const renderView = () => {
     switch (currentView) {

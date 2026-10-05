@@ -16,6 +16,7 @@ const KNOWN_SETTING_KEYS = new Set([
   'prizepicks_prompt', 'temperature', 'surface_temperatures', 'max_tokens',
   'top_p', 'top_k', 'bridge_port', 'bridge_enabled', 'jarvis_path', 'compaction',
   'profiles', 'active_profile', 'api_sports_key', 'agents_root',
+  'goal_notifications_enabled',
 ]);
 
 export function SettingsView() {
@@ -52,6 +53,28 @@ export function SettingsView() {
       if (value !== settings[key]) next.add(key); else next.delete(key);
       return next;
     });
+  };
+
+  // In-app Goal notifications are persisted in the same SQLite settings table as
+  // every other key. Absent => the documented default (enabled). This is the
+  // user-facing control for the narrow persisted bool; it only affects the
+  // in-app surface, never OS/email/push/external delivery.
+  const goalNotificationsEnabled = (editing['goal_notifications_enabled'] ?? 'true') === 'true';
+
+  const toggleGoalNotifications = async (enabled: boolean) => {
+    const value = enabled ? 'true' : 'false';
+    handleChange('goal_notifications_enabled', value);
+    setSaving(prev => new Set(prev).add('goal_notifications_enabled'));
+    try {
+      await invoke('set_setting', { key: 'goal_notifications_enabled', value });
+      setSettings(prev => ({ ...prev, goal_notifications_enabled: value }));
+      setDirty(prev => { const n = new Set(prev); n.delete('goal_notifications_enabled'); return n; });
+      success('Saved goal_notifications_enabled');
+    } catch (e) {
+      toastError(String(e), 'Failed to save goal_notifications_enabled');
+    } finally {
+      setSaving(prev => { const n = new Set(prev); n.delete('goal_notifications_enabled'); return n; });
+    }
   };
 
   const saveKey = async (key: string) => {
@@ -91,6 +114,29 @@ export function SettingsView() {
           </button>
         }
       />
+
+      {!loading && !error && (
+        <GlassCard className="p-3 shrink-0">
+          <label className="flex items-center justify-between gap-3 cursor-pointer">
+            <span className="flex flex-col">
+              <span className="text-xs font-mono text-bone/80">In-app Goal notifications</span>
+              <span className="text-[10px] text-bone/40">
+                Show in-app toasts for Goal-linked scheduled-run progress, waiting, blocked,
+                cancellation, failure, and verified scheduled-run completion. In-app only — no OS,
+                email, push, or external notifications.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              aria-label="In-app Goal notifications"
+              checked={goalNotificationsEnabled}
+              disabled={saving.has('goal_notifications_enabled')}
+              onChange={e => void toggleGoalNotifications(e.target.checked)}
+              className="w-4 h-4 accent-amber-400 shrink-0"
+            />
+          </label>
+        </GlassCard>
+      )}
 
       {!loading && !error && (
         <input

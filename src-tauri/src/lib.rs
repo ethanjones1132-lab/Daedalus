@@ -2,6 +2,7 @@ pub mod commands;
 pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
+pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
 pub mod supervisor;

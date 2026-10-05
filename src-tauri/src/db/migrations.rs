@@ -283,6 +283,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_memory_capture_migrations(conn)?;
     apply_goal_migrations(conn)?;
     apply_cron_activation_migrations(conn)?;
+    apply_goal_notification_migrations(conn)?;
 
     Ok(())
 }
@@ -1567,6 +1568,50 @@ pub fn apply_cron_activation_migrations(conn: &Connection) -> Result<(), rusqlit
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT cron_activation_migration; \
                  RELEASE SAVEPOINT cron_activation_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 3 — durable dedupe ledger for in-app Goal
+/// notifications. One row is written per emitted notification, keyed by a
+/// deterministic persisted identity (activation/occurrence plus state), so an
+/// in-app toast is emitted at most once per durable state change even across a
+/// restart. Additive and idempotent; no existing row is touched. The ledger
+/// stores only identifiers and short fixed copy — never prompt contents.
+pub fn apply_goal_notification_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT goal_notification_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS goal_notifications (
+                notification_key TEXT PRIMARY KEY,
+                goal_id          TEXT NOT NULL,
+                activation_id    TEXT,
+                cron_job_id      TEXT,
+                run_id           TEXT,
+                kind             TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                message          TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_notifications_goal
+                ON goal_notifications(goal_id, created_at);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT goal_notification_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT goal_notification_migration; \
+                 RELEASE SAVEPOINT goal_notification_migration;",
             );
             Err(err)
         }

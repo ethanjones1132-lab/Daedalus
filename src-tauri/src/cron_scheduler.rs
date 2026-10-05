@@ -624,26 +624,31 @@ fn settle_activation_denied(
 
     // Read the current state so an already-recorded identical denial is treated
     // as an idempotent success rather than a failed update.
-    let existing: Option<(String, Option<String>)> = conn
+    let existing: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT claim_state, terminal_reason FROM cron_activations WHERE activation_id = ?1",
+            "SELECT claim_state, terminal_reason, goal_id, cron_job_id, session_id \
+             FROM cron_activations WHERE activation_id = ?1",
             [activation_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()
         .map_err(|e| format!("failed to read activation {activation_id}: {e}"))?;
+    let (goal_id, cron_job_id) = match &existing {
+        Some((_, _, goal_id, cron_job_id, _)) => (goal_id.clone(), cron_job_id.clone()),
+        None => (None, None),
+    };
     match existing {
         None => {
             return Err(format!(
                 "activation {activation_id} not found; denied state not persisted"
             ))
         }
-        Some((state, existing_reason))
+        Some((state, existing_reason, _, _, _))
             if state == claim_state && existing_reason.as_deref() == Some(reason) =>
         {
             return Ok(());
         }
-        Some((state, _)) if matches!(state.as_str(), "completed" | "failed" | "cancelled") => {
+        Some((state, _, _, _, _)) if matches!(state.as_str(), "completed" | "failed" | "cancelled") => {
             // A terminal activation must not be overwritten by a late denial.
             return Ok(());
         }
@@ -664,6 +669,33 @@ fn settle_activation_denied(
             "denied state for activation {activation_id} was not persisted (affected {affected})"
         ));
     }
+    drop(conn);
+
+    // Notify only after the denied state is durably persisted, and only for a
+    // Goal-linked activation. A blocked denial is actionable; a waiting denial
+    // is a request for user input.
+    if let (Some(goal_id), Some(cron_job_id)) = (goal_id, cron_job_id) {
+        let request = if claim_state == "waiting_for_user" {
+            crate::notifications::waiting_request(
+                &goal_id,
+                activation_id,
+                &cron_job_id,
+                None,
+                activation_id,
+                reason,
+            )
+        } else {
+            crate::notifications::blocked_request(
+                &goal_id,
+                activation_id,
+                &cron_job_id,
+                None,
+                activation_id,
+                reason,
+            )
+        };
+        crate::notifications::emit_goal_notifications(app, vec![request]);
+    }
     Ok(())
 }
 
@@ -680,6 +712,16 @@ pub fn mark_activation_cancelled(
 ) -> Result<(), String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    // Capture the Goal/job identity (if any) so the post-write notification can
+    // be scoped to a Goal-linked activation.
+    let identity: Option<(Option<String>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT goal_id, cron_job_id, run_id FROM cron_activations WHERE activation_id = ?1",
+            [activation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read activation {activation_id}: {e}"))?;
     conn.execute(
         "UPDATE cron_activations SET claim_state = 'cancelled', terminal_reason = ?1, \
          cancel_acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
@@ -689,6 +731,21 @@ pub fn mark_activation_cancelled(
         rusqlite::params![reason, activation_id],
     )
     .map_err(|e| format!("failed to persist cancellation for activation {activation_id}: {e}"))?;
+    drop(conn);
+
+    // A confirmed cancellation is a distinct terminal state (never completion).
+    // Notify only after the durable write and only when Goal-linked.
+    if let Some((Some(goal_id), Some(cron_job_id), run_id)) = identity {
+        let request = crate::notifications::cancelled_request(
+            &goal_id,
+            activation_id,
+            &cron_job_id,
+            run_id.as_deref(),
+            activation_id,
+            reason,
+        );
+        crate::notifications::emit_goal_notifications(app, vec![request]);
+    }
     Ok(())
 }
 
@@ -1487,6 +1544,43 @@ fn record_run(
             // recurring activation is permitted.
             take_cancel_request(job_id);
         }
+
+        // Preference-aware in-app notification, emitted ONLY after the terminal
+        // state and the durable run row are persisted, and only for a
+        // Goal-linked activation. A `success` is reported as a verified
+        // scheduled-run completion, never as Goal completion or acceptance.
+        if settled && ctx.goal_id.is_some() {
+            let goal_id = ctx.goal_id.as_deref().unwrap_or_default();
+            let request = match claim_state {
+                "completed" => crate::notifications::completed_request(
+                    goal_id,
+                    &ctx.activation_id,
+                    job_id,
+                    &run_id,
+                    &run_id,
+                ),
+                "cancelled" => crate::notifications::cancelled_request(
+                    goal_id,
+                    &ctx.activation_id,
+                    job_id,
+                    Some(&run_id),
+                    &run_id,
+                    error,
+                ),
+                _ => crate::notifications::failed_request(
+                    goal_id,
+                    &ctx.activation_id,
+                    job_id,
+                    Some(&run_id),
+                    &run_id,
+                    error,
+                ),
+            };
+            // Drop the DB lock before emitting; emit re-acquires it.
+            drop(conn);
+            crate::notifications::emit_goal_notifications(app, vec![request]);
+            return settled;
+        }
     }
 
     // Prune runs for this job to keep only the last 100 entries.
@@ -1561,6 +1655,20 @@ pub async fn execute_job(
     // Transition the claim to `dispatched` before the external effect so a crash
     // mid-dispatch is recoverable as `ambiguous`, not a silent replay.
     update_claim_state(app, &activation_id, "dispatched", None);
+
+    // Meaningful progress notification: this fires once per claimed Goal-linked
+    // occurrence (the durable `dispatched` state is the dedupe identity), not on
+    // every internal step. Only after the claim state is persisted.
+    if let Some(ref gid) = goal_id {
+        let request = crate::notifications::progress_request(
+            gid,
+            &activation_id,
+            job_id,
+            &activation_id,
+            "dispatched",
+        );
+        crate::notifications::emit_goal_notifications(app, vec![request]);
+    }
 
     // Register a cancellation control for this execution and re-check the cancel
     // intent under the registry lock so a cancel cannot slip between the
