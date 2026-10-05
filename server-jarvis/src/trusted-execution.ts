@@ -602,14 +602,14 @@ async function executeTrustedAcceptance(
     inFlight.delete(inflightKey);
   }
 
-  if (
-    controller.signal.aborted &&
-    outcome !== "waiting_for_user" &&
-    outcome !== "blocked" &&
-    outcome !== "cancelled" &&
-    outcome !== "rejected" &&
-    outcome !== "partial"
-  ) {
+  const nonOverwritable = new Set<TrustedAcceptanceResponse["outcome"]>([
+    "waiting_for_user",
+    "blocked",
+    "cancelled",
+    "rejected",
+    "partial",
+  ]);
+  if (controller.signal.aborted && !nonOverwritable.has(outcome)) {
     if (controller.signal.reason === "trusted_timeout") {
       outcome = "failed";
       reason = "acceptance deadline exceeded";

@@ -942,10 +942,12 @@ pub(crate) fn complete_goal_from_accepted_evidence(
                  WHERE acceptance_key = ?1 AND accepted = 1 ORDER BY criterion_id",
             )
             .map_err(|e| e.to_string())?;
-        stmt.query_map([acceptance_key], |row| row.get::<_, String>(0))
+        let rows = stmt
+            .query_map([acceptance_key], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        rows
     };
     accepted_rows.sort();
 
@@ -954,10 +956,12 @@ pub(crate) fn complete_goal_from_accepted_evidence(
         let mut stmt = tx
             .prepare("SELECT id FROM goal_criteria WHERE goal_id = ?1")
             .map_err(|e| e.to_string())?;
-        stmt.query_map([goal_id], |row| row.get::<_, String>(0))
+        let rows = stmt
+            .query_map([goal_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        rows
     };
     let mut accepted: Vec<String> = accepted_criterion_ids.to_vec();
     accepted.sort();

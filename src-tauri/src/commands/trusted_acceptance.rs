@@ -710,10 +710,12 @@ fn derive_goal(
         let mut stmt = conn
             .prepare("SELECT id FROM goal_criteria WHERE goal_id = ?1")
             .map_err(|e| e.to_string())?;
-        stmt.query_map([&goal_id], |row| row.get::<_, String>(0))
+        let rows = stmt
+            .query_map([&goal_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        rows
     };
     let mut declared: Vec<String> = criterion_ids.to_vec();
     declared.sort();
@@ -1148,8 +1150,11 @@ fn run_acceptance(
                         bun_instance_id = Some(resp.bun_instance_id.clone());
                         runtime_started = Some(resp.started_at.clone());
                         runtime_finished = Some(resp.finished_at.clone());
-                        evidence = serde_json::to_value(&resp.calls)
-                            .map_err(|e| format!("failed to serialize acceptance evidence: {e}"))?;
+                        evidence = Some(
+                            serde_json::to_value(&resp.calls).map_err(|e| {
+                                format!("failed to serialize acceptance evidence: {e}")
+                            })?,
+                        );
                     }
                 }
             }
