@@ -85,7 +85,11 @@ Both ran at about 66 tok/s single-stream on the L40S. Job time was 9.6 and 14.3 
 - **The failure mode is derailment on hard prompts.** Hidden-package fixes fell from 14 to 3. 10 answers ran to the token cap with runaway number lists or self-repeating prose, which then fails as a SyntaxError. Simple and robustness tasks are untouched.
 - **The unpruned Coder scores only 97 with thinking off.** That is below what already runs on this PC: Qwen3.6 keep96 scores 101 at 274 tok/s, Gemma 4 26B 105, and gpt-oss-20b 108. ISTA's published scores use extra-high reasoning effort, so thinking may be what this model needs. That is untested on tier2b.
 
-## Next steps
+## Decision
+
+The owner closed the Flash-Next line on 2026-10-04. Qwen3.6 keep96 stays the local model. The thinking-on test below stays open in case hardware or priorities change.
+
+## Next steps (if reopened)
 
 1. **Don't run keep96 locally.** At 83 it trails Qwen3.6 keep96, which is faster and already fits.
 2. **Before buying RAM for Flash-Next, score the unpruned Coder with thinking on.** One more Modal run of about $1, using `tier2b_llama.py --budget 2048` or `-1`. If thinking lifts it well past 105, the 32 GB / keep224 path is worth it. If not, the current local lineup is as good on this benchmark.
