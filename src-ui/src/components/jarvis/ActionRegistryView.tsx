@@ -31,6 +31,16 @@ import {
   MetricBlock,
   useToast,
 } from '../ui';
+import {
+  acceptanceStatusVariant,
+  criterionEvidenceSummary,
+  evidenceSummary,
+  executionStatusVariant,
+  isTrustedAcceptanceReceipt,
+  isTrustedExecutionReceipt,
+  type TrustedAcceptanceReceipt,
+  type TrustedExecutionReceipt,
+} from './trusted-receipt-state';
 
 interface ActionRegistrySummary {
   active: number;
@@ -209,6 +219,230 @@ function mutationSuccessText(mutation: RegistryMutation): string {
   return 'Action registry update confirmed.';
 }
 
+/**
+ * Authoritative native receipt evidence for one exact Action Registry action id.
+ * Loads on demand only, decodes strictly, and binds every returned record to the
+ * displayed action id. The file-backed row's `execution_evidence` /
+ * `acceptance_evidence` is never read: only `list_trusted_executions` and
+ * `get_trusted_acceptance` are displayed. Any failed/mismatched read shows an
+ * explicit unavailable state instead of evidence.
+ */
+function ActionNativeReceipts({ actionId }: { actionId: string }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [executions, setExecutions] = useState<TrustedExecutionReceipt[]>([]);
+  const [receipts, setReceipts] = useState<Record<string, TrustedAcceptanceReceipt | null>>({});
+  const requestId = useRef(0);
+
+  const load = useCallback(async () => {
+    const id = ++requestId.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const raw = await invoke<unknown>('list_trusted_executions', { actionId });
+      if (id !== requestId.current) return;
+      if (!Array.isArray(raw)) throw new Error('unreadable');
+      const rows: TrustedExecutionReceipt[] = [];
+      for (const item of raw) {
+        if (!isTrustedExecutionReceipt(item) || item.action_id !== actionId) {
+          throw new Error('malformed');
+        }
+        rows.push(item);
+      }
+      const nextReceipts: Record<string, TrustedAcceptanceReceipt | null> = {};
+      for (const execution of rows) {
+        let receipt: TrustedAcceptanceReceipt | null = null;
+        try {
+          const rawReceipt = await invoke<unknown>('get_trusted_acceptance', {
+            executionId: execution.execution_id,
+          });
+          if (id !== requestId.current) return;
+          if (rawReceipt !== null && rawReceipt !== undefined) {
+            if (
+              !isTrustedAcceptanceReceipt(rawReceipt) ||
+              rawReceipt.execution_id !== execution.execution_id ||
+              rawReceipt.action_id !== actionId ||
+              rawReceipt.manifest_id !== execution.manifest_id
+            ) {
+              throw new Error('malformed');
+            }
+            receipt = rawReceipt;
+          }
+        } catch {
+          if (id !== requestId.current) return;
+          throw new Error('receipt-unreadable');
+        }
+        nextReceipts[execution.execution_id] = receipt;
+      }
+      if (id !== requestId.current) return;
+      setExecutions(rows);
+      setReceipts(nextReceipts);
+      setUnavailable(false);
+      setLoaded(true);
+    } catch {
+      if (id !== requestId.current) return;
+      setExecutions([]);
+      setReceipts({});
+      setLoaded(false);
+      setUnavailable(true);
+      setError(
+        'Native execution/acceptance receipts could not be read for this action. Evidence is unavailable; the file-backed Action Registry row is not a proof source.',
+      );
+    } finally {
+      if (id === requestId.current) setLoading(false);
+    }
+  }, [actionId]);
+
+  useEffect(() => {
+    requestId.current++;
+    setExecutions([]);
+    setReceipts({});
+    setLoaded(false);
+    setUnavailable(false);
+    setError(null);
+    setLoading(false);
+    if (open) void load();
+  }, [actionId, open, load]);
+
+  return (
+    <div className="mt-3 border-t border-white/10 pt-2">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className="text-[10px] font-mono uppercase tracking-wider text-bone/50 hover:text-bone transition-colors"
+      >
+        {open ? '▾' : '▸'} Native receipts
+      </button>
+      {open && (
+        <div className="mt-2 space-y-2">
+          {loading && (
+            <div role="status" className="text-[11px] text-bone/50">
+              Loading native execution/acceptance receipts…
+            </div>
+          )}
+          {error && (
+            <div role="alert" className="text-[11px] text-red-200">
+              {error}
+            </div>
+          )}
+          {!loading && !unavailable && loaded && executions.length === 0 && (
+            <div className="text-[11px] text-bone/40">
+              No native trusted execution receipts exist for this action.
+            </div>
+          )}
+          {executions.map((execution) => {
+            const receipt = receipts[execution.execution_id] ?? null;
+            return (
+              <div
+                key={execution.execution_id}
+                className="rounded-lg border border-white/10 bg-black/10 p-2"
+              >
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Pill variant={executionStatusVariant(execution.status)}>{execution.status}</Pill>
+                  {receipt && (
+                    <Pill variant={acceptanceStatusVariant(receipt.status)}>
+                      acceptance: {receipt.status}
+                    </Pill>
+                  )}
+                  {receipt?.confirmed && <Pill variant="success">native confirmed</Pill>}
+                </div>
+                <div className="mt-1 text-[10px] font-mono text-bone/50 break-all">
+                  <div>action {execution.action_id}</div>
+                  <div>execution {execution.execution_id}</div>
+                  <div>
+                    manifest {execution.manifest_id} · v{execution.manifest_registry_version} ·{' '}
+                    {execution.manifest_content_hash.slice(0, 12)}… · schema{' '}
+                    {execution.manifest_schema_version}
+                  </div>
+                  <div>
+                    agent {execution.agent_id} · workspace {execution.project_root}
+                  </div>
+                  <div>
+                    runtime {execution.runtime_started_at ?? '—'} →{' '}
+                    {execution.runtime_finished_at ?? '—'}
+                  </div>
+                </div>
+                {execution.terminal_reason && (
+                  <div className="mt-1 text-[10px] text-bone/50">
+                    reason: {execution.terminal_reason}
+                  </div>
+                )}
+                {execution.conflict?.detail && (
+                  <div className="mt-1 text-[10px] text-amber-200/80">
+                    conflict: {execution.conflict.detail}
+                  </div>
+                )}
+                {evidenceSummary(execution.evidence) && (
+                  <div className="mt-1 text-[10px] text-bone/40">
+                    run evidence: {evidenceSummary(execution.evidence)}
+                  </div>
+                )}
+                {receipt && (
+                  <div className="mt-2 space-y-1">
+                    <div className="text-[10px] font-mono text-bone/50 break-all">
+                      acceptance {receipt.acceptance_key} · goal {receipt.goal_id}
+                    </div>
+                    {receipt.terminal_reason && (
+                      <div className="text-[10px] text-bone/50">
+                        delivery note: {receipt.terminal_reason}
+                      </div>
+                    )}
+                    <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                      Criterion checks
+                    </div>
+                    <ul className="space-y-1">
+                      {receipt.criteria.map((criterion) => (
+                        <li
+                          key={`${criterion.criterion_id}:${criterion.check_index}`}
+                          className="text-[10px] font-mono text-bone/70"
+                        >
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <Pill variant={criterion.accepted ? 'success' : 'error'}>
+                              {criterion.accepted ? 'accepted' : 'not accepted'}
+                            </Pill>
+                            <span>{criterion.tool}</span>
+                            <span className="text-bone/40">check {criterion.check_index}</span>
+                          </div>
+                          <div className="text-bone/40 break-all">
+                            criterion {criterion.criterion_id} · expected{' '}
+                            {criterion.expected_sha256.slice(0, 12)}… · actual{' '}
+                            {criterion.actual_sha256
+                              ? `${criterion.actual_sha256.slice(0, 12)}…`
+                              : '—'}
+                          </div>
+                          {criterionEvidenceSummary(criterion.evidence) && (
+                            <div className="text-bone/40">
+                              {criterionEvidenceSummary(criterion.evidence)}
+                            </div>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {!receipt && !loading && (
+                  <div className="mt-1 text-[10px] text-bone/40">
+                    No native acceptance receipt for this execution.
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          <p className="text-[10px] font-mono text-bone-faint">
+            Evidence is read only from authoritative native execution/acceptance receipts bound to
+            this exact action id. The file-backed Action Registry row&apos;s evidence fields are
+            never displayed or trusted.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ActionRegistryView() {
   const [state, dispatch] = useReducer(reduceRegistryState<RegistrySnapshot>, initialRegistryState<RegistrySnapshot>());
   const [alertState, dispatchAlerts] = useReducer(
@@ -219,6 +453,12 @@ export default function ActionRegistryView() {
   const alertRequestId = useRef(0);
   const mutationRef = useRef<RegistryMutation | null>(null);
   const [mutation, setMutation] = useState<RegistryMutation | null>(null);
+  const [doneOpen, setDoneOpen] = useState(false);
+  const [doneActions, setDoneActions] = useState<RegistryAction[] | null>(null);
+  const [doneLoading, setDoneLoading] = useState(false);
+  const [doneError, setDoneError] = useState(false);
+  const [doneRetry, setDoneRetry] = useState(0);
+  const doneRequestId = useRef(0);
   const { snapshot, loading, error } = state;
   const summary = snapshot?.summary;
   const active = snapshot?.active ?? [];
@@ -270,6 +510,35 @@ export default function ActionRegistryView() {
       dispatchAlerts({ type: 'failure', requestId: id });
     }
   }, []);
+
+  // Done actions are loaded on demand so terminal actions absent from the
+  // active/blocked buckets remain inspectable, including their authoritative
+  // native execution/acceptance receipt evidence. A failed read is unavailable,
+  // never an empty done bucket.
+  const fetchDone = useCallback(async () => {
+    const id = ++doneRequestId.current;
+    setDoneLoading(true);
+    try {
+      const raw = await invoke<unknown>('get_action_registry_bucket', { bucket: 'done' });
+      if (id !== doneRequestId.current) return;
+      if (!raw || typeof raw !== 'object' || !Array.isArray((raw as { actions?: unknown }).actions)) {
+        throw new Error('unreadable');
+      }
+      setDoneActions((raw as { actions: RegistryAction[] }).actions);
+      setDoneError(false);
+    } catch {
+      if (id !== doneRequestId.current) return;
+      setDoneActions(null);
+      setDoneError(true);
+    } finally {
+      if (id === doneRequestId.current) setDoneLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!doneOpen) return;
+    void fetchDone();
+  }, [doneOpen, doneRetry, fetchDone]);
 
   useEffect(() => {
     void fetchData();
@@ -422,14 +691,24 @@ export default function ActionRegistryView() {
           subtitle="cross-project work queue"
           count={summary?.active}
         />
-        <button
-          type="button"
-          onClick={() => void handleMutation('sync')}
-          disabled={mutationLocked}
-          className="px-4 py-2 text-xs font-mono uppercase tracking-wider rounded-lg border border-royal/40 text-royal-light hover:bg-royal/10 transition-colors disabled:opacity-50"
-        >
-          {mutation?.kind === 'sync' && mutation.phase === 'writing' ? 'Syncing…' : 'Sync Adapters'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            aria-expanded={doneOpen}
+            onClick={() => setDoneOpen((value) => !value)}
+            className="px-4 py-2 text-xs font-mono uppercase tracking-wider rounded-lg border border-white/20 text-bone-dim hover:bg-white/10 transition-colors"
+          >
+            {doneOpen ? 'Hide done actions' : 'Show done actions'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleMutation('sync')}
+            disabled={mutationLocked}
+            className="px-4 py-2 text-xs font-mono uppercase tracking-wider rounded-lg border border-royal/40 text-royal-light hover:bg-royal/10 transition-colors disabled:opacity-50"
+          >
+            {mutation?.kind === 'sync' && mutation.phase === 'writing' ? 'Syncing…' : 'Sync Adapters'}
+          </button>
+        </div>
       </div>
 
       {mutationFeedback}
@@ -498,6 +777,45 @@ export default function ActionRegistryView() {
           </section>
         </div>
       )}
+
+      {doneOpen && (
+        <section className="mt-6">
+          <h3 className="text-sm font-semibold text-bone mb-3">Done</h3>
+          {doneLoading && <LoadingState message="Loading done actions…" />}
+          {doneError && !doneLoading && (
+            <div role="alert">
+              <ErrorState error="Could not load done actions from the native authority." />
+              <button
+                type="button"
+                onClick={() => setDoneRetry((value) => value + 1)}
+                className="mt-2 px-3 py-1 text-xs rounded-md bg-white/5 hover:bg-white/10 transition-colors"
+              >
+                Retry done
+              </button>
+            </div>
+          )}
+          {!doneLoading && !doneError && doneActions !== null && doneActions.length === 0 && (
+            <GlassCard className="text-center py-10">
+              <p className="text-bone-dim text-sm font-mono">No done actions</p>
+            </GlassCard>
+          )}
+          {!doneLoading && !doneError && doneActions !== null && doneActions.length > 0 && (
+            <AnimatedList>
+              {doneActions.map((action) => (
+                <ActionCard
+                  key={action.id}
+                  action={action}
+                  bucket="done"
+                  disabled
+                  onApprove={() => {}}
+                  onWaive={() => {}}
+                  onDispatch={() => {}}
+                />
+              ))}
+            </AnimatedList>
+          )}
+        </section>
+      )}
     </PageTransition>
   );
 }
@@ -511,7 +829,7 @@ function ActionCard({
   onDispatch,
 }: {
   action: RegistryAction;
-  bucket: 'active' | 'blocked';
+  bucket: 'active' | 'blocked' | 'done';
   disabled: boolean;
   onApprove: (id: string) => void;
   onWaive: (id: string) => void;
@@ -548,7 +866,7 @@ function ActionCard({
             {action.escalation_note && (
               <p className="text-[11px] text-amber-200/80 mt-2 font-mono">{action.escalation_note}</p>
             )}
-            {action.approval_required && action.approval_status !== 'approved' && action.approval_status !== 'waived' && (
+            {bucket !== 'done' && action.approval_required && action.approval_status !== 'approved' && action.approval_status !== 'waived' && (
               <div className="flex items-center gap-2 mt-3">
                 <button
                   type="button"
@@ -583,6 +901,7 @@ function ActionCard({
                 </button>
               </div>
             )}
+            <ActionNativeReceipts actionId={action.id} />
           </div>
         </div>
       </GlassCard>

@@ -1,7 +1,10 @@
 // ── GoalsView — durable user-owned Goals with acceptance criteria ──
 //    (goal_create/goal_list/goal_get/goal_update/goal_transition/
-//     goal_links_list). A Goal is never shown as complete here: completion
-//    requires verified acceptance evidence that this part does not implement.
+//     goal_links_list). Completion is never inferred here: trusted acceptance
+//    runs only through the native ToolRuntime/trusted manifest, and an
+//    accepted/completed state is shown only after a durable native readback of
+//    the exact acceptance receipt, Goal terminal evidence, and Action Registry
+//    terminal state.
 
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -15,6 +18,20 @@ import {
   EmptyState,
   type StatusVariant,
 } from '../ui';
+import {
+  acceptanceStatusVariant,
+  criterionEvidenceSummary,
+  evidenceSummary,
+  executionStatusVariant,
+  isTrustedAcceptanceReceipt,
+  isTrustedExecutionReceipt,
+  isTrustedManifestSummary,
+  manifestAcceptanceKeys,
+  normalizeRoot,
+  type TrustedAcceptanceReceipt,
+  type TrustedExecutionReceipt,
+  type TrustedManifestSummary,
+} from './trusted-receipt-state';
 
 interface Goal {
   id: string;
@@ -298,6 +315,95 @@ function scheduleOpReconciled(
   return !result.inFlight.has(jobId);
 }
 
+interface ActionRegistryRow {
+  id: string;
+  status: string;
+}
+
+/**
+ * One Goal-scoped trusted acceptance candidate, resolved only from
+ * authoritative native receipts. Eligibility binds the exact native execution
+ * receipt to the current registered manifest (id/version/hash) and to this
+ * Goal's own criteria/Agent/workspace. Nothing here is derived from Goal text,
+ * model output, or Action Registry row evidence.
+ */
+interface AcceptanceCandidate {
+  execution: TrustedExecutionReceipt;
+  manifest: TrustedManifestSummary;
+  receipt: TrustedAcceptanceReceipt | null;
+}
+
+interface AcceptanceLoadResult {
+  candidates: AcceptanceCandidate[];
+  doneActionIds: Set<string>;
+  unavailable: boolean;
+}
+
+/** Exact set equality (order-independent) for criterion ids. Empty is invalid. */
+function sameCriterionSet(a: string[], b: string[]): boolean {
+  if (a.length === 0 || a.length !== b.length) return false;
+  const set = new Set(b);
+  return a.every((key) => set.has(key));
+}
+
+function criteriaAllAccepted(receipt: TrustedAcceptanceReceipt, required: string[]): boolean {
+  if (required.length === 0) return false;
+  const accepted = new Set(
+    receipt.criteria.filter((criterion) => criterion.accepted).map((criterion) => criterion.criterion_id),
+  );
+  return required.every((id) => accepted.has(id));
+}
+
+/** Exact Goal-terminal receipt reference written by native completion. */
+function acceptanceTerminalRef(receipt: TrustedAcceptanceReceipt): string {
+  return `trusted_acceptance:${receipt.acceptance_key}`;
+}
+
+/**
+ * Accepted/completed is shown only when the durable native acceptance receipt
+ * binds to the exact execution/manifest/Goal, every required criterion row is
+ * accepted, and current native readbacks prove the Goal terminal link/event and
+ * the Action Registry action is terminally done. Model/command/registry text is
+ * never a basis for completion.
+ */
+function isAcceptedCompleted(
+  candidate: AcceptanceCandidate,
+  detail: GoalDetail,
+  doneActionIds: Set<string>,
+): boolean {
+  const { execution, receipt } = candidate;
+  if (!receipt) return false;
+  if (receipt.execution_id !== execution.execution_id) return false;
+  if (receipt.action_id !== execution.action_id) return false;
+  if (receipt.manifest_id !== execution.manifest_id) return false;
+  if (receipt.goal_id !== detail.goal.id) return false;
+  if (receipt.status !== 'accepted') return false;
+  if (!criteriaAllAccepted(receipt, detail.criteria.map((criterion) => criterion.id))) return false;
+  if (detail.goal.status !== 'completed') return false;
+  const ref = acceptanceTerminalRef(receipt);
+  if (!detail.links.some((link) => link.target_kind === 'evidence' && link.target_id === ref)) {
+    return false;
+  }
+  if (
+    !detail.events.some(
+      (event) =>
+        event.event_type === 'transition' &&
+        event.to_status === 'completed' &&
+        event.reason === ref,
+    )
+  ) {
+    return false;
+  }
+  return doneActionIds.has(execution.action_id);
+}
+
+function acceptanceRank(candidate: AcceptanceCandidate): number {
+  if (candidate.receipt?.status === 'accepted') return 0;
+  if (candidate.execution.status === 'pending_acceptance') return 1;
+  if (candidate.receipt !== null) return 2;
+  return 3;
+}
+
 export default function GoalsView() {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [detail, setDetail] = useState<GoalDetail | null>(null);
@@ -325,6 +431,15 @@ export default function GoalsView() {
   const [reconciling, setReconciling] = useState(false);
   const [scheduleOps, setScheduleOps] = useState<Record<string, ScheduleOp>>({});
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+
+  const [acceptanceCandidates, setAcceptanceCandidates] = useState<AcceptanceCandidate[]>([]);
+  const [acceptanceDoneIds, setAcceptanceDoneIds] = useState<Set<string>>(new Set());
+  const [acceptanceUnavailable, setAcceptanceUnavailable] = useState(false);
+  const [acceptanceReadError, setAcceptanceReadError] = useState<string | null>(null);
+  const [acceptanceRefreshing, setAcceptanceRefreshing] = useState(false);
+  const [acceptanceRunningId, setAcceptanceRunningId] = useState<string | null>(null);
+  const [acceptanceMessage, setAcceptanceMessage] = useState<string | null>(null);
+  const acceptancePending = useRef(false);
 
   const [objective, setObjective] = useState('');
   const [criteria, setCriteria] = useState<string[]>(['']);
@@ -554,6 +669,264 @@ export default function GoalsView() {
     [refreshScheduleState],
   );
 
+  // Authoritative trusted-acceptance readback for the selected Goal. Candidate
+  // executions come only from native receipts: a registered manifest is
+  // Goal-scoped when its exact acceptance criterion set equals the Goal's own
+  // criteria and its Agent/workspace scope matches, then the manifest's exact
+  // action receipts are read and each execution must match the manifest's
+  // id/version/hash/schema/Agent/action tuple. A failed or malformed read marks
+  // the panel unavailable (never empty success); a mismatched identity is
+  // dropped so stale evidence is never shown.
+  const loadAcceptanceState = useCallback(
+    async (goalDetail: GoalDetail, expectedRequest: number): Promise<AcceptanceLoadResult> => {
+      const empty: AcceptanceLoadResult = {
+        candidates: [],
+        doneActionIds: new Set(),
+        unavailable: true,
+      };
+      let manifests: TrustedManifestSummary[];
+      try {
+        const raw = await invoke<unknown>('list_trusted_acceptance_manifests');
+        if (expectedRequest !== detailRequestId.current) return empty;
+        if (!Array.isArray(raw)) throw new Error('unreadable');
+        manifests = [];
+        for (const row of raw) {
+          if (!isTrustedManifestSummary(row)) throw new Error('malformed');
+          manifests.push(row);
+        }
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return empty;
+        setAcceptanceCandidates([]);
+        setAcceptanceDoneIds(new Set());
+        setAcceptanceUnavailable(true);
+        setAcceptanceReadError(
+          'The native trusted-manifest registry could not be read. Trusted acceptance is unavailable.',
+        );
+        return empty;
+      }
+
+      const goal = goalDetail.goal;
+      const required = goalDetail.criteria.map((criterion) => criterion.id);
+      const goalRoot = normalizeRoot(goal.project_root);
+      const scoped = manifests.filter(
+        (manifest) =>
+          typeof manifest.action_id === 'string' &&
+          manifest.action_id.length > 0 &&
+          manifest.schema_version === 1 &&
+          manifest.agent_id === goal.agent_id &&
+          goalRoot !== null &&
+          normalizeRoot(manifest.project_root) === goalRoot &&
+          sameCriterionSet(manifestAcceptanceKeys(manifest), required),
+      );
+
+      const candidates: AcceptanceCandidate[] = [];
+      let failed = false;
+      for (const manifest of scoped) {
+        let executions: TrustedExecutionReceipt[];
+        try {
+          const raw = await invoke<unknown>('list_trusted_executions', {
+            actionId: manifest.action_id,
+          });
+          if (expectedRequest !== detailRequestId.current) return empty;
+          if (!Array.isArray(raw)) throw new Error('unreadable');
+          executions = [];
+          for (const item of raw) {
+            if (!isTrustedExecutionReceipt(item) || item.action_id !== manifest.action_id) {
+              throw new Error('malformed');
+            }
+            executions.push(item);
+          }
+        } catch {
+          if (expectedRequest !== detailRequestId.current) return empty;
+          failed = true;
+          continue;
+        }
+        const matching = executions.filter(
+          (execution) =>
+            execution.manifest_id === manifest.manifest_id &&
+            execution.manifest_registry_version === manifest.registry_version &&
+            execution.manifest_content_hash === manifest.content_hash &&
+            execution.manifest_schema_version === manifest.schema_version &&
+            execution.agent_id === manifest.agent_id &&
+            execution.action_id === manifest.action_id,
+        );
+        for (const execution of matching) {
+          let receipt: TrustedAcceptanceReceipt | null = null;
+          try {
+            const rawReceipt = await invoke<unknown>('get_trusted_acceptance', {
+              executionId: execution.execution_id,
+            });
+            if (expectedRequest !== detailRequestId.current) return empty;
+            if (rawReceipt !== null && rawReceipt !== undefined) {
+              if (
+                !isTrustedAcceptanceReceipt(rawReceipt) ||
+                rawReceipt.execution_id !== execution.execution_id ||
+                rawReceipt.action_id !== execution.action_id ||
+                rawReceipt.manifest_id !== execution.manifest_id
+              ) {
+                throw new Error('malformed');
+              }
+              receipt = rawReceipt;
+            }
+          } catch {
+            if (expectedRequest !== detailRequestId.current) return empty;
+            failed = true;
+            continue;
+          }
+          candidates.push({ execution, manifest, receipt });
+        }
+      }
+
+      let doneActionIds = new Set<string>();
+      let doneOk = false;
+      try {
+        const rawDone = await invoke<unknown>('get_action_registry_bucket', { bucket: 'done' });
+        if (expectedRequest !== detailRequestId.current) return empty;
+        if (
+          rawDone &&
+          typeof rawDone === 'object' &&
+          Array.isArray((rawDone as { actions?: unknown }).actions)
+        ) {
+          const rows = (rawDone as { actions: ActionRegistryRow[] }).actions;
+          doneActionIds = new Set(
+            rows.filter((row) => row && row.status === 'done').map((row) => row.id),
+          );
+          doneOk = true;
+        } else {
+          throw new Error('unreadable');
+        }
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return empty;
+        failed = true;
+      }
+
+      if (expectedRequest !== detailRequestId.current) return empty;
+      candidates.sort((a, b) => acceptanceRank(a) - acceptanceRank(b));
+      const unavailable = failed || !doneOk;
+      setAcceptanceCandidates(candidates);
+      setAcceptanceDoneIds(doneActionIds);
+      setAcceptanceUnavailable(unavailable);
+      setAcceptanceReadError(
+        unavailable
+          ? 'Some authoritative native receipts could not be read. Affected acceptance evidence is hidden and shown as unavailable; no completion is claimed without a full readback.'
+          : null,
+      );
+      return { candidates, doneActionIds, unavailable };
+    },
+    [],
+  );
+
+  const refreshAcceptanceState = useCallback(async () => {
+    const current = detail;
+    if (!current || acceptancePending.current) return;
+    const expectedRequest = detailRequestId.current;
+    setAcceptanceRefreshing(true);
+    try {
+      await loadAcceptanceState(current, expectedRequest);
+    } finally {
+      setAcceptanceRefreshing(false);
+    }
+  }, [detail, loadAcceptanceState]);
+
+  // Explicit user-authorized acceptance run for ONE exact native
+  // `pending_acceptance` execution id. The command return is never a completion
+  // claim: the exact execution receipt, acceptance receipt, Goal/criteria, and
+  // Action Registry terminal state are re-read and must all match before an
+  // accepted/completed state is displayed.
+  const runAcceptance = useCallback(
+    async (executionId: string) => {
+      const current = detail;
+      if (!current || acceptancePending.current) return;
+      const goalId = current.goal.id;
+      const expectedRequest = detailRequestId.current;
+      const candidate = acceptanceCandidates.find(
+        (row) => row.execution.execution_id === executionId,
+      );
+      if (
+        !candidate ||
+        candidate.execution.status !== 'pending_acceptance' ||
+        candidate.receipt !== null
+      ) {
+        return;
+      }
+      const execution = candidate.execution;
+      acceptancePending.current = true;
+      setAcceptanceRunningId(executionId);
+      setAcceptanceMessage(null);
+      let commandError: string | null = null;
+      try {
+        try {
+          await invoke('run_trusted_acceptance', { executionId });
+        } catch (err) {
+          commandError = typeof err === 'string' ? err : 'unknown error';
+        }
+        if (selectedIdRef.current !== goalId || expectedRequest !== detailRequestId.current) {
+          return;
+        }
+        // Re-read the exact execution receipt and bind it to the frozen tuple.
+        let freshExecution: TrustedExecutionReceipt | null = null;
+        try {
+          const raw = await invoke<unknown>('get_trusted_execution', { executionId });
+          if (isTrustedExecutionReceipt(raw)) freshExecution = raw;
+        } catch {
+          freshExecution = null;
+        }
+        let freshDetail: GoalDetail | null = null;
+        try {
+          const raw = await invoke<GoalDetail>('goal_get', { id: goalId });
+          if (raw && raw.goal && raw.goal.id === goalId) freshDetail = raw;
+        } catch {
+          freshDetail = null;
+        }
+        if (selectedIdRef.current !== goalId || expectedRequest !== detailRequestId.current) {
+          return;
+        }
+        if (freshDetail) setDetail(freshDetail);
+        const result = await loadAcceptanceState(freshDetail ?? current, expectedRequest);
+        if (selectedIdRef.current !== goalId || expectedRequest !== detailRequestId.current) {
+          return;
+        }
+        const updated =
+          result.candidates.find((row) => row.execution.execution_id === executionId) ?? null;
+        const executionBound =
+          freshExecution !== null &&
+          freshExecution.execution_id === execution.execution_id &&
+          freshExecution.action_id === execution.action_id &&
+          freshExecution.manifest_id === execution.manifest_id &&
+          freshExecution.manifest_registry_version === execution.manifest_registry_version &&
+          freshExecution.manifest_content_hash === execution.manifest_content_hash &&
+          freshExecution.agent_id === execution.agent_id &&
+          freshExecution.project_root === execution.project_root;
+        const accepted =
+          executionBound &&
+          updated !== null &&
+          freshDetail !== null &&
+          isAcceptedCompleted(updated, freshDetail, result.doneActionIds);
+        if (accepted) {
+          setAcceptanceMessage(
+            'Trusted acceptance confirmed from durable native readback: every required criterion is accepted, the Goal is completed, and the Action Registry action is terminally done.',
+          );
+        } else if (commandError !== null) {
+          setAcceptanceMessage(
+            `Acceptance did not confirm (${commandError}). No completion is claimed; only the durable native receipt state below is shown.`,
+          );
+        } else if (updated?.receipt) {
+          setAcceptanceMessage(
+            `Acceptance recorded status '${updated.receipt.status}'. Terminal delivery is not confirmed; no completion is claimed.`,
+          );
+        } else {
+          setAcceptanceMessage(
+            'Acceptance did not produce a confirmable native receipt. No completion is claimed.',
+          );
+        }
+      } finally {
+        acceptancePending.current = false;
+        setAcceptanceRunningId(null);
+      }
+    },
+    [detail, acceptanceCandidates, loadAcceptanceState],
+  );
+
   // One schedule mutation at a time per job. The native command must confirm the
   // effect and an authoritative readback must then succeed before the operation
   // is cleared; otherwise the operation is left actionable and the display is
@@ -729,9 +1102,19 @@ export default function GoalsView() {
       runErrors: {},
     };
     setExpandedJob(null);
+    setAcceptanceCandidates([]);
+    setAcceptanceDoneIds(new Set());
+    setAcceptanceUnavailable(false);
+    setAcceptanceReadError(null);
+    setAcceptanceRefreshing(false);
+    setAcceptanceRunningId(null);
+    setAcceptanceMessage(null);
+    acceptancePending.current = false;
+    let loaded: GoalDetail | null = null;
     try {
       const next = await invoke<GoalDetail>('goal_get', { id });
       if (request !== detailRequestId.current) return;
+      loaded = next;
       setDetail(next);
       setError(null);
     } catch {
@@ -752,7 +1135,12 @@ export default function GoalsView() {
     // Goal-linked Commitments and schedules are read from their own native
     // authorities. Their read failures are reported in their own panels.
     await loadGoalSupport(id, request);
-  }, [loadGoalSupport]);
+    // Trusted acceptance receipts are read only from native authorities and
+    // bound to this exact Goal generation.
+    if (loaded && request === detailRequestId.current) {
+      await loadAcceptanceState(loaded, request);
+    }
+  }, [loadGoalSupport, loadAcceptanceState]);
 
   useEffect(() => {
     void fetchGoals();
@@ -1011,6 +1399,182 @@ export default function GoalsView() {
               </GlassCard>
 
               <GlassCard className="p-4">
+                <div className="flex items-start justify-between gap-2 flex-wrap">
+                  <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
+                    Trusted acceptance
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Refresh trusted acceptance receipts from the native authority"
+                    disabled={acceptanceRefreshing || acceptanceRunningId !== null}
+                    onClick={() => void refreshAcceptanceState()}
+                    className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                  >
+                    {acceptanceRefreshing ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+                <div className="mt-1 text-[11px] text-bone/40">
+                  Acceptance runs only through the native trusted manifest and the current Permission
+                  policy. Completion is shown only after a durable native readback; a tool run or a
+                  command return is never acceptance.
+                </div>
+                {acceptanceReadError && (
+                  <div role="alert" className="mt-2 text-sm text-red-200">
+                    {acceptanceReadError}
+                  </div>
+                )}
+                {acceptanceMessage && (
+                  <div role="status" className="mt-2 text-[11px] text-bone/60">
+                    {acceptanceMessage}
+                  </div>
+                )}
+                {acceptanceCandidates.length === 0 && !acceptanceUnavailable ? (
+                  <div className="text-sm text-bone/40 mt-2">
+                    No registered trusted acceptance manifest is bound to this Goal&apos;s criteria,
+                    Agent, and workspace. Register a manifest in Settings and run the approved action
+                    first.
+                  </div>
+                ) : (
+                  <ul className="mt-2 space-y-2">
+                    {acceptanceCandidates.map((candidate) => {
+                      const { execution, manifest, receipt } = candidate;
+                      const accepted = isAcceptedCompleted(candidate, detail, acceptanceDoneIds);
+                      const canRun =
+                        execution.status === 'pending_acceptance' &&
+                        receipt === null &&
+                        detail.goal.status !== 'completed' &&
+                        detail.goal.status !== 'failed' &&
+                        detail.goal.status !== 'cancelled';
+                      return (
+                        <li
+                          key={execution.execution_id}
+                          className="rounded-lg border border-white/10 p-3"
+                        >
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <Pill variant={executionStatusVariant(execution.status)}>
+                              {execution.status}
+                            </Pill>
+                            {receipt && (
+                              <Pill variant={acceptanceStatusVariant(receipt.status)}>
+                                acceptance: {receipt.status}
+                              </Pill>
+                            )}
+                            {accepted && <Pill variant="success">accepted &amp; completed</Pill>}
+                            {receipt && !accepted && receipt.status === 'accepted' && (
+                              <Pill variant="warn">delivery not confirmed</Pill>
+                            )}
+                          </div>
+                          <div className="mt-1 text-[11px] text-bone/50 font-mono break-all">
+                            <div>action {execution.action_id}</div>
+                            <div>execution {execution.execution_id}</div>
+                            <div>
+                              manifest {manifest.manifest_id} · v{manifest.registry_version} ·{' '}
+                              {manifest.content_hash.slice(0, 12)}… · schema {manifest.schema_version}
+                            </div>
+                            <div>
+                              agent {manifest.agent_id} · workspace {manifest.project_root}
+                            </div>
+                          </div>
+                          {execution.terminal_reason && (
+                            <div className="mt-1 text-[11px] text-bone/50">
+                              reason: {execution.terminal_reason}
+                            </div>
+                          )}
+                          {execution.conflict?.detail && (
+                            <div className="mt-1 text-[11px] text-warning">
+                              conflict: {execution.conflict.detail}
+                            </div>
+                          )}
+                          {evidenceSummary(execution.evidence) && (
+                            <div className="mt-1 text-[11px] text-bone/40">
+                              run evidence: {evidenceSummary(execution.evidence)}
+                            </div>
+                          )}
+                          {receipt && (
+                            <div className="mt-2 space-y-1">
+                              <div className="text-[11px] text-bone/50 font-mono break-all">
+                                <div>
+                                  acceptance {receipt.acceptance_key} · goal {receipt.goal_id}
+                                </div>
+                                <div>
+                                  runtime {receipt.runtime_started_at ?? '—'} →{' '}
+                                  {receipt.runtime_finished_at ?? '—'}
+                                </div>
+                              </div>
+                              {receipt.terminal_reason && (
+                                <div className="text-[11px] text-bone/50">
+                                  delivery note: {receipt.terminal_reason}
+                                </div>
+                              )}
+                              <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                                Criterion checks
+                              </div>
+                              <ul className="space-y-1">
+                                {receipt.criteria.map((criterion) => (
+                                  <li
+                                    key={`${criterion.criterion_id}:${criterion.check_index}`}
+                                    className="text-[11px] font-mono text-bone/70"
+                                  >
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Pill variant={criterion.accepted ? 'success' : 'error'}>
+                                        {criterion.accepted ? 'accepted' : 'not accepted'}
+                                      </Pill>
+                                      <span>{criterion.tool}</span>
+                                      <span className="text-bone/40">
+                                        check {criterion.check_index}
+                                      </span>
+                                    </div>
+                                    <div className="text-bone/40 break-all">
+                                      criterion {criterion.criterion_id} · expected{' '}
+                                      {criterion.expected_sha256.slice(0, 12)}… · actual{' '}
+                                      {criterion.actual_sha256
+                                        ? `${criterion.actual_sha256.slice(0, 12)}…`
+                                        : '—'}
+                                    </div>
+                                    {criterionEvidenceSummary(criterion.evidence) && (
+                                      <div className="text-bone/40">
+                                        {criterionEvidenceSummary(criterion.evidence)}
+                                      </div>
+                                    )}
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          {canRun && (
+                            <div className="mt-2">
+                              <button
+                                type="button"
+                                aria-label={`Run acceptance checks for execution ${execution.execution_id}`}
+                                disabled={acceptanceRunningId !== null}
+                                onClick={() => void runAcceptance(execution.execution_id)}
+                                className="px-2 py-0.5 rounded-md border border-accent/40 text-xs text-accent/90 hover:bg-accent/10 disabled:opacity-40 transition-colors"
+                              >
+                                {acceptanceRunningId === execution.execution_id
+                                  ? 'Running acceptance…'
+                                  : 'Run acceptance checks'}
+                              </button>
+                              <div className="mt-1 text-[10px] text-bone/40">
+                                Bound to this exact pending-acceptance execution. Native revalidates
+                                the manifest, Agent/workspace scope, Goal criteria, and Permission
+                                policy.
+                              </div>
+                            </div>
+                          )}
+                          {!canRun && !receipt && execution.status !== 'pending_acceptance' && (
+                            <div className="mt-1 text-[11px] text-bone/40">
+                              This execution is not awaiting acceptance; reconcile the exact
+                              operation from the trusted manifest panel.
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </GlassCard>
+
+              <GlassCard className="p-4">
                 <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
                   Goal-linked runs
                 </div>
@@ -1041,8 +1605,9 @@ export default function GoalsView() {
                         )}
                         {run.accepted_output_pending && (
                           <div className="mt-1 text-[11px] text-bone/40">
-                            Accepted output: pending / unverified (trusted acceptance is not
-                            implemented; the completion gate stays open).
+                            Accepted output: pending / unverified until trusted acceptance checks
+                            run and confirm from durable native receipts; the completion gate stays
+                            open.
                           </div>
                         )}
                       </li>
