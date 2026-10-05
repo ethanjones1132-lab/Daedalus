@@ -138,6 +138,8 @@ Priority #2 source work was explicitly authorized by the user on 2026-10-05 whil
 | 3 | Goal-linked commitments, scheduling, cancellation, resource gates, and notifications | [Commitments and scheduling](superpowers/plans/2026-10-05-roadmap-priority-2-part-3-commitments-scheduling.md) |
 | 4 | Trusted acceptance-manifest execution and verified delivery evidence | [Trusted delivery](superpowers/plans/2026-10-05-roadmap-priority-2-part-4-trusted-delivery.md) |
 
+**Part 4 trust source decision:** trusted acceptance manifests will live in a distinct native SQLite table in app-owned `jarvis.db` under Tauri `app_data_dir`, bound to exact Agent ID and canonical project root, with stable ID, version, and canonical content hash. Users explicitly manage manifest add/replace/remove through Settings; no executable manifests are auto-seeded. Goal, model, task, and Action Registry content can reference a manifest ID but cannot provide trust or manifest content. The file-backed Action Registry remains untrusted. Native dispatch revalidates scope and still enforces the current canonical ToolRuntime Permission policy. This is source scope only; tests, live action execution, restart demonstrations, and all Priority #2 acceptance criteria remain NOT RUN/open.
+
 All parts are source implementation plans. Tests, live execution, restart/interruption demonstrations, and all Priority #2 completion criteria remain NOT RUN/open.
 
 ### Completion criteria

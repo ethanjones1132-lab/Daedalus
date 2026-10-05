@@ -10,9 +10,16 @@ Approved actions execute through Jarvis's canonical Tool runtime under the exist
 
 Parts 1–3 are committed and reviewed. Use their Goal state, run/checkpoint, schedule, cancellation, permission, resource, and evidence contracts. Continue the existing Action Registry integration; do not create another action source of truth or direct tool executor.
 
+## Trusted manifest source and administration
+
+- Store trusted acceptance manifests in a distinct native SQLite table in the existing `jarvis.db` under Tauri `app_data_dir`; the Action Registry files under `workspace/action-registry` remain untrusted action data and are not a manifest authority.
+- Each registered manifest has a stable native manifest ID, schema version, canonical content hash, validated versioned content, exact Agent ID, and canonical project-root scope. The user must explicitly add, replace, or remove a manifest through a Settings trust-management surface. There are no auto-seeded executable manifests.
+- Goal, Action Registry, model, and task content may reference a registered manifest ID only. None may supply, replace, mutate, or authorize manifest content. Native code resolves the ID and revalidates its Agent/project scope at dispatch; a missing, stale, malformed, or mismatched binding remains unavailable/blocked.
+- The Settings surface must show manifest ID/version/hash and bound Agent/workspace scope, and require an explicit user action for each add/replace/remove. Trust administration does not grant tool permissions; dispatch still uses current native Agent projection and existing ToolRuntime Permission policy.
+
 ## Implementation scope
 
-1. Define a versioned trusted acceptance-manifest contract rooted in app-owned/project-trusted configuration and validated against canonical Goal criteria. Manifest selection must be explicit and scoped to project/workspace/Agent; content supplied by a Goal, model, action description, or untrusted registry data cannot grant permission or define a command to trust.
+1. Define a versioned trusted acceptance-manifest contract in the app-owned SQLite registry above and validate it against canonical Goal criteria. Manifest selection must be explicit and scoped to project/workspace/Agent; content supplied by a Goal, model, action description, or untrusted registry data cannot grant permission or define a command to trust.
 2. Replace the current eligible-action `verification_manifest_missing` unavailable stub only where a trusted manifest resolves and current policy authorizes it. Otherwise preserve an explicit actionable unavailable/blocked/waiting reason.
 3. Dispatch the approved action through canonical Tool runtime bundles and a bounded execution context. Revalidate Agent projection and Permission policy at dispatch; honor cancellation, timeout/resource bounds, and durable idempotency from Part 2/3.
 4. Execute acceptance criteria using runtime-owned checks and capture exact command/tool identity, exit outcome, timestamps, run ID, and bounded output artifact/evidence references. Model-written success claims are never acceptance evidence.
