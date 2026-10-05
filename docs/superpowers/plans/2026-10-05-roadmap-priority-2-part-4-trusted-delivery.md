@@ -17,6 +17,69 @@ Parts 1–3 are committed and reviewed. Use their Goal state, run/checkpoint, sc
 - Goal, Action Registry, model, and task content may reference a registered manifest ID only. None may supply, replace, mutate, or authorize manifest content. Native code resolves the ID and revalidates its Agent/project scope at dispatch; a missing, stale, malformed, or mismatched binding remains unavailable/blocked.
 - The Settings surface must show manifest ID/version/hash and bound Agent/workspace scope, and require an explicit user action for each add/replace/remove. Trust administration does not grant tool permissions; dispatch still uses current native Agent projection and existing ToolRuntime Permission policy.
 
+## v1 trusted acceptance manifest schema (Part 4 slice 1)
+
+Slice 1 implements only the native trust registry and its explicit Settings management surface. It defines the exact versioned content shape below, stores strictly validated canonical content, and performs no dispatch, execution, evidence, or completion.
+
+### Registry row
+
+Table `trusted_acceptance_manifests` in the app-owned `jarvis.db` (via `AppDb`):
+
+| Column | Meaning |
+|---|---|
+| `manifest_id` | Stable native UUID minted on create; never changes across replace. |
+| `registry_version` | Incrementing integer starting at 1; `replace` adds exactly 1. |
+| `schema_version` | Content schema version (only `1` is accepted now). |
+| `content_hash` | Lowercase SHA-256 of the canonical serialized content. |
+| `content_json` | Canonical validated JSON (`json_valid` enforced). |
+| `agent_id` | Exact existing, enabled native Agent row id. |
+| `project_root` | Canonical existing directory from `normalize_project_root`. |
+| `created_at`, `updated_at` | Native timestamps. |
+
+No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `remove` require an optimistic `expected_version` and/or `expected_hash`; the write is guarded by `WHERE registry_version = ? AND content_hash = ?`, so a stale caller cannot silently overwrite or delete a changed record.
+
+### Content JSON v1 (exact shape)
+
+```json
+{
+  "schema_version": 1,
+  "execution": [
+    { "tool": "read_file", "arguments": { "path": "README.md" } }
+  ],
+  "acceptance": {
+    "<stable-goal-criterion-uuid>": [
+      {
+        "tool": "read_file",
+        "arguments": { "path": "README.md" },
+        "expect_sha256": "<64-char lowercase sha256>"
+      }
+    ]
+  }
+}
+```
+
+- `execution` is the explicit approved call list; `acceptance` is keyed by stable Goal criterion UUID and each check carries the deterministic result's expected SHA-256.
+- Tool identity and arguments are the only call data. There is no `command`, `shell`, `script`, `template`, free-form `args`, or `content` field anywhere in the shape.
+
+### Strict validation
+
+- `deny_unknown_fields` at every level: unknown keys are rejected.
+- `schema_version` must equal `1`; `execution`/`acceptance` must be non-empty.
+- Tools are restricted to the deterministic, read-only v1 allowlist `read_file`, `list_directory`, `glob`, `grep`. Shell tools (`bash`, `powershell`), content-bearing writers (`write_file`, `edit_file`, `multi_edit`, `apply_patch`), and web tools are rejected — so no shell command string, script, or unbounded file content can be encoded. Mutating calls are deferred to a future schema version; v1 grants no execution authority.
+- Per-tool arguments are exact and bounded: `read_file` requires `path` and allows bounded `offset`/`limit`; `list_directory` requires `path`; `glob` requires `pattern` and optional `path`; `grep` requires `pattern`, optional `path`/`output_mode` (one of `files_with_matches`, `content`, `count`)/`head_limit`. Any other field for a tool is rejected.
+- Paths must be relative, non-empty, ≤ 1024 chars, free of control characters, and must not be absolute, drive-prefixed, root, or contain `..`.
+- Patterns must be non-empty, ≤ 512 chars, and free of control characters.
+- `expect_sha256` must be exactly 64 lowercase hex characters.
+- Acceptance criterion keys must be well-formed UUIDs (resolved against the bound Goal's `goal_criteria.id` at resolution time, which is not implemented in slice 1).
+- Bounds: content ≤ 64 KiB, ≤ 50 execution calls, ≤ 100 acceptance criteria, ≤ 50 checks per criterion, ≤ 200 total checks.
+
+### Trust invariants
+
+- The SQLite registry is the only native trust authority; the file-backed Action Registry remains untrusted.
+- Manifest scope binds an exact existing **enabled** Agent and a canonical existing workspace root. Registration is attribution only and grants no tool permission; later dispatch still passes current ToolRuntime Permission policy.
+- Content is never supplied or authorized by Goal, model, task, Action Registry, or Action Registry text. Goal/model/registry text may reference a manifest ID only.
+- Canonical content SHA-256 is computed over the re-serialized validated content (struct-field order, sorted criterion keys, omitted absent optionals), so equivalent inputs hash identically.
+
 ## Implementation scope
 
 1. Define a versioned trusted acceptance-manifest contract in the app-owned SQLite registry above and validate it against canonical Goal criteria. Manifest selection must be explicit and scoped to project/workspace/Agent; content supplied by a Goal, model, action description, or untrusted registry data cannot grant permission or define a command to trust.
