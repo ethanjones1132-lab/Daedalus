@@ -41,7 +41,13 @@ QUESTIONS = {
              "criteria": {"local": "a small, local change in the code shown",
                           "logic": "logic that needs careful reasoning about behaviour and edge cases",
                           "unseen": "depends on code or an API whose source is not shown"}},
+    "files": {"type": "noul", "instructions": "Does this code read or write files on disk?"},
+    "library": {"type": "noul", "instructions": "Does the fix depend on using a standard-library module correctly?"},
+    "robust": {"type": "noul", "instructions": "Is the bug about handling bad, missing or unusual input without "
+                                               "crashing?"},
 }
+# tier2b categories each signal should pick out (for the zero-shot separation report only)
+SIGNALS = {"hidden": "B", "files": "D", "library": "E", "robust": "C"}
 
 
 def decide(a):
@@ -55,17 +61,18 @@ def decide(a):
         state = baseline_prompt(task)
         extra = {"max_len": 8192} if a.checkpoint == "multilingual" else {}
         r = agent.predict(state, QUESTIONS, **extra)["answers"]
-        out[task["name"]] = {"category": task["category"], "hidden": r["hidden"]["noul"],
-                             "effort": r["effort"]["score"], "kind": r["kind"]["choice"],
-                             "kind_p": r["kind"]["probabilities"]}
+        out[task["name"]] = {"category": task["category"], "effort": r["effort"]["score"],
+                             "kind": r["kind"]["choice"], "kind_p": r["kind"]["probabilities"],
+                             **{k: r[k]["noul"] for k in SIGNALS}}
     path = LOGS / f"laya-decisions-{a.checkpoint}.json"
     path.write_text(json.dumps(out, indent=1))
     print(f"{len(out)} tasks in {time.time() - t0:.0f} s -> {path}")
-    # how well does each signal separate the hidden-package tasks (B) from the rest? (AUC)
-    pos = [v["hidden"] for v in out.values() if v["category"] == "B"]
-    neg = [v["hidden"] for v in out.values() if v["category"] != "B"]
-    auc = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg) / max(len(pos) * len(neg), 1)
-    print(f"hidden: mean P on B tasks {sum(pos) / len(pos):.3f}, on others {sum(neg) / len(neg):.3f}, AUC {auc:.3f}")
+    for sig, cat in SIGNALS.items():  # how well does each signal separate its category from the rest? (AUC)
+        pos = [v[sig] for v in out.values() if v["category"] == cat]
+        neg = [v[sig] for v in out.values() if v["category"] != cat]
+        auc = sum((p > n) + 0.5 * (p == n) for p in pos for n in neg) / max(len(pos) * len(neg), 1)
+        print(f"{sig:8s} vs {cat}: mean P {sum(pos) / len(pos):.3f} on {cat}, {sum(neg) / len(neg):.3f} on others, "
+              f"AUC {auc:.3f}")
     kinds = collections.Counter((v["category"], v["kind"]) for v in out.values())
     print("kind by category:", dict(sorted(kinds.items())))
 
