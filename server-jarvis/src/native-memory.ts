@@ -26,6 +26,8 @@ import { MEMORY_REVALIDATION_NOT_REQUIRED, MEMORY_REVALIDATION_REASON_CODES } fr
 import { noteMemoryDerivedActivity } from "./memory-derived-state";
 import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 import { readPersistedGoalCheckpoint } from "./orchestration/session-memory";
+import { loadConfig } from "./config";
+import { handleTrustedExecutionRequest } from "./trusted-execution";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
@@ -1242,7 +1244,13 @@ export async function handleNativeMemoryRequest(
   goalRegistry: GoalRunRegistry | null = null,
 ): Promise<Response | null> {
   const path = new URL(req.url).pathname;
-  if (!path.startsWith("/internal/memory") && !path.startsWith("/internal/goals")) return null;
+  if (
+    !path.startsWith("/internal/memory") &&
+    !path.startsWith("/internal/goals") &&
+    !path.startsWith("/internal/trusted")
+  ) {
+    return null;
+  }
 
   // Goal binding routes are capability-authenticated but deliberately do not
   // depend on memory recall availability.
@@ -1299,6 +1307,24 @@ export async function handleNativeMemoryRequest(
         return json({ code: error.code }, error.status);
       }
       return json({ code: "goal_authority_unavailable" }, 503);
+    }
+  }
+
+  // Trusted action execution routes. Capability-authenticated like the other
+  // internal routes; never reachable without the owned native bearer secret.
+  if (path.startsWith("/internal/trusted")) {
+    const meta = registryMeta.get(registry);
+    if (!meta || !meta.capability) {
+      return json({ code: "execution_unavailable" }, 503);
+    }
+    if (!bearerAuthorized(req, meta.capability)) {
+      return json({ code: "unauthorized" }, 401);
+    }
+    try {
+      const response = await handleTrustedExecutionRequest(req, loadConfig(), meta.bunInstanceId);
+      return response ?? json({ code: "not_found" }, 404);
+    } catch {
+      return json({ code: "execution_unavailable" }, 503);
     }
   }
 

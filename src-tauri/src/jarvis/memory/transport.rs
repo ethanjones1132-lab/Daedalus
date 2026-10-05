@@ -499,6 +499,69 @@ pub fn native_memory_transport() -> &'static NativeMemoryTransport {
     TRANSPORT.get_or_init(NativeMemoryTransport::new)
 }
 
+/// Dispatch one native-approved trusted manifest execution to the live owned
+/// Bun child over the private authenticated capability path. Returns `Ok(None)`
+/// when no owned child is live (nothing was dispatched); `Err` means the round
+/// trip failed after the request may have been dispatched, so the caller must
+/// treat the outcome as ambiguous and never replay.
+pub fn execute_trusted_manifest(
+    transport: &NativeMemoryTransport,
+    request: &crate::commands::trusted_execution::TrustedExecutionRequestWire,
+) -> Result<Option<crate::commands::trusted_execution::TrustedExecutionResponseWire>, String> {
+    let mut state = transport.lock_state();
+    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        return Ok(None);
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let body = transport
+        .post_json("/internal/trusted/execute", request, 200)
+        .map_err(|_| "trusted execution transport unavailable".to_string())?;
+    let parsed: crate::commands::trusted_execution::TrustedExecutionResponseWire =
+        serde_json::from_str(&body)
+            .map_err(|_| "trusted execution response could not be read".to_string())?;
+    if parsed.execution_id != request.execution_id {
+        return Err("trusted execution response identity mismatch".to_string());
+    }
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+    {
+        return Err("owned Bun child was replaced during trusted execution".to_string());
+    }
+    state.bound_generation = Some(generation);
+    state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    Ok(Some(parsed))
+}
+
+/// Request cancellation of one in-flight trusted execution by exact execution
+/// id. Returns whether the live owned child reported that it aborted the real
+/// AbortSignal for that operation. Writes nothing.
+pub fn cancel_trusted_execution(
+    transport: &NativeMemoryTransport,
+    execution_id: &str,
+) -> Result<bool, String> {
+    #[derive(Serialize)]
+    struct CancelRequest<'a> {
+        execution_id: &'a str,
+    }
+    #[derive(Deserialize)]
+    struct CancelResponse {
+        cancelled: bool,
+    }
+    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        return Ok(false);
+    }
+    let body = transport
+        .post_json(
+            "/internal/trusted/cancel",
+            &CancelRequest { execution_id },
+            200,
+        )
+        .map_err(|_| "trusted cancel transport unavailable".to_string())?;
+    let parsed: CancelResponse =
+        serde_json::from_str(&body).map_err(|_| "trusted cancel response could not be read".to_string())?;
+    Ok(parsed.cancelled)
+}
+
 /// Prepare a native turn and register its bounded envelope with the owned Bun
 /// process. Holds the shared operation gate across retrieval and registration
 /// so a mutation cannot interleave; the AppDb mutex is released across HTTP.

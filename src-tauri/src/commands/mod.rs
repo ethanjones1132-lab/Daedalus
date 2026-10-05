@@ -59,6 +59,10 @@ pub use action_registry::*;
 pub mod trusted_manifests;
 pub use trusted_manifests::*;
 
+// Trusted action execution receipts (Roadmap Priority #2, Part 4)
+pub mod trusted_execution;
+pub use trusted_execution::*;
+
 // Legacy dashboard/get_* command handlers (WSL-backed)
 pub mod legacy;
 pub use legacy::*;

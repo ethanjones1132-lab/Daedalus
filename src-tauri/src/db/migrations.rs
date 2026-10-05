@@ -285,6 +285,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_cron_activation_migrations(conn)?;
     apply_goal_notification_migrations(conn)?;
     apply_trusted_manifest_migrations(conn)?;
+    apply_trusted_execution_migrations(conn)?;
 
     Ok(())
 }
@@ -1680,6 +1681,67 @@ pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqli
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT trusted_manifest_migration; \
                  RELEASE SAVEPOINT trusted_manifest_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent durable receipt table for native-approved trusted
+/// manifest executions (Roadmap Priority #2, Part 4). One row is the durable
+/// idempotency claim and actual execution receipt for one
+/// `(action_id, manifest_id, content_hash, workspace, projection)` tuple. The
+/// row records the exact captured Agent/projection/root identity so a stale
+/// authority is detectable, runtime-owned tool outcomes/evidence, and the
+/// `pending_acceptance` state. A tool run never itself completes a Goal.
+pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_execution_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_action_executions (
+                execution_id                  TEXT PRIMARY KEY,
+                idempotency_key               TEXT NOT NULL UNIQUE,
+                action_id                     TEXT NOT NULL,
+                manifest_id                   TEXT NOT NULL,
+                manifest_registry_version     INTEGER NOT NULL,
+                manifest_content_hash         TEXT NOT NULL,
+                manifest_schema_version       INTEGER NOT NULL,
+                agent_id                      TEXT NOT NULL,
+                project_root                  TEXT NOT NULL,
+                projection_slug               TEXT NOT NULL,
+                projection_source_hash        TEXT NOT NULL,
+                projection_active_source_hash TEXT NOT NULL,
+                projection_version            INTEGER NOT NULL,
+                projection_activated_at       TEXT NOT NULL,
+                status                        TEXT NOT NULL,
+                terminal_reason               TEXT,
+                run_id                        TEXT,
+                bun_run_id                    TEXT,
+                evidence_json                 TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                started_at                    TEXT,
+                settled_at                    TEXT,
+                created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_action
+                ON trusted_action_executions(action_id, status);
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_manifest
+                ON trusted_action_executions(manifest_id);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_execution_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_execution_migration; \
+                 RELEASE SAVEPOINT trusted_execution_migration;",
             );
             Err(err)
         }
