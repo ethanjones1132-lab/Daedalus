@@ -96,7 +96,10 @@ def per_task(path):
         return dict(res)
     res = collections.defaultdict(lambda: [0, 0])
     for r in rows:
-        if "task" in r:
+        if "task" in r and "rounds" in r:  # repair_tier2b rows: the last round's file is the answer
+            res[r["task"]][0] += r["rounds"][-1]["graded_ok"]
+            res[r["task"]][1] += 1
+        elif "task" in r and "ok" in r:  # tier2b and probe rows
             res[r["task"]][0] += r["ok"]
             res[r["task"]][1] += 1
     return dict(res)
@@ -115,6 +118,13 @@ def route(rule, d, labels):
     if kind == "kind":
         m = dict(p.split("=") for p in spec.split(","))
         return m[d["kind"]]
+    if kind == "seq":  # ordered clauses 'cond>config': kind=X, a noul signal (P > 0.5), or else
+        for clause in spec.split(","):
+            cond, cfg = clause.split(">")
+            if cond == "else" or (cond.startswith("kind=") and d["kind"] == cond[5:]) or \
+                    (cond in SIGNALS and d[cond] > 0.5):
+                return cfg
+        raise ValueError(f"no clause matched in {rule}")
     raise ValueError(rule)
 
 

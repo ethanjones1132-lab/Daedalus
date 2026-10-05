@@ -10,7 +10,7 @@
 {"task": "parse_csv_line", "category": "A", "sample": 0, "ok": false, "detail": "IndexError: list index out of range", "gen_n": 95, "secs": 3.7}
 {"task": "parse_csv_line", "category": "A", "sample": 1, "ok": false, "detail": "StopIteration", "gen_n": 79, "secs": 2.6}
 {"task": "parse_csv_line", "category": "A", "sample": 2, "ok": false, "detail": "StopIteration", "gen_n": 68, "secs": 2.3}
-{"task": "pkg_discount", "category": "B", "sample": 0, "ok": false, "detail": "ImportError: cannot import name 'total_price' from 'calc' (C:\\Users\\ethan\\AppData\\Local\\Temp\\t2b-583ofnwx\\calc.py)", "gen_n": 926, "secs": 30.2}
+{"task": "pkg_discount", "category": "B", "sample": 0, "ok": false, "detail": "ImportError: cannot import name 'total_price' from 'calc' (<tmp>\\t2b-583ofnwx\\calc.py)", "gen_n": 926, "secs": 30.2}
 {"task": "pkg_discount", "category": "B", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 98, "secs": 3.3}
 {"task": "pkg_discount", "category": "B", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 649, "secs": 20.7}
 {"task": "pkg_auth", "category": "B", "sample": 0, "ok": false, "detail": "PermissionError: token invalid or expired", "gen_n": 52, "secs": 2.5}
@@ -62,7 +62,7 @@
 {"task": "running_sum", "category": "A", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 48, "secs": 1.6}
 {"task": "running_sum", "category": "A", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 48, "secs": 1.6}
 {"task": "pkg_inventory", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 32, "secs": 1.8}
-{"task": "pkg_inventory", "category": "B", "sample": 1, "ok": false, "detail": "ImportError: cannot import name 'check' from 'stock' (C:\\Users\\ethan\\AppData\\Local\\Temp\\t2b-wm3oezra\\stock.py)", "gen_n": 1206, "secs": 37.9}
+{"task": "pkg_inventory", "category": "B", "sample": 1, "ok": false, "detail": "ImportError: cannot import name 'check' from 'stock' (<tmp>\\t2b-wm3oezra\\stock.py)", "gen_n": 1206, "secs": 37.9}
 {"task": "pkg_inventory", "category": "B", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 32, "secs": 1.1}
 {"task": "pkg_tax", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 100, "secs": 3.9}
 {"task": "pkg_tax", "category": "B", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 994, "secs": 31.2}
