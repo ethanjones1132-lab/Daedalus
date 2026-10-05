@@ -55,6 +55,10 @@ pub use system::*;
 pub mod action_registry;
 pub use action_registry::*;
 
+// Trusted acceptance manifest registry (Roadmap Priority #2, Part 4 slice 1)
+pub mod trusted_manifests;
+pub use trusted_manifests::*;
+
 // Legacy dashboard/get_* command handlers (WSL-backed)
 pub mod legacy;
 pub use legacy::*;

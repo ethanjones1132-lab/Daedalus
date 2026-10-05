@@ -4928,6 +4928,391 @@ function SessionsPanel({
 }
 
 // ═══════════════════════════════════════════════════════════════
+// ── Trusted Acceptance Manifests (native trust authority) ──
+// ──
+// ── The registry lives in the app-owned SQLite jarvis.db and is the ONLY trust
+// ── authority. The file-backed Action Registry, model output, Goal text, and
+// ── task text can never create or edit manifest content. Registration grants no
+// ── permission and executes nothing; this panel only displays native records
+// ── and forwards explicit user add/replace/remove actions.
+// ═══════════════════════════════════════════════════════════════
+
+interface TrustedManifestRecord {
+  manifest_id: string;
+  registry_version: number;
+  schema_version: number;
+  content_hash: string;
+  content: unknown;
+  agent_id: string;
+  project_root: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface TrustedManifestAgentRow {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+const TRUSTED_MANIFEST_EXAMPLE = `{
+  "schema_version": 1,
+  "execution": [
+    { "tool": "read_file", "arguments": { "path": "README.md" } }
+  ],
+  "acceptance": {
+    "<goal-criterion-uuid>": [
+      { "tool": "read_file", "arguments": { "path": "README.md" }, "expect_sha256": "<64-char-lowercase-sha256>" }
+    ]
+  }
+}`;
+
+function TrustedManifestsPanel() {
+  const [manifests, setManifests] = useState<TrustedManifestRecord[]>([]);
+  const [agents, setAgents] = useState<TrustedManifestAgentRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const requestId = useRef(0);
+  const pending = useRef(false);
+
+  const [contentJson, setContentJson] = useState('');
+  const [agentId, setAgentId] = useState('');
+  const [projectRoot, setProjectRoot] = useState('');
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [expectedVersion, setExpectedVersion] = useState('');
+
+  // Authoritative readback. Returns true only when the registry list was read;
+  // a failure keeps the previously displayed list and marks it unavailable so
+  // the UI never updates optimistically or claims success without evidence.
+  const load = useCallback(async (): Promise<boolean> => {
+    const request = ++requestId.current;
+    setLoading(true);
+    try {
+      const rows = await invoke<unknown>('list_trusted_acceptance_manifests');
+      if (request !== requestId.current) return false;
+      if (!Array.isArray(rows)) {
+        setUnavailable(true);
+        setReadError('The native trusted-manifest registry returned an unreadable response. Showing nothing as trusted.');
+        return false;
+      }
+      setManifests(rows as TrustedManifestRecord[]);
+      setUnavailable(false);
+      setReadError(null);
+      return true;
+    } catch {
+      if (request !== requestId.current) return false;
+      setUnavailable(true);
+      setReadError('Could not read the native trusted-manifest registry. No trust is inferred from this failure.');
+      return false;
+    } finally {
+      if (request === requestId.current) setLoading(false);
+    }
+  }, []);
+
+  const loadAgents = useCallback(async () => {
+    try {
+      const rows = await invoke<unknown>('list_agents');
+      if (Array.isArray(rows)) {
+        const enabled = (rows as TrustedManifestAgentRow[]).filter((a) => a?.enabled);
+        setAgents(enabled);
+        setAgentId((current) => current || enabled[0]?.id || '');
+      }
+    } catch {
+      // The Agent picker is a convenience; native still validates the id.
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    void loadAgents();
+  }, [load, loadAgents]);
+
+  const runAction = useCallback(
+    async (label: string, run: () => Promise<unknown>) => {
+      if (pending.current) return;
+      pending.current = true;
+      setBusy(true);
+      setActionError(null);
+      try {
+        await run();
+      } catch (e) {
+        setActionError(typeof e === 'string' ? e : `${label} failed.`);
+        pending.current = false;
+        setBusy(false);
+        return;
+      }
+      const confirmed = await load();
+      if (!confirmed) {
+        setActionError(`${label} was submitted, but the registry could not be re-read. Showing the previous list; it may be stale.`);
+      }
+      pending.current = false;
+      setBusy(false);
+    },
+    [load],
+  );
+
+  const handleCreate = () => {
+    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim()) {
+      setActionError('Manifest content, an enabled Agent, and an existing workspace root are required.');
+      return;
+    }
+    void runAction('Add manifest', () =>
+      invoke('create_trusted_acceptance_manifest', {
+        contentJson,
+        agentId: agentId.trim(),
+        projectRoot: projectRoot.trim(),
+      }),
+    );
+  };
+
+  const handleSelectForReplace = (record: TrustedManifestRecord) => {
+    setSelectedId(record.manifest_id);
+    setExpectedVersion(String(record.registry_version));
+    setAgentId(record.agent_id);
+    setProjectRoot(record.project_root);
+    setContentJson(JSON.stringify(record.content, null, 2));
+    setActionError(null);
+  };
+
+  const handleReplace = () => {
+    if (!selectedId) {
+      setActionError('Select a registered manifest to replace.');
+      return;
+    }
+    const version = Number(expectedVersion);
+    if (!Number.isInteger(version) || version < 1) {
+      setActionError('Enter the current registry version you are replacing.');
+      return;
+    }
+    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim()) {
+      setActionError('Manifest content, an enabled Agent, and an existing workspace root are required.');
+      return;
+    }
+    void runAction('Replace manifest', () =>
+      invoke('replace_trusted_acceptance_manifest', {
+        manifestId: selectedId,
+        expectedVersion: version,
+        contentJson,
+        agentId: agentId.trim(),
+        projectRoot: projectRoot.trim(),
+      }),
+    );
+  };
+
+  const handleRemove = (record: TrustedManifestRecord) => {
+    void runAction('Remove manifest', () =>
+      invoke('remove_trusted_acceptance_manifest', {
+        manifestId: record.manifest_id,
+        expectedVersion: record.registry_version,
+      }),
+    );
+  };
+
+  const inputCls =
+    'w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors';
+
+  return (
+    <GlassCard hoverable={false}>
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <h3 className="text-sm font-semibold text-bone">Trusted acceptance manifests</h3>
+          <p className="text-[10px] font-mono text-bone-faint mt-0.5">
+            Native registry in the app-owned jarvis.db. Action Registry files, model output, and Goal
+            or task text cannot create or edit a manifest. Registering here grants no tool permission
+            and runs nothing.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void load()}
+          disabled={loading || busy}
+          className="px-3 py-1.5 text-[10px] font-mono rounded-lg border border-iron/40 text-bone-dim hover:text-bone hover:border-iron/60 disabled:opacity-50 transition-colors shrink-0"
+        >
+          {loading ? 'Loading…' : 'Reload'}
+        </button>
+      </div>
+
+      {readError && (
+        <div role="alert" className="mb-3 text-[11px] font-mono text-error">
+          {readError}
+        </div>
+      )}
+      {unavailable && manifests.length > 0 && (
+        <div role="alert" className="mb-3 text-[11px] font-mono text-amber-300">
+          Showing previously loaded manifests; they may be stale.
+        </div>
+      )}
+      {actionError && (
+        <div role="alert" className="mb-3 text-[11px] font-mono text-error">
+          {actionError}
+        </div>
+      )}
+
+      {manifests.length === 0 && !unavailable ? (
+        <EmptyState message="No trusted acceptance manifests are registered. Nothing is trusted until you explicitly add one." />
+      ) : manifests.length > 0 ? (
+        <ul className="space-y-2 mb-4">
+          {manifests.map((record) => (
+            <li
+              key={record.manifest_id}
+              className={cn(
+                'rounded-lg border p-3',
+                record.manifest_id === selectedId ? 'border-royal/50 bg-royal/5' : 'border-iron/30',
+              )}
+            >
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] font-mono text-bone-dim">
+                <span>registry v{record.registry_version}</span>
+                <span>schema v{record.schema_version}</span>
+              </div>
+              <div className="mt-1 text-[10px] font-mono text-bone break-all">
+                id {record.manifest_id}
+              </div>
+              <div className="mt-1 text-[10px] font-mono text-bone-dim break-all">
+                content-sha256 {record.content_hash}
+              </div>
+              <div className="mt-1 text-[10px] font-mono text-bone-faint break-all">
+                agent {record.agent_id} · root {record.project_root}
+              </div>
+              <div className="mt-1 text-[10px] font-mono text-bone-faint">
+                updated {record.updated_at}
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleSelectForReplace(record)}
+                  disabled={busy}
+                  className="px-2 py-0.5 text-[10px] font-mono rounded border border-royal/40 text-royal-light hover:bg-royal/10 disabled:opacity-50 transition-colors"
+                >
+                  Use for replace
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleRemove(record)}
+                  disabled={busy}
+                  className="px-2 py-0.5 text-[10px] font-mono rounded border border-error/40 text-error hover:bg-error/10 disabled:opacity-50 transition-colors"
+                >
+                  Remove
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
+      <div className="space-y-2 border-t border-iron/20 pt-3">
+        <p className="text-[10px] font-mono text-bone-faint">
+          {selectedId ? 'Editing a replace for the selected manifest.' : 'Adding a new manifest.'}
+        </p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <div>
+            <label className="text-[10px] font-mono text-bone-dim block mb-1">Enabled Agent</label>
+            <select
+              value={agentId}
+              onChange={(e) => setAgentId(e.target.value)}
+              disabled={busy}
+              className={inputCls}
+            >
+              <option value="">Select an enabled Agent…</option>
+              {agents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name} ({agent.id})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-[10px] font-mono text-bone-dim block mb-1">Existing workspace root</label>
+            <input
+              type="text"
+              value={projectRoot}
+              onChange={(e) => setProjectRoot(e.target.value)}
+              disabled={busy}
+              placeholder="/absolute/path/to/project"
+              className={inputCls}
+            />
+          </div>
+        </div>
+        {selectedId && (
+          <div>
+            <label className="text-[10px] font-mono text-bone-dim block mb-1">
+              Expected current registry version
+            </label>
+            <input
+              type="number"
+              min={1}
+              value={expectedVersion}
+              onChange={(e) => setExpectedVersion(e.target.value)}
+              disabled={busy}
+              className={cn(inputCls, 'w-32')}
+            />
+          </div>
+        )}
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <label className="text-[10px] font-mono text-bone-dim">v1 manifest content (strict JSON)</label>
+            <button
+              type="button"
+              onClick={() => setContentJson(TRUSTED_MANIFEST_EXAMPLE)}
+              disabled={busy}
+              className="text-[10px] font-mono text-bone-faint hover:text-bone-dim disabled:opacity-50"
+            >
+              Load example shape
+            </button>
+          </div>
+          <textarea
+            value={contentJson}
+            onChange={(e) => setContentJson(e.target.value)}
+            disabled={busy}
+            rows={10}
+            spellCheck={false}
+            placeholder={TRUSTED_MANIFEST_EXAMPLE}
+            className={cn(inputCls, 'resize-y')}
+          />
+          <p className="text-[10px] font-mono text-bone-faint mt-1">
+            Unknown keys, shell tools/commands, scripts, templates, and unbounded values are rejected
+            by native validation.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleCreate}
+            disabled={busy}
+            className="px-3 py-1.5 text-[10px] font-mono rounded-lg border border-cyan-neon/40 text-cyan-glow hover:bg-cyan-neon/10 disabled:opacity-50 transition-colors"
+          >
+            {busy ? 'Submitting…' : 'Add manifest'}
+          </button>
+          <button
+            type="button"
+            onClick={handleReplace}
+            disabled={busy || !selectedId}
+            className="px-3 py-1.5 text-[10px] font-mono rounded-lg border border-royal/40 text-royal-light hover:bg-royal/10 disabled:opacity-50 transition-colors"
+          >
+            Replace selected
+          </button>
+          {selectedId && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedId(null);
+                setExpectedVersion('');
+              }}
+              disabled={busy}
+              className="text-[10px] font-mono text-bone-faint hover:text-bone-dim disabled:opacity-50"
+            >
+              Clear selection
+            </button>
+          )}
+        </div>
+      </div>
+    </GlassCard>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
 // ── Config Panel ──
 // ═══════════════════════════════════════════════════════════════
 
@@ -5466,6 +5851,10 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
           )}
         </GlassCard>
       </fieldset>
+
+      <div className="mt-4">
+        <TrustedManifestsPanel />
+      </div>
     </div>
   );
 }

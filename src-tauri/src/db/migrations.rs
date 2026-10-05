@@ -284,6 +284,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_goal_migrations(conn)?;
     apply_cron_activation_migrations(conn)?;
     apply_goal_notification_migrations(conn)?;
+    apply_trusted_manifest_migrations(conn)?;
 
     Ok(())
 }
@@ -1612,6 +1613,50 @@ pub fn apply_goal_notification_migrations(conn: &Connection) -> Result<(), rusql
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT goal_notification_migration; \
                  RELEASE SAVEPOINT goal_notification_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent registry for user-registered trusted acceptance
+/// manifests (Roadmap Priority #2, Part 4 slice 1). This is the *only* native
+/// trust authority: the file-backed Action Registry under
+/// `workspace/action-registry` remains untrusted action data. No row is
+/// auto-seeded — every manifest is an explicit user add/replace through
+/// Settings — so an empty table means no trusted executable manifest.
+pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_manifest_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_manifests (
+                manifest_id      TEXT PRIMARY KEY,
+                registry_version INTEGER NOT NULL,
+                schema_version   INTEGER NOT NULL,
+                content_hash     TEXT NOT NULL,
+                content_json     TEXT NOT NULL CHECK(json_valid(content_json)),
+                agent_id         TEXT NOT NULL,
+                project_root     TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_manifests_scope
+                ON trusted_acceptance_manifests(agent_id, project_root);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_manifest_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_manifest_migration; \
+                 RELEASE SAVEPOINT trusted_manifest_migration;",
             );
             Err(err)
         }
