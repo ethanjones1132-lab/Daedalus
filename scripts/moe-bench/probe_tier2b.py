@@ -48,8 +48,23 @@ def probe_prompt(task):
 
 
 def fix_prompt(task, script, output):
+    if PROMPT_V == 1:
+        return (baseline_prompt(task) + f"\n\nYou ran this script in the package directory:\n```python\n{script}\n```\n"
+                f"Its output:\n```\n{output}\n```\nNow return only the complete corrected file.")
+    # v2 (2026-10-05 06:10): v1 fixes sometimes came back as another script, or copied a failed probe's imports
     return (baseline_prompt(task) + f"\n\nYou ran this script in the package directory:\n```python\n{script}\n```\n"
-            f"Its output:\n```\n{output}\n```\nNow return only the complete corrected file.")
+            f"Its output:\n```\n{output}\n```\nUse what the output shows about how the code behaves. Now return the "
+            f"complete corrected {task['entry']} itself, not a test or probe script. Keep {task['entry']}'s own import "
+            f"lines unless the fix needs a change there.")
+
+
+def retry_prompt(task, script, output):
+    return (probe_prompt(task) + f"\n\nYour previous script failed before it could show anything about the package:\n"
+            f"```python\n{script}\n```\nOutput:\n```\n{output}\n```\nImport the modules the same way "
+            f"{task['entry']} does. Reply with only a corrected script, in one ```python block.")
+
+
+PROMPT_V = 1
 
 
 def run_probe(task, script):
@@ -65,8 +80,12 @@ def run_probe(task, script):
             shutil.rmtree(src.parent / "__pycache__", ignore_errors=True)
         (d / "_probe.py").write_text(script, encoding="utf-8")
         try:
-            r = subprocess.run([sys.executable, "_probe.py"], cwd=d, capture_output=True, text=True, timeout=10)
-            out = (r.stdout + (("\n" + r.stderr) if r.stderr.strip() else "")).strip()
+            # utf-8 with replacement: a probe that prints a byte cp1252 can't decode killed the reader thread
+            # (stdout None) on 2026-10-05
+            r = subprocess.run([sys.executable, "_probe.py"], cwd=d, capture_output=True, text=True, timeout=10,
+                               encoding="utf-8", errors="replace")
+            so, se = r.stdout or "", r.stderr or ""
+            out = (so + (("\n" + se) if se.strip() else "")).strip()
         except subprocess.TimeoutExpired:
             out = "(timed out after 10 s)"
         return out[:OUT_CAP] + ("\n... (truncated)" if len(out) > OUT_CAP else "")
@@ -85,6 +104,8 @@ def grade(task, code):
 
 
 def run(a):
+    global PROMPT_V
+    PROMPT_V = a.prompt_v
     bon.CFG.update(bon.CONFIGS[a.model], budget=a.budget)
     out = pathlib.Path(a.out)
     done = set()
@@ -103,10 +124,17 @@ def run(a):
                     text, n1 = bon.chat(probe_prompt(task), 30000 + trial)
                     script = extract_code(text)
                     output = run_probe(task, script)
+                    retried = False
+                    if PROMPT_V >= 2 and "Traceback" in output:  # one corrected probe when the first one crashed
+                        text, n1b = bon.chat(retry_prompt(task, script, output), 31000 + trial)
+                        script, retried = extract_code(text), True
+                        output = run_probe(task, script)
+                        n1 = (n1 or 0) + (n1b or 0)
                     answer, n2 = bon.chat(fix_prompt(task, script, output), trial)
                     ok, detail = grade(task, extract_code(answer))
                     f.write(json.dumps({"task": task["name"], "category": task["category"], "trial": trial,
-                                        "probe": script, "probe_output": output, "answer": answer, "ok": ok,
+                                        "probe": script, "probe_output": output, "probe_retried": retried,
+                                        "prompt_v": PROMPT_V, "answer": answer, "ok": ok,
                                         "detail": detail, "gen_probe": n1, "gen_fix": n2,
                                         "secs": round(time.time() - t, 1)}) + "\n")
                     f.flush()
@@ -153,6 +181,8 @@ def main():
     r.add_argument("--trials", type=int, default=3)
     r.add_argument("--budget", type=int, default=0)
     r.add_argument("--baseline", default="")
+    r.add_argument("--prompt-v", type=int, default=1, help="1 = first version; 2 = retry a crashed probe once, "
+                                                           "and ask for the module file explicitly")
     z = sub.add_parser("analyze")
     z.add_argument("out")
     z.add_argument("--baseline", default="")

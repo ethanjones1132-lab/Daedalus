@@ -199,9 +199,21 @@ The best routed system rests on tier2b's 7 hidden-package tasks. So 12 fresh tas
 - When the model sometimes gets it right, sample several candidates and pick by self-tests.
 - Don't spend the budget on longer thinking.
 
+**Probe v2** (06:05–06:40). Two changes: a crashed probe gets one corrected retry (import "the same way the entry file does"), and the fix prompt asks for the module file itself and its own import lines.
+
+| Probing | tier2b | Fresh hidden-package (36) |
+|---|---|---|
+| Qwen: single / v1 / v2 | 101 / 95 / 90 | 11 / 16 / 13 |
+| Gemma: single / v1 / v2 | 105 / 103 / **107** | 12 / 18 / 15 |
+
+- **For Gemma, probing is close to a free default:** v2 is its best tier2b score (B 14, D 21, E 18), and both versions gain on fresh tasks.
+- **For Qwen, probing is a targeted tool:** it gains on unseen-code tasks but costs elsewhere, by 6–11 on tier2b. Run it only when the task depends on code the model can't see.
+- **v2 changed less than run-to-run noise** on the 36-sample set, and the prompt was not iterated further.
+- A runner bug surfaced: probe output that cp1252 can't decode killed the subprocess reader thread. Fixed with utf-8 + replace; the crashed run was resumed.
+
 ## 10. Next
 
-1. **Fix the probe prompt's two failure modes and make probing interactive** (more than one probe round). Then run it on both sets. It is the lever with the best evidence of transfer. The failure modes: it answers with a script instead of the file, and it copies a failed probe's imports.
+1. **Gate probing per task with a calibrated Laya flag** ("depends on unseen code"): Gemma probes by default, Qwen only on flagged tasks. Calibrate on a grown fresh set. Probing is the lever with the best evidence of transfer.
 2. **Serve the routed system:** Laya (CPU, 0.7 s per decision) in front of Qwen keep96 best-of-N, with Gemma for unseen-code tasks.
    - Both models don't fit in 8 GB at once, so it needs a model swap per routed task, or batching tasks by route.
    - Measure the swap cost.
