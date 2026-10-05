@@ -21,13 +21,16 @@ import {
 import {
   acceptanceStatusVariant,
   criterionEvidenceSummary,
+  deepJsonEqual,
   evidenceSummary,
   executionStatusVariant,
   isTrustedAcceptanceReceipt,
   isTrustedExecutionReceipt,
   isTrustedManifestSummary,
+  manifestAcceptanceChecks,
   manifestAcceptanceKeys,
   normalizeRoot,
+  type TrustedAcceptanceCriterionReceipt,
   type TrustedAcceptanceReceipt,
   type TrustedExecutionReceipt,
   type TrustedManifestSummary,
@@ -346,12 +349,32 @@ function sameCriterionSet(a: string[], b: string[]): boolean {
   return a.every((key) => set.has(key));
 }
 
-function criteriaAllAccepted(receipt: TrustedAcceptanceReceipt, required: string[]): boolean {
-  if (required.length === 0) return false;
-  const accepted = new Set(
-    receipt.criteria.filter((criterion) => criterion.accepted).map((criterion) => criterion.criterion_id),
-  );
-  return required.every((id) => accepted.has(id));
+/**
+ * Exact one-for-one comparison of a native acceptance receipt's criterion rows
+ * against the validated manifest's declared checks. Requires an identical row
+ * count, every expected `(criterion_id, check_index)` present exactly once with
+ * matching tool/expected hash, every row accepted, and every actual hash exactly
+ * equal to its expected hash. A partially passing criterion never counts.
+ */
+function receiptMatchesManifestChecks(
+  receipt: TrustedAcceptanceReceipt,
+  manifest: TrustedManifestSummary,
+): boolean {
+  const expected = manifestAcceptanceChecks(manifest);
+  if (expected.length === 0 || receipt.criteria.length !== expected.length) return false;
+  const byKey = new Map<string, TrustedAcceptanceCriterionReceipt>();
+  for (const row of receipt.criteria) {
+    byKey.set(`${row.criterion_id}:${row.check_index}`, row);
+  }
+  for (const row of expected) {
+    const actual = byKey.get(`${row.criterion_id}:${row.check_index}`);
+    if (!actual) return false;
+    if (actual.tool !== row.tool) return false;
+    if (actual.expected_sha256 !== row.expected_sha256) return false;
+    if (actual.accepted !== true) return false;
+    if (actual.actual_sha256 !== row.expected_sha256) return false;
+  }
+  return true;
 }
 
 /** Exact Goal-terminal receipt reference written by native completion. */
@@ -360,25 +383,77 @@ function acceptanceTerminalRef(receipt: TrustedAcceptanceReceipt): string {
 }
 
 /**
- * Accepted/completed is shown only when the durable native acceptance receipt
- * binds to the exact execution/manifest/Goal, every required criterion row is
- * accepted, and current native readbacks prove the Goal terminal link/event and
- * the Action Registry action is terminally done. Model/command/registry text is
- * never a basis for completion.
+ * Exact readback equality between the transient `run_trusted_acceptance` return
+ * and the independently re-read `get_trusted_acceptance` persisted receipt.
+ * Every DTO payload field must match, including the criterion rows in order and
+ * their evidence payloads. `confirmed` is intentionally excluded: the in-process
+ * run return sets it true only after native proof, while the read command
+ * reconstructs the persisted row with `false`.
+ */
+function acceptanceReceiptsMatch(
+  command: TrustedAcceptanceReceipt,
+  durable: TrustedAcceptanceReceipt,
+): boolean {
+  if (
+    command.acceptance_key !== durable.acceptance_key ||
+    command.execution_id !== durable.execution_id ||
+    command.action_id !== durable.action_id ||
+    command.manifest_id !== durable.manifest_id ||
+    command.goal_id !== durable.goal_id ||
+    command.status !== durable.status ||
+    command.terminal_reason !== durable.terminal_reason ||
+    command.bun_run_id !== durable.bun_run_id ||
+    command.bun_instance_id !== durable.bun_instance_id ||
+    command.runtime_started_at !== durable.runtime_started_at ||
+    command.runtime_finished_at !== durable.runtime_finished_at ||
+    command.settled_at !== durable.settled_at ||
+    command.created_at !== durable.created_at ||
+    command.updated_at !== durable.updated_at
+  ) {
+    return false;
+  }
+  if (!deepJsonEqual(command.evidence, durable.evidence)) return false;
+  if (command.criteria.length !== durable.criteria.length) return false;
+  for (let index = 0; index < command.criteria.length; index += 1) {
+    const a = command.criteria[index];
+    const b = durable.criteria[index];
+    if (
+      a.criterion_id !== b.criterion_id ||
+      a.check_index !== b.check_index ||
+      a.tool !== b.tool ||
+      a.expected_sha256 !== b.expected_sha256 ||
+      a.actual_sha256 !== b.actual_sha256 ||
+      a.accepted !== b.accepted ||
+      !deepJsonEqual(a.evidence, b.evidence)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Accepted/completed is shown only when the native acceptance receipt is
+ * explicitly `confirmed`, binds to the exact execution/manifest/Goal, its full
+ * criterion row set matches the validated manifest checks exactly, and current
+ * native readbacks prove the Goal terminal link/event and the Action Registry
+ * action is terminally done. Status `accepted` alone is never delivery
+ * confirmation; model/command/registry text is never a basis for completion.
  */
 function isAcceptedCompleted(
   candidate: AcceptanceCandidate,
   detail: GoalDetail,
   doneActionIds: Set<string>,
 ): boolean {
-  const { execution, receipt } = candidate;
+  const { execution, manifest, receipt } = candidate;
   if (!receipt) return false;
+  if (receipt.confirmed !== true) return false;
   if (receipt.execution_id !== execution.execution_id) return false;
   if (receipt.action_id !== execution.action_id) return false;
   if (receipt.manifest_id !== execution.manifest_id) return false;
   if (receipt.goal_id !== detail.goal.id) return false;
   if (receipt.status !== 'accepted') return false;
-  if (!criteriaAllAccepted(receipt, detail.criteria.map((criterion) => criterion.id))) return false;
+  if (!receiptMatchesManifestChecks(receipt, manifest)) return false;
   if (detail.goal.status !== 'completed') return false;
   const ref = acceptanceTerminalRef(receipt);
   if (!detail.links.some((link) => link.target_kind === 'evidence' && link.target_id === ref)) {
@@ -439,6 +514,13 @@ export default function GoalsView() {
   const [acceptanceRefreshing, setAcceptanceRefreshing] = useState(false);
   const [acceptanceRunningId, setAcceptanceRunningId] = useState<string | null>(null);
   const [acceptanceMessage, setAcceptanceMessage] = useState<string | null>(null);
+  // Native `run_trusted_acceptance` is the only source of an explicitly
+  // `confirmed` acceptance receipt (`get_trusted_acceptance` always returns
+  // confirmed=false). Session confirmations are held by exact execution id and
+  // are still re-verified against current readbacks on every render.
+  const [confirmedAcceptance, setConfirmedAcceptance] = useState<
+    Record<string, TrustedAcceptanceReceipt>
+  >({});
   const acceptancePending = useRef(false);
 
   const [objective, setObjective] = useState('');
@@ -741,16 +823,29 @@ export default function GoalsView() {
           failed = true;
           continue;
         }
-        const matching = executions.filter(
-          (execution) =>
-            execution.manifest_id === manifest.manifest_id &&
-            execution.manifest_registry_version === manifest.registry_version &&
-            execution.manifest_content_hash === manifest.content_hash &&
-            execution.manifest_schema_version === manifest.schema_version &&
-            execution.agent_id === manifest.agent_id &&
-            execution.action_id === manifest.action_id,
-        );
-        for (const execution of matching) {
+        const manifestRoot = normalizeRoot(manifest.project_root);
+        for (const execution of executions) {
+          // An execution that claims this manifest id must satisfy the complete
+          // exact tuple, including canonical project root. A mismatch is an
+          // integrity failure (unavailable), never a silently-dropped candidate
+          // that would render an empty/not-linked state.
+          if (execution.manifest_id !== manifest.manifest_id) continue;
+          const rootMatches =
+            manifestRoot !== null &&
+            goalRoot !== null &&
+            manifestRoot === goalRoot &&
+            normalizeRoot(execution.project_root) === manifestRoot;
+          if (
+            !rootMatches ||
+            execution.manifest_registry_version !== manifest.registry_version ||
+            execution.manifest_content_hash !== manifest.content_hash ||
+            execution.manifest_schema_version !== manifest.schema_version ||
+            execution.agent_id !== manifest.agent_id ||
+            execution.action_id !== manifest.action_id
+          ) {
+            failed = true;
+            continue;
+          }
           let receipt: TrustedAcceptanceReceipt | null = null;
           try {
             const rawReceipt = await invoke<unknown>('get_trusted_acceptance', {
@@ -762,7 +857,8 @@ export default function GoalsView() {
                 !isTrustedAcceptanceReceipt(rawReceipt) ||
                 rawReceipt.execution_id !== execution.execution_id ||
                 rawReceipt.action_id !== execution.action_id ||
-                rawReceipt.manifest_id !== execution.manifest_id
+                rawReceipt.manifest_id !== execution.manifest_id ||
+                rawReceipt.goal_id !== goal.id
               ) {
                 throw new Error('malformed');
               }
@@ -854,9 +950,11 @@ export default function GoalsView() {
       setAcceptanceRunningId(executionId);
       setAcceptanceMessage(null);
       let commandError: string | null = null;
+      let commandReceipt: TrustedAcceptanceReceipt | null = null;
       try {
         try {
-          await invoke('run_trusted_acceptance', { executionId });
+          const raw = await invoke<unknown>('run_trusted_acceptance', { executionId });
+          if (isTrustedAcceptanceReceipt(raw)) commandReceipt = raw;
         } catch (err) {
           commandError = typeof err === 'string' ? err : 'unknown error';
         }
@@ -896,15 +994,55 @@ export default function GoalsView() {
           freshExecution.manifest_registry_version === execution.manifest_registry_version &&
           freshExecution.manifest_content_hash === execution.manifest_content_hash &&
           freshExecution.agent_id === execution.agent_id &&
-          freshExecution.project_root === execution.project_root;
+          normalizeRoot(freshExecution.project_root) === normalizeRoot(execution.project_root);
+        // Delivery confirmation requires the running command's explicitly
+        // `confirmed` receipt AND the independently re-read `get_trusted_acceptance`
+        // persisted receipt to be identical in every payload field (including
+        // criterion rows and their evidence), differing only in `confirmed`.
+        const durable = updated?.receipt ?? null;
+        const commandConfirmedAccepted =
+          commandReceipt !== null &&
+          commandReceipt.confirmed === true &&
+          commandReceipt.status === 'accepted' &&
+          commandReceipt.execution_id === execution.execution_id &&
+          commandReceipt.action_id === execution.action_id &&
+          commandReceipt.manifest_id === execution.manifest_id &&
+          commandReceipt.goal_id === goalId;
+        const receiptsMatch =
+          commandReceipt !== null &&
+          durable !== null &&
+          acceptanceReceiptsMatch(commandReceipt, durable);
+        const receiptBound = commandConfirmedAccepted && receiptsMatch;
+        // Fail closed: if the run claimed confirmation but the persisted
+        // readback is missing, malformed, or differs, the accepted/completed
+        // state is unavailable rather than inferred from the command response.
+        if (commandConfirmedAccepted && !receiptsMatch && commandError === null) {
+          setAcceptanceUnavailable(true);
+          setAcceptanceReadError(
+            'The native acceptance confirmation did not exactly match the persisted acceptance receipt, so no accepted/completed state is shown.',
+          );
+        } else if (commandReceipt === null && commandError === null) {
+          setAcceptanceUnavailable(true);
+          setAcceptanceReadError(
+            'The native acceptance command did not return a readable receipt, so no accepted/completed state is shown.',
+          );
+        }
         const accepted =
           executionBound &&
+          receiptBound &&
           updated !== null &&
           freshDetail !== null &&
-          isAcceptedCompleted(updated, freshDetail, result.doneActionIds);
-        if (accepted) {
+          commandReceipt !== null &&
+          isAcceptedCompleted(
+            { execution: updated.execution, manifest: updated.manifest, receipt: commandReceipt },
+            freshDetail,
+            result.doneActionIds,
+          );
+        if (accepted && commandReceipt !== null) {
+          const confirmed = commandReceipt;
+          setConfirmedAcceptance((prev) => ({ ...prev, [executionId]: confirmed }));
           setAcceptanceMessage(
-            'Trusted acceptance confirmed from durable native readback: every required criterion is accepted, the Goal is completed, and the Action Registry action is terminally done.',
+            'Trusted acceptance confirmed: the native run returned a confirmed receipt, the re-read durable receipt matches it, the Goal is completed from accepted evidence, and the Action Registry action is terminally done.',
           );
         } else if (commandError !== null) {
           setAcceptanceMessage(
@@ -1109,6 +1247,7 @@ export default function GoalsView() {
     setAcceptanceRefreshing(false);
     setAcceptanceRunningId(null);
     setAcceptanceMessage(null);
+    setConfirmedAcceptance({});
     acceptancePending.current = false;
     let loaded: GoalDetail | null = null;
     try {
@@ -1438,7 +1577,20 @@ export default function GoalsView() {
                   <ul className="mt-2 space-y-2">
                     {acceptanceCandidates.map((candidate) => {
                       const { execution, manifest, receipt } = candidate;
-                      const accepted = isAcceptedCompleted(candidate, detail, acceptanceDoneIds);
+                      // A native run confirmation is only ever trusted for the
+                      // exact execution it was minted for; the decision still
+                      // re-verifies the current Goal/Action/manifest readbacks.
+                      const sessionConfirmed = confirmedAcceptance[execution.execution_id];
+                      const decisionCandidate =
+                        sessionConfirmed && sessionConfirmed.execution_id === execution.execution_id
+                          ? { execution, manifest, receipt: sessionConfirmed }
+                          : candidate;
+                      // A tuple/read integrity failure makes the panel
+                      // unavailable; never show an accepted state from a
+                      // possibly-stale confirmation in that case.
+                      const accepted =
+                        !acceptanceUnavailable &&
+                        isAcceptedCompleted(decisionCandidate, detail, acceptanceDoneIds);
                       const canRun =
                         execution.status === 'pending_acceptance' &&
                         receipt === null &&

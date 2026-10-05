@@ -48,8 +48,66 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isNullableString(value: unknown): value is string | null {
-  return value === null || value === undefined || typeof value === 'string';
+function isInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+/**
+ * Rust `Option<String>` fields are serialized without `skip_serializing_if` on
+ * the receipt DTOs, so they are always present as `null` or a string. A
+ * missing/undefined field must fail closed rather than be treated as null.
+ */
+function isPresentNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
+
+/**
+ * A required JSON field (Rust `serde_json::Value` / `Option<Value>` serialized
+ * without `skip_serializing_if`) must be present; an explicit `null` is valid.
+ */
+function isPresentJson(value: unknown): boolean {
+  return value !== undefined;
+}
+
+function isTrustedExecutionConflict(value: unknown): value is { kind: string; detail: string } {
+  if (!isPlainObject(value)) return false;
+  return isNonEmptyString(value.kind) && isNonEmptyString(value.detail);
+}
+
+/**
+ * Bounded recursive JSON equality for receipt `evidence` payloads (serde_json
+ * values). Arrays compare by length and order; objects compare by exact key set
+ * and recursively-equal values; primitives by strict equality.
+ */
+export function deepJsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let index = 0; index < a.length; index += 1) {
+      if (!deepJsonEqual(a[index], b[index])) return false;
+    }
+    return true;
+  }
+  if (isPlainObject(a) || isPlainObject(b)) {
+    if (!isPlainObject(a) || !isPlainObject(b)) return false;
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) return false;
+    for (const key of aKeys) {
+      if (!hasOwn(b, key)) return false;
+      if (!deepJsonEqual(a[key], b[key])) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 export interface TrustedExecutionReceipt {
@@ -74,7 +132,7 @@ export interface TrustedExecutionReceipt {
   cancel_requested_at: string | null;
   created_at: string;
   updated_at: string;
-  conflict?: { kind: string; detail: string } | null;
+  conflict: { kind: string; detail: string } | null;
 }
 
 export interface TrustedAcceptanceCriterionReceipt {
@@ -127,91 +185,232 @@ export interface TrustedManifestSummary {
 }
 
 export function isTrustedExecutionReceipt(value: unknown): value is TrustedExecutionReceipt {
-  if (!value || typeof value !== 'object') return false;
-  const row = value as Record<string, unknown>;
+  if (!isPlainObject(value)) return false;
+  const row = value;
   return (
     isUuid(row.execution_id) &&
+    isNonEmptyString(row.idempotency_key) &&
     isNonEmptyString(row.action_id) &&
     isNonEmptyString(row.manifest_id) &&
-    typeof row.manifest_registry_version === 'number' &&
-    Number.isInteger(row.manifest_registry_version) &&
+    isInteger(row.manifest_registry_version) &&
     row.manifest_registry_version >= 1 &&
     isHex64(row.manifest_content_hash) &&
+    isInteger(row.manifest_schema_version) &&
+    row.manifest_schema_version >= 1 &&
+    isNonEmptyString(row.agent_id) &&
+    isNonEmptyString(row.project_root) &&
     typeof row.status === 'string' &&
     EXECUTION_STATUS_SET.has(row.status) &&
-    isNullableString(row.terminal_reason) &&
-    isNullableString(row.run_id) &&
-    isNullableString(row.bun_run_id) &&
-    isNullableString(row.runtime_started_at) &&
-    isNullableString(row.runtime_finished_at) &&
-    isNullableString(row.cancel_requested_at)
+    isPresentNullableString(row.terminal_reason) &&
+    isPresentNullableString(row.run_id) &&
+    isPresentNullableString(row.bun_run_id) &&
+    hasOwn(row, 'evidence') &&
+    isPresentJson(row.evidence) &&
+    isPresentNullableString(row.started_at) &&
+    isPresentNullableString(row.settled_at) &&
+    isPresentNullableString(row.runtime_started_at) &&
+    isPresentNullableString(row.runtime_finished_at) &&
+    isPresentNullableString(row.cancel_requested_at) &&
+    isNonEmptyString(row.created_at) &&
+    isNonEmptyString(row.updated_at) &&
+    hasOwn(row, 'conflict') &&
+    (row.conflict === null || isTrustedExecutionConflict(row.conflict))
   );
 }
 
 function isTrustedAcceptanceCriterion(value: unknown): value is TrustedAcceptanceCriterionReceipt {
-  if (!value || typeof value !== 'object') return false;
-  const row = value as Record<string, unknown>;
+  if (!isPlainObject(value)) return false;
+  const row = value;
   return (
     isNonEmptyString(row.criterion_id) &&
     isNonEmptyString(row.tool) &&
-    typeof row.check_index === 'number' &&
-    Number.isInteger(row.check_index) &&
+    isInteger(row.check_index) &&
+    row.check_index >= 0 &&
     isHex64(row.expected_sha256) &&
-    (row.actual_sha256 === null ||
-      row.actual_sha256 === undefined ||
-      typeof row.actual_sha256 === 'string') &&
-    typeof row.accepted === 'boolean'
+    (row.actual_sha256 === null || isHex64(row.actual_sha256)) &&
+    typeof row.accepted === 'boolean' &&
+    hasOwn(row, 'evidence') &&
+    isPresentJson(row.evidence)
   );
 }
 
 export function isTrustedAcceptanceReceipt(value: unknown): value is TrustedAcceptanceReceipt {
-  if (!value || typeof value !== 'object') return false;
-  const row = value as Record<string, unknown>;
-  return (
-    isNonEmptyString(row.acceptance_key) &&
-    isUuid(row.execution_id) &&
-    isNonEmptyString(row.action_id) &&
-    isNonEmptyString(row.manifest_id) &&
-    isNonEmptyString(row.goal_id) &&
-    typeof row.status === 'string' &&
-    ACCEPTANCE_STATUS_SET.has(row.status) &&
-    isNullableString(row.terminal_reason) &&
-    isNullableString(row.bun_run_id) &&
-    isNullableString(row.bun_instance_id) &&
-    typeof row.confirmed === 'boolean' &&
-    Array.isArray(row.criteria) &&
-    row.criteria.every(isTrustedAcceptanceCriterion)
-  );
+  if (!isPlainObject(value)) return false;
+  const row = value;
+  if (
+    !isNonEmptyString(row.acceptance_key) ||
+    !isUuid(row.execution_id) ||
+    !isNonEmptyString(row.action_id) ||
+    !isNonEmptyString(row.manifest_id) ||
+    !isNonEmptyString(row.goal_id) ||
+    typeof row.status !== 'string' ||
+    !ACCEPTANCE_STATUS_SET.has(row.status) ||
+    !isPresentNullableString(row.terminal_reason) ||
+    !isPresentNullableString(row.bun_run_id) ||
+    !isPresentNullableString(row.bun_instance_id) ||
+    !hasOwn(row, 'evidence') ||
+    !isPresentJson(row.evidence) ||
+    !isPresentNullableString(row.runtime_started_at) ||
+    !isPresentNullableString(row.runtime_finished_at) ||
+    !isPresentNullableString(row.settled_at) ||
+    !isNonEmptyString(row.created_at) ||
+    !isNonEmptyString(row.updated_at) ||
+    typeof row.confirmed !== 'boolean' ||
+    !Array.isArray(row.criteria)
+  ) {
+    return false;
+  }
+  const seen = new Set<string>();
+  for (const criterion of row.criteria) {
+    if (!isTrustedAcceptanceCriterion(criterion)) return false;
+    const key = `${criterion.criterion_id}:${criterion.check_index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+  }
+  return true;
+}
+
+const TOOL_ARGUMENT_KEYS = new Set([
+  'path',
+  'pattern',
+  'offset',
+  'limit',
+  'output_mode',
+  'head_limit',
+  'content',
+  'old_string',
+  'new_string',
+]);
+const STRING_ARGUMENT_KEYS = new Set([
+  'path',
+  'pattern',
+  'output_mode',
+  'content',
+  'old_string',
+  'new_string',
+]);
+const UINT_ARGUMENT_KEYS = new Set(['offset', 'limit', 'head_limit']);
+
+/** Structurally validate one v1 bounded ToolRuntime argument map. */
+function isBoundedArgumentsV1(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!TOOL_ARGUMENT_KEYS.has(key)) return false;
+    if (STRING_ARGUMENT_KEYS.has(key)) {
+      if (typeof entry !== 'string') return false;
+    } else if (UINT_ARGUMENT_KEYS.has(key)) {
+      if (!isInteger(entry) || entry < 0) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Structurally validate one v1 acceptance check (`tool`, optional bounded
+ *  `arguments`, and an exact lowercase-hex `expect_sha256`). */
+function isAcceptanceCheckV1(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  for (const key of Object.keys(value)) {
+    if (key !== 'tool' && key !== 'arguments' && key !== 'expect_sha256') return false;
+  }
+  if (!isNonEmptyString(value.tool)) return false;
+  if (!isHex64(value.expect_sha256)) return false;
+  if (hasOwn(value, 'arguments')) {
+    const args = value.arguments;
+    if (args !== null && !isBoundedArgumentsV1(args)) return false;
+  }
+  return true;
+}
+
+/** Structurally validate the stored v1 manifest content: exact schema version,
+ *  a non-empty execution list, and a non-empty criterion-keyed acceptance map
+ *  whose keys are UUIDs and whose check lists are well-formed. */
+function isManifestContentV1(value: unknown): value is {
+  schema_version: number;
+  execution: unknown[];
+  acceptance: Record<string, unknown[]>;
+} {
+  if (!isPlainObject(value)) return false;
+  if (value.schema_version !== 1) return false;
+  const execution = value.execution;
+  if (!Array.isArray(execution) || execution.length === 0) return false;
+  const acceptance = value.acceptance;
+  if (!isPlainObject(acceptance)) return false;
+  const keys = Object.keys(acceptance);
+  if (keys.length === 0) return false;
+  for (const key of keys) {
+    if (!isUuid(key)) return false;
+    const checks = acceptance[key];
+    if (!Array.isArray(checks) || checks.length === 0) return false;
+    for (const check of checks) {
+      if (!isAcceptanceCheckV1(check)) return false;
+    }
+  }
+  return true;
 }
 
 export function isTrustedManifestSummary(value: unknown): value is TrustedManifestSummary {
-  if (!value || typeof value !== 'object') return false;
-  const row = value as Record<string, unknown>;
+  if (!isPlainObject(value)) return false;
+  const row = value;
   return (
     isNonEmptyString(row.manifest_id) &&
-    typeof row.registry_version === 'number' &&
-    Number.isInteger(row.registry_version) &&
+    isInteger(row.registry_version) &&
     row.registry_version >= 1 &&
-    typeof row.schema_version === 'number' &&
-    Number.isInteger(row.schema_version) &&
+    isInteger(row.schema_version) &&
+    row.schema_version === 1 &&
     isHex64(row.content_hash) &&
+    hasOwn(row, 'content') &&
+    isManifestContentV1(row.content) &&
     isNonEmptyString(row.agent_id) &&
-    typeof row.project_root === 'string' &&
-    (row.action_id === null ||
-      row.action_id === undefined ||
-      typeof row.action_id === 'string') &&
+    isNonEmptyString(row.project_root) &&
+    (row.action_id === null || isNonEmptyString(row.action_id)) &&
     isNonEmptyString(row.created_at) &&
     isNonEmptyString(row.updated_at)
   );
 }
 
-/** Sorted acceptance criterion keys declared by a registered manifest. */
+/** Sorted acceptance criterion keys declared by a validated manifest. A
+ *  malformed manifest never reaches here (the guard rejects it), so a returned
+ *  empty list would only mean an impossible empty map. */
 export function manifestAcceptanceKeys(manifest: TrustedManifestSummary): string[] {
   const content = manifest.content;
-  if (!content || typeof content !== 'object' || Array.isArray(content)) return [];
-  const acceptance = (content as Record<string, unknown>).acceptance;
-  if (!acceptance || typeof acceptance !== 'object' || Array.isArray(acceptance)) return [];
-  return Object.keys(acceptance as Record<string, unknown>).slice().sort();
+  if (!isManifestContentV1(content)) return [];
+  return Object.keys(content.acceptance).slice().sort();
+}
+
+export interface TrustedAcceptanceExpectedCheck {
+  criterion_id: string;
+  check_index: number;
+  tool: string;
+  expected_sha256: string;
+}
+
+/**
+ * Exact acceptance-check rows declared by a validated manifest, derived the same
+ * way native persists receipt rows: criterion UUID keys sorted ascending, each
+ * criterion's declared check order preserved, `check_index` starting at zero.
+ * Callers compare these rows one-for-one against a native acceptance receipt.
+ */
+export function manifestAcceptanceChecks(
+  manifest: TrustedManifestSummary,
+): TrustedAcceptanceExpectedCheck[] {
+  const content = manifest.content;
+  if (!isManifestContentV1(content)) return [];
+  const rows: TrustedAcceptanceExpectedCheck[] = [];
+  for (const criterionId of Object.keys(content.acceptance).slice().sort()) {
+    const checks = content.acceptance[criterionId];
+    for (let index = 0; index < checks.length; index += 1) {
+      const check = checks[index] as TrustedManifestAcceptanceCheck;
+      rows.push({
+        criterion_id: criterionId,
+        check_index: index,
+        tool: check.tool,
+        expected_sha256: check.expect_sha256,
+      });
+    }
+  }
+  return rows;
 }
 
 /** Best-effort workspace-root normalization for display/filter only; native
