@@ -15,11 +15,29 @@
 
 - Versutus gate paused for the runs.
 
-> Status: DRAFT, written during the night. Sections marked *pending* fill in as the queue finishes.
-
 ## 1. Bottom line
 
-*(final summary goes here once the queue drains)*
+| System | tier2b | Notes |
+|---|---|---|
+| Best single shot before tonight | 108 (gpt-oss full, 46 tok/s) / 105 (Gemma) / 101 (Qwen keep96, 274 tok/s) | 2026-10-04 |
+| Qwen best-of-N with self-tests, 8 candidates | **107** | 98 single shot. The 3-candidate recipe gave 103 and 107 in two independent runs |
+| Mixed Qwen + Gemma candidate pool, self-test pick | **108** | oracle 113 |
+| **Laya routes "depends on unseen code" tasks to Gemma, the rest to Qwen best-of-N** | **110–111** | best system; hindsight oracle over all configs 114 |
+
+**What helped, in order:**
+1. **A second model, routed by Laya's zero-shot task decision.** Gemma is strong where Qwen is weakest (hidden-package tasks), and Laya spots those tasks (AUC 0.96).
+2. **More candidates plus the model's own tests,** for Qwen only. Gemma's samples don't vary.
+3. **Repair from self-test feedback** for Qwen (+3). For Gemma it breaks more than it fixes.
+
+**What didn't help:**
+- More thinking or effort, for any of the three models.
+- Probing as a default; it trades categories per model.
+- Off-the-shelf LoRAs; none exist for code on these bases.
+- Agreement voting (CodeT), which loses to counting passes.
+
+**Caveats:**
+- Run-to-run noise is about ±4, and most of the variance sits in the 21 hidden-package samples.
+- The routing's choice of which model gets which task type was made on tier2b, so it needs confirming on fresh tasks before it's trusted.
 
 ## 2. Best-of-N with self-written tests (Qwen keep96): **98 → 107**
 
@@ -27,7 +45,9 @@ Full write-up: `2026-10-05-bestofn-selftest.md`.
 - Recipe: one answer at 0.2, two at 0.7, plus one suite of tests the model writes itself. Pick the most tests passed.
 - The grading tests are never used to choose.
 - 15.5% of the self-tests are wrong, yet any single suite gives the same 107.
-- Three candidates are enough.
+- **Replication with fresh seeds** (the cheap recipe, 3 candidates and 1 suite): single shot 98, self-test pick **103**, CodeT 100, oracle 105.
+  - The first run's 3-candidate subset (107) was a good draw. Expect +5 to +9 from the cheap recipe, and 107 from 8 candidates.
+  - The variance is in the hidden-package tasks: 8 against 11.
 
 ## 3. Thinking budgets ("effort levels")
 
@@ -39,7 +59,15 @@ Full write-up: `2026-10-05-bestofn-selftest.md`.
 - **Thinking does not raise either total on today's runtime.** A short budget (512) costs 7–10 points.
 - **For Qwen, 1,536+ moves points between categories:** hidden-package tasks gain 5, file I/O tasks lose 4.
 - **For Gemma, thinking produced format failures** (syntax and indentation errors at the token cap). Its 2026-09-10 gain from thinking (96 → 105) is gone because thinking-off is now 105.
-- **gpt-oss-20b keep24, the model with explicit effort levels:** low = 105 (2026-10-04); medium = *pending*.
+- **gpt-oss-20b keep24, the model with explicit effort levels** (greedy, speed-lab config):
+
+  | Effort | Total | A | B | C | D | E |
+  |---|---|---|---|---|---|---|
+  | Low (2026-10-04) | **105** | 36 | 10 | 21 | 21 | 17 |
+  | Medium | 99 | 36 | 7 | 20 | 19 | 17 |
+
+  Medium answers are about 3× longer (927 tokens on average) and took 30.7 min.
+- **Across all three models, more thinking or effort never raised a tier2b total on this hardware and runtime.** It often cost 6–10 points; only Qwen's larger budgets shifted points between categories. For "one-shot a feature" on these local models, spend the extra compute on more candidates (Qwen) or a second model (routing), not on longer reasoning.
 
 ## 4. Adapters and LoRAs
 
@@ -110,10 +138,12 @@ The script is `repair_tier2b.py`. The loop:
 | Model | Single shot | After repair | Entered repair | Fixed | **Broke** | Stayed right | Stayed wrong |
 |---|---|---|---|---|---|---|---|
 | Qwen keep96 | 99 (B 6) | **102** (B 9) | 47 of 117 | 5 | **2** | 31 | 9 |
-| Gemma 26B | *pending* | | | | | | |
+| Gemma 26B | 104 (B 14) | 102 (B 13) | 35 of 117 | 1 | **3** | 22 | 9 |
 
 - **Repair is cheaper than best-of-N** (extra calls only where a self-test fails) **but gains less** for Qwen: +3 against +9.
-- **This is the clearest reading of the verifier risk.** In 31 of 47 entries the self-test was wrong about correct code and the model kept its code. In 2 it gave in and broke correct code, about 6% of the correct entries.
+- **For Gemma it does net harm:** 1 fixed, 3 broken.
+- **This is the clearest reading of the verifier risk.** Correct code that failed a wrong self-test was kept 31 of 33 times by Qwen, but only 22 of 25 times by Gemma. Gemma bends to its own wrong checks more often.
+- Like best-of-N, Gemma does not turn extra signal into new correct fixes.
 
 ## 8. Gemma best-of-N and the mixed Qwen + Gemma pool
 
@@ -141,7 +171,32 @@ Unlike Qwen (single 98, oracle 109), re-sampling Gemma at 0.7 never produced a c
 - In 8 task-trials a correct candidate existed but wasn't picked. That is the remaining selection headroom.
 - Laya routing (unseen-code tasks → Gemma, the rest → Qwen best-of-N, 111) still beats the pool's 108. Routing those tasks to Gemma is a better decision than asking self-tests to choose there.
 
-## 9. Incidents and fixes
+## 9. Next
+
+1. **Confirm the routing on disjoint tasks.** It needs a fresh hidden-package-style set (a module visible only as bytecode plus a bug report). The B-route rests on 7 tier2b tasks.
+2. **Serve the routed system:** Laya (CPU, 0.7 s per decision) in front of Qwen keep96 best-of-N, with Gemma for unseen-code tasks.
+   - Both models don't fit in 8 GB at once, so it needs a model swap per routed task, or batching tasks by route.
+   - Measure the swap cost.
+3. **Fix the probe prompt's two failure modes,** then retest probing only where it helped: Qwen on B, Gemma on D.
+   - It sometimes answers with a script instead of the file.
+   - It copies a failed probe's imports.
+4. **Calibrate Laya** (`laya.calibrate` temperature fitting) on disjoint labelled decisions, so its probabilities can be thresholded. The root checkpoint's P(hidden) is high on every task, even though it ranks them well.
+
+## 10. Files
+
+- **Raw rows** in `docs/benchmarks/2026-10-05/`, with local temp paths scrubbed to `<tmp>`:
+  - `bestofn-*.jsonl`
+  - `probe-*.jsonl`
+  - `repair-*.jsonl`
+  - `tier2b-*-think*.jsonl` and `tier2b-gptoss20b-keep24-effort-medium.jsonl`
+  - `thinking-results.jsonl`
+  - `laya-decisions-*.json`
+- **Scripts** in `scripts/moe-bench/`:
+  - `bestofn_tier2b.py`, `bestofn_ablate.py`, `bestofn_mix.py`
+  - `thinking_sweep.py`, `probe_tier2b.py`, `repair_tier2b.py`
+  - `laya_router.py`, `scrub_paths.py`
+
+## 11. Incidents and fixes
 
 - **The best-of-N runner missed `unittest.TestCase` suites,** a third of the model's suites. Fixed, and every stored candidate re-checked offline.
 - **At temperature 0.2 the best-of-N candidates were near-copies:** oracle = single shot on the first 26 task-trials. Fixed by sampling the alternatives at 0.7.

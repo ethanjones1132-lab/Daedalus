@@ -233,7 +233,8 @@ def run(a):
                     t = time.time()
                     suites = []
                     for s in range(a.suites):  # suite 0 at 0.2; the rest at --temp-alt, so suites differ
-                        text, n_tok = chat(test_prompt(task), 20000 + 100 * trial + s, a.temp_alt if s else None)
+                        text, n_tok = chat(test_prompt(task), a.seed_base + 20000 + 100 * trial + s,
+                                           a.temp_alt if s else None)
                         code = extract_code(text)
                         names = test_names(code)
                         suites.append((code, names))
@@ -244,7 +245,7 @@ def run(a):
                     for c in range(a.n):
                         # candidate 0 = the tier2b sample (seed, 0.2); the rest at --temp-alt for diversity:
                         # at 0.2 all eight were near-copies (2026-10-05, first 26 task-trials)
-                        sd = trial if c == 0 else 1000 + 100 * trial + c
+                        sd = trial if c == 0 else a.seed_base + 1000 + 100 * trial + c
                         text, n_tok = chat(baseline_prompt(task), sd, a.temp_alt if c else None)
                         cands.append((c, sd, n_tok, text))
                     checks = list(ex.map(lambda x: check(task, extract_code(x[3]), suites), cands))
@@ -395,6 +396,9 @@ def main():
                         "model's best single-shot temperature)")
     r.add_argument("--model", default="qwen36keep96", choices=sorted(CONFIGS))
     r.add_argument("--budget", type=int, default=0, help="thinking budget: 0 off, -1 unlimited, N tokens")
+    r.add_argument("--seed-base", type=int, default=0,
+                   help="offset for the alternative candidates' and suites' seeds (a fresh replication); "
+                        "candidate 0 keeps the tier2b seed")
     z = sub.add_parser("analyze")
     z.add_argument("out")
     c = sub.add_parser("recheck")

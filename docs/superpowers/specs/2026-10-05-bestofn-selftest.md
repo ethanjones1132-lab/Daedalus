@@ -2,7 +2,7 @@
 
 **Question.** Qwen3.6 keep96 runs tier2b in 1.7 minutes. Does sampling several fixes and choosing one beat single-shot? The rule for choosing: use only signals that exist for any feature or build, never the benchmark's grading tests. The owner's concern: such gains depend on a verifier that "will not be clean on all content."
 
-**Answer.** Yes. **98 → 107/117** with three candidates and one suite of tests the model wrote itself. That matches gpt-oss-20b's 108 within noise, at Qwen keep96's 274 tok/s. The gain survives a noisy verifier: 15.5% of the self-tests are wrong, and selection still recovers 9 of the 11 points the oracle could gain.
+**Answer.** Yes. **98 → 107/117** with eight candidates and tests the model wrote itself, which matches gpt-oss-20b's 108 within noise at Qwen keep96's 274 tok/s. The cheap recipe (three candidates, one suite) gave 107 and 103 in two independent runs; see "Replication" below. The gain survives a noisy verifier: 15.5% of the self-tests are wrong, and selection still recovers 9 of the 11 points the oracle could gain.
 
 ## Setup
 
@@ -51,6 +51,17 @@ Single shot here is 98, against 101 in the 2026-10-04 sampling sweep, which is w
 |---|---|---|---|---|---|---|
 | Self-test selection | 98 | 103 | **107** | 107 | 107 | 107 |
 | Oracle | 98 | 103 | 107 | 108 | 108 | 109 |
+
+**Replication** (05:22, fresh seeds for every alternative candidate and suite, the cheap recipe of 3 candidates and 1 suite):
+
+| Selection | Score |
+|---|---|
+| Single shot | 98 |
+| Self-test pick | **103** |
+| CodeT | 100 |
+| Oracle | 105 |
+
+The N=3 rows of the ablation below are a subset of the main run, and that draw was good. Across the two runs the cheap recipe gains +5 to +9. The variance sits in the 21 hidden-package samples (8 against 11).
 
 **Reading the ablations:**
 - **Compile and import checks add nothing here.** keep96 almost always writes code that parses. On other models or bigger features, this layer may matter more.
