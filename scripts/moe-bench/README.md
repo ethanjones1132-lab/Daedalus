@@ -1,6 +1,6 @@
 # moe-bench: MoE serving and pruning on the 8 GB RTX 4060
 
-These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-results.md` and `2026-10-04-final-report.md`. They are checked in here because their original home, `D:\qwen3-forge`, is on a USB drive that failed on 2026-10-04.
+These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-results.md`, `2026-10-04-final-report.md`, `2026-10-05-bestofn-selftest.md` and `2026-10-05-overnight-levers.md`. They are checked in here because their original home, `D:\qwen3-forge`, is on a USB drive that failed on 2026-10-04.
 
 **Layout.** Paths are absolute and assume this layout on C:.
 
@@ -27,11 +27,20 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `after_*.ps1` | Detached chains that run the next step when the previous process exits, so they survive Claude restarts. |
 | `prune_gptoss.py`, `make_keep24.py` | gpt-oss-20b pruning. Calibrates on the full model's own chat-format transcripts, then slices to 16/24 of 32 experts and probes and benchmarks each slice. `slice_experts.py` now also slices expert and router biases, and combines several imatrix files. |
 | `speedlab.py` | Per model: base placement, then one runtime lever at a time, then the best lossless combination. Levers: threads, priority, KV f16, speculation depth, n-gram lookup on its own and stacked, no speculation, fewer experts, ubatch. |
+| `gptoss_speedlab.py` | The earlier gpt-oss-only speed lab (full MXFP4 model with its EAGLE3 draft). `speedlab.py` replaced it for the run. |
 | `sampling_sweep.py` | tier2b at each speed-lab winner under current / model-card / greedy sampling (`tier2b_llama.py --sampling`). |
 | `report_tables.py` | Markdown tables from all of the above. |
 | `run_rest.ps1` | The sequential, restart-safe chain that ran the speed lab and sampling sweeps. |
-| `drive-rescue/` | The SSD and D: diagnostics: SMART, openSeaChest self-test, chkdsk and Repair-Volume runs, the NVMe temperature logger and the guard. |
+| `drive-rescue/` | The SSD and D: diagnostics: SMART, openSeaChest self-test, chkdsk and Repair-Volume runs, the NVMe temperature logger and the guard, plus the read-only sector copy taken before any repair (`d_copy.py`). |
 | `remote/modal_flashnext.py`, `remote/flashnext_calib.py` | Qwen3.8-Flash-Next Coder expert usage on a Modal L40S: own-answer calibration (4 parallel slots), llama-imatrix, per-layer energy and routing summary. Results: `docs/superpowers/specs/2026-10-04-flashnext-expert-usage.md`. |
+| `thinking_sweep.py` | tier2b at thinking budgets of 512, 1,536 and 4,096 tokens for Qwen keep96 and Gemma 26B, each at its speed-lab winner and best sampling. |
+| `bestofn_tier2b.py` | Best-of-N with a verifier that never sees the grading test: N candidate fixes, chosen by compile, import and the model's own tests. |
+| `bestofn_mix.py`, `bestofn_ablate.py` | No generation, from stored best-of-N runs: a mixed Qwen + Gemma candidate pool, and selection by which self-tests exist and by N. |
+| `probe_tier2b.py` | Probe-then-fix: before fixing, the model writes one short script, runs it in the task's package (the hidden module is bytecode only) and sees its output. `--prompt-v 2` is the revised probe prompt. |
+| `repair_tier2b.py` | Repair: the model's failing self-tests and their errors go back to it for up to `--rounds` corrections. |
+| `laya_router.py` | Laya (convaiinnovations/laya), zero-shot, labels each task (depends on unseen code? effort? kind?) and a fixed rule routes it to a model and config. |
+| `scrub_paths.py` | Replaces local temp paths, which carry the account name, with `<tmp>` in result files before they're committed. |
+| `overnight-2026-10-04/`, `overnight-2026-10-05/` | Each night's status notes and runners. 2026-10-05: the chain (`overnight_2026-10-05.ps1`), the restart-safe queue runner (`night_queue.ps1` reading `night-queue.txt`) and the gpt-oss effort wrapper (`effort_run.py`). |
 
 **Lessons that shaped the code**
 
@@ -45,4 +54,6 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 - **llama.cpp 836d571 has no `--no-mmap`.** Use `--load-mode none`. The old flag exits with "invalid argument", which looks like a load failure.
 - **PyPI `gguf` can't read ISTA's Flash-Next GGUFs** (Q2_0 = type 42). Put llama.cpp's own `gguf-py` first on `PYTHONPATH`.
 - **Energy kept is the pruning headroom test.** Already-pruned pools (ISTA's 256-of-512 Coder) are flat: 90% of energy needs 59% of the experts, against 35% for raw Qwen3.6.
+- **Run model-written tests as `unittest` classes too.** About a third of the self-test suites were `TestCase` classes, which the first best-of-N runner never ran.
+- **Queued `cmd /c` lines lose their quote marks.** Pass JSON arguments through a wrapper script (`effort_run.py`).
 - **C:'s NVMe faults under heavy load.** Pause after multi-GB writes, keep RAM free so expert pages aren't re-read from it, and watch its temperature (`drive-rescue/ssd_watch.ps1`).
