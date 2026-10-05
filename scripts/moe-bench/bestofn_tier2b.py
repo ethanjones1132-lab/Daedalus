@@ -9,8 +9,9 @@ when the choice uses only signals that exist for any feature or build:
 The grading test is deleted from every checking workspace. It is used afterwards, only to score the
 chosen candidate, and per candidate for the diagnostics.
 
-For each task and trial: N candidate fixes (the tier2b prompt; candidate 0 uses the tier2b seed, so
-it is the plain single-shot answer) and S self-test suites. Everything is stored, and `analyze`
+For each task and trial: N candidate fixes (the tier2b prompt; candidate 0 uses the tier2b seed and
+temperature 0.2, so it is the plain single-shot answer; the others use --temp-alt) and S self-test
+suites. Everything is stored, and `analyze`
 computes the selection policies from the rows, so a new policy needs no new generations:
   first     candidate 0 (single shot)
   compile   first candidate that compiles and imports
@@ -22,6 +23,7 @@ accepts (the pick passes every self-test yet fails grading), misses, and no-sign
 
 usage: bestofn_tier2b.py run --out OUT.jsonl [--n 8] [--suites 2] [--trials 3] [--tasks 0]
        bestofn_tier2b.py analyze OUT.jsonl
+       bestofn_tier2b.py recheck OUT.jsonl   (re-run the checks on stored rows -> OUT.recheck.jsonl)
 """
 import argparse
 import ast
@@ -49,7 +51,9 @@ MODEL = r"C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep
 PORT = 8093
 BASE = f"http://127.0.0.1:{PORT}"
 SAMPLING = {"temperature": 0.2, "top_p": 0.95}  # keep96's best single-shot setting (101/117)
-RUNNER = """import importlib.util, json, sys
+# Runs plain test_* functions and unittest.TestCase methods (a third of the model's suites use
+# TestCase classes even when asked for functions), one result per test.
+RUNNER = """import importlib.util, inspect, json, sys, unittest
 spec = importlib.util.spec_from_file_location("_selftest", sys.argv[1])
 try:
     m = importlib.util.module_from_spec(spec)
@@ -58,14 +62,23 @@ except BaseException as e:
     print(json.dumps({"__load_error__": repr(e)[:200]}))
     sys.exit(0)
 res = {}
-for name in sorted(n for n in dir(m) if n.startswith("test")):
-    f = getattr(m, name)
-    if callable(f):
+for name, obj in sorted(vars(m).items()):
+    if getattr(obj, "__module__", None) != m.__name__:
+        continue
+    if inspect.isfunction(obj) and name.startswith("test"):
         try:
-            f()
+            obj()
             res[name] = True
         except BaseException:
             res[name] = False
+    elif inspect.isclass(obj) and issubclass(obj, unittest.TestCase):
+        for meth in sorted(n for n in dir(obj) if n.startswith("test") and callable(getattr(obj, n))):
+            r = unittest.TestResult()
+            try:
+                obj(meth).run(r)
+                res[f"{name}.{meth}"] = r.wasSuccessful()
+            except BaseException:
+                res[f"{name}.{meth}"] = False
 print(json.dumps(res))
 """
 
@@ -77,9 +90,10 @@ def post(path, payload, timeout=600):
         return json.loads(r.read())
 
 
-def chat(prompt, seed_):
+def chat(prompt, seed_, temperature=None):
+    sampling = {**SAMPLING, **({"temperature": temperature} if temperature is not None else {})}
     r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": prompt}], "max_tokens": 2048,
-                                      **SAMPLING, "seed": seed_, "cache_prompt": True,
+                                      **sampling, "seed": seed_, "cache_prompt": True,
                                       "chat_template_kwargs": {"enable_thinking": False}})
     return r["choices"][0]["message"].get("content") or "", r.get("timings", {}).get("predicted_n")
 
@@ -101,11 +115,17 @@ def test_prompt(task):
 
 
 def test_names(code):
+    """Top-level test_* functions and Class.test_* methods, matching what RUNNER reports."""
     try:
-        return sorted(n.name for n in ast.parse(code).body
-                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test"))
+        body = ast.parse(code).body
     except SyntaxError:
         return []
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef)
+    names = [n.name for n in body if isinstance(n, fn) and n.name.startswith("test")]
+    for c in body:
+        if isinstance(c, ast.ClassDef):
+            names += [f"{c.name}.{n.name}" for n in c.body if isinstance(n, fn) and n.name.startswith("test")]
+    return sorted(names)
 
 
 def workspace(task, code):
@@ -198,24 +218,26 @@ def run(a):
                         continue
                     t = time.time()
                     suites = []
-                    for s in range(a.suites):
-                        text, n_tok = chat(test_prompt(task), 20000 + 100 * trial + s)
+                    for s in range(a.suites):  # suite 0 at 0.2; the rest at --temp-alt, so suites differ
+                        text, n_tok = chat(test_prompt(task), 20000 + 100 * trial + s, a.temp_alt if s else None)
                         code = extract_code(text)
                         names = test_names(code)
                         suites.append((code, names))
                         f.write(json.dumps({"type": "suite", "task": task["name"], "category": task["category"],
                                             "trial": trial, "suite": s, "gen_n": n_tok, "tests": names,
-                                            "code": code[:6000]}) + "\n")
+                                            "code": code}) + "\n")
                     cands = []
                     for c in range(a.n):
-                        sd = trial if c == 0 else 1000 + 100 * trial + c  # candidate 0 = the tier2b sample
-                        text, n_tok = chat(baseline_prompt(task), sd)
+                        # candidate 0 = the tier2b sample (seed, 0.2); the rest at --temp-alt for diversity:
+                        # at 0.2 all eight were near-copies (2026-10-05, first 26 task-trials)
+                        sd = trial if c == 0 else 1000 + 100 * trial + c
+                        text, n_tok = chat(baseline_prompt(task), sd, a.temp_alt if c else None)
                         cands.append((c, sd, n_tok, text))
                     checks = list(ex.map(lambda x: check(task, extract_code(x[3]), suites), cands))
                     for (c, sd, n_tok, text), chk in zip(cands, checks):
                         f.write(json.dumps({"type": "cand", "task": task["name"], "category": task["category"],
                                             "trial": trial, "cand": c, "seed": sd, "gen_n": n_tok, **chk,
-                                            "content": text[:6000]}) + "\n")
+                                            "content": text}) + "\n")
                     f.flush()
                     ok = sum(chk["graded_ok"] for chk in checks)
                     print(f"{task['name']} t{trial}: {ok}/{a.n} candidates pass grading; "
@@ -229,6 +251,38 @@ def run(a):
         log.close()
     print(f"done in {(time.time() - t_start) / 60:.1f} min", flush=True)
     analyze(argparse.Namespace(out=a.out))
+
+
+def recheck(a):
+    """Re-run every check on the stored candidates and suites with the current runner, without
+    generating anything (2026-10-05: the first runner missed unittest.TestCase suites).
+    Writes OUT.recheck.jsonl and analyzes it."""
+    rows = [json.loads(l) for l in open(a.out, encoding="utf-8") if l.strip()]
+    tasks = {t["name"]: t for t in TASKS}
+    suites, cands = {}, {}
+    for r in rows:  # the last copy wins, as in analyze
+        if r["type"] == "suite":
+            suites[(r["task"], r["trial"], r["suite"])] = r
+        elif r["type"] == "cand":
+            cands[(r["task"], r["trial"], r["cand"])] = r
+    dst = pathlib.Path(a.out).with_suffix(".recheck.jsonl")
+    with dst.open("w", encoding="utf-8") as f, ThreadPoolExecutor(8) as ex:
+        for name, trial in sorted({(t, tr) for t, tr, _ in cands}):
+            task = tasks[name]
+            suite_list = []
+            for s in sorted(k[2] for k in suites if k[:2] == (name, trial)):
+                row = suites[(name, trial, s)]
+                names = test_names(row["code"])
+                suite_list.append((row["code"], names))
+                f.write(json.dumps({**row, "tests": names}) + "\n")
+            cs = [cands[k] for k in sorted(k for k in cands if k[:2] == (name, trial))]
+            checks = list(ex.map(lambda r: check(task, extract_code(r["content"]), suite_list), cs))
+            for row, chk in zip(cs, checks):
+                f.write(json.dumps({**row, **chk}) + "\n")
+            f.flush()
+            print(f"{name} t{trial}: rechecked {len(cs)} candidates against "
+                  f"{[len(n) for _, n in suite_list]} self-tests", flush=True)
+    analyze(argparse.Namespace(out=str(dst)))
 
 
 def pick(cands, policy):
@@ -255,10 +309,13 @@ def pick(cands, policy):
 
 def analyze(a):
     rows = [json.loads(l) for l in open(a.out, encoding="utf-8") if l.strip()]
-    by = collections.defaultdict(list)
+    latest = {}  # a task-trial redone after an interruption appends again: keep the last copy
     for r in rows:
         if r["type"] == "cand":
-            by[(r["task"], r["category"], r["trial"])].append(r)
+            latest[(r["task"], r["trial"], r["cand"])] = r
+    by = collections.defaultdict(list)
+    for r in latest.values():
+        by[(r["task"], r["category"], r["trial"])].append(r)
     for v in by.values():
         v.sort(key=lambda r: r["cand"])
     n = min(len(v) for v in by.values())
@@ -286,7 +343,8 @@ def analyze(a):
                 if len(vecs) <= 1:
                     diag["no signal (self-tests cannot tell candidates apart)"] += 1
         score["oracle"][cat] += oracle
-        score["mean of candidates"][cat] += sum(c["graded_ok"] for c in cands) / len(cands)
+        rest = cands[1:] or cands  # candidates 1.. are the --temp-alt samples
+        score["mean of candidates"][cat] += sum(c["graded_ok"] for c in rest) / len(rest)
         for c in cands:  # self-tests a grading-correct candidate fails are wrong (or over-specified)
             if c["graded_ok"]:
                 for res in c["self"].values():
@@ -296,6 +354,7 @@ def analyze(a):
     total = len(by)
     print(f"\n{total} task-trials, N = {n} candidates each")
     print(f"{'policy':22s} {'score':>8s}  " + "  ".join(f"{c:>6s}" for c in cats))
+    print("('first' is candidate 0, the single-shot answer; 'mean of candidates' averages candidates 1..N-1)")
     for p in ["first", "mean of candidates", "compile", "selftest", "codet", "oracle"]:
         s = score[p]
         tot = sum(s.values())
@@ -317,10 +376,14 @@ def main():
     r.add_argument("--suites", type=int, default=2)
     r.add_argument("--trials", type=int, default=3)
     r.add_argument("--tasks", type=int, default=0, help="first N tasks only (smoke test)")
+    r.add_argument("--temp-alt", type=float, default=None,
+                   help="temperature for candidates 1..N-1 and suites 1..S-1 (candidate 0 and suite 0 stay at 0.2)")
     z = sub.add_parser("analyze")
     z.add_argument("out")
+    c = sub.add_parser("recheck")
+    c.add_argument("out")
     a = ap.parse_args()
-    run(a) if a.cmd == "run" else analyze(a)
+    {"run": run, "analyze": analyze, "recheck": recheck}[a.cmd](a)
 
 
 if __name__ == "__main__":
