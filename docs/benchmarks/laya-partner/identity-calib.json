@@ -1,0 +1,22 @@
+{
+ "classify_wording": "v1",
+ "verify_form": "noul",
+ "platt": {
+  "unseen": [
+   1.0,
+   0.0
+  ],
+  "effort_little": [
+   1.0,
+   0.0
+  ],
+  "effort_alot": [
+   1.0,
+   0.0
+  ],
+  "verify": [
+   1.0,
+   0.0
+  ]
+ }
+}
