@@ -1,7 +1,7 @@
 # Priority 2 Part 3 — UI slice handoff
 
 **Scope:** Roadmap Priority #2, Part 3 (commitments and scheduled activations), Goal-detail UI slice.
-**Final production source checkpoint:** `2b226db1e9989445a1c10465ec6f5bf39430f3fd` (`fix(goals): reconcile each schedule op against its requested effect`), following the initial UI slice `f655346437071e98a75c14a779f750113efff2ba`, the honesty/usability slice `5e085baf8450dc1467cf1e3ceaf945d934037ef9`, and the evidence-gated slice `015772e52e0279c53680630cd40a54939cb85e74`.
+**Final production source checkpoint:** `cf7234e24f65bbbed69ddb844d72cfc3e819c3ce` (`ui(goals): use neutral pending wording for in-flight schedule ops`), following the initial UI slice `f655346437071e98a75c14a779f750113efff2ba`, the honesty/usability slice `5e085baf8450dc1467cf1e3ceaf945d934037ef9`, the evidence-gated slice `015772e52e0279c53680630cd40a54939cb85e74`, and the effect-aware slice `2b226db1e9989445a1c10465ec6f5bf39430f3fd`.
 **Production path:** `src-ui/src/components/jarvis/GoalsView.tsx` only. No native API, migration, permission, or App-routing change was needed; every control is backed by an existing native durable command.
 
 ## Complete in this slice
@@ -25,6 +25,7 @@
   - **Run now** — the `ScheduleOp` captures an immutable baseline of activation ids, run ids, and the submission time. Clearing requires readable activation+run history for that job and newly observed evidence beyond the baseline (a new activation or run id). If the baseline history was unavailable before submission, it instead requires evidence timestamped at/after the recorded submission time, so readability alone is never treated as confirmation.
   - **cancel** — the tracked in-flight execution must be absent after the refresh with activation/run history still readable.
   - A job missing from the refreshed linked list, unreadable relevant history, or an unchanged effect leaves the operation uncertain (controls stay disabled) until a later successful reconciliation.
+- **Neutral pending status copy (`cf7234e2`):** the `writing` phase is installed before `invoke` returns, so its live status now reads "Submitting and confirming the authoritative schedule state…" instead of implying the native command already accepted the request. Error/uncertainty wording shown after a genuine native response is unchanged.
 - History responses (`get_cron_activations`/`get_cron_runs`) that are non-array or fail are shown as "could not be read", never as "no history".
 
 ## Canonical doc updates
@@ -41,4 +42,4 @@
 
 ## Remaining Part 3 items
 
-With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `2b226db1e9989445a1c10465ec6f5bf39430f3fd`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
+With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `cf7234e24f65bbbed69ddb844d72cfc3e819c3ce`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
