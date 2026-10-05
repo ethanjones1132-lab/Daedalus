@@ -156,7 +156,7 @@ All parts are source implementation plans. Tests, live execution, restart/interr
 
 ## 3. Prove that learning improves future work
 
-**Sequence override — 2026-10-05:** At the user's explicit direction, Priority #3 source work and the roadmap's controlled evaluation are active before Priority #1 or #2 runtime acceptance is complete. Priority #1 and Priority #2 acceptance remain **open/NOT RUN**; this direction does not waive or satisfy those gates. Priority #4 remains queued until Priority #3 has its required independent controlled-transfer evidence. The full Luna plan is [Priority 3 learning effectiveness](superpowers/plans/2026-10-05-roadmap-priority-3-learning-effectiveness.md).
+**Sequence override — 2026-10-05:** At the user's explicit direction, Priority #3 source work and the roadmap's controlled evaluation are active before Priority #1 or #2 runtime acceptance is complete. Priority #1 and Priority #2 acceptance remain **open/NOT RUN**; this direction does not waive or satisfy those gates. Priority #4 remains queued until Priority #3 has its required independent controlled-transfer evidence. The full Luna plan is [Priority 3 learning effectiveness](superpowers/plans/2026-10-05-roadmap-priority-3-learning-effectiveness.md); see the [Priority 3 status](implementation/roadmap-priority-3-status.md) for the current Phase 1 authority gate.
 
 ### Intended outcome
 

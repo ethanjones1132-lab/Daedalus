@@ -6,7 +6,7 @@
 
 **Architecture:** Replace fabricated native learning-session findings with truthful source-backed results or an explicit unavailable outcome. Build a frozen, paired skill-transfer evaluation using the existing local-only rollout path and isolated held-out fixtures; attach exact runtime evidence to a durable campaign record. Keep the evaluator, rubric, thresholds, dataset split, and acceptance evidence independent from candidate generation and promotion, with promotion remaining staged and explicit.
 
-**Tech Stack:** Rust/Tauri learning command, Bun/TypeScript ToolRuntime and self-tuning pipeline, existing Tier-2B fixture tasks and authentic grader, local Ollama `/api/chat`, JSON/Markdown campaign evidence.
+**Tech Stack:** Rust/Tauri learning command and Session/Agent/workspace authority, explicit React Session/run selection, Bun/TypeScript ToolRuntime and self-tuning pipeline, existing Tier-2B fixture tasks and authentic grader, local Ollama `/api/chat`, JSON/Markdown campaign evidence.
 
 **Spec:** `docs/CURRENT_ROADMAP.md`, Priority 3, “Prove that learning improves future work.”
 
@@ -18,10 +18,13 @@
 - Evaluation tasks use only checked-in synthetic fixtures. Do not read, write, or send user project files, call web/MCP/delegate tools, change credentials/settings, download models, install packages, deploy, or promote a candidate into live use.
 - Use the already-installed local Ollama model only. If no single installed model can be pinned and identified for every arm, stop with an incomplete/blocked evaluation report; do not substitute another backend.
 - Record actual values and mark unavailable values explicitly. Do not treat compiler/build checks as runtime evidence.
+- A user-selected Session ID or completed Agent run ID is only a selector. Native must resolve and validate the persisted run→Session→Agent→canonical project-root tuple; Bun must resolve the exact persisted source/trajectory evidence for the same tuple. No caller-provided Agent, workspace, or snapshot is authority.
+- If an exact completed run, Session owner, enabled Agent, canonical project root, persisted source evidence, or current ToolRuntime Permission cannot be proven or is ambiguous/stale, return explicit unavailable with no research dispatch and no success-file write.
 
 ## Review Focus
 
 - A candidate source run or trajectory must be distinct from every transfer task; prove this from the frozen train/held-out names and hashes.
+- The Phase 1 learning command must be reachable from an explicit UI selection bound to one persisted Session and exact completed run; the native command revalidates both identifiers and resolves all authority from native storage.
 - Baseline, learned candidate, and neutral control must use the same Ollama model, task snapshot, sampler seed, system/directive version, tool bundle, concurrency, context/output limits, and wall budget. Randomize arm order within every task/seed block.
 - Candidate or evaluator content must not alter the independent grader, acceptance thresholds, held-out split, or scoring code after the campaign is frozen.
 - Only exact authentic fixture-oracle results count as accepted correctness; model claims and the pipeline’s own completion wording do not.
@@ -32,15 +35,20 @@
 **Files:**
 - Modify: `src-tauri/src/commands/jarvis_commands.rs` (`run_learning_session`)
 - Modify: `src-tauri/src/jarvis/learning.rs` (source validation and evidence types)
+- Modify: `src-tauri/src/commands/sessions.rs` or the nearest existing native query module for a narrow authoritative list of eligible persisted Sessions/runs; selection values are identifiers only.
+- Modify: `src-ui/src/components/jarvis/JarvisView.tsx` and create `src-ui/src/components/jarvis/LearningView.tsx` (or the smallest existing Jarvis navigation surface) for explicit Session and exact completed-run selection with clear unavailable/error states.
+- Modify: `src-tauri/src/db/migrations.rs` only if existing persisted authorities lack a necessary integrity constraint; do not create a second learning authority or persist caller claims.
 - Modify or create: `server-jarvis/src/learning-session.ts` (bounded research orchestration)
-- Modify: `server-jarvis/src/index.ts` (typed route to the research service)
-- Reuse: `server-jarvis/src/web-bundle.ts`, `server-jarvis/src/tool-runtime.ts`, `server-jarvis/src/intelligence/skill-source-evidence.ts`
+- Modify: `server-jarvis/src/native-memory.ts` and `src-tauri/src/jarvis/memory/transport.rs` only for private lookup/request of exact persisted run/session evidence; do not accept a snapshot from the UI.
+- Reuse: `server-jarvis/src/web-bundle.ts`, `server-jarvis/src/tool-runtime.ts`, `server-jarvis/src/intelligence/skill-source-evidence.ts`, native `sessions`/`agent_runs`/`stage_runs`/Agent projection authority, and existing Session/workspace validators.
 
-- [ ] Replace `run_learning_session`’s deterministic `Placeholder finding` synthesis with a bounded typed request to Bun’s research service. The result contains only findings grounded in successfully retrieved source material, with canonical URL/host, retrieval time, content digest, and a bounded source excerpt/reference.
-- [ ] Use the existing `web_search`/`web_fetch` ToolRuntime surface and current configured capability policy. Do not issue direct HTTP calls from a new bypass path or grant a new Permission. On denied, missing, malformed, or failed retrieval/model synthesis, return an explicit unavailable/partial result and do not write a successful learning-session file.
+- [ ] Add an explicit user flow to select one persisted Session and one exact completed `agent_run_id`. IDs are selectors only. Native rereads the submitted values and validates the run is completed and belongs to the selected Session, resolves the Agent from the persisted Session, verifies the enabled Agent projection, and canonicalizes/revalidates the persisted project root. Reads that fail or return multiple/conflicting rows are unavailable; never use latest-row heuristics or caller-provided identity/scope/snapshot.
+- [ ] Resolve the exact persisted source/trajectory evidence for that verified run and Session through the private native↔Bun capability. Bun must read authoritative stored evidence by the exact tuple, strictly decode it, and compare Session/Agent/workspace/run identity plus required digests; it must not treat a structurally valid caller-supplied snapshot as stored evidence. If existing stores cannot provide a unique matching record, return unavailable before ToolRuntime creation.
+- [ ] Replace `run_learning_session`’s deterministic `Placeholder finding` synthesis with a bounded typed request to Bun’s research service, dispatched only after the exact persisted tuple has been verified. The result contains only findings grounded in successfully retrieved source material, with canonical URL/host, retrieval time, content digest, and a bounded source excerpt/reference.
+- [ ] Use the existing `web_search`/`web_fetch` ToolRuntime surface and current configured capability policy in a context bound to the validated Session and workspace. Do not issue direct HTTP calls from a new bypass path or grant a new Permission. On denied, approval-required, missing, malformed, or failed retrieval/synthesis, return an explicit unavailable/partial result and do not write a successful learning-session file.
 - [ ] Replace `evaluate_source` substring checks with parsed URL hostname checks using exact hostname or subdomain boundaries; malformed URLs and lookalike suffixes are rejected. Preserve the existing source quality intent and expose the exact rejection reason.
-- [ ] Ensure returned candidate/source evidence resolves to the exact stored trajectory/run IDs and content digests consumed by the distiller. Preserve strict decoding in `skill-source-evidence.ts`; no candidate may claim support from a different run.
-- [ ] Luna reviews the resulting native/Bun request, failure outcomes, source URL validation, and evidence binding before the next phase. Run only the five permitted exact-SHA checks; no tests or live research requests in this phase.
+- [ ] Ensure returned candidate/source evidence resolves to the exact stored trajectory/run IDs and content digests consumed by the distiller. Preserve strict decoding in `skill-source-evidence.ts`; no candidate may claim support from a different run. Returned evidence must use the validated run identity, not a minted “learning run” ID.
+- [ ] Luna reviews the Session/run selector, native persisted tuple resolution, Bun persisted-evidence lookup, ToolRuntime Permission context, failure outcomes, source URL validation, and evidence binding before the next phase. Run only the five permitted exact-SHA checks; no tests or live research requests in this phase.
 
 ## Phase 2 — Frozen transfer-study manifest and isolated paired evaluator
 
