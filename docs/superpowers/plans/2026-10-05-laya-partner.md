@@ -337,10 +337,20 @@ def ece(probs, labels, bins=10):
 
 
 def platt_fit(probs, labels, iters=100, l2=1e-3):
-    """(a, b) for p' = sigmoid(a * logit(p) + b), by Newton's method on the log loss. A little L2 pull towards
-    the identity (a = 1, b = 0) keeps one-class or separable samples finite."""
+    """(a, b) for p' = sigmoid(a * logit(p) + b), by Newton's method with a backtracking line search on the log
+    loss. A little L2 pull towards the identity (a = 1, b = 0) keeps one-class or separable samples finite; the
+    line search keeps the step sane when a and b are nearly collinear (all probabilities alike)."""
     xs = [logit(p) for p in probs]
+
+    def loss(a, b):
+        tot = 0.5 * l2 * ((a - 1) ** 2 + b ** 2)
+        for x, y in zip(xs, labels):
+            z = a * x + b
+            tot += max(z, 0.0) + math.log1p(math.exp(-abs(z))) - y * z
+        return tot
+
     a, b = 1.0, 0.0
+    cur = loss(a, b)
     for _ in range(iters):
         ga, gb, haa, hab, hbb = l2 * (a - 1), l2 * b, l2, 0.0, l2
         for x, y in zip(xs, labels):
@@ -352,9 +362,14 @@ def platt_fit(probs, labels, iters=100, l2=1e-3):
         if det <= 1e-12:
             break
         da, db = (hbb * ga - hab * gb) / det, (haa * gb - hab * ga) / det
-        a, b = a - da, b - db
-        if abs(da) + abs(db) < 1e-9:
+        t = 1.0
+        while t > 1e-10 and loss(a - t * da, b - t * db) > cur:
+            t /= 2
+        a, b = a - t * da, b - t * db
+        new_loss = loss(a, b)
+        if cur - new_loss < 1e-12:
             break
+        cur = new_loss
     return a, b
 
 
