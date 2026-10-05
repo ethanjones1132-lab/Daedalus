@@ -75,8 +75,70 @@ interface GoalRunProgress {
   finished_at: string | null;
 }
 
+interface CommitmentRecord {
+  id: string;
+  text: string;
+  status: string;
+  due: string | null;
+  created_at: string;
+  completed_at: string | null;
+  agent_id: string | null;
+  goal_id: string | null;
+}
+
+interface CronSchedule {
+  id: string;
+  name: string;
+  schedule: string;
+  agent_id: string;
+  session_id: string | null;
+  enabled: boolean;
+  last_run: string | null;
+  next_run: string | null;
+  run_count: number;
+  goal_id: string | null;
+}
+
+interface CronActivation {
+  activation_id: string;
+  cron_id: string;
+  schedule_occurrence: string;
+  trigger_kind: string;
+  claim_state: string;
+  run_id: string | null;
+  terminal_reason: string | null;
+  claimed_at: string;
+  dispatched_at: string | null;
+  settled_at: string | null;
+}
+
+interface CronRunRecord {
+  id: string;
+  cron_id: string;
+  status: string;
+  error: string;
+  terminal_reason: string | null;
+  started_at: string;
+  finished_at: string | null;
+  activation_id: string | null;
+  schedule_occurrence: string | null;
+}
+
+type ScheduleOpKind = 'pause' | 'resume' | 'run' | 'cancel';
+type ScheduleOpPhase = 'writing' | 'write-failed' | 'read-failed';
+
+interface ScheduleOp {
+  kind: ScheduleOpKind;
+  goalId: string;
+  phase: ScheduleOpPhase;
+  message?: string;
+}
+
 const TRANSITION_STATUSES = ['running', 'waiting_for_user', 'blocked', 'paused', 'failed', 'cancelled'];
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled'];
+
+/** Activation claim states that require a specific user/reconciliation action. */
+const ACTIONABLE_CLAIM_STATES = ['waiting_for_user', 'blocked', 'ambiguous'];
 
 const STATUS_VARIANT: Record<string, StatusVariant> = {
   pending: 'default',
@@ -98,6 +160,42 @@ function allowedTransitions(status: string): string[] {
   return TRANSITION_STATUSES.filter((s) => s !== status);
 }
 
+const CLAIM_VARIANT: Record<string, StatusVariant> = {
+  claimed: 'info',
+  dispatched: 'info',
+  completed: 'success',
+  failed: 'error',
+  cancelled: 'default',
+  ambiguous: 'warn',
+  waiting_for_user: 'warn',
+  blocked: 'error',
+};
+
+function claimVariant(state: string): StatusVariant {
+  return CLAIM_VARIANT[state] ?? 'default';
+}
+
+function actionableLabel(state: string): string {
+  if (state === 'waiting_for_user') return 'Waiting for you';
+  if (state === 'blocked') return 'Blocked';
+  if (state === 'ambiguous') return 'Needs reconciliation';
+  return state;
+}
+
+function cronRunVariant(status: string): StatusVariant {
+  if (status === 'success') return 'success';
+  if (status === 'failed') return 'error';
+  if (status === 'timeout') return 'warn';
+  return 'default';
+}
+
+function scheduleOpVerb(kind: ScheduleOpKind): string {
+  if (kind === 'pause') return 'pause';
+  if (kind === 'resume') return 'resume';
+  if (kind === 'cancel') return 'cancel';
+  return 'run';
+}
+
 export default function GoalsView() {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [detail, setDetail] = useState<GoalDetail | null>(null);
@@ -108,6 +206,17 @@ export default function GoalsView() {
   const [transitionError, setTransitionError] = useState<string | null>(null);
   const [transitioning, setTransitioning] = useState(false);
 
+  const [commitments, setCommitments] = useState<CommitmentRecord[]>([]);
+  const [schedules, setSchedules] = useState<CronSchedule[]>([]);
+  const [activations, setActivations] = useState<Record<string, CronActivation[]>>({});
+  const [cronRuns, setCronRuns] = useState<Record<string, CronRunRecord[]>>({});
+  const [inFlight, setInFlight] = useState<Set<string>>(new Set());
+  const [activationErrors, setActivationErrors] = useState<Record<string, boolean>>({});
+  const [runErrors, setRunErrors] = useState<Record<string, boolean>>({});
+  const [scheduleReadError, setScheduleReadError] = useState<string | null>(null);
+  const [scheduleOps, setScheduleOps] = useState<Record<string, ScheduleOp>>({});
+  const [expandedJob, setExpandedJob] = useState<string | null>(null);
+
   const [objective, setObjective] = useState('');
   const [criteria, setCriteria] = useState<string[]>(['']);
   const [creating, setCreating] = useState(false);
@@ -117,6 +226,7 @@ export default function GoalsView() {
   const detailRequestId = useRef(0);
   const selectedIdRef = useRef<string | null>(null);
   const transitionPending = useRef(false);
+  const scheduleOpsRef = useRef<Record<string, ScheduleOp>>({});
 
   const fetchGoals = useCallback(async () => {
     const request = ++requestId.current;
@@ -134,6 +244,182 @@ export default function GoalsView() {
     }
   }, []);
 
+  // Authoritative native readback for the Goal's associated schedules,
+  // activations, and runs. Every schedule mutation calls this before the UI may
+  // claim the change succeeded; a failed readback leaves the previous displayed
+  // state in place and reports uncertainty. A stale selection generation is
+  // discarded. History read failures are tracked per job so an unavailable list
+  // is never rendered as "no activations".
+  const refreshScheduleState = useCallback(
+    async (goalId: string, expectedRequest: number): Promise<boolean> => {
+      try {
+        const [jobs, flight] = await Promise.all([
+          invoke<CronSchedule[]>('list_cron_jobs'),
+          invoke<string[]>('get_in_flight_cron_jobs'),
+        ]);
+        if (expectedRequest !== detailRequestId.current) return false;
+        const linked = (Array.isArray(jobs) ? jobs : []).filter(
+          (job) => job.goal_id === goalId,
+        );
+        const nextActivations: Record<string, CronActivation[]> = {};
+        const nextRuns: Record<string, CronRunRecord[]> = {};
+        const nextActivationErrors: Record<string, boolean> = {};
+        const nextRunErrors: Record<string, boolean> = {};
+        for (const job of linked) {
+          try {
+            const rows = await invoke<CronActivation[]>('get_cron_activations', {
+              cronId: job.id,
+            });
+            if (expectedRequest !== detailRequestId.current) return false;
+            nextActivations[job.id] = Array.isArray(rows) ? rows : [];
+          } catch {
+            if (expectedRequest !== detailRequestId.current) return false;
+            nextActivations[job.id] = [];
+            nextActivationErrors[job.id] = true;
+          }
+          try {
+            const rows = await invoke<CronRunRecord[]>('get_cron_runs', {
+              cronId: job.id,
+            });
+            if (expectedRequest !== detailRequestId.current) return false;
+            nextRuns[job.id] = Array.isArray(rows) ? rows : [];
+          } catch {
+            if (expectedRequest !== detailRequestId.current) return false;
+            nextRuns[job.id] = [];
+            nextRunErrors[job.id] = true;
+          }
+        }
+        if (expectedRequest !== detailRequestId.current) return false;
+        setSchedules(linked);
+        setActivations(nextActivations);
+        setCronRuns(nextRuns);
+        setActivationErrors(nextActivationErrors);
+        setRunErrors(nextRunErrors);
+        setInFlight(new Set(Array.isArray(flight) ? flight : []));
+        setScheduleReadError(null);
+        return true;
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return false;
+        setScheduleReadError(
+          'Could not read goal-linked schedules from the native authority.',
+        );
+        return false;
+      }
+    },
+    [],
+  );
+
+  // Goal-linked Commitments are owned by the Commitment JSON authority, so the
+  // display is derived from the authoritative records (never an inferred link).
+  const loadGoalSupport = useCallback(
+    async (goalId: string, expectedRequest: number) => {
+      try {
+        const all = await invoke<CommitmentRecord[]>('get_commitments');
+        if (expectedRequest !== detailRequestId.current) return;
+        setCommitments(
+          Array.isArray(all) ? all.filter((c) => c.goal_id === goalId) : [],
+        );
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return;
+        setCommitments([]);
+      }
+      await refreshScheduleState(goalId, expectedRequest);
+    },
+    [refreshScheduleState],
+  );
+
+  // One schedule mutation at a time per job. The native command must confirm the
+  // effect and an authoritative readback must then succeed before the operation
+  // is cleared; otherwise the operation is left actionable and the display is
+  // not optimized.
+  const runScheduleOp = useCallback(
+    async (kind: ScheduleOpKind, job: CronSchedule) => {
+      const goalId = job.goal_id;
+      if (!goalId) return;
+      if (scheduleOpsRef.current[job.id]) return;
+      const expectedRequest = detailRequestId.current;
+      const op: ScheduleOp = { kind, goalId, phase: 'writing' };
+      scheduleOpsRef.current = { ...scheduleOpsRef.current, [job.id]: op };
+      setScheduleOps(scheduleOpsRef.current);
+
+      const fail = (message: string) => {
+        if (
+          selectedIdRef.current !== goalId ||
+          expectedRequest !== detailRequestId.current
+        ) {
+          return;
+        }
+        scheduleOpsRef.current = {
+          ...scheduleOpsRef.current,
+          [job.id]: { ...op, phase: 'write-failed', message },
+        };
+        setScheduleOps(scheduleOpsRef.current);
+      };
+
+      let confirmed: boolean;
+      try {
+        const command =
+          kind === 'pause'
+            ? 'disable_cron_job'
+            : kind === 'resume'
+              ? 'enable_cron_job'
+              : kind === 'cancel'
+                ? 'cancel_cron_job'
+                : 'run_cron_job';
+        confirmed = (await invoke<boolean>(command, { id: job.id })) === true;
+      } catch (err) {
+        fail(
+          typeof err === 'string'
+            ? err
+            : `Could not ${scheduleOpVerb(kind)} this schedule.`,
+        );
+        return;
+      }
+
+      if (
+        selectedIdRef.current !== goalId ||
+        expectedRequest !== detailRequestId.current
+      ) {
+        return;
+      }
+
+      if (!confirmed) {
+        fail(
+          kind === 'cancel'
+            ? 'Cancellation was requested but the running execution did not confirm it. The run may still be active; reconcile the activation history.'
+            : `The native authority did not confirm the ${scheduleOpVerb(kind)} request.`,
+        );
+        return;
+      }
+
+      const readBack = await refreshScheduleState(goalId, expectedRequest);
+      if (
+        selectedIdRef.current !== goalId ||
+        expectedRequest !== detailRequestId.current
+      ) {
+        return;
+      }
+      if (!readBack) {
+        scheduleOpsRef.current = {
+          ...scheduleOpsRef.current,
+          [job.id]: {
+            ...op,
+            phase: 'read-failed',
+            message: `The ${scheduleOpVerb(kind)} was accepted, but the authoritative schedule state could not be re-read. Showing the previous state; it may be stale.`,
+          },
+        };
+        setScheduleOps(scheduleOpsRef.current);
+        return;
+      }
+
+      const next = { ...scheduleOpsRef.current };
+      delete next[job.id];
+      scheduleOpsRef.current = next;
+      setScheduleOps(next);
+    },
+    [refreshScheduleState],
+  );
+
   const loadDetail = useCallback(async (id: string) => {
     // Bind this read to the selection generation. A response for an older
     // selection is discarded so it can never replace a newer selected Goal.
@@ -145,6 +431,17 @@ export default function GoalsView() {
     // list selection never disagree; re-selecting the shown Goal is preserved.
     setDetail((prev) => (prev && prev.goal.id === id ? prev : null));
     setRuns((prev) => (prev.length > 0 ? [] : prev));
+    setCommitments((prev) => (prev.length > 0 ? [] : prev));
+    setSchedules((prev) => (prev.length > 0 ? [] : prev));
+    setActivations((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+    setCronRuns((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+    setInFlight((prev) => (prev.size > 0 ? new Set<string>() : prev));
+    setActivationErrors((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+    setRunErrors((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+    setScheduleReadError(null);
+    scheduleOpsRef.current = {};
+    setScheduleOps({});
+    setExpandedJob(null);
     try {
       const next = await invoke<GoalDetail>('goal_get', { id });
       if (request !== detailRequestId.current) return;
@@ -165,7 +462,10 @@ export default function GoalsView() {
       if (request !== detailRequestId.current) return;
       setRuns([]);
     }
-  }, []);
+    // Goal-linked Commitments and schedules are read from their own native
+    // authorities. Their read failures are reported in their own panels.
+    await loadGoalSupport(id, request);
+  }, [loadGoalSupport]);
 
   useEffect(() => {
     void fetchGoals();
@@ -209,8 +509,11 @@ export default function GoalsView() {
         id: goalId,
         toStatus: to,
       });
-      // A mutation supersedes any in-flight detail read.
+      // A mutation supersedes any in-flight detail read and any schedule
+      // readback bound to the previous generation.
       detailRequestId.current++;
+      scheduleOpsRef.current = {};
+      setScheduleOps({});
       if (selectedIdRef.current !== goalId) return;
       setDetail(next);
       await fetchGoals();
@@ -225,6 +528,12 @@ export default function GoalsView() {
 
   const inputCls =
     'px-3 py-2 text-sm rounded-lg bg-white/5 border border-white/10 text-bone placeholder:text-bone/30 focus:outline-none focus:border-accent/50';
+
+  const otherLinks = detail
+    ? detail.links.filter(
+        (link) => link.target_kind !== 'commitment' && link.target_kind !== 'cron_job',
+      )
+    : [];
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
@@ -457,16 +766,269 @@ export default function GoalsView() {
 
               <GlassCard className="p-4">
                 <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
-                  Linked records
+                  Goal-linked commitments
                 </div>
-                {detail.links.length === 0 ? (
+                {commitments.length === 0 ? (
                   <div className="text-sm text-bone/40 mt-1">
-                    No explicit association links yet. Goal-linked runs appear above once a turn is
-                    executed under this goal.
+                    No commitments are linked to this goal. Linking records attribution only;
+                    commitment completion is never treated as goal acceptance.
+                  </div>
+                ) : (
+                  <ul className="mt-2 space-y-2">
+                    {commitments.map((commitment) => (
+                      <li key={commitment.id} className="text-sm text-bone/80">
+                        <div className="flex items-center gap-2">
+                          <Pill variant={commitment.status === 'completed' ? 'success' : 'default'}>
+                            {commitment.status}
+                          </Pill>
+                          <span>{commitment.text}</span>
+                        </div>
+                        <div className="mt-1 text-[11px] text-bone/40 font-mono">
+                          {commitment.agent_id ? `agent ${commitment.agent_id} · ` : ''}
+                          {commitment.due ? `due ${commitment.due} · ` : ''}
+                          commitment {commitment.id}
+                          {commitment.completed_at ? ` · completed ${commitment.completed_at}` : ''}
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </GlassCard>
+
+              <GlassCard className="p-4">
+                <div className="flex items-start justify-between gap-2 flex-wrap">
+                  <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
+                    Goal-linked schedules
+                  </div>
+                  <div className="text-[11px] text-bone/40">
+                    A successful run is progress evidence, not goal acceptance.
+                  </div>
+                </div>
+                {scheduleReadError && (
+                  <div role="alert" className="mt-1 text-sm text-red-200">
+                    {scheduleReadError}
+                  </div>
+                )}
+                {schedules.length === 0 ? (
+                  <div className="text-sm text-bone/40 mt-1">
+                    No cron schedules are linked to this goal. Associating a job attributes its
+                    future activations to this objective; it does not grant permissions.
+                  </div>
+                ) : (
+                  <ul className="mt-2 space-y-3">
+                    {schedules.map((job) => {
+                      const op = scheduleOps[job.id];
+                      const running = inFlight.has(job.id);
+                      const jobActivations = activations[job.id] ?? [];
+                      const jobRuns = cronRuns[job.id] ?? [];
+                      const actionable = jobActivations.filter((a) =>
+                        ACTIONABLE_CLAIM_STATES.includes(a.claim_state),
+                      );
+                      const expanded = expandedJob === job.id;
+                      return (
+                        <li key={job.id} className="rounded-lg border border-white/10 p-3">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <StatusDot ok={job.enabled} warn={!job.enabled} />
+                            <span className="text-sm text-bone truncate">{job.name}</span>
+                            <Pill variant={job.enabled ? 'success' : 'default'}>
+                              {job.enabled ? 'enabled' : 'paused'}
+                            </Pill>
+                            {running && <Pill variant="info">running</Pill>}
+                          </div>
+                          <div className="mt-1 text-[11px] text-bone/40 font-mono">
+                            {job.schedule} · next {job.next_run ?? '—'} · last{' '}
+                            {job.last_run ?? 'never'} · {job.run_count} runs · agent {job.agent_id}
+                          </div>
+
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {job.enabled ? (
+                              <button
+                                type="button"
+                                aria-label={`Pause schedule ${job.name}`}
+                                disabled={op !== undefined}
+                                onClick={() => void runScheduleOp('pause', job)}
+                                className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                              >
+                                {op?.kind === 'pause' && op.phase === 'writing' ? 'Pausing…' : 'Pause'}
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                aria-label={`Resume schedule ${job.name}`}
+                                disabled={op !== undefined}
+                                onClick={() => void runScheduleOp('resume', job)}
+                                className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                              >
+                                {op?.kind === 'resume' && op.phase === 'writing' ? 'Resuming…' : 'Resume'}
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              aria-label={`Run schedule ${job.name} now`}
+                              title="Starts a new manual occurrence; this is not a replay of a prior activation."
+                              disabled={op !== undefined || running || !job.enabled}
+                              onClick={() => void runScheduleOp('run', job)}
+                              className="px-2 py-0.5 rounded-md border border-accent/40 text-xs text-accent/90 hover:bg-accent/10 disabled:opacity-40 transition-colors"
+                            >
+                              {op?.kind === 'run' && op.phase === 'writing' ? 'Starting…' : 'Run now'}
+                            </button>
+                            {running && (
+                              <button
+                                type="button"
+                                aria-label={`Cancel schedule ${job.name}`}
+                                disabled={op !== undefined}
+                                onClick={() => void runScheduleOp('cancel', job)}
+                                className="px-2 py-0.5 rounded-md border border-error/40 text-xs text-error/90 hover:bg-error/10 disabled:opacity-40 transition-colors"
+                              >
+                                {op?.kind === 'cancel' && op.phase === 'writing' ? 'Cancelling…' : 'Cancel'}
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="mt-1 text-[10px] text-bone/30">
+                            Pause stops future activations and requests cancellation of any in-flight
+                            run. Run now starts a new manual occurrence.
+                          </div>
+
+                          {op && op.phase === 'writing' && (
+                            <div role="status" className="mt-1.5 text-[11px] text-bone/40">
+                              {`${scheduleOpVerb(op.kind)} request accepted; confirming the authoritative schedule state…`}
+                            </div>
+                          )}
+                          {op && (op.phase === 'write-failed' || op.phase === 'read-failed') && (
+                            <div role="alert" className="mt-1.5 text-[11px] text-red-200">
+                              {op.message}
+                            </div>
+                          )}
+
+                          {actionable.length > 0 && (
+                            <div className="mt-2 space-y-1">
+                              {actionable.map((activation) => (
+                                <div
+                                  key={activation.activation_id}
+                                  role="alert"
+                                  className={cn(
+                                    'rounded-md border p-2 text-[11px]',
+                                    activation.claim_state === 'blocked'
+                                      ? 'border-error/30 bg-error/5 text-error'
+                                      : 'border-warning/30 bg-warning/5 text-warning',
+                                  )}
+                                >
+                                  <span className="font-semibold uppercase tracking-wider">
+                                    {actionableLabel(activation.claim_state)}
+                                  </span>
+                                  {activation.terminal_reason
+                                    ? `: ${activation.terminal_reason}`
+                                    : ''}
+                                  <div className="mt-0.5 text-bone/40 font-mono">
+                                    occurrence {activation.schedule_occurrence} ·{' '}
+                                    {activation.claimed_at}
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          <div className="mt-2">
+                            <button
+                              type="button"
+                              aria-expanded={expanded}
+                              onClick={() => setExpandedJob(expanded ? null : job.id)}
+                              className="text-[10px] font-mono text-bone/50 hover:text-bone transition-colors"
+                            >
+                              {expanded ? '▾' : '▸'} Activation history ({jobActivations.length})
+                            </button>
+                            {expanded && (
+                              <div className="mt-1.5 pl-2 border-l border-white/10 space-y-1.5">
+                                {activationErrors[job.id] && (
+                                  <div role="alert" className="text-[11px] text-red-200">
+                                    Activation history could not be read; it may be incomplete.
+                                  </div>
+                                )}
+                                {!activationErrors[job.id] && jobActivations.length === 0 && (
+                                  <div className="text-[11px] text-bone/40">
+                                    No activations recorded yet.
+                                  </div>
+                                )}
+                                {jobActivations.map((activation) => (
+                                  <div
+                                    key={activation.activation_id}
+                                    className="text-[11px] text-bone/70 font-mono"
+                                  >
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Pill variant={claimVariant(activation.claim_state)}>
+                                        {activation.claim_state}
+                                      </Pill>
+                                      <span>occ {activation.schedule_occurrence}</span>
+                                      <span className="text-bone/40">{activation.trigger_kind}</span>
+                                    </div>
+                                    <div className="text-bone/40">
+                                      claimed {activation.claimed_at}
+                                      {activation.dispatched_at
+                                        ? ` · dispatched ${activation.dispatched_at}`
+                                        : ''}
+                                      {activation.settled_at
+                                        ? ` · settled ${activation.settled_at}`
+                                        : ''}
+                                      {activation.run_id ? ` · run ${activation.run_id}` : ''}
+                                    </div>
+                                    {activation.terminal_reason && (
+                                      <div className="text-bone/60">
+                                        reason: {activation.terminal_reason}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mt-1">
+                                  Recent runs
+                                </div>
+                                {runErrors[job.id] && (
+                                  <div role="alert" className="text-[11px] text-red-200">
+                                    Run history could not be read; it may be incomplete.
+                                  </div>
+                                )}
+                                {!runErrors[job.id] && jobRuns.length === 0 && (
+                                  <div className="text-[11px] text-bone/40">No runs recorded yet.</div>
+                                )}
+                                {jobRuns.slice(0, 10).map((run) => (
+                                  <div key={run.id} className="text-[11px] text-bone/70 font-mono">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Pill variant={cronRunVariant(run.status)}>{run.status}</Pill>
+                                      <span>{run.started_at}</span>
+                                      {run.activation_id ? (
+                                        <span className="text-bone/40">act {run.activation_id}</span>
+                                      ) : null}
+                                    </div>
+                                    {run.terminal_reason && (
+                                      <div className="text-bone/60">reason: {run.terminal_reason}</div>
+                                    )}
+                                    {run.error && (
+                                      <div className="text-red-200/80 truncate">{run.error}</div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </GlassCard>
+
+              <GlassCard className="p-4">
+                <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
+                  Other linked records
+                </div>
+                {otherLinks.length === 0 ? (
+                  <div className="text-sm text-bone/40 mt-1">
+                    No other association links. Commitment and cron schedule links appear above;
+                    goal-linked runs appear above once a turn is executed under this goal.
                   </div>
                 ) : (
                   <ul className="mt-2 space-y-1.5">
-                    {detail.links.map((link) => (
+                    {otherLinks.map((link) => (
                       <li key={link.id} className="text-sm text-bone/70 font-mono">
                         {link.target_kind}: {link.target_id}
                       </li>
