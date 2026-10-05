@@ -31,6 +31,7 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `report_tables.py` | Markdown tables from all of the above. |
 | `run_rest.ps1` | The sequential, restart-safe chain that ran the speed lab and sampling sweeps. |
 | `drive-rescue/` | The SSD and D: diagnostics: SMART, openSeaChest self-test, chkdsk and Repair-Volume runs, the NVMe temperature logger and the guard. |
+| `remote/modal_flashnext.py`, `remote/flashnext_calib.py` | Qwen3.8-Flash-Next Coder expert usage on a Modal L40S: own-answer calibration (4 parallel slots), llama-imatrix, per-layer energy and routing summary. Results: `docs/superpowers/specs/2026-10-04-flashnext-expert-usage.md`. |
 
 **Lessons that shaped the code**
 
@@ -41,4 +42,7 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 - **Stack n-gram lookup on the model's own MTP head:** `--spec-type draft-mtp,ngram-mod`. That's 2.1–2.2× on Gemma and Qwen.
 - **For gpt-oss, drop the EAGLE3 draft and use `ngram-mod` alone.** The draft's VRAM forces extra expert layers onto single-channel RAM.
 - **Pruning gpt-oss: calibrate on its own transcripts.** Raw code removes the experts its reasoning needs.
+- **llama.cpp 836d571 has no `--no-mmap`.** Use `--load-mode none`. The old flag exits with "invalid argument", which looks like a load failure.
+- **PyPI `gguf` can't read ISTA's Flash-Next GGUFs** (Q2_0 = type 42). Put llama.cpp's own `gguf-py` first on `PYTHONPATH`.
+- **Energy kept is the pruning headroom test.** Already-pruned pools (ISTA's 256-of-512 Coder) are flat: 90% of energy needs 59% of the experts, against 35% for raw Qwen3.6.
 - **C:'s NVMe faults under heavy load.** Pause after multi-GB writes, keep RAM free so expert pages aren't re-read from it, and watch its temperature (`drive-rescue/ssd_watch.ps1`).

@@ -4,8 +4,10 @@ on an L40S 48 GB (2026-10-04; Novita had no GPUs, and Modal offers no RTX 5090).
     python -m modal run --detach scripts/moe-bench/remote/modal_flashnext.py
     python -m modal volume get flashnext results <local dir>
 
-- Image: CUDA 12.8 devel plus llama.cpp 836d57176 (the build behind every local result),
-  compiled for sm_89. The L40S is Ada, the same architecture as the RTX 4060 here.
+- Image: llama.cpp's official full-cuda image, b11382 (CUDA 12.8), pinned by digest. It is
+  one commit after 836d57176 = b11381, the build behind every local result, and that commit
+  only touches the WebGPU backend. Compiling 836d57176 on Modal's image builder ran at about
+  2% a minute (~50 min), so the prebuilt image replaced it.
 - The Coder GGUF pair (58.4 GB) downloads to the container's local disk on each run. The
   volume "flashnext" keeps the work: calib/ (transcripts, resumable), the imatrix, and
   results/ (expert-usage-summary.json and friends).
@@ -26,25 +28,20 @@ import time
 import modal
 
 REPO = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF"
-LLAMA_REF = "836d57176"
+# ghcr.io/ggml-org/llama.cpp:full-cuda as of 2026-10-04, linux/amd64 manifest (b11382, rev 11fe02151)
+LLAMA_IMAGE = "ghcr.io/ggml-org/llama.cpp@sha256:3e57be4957bb34ab46a7a5e18165177d1356ac5ffb7b9a553f5b74b1788d17a5"
 HERE = pathlib.Path(__file__).parent
 W = "/vol"
 MD = "/model"
 M = f"{MD}/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
-BIN = "/opt/llama.cpp/build/bin"
+BIN = "/app"
 RESIDENT = "--load-mode none --lazy-mode off"
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")  # 3.12: same prompt set as the local test
-    .apt_install("git", "build-essential", "curl", "libgomp1")
-    .pip_install("cmake", "huggingface_hub[hf_xet]", "gguf", "numpy")
-    .run_commands(
-        f"git clone -q https://github.com/ggml-org/llama.cpp /opt/llama.cpp && cd /opt/llama.cpp && git checkout -q {LLAMA_REF}",
-        "cd /opt/llama.cpp && cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DGGML_NATIVE=OFF "
-        "-DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined "
-        "&& cmake --build build -j$(nproc) --target llama-server llama-imatrix",
-    )
-    .env({"HF_XET_HIGH_PERFORMANCE": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1"})
+    modal.Image.from_registry(LLAMA_IMAGE, add_python="3.12")  # 3.12: same prompt set as the local test
+    .entrypoint([])
+    .pip_install("huggingface_hub[hf_xet]", "gguf", "numpy")
+    .env({"HF_XET_HIGH_PERFORMANCE": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1", "LD_LIBRARY_PATH": "/app"})
     .add_local_file(HERE / "flashnext_calib.py", "/opt/flashnext_calib.py")
 )
 vol = modal.Volume.from_name("flashnext", create_if_missing=True)
