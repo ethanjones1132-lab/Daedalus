@@ -129,15 +129,30 @@ type ScheduleOpPhase = 'writing' | 'write-failed' | 'read-failed';
 
 interface ScheduleOp {
   kind: ScheduleOpKind;
+  jobId: string;
   goalId: string;
   phase: ScheduleOpPhase;
   message?: string;
+  /**
+   * Immutable operation context captured at submission so the requested effect
+   * can be reconciled later without re-submitting. `expectedEnabled` is the
+   * enabled value a pause (false) or resume (true) must reach; the baseline
+   * activation/run ids and submission time let Run now require newly observed
+   * evidence after the action.
+   */
+  expectedEnabled?: boolean;
+  baselineActivationIds?: string[];
+  baselineRunIds?: string[];
+  submittedAt?: string;
 }
 
 /**
- * Result of an authoritative schedule read. `ok` additionally reports which
- * linked jobs had readable activation/run history, so a pending mutation is only
- * cleared when the readbacks relevant to that operation actually succeeded.
+ * Result of an authoritative schedule read. `ok` reports the observed enabled
+ * state, in-flight set, and the readable activation/run history per linked job,
+ * so a pending mutation is only cleared when the specific effect it requested is
+ * actually evidenced. Jobs whose history read failed are omitted from
+ * `activationsByJob`/`runsByJob` (their UI error flags remain set) so a missing
+ * key is unavailable, never an empty authoritative history.
  */
 type ScheduleRefreshResult =
   | { status: 'stale' }
@@ -145,8 +160,10 @@ type ScheduleRefreshResult =
   | {
       status: 'ok';
       linkedJobIds: Set<string>;
-      activationAvailable: Record<string, boolean>;
-      runAvailable: Record<string, boolean>;
+      enabledByJob: Record<string, boolean>;
+      inFlight: Set<string>;
+      activationsByJob: Record<string, CronActivation[]>;
+      runsByJob: Record<string, CronRunRecord[]>;
     };
 
 const TRANSITION_STATUSES = ['running', 'waiting_for_user', 'blocked', 'paused', 'failed', 'cancelled'];
@@ -216,25 +233,69 @@ function hasWritingScheduleOp(ops: Record<string, ScheduleOp>): boolean {
   return Object.values(ops).some((op) => op.phase === 'writing');
 }
 
+const hasOwn = (value: object, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key);
+
+function isAtOrAfter(timestamp: string | null | undefined, reference: number): boolean {
+  if (!timestamp) return false;
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) && parsed >= reference;
+}
+
 /**
- * Whether the authoritative readbacks relevant to one operation succeeded.
- * Pause/resume only depends on the native schedule list (its enabled state).
- * Run now depends on the activation and run history that would evidence the new
- * execution; cancel depends on the in-flight read (already required for an `ok`
- * result) plus that same activation/run history. A job missing from the linked
- * list cannot be confirmed and is treated as not reconcilable.
+ * Whether one operation's requested effect is evidenced by an authoritative
+ * readback. This is the single predicate applied both immediately after the
+ * command's readback and later by the read-only Refresh, so an uncertain op is
+ * only cleared when its own effect is observed:
+ *   * pause/resume — the job must now show the expected enabled value;
+ *   * run — activation and run history must be readable and show evidence newer
+ *     than the recorded baseline (or, when the baseline was unreadable before
+ *     submission, evidence at/after the recorded submission time);
+ *   * cancel — the tracked in-flight execution must now be absent, with history
+ *     still readable.
+ * A job missing from the linked list, or whose history was unreadable, is never
+ * treated as reconciled.
  */
-function relevantScheduleReadsOk(
-  kind: ScheduleOpKind,
-  jobId: string,
+function scheduleOpReconciled(
+  op: ScheduleOp,
   result: Extract<ScheduleRefreshResult, { status: 'ok' }>,
 ): boolean {
+  const jobId = op.jobId;
   if (!result.linkedJobIds.has(jobId)) return false;
-  if (kind === 'pause' || kind === 'resume') return true;
-  return (
-    result.activationAvailable[jobId] === true &&
-    result.runAvailable[jobId] === true
-  );
+
+  if (op.kind === 'pause' || op.kind === 'resume') {
+    return result.enabledByJob[jobId] === op.expectedEnabled;
+  }
+
+  // A missing key means the history read for that job was unavailable.
+  if (!hasOwn(result.activationsByJob, jobId) || !hasOwn(result.runsByJob, jobId)) {
+    return false;
+  }
+  const activations = result.activationsByJob[jobId];
+  const runs = result.runsByJob[jobId];
+
+  if (op.kind === 'run') {
+    if (op.baselineActivationIds !== undefined && op.baselineRunIds !== undefined) {
+      const newActivation = activations.some(
+        (activation) => !op.baselineActivationIds!.includes(activation.activation_id),
+      );
+      const newRun = runs.some((run) => !op.baselineRunIds!.includes(run.id));
+      return newActivation || newRun;
+    }
+    // No readable baseline before submission: only accept evidence that is newer
+    // than the recorded submission time.
+    if (!op.submittedAt) return false;
+    const submitted = Date.parse(op.submittedAt);
+    if (!Number.isFinite(submitted)) return false;
+    const newActivation = activations.some((activation) =>
+      isAtOrAfter(activation.claimed_at, submitted),
+    );
+    const newRun = runs.some((run) => isAtOrAfter(run.started_at, submitted));
+    return newActivation || newRun;
+  }
+
+  // cancel: the tracked in-flight execution must be gone after the refresh.
+  return !result.inFlight.has(jobId);
 }
 
 export default function GoalsView() {
@@ -276,6 +337,14 @@ export default function GoalsView() {
   const transitionPending = useRef(false);
   const scheduleOpsRef = useRef<Record<string, ScheduleOp>>({});
   const reconcilePending = useRef(false);
+  // Latest successfully-read history, used only to capture an immutable baseline
+  // before a Run now submission (or to detect that no baseline was available).
+  const historyRef = useRef<{
+    activations: Record<string, CronActivation[]>;
+    runs: Record<string, CronRunRecord[]>;
+    activationErrors: Record<string, boolean>;
+    runErrors: Record<string, boolean>;
+  }>({ activations: {}, runs: {}, activationErrors: {}, runErrors: {} });
 
   const fetchGoals = useCallback(async () => {
     const request = ++requestId.current;
@@ -334,13 +403,17 @@ export default function GoalsView() {
       if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
       const linked = jobs.filter((job) => job.goal_id === goalId);
       const linkedJobIds = new Set(linked.map((job) => job.id));
+      const enabledByJob: Record<string, boolean> = {};
       const nextActivations: Record<string, CronActivation[]> = {};
       const nextRuns: Record<string, CronRunRecord[]> = {};
       const nextActivationErrors: Record<string, boolean> = {};
       const nextRunErrors: Record<string, boolean> = {};
-      const activationAvailable: Record<string, boolean> = {};
-      const runAvailable: Record<string, boolean> = {};
+      // Only successfully-read histories appear here, so a missing key is an
+      // unavailable history rather than an authoritative empty list.
+      const observedActivations: Record<string, CronActivation[]> = {};
+      const observedRuns: Record<string, CronRunRecord[]> = {};
       for (const job of linked) {
+        enabledByJob[job.id] = job.enabled;
         try {
           const rows = await invoke<unknown>('get_cron_activations', {
             cronId: job.id,
@@ -348,17 +421,15 @@ export default function GoalsView() {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           if (Array.isArray(rows)) {
             nextActivations[job.id] = rows as CronActivation[];
-            activationAvailable[job.id] = true;
+            observedActivations[job.id] = rows as CronActivation[];
           } else {
             nextActivations[job.id] = [];
             nextActivationErrors[job.id] = true;
-            activationAvailable[job.id] = false;
           }
         } catch {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           nextActivations[job.id] = [];
           nextActivationErrors[job.id] = true;
-          activationAvailable[job.id] = false;
         }
         try {
           const rows = await invoke<unknown>('get_cron_runs', {
@@ -367,17 +438,15 @@ export default function GoalsView() {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           if (Array.isArray(rows)) {
             nextRuns[job.id] = rows as CronRunRecord[];
-            runAvailable[job.id] = true;
+            observedRuns[job.id] = rows as CronRunRecord[];
           } else {
             nextRuns[job.id] = [];
             nextRunErrors[job.id] = true;
-            runAvailable[job.id] = false;
           }
         } catch {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
           nextRuns[job.id] = [];
           nextRunErrors[job.id] = true;
-          runAvailable[job.id] = false;
         }
       }
       if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
@@ -389,7 +458,20 @@ export default function GoalsView() {
       setInFlight(new Set(flight));
       setScheduleUnavailable(false);
       setScheduleReadError(null);
-      return { status: 'ok', linkedJobIds, activationAvailable, runAvailable };
+      historyRef.current = {
+        activations: nextActivations,
+        runs: nextRuns,
+        activationErrors: nextActivationErrors,
+        runErrors: nextRunErrors,
+      };
+      return {
+        status: 'ok',
+        linkedJobIds,
+        enabledByJob,
+        inFlight: new Set(flight),
+        activationsByJob: observedActivations,
+        runsByJob: observedRuns,
+      };
     },
     [],
   );
@@ -420,19 +502,17 @@ export default function GoalsView() {
       return;
     }
     if (outcome.status === 'ok') {
-      // Clear a pending failed/uncertain operation only when the readback
-      // relevant to that operation succeeded. Pause/resume only needs the native
-      // job list (enabled state); run/cancel additionally need the activation and
-      // run history that would evidence the new or settled execution. An
-      // incomplete history readback leaves the operation uncertain and the
-      // controls disabled until a later successful reconciliation.
+      // Clear a pending failed/uncertain operation only when the readback shows
+      // that operation's own requested effect (see scheduleOpReconciled). An
+      // incomplete history or an unchanged effect leaves the operation uncertain
+      // and the controls disabled until a later successful reconciliation.
       const next: Record<string, ScheduleOp> = {};
       for (const [jobId, op] of Object.entries(scheduleOpsRef.current)) {
         if (op.phase === 'writing') {
           next[jobId] = op;
           continue;
         }
-        if (!relevantScheduleReadsOk(op.kind, jobId, outcome)) next[jobId] = op;
+        if (!scheduleOpReconciled(op, outcome)) next[jobId] = op;
       }
       scheduleOpsRef.current = next;
       setScheduleOps(next);
@@ -484,7 +564,38 @@ export default function GoalsView() {
       if (!goalId) return;
       if (scheduleOpsRef.current[job.id]) return;
       const expectedRequest = detailRequestId.current;
-      const op: ScheduleOp = { kind, goalId, phase: 'writing' };
+
+      // Capture immutable context so the requested effect can be reconciled
+      // later without re-submitting. A run baseline is only usable when both
+      // history reads were previously successful; otherwise the predicate
+      // requires evidence newer than the submission time.
+      const history = historyRef.current;
+      const baselineActivationIds =
+        history.activationErrors[job.id] !== true &&
+        Array.isArray(history.activations[job.id])
+          ? history.activations[job.id].map((activation) => activation.activation_id)
+          : undefined;
+      const baselineRunIds =
+        history.runErrors[job.id] !== true && Array.isArray(history.runs[job.id])
+          ? history.runs[job.id].map((run) => run.id)
+          : undefined;
+
+      const op: ScheduleOp = {
+        kind,
+        jobId: job.id,
+        goalId,
+        phase: 'writing',
+        ...(kind === 'pause' || kind === 'resume'
+          ? { expectedEnabled: kind === 'resume' }
+          : {}),
+        ...(kind === 'run'
+          ? {
+              baselineActivationIds,
+              baselineRunIds,
+              submittedAt: new Date().toISOString(),
+            }
+          : {}),
+      };
       scheduleOpsRef.current = { ...scheduleOpsRef.current, [job.id]: op };
       setScheduleOps(scheduleOpsRef.current);
 
@@ -560,17 +671,17 @@ export default function GoalsView() {
         setScheduleOps(scheduleOpsRef.current);
         return;
       }
-      if (!relevantScheduleReadsOk(kind, job.id, readBack)) {
-        // The schedule list was readable, but the specific evidence this
-        // operation depends on (a new run/activation, or settled cancellation
-        // history) could not be read. Keep the operation uncertain so the UI
-        // does not claim it succeeded on incomplete evidence.
+      if (!scheduleOpReconciled(op, readBack)) {
+        // The schedule list was readable, but the requested effect was not
+        // observed (e.g. still enabled after a pause, no new run/activation, or
+        // a still-tracked in-flight cancel). Keep the operation uncertain so the
+        // UI does not claim it succeeded without evidence.
         scheduleOpsRef.current = {
           ...scheduleOpsRef.current,
           [job.id]: {
             ...op,
             phase: 'read-failed',
-            message: `The ${scheduleOpVerb(kind)} was accepted, but the activation/run history needed to confirm it could not be read. Showing the previous state; it is stale. Use Refresh to reconcile the schedule status.`,
+            message: `The ${scheduleOpVerb(kind)} was accepted, but the native schedule state does not yet show its requested effect (for example, a still-enabled pause, no new run/activation, or a still-tracked cancel). Use Refresh to reconcile the schedule status.`,
           },
         };
         setScheduleOps(scheduleOpsRef.current);
@@ -611,6 +722,12 @@ export default function GoalsView() {
     reconcilePending.current = false;
     scheduleOpsRef.current = {};
     setScheduleOps({});
+    historyRef.current = {
+      activations: {},
+      runs: {},
+      activationErrors: {},
+      runErrors: {},
+    };
     setExpandedJob(null);
     try {
       const next = await invoke<GoalDetail>('goal_get', { id });
