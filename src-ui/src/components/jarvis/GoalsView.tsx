@@ -1208,7 +1208,7 @@ export default function GoalsView() {
 
                           {op && op.phase === 'writing' && (
                             <div role="status" className="mt-1.5 text-[11px] text-bone/40">
-                              {`${scheduleOpVerb(op.kind)} request accepted; confirming the authoritative schedule state…`}
+                              {'Submitting and confirming the authoritative schedule state…'}
                             </div>
                           )}
                           {op && (op.phase === 'write-failed' || op.phase === 'read-failed') && (
