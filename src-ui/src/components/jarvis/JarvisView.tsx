@@ -199,18 +199,21 @@ const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 // result is shown with a truthful pending notice. The finalizer is not retried.
 const MEMORY_FINALIZE_TIMEOUT_MS = 5_000;
 
-// Honest capture-status label. `saved` is shown only for a committed receipt
-// with saved_count > 0; nothing here is an assistant acknowledgement.
+// Honest, generic capture-status label. The projection states stay exactly
+// `saved|pending|unchanged|failed`; these small labels describe the capture
+// outcome without claiming that a factual memory row was created or that
+// durable state stayed unchanged (a goal replace/clear can change durable
+// continuity with saved_count 0 or with a null memory id).
 function captureStateLabel(view: CaptureStateView): string {
   switch (view.state) {
     case 'saved':
-      return `Memory saved (${view.savedCount})`;
+      return `Saved (${view.savedCount})`;
     case 'pending':
-      return 'Memory capture pending';
+      return 'Capture pending';
     case 'failed':
-      return 'Memory not saved';
+      return 'Capture failed';
     default:
-      return 'Memory unchanged';
+      return 'No new saved items';
   }
 }
 

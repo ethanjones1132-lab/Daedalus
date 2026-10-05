@@ -16,11 +16,15 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::json;
 
-use super::capture_contracts::{ActiveObjective, MemoryDerivedInvalidation, SessionContinuity};
+use super::capture_contracts::{
+    ActiveObjective, ContinuityMode, ContinuityPreview, ContinuitySetRequest,
+    MemoryDerivedInvalidation, SessionContinuity,
+};
 use super::contracts::{MemoryError, MemoryScope, MemoryScopeKind};
 use super::turn::{MemoryTurnTerminalStatus, PersistedMemoryTurn, PreparedMemorySelection};
-use super::{engine, scoped};
+use super::{capture, engine, scoped};
 
 /// Durable outbox row reconstructed during a drain. The namespaced
 /// `operation_id` key is rebuilt from the owning Session when it is sent.
@@ -81,6 +85,834 @@ pub fn read_session_continuity(
             revision: 1,
         }),
     }
+}
+
+// ── Phase 3.4 explicit objective continuity ─────────────────────────────────
+//
+// Objective state is controlled only by exact whole-message directives read
+// from the immutable saved user source. Ordinary text, corrections, questions,
+// failures, and assistant suggestions never replace or advance it. Preparation
+// previews an action ephemerally; only post-turn capture (or the explicit
+// gated setter) commits durable state.
+
+const CLEAR_DIRECTIVE: &str = "Clear active objective";
+const RESUME_DIRECTIVE: &str = "Continue active objective";
+const OBJECTIVE_PREFIX: &str = "Objective:";
+/// Bounded, wire-safe length for an operator continuity operation id.
+const MAX_OPERATION_ID_LEN: usize = 200;
+
+/// True when a public continuity operation id is nonempty, bounded, and safe in
+/// the native `session/<id>/operation/<id>` wire grammar: printable, no control
+/// characters, and no path/namespace separator (`/`, `\`). Rejecting an unsafe
+/// id BEFORE replay/cleanup prevents persisting an undrainable outbox payload
+/// and prevents a caller from controlling the wire namespace.
+fn valid_continuity_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.chars().count() <= MAX_OPERATION_ID_LEN
+        && operation_id
+            .chars()
+            .all(|c| !c.is_control() && c != '/' && c != '\\')
+}
+/// Content-safety boundary for a replacement objective, byte-identical to the
+/// scoped-memory content boundary.
+const MAX_OBJECTIVE_BYTES: usize = 4096;
+
+/// Parsed exact objective directive. `Invalid` leaves durable continuity
+/// unchanged; it exists so the capture path can record a bounded observable
+/// rejection without inventing authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveDirective {
+    Preserve,
+    Resume,
+    Replace(String),
+    Clear,
+    Invalid(String),
+}
+
+/// Parse only exact whole-message objective controls from the persisted user
+/// source. No case folding, keyword search, assistant text, or suffix trimming:
+/// for `Objective: <text>` the exact remaining raw bytes after the mandatory
+/// `Objective: ` delimiter are preserved verbatim (including meaningful leading
+/// or trailing whitespace). The payload may contain whitespace but must not be
+/// whitespace-only. `Clear active objective` and `Continue active objective`
+/// are matched as the exact whole saved message.
+pub fn parse_objective_directive(source: &str) -> ObjectiveDirective {
+    if source == CLEAR_DIRECTIVE {
+        return ObjectiveDirective::Clear;
+    }
+    if source == RESUME_DIRECTIVE {
+        return ObjectiveDirective::Resume;
+    }
+    let Some(rest) = source.strip_prefix(OBJECTIVE_PREFIX) else {
+        return ObjectiveDirective::Preserve;
+    };
+    let Some(payload) = rest.strip_prefix(' ') else {
+        return ObjectiveDirective::Invalid("malformed_objective".to_string());
+    };
+    if payload.trim().is_empty() {
+        return ObjectiveDirective::Invalid("empty_objective".to_string());
+    }
+    if payload.as_bytes().len() > MAX_OBJECTIVE_BYTES {
+        return ObjectiveDirective::Invalid("objective_too_large".to_string());
+    }
+    ObjectiveDirective::Replace(payload.to_string())
+}
+
+/// The `(created_at, rowid)` ordering key for one persisted message in a
+/// Session, or `None` when the row is gone. Used to prove an older recorded
+/// directive cannot undo a later explicitly accepted objective/clear.
+fn message_order_key(
+    conn: &Connection,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<(String, i64)>, MemoryError> {
+    conn.query_row(
+        "SELECT created_at, rowid FROM messages WHERE id = ? AND session_id = ?",
+        params![message_id, session_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .optional()
+    .map_err(MemoryError::from)
+}
+
+/// The highest `(created_at, rowid)` order key among all persisted messages of
+/// this Session (user and assistant), or `None` when the Session has no message
+/// rows. This is the exact "latest User order at call" the manual boundary
+/// freezes.
+fn latest_source_order_key(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(String, i64)>, MemoryError> {
+    conn.query_row(
+        "SELECT created_at, rowid FROM messages
+         WHERE session_id = ?
+         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        [session_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .optional()
+    .map_err(MemoryError::from)
+}
+
+/// Validate one persisted internal ordering key. A present highwater must carry
+/// a nonempty, parseable RFC3339 timestamp and a strictly positive rowid; a
+/// partially or corruptly written cursor/boundary fails closed (Err) rather than
+/// silently widening or dropping staleness protection.
+fn validate_order_key(created_at: &str, rowid: i64) -> Result<(), MemoryError> {
+    if created_at.trim().is_empty()
+        || DateTime::parse_from_rfc3339(created_at).is_err()
+        || rowid <= 0
+    {
+        return Err(MemoryError::storage_unavailable(
+            "Corrupt persisted continuity ordering key",
+        ));
+    }
+    Ok(())
+}
+
+/// A durable `(created_at, rowid)` highwater read from two internal cursor
+/// columns. `Err` on a partially-written boundary (one column present without
+/// the other), so corrupt metadata fails closed rather than silently widening
+/// or dropping staleness protection.
+fn read_highwater(
+    conn: &Connection,
+    session_id: &str,
+    created_col: &str,
+    rowid_col: &str,
+) -> Result<Option<(String, i64)>, MemoryError> {
+    let sql = format!(
+        "SELECT {created_col}, {rowid_col} FROM session_continuity WHERE session_id = ?"
+    );
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(&sql, [session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(MemoryError::from)?;
+    match row {
+        None => Ok(None),
+        Some((None, None)) => Ok(None),
+        Some((Some(created_at), Some(rowid))) => {
+            validate_order_key(&created_at, rowid)?;
+            Ok(Some((created_at, rowid)))
+        }
+        Some(_) => Err(MemoryError::storage_unavailable(format!(
+            "Corrupt persisted continuity highwater ({created_col})"
+        ))),
+    }
+}
+
+/// Read the previous action cursor including its recorded source id. All three
+/// cursor columns present with a nonempty source id is a complete cursor; all
+/// three NULL is the legitimate pre-Part-3.4 old row (no cursor). ANY partial
+/// set, or a present ordering key with an empty/absent source id, fails closed
+/// so corruption cannot silently drop staleness protection.
+fn read_action_cursor(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(Option<String>, String, i64)>, MemoryError> {
+    let row: Option<(Option<String>, Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT last_action_source_message_id, last_action_created_at, last_action_rowid
+             FROM session_continuity WHERE session_id = ?",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(MemoryError::from)?;
+    match row {
+        None => Ok(None),
+        // The whole old row: no cursor columns at all is legitimate.
+        Some((None, None, None)) => Ok(None),
+        Some((Some(source), Some(created_at), Some(rowid))) => {
+            if source.trim().is_empty() {
+                return Err(MemoryError::storage_unavailable(
+                    "Corrupt persisted continuity action cursor (empty source id)",
+                ));
+            }
+            validate_order_key(&created_at, rowid)?;
+            Ok(Some((Some(source), created_at, rowid)))
+        }
+        // Any other combination (partial set, key without source, source
+        // without key) is corrupt and must not fail open.
+        Some(_) => Err(MemoryError::storage_unavailable(
+            "Corrupt persisted continuity action cursor",
+        )),
+    }
+}
+
+/// Monotonic maximum of two `(created_at, rowid)` order keys. `rowid` is only a
+/// tie-breaker within one timestamp, so lexicographic timestamp comparison (the
+/// same relation `directive_is_stale` uses) is authoritative.
+fn max_order_key(
+    a: Option<(String, i64)>,
+    b: Option<(String, i64)>,
+) -> Option<(String, i64)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// The durable order key of the LAST accepted objective action (replace, clear,
+/// or explicit operator set). Read from the internal cursor columns, which
+/// survive a later clear (objective NULL) and removal of the recorded source
+/// row. A row created before Part 3.4 (cursor columns NULL) falls back to the
+/// active objective's source row when one still exists.
+fn action_order_cursor(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(String, i64)>, MemoryError> {
+    // Use the FULLY validated cursor read (all three columns, nonempty source),
+    // so preview/resolve/gate/commit/read/write all share one policy and a
+    // source-id-only corruption fails closed rather than falling back.
+    if let Some((_, created_at, rowid)) = read_action_cursor(conn, session_id)? {
+        return Ok(Some((created_at, rowid)));
+    }
+    let current = read_session_continuity(conn, session_id)?;
+    match current.active_objective {
+        Some(objective) => message_order_key(conn, session_id, &objective.source_message_id),
+        None => Ok(None),
+    }
+}
+
+/// The durable manual-operator highwater boundary, or `None` when no manual set
+/// has occurred (or a pre-Part-3.4 row lacks the columns).
+fn manual_boundary(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(String, i64)>, MemoryError> {
+    read_highwater(
+        conn,
+        session_id,
+        "manual_boundary_created_at",
+        "manual_boundary_rowid",
+    )
+}
+
+/// The single staleness policy shared by preview, resolve, cleanup planning and
+/// commit. A directive is stale when it is at OR BEFORE the last automatic
+/// objective action (a later objective/clear is already accepted) or at OR
+/// BEFORE a manual operator boundary (a manual choice may have deliberately
+/// picked an older source, and every source already recorded at that call is
+/// protected). A missing directive source row has no provable ordering, so it
+/// fails closed: the directive is treated as stale and never applied as a new
+/// current objective.
+pub(crate) fn directive_is_stale(
+    conn: &Connection,
+    session_id: &str,
+    directive_source_message_id: &str,
+) -> Result<bool, MemoryError> {
+    let Some(directive_key) = message_order_key(conn, session_id, directive_source_message_id)?
+    else {
+        return Ok(true);
+    };
+    if let Some(boundary) = manual_boundary(conn, session_id)? {
+        if directive_key <= boundary {
+            return Ok(true);
+        }
+    }
+    if let Some(cursor) = action_order_cursor(conn, session_id)? {
+        if directive_key <= cursor {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Build the effective (ephemeral) continuity snapshot for one turn without
+/// touching durable state. `None` means the private envelope omits continuity
+/// entirely: an ordinary message with no active objective and no objective
+/// action. A stale automatic replacement/clear previews `preserve` with the
+/// currently accepted snapshot and is never shown as a current replacement.
+pub fn preview_turn_continuity(
+    conn: &Connection,
+    session_id: &str,
+    source_message_id: &str,
+    turn_id: &str,
+    source_text: &str,
+) -> Result<Option<ContinuityPreview>, MemoryError> {
+    let current = read_session_continuity(conn, session_id)?;
+    let directive = parse_objective_directive(source_text);
+    let stale = matches!(
+        &directive,
+        ObjectiveDirective::Replace(_) | ObjectiveDirective::Clear
+    ) && directive_is_stale(conn, session_id, source_message_id)?;
+    Ok(preview_from(
+        &current,
+        source_message_id,
+        turn_id,
+        directive,
+        stale,
+    ))
+}
+
+fn preview_from(
+    current: &SessionContinuity,
+    source_message_id: &str,
+    turn_id: &str,
+    directive: ObjectiveDirective,
+    stale: bool,
+) -> Option<ContinuityPreview> {
+    if stale {
+        current.active_objective.as_ref()?;
+        return Some(ContinuityPreview {
+            snapshot: current.clone(),
+            mode: ContinuityMode::Preserve,
+        });
+    }
+    let mut snapshot = current.clone();
+    match directive {
+        ObjectiveDirective::Preserve | ObjectiveDirective::Invalid(_) => {
+            current.active_objective.as_ref()?;
+            Some(ContinuityPreview {
+                snapshot,
+                mode: ContinuityMode::Preserve,
+            })
+        }
+        ObjectiveDirective::Resume => {
+            current.active_objective.as_ref()?;
+            Some(ContinuityPreview {
+                snapshot,
+                mode: ContinuityMode::Resume,
+            })
+        }
+        ObjectiveDirective::Replace(text) => {
+            snapshot.active_objective = Some(ActiveObjective {
+                text,
+                source_message_id: source_message_id.to_string(),
+                source_turn_id: Some(turn_id.to_string()),
+                depends_on_memory_ids: Vec::new(),
+            });
+            snapshot.latest_turn_id = Some(turn_id.to_string());
+            Some(ContinuityPreview {
+                snapshot,
+                mode: ContinuityMode::Replace,
+            })
+        }
+        ObjectiveDirective::Clear => {
+            snapshot.active_objective = None;
+            snapshot.latest_turn_id = Some(turn_id.to_string());
+            Some(ContinuityPreview {
+                snapshot,
+                mode: ContinuityMode::Clear,
+            })
+        }
+    }
+}
+
+/// The truthful durable effect of the exact objective directive recorded on one
+/// turn. Used to build the single automatic capture operation receipt: resume
+/// and preserve produce no new operation; a stale older directive is observable
+/// but changes nothing; a malformed directive is a bounded pending rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveCommit {
+    None,
+    Saved,
+    Cleared,
+    Stale,
+    Malformed(String),
+}
+
+/// Classify the exact objective action for one immutable turn, including the
+/// durable staleness comparison. Never writes.
+pub fn resolve_objective_commit(
+    conn: &Connection,
+    turn: &PersistedMemoryTurn,
+) -> Result<ObjectiveCommit, MemoryError> {
+    let directive = parse_objective_directive(&turn.user_message);
+    let stale = match &directive {
+        ObjectiveDirective::Replace(_) | ObjectiveDirective::Clear => {
+            directive_is_stale(conn, &turn.session_id, &turn.source_message_id)?
+        }
+        _ => false,
+    };
+    Ok(match directive {
+        ObjectiveDirective::Preserve | ObjectiveDirective::Resume => ObjectiveCommit::None,
+        ObjectiveDirective::Invalid(reason) => ObjectiveCommit::Malformed(reason),
+        ObjectiveDirective::Replace(_) if !stale => ObjectiveCommit::Saved,
+        ObjectiveDirective::Clear if !stale => ObjectiveCommit::Cleared,
+        ObjectiveDirective::Replace(_) | ObjectiveDirective::Clear => ObjectiveCommit::Stale,
+    })
+}
+
+/// Upsert the durable continuity row and return the persisted result. The
+/// first real write is revision 2 (the no-row default is revision 1), and every
+/// write advances the revision so stale preparations are invalidated. A missing
+/// objective persists `NULL` (an explicit clear), never a fabricated source.
+/// `action_source_message_id` records the internal order cursor of the accepted
+/// action so a delayed older directive (including one after a later clear) can
+/// be rejected even if the source row is later removed. `set_manual_boundary`
+/// additionally freezes the manual-operator highwater at the latest message
+/// order currently present, so a manual choice of an older source cannot be
+/// undone by any already-recorded automatic directive (including one with the
+/// same source order). Both persisted ordering keys are MONOTONIC: a write can
+/// never lower a previously recorded action cursor or manual boundary, even
+/// when it chooses an old source or the newest message rows were deleted.
+fn write_session_continuity(
+    conn: &Connection,
+    session_id: &str,
+    objective: Option<&ActiveObjective>,
+    latest_turn_id: Option<&str>,
+    action_source_message_id: Option<&str>,
+    set_manual_boundary: bool,
+    now: DateTime<Utc>,
+) -> Result<SessionContinuity, MemoryError> {
+    let objective_json = match objective {
+        Some(objective) => Some(serde_json::to_string(objective).map_err(|_| {
+            MemoryError::storage_unavailable("Failed to serialize continuity objective")
+        })?),
+        None => None,
+    };
+    let previous_cursor = read_action_cursor(conn, session_id)?;
+    let previous_boundary = read_highwater(
+        conn,
+        session_id,
+        "manual_boundary_created_at",
+        "manual_boundary_rowid",
+    )?;
+    let candidate_cursor = match action_source_message_id {
+        Some(source_message_id) => message_order_key(conn, session_id, source_message_id)?
+            .map(|(created_at, rowid)| (Some(source_message_id.to_string()), created_at, rowid)),
+        None => None,
+    };
+    // Monotonic action cursor: advance only to a strictly newer source, never
+    // rewind to an older chosen source or drop the cursor when the source row
+    // was deleted.
+    let action_cursor: Option<(Option<String>, String, i64)> =
+        match (previous_cursor, candidate_cursor) {
+            (Some(prev), Some(cand)) => {
+                if (cand.1.clone(), cand.2) > (prev.1.clone(), prev.2) {
+                    Some(cand)
+                } else {
+                    Some(prev)
+                }
+            }
+            (Some(prev), None) => Some(prev),
+            (None, cand) => cand,
+        };
+    let (cursor_source, cursor_created_at, cursor_rowid) = match action_cursor {
+        Some((source, created_at, rowid)) => (source, Some(created_at), Some(rowid)),
+        None => (None, None, None),
+    };
+    // Monotonic manual boundary: a manual set after newer rows were removed
+    // must not lower the protected highwater.
+    let candidate_boundary = if set_manual_boundary {
+        latest_source_order_key(conn, session_id)?
+    } else {
+        None
+    };
+    let (boundary_created_at, boundary_rowid) =
+        match max_order_key(previous_boundary, candidate_boundary) {
+            Some((created_at, rowid)) => (Some(created_at), Some(rowid)),
+            None => (None, None),
+        };
+    conn.execute(
+        "INSERT INTO session_continuity
+             (session_id, active_objective_json, latest_turn_id, revision, updated_at,
+              last_action_source_message_id, last_action_created_at, last_action_rowid,
+              manual_boundary_created_at, manual_boundary_rowid)
+         VALUES (?, ?, ?, 2, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+             active_objective_json = excluded.active_objective_json,
+             latest_turn_id = excluded.latest_turn_id,
+             revision = session_continuity.revision + 1,
+             updated_at = excluded.updated_at,
+             last_action_source_message_id = excluded.last_action_source_message_id,
+             last_action_created_at = excluded.last_action_created_at,
+             last_action_rowid = excluded.last_action_rowid,
+             manual_boundary_created_at = excluded.manual_boundary_created_at,
+             manual_boundary_rowid = excluded.manual_boundary_rowid",
+        params![
+            session_id,
+            objective_json,
+            latest_turn_id,
+            now.to_rfc3339(),
+            cursor_source,
+            cursor_created_at,
+            cursor_rowid,
+            boundary_created_at,
+            boundary_rowid,
+        ],
+    )
+    .map_err(MemoryError::from)?;
+    read_session_continuity(conn, session_id)
+}
+
+/// Write one mandatory continuity audit event inside the caller's savepoint. A
+/// failed audit write propagates and rolls the whole continuity/receipt/ledger
+/// transaction back: an accepted objective change is never observable without
+/// its audit.
+fn write_continuity_audit(
+    conn: &Connection,
+    event_type: &str,
+    session_id: &str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+    reason: &str,
+) -> Result<(), MemoryError> {
+    engine::write_memory_event(
+        conn,
+        None,
+        event_type,
+        "memory_capture",
+        before,
+        after,
+        reason,
+        1.0,
+        Some(session_id),
+    )
+    .map_err(MemoryError::storage_unavailable)
+}
+
+/// Commit the exact objective action recorded on one immutable turn. Runs
+/// inside the capture savepoint (same outer transaction as receipt/ledger) and
+/// never opens its own ledger or mutation gate. An older directive that would
+/// undo a strictly later accepted objective/clear is recorded as stale and
+/// leaves durable state untouched. `resume` and `preserve` NEVER rewrite native
+/// objective state or advance the revision; `resume` is a Bun continuation mode
+/// and is recorded as an audit only.
+pub fn apply_turn_continuity(
+    conn: &Connection,
+    turn: &PersistedMemoryTurn,
+    now: DateTime<Utc>,
+) -> Result<SessionContinuity, MemoryError> {
+    let current = read_session_continuity(conn, &turn.session_id)?;
+    match parse_objective_directive(&turn.user_message) {
+        ObjectiveDirective::Preserve => Ok(current),
+        ObjectiveDirective::Invalid(reason) => {
+            write_continuity_audit(
+                conn,
+                "continuity_directive_invalid",
+                &turn.session_id,
+                None,
+                None,
+                &format!("Rejected malformed objective directive: {reason}"),
+            )?;
+            Ok(current)
+        }
+        ObjectiveDirective::Resume => {
+            if current.active_objective.is_none() {
+                return Ok(current);
+            }
+            write_continuity_audit(
+                conn,
+                "continuity_resume",
+                &turn.session_id,
+                Some(json!(current.active_objective)),
+                Some(json!(current.active_objective)),
+                "Active objective resumed for the current turn; stored objective preserved",
+            )?;
+            Ok(current)
+        }
+        ObjectiveDirective::Replace(text) => {
+            if directive_is_stale(conn, &turn.session_id, &turn.source_message_id)? {
+                write_continuity_audit(
+                    conn,
+                    "continuity_directive_stale",
+                    &turn.session_id,
+                    Some(json!(current.active_objective)),
+                    None,
+                    "Ignored older objective directive; a later objective action is already accepted",
+                )?;
+                return Ok(current);
+            }
+            let objective = ActiveObjective {
+                text,
+                source_message_id: turn.source_message_id.clone(),
+                source_turn_id: Some(turn.turn_id.clone()),
+                depends_on_memory_ids: Vec::new(),
+            };
+            let updated = write_session_continuity(
+                conn,
+                &turn.session_id,
+                Some(&objective),
+                Some(&turn.turn_id),
+                Some(&turn.source_message_id),
+                false,
+                now,
+            )?;
+            write_continuity_audit(
+                conn,
+                "continuity_set",
+                &turn.session_id,
+                Some(json!(current.active_objective)),
+                Some(json!(updated.active_objective)),
+                "Active objective replaced from exact saved user source",
+            )?;
+            Ok(updated)
+        }
+        ObjectiveDirective::Clear => {
+            if directive_is_stale(conn, &turn.session_id, &turn.source_message_id)? {
+                write_continuity_audit(
+                    conn,
+                    "continuity_directive_stale",
+                    &turn.session_id,
+                    Some(json!(current.active_objective)),
+                    None,
+                    "Ignored older clear directive; a later objective action is already accepted",
+                )?;
+                return Ok(current);
+            }
+            let updated = write_session_continuity(
+                conn,
+                &turn.session_id,
+                None,
+                Some(&turn.turn_id),
+                Some(&turn.source_message_id),
+                false,
+                now,
+            )?;
+            write_continuity_audit(
+                conn,
+                "continuity_clear",
+                &turn.session_id,
+                Some(json!(current.active_objective)),
+                None,
+                "Active objective cleared from exact saved user source",
+            )?;
+            Ok(updated)
+        }
+    }
+}
+
+/// Load the exact persisted source user message owned by this Session for the
+/// explicit continuity setter. A missing row, a non-user role, or a foreign
+/// Session is a typed failure; assistant text can never be objective source.
+fn load_source_user_content(
+    conn: &Connection,
+    session_id: &str,
+    source_message_id: &str,
+) -> Result<String, MemoryError> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT role, content FROM messages WHERE id = ? AND session_id = ?",
+            params![source_message_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(MemoryError::from)?;
+    let (role, content) = row.ok_or_else(|| {
+        MemoryError::invalid_payload("Objective source message is not persisted in this Session")
+    })?;
+    if role != "user" {
+        return Err(MemoryError::invalid_payload(
+            "Objective source must be a persisted user-role message",
+        ));
+    }
+    Ok(content)
+}
+
+/// Validate an explicit continuity set against expected revision and exact
+/// persisted source. Read-only: the durable write and ledger happen inside the
+/// gated mutation.
+pub fn validate_continuity_set(
+    conn: &Connection,
+    request: &ContinuitySetRequest,
+) -> Result<(), MemoryError> {
+    if !valid_continuity_operation_id(&request.operation_id) {
+        return Err(MemoryError::invalid_payload(
+            "Continuity operation id must be a bounded, wire-safe, nonempty id",
+        ));
+    }
+    if request.expected_revision < 1 {
+        return Err(MemoryError::invalid_payload(
+            "Continuity expected revision must be positive",
+        ));
+    }
+    let current = read_session_continuity(conn, &request.session_id)?;
+    if current.revision != request.expected_revision {
+        return Err(MemoryError::revision_conflict(
+            "Continuity revision no longer matches the expected revision",
+        ));
+    }
+    let source = load_source_user_content(conn, &request.session_id, &request.source_message_id)?;
+    match &request.objective {
+        Some(text) => {
+            if text.trim().is_empty() || !source.contains(text) {
+                return Err(MemoryError::invalid_payload(
+                    "Objective must be a nonempty exact substring of the saved user source",
+                ));
+            }
+            if text.as_bytes().len() > MAX_OBJECTIVE_BYTES {
+                return Err(MemoryError::invalid_payload(
+                    "Objective exceeds the content-safety boundary",
+                ));
+            }
+        }
+        None => {
+            if source != CLEAR_DIRECTIVE {
+                return Err(MemoryError::invalid_payload(
+                    "Clear requires the exact saved user content `Clear active objective`",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Canonical payload hash for the explicit setter. Includes the EXACT persisted
+/// user source bytes so a deleted/role-changed/edited source can never replay a
+/// previously saved objective. `source` is `None` only when the source row is
+/// missing or no longer user-role; that sentinel can never match a stored hash,
+/// so any existing ledger row becomes an observable `operation_conflict`.
+fn continuity_operation_hash(request: &ContinuitySetRequest, source: Option<&str>) -> String {
+    capture::hash_parts(vec![
+        json!("set_session_continuity"),
+        json!(request.session_id),
+        json!(request.expected_revision),
+        json!(request.source_message_id),
+        json!(request.objective),
+        json!(request.operation_id),
+        json!(source),
+    ])
+}
+
+/// Exact canonical replay for the explicit continuity setter. Loads and
+/// revalidates the exact same-Session persisted USER source first (without
+/// checking the expected revision), then replays only when the stored hash
+/// matches. `None` when no ledger row exists; a same-identity/different-payload
+/// retry is `operation_conflict`. Never writes and never submits to the
+/// mutation.
+pub fn replay_session_continuity_set(
+    conn: &Connection,
+    request: &ContinuitySetRequest,
+) -> Result<Option<SessionContinuity>, MemoryError> {
+    // Validate the wire-safe operation id BEFORE any ledger replay/cleanup. An
+    // unsafe id must never reach the ledger lookup or the derived gate; the
+    // expected revision remains a NEW-operation-only check.
+    if !valid_continuity_operation_id(&request.operation_id) {
+        return Err(MemoryError::invalid_payload(
+            "Continuity operation id must be a bounded, wire-safe, nonempty id",
+        ));
+    }
+    let source = load_source_user_content(conn, &request.session_id, &request.source_message_id);
+    let payload_hash = continuity_operation_hash(request, source.as_deref().ok());
+    capture::replay_ledger::<SessionContinuity>(
+        conn,
+        &request.session_id,
+        &request.operation_id,
+        &payload_hash,
+    )
+}
+
+/// Explicit operator continuity set. Revalidates the exact persisted user
+/// source and (for a NEW operation only) the expected revision, then atomically
+/// persists the objective/clear and records the original response in the
+/// Session operation ledger. The caller holds the Phase 3.2 derived mutation
+/// gate; this helper opens only a nested savepoint.
+pub fn set_session_continuity(
+    conn: &Connection,
+    request: ContinuitySetRequest,
+    now: DateTime<Utc>,
+) -> Result<SessionContinuity, MemoryError> {
+    // Validate the wire-safe operation id BEFORE any ledger replay/cleanup so an
+    // unsafe id can never be persisted into the `session/<id>/operation/<id>`
+    // wire namespace. The expected revision stays NEW-operation-only.
+    if !valid_continuity_operation_id(&request.operation_id) {
+        return Err(MemoryError::invalid_payload(
+            "Continuity operation id must be a bounded, wire-safe, nonempty id",
+        ));
+    }
+    scoped::with_memory_savepoint(conn, |conn| {
+        let source =
+            load_source_user_content(conn, &request.session_id, &request.source_message_id);
+        let payload_hash = continuity_operation_hash(&request, source.as_deref().ok());
+        if let Some(prior) = capture::replay_ledger::<SessionContinuity>(
+            conn,
+            &request.session_id,
+            &request.operation_id,
+            &payload_hash,
+        )? {
+            return Ok(prior);
+        }
+        // NEW operation: a valid persisted user source and the exact expected
+        // revision are both required before any durable write.
+        let _source = source?;
+        validate_continuity_set(conn, &request)?;
+        let objective = match &request.objective {
+            Some(text) => Some(ActiveObjective {
+                text: text.clone(),
+                source_message_id: request.source_message_id.clone(),
+                source_turn_id: None,
+                depends_on_memory_ids: Vec::new(),
+            }),
+            None => None,
+        };
+        let current = read_session_continuity(conn, &request.session_id)?;
+        // A manual operator set is authoritative: freeze a highwater at the
+        // latest message order present now so every already-recorded source
+        // (including the chosen one) is protected from later automatic turns.
+        let updated = write_session_continuity(
+            conn,
+            &request.session_id,
+            objective.as_ref(),
+            None,
+            Some(&request.source_message_id),
+            true,
+            now,
+        )?;
+        write_continuity_audit(
+            conn,
+            if objective.is_some() {
+                "continuity_set"
+            } else {
+                "continuity_clear"
+            },
+            &request.session_id,
+            Some(json!(current.active_objective)),
+            Some(json!(updated.active_objective)),
+            "Explicit operator continuity action",
+        )?;
+        capture::ledger_put(
+            conn,
+            &request.session_id,
+            &request.operation_id,
+            &payload_hash,
+            &updated,
+            now,
+        )?;
+        Ok(updated)
+    })
 }
 
 /// Resolve the actual owner Session of a persisted message, or `None` when the

@@ -2129,94 +2129,108 @@ pub fn apply_deferred_review(
     Ok((mem_changed, skill_changed))
 }
 
-/// Review a session: derive durable memories from session memory and
-/// message history, then apply them through the deferred review path.
-/// Returns a machine-readable review result and is safe to call multiple
-/// times (subsequent calls are idempotent at the memory layer).
+/// Review a session for operator inspection. Phase 3.4 makes this READ-ONLY
+/// with respect to learning: it never derives memories from the transcript or
+/// legacy summary, never runs deferred review/consolidation, and never mutates
+/// skills. It reports the accepted capture-receipt counts recorded by the Phase
+/// 3 capture lifecycle. The signature and command name remain compatible.
 pub fn review_session(conn: &Connection, session_id: &str) -> Result<Value, String> {
-    let sm = get_session_memory(conn, session_id)?;
+    use crate::jarvis::memory::capture_contracts::{CaptureOperationStatus, CaptureReceipt};
 
-    let mut memories: Vec<Value> = Vec::new();
-    if let Some(sm) = &sm {
-        if !sm.current_goal.trim().is_empty() {
-            memories.push(json!({
-                "title": "Session goal",
-                "content": sm.current_goal.clone(),
-                "category": "general",
-            }));
-        }
-        if !sm.summary.trim().is_empty() {
-            memories.push(json!({
-                "title": "Session summary",
-                "content": sm.summary.clone(),
-                "category": "general",
-            }));
-        }
-    }
-
-    // Pull any user messages as extra review signal, but keep the review small
-    // and deterministic.
-    let user_messages: Vec<String> = {
+    let mut receipts = 0i64;
+    // Truthful status-derived counts. `accepted_operations` counts the durable
+    // accepted statuses (Saved | Corrected | Forgotten) so a goal clear
+    // (Forgotten) is not missed. Pending and Blocked are excluded from
+    // `accepted_operations` and reported separately.
+    let mut accepted_operations = 0i64;
+    let mut pending_operations = 0i64;
+    let mut blocked_operations = 0i64;
+    {
         let mut stmt = conn
-            .prepare(
-                "SELECT content FROM messages
-                 WHERE session_id = ? AND role = 'user'
-                 ORDER BY created_at ASC LIMIT 20",
-            )
+            .prepare("SELECT receipt_json FROM memory_capture_receipts WHERE session_id = ?")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([session_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
-    let combined_user = user_messages
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !combined_user.is_empty() {
-        memories.push(json!({
-            "title": "User turns",
-            "content": truncate(&combined_user, 1200),
-            "category": "user",
-        }));
+        for row in rows {
+            let raw = row.map_err(|e| e.to_string())?;
+            receipts += 1;
+            // A persisted receipt is CHECK(json_valid) and typed; a row that no
+            // longer decodes is corrupt storage and must fail closed, never be
+            // silently skipped or undercounted.
+            let receipt: CaptureReceipt = serde_json::from_str(&raw).map_err(|_| {
+                "corrupt persisted capture receipt in review_session".to_string()
+            })?;
+            // Validate the typed receipt before trusting its counts: the receipt
+            // must belong to the requested Session, carry a nonempty turn id and
+            // unique nonempty operation ids, use positive revisions, and its
+            // stored `saved_count`/`pending_count` must agree with the statuses
+            // it contains. A disagreement is corrupt storage, not a number to
+            // report, so it propagates as a failure.
+            if receipt.session_id != session_id {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            if receipt.turn_id.trim().is_empty() {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            if receipt.store_revision < 1 || receipt.continuity_revision < 1 {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            let mut operation_ids = std::collections::HashSet::new();
+            let mut saved_statuses = 0usize;
+            let mut pending_statuses = 0usize;
+            for operation in &receipt.operations {
+                if operation.operation_id.trim().is_empty()
+                    || !operation_ids.insert(operation.operation_id.as_str())
+                {
+                    return Err("corrupt persisted capture receipt in review_session".to_string());
+                }
+                match operation.status {
+                    CaptureOperationStatus::Saved | CaptureOperationStatus::Corrected => {
+                        saved_statuses += 1;
+                        accepted_operations += 1;
+                    }
+                    CaptureOperationStatus::Forgotten => {
+                        accepted_operations += 1;
+                    }
+                    CaptureOperationStatus::Pending => {
+                        pending_statuses += 1;
+                        pending_operations += 1;
+                    }
+                    CaptureOperationStatus::Blocked => {
+                        blocked_operations += 1;
+                    }
+                }
+            }
+            if receipt.saved_count != saved_statuses || receipt.pending_count != pending_statuses {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+        }
     }
-
-    if memories.is_empty() {
-        return Ok(json!({
-            "reviewed": true,
-            "session_id": session_id,
-            "memories_created": 0,
-            "skills_updated": 0,
-            "note": "no reviewable content",
-        }));
-    }
-
-    let review_json = json!({ "memories": memories, "skill_updates": [] });
-    let (mem_changed, skill_changed) =
-        apply_deferred_review(conn, session_id, &review_json.to_string())?;
-
     Ok(json!({
         "reviewed": true,
         "session_id": session_id,
-        "memories_created": mem_changed,
-        "skills_updated": skill_changed,
+        "memories_created": 0,
+        "skills_updated": 0,
+        "capture_receipts": receipts,
+        "accepted_operations": accepted_operations,
+        "pending_operations": pending_operations,
+        "blocked_operations": blocked_operations,
     }))
 }
 
-/// Session-end flush: commit any pending state. Called when a session
-/// ends (/new, app shutdown, context compression).
+/// Session-end flush. Phase 3.4 resets ONLY review bookkeeping; it preserves
+/// active typed continuity and runs no old housekeeping, summary extraction,
+/// consolidation, or skill/prompt-delta mutation. Recorded user instructions
+/// are captured by the turn/transport recovery path instead.
 pub fn commit_session_end(conn: &Connection, session_id: &str) -> Result<(), String> {
-    // Force a final consolidation pass
-    let _ = consolidate_memories(conn);
-    // Reset counter so next session starts fresh
     conn.execute(
-        "UPDATE session_memory SET turn_counter = 0, updated_at = ? WHERE session_id = ?",
+        "UPDATE session_memory
+         SET turn_counter = 0, last_review_at = NULL, updated_at = ?
+         WHERE session_id = ?",
         params![now(), session_id],
     )
-    .map_err(|e| format!("Failed to reset counter on session end: {}", e))?;
+    .map_err(|e| format!("Failed to reset review bookkeeping on session end: {}", e))?;
     Ok(())
 }
 

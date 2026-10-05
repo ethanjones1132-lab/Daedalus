@@ -6,6 +6,7 @@ import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
 import {
+  createTaskRun,
   resolveTaskRunTurn,
   setTaskPlan,
   type CreateTaskPlanItemInput,
@@ -80,10 +81,80 @@ export interface SessionMemoryState {
 export interface BeginTaskRunInput {
   message: string;
   requirement: TurnRequirement;
+  sessionId?: string;
   workspacePath?: string;
   sessionGrants?: string[];
   depth?: TaskRunDepth;
   estimatedComplexity?: "low" | "medium" | "high";
+  /**
+   * Optional private Phase 3.4 continuity action from the native envelope.
+   * Only the native registered envelope can supply this; HTTP-only callers
+   * cannot. When present it is consumed BEFORE the legacy heuristic objective
+   * replacement. Absent means ordinary behavior.
+   */
+  continuity?: ContinuityAction;
+}
+
+/** Native objective action Bun applies to TaskRun state. */
+export interface ContinuityAction {
+  mode: "preserve" | "resume" | "replace" | "clear";
+  /** Accepted active objective text, or null for a clear. */
+  objective: string | null;
+}
+
+/** The derived native objective text after neutralization. Reconstructed from
+ * the envelope/sanitized history, never from a persisted summary/current_goal. */
+const OBJECTIVE_NEUTRALIZED_MARKER = "[Memory source removed]";
+
+/**
+ * Internal continuation cue for an explicit native resume. It matches the
+ * existing narrow continuation-phrase list so `resolveTaskRunTurn` continues
+ * the stored run even when the accepted objective is long. It is never shown
+ * to the model: routing/inference use the accepted goal.
+ */
+const RESUME_CONTINUATION_CUE = "continue";
+
+/**
+ * Repair the objective text of a contract being resumed. A neutralized OR
+ * mismatching stored objective is replaced from the native accepted text; if
+ * the accepted text is unavailable the text is left neutralized and the plan is
+ * marked for textual reconstruction, retaining independent executed evidence.
+ * Never reconstructs from an old summary/current_goal.
+ */
+function repairObjectiveForResume(
+  contract: TaskRunContract,
+  accepted: string | null,
+): TaskRunContract {
+  const neutralized = contract.objective === OBJECTIVE_NEUTRALIZED_MARKER;
+  const mismatching = accepted != null && contract.objective !== accepted;
+  if (!neutralized && !mismatching) return contract;
+  if (accepted) {
+    // A mismatching, non-neutralized stored objective is a cached plan for a
+    // DIFFERENT goal (for example a previewed replacement whose capture
+    // failed). Neutralize its textual carriers BEFORE adopting the accepted
+    // objective so the old plan text/remaining work/outcome cannot masquerade
+    // as authority for the accepted goal, while independent executed evidence,
+    // ids, status, progress and grants are retained. An already-neutralized
+    // contract keeps its existing reconstruction marker.
+    const base = mismatching && !neutralized
+      ? neutralizeTaskRunTextualCarriers(contract)
+      : contract;
+    return {
+      ...base,
+      objective: accepted,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (neutralized) return contract;
+  // No accepted text and a mismatching objective: neutralize textual carriers
+  // (existing policy) while retaining independent executed evidence ids.
+  return {
+    ...contract,
+    objective: OBJECTIVE_NEUTRALIZED_MARKER,
+    remainingWork: [],
+    reconstruction: "reconstruction_required",
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 export interface RecordToolResultInput {
@@ -230,8 +301,43 @@ export class SessionMemory {
     return this.getSession(sessionId).taskRun;
   }
 
+  /**
+   * Resolve this turn's TaskRun contract, applying the native continuity action
+   * (when present) BEFORE the legacy heuristic.
+   *
+   * - `preserve`: a genuinely independent ephemeral question contract built
+   *   from the CURRENT question; the stored TaskRun is byte/field unchanged.
+   * - `resume`: existing continuation using the native ACCEPTED objective (never
+   *   the literal "Continue active objective" phrase), persisted normally.
+   * - `replace`/`clear`: an explicit objective boundary for the current task
+   *   only, taken BEFORE the legacy resolver so a heuristic continuation cannot
+   *   retain the old task/plan.
+   * - absent: exact legacy behavior (resolveTaskRunTurn), persisted.
+   */
   beginTaskRun(sessionId: string, input: BeginTaskRunInput): TaskRunContract {
     const session = this.getSession(sessionId);
+    const continuity = input.continuity;
+    if (continuity?.mode === "preserve") {
+      // Ephemeral only. The stored TaskRun must not change at all.
+      return this.ephemeralQuestionContract(input);
+    }
+    if (continuity?.mode === "resume") {
+      const next = this.resumeTaskRun(session, input, continuity);
+      session.taskRun = next;
+      session.lastActiveAt = Date.now();
+      this.persist(session);
+      return next;
+    }
+    if (continuity?.mode === "replace" || continuity?.mode === "clear") {
+      const next = applyContinuityBoundary(
+        this.boundaryBaseContract(session, input),
+        continuity,
+      );
+      session.taskRun = next;
+      session.lastActiveAt = Date.now();
+      this.persist(session);
+      return next;
+    }
     const resolved = resolveTaskRunTurn(
       session.taskRun,
       input.message,
@@ -244,7 +350,7 @@ export class SessionMemory {
         estimatedComplexity: input.estimatedComplexity,
       },
     );
-    session.taskRun = {
+    const next = {
       ...resolved.contract,
       workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
       ...(resolved.isContinuation
@@ -255,9 +361,124 @@ export class SessionMemory {
           }),
       updatedAt: new Date().toISOString(),
     };
+    session.taskRun = next;
     session.lastActiveAt = Date.now();
     this.persist(session);
-    return session.taskRun;
+    return next;
+  }
+
+  /**
+   * A genuinely independent ephemeral contract for a preserve side question.
+   * Fresh transient id, fresh empty plan/progress/evidence, question-only
+   * requirement/depth/writeIntent. Prior granted roots are carried as
+   * PERMISSION ONLY. Never persisted and never aliases the stored plan.
+   */
+  ephemeralQuestionContract(input: BeginTaskRunInput): TaskRunContract {
+    return createTaskRun({
+      taskRunId: `task_${crypto.randomUUID()}`,
+      sessionId: input.sessionId ?? "unknown",
+      objective: input.message,
+      workspacePath: input.workspacePath,
+      sessionGrants: input.sessionGrants,
+      requirement: input.requirement,
+      depth: input.depth ?? "standard",
+      estimatedComplexity: input.estimatedComplexity ?? "medium",
+    });
+  }
+
+  /**
+   * Resume the accepted goal using existing continuation semantics. The native
+   * accepted objective (not the literal phrase) is the effective input. A
+   * neutralized or mismatching stored objective is repaired from native text
+   * BEFORE routing. On a goal resume with no existing run, a fresh accepted-goal
+   * task is created with NO invented grants (prior granted roots only).
+   */
+  private resumeTaskRun(
+    session: SessionMemoryState,
+    input: BeginTaskRunInput,
+    continuity: ContinuityAction,
+  ): TaskRunContract {
+    const accepted = continuity.objective ?? null;
+    const stored = session.taskRun;
+    if (!stored) {
+      return createTaskRun({
+        taskRunId: `task_${crypto.randomUUID()}`,
+        sessionId: session.sessionId,
+        objective: accepted ?? input.message,
+        workspacePath: input.workspacePath,
+        sessionGrants: input.sessionGrants,
+        requirement: input.requirement,
+        depth: input.depth ?? "standard",
+        estimatedComplexity: input.estimatedComplexity ?? "medium",
+      });
+    }
+    // Repair a neutralized OR mismatching objective text from the native
+    // accepted text before routing. Never reconstruct from an old summary/
+    // current_goal. A mismatching plan/plan-text is treated as a textual
+    // reconstruction requirement per the existing neutralization policy while
+    // independent executed evidence is retained.
+    const repaired = repairObjectiveForResume(stored, accepted);
+    // Explicit resume ALWAYS continues the accepted goal. The legacy resolver
+    // only continues for a continuation cue or a short full-execution work
+    // order, so a longer accepted objective would silently mint a NEW TaskRun
+    // and lose the plan/ids/count/evidence. Force continuation by passing an
+    // INTERNAL cue and a base that is live (`status: "active"`), regardless of
+    // the stored terminal status. Routing/inference still use the accepted goal
+    // (not this cue).
+    const base: TaskRunContract = {
+      ...repaired,
+      status: "active",
+    };
+    const resolved = resolveTaskRunTurn(
+      base,
+      RESUME_CONTINUATION_CUE,
+      input.requirement,
+      {
+        sessionId: session.sessionId,
+        workspacePath: input.workspacePath,
+        sessionGrants: input.sessionGrants,
+        depth: input.depth,
+        estimatedComplexity: input.estimatedComplexity,
+      },
+    );
+    const next: TaskRunContract = {
+      ...resolved.contract,
+      // The accepted objective is authoritative regardless of continuation
+      // heuristics; never let the literal phrase/cue become the objective.
+      objective: accepted ?? resolved.contract.objective,
+      workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
+      status: "active",
+      updatedAt: new Date().toISOString(),
+    };
+    return next;
+  }
+
+  /**
+   * Base contract for an explicit replace/clear. Taken BEFORE the legacy
+   * resolver, and INTENTIONALLY fresh rather than spreading the stored
+   * contract: an explicit objective boundary must start a new task text/plan/
+   * progress boundary so the old task's execution intent (objective, depth,
+   * writeIntent, count, status, evidence) does not remain under an unrelated
+   * accepted goal. Independent Session caches (tool/file/check facts) live on
+   * `SessionMemoryState`, not here, and previously granted roots are retained
+   * as permission only. Historical execution evidence is NOT attributed to the
+   * new goal (`evidenceCount` resets).
+   */
+  private boundaryBaseContract(
+    session: SessionMemoryState,
+    input: BeginTaskRunInput,
+  ): TaskRunContract {
+    const stored = session.taskRun;
+    return createTaskRun({
+      taskRunId: stored?.taskRunId ?? `task_${crypto.randomUUID()}`,
+      sessionId: session.sessionId,
+      objective: input.message,
+      workspacePath: stored?.workspacePath ?? input.workspacePath,
+      sessionGrants: stored?.sessionGrants ?? input.sessionGrants,
+      requirement: input.requirement,
+      depth: input.depth ?? "standard",
+      estimatedComplexity: input.estimatedComplexity ?? "medium",
+    });
   }
 
   updateTaskRun(
@@ -296,6 +517,18 @@ export class SessionMemory {
     session.lastActiveAt = Date.now();
     this.persist(session);
     return session.taskRun;
+  }
+
+  /**
+   * Pure ephemeral planning for a preserve/resume side turn: seed this turn's
+   * contract from intake planning WITHOUT touching the durable TaskRun. Never
+   * persists or advances the stored plan/status/evidence/count.
+   */
+  beginTaskRunLocalPlanning(
+    contract: TaskRunContract,
+    planning: OwnedPlanningAttachment,
+  ): TaskRunContract {
+    return seedTaskPlanFromPlanning(contract, planning, {});
   }
 
   /** Replace the full TaskPlan ledger (planner-mediated validate, or reconstruction). */
@@ -887,6 +1120,52 @@ function shouldDiscardDerivedFact(fact: DiscoveredFactEntry): boolean {
 
 /** Exact neutral marker for any future model-facing suppressed carrier. */
 const MEMORY_SOURCE_REMOVED = "[Memory source removed]";
+
+/**
+ * Apply an explicit `replace`/`clear` objective boundary to a contract for the
+ * originating Session only. It never widens grants, adds scheduler behavior, or
+ * touches unrelated TaskRuns.
+ *
+ * - `replace`: set the accepted objective on the intentionally fresh base
+ *   (the old task's objective/depth/writeIntent/count/status/plan/evidence do
+ *   not carry into the new goal).
+ * - `clear`: STOP the old run as an active continuation so a later ordinary
+ *   "continue" cannot resurrect the cleared task, its neutral marker, or its
+ *   sticky write intent. Grants and independent Session caches are retained;
+ *   the run is terminal (`cancelled`) with no live plan.
+ */
+function applyContinuityBoundary(
+  contract: TaskRunContract,
+  continuity: ContinuityAction,
+): TaskRunContract {
+  if (continuity.mode === "replace") {
+    if (!continuity.objective) return contract;
+    return {
+      ...contract,
+      objective: continuity.objective,
+      status: "active",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (continuity.mode === "clear") {
+    return {
+      ...contract,
+      objective: OBJECTIVE_NEUTRALIZED_MARKER,
+      remainingWork: [],
+      reconstruction: "reconstruction_required",
+      plan: undefined,
+      // Stop the old run: a terminal status means it is no longer live, so a
+      // following ordinary continue cannot resume it or its sticky write
+      // intent. Independent Session caches/grants are retained.
+      status: "cancelled",
+      writeIntent: false,
+      lastOutcome: undefined,
+      lastTurnId: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return contract;
+}
 
 /**
  * Neutralize the stale textual carriers of a TaskRun until fresh sanitized

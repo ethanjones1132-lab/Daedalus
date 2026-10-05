@@ -16,9 +16,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::db::AppDb;
 use crate::jarvis::memory::capture::{self, UserMemoryOperation};
 use crate::jarvis::memory::capture_contracts::{
-    CaptureReceipt, CaptureReceiptsRequest, CaptureTurnRequest, CorrectionResult,
-    ForgetResult, MemoryDerivedInvalidation, NativeDerivedMutationPlan, ScopedCorrectRequest,
-    ScopedForgetRequest, StageProposalRequest,
+    CaptureReceipt, CaptureReceiptsRequest, CaptureTurnRequest, ContinuityReadRequest,
+    ContinuitySetRequest, CorrectionResult, ForgetResult, MemoryDerivedInvalidation,
+    NativeDerivedMutationPlan, ScopedCorrectRequest, ScopedForgetRequest, SessionContinuity,
+    StageProposalRequest,
 };
 use crate::jarvis::memory::contracts::{
     AuthorityKind, MemoryError, MemoryProvenance, MutationResult,
@@ -167,6 +168,63 @@ pub fn memory_capture_receipts(
 ) -> Result<Option<CaptureReceipt>, MemoryError> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     capture::read_capture_receipt(&conn, &request.session_id, &request.turn_id)
+}
+
+// ── Explicit continuity read/set (Phase 3.4) ────────────────────────────────
+//
+// `memory_continuity_read` is a pure SQLite read. `memory_continuity_set` is an
+// explicit operator action routed through the same derived-state gate as every
+// other semantic mutation; its exact canonical replay precedes cleanup.
+
+/// Read the structured continuity for one Session. Read-only: never mutates,
+/// invalidates, or performs HTTP.
+#[tauri::command]
+pub fn memory_continuity_read(
+    db: State<AppDb>,
+    request: ContinuityReadRequest,
+) -> Result<SessionContinuity, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    continuity::read_session_continuity(&conn, &request.session_id)
+}
+
+/// Explicitly set or clear the active objective. Validates expected continuity
+/// revision and exact saved user source BEFORE the gate, resolves an exact
+/// canonical replay without cleanup, and otherwise ACKs derived cleanup and
+/// commits the objective + ledger atomically under the operation mutex.
+#[tauri::command]
+pub async fn memory_continuity_set(
+    app: AppHandle,
+    request: ContinuitySetRequest,
+) -> Result<SessionContinuity, MemoryError> {
+    let session_id = request.session_id.clone();
+    let resolve_request = request.clone();
+    super::memory_turn::run_derived_gated_mutation_with_replay(
+        app,
+        session_id,
+        move |conn| {
+            if let Some(prior) = continuity::replay_session_continuity_set(conn, &resolve_request)? {
+                return Ok(transport::DerivedGatePlan::Replay(prior));
+            }
+            continuity::validate_continuity_set(conn, &resolve_request)?;
+            let affected_session_ids = continuity::collect_affected_session_ids(
+                conn,
+                &resolve_request.session_id,
+                None,
+                &[],
+            )?;
+            Ok(transport::DerivedGatePlan::Invalidate(NativeDerivedMutationPlan {
+                invalidation: MemoryDerivedInvalidation {
+                    operation_id: resolve_request.operation_id.clone(),
+                    affected_session_ids,
+                    memory_ids: Vec::new(),
+                    source_message_ids: Vec::new(),
+                },
+                scope: None,
+            }))
+        },
+        move |conn, _plan| continuity::set_session_continuity(conn, request, Utc::now()),
+    )
+    .await
 }
 
 /// Exact canonical replay for a manual correct/forget. Returns the persisted
@@ -407,17 +465,69 @@ pub struct RelayTurnFinalization {
 /// with NO HTTP cleanup and NO invalidation. Ordinary text and an ambiguous
 /// directive likewise persist the ledger receipt without cleanup. Only a valid
 /// accepted user write recomputes its exact affected ids for cleanup.
+/// Derived invalidation for an objective-only semantic change. Objective
+/// continuity is Session-local: only the originating Session is a derived-state
+/// consumer, and no memory or source ids are involved. It is still routed
+/// through the gate so unconsumed preparations are invalidated and the
+/// Session's derived prompt state is evicted before the new objective commits.
+fn objective_capture_invalidation(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<NativeDerivedMutationPlan, MemoryError> {
+    let affected_session_ids = continuity::collect_affected_session_ids(conn, session_id, None, &[])?;
+    Ok(NativeDerivedMutationPlan {
+        invalidation: MemoryDerivedInvalidation {
+            operation_id: format!("turn/{turn_id}/user/0"),
+            affected_session_ids,
+            memory_ids: Vec::new(),
+            source_message_ids: Vec::new(),
+        },
+        scope: None,
+    })
+}
+
 fn capture_gate_plan(
     conn: &Connection,
     session_id: &str,
     turn_id: &str,
 ) -> Result<transport::DerivedGatePlan<CaptureReceipt>, MemoryError> {
-    let persisted = turn::read_memory_turn(conn, session_id, turn_id)?;
+    // Validate the canonical immutable source tuple (source id/body/hash/role/
+    // session/terminal) BEFORE classification/cleanup. An invalid source or a
+    // conflicting terminal tuple is rejected here, so derived TaskRun state is
+    // never scrubbed for a capture that cannot commit. Read-only and identical
+    // to the mutation-path comparison.
+    let persisted = capture::validate_turn_source(conn, session_id, turn_id)?;
     if capture::read_capture_receipt(conn, session_id, turn_id)?.is_some() {
         let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
         return Ok(transport::DerivedGatePlan::Replay(receipt));
     }
-    match capture::parse_user_memory_operation(&persisted)? {
+    let directive = continuity::parse_objective_directive(&persisted.user_message);
+    // The objective namespace is EXCLUSIVE and is handled BEFORE any memory
+    // parser-derived cleanup. A recognized objective control must never select
+    // the memory-operation scope cleanup, even when the objective text itself
+    // contains memory grammar words (`Objective: Remember: ...`): the goal
+    // payload is inert DATA. A valid, nonstale replace/clear invalidates only
+    // the originating Session's derived state (scope `None`). Resume, invalid,
+    // and stale directives change nothing and go through the canonical capture
+    // replay/no-cleanup path.
+    if capture::is_objective_namespace_directive(&directive) {
+        let objective_is_semantic = match directive {
+            continuity::ObjectiveDirective::Replace(_) | continuity::ObjectiveDirective::Clear => {
+                !continuity::directive_is_stale(conn, session_id, &persisted.source_message_id)?
+            }
+            _ => false,
+        };
+        if objective_is_semantic {
+            return Ok(transport::DerivedGatePlan::Invalidate(
+                objective_capture_invalidation(conn, session_id, turn_id)?,
+            ));
+        }
+        let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
+        return Ok(transport::DerivedGatePlan::Replay(receipt));
+    }
+    let memory_op = capture::parse_user_memory_operation(&persisted)?;
+    match memory_op {
         None | Some(UserMemoryOperation::Pending { .. }) => {
             let receipt = capture::capture_recorded_turn(conn, &persisted, Utc::now())?;
             Ok(transport::DerivedGatePlan::Replay(receipt))

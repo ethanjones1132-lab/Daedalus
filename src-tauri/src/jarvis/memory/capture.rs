@@ -370,7 +370,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn hash_parts(parts: Vec<JsonValue>) -> String {
+pub(crate) fn hash_parts(parts: Vec<JsonValue>) -> String {
     let mut canonical = Vec::with_capacity(parts.len() + 1);
     canonical.push(JsonValue::String(CAPTURE_HASH_VERSION.to_string()));
     canonical.extend(parts);
@@ -552,7 +552,33 @@ fn terminal_tuple_hash(turn: &PersistedMemoryTurn) -> String {
     sha256_hex(serde_json::to_string(&value).unwrap_or_default().as_bytes())
 }
 
-fn operation_payload_hash(
+/// Canonical continuity-action payload for an explicit objective control. The
+/// action mode, the exact saved source message id/hash, and the exact objective
+/// text (for a replacement) participate; outcome, timestamps, and the resulting
+/// revision do not.
+fn objective_action_payload(
+    turn: &PersistedMemoryTurn,
+    directive: &continuity::ObjectiveDirective,
+) -> JsonValue {
+    let (mode, text) = match directive {
+        continuity::ObjectiveDirective::Preserve => ("preserve", None),
+        continuity::ObjectiveDirective::Resume => ("resume", None),
+        continuity::ObjectiveDirective::Clear => ("clear", None),
+        continuity::ObjectiveDirective::Replace(text) => ("replace", Some(text.as_str())),
+        continuity::ObjectiveDirective::Invalid(reason) => ("invalid", Some(reason.as_str())),
+    };
+    json!({
+        "mode": mode,
+        "text": text,
+        "source_message_id": turn.source_message_id,
+        "message_hash": turn.message_hash,
+    })
+}
+
+/// The EXACT Phase 3.1–3.3 payload hash. Byte-identical for ordinary messages,
+/// every memory operation, and preserve, so all existing ledger rows and
+/// receipts continue to replay unchanged after the Part 3.4 upgrade.
+fn legacy_operation_payload_hash(
     turn: &PersistedMemoryTurn,
     parsed: &Option<UserMemoryOperation>,
 ) -> String {
@@ -600,6 +626,30 @@ fn operation_payload_hash(
     }
 }
 
+/// The automatic capture payload hash. Ordinary, preserve, and malformed turns
+/// keep the EXACT legacy hash; only explicit objective controls (replace, clear,
+/// resume) extend it with the canonical objective-action payload. This keeps
+/// legacy no-op receipts replayable while making a genuine objective change
+/// distinguishable from an old no-op.
+fn operation_payload_hash(
+    turn: &PersistedMemoryTurn,
+    parsed: &Option<UserMemoryOperation>,
+    directive: &continuity::ObjectiveDirective,
+) -> String {
+    match directive {
+        continuity::ObjectiveDirective::Replace(_)
+        | continuity::ObjectiveDirective::Clear
+        | continuity::ObjectiveDirective::Resume => hash_parts(vec![
+            json!("capture_objective"),
+            json!(legacy_operation_payload_hash(turn, parsed)),
+            objective_action_payload(turn, directive),
+        ]),
+        continuity::ObjectiveDirective::Preserve | continuity::ObjectiveDirective::Invalid(_) => {
+            legacy_operation_payload_hash(turn, parsed)
+        }
+    }
+}
+
 // ── Operation ledger ────────────────────────────────────────────────────────
 
 struct LedgerRow {
@@ -627,7 +677,7 @@ fn ledger_get(
     .map_err(MemoryError::from)
 }
 
-fn ledger_put<T: Serialize>(
+pub(crate) fn ledger_put<T: Serialize>(
     conn: &Connection,
     session_id: &str,
     operation_id: &str,
@@ -648,7 +698,7 @@ fn ledger_put<T: Serialize>(
     Ok(())
 }
 
-fn replay_ledger<T: DeserializeOwned>(
+pub(crate) fn replay_ledger<T: DeserializeOwned>(
     conn: &Connection,
     session_id: &str,
     operation_id: &str,
@@ -1026,6 +1076,69 @@ fn operation_receipt(
     }
 }
 
+/// Build the automatic objective operation receipt for one turn, or `None`
+/// when the recognized directive produces no operation. It shares the one
+/// `turn/<id>/user/0` operation slot and is persisted inside the same
+/// receipt/ledger savepoint; it NEVER creates a public setter ledger row.
+/// `resume` (and, defensively, `preserve`) add NO operation — never a
+/// permanently Pending capture; `replace` is a truthful Saved (objective, no
+/// memory id); `clear` a Forgotten; a stale older directive a Blocked; a
+/// malformed directive a bounded Pending rejection. A recognized objective
+/// namespace therefore yields at most one receipt.
+fn objective_operation_receipt(
+    operation_id: &str,
+    commit: &continuity::ObjectiveCommit,
+) -> Option<CaptureOperationReceipt> {
+    match commit {
+        // `resume` classifies to `None`: the stored objective is preserved and
+        // no durable capture operation exists, so no receipt is emitted.
+        continuity::ObjectiveCommit::None => None,
+        continuity::ObjectiveCommit::Saved => Some(operation_receipt(
+            operation_id,
+            CaptureOperationStatus::Saved,
+            None,
+            None,
+            Some("objective_saved".to_string()),
+        )),
+        continuity::ObjectiveCommit::Cleared => Some(operation_receipt(
+            operation_id,
+            CaptureOperationStatus::Forgotten,
+            None,
+            None,
+            Some("objective_cleared".to_string()),
+        )),
+        continuity::ObjectiveCommit::Stale => Some(operation_receipt(
+            operation_id,
+            CaptureOperationStatus::Blocked,
+            None,
+            None,
+            Some("objective_stale".to_string()),
+        )),
+        continuity::ObjectiveCommit::Malformed(_) => Some(operation_receipt(
+            operation_id,
+            CaptureOperationStatus::Pending,
+            None,
+            None,
+            Some("objective_bounded".to_string()),
+        )),
+    }
+}
+
+/// True when the exact message is an objective-namespace control (including a
+/// malformed one). The objective namespace EXCLUSIVE: such a message never runs
+/// the legacy `remember:`/`constraint:`/etc. memory grammar, so objective text
+/// that merely contains memory words is inert data and never a second operation
+/// on the same `turn/<id>/user/0` slot.
+pub(crate) fn is_objective_namespace_directive(directive: &continuity::ObjectiveDirective) -> bool {
+    matches!(
+        directive,
+        continuity::ObjectiveDirective::Replace(_)
+            | continuity::ObjectiveDirective::Clear
+            | continuity::ObjectiveDirective::Resume
+            | continuity::ObjectiveDirective::Invalid(_)
+    )
+}
+
 fn execute_capture_operation(
     conn: &Connection,
     turn: &PersistedMemoryTurn,
@@ -1269,7 +1382,7 @@ fn immutable_snapshot_json(turn: &PersistedMemoryTurn) -> JsonValue {
 /// helper caller can never supply fabricated terminal evidence, generation,
 /// timestamps, or selected ids. A legitimate in-gate race is handled by Part
 /// 3.2 re-reading the turn inside the mutation gate before calling this.
-fn revalidate_turn_snapshot(
+pub(crate) fn revalidate_turn_snapshot(
     conn: &Connection,
     turn: &PersistedMemoryTurn,
 ) -> Result<PersistedMemoryTurn, MemoryError> {
@@ -1306,6 +1419,22 @@ fn revalidate_turn_snapshot(
             "Capture source message no longer matches the persisted turn hash",
         )),
     }
+}
+
+/// Read the canonical persisted turn for one Session/turn and validate its
+/// IMMUTABLE source tuple (source id, body, hash, scope, terminal tuple) against
+/// the persisted row and the actual USER message role/hash. Read-only and
+/// non-mutating: used by the capture gate BEFORE classification/cleanup so an
+/// invalid source or conflicting tuple is rejected without first scrubbing
+/// derived TaskRun state. Reuses the same canonical comparison as the mutation
+/// path, so gate and mutation agree.
+pub(crate) fn validate_turn_source(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<PersistedMemoryTurn, MemoryError> {
+    let persisted = turn::read_memory_turn(conn, session_id, turn_id)?;
+    revalidate_turn_snapshot(conn, &persisted)
 }
 
 fn short_hash(hash: &str) -> &str {
@@ -1375,13 +1504,19 @@ pub fn capture_recorded_turn(
     let persisted = revalidate_turn_snapshot(conn, turn)?;
     let turn = &persisted;
     let parsed = parse_user_memory_operation(turn)?;
+    let directive = continuity::parse_objective_directive(&turn.user_message);
     let operation_id = format!("turn/{}/user/0", turn.turn_id);
     let terminal_hash = terminal_tuple_hash(turn);
-    let payload_hash = operation_payload_hash(turn, &parsed);
+    let legacy_hash = legacy_operation_payload_hash(turn, &parsed);
+    let payload_hash = operation_payload_hash(turn, &parsed, &directive);
 
-    // Ledger payload identity is checked before any replay.
+    // Ledger payload identity is checked before any replay. An EXACT legacy
+    // (pre-Part-3.4) hash for this canonical source/operation is accepted as a
+    // replay, so a previously captured legacy no-op for an exact Objective/
+    // Clear/Continue never conflicts merely because the parser learned
+    // objective directives. Any other mismatch remains `operation_conflict`.
     if let Some(row) = ledger_get(conn, &turn.session_id, &operation_id)? {
-        if row.payload_hash != payload_hash {
+        if row.payload_hash != payload_hash && row.payload_hash != legacy_hash {
             return Err(MemoryError::operation_conflict(
                 "Operation identity was reused with a different capture payload",
             ));
@@ -1443,9 +1578,20 @@ pub fn capture_recorded_turn(
             ));
         }
 
-        let operations = execute_capture_operation(conn, turn, &parsed, &operation_id, now)?;
-        let continuity_revision =
-            continuity::read_session_continuity(conn, &turn.session_id)?.revision;
+        // The objective namespace is EXCLUSIVE: a recognized objective control
+        // runs no legacy memory operation. `Objective: Support Remember: syntax`
+        // therefore never also executes the memory command on the same
+        // `turn/<id>/user/0` slot; objective payload words are inert DATA.
+        let operations = if is_objective_namespace_directive(&directive) {
+            let objective_commit = continuity::resolve_objective_commit(conn, turn)?;
+            objective_operation_receipt(&operation_id, &objective_commit)
+                .into_iter()
+                .collect()
+        } else {
+            execute_capture_operation(conn, turn, &parsed, &operation_id, now)?
+        };
+        let continuity_after = continuity::apply_turn_continuity(conn, turn, now)?;
+        let continuity_revision = continuity_after.revision;
         let store_revision = scoped::memory_store_revision(conn)?;
         let receipt = build_receipt(turn, operations, store_revision, continuity_revision);
         let initial_hash = if turn.terminal_status.is_some() {

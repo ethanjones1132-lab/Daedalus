@@ -1160,6 +1160,32 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             "TEXT NOT NULL DEFAULT '[]'",
         )?;
 
+        // Phase 3.4 internal action cursor. Records the stable `(created_at,
+        // rowid)` order key of the LAST accepted objective action (replace,
+        // clear, or explicit operator set), independent of whether an active
+        // objective still exists. A delayed older automatic directive is
+        // rejected by comparing its source order key against this cursor even
+        // after a later clear (which leaves `active_objective_json` NULL) and
+        // even if the recorded source message is later removed. This is internal
+        // durability only; it never widens the frozen public continuity DTOs.
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "last_action_source_message_id",
+            "TEXT",
+        )?;
+        add_column_if_missing(conn, "session_continuity", "last_action_created_at", "TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "last_action_rowid", "INTEGER")?;
+        // A manual operator set is a monotonic HIGHWATER boundary: every source
+        // already recorded when the operator acted (including one numerically
+        // equal to the chosen source) is protected from later automatic
+        // directives. Stored as the `(created_at,rowid)` key of the
+        // highest-order message present at the manual call. Automatic
+        // directives at or below this boundary are stale; only a source saved
+        // strictly after the boundary may change the objective.
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_created_at", "TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_rowid", "INTEGER")?;
+
         // Additive Part 3.2 outbox. Committed Part 3.1 already created
         // `memory_derived_invalidations` WITH a `REFERENCES sessions ON DELETE
         // CASCADE` FK; `CREATE TABLE IF NOT EXISTS` cannot remove it, so a

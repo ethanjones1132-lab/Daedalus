@@ -1686,6 +1686,8 @@ pub fn run() {
             memory_turn_diagnostic,
             memory_capture_turn,
             memory_capture_receipts,
+            memory_continuity_read,
+            memory_continuity_set,
             memory_scoped_correct,
             memory_scoped_forget,
             memory_stage_proposal,

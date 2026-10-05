@@ -176,7 +176,11 @@ import { extractDeltaText } from "./sse-delta";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
-import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
+import {
+  SessionMemory,
+  mergeSharedContextHints,
+  type ContinuityAction,
+} from "./orchestration/session-memory";
 import {
   AgentPool,
   firstTokenTimeoutFor,
@@ -1461,12 +1465,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // while real work remains.
   const writeTaskIntent = initialRequirement === "full_execution" &&
     (hasWriteIntent(message) || (priorTaskRunLive && priorTaskRun?.writeIntent === true));
-  const turnBudget = createTurnBudget(
-    initialRequirement,
-    deepTaskIntent || forcedDeepRead || writeTaskIntent ? "high" : "medium",
-    turnStartedAt,
-    { forcedDeepRead, deepTask: deepTaskIntent || writeTaskIntent },
-  );
+  // The turn budget is created AFTER the native continuity action is known
+  // (below), from the same effective requirement/depth/intent used to begin and
+  // route the turn — never a stored objective a side question must not use.
+  // `ensureTurnBudget` is a closure over this binding.
+  let turnBudget: ReturnType<typeof createTurnBudget>;
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
       throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
@@ -1489,7 +1492,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     turnHistory,
     cfg.jarvis_path,
   );
-  const turnSessionGrants = cfg.tools.grant_session_roots
+  // Roots named by the RAW current message. For an explicit native objective
+  // control (`Objective: ...`, clear, resume) the message text is CONTEXT, not
+  // a permission source: a goal may name arbitrary paths and must never create
+  // or widen session root grants. New roots from such a message are ignored;
+  // the stored run's prior granted roots remain valid permissions.
+  let turnSessionGrants = cfg.tools.grant_session_roots
     ? extractRootGrants(message)
     : [];
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
@@ -1564,20 +1572,140 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
   const streamLease = activeStreams.begin(sessionId);
   const streamAbort = streamLease.controller;
+  // Private Phase 3.4 continuity action from the native registered envelope.
+  // Only a consumed native envelope can populate TaskRun authority; HTTP-only
+  // callers cannot supply it.
+  const nativeContinuity = turnMemoryEnvelope?.continuity ?? undefined;
+  const continuityAction: ContinuityAction | undefined = nativeContinuity
+    ? {
+        mode: nativeContinuity.mode,
+        objective: nativeContinuity.snapshot.active_objective?.text ?? null,
+      }
+    : undefined;
+  // Effective requirement/objective must derive from the SAME effective turn
+  // contract used for routing so a side question/resume never computes the
+  // wrong budget or continuation from a stored objective it should not use.
+  //   - preserve: classify the CURRENT question independently (never inherit
+  //     the prior full_execution requirement or sticky deep/write intent).
+  //   - resume: use the accepted goal's continuation/prior requirement.
+  //   - replace/clear: accepted current goal, independent of prior heuristics.
+  //   - absent: existing continuation-aware resolution.
+  const continuityMode = continuityAction?.mode;
+  // A native objective control message can name arbitrary paths in its goal
+  // text. Ignore those new roots for ALL native continuity modes; existing
+  // prior grants on the stored run remain the only permissions (carried as
+  // permission only, never re-derived from the objective text).
+  if (continuityMode !== undefined) {
+    turnSessionGrants = priorTaskRun?.sessionGrants ?? [];
+  }
+  // A user QUESTION (preserve) legitimately narrows its own read allowlist via
+  // the existing resolver — keep it. An explicit goal control (replace/clear/
+  // resume) is context, not a workspace scope declaration: never let explicit
+  // paths inside the accepted goal text shape a read allowlist.
+  const effectiveWorkspaceReadScope =
+    continuityMode === "replace" || continuityMode === "clear" || continuityMode === "resume"
+      ? undefined
+      : workspaceReadScope;
+  // The effective user text every downstream inference boundary must use, so
+  // `resume` never feeds the literal "Continue active objective" and `replace`
+  // uses the accepted goal rather than the raw directive. `preserve` and
+  // `clear` use the current question. Never the literal directive phrase.
+  const effectiveUserMessage = continuityMode === "resume" || continuityMode === "replace"
+    ? (continuityAction?.objective ?? message)
+    : message;
+  // Rebind the execution message now that the ORIGINAL raw request has served
+  // registry consume, workspace boundary/grant derivation and source proof.
+  // Every later consumer (tool-intent detection, context-window optimization,
+  // web-search/CLI prompt assembly, acceptance input, repetition and routing)
+  // must see the accepted goal for a native resume/replace, never the literal
+  // directive text. Preserve/clear/ordinary are unchanged because
+  // `effectiveUserMessage` equals the original there. The original native
+  // source tuple/message-hash is never re-recorded or replaced.
+  message = effectiveUserMessage;
+  // Native-mode requirement classification. Every native mode classifies the
+  // EFFECTIVE user text with no inherited previous requirement: preserve uses
+  // the current question, replace uses the accepted goal, clear uses the
+  // current control command. Only a `resume` whose stored objective EXACTLY
+  // matches the native accepted objective may inherit the prior requirement/
+  // depth/writeIntent; a mismatched or neutralized stored goal (for example a
+  // failed capture of a previewed replacement) classifies the accepted goal on
+  // its own instead of resuming an unrelated plan.
+  const matchingResume = continuityMode === "resume"
+    && priorTaskRun !== undefined
+    && continuityAction?.objective != null
+    && priorTaskRun.objective === continuityAction.objective;
+  const ownRequirement =
+    resolveTurnRequirement(effectiveUserMessage, undefined, false).result.requirement;
+  const effectiveRequirement = continuityMode === undefined
+    ? initialResolvedRequirement.result.requirement
+    : matchingResume
+      ? (priorTaskRun?.requirement ?? ownRequirement)
+      : ownRequirement;
+  // `preserve` and `clear` run this turn's pipeline against a LOCAL contract so
+  // completion/planning writers cannot reactivate a cleared boundary or touch
+  // the stored task. `resume`/`replace` persist normally.
+  const continuityLocalTaskRun =
+    continuityMode === "preserve" || continuityMode === "clear";
+  // Deep/write/forced-deep intent come from the EFFECTIVE task for every native
+  // mode. Only a matching resume may inherit the prior depth/writeIntent; a
+  // preserve side question, an explicit replace and a clear never inherit the
+  // stored sticky flags, but do classify their own request (which may itself be
+  // a deep read or a write).
+  const effectiveForcedDeepRead = continuityMode === undefined
+    ? forcedDeepRead
+    : FORCE_DEEP_READ_PATTERN.test(effectiveUserMessage);
+  const effectiveDeepTaskIntent = continuityMode === undefined
+    ? deepTaskIntent
+    : resolveDeepReadIntent(
+        effectiveUserMessage,
+        matchingResume ? priorTaskRun?.depth : undefined,
+      );
+  const effectiveWriteTaskIntent = continuityMode === undefined
+    ? writeTaskIntent
+    : effectiveRequirement === "full_execution" &&
+      (hasWriteIntent(effectiveUserMessage)
+        || (matchingResume && priorTaskRun?.writeIntent === true));
+  // Rebuild the budget from the ACTUAL effective values so begin depth, route
+  // requirement and budget agree. A native goal control can change the deep/
+  // write tier even when the requirement string is unchanged. The ordinary
+  // (no-continuity) path passes identical values, so its budget is unchanged.
+  turnBudget = createTurnBudget(
+    effectiveRequirement,
+    effectiveDeepTaskIntent || effectiveForcedDeepRead || effectiveWriteTaskIntent ? "high" : "medium",
+    turnStartedAt,
+    { forcedDeepRead: effectiveForcedDeepRead, deepTask: effectiveDeepTaskIntent || effectiveWriteTaskIntent },
+  );
   let activeTaskRun: TaskRunContract;
   try {
-    activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
-      message,
-      requirement: initialResolvedRequirement.result.requirement,
+    // Depth is classified from the effective task: preserve/clear/replace use
+    // the current message or accepted goal independently, never the stored
+    // deep-task depth. Only a matching resume may keep the accepted goal's
+    // depth.
+    const beginDepth = effectiveDeepTaskIntent ? "deep" as const : "standard" as const;
+    const beginInput = {
+      message: effectiveUserMessage,
+      requirement: effectiveRequirement,
+      sessionId,
       workspacePath: activeWorkspacePath,
       sessionGrants: turnSessionGrants,
-      depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
-      estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
-    });
+      depth: beginDepth,
+      estimatedComplexity: (beginDepth === "deep" ? "high" : "medium") as "low" | "medium" | "high",
+      continuity: continuityAction,
+    };
+    activeTaskRun = sessionMemory.beginTaskRun(sessionId, beginInput);
+    // A clear persists the terminal boundary at begin, but its own turn must
+    // not persist completion/planning over that boundary: run this turn on a
+    // local detached contract. Same local guards as preserve.
+    if (continuityMode === "clear") {
+      activeTaskRun = sessionMemory.ephemeralQuestionContract(beginInput);
+    }
   } catch (error) {
     streamLease.release();
     throw error;
   }
+  // The effective contract for routing/planning/skills/inference. A preserve
+  // side question / clear turn is fully ephemeral; its mutations target this
+  // local contract only, so the stored task/plan/status/evidence stay intact.
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1803,7 +1931,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           deadlineAt: turnBudget.deadlineAt,
         }),
         onDeadline: async () => {
-          if (!turnInvalidated() && sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
+          if (!turnInvalidated() && !continuityLocalTaskRun && sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
             sessionMemory.updateTaskRun(sessionId, {
               status: "paused",
               lastOutcome: "admission_deadline",
@@ -2122,14 +2250,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
-        // Setup context message using turn history if present
-        let contextMessage = message;
+        // Setup context message using turn history if present. Uses the
+        // effective user text so a resume executes the accepted goal and a
+        // replace uses the accepted objective, never the literal directive.
+        let contextMessage = effectiveUserMessage;
         if (turnHistory.length > 0) {
-          const historyBudget = HISTORY_BUDGET_TOKENS[initialRequirement];
+          const historyBudget = HISTORY_BUDGET_TOKENS[effectiveRequirement];
           const historyBlock = buildBoundedHistoryBlock(turnHistory, historyBudget, 800);
           contextMessage = historyBlock
-            ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${message}`
-            : message;
+            ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${effectiveUserMessage}`
+            : effectiveUserMessage;
         }
         // Continuation self-sufficiency (2026-07-16 evening): a bare
         // "continue" reached the executor/synthesizer as the literal word
@@ -2143,7 +2273,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           activeTaskRun.reconstruction !== "reconstruction_required" &&
           activeTaskRun.turnCount > 1 &&
           activeTaskRun.objective &&
-          activeTaskRun.objective.trim() !== message.trim()
+          activeTaskRun.objective.trim() !== effectiveUserMessage.trim()
         ) {
           const priorOutcome = priorTaskRun?.lastOutcome
             ? ` Last turn outcome: ${priorTaskRun.lastOutcome}.`
@@ -3550,10 +3680,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           coordinatorDurationMs,
           routeSource,
         } = await resolveCoordinatorRouteEntry({
-          message,
-          priorRequirement:
-            activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
-          taskRunLive: !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
+          // Route/turnRequirement must be classified from the SAME effective
+          // task as the budget above: a native goal control routes on the
+          // accepted goal, and only a matching resume inherits the prior
+          // requirement. Ordinary turns pass the raw message unchanged.
+          // A matching resume with an INTACT surviving plan hands the route
+          // seam an internal continuation cue so it reuses the active TaskPlan
+          // as an explicit continuation instead of re-authoring one from the
+          // long accepted goal. The cue is routing metadata only: coordinator
+          // callbacks/context and every provider input still use the accepted
+          // goal via `contextMessage`/`effectiveUserMessage`. A neutral
+          // reconstruction-required plan is never routed through active reuse.
+          message: matchingResume && activeTaskRun.reconstruction === "none"
+            ? "continue"
+            : effectiveUserMessage,
+          priorRequirement: continuityMode === undefined
+            ? (activeTaskRun.requirement ?? continuationRequirements.get(sessionId))
+            : matchingResume
+              ? (priorTaskRun?.requirement ?? activeTaskRun.requirement)
+              : undefined,
+          taskRunLive: continuityMode === undefined
+            ? !["completed", "failed", "cancelled"].includes(activeTaskRun.status)
+            : matchingResume,
           taskRunStatus: activeTaskRun.status,
           taskRunTurnCount: activeTaskRun.turnCount,
           continuationCarry: {
@@ -3569,7 +3717,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           routeViaModel: () =>
             coordinator.route(contextMessage, {
                sessionId,
-               rawMessage: message,
+               rawMessage: effectiveUserMessage,
                history: turnHistory,
                lastOutcome: sessionMemory.getLastOutcome(sessionId),
                sessionMemoryHints: memoryHints,
@@ -3607,7 +3755,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // (executor→synthesizer) so planner/reviewer/supervision tax cannot
         // re-starve. Applied before normalize for telemetry, then re-asserted
         // after normalize because full_execution invariants re-add reviewer.
-        if (forcedDeepRead && !shortCircuit && !useActivePlanContinuation) {
+        if (effectiveForcedDeepRead && !shortCircuit && !useActivePlanContinuation) {
           route = applyForcedDeepReadRoute(route);
           console.log(
             `[Jarvis Orchestrator] forced deep read: direct executor route with extended budget ` +
@@ -3619,7 +3767,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // exists; ceremony cost 30-60s/turn live and starved synthesis).
         // Active-plan continuation already chose executor[+reviewer]→synthesizer.
         const leanContinuation = !shortCircuit
-          && !forcedDeepRead
+          && !effectiveForcedDeepRead
           && !useActivePlanContinuation
           && activeTaskRun.depth === "deep"
           && activeTaskRun.turnCount > 1
@@ -3638,7 +3786,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
            routeSource,
          );
          if (!streamLease.isCurrent() || streamAbort.signal.aborted) await emitCancelled();
-         if (!turnInvalidated()) {
+         if (!turnInvalidated() && !continuityLocalTaskRun) {
            sessionMemory.updateTaskRun(sessionId, {
             estimatedComplexity: route.context.estimated_complexity,
           });
@@ -3648,13 +3796,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // or unusable — never wipe verified/blocked progress on continuation.
         // Complex: brief only — ledger filled after Planner validate in pipeline.
         // Active-plan continuation must not reseed — plan is already expanded.
+        // A preserve/resume side turn never seeds durable planning: the seed
+        // applies to the ephemeral contract for this turn only.
         if (route.plan_authorship && !useActivePlanContinuation && !turnInvalidated()) {
           const priorPlanItems = activeTaskRun.plan?.items?.length ?? 0;
-          const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
-            plan_authorship: route.plan_authorship,
-            plan_items: route.plan_items ?? [],
-            plan_brief: route.plan_brief,
-          });
+          const seeded = continuityLocalTaskRun
+            ? sessionMemory.beginTaskRunLocalPlanning(activeTaskRun, {
+                plan_authorship: route.plan_authorship,
+                plan_items: route.plan_items ?? [],
+                plan_brief: route.plan_brief,
+              })
+            : sessionMemory.applyOwnedPlanning(sessionId, {
+                plan_authorship: route.plan_authorship,
+                plan_items: route.plan_items ?? [],
+                plan_brief: route.plan_brief,
+              });
           if (seeded) {
             activeTaskRun = seeded;
             const itemCount = seeded.plan?.items.length ?? 0;
@@ -3677,7 +3833,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // because full_execution invariants re-add reviewer/planner.
         const forcedPipeline = useActivePlanContinuation && activePlanPipeline && !shortCircuit
           ? activePlanPipeline
-          : (forcedDeepRead || leanContinuation) && !shortCircuit
+          : (effectiveForcedDeepRead || leanContinuation) && !shortCircuit
             ? (["executor", "synthesizer"] as StageName[])
             : normalized.pipeline;
         const reconciled = reconcileRouteWithBudget(
@@ -3695,7 +3851,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const executablePipeline = reconciled.pipeline;
         const executableRoute = { ...route, pipeline: executablePipeline as typeof route.pipeline };
         const executionProfile: ExecutionProfile = normalized.profile;
-        if (shouldRememberRequirement(shortCircuit)) {
+        // The cached continuation requirement belongs to the STORED task. A
+        // preserve side question must not overwrite it with its own
+        // classification; a clear removes the old continuation boundary so a
+        // later ordinary continue cannot resurrect the cleared task.
+        if (continuityMode === "clear") {
+          continuationRequirements.delete(sessionId);
+        } else if (continuityMode !== "preserve" && shouldRememberRequirement(shortCircuit)) {
           rememberContinuationRequirement(sessionId, turnReq.requirement);
         }
         console.log(
@@ -3713,7 +3875,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const runFinalizer = new RunFinalizer({
           agentRunId,
           sessionId,
-          userRequest: message,
+          userRequest: effectiveUserMessage,
           taskType: route.task_type,
           pipeline: executablePipeline as string[],
           route,
@@ -3730,15 +3892,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         orchestratorRunFinalizer = runFinalizer;
         runFinalizer.start();
         const conductorRunId = runFinalizer.runConductorId;
-        if (workspaceReadScope) {
+        if (effectiveWorkspaceReadScope) {
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "scope_notice",
             mode: "explicit_allowlist",
-            workspace_root: workspaceReadScope.workspaceRoot,
-            allowed_paths: workspaceReadScope.allowedPaths,
-            allow_root_listing: workspaceReadScope.allowRootListing,
-            shell: workspaceReadScope.denyShell ? "denied" : "unchanged",
-            network: workspaceReadScope.denyNetwork ? "denied" : "unchanged",
+            workspace_root: effectiveWorkspaceReadScope.workspaceRoot,
+            allowed_paths: effectiveWorkspaceReadScope.allowedPaths,
+            allow_root_listing: effectiveWorkspaceReadScope.allowRootListing,
+            shell: effectiveWorkspaceReadScope.denyShell ? "denied" : "unchanged",
+            network: effectiveWorkspaceReadScope.denyNetwork ? "denied" : "unchanged",
             session_id: sessionId,
             run_id: agentRunId,
           })}\n\n`));
@@ -3797,7 +3959,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.task_type,
         );
         runFinalizer.setInstructionVariants(instructionSelection);
-        const resolvedSkills = resolveSkillsForTurn(activeTaskRun.objective, route.task_type);
+        const resolvedSkills = resolveSkillsForTurn(effectiveUserMessage, route.task_type);
         // Staged policy canary arm: ~10% of turns while a canary is active use
         // request-scoped overlay for routing/budget reads (global maps stay production).
         const policyCanaryTurn = conductorLearning.shouldRouteToCanaryPolicy();
@@ -3863,8 +4025,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.context.estimated_complexity,
           agentRunId,
         );
-        // Bind TaskPlan ledger for per-item grading in afterStage.
-        liveConductor.setPlanContext(sessionMemory.getTaskRun(sessionId) ?? activeTaskRun);
+        // Bind TaskPlan ledger for per-item grading in afterStage. A
+        // preserve/resume side turn binds its ephemeral contract, never the
+        // stored task/plan it must not change.
+        liveConductor.setPlanContext(
+          continuityLocalTaskRun
+            ? activeTaskRun
+            : sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+        );
         const executor = new PipelineExecutor(
           callModel,
           runtime,
@@ -3908,7 +4076,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const pipelineOptions = {
           topology: normalized.topology,
           executionProfile,
-          rawMessage: message,
+          rawMessage: effectiveUserMessage,
           turnRequirement: turnReq.requirement,
           estimatedComplexity: route.context.estimated_complexity,
           taskRunDepth: activeTaskRun.depth,
@@ -3917,7 +4085,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
           // Owned-runtime-loop: TaskPlan ledger + planning ownership for this turn.
-          taskRunContract: sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+          // A preserve/resume side turn uses its ephemeral contract so saved plan
+          // progress cannot advance from side-question evidence.
+          taskRunContract: continuityLocalTaskRun
+            ? activeTaskRun
+            : sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
           ownedPlanning: route.plan_authorship
             ? {
                 plan_authorship: route.plan_authorship,
@@ -3927,10 +4099,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             : undefined,
            onTaskPlanUpdate: (contract: TaskRunContract) => {
              if (!ownsSessionState() || turnInvalidated()) return;
+             if (continuityLocalTaskRun) {
+               // Side turn: keep the plan mutation ephemeral; never persist it
+               // over the stored task run.
+               activeTaskRun = contract;
+               liveConductor.setPlanContext(contract);
+               return;
+             }
              sessionMemory.setTaskRunContract(sessionId, contract);
              liveConductor.setPlanContext(contract);
            },
-          workspaceReadScope,
+          workspaceReadScope: effectiveWorkspaceReadScope,
           turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
@@ -3942,7 +4121,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // like trivial short-circuits and workspace reads already do. Medium/
           // high complexity keep the strong model.
           preferFastSynthesizer: routeSource === "trivial_short_circuit"
-            || Boolean(workspaceReadScope)
+            || Boolean(effectiveWorkspaceReadScope)
             || route.context.estimated_complexity === "low",
           distilledSkillsBlock: resolvedSkills.promptBlock,
           // Ephemeral recall snapshot rides only to the delegate's final CLI
@@ -4003,7 +4182,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 coordinator,
                 routeOptions: {
                   sessionId,
-                  rawMessage: message,
+                  rawMessage: effectiveUserMessage,
                   history: turnHistory,
                    lastOutcome: sessionMemory.getLastOutcome(sessionId),
                    sessionMemoryHints: memoryHints,
@@ -4115,7 +4294,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const turnWriteTargets = successfulToolCalls
           .filter((call) => TURN_WRITE_TOOLS.has(call.name))
           .flatMap((call) => collectToolPathTargets(call.arguments));
-         if (ownsSessionState() && !turnInvalidated() && turnWriteTargets.length > 0) {
+         if (ownsSessionState() && !turnInvalidated() && turnWriteTargets.length > 0 && !continuityLocalTaskRun) {
            sessionMemory.updateTaskRun(sessionId, {
             lastWriteTargets: recordWriteTargets(
               sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
@@ -4134,9 +4313,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // synthesizer prose must not mark multi-item plans completed while
         // items remain pending/blocked. Latest contract may have mid-turn
         // plan mutations via onTaskPlanUpdate.
-         const latestTaskRun = ownsSessionState()
-           ? sessionMemory.getTaskRun(sessionId) ?? activeTaskRun
-           : activeTaskRun;
+         const latestTaskRun = continuityLocalTaskRun
+           ? activeTaskRun
+           : ownsSessionState()
+             ? sessionMemory.getTaskRun(sessionId) ?? activeTaskRun
+             : activeTaskRun;
         const reconciledStatus = reconcileTaskRunStatus({
           contract: latestTaskRun,
           turnAcceptanceStatus: taskAcceptance.status,
@@ -4179,7 +4360,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           decision.runOutcome,
           reward?.outcomeFloor,
         );
-         if (ownsSessionState() && !turnInvalidated()) {
+         if (ownsSessionState() && !turnInvalidated() && !continuityLocalTaskRun) {
            sessionMemory.updateTaskRun(sessionId, {
              status: decision.taskStatus,
              evidenceCount,
@@ -4235,7 +4416,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           breakdown: JSON.parse(serializeRunRewardBreakdown(runReward)),
         });
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
-         if (ownsSessionState() && !turnInvalidated()) {
+         if (ownsSessionState() && !turnInvalidated() && !continuityLocalTaskRun) {
            sessionMemory.recordPipelineOutcome(sessionId, {
              outcome: rewardOutcome,
              errorCode: result.error_code,
@@ -4329,7 +4510,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             agentRunId,
             sessionId,
             taskType: route.task_type,
-            userRequest: message,
+            userRequest: effectiveUserMessage,
             workerInstructions: route.worker_instructions,
             stageRuns: stageRunsForDistill,
             runOutcome: rewardOutcome,
@@ -4389,8 +4570,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           fallback_events: orchFallbackEvents,
           fallback_reason: orchLastFallbackReason,
           fallback_model: orchLastFallbackModel,
-          scope_mode: workspaceReadScope ? "explicit_allowlist" : "inferred",
-          scope_compliant: workspaceReadScope
+          scope_mode: effectiveWorkspaceReadScope ? "explicit_allowlist" : "inferred",
+          scope_compliant: effectiveWorkspaceReadScope
             ? (result.toolCalls ?? []).every((call) => call.error_code !== "policy_denied")
             : undefined,
           executed_tools: (result.toolCalls ?? [])

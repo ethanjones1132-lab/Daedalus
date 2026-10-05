@@ -290,6 +290,13 @@ export interface PreparedMemoryTurn {
   prepared_at: string;
   expires_at: string;
   app_instance_id: string;
+  /**
+   * Optional private Phase 3.4 continuity preview. Native-created only and
+   * never a request field, so an HTTP-only caller cannot forge it. Absent for
+   * an ordinary turn with no accepted active objective. Mirrors the Rust
+   * `PreparedMemoryTurn.continuity`.
+   */
+  continuity?: ContinuityPreview;
 }
 
 export interface MemoryRuntimeEvidence {
@@ -409,6 +416,26 @@ export interface SessionContinuity {
   active_objective: ActiveObjective | null;
   latest_turn_id: string | null;
   revision: number;
+}
+
+/**
+ * Exact whole-message objective control mode. `preserve` is the default for
+ * every ordinary question, correction, cancellation or assistant suggestion;
+ * only an exact `Objective: <text>`, `Clear active objective`, or
+ * `Continue active objective` message changes the typed objective. Mirrors the
+ * Rust `ContinuityMode`.
+ */
+export type ContinuityMode = "preserve" | "resume" | "replace" | "clear";
+
+/**
+ * Optional private Phase 3.4 continuity preview carried in the Phase 2 prepared
+ * envelope. Native-created metadata only. `snapshot` is the effective
+ * (previewed) typed continuity for the current turn; `mode` names the exact
+ * action Bun must apply to TaskRun state. Mirrors the Rust `ContinuityPreview`.
+ */
+export interface ContinuityPreview {
+  snapshot: SessionContinuity;
+  mode: ContinuityMode;
 }
 
 export interface CaptureTurnRequest {

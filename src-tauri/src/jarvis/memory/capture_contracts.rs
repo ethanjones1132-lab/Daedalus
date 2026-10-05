@@ -117,6 +117,30 @@ pub struct SessionContinuity {
     pub revision: i64,
 }
 
+/// Exact whole-message objective control mode. `preserve` is the default for
+/// every ordinary question, correction, cancellation or assistant suggestion;
+/// only an exact `Objective: <text>`, `Clear active objective`, or
+/// `Continue active objective` message changes the typed objective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuityMode {
+    Preserve,
+    Resume,
+    Replace,
+    Clear,
+}
+
+/// Optional private Phase 3.4 continuity preview carried in the Phase 2
+/// prepared envelope. It is native-created metadata only: an HTTP-only caller
+/// cannot forge it because it is never a request field. `snapshot` is the
+/// effective (previewed) typed continuity for the current turn; `mode` names
+/// the exact action Bun must apply to TaskRun state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContinuityPreview {
+    pub snapshot: SessionContinuity,
+    pub mode: ContinuityMode,
+}
+
 // ── Command request envelopes (one `request` object per Tauri command) ───────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

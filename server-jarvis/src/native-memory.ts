@@ -11,10 +11,14 @@
 import { realpathSync } from "node:fs";
 
 import type {
+  ActiveObjective,
+  ContinuityMode,
+  ContinuityPreview,
   MemoryDerivedInvalidation,
   MemoryRecallStatus,
   MemoryRuntimeEvidence,
   PreparedMemoryTurn,
+  SessionContinuity,
 } from "./memory-contract";
 import { noteMemoryDerivedActivity } from "./memory-derived-state";
 import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
@@ -42,6 +46,14 @@ const MAX_ITEMS = 5;
 const MAX_ITEM_SCALARS = 600;
 const MAX_BLOCK_SCALARS = 4_000;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** Content-safety boundary for a replacement objective (native `MAX_OBJECTIVE_BYTES`). */
+const MAX_OBJECTIVE_BYTES = 4_096;
+const CONTINUITY_MODES = new Set<ContinuityMode>([
+  "preserve",
+  "resume",
+  "replace",
+  "clear",
+]);
 
 interface NativeMemoryBootstrap {
   capability: string;
@@ -263,6 +275,142 @@ function validateEnvelope(envelope: PreparedMemoryTurn): void {
   for (const item of envelope.selected) {
     if (typeof item.text !== "string" || scalarLength(item.text) > MAX_ITEM_SCALARS) {
       throw new RegistryError("invalid_envelope", 400, "envelope item exceeds the scalar bound");
+    }
+  }
+  // Optional private continuity preview. An HTTP-only caller must not be able to
+  // smuggle one in, and an explicit `null` is rejected (native `None` OMITS the
+  // field). It is validated here (session identity, revisions, ids, text bound,
+  // dependency ids, mode-specific shape, unknown fields) and rejected outright
+  // on any mismatch.
+  if (envelope.continuity === null) {
+    throw new RegistryError("invalid_envelope", 400, "continuity must be omitted, not null");
+  }
+  if (envelope.continuity !== undefined) {
+    validateContinuityPreview(envelope, envelope.continuity);
+  }
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isBoundedId(value: unknown): value is string {
+  return isNonemptyString(value) && value.length <= MAX_DERIVED_ID_LENGTH;
+}
+
+/**
+ * Strictly validate the native-created continuity preview carried in a
+ * registered envelope. The snapshot Session must match the envelope Session,
+ * the revision must be a safe integer >= 1, ids must be bounded and nonempty,
+ * dependency entries must be bounded nonempty strings, arrays must be bounded,
+ * unknown fields are rejected, and the mode-specific objective shape is
+ * enforced. Any violation fails registration rather than trusting a partial
+ * payload.
+ */
+function validateContinuityPreview(
+  envelope: PreparedMemoryTurn,
+  preview: ContinuityPreview,
+): void {
+  if (typeof preview !== "object" || preview === null || Array.isArray(preview)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity payload is not an object");
+  }
+  const previewRecord = preview as unknown as Record<string, unknown>;
+  for (const key of Object.keys(previewRecord)) {
+    if (key !== "snapshot" && key !== "mode") {
+      throw new RegistryError("invalid_envelope", 400, "continuity payload has an unknown field");
+    }
+  }
+  if (typeof preview.mode !== "string" || !CONTINUITY_MODES.has(preview.mode as ContinuityMode)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity mode is not recognized");
+  }
+  const mode = preview.mode as ContinuityMode;
+  const snapshot = preview.snapshot;
+  if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity snapshot is not an object");
+  }
+  const snapshotRecord = snapshot as unknown as Record<string, unknown>;
+  for (const key of Object.keys(snapshotRecord)) {
+    if (
+      key !== "session_id" &&
+      key !== "active_objective" &&
+      key !== "latest_turn_id" &&
+      key !== "revision"
+    ) {
+      throw new RegistryError("invalid_envelope", 400, "continuity snapshot has an unknown field");
+    }
+  }
+  const typed = snapshot as SessionContinuity;
+  if (!isNonemptyString(typed.session_id) || typed.session_id !== envelope.session_id) {
+    throw new RegistryError("invalid_envelope", 400, "continuity session does not match envelope");
+  }
+  if (!Number.isSafeInteger(typed.revision) || typed.revision < 1) {
+    throw new RegistryError("invalid_envelope", 400, "continuity revision is not a positive integer");
+  }
+  if (typed.latest_turn_id !== null && !isBoundedId(typed.latest_turn_id)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity latest turn id is invalid");
+  }
+  // Mode-specific objective shape. `clear` requires a null active objective;
+  // preserve/resume/replace require a valid one.
+  const objective = typed.active_objective;
+  if (mode === "clear") {
+    if (objective !== null) {
+      throw new RegistryError("invalid_envelope", 400, "clear continuity requires a null objective");
+    }
+    return;
+  }
+  if (objective === null || objective === undefined) {
+    throw new RegistryError("invalid_envelope", 400, "continuity mode requires an active objective");
+  }
+  validateActiveObjective(envelope, objective, mode, typed.latest_turn_id);
+}
+
+function validateActiveObjective(
+  envelope: PreparedMemoryTurn,
+  objective: ActiveObjective,
+  mode: ContinuityMode,
+  latestTurnId: string | null | undefined,
+): void {
+  if (typeof objective !== "object" || objective === null || Array.isArray(objective)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective is not an object");
+  }
+  const objectiveRecord = objective as unknown as Record<string, unknown>;
+  for (const key of Object.keys(objectiveRecord)) {
+    if (
+      key !== "text" &&
+      key !== "source_message_id" &&
+      key !== "source_turn_id" &&
+      key !== "depends_on_memory_ids"
+    ) {
+      throw new RegistryError("invalid_envelope", 400, "continuity objective has an unknown field");
+    }
+  }
+  if (!isNonemptyString(objective.text) || objective.text.trim().length === 0) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective text is required");
+  }
+  if (Buffer.byteLength(objective.text, "utf8") > MAX_OBJECTIVE_BYTES) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective text exceeds the bound");
+  }
+  if (!isBoundedId(objective.source_message_id)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective source id is required");
+  }
+  if (objective.source_turn_id !== null && !isBoundedId(objective.source_turn_id)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective turn id is invalid");
+  }
+  if (!Array.isArray(objective.depends_on_memory_ids)) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective dependencies are invalid");
+  }
+  if (objective.depends_on_memory_ids.length > MAX_DERIVED_ARRAY_ENTRIES) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective dependencies exceed the bound");
+  }
+  if (objective.depends_on_memory_ids.some((id) => !isBoundedId(id))) {
+    throw new RegistryError("invalid_envelope", 400, "continuity objective dependencies are invalid");
+  }
+  // A `replace` preview must refer to THIS turn: its source turn and the
+  // snapshot's latest turn must both name the envelope turn. Preserve/resume
+  // may legitimately carry an earlier accepted source.
+  if (mode === "replace") {
+    if (objective.source_turn_id !== envelope.turn_id || latestTurnId !== envelope.turn_id) {
+      throw new RegistryError("invalid_envelope", 400, "replace continuity is not bound to this turn");
     }
   }
 }
