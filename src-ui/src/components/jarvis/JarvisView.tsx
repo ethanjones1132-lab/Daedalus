@@ -4973,6 +4973,489 @@ const TRUSTED_MANIFEST_EXAMPLE = `{
   }
 }`;
 
+// ── Trusted manifest operations (native-persisted execution receipts) ──
+//
+// A fresh "Run manifest" click generates exactly one operation UUID, freezes the
+// exact dispatch tuple locally, and never derives a dispatch from Goal/model or
+// action-description text. "Retry / reconcile" reuses that exact frozen tuple;
+// it never mints a replacement id. Every outcome shown comes from an exact
+// native `get_trusted_execution` readback validated against the frozen tuple.
+
+interface TrustedExecutionReceipt {
+  execution_id: string;
+  action_id: string;
+  manifest_id: string;
+  manifest_registry_version: number;
+  manifest_content_hash: string;
+  status: string;
+  terminal_reason: string | null;
+  cancel_requested_at: string | null;
+  run_id: string | null;
+  bun_run_id: string | null;
+  runtime_started_at: string | null;
+  runtime_finished_at: string | null;
+  evidence: unknown;
+}
+
+interface FrozenOperation {
+  operationId: string;
+  actionId: string;
+  manifestId: string;
+  expectedManifestVersion: number;
+  expectedManifestHash: string;
+}
+
+const UNRESOLVED_OPERATION_STATUSES = ['claimed', 'dispatched', 'ambiguous', 'pending_acceptance'];
+const CANCELLABLE_OPERATION_STATUSES = ['claimed', 'dispatched'];
+
+function operationStorageKey(actionId: string): string {
+  return `jarvis.trusted.operation.${actionId}`;
+}
+
+function storeOperation(op: FrozenOperation): void {
+  try {
+    localStorage.setItem(operationStorageKey(op.actionId), JSON.stringify(op));
+  } catch {
+    // Local storage is untrusted and best-effort; native remains authority.
+  }
+}
+
+function readStoredOperation(actionId: string): FrozenOperation | null {
+  try {
+    const raw = localStorage.getItem(operationStorageKey(actionId));
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const value = parsed as Record<string, unknown>;
+    const operationId = value.operationId;
+    const a = value.actionId;
+    const manifestId = value.manifestId;
+    const version = value.expectedManifestVersion;
+    const hash = value.expectedManifestHash;
+    if (typeof operationId !== 'string' || operationId.length === 0) return null;
+    if (typeof a !== 'string' || a !== actionId) return null;
+    if (typeof manifestId !== 'string' || manifestId.length === 0) return null;
+    if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return null;
+    if (typeof hash !== 'string' || hash.length === 0) return null;
+    return {
+      operationId,
+      actionId: a,
+      manifestId,
+      expectedManifestVersion: version,
+      expectedManifestHash: hash,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function newOperationId(): string {
+  const cryptoObj = (
+    globalThis as {
+      crypto?: {
+        randomUUID?: () => string;
+        getRandomValues?: (array: Uint8Array) => Uint8Array;
+      };
+    }
+  ).crypto;
+  if (cryptoObj && typeof cryptoObj.randomUUID === 'function') {
+    return cryptoObj.randomUUID();
+  }
+  if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    cryptoObj.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  return '';
+}
+
+function isTrustedExecutionReceipt(value: unknown): value is TrustedExecutionReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.execution_id === 'string' &&
+    row.execution_id.length > 0 &&
+    typeof row.action_id === 'string' &&
+    typeof row.manifest_id === 'string' &&
+    typeof row.manifest_registry_version === 'number' &&
+    typeof row.manifest_content_hash === 'string' &&
+    typeof row.status === 'string'
+  );
+}
+
+function reconstructFrozen(receipt: TrustedExecutionReceipt): FrozenOperation {
+  return {
+    operationId: receipt.execution_id,
+    actionId: receipt.action_id,
+    manifestId: receipt.manifest_id,
+    expectedManifestVersion: receipt.manifest_registry_version,
+    expectedManifestHash: receipt.manifest_content_hash,
+  };
+}
+
+function receiptMatchesFrozen(receipt: TrustedExecutionReceipt, op: FrozenOperation): boolean {
+  return (
+    receipt.execution_id === op.operationId &&
+    receipt.action_id === op.actionId &&
+    receipt.manifest_id === op.manifestId &&
+    receipt.manifest_registry_version === op.expectedManifestVersion &&
+    receipt.manifest_content_hash === op.expectedManifestHash
+  );
+}
+
+function operationStatusVariant(
+  status: string,
+): 'success' | 'warn' | 'error' | 'info' | 'default' {
+  if (status === 'blocked' || status === 'failed') return 'error';
+  if (
+    status === 'ambiguous' ||
+    status === 'waiting_for_user' ||
+    status === 'partial' ||
+    status === 'pending_acceptance'
+  ) {
+    return 'warn';
+  }
+  if (status === 'claimed' || status === 'dispatched') return 'info';
+  if (status === 'completed') return 'success';
+  return 'default';
+}
+
+/** Bounded, metadata-only evidence summary. Raw tool output is never rendered. */
+function evidenceSummary(evidence: unknown): string | null {
+  if (!Array.isArray(evidence) || evidence.length === 0) return null;
+  const parts = evidence.slice(0, 5).map((item) => {
+    const row = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>;
+    const tool = typeof row.tool === 'string' ? row.tool : '?';
+    const status = typeof row.status === 'string' ? row.status : '?';
+    const hash = typeof row.output_sha256 === 'string' ? row.output_sha256.slice(0, 8) : '';
+    const bytes = typeof row.output_bytes === 'number' ? `${row.output_bytes}B` : '';
+    const suffix = [hash ? `${hash}…` : '', bytes].filter((v) => v.length > 0).join(' ');
+    return `${tool}:${status}${suffix ? ` (${suffix})` : ''}`;
+  });
+  return `${evidence.length} call(s): ${parts.join(', ')}`;
+}
+
+function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }) {
+  const actionId = record.action_id ?? '';
+  const [history, setHistory] = useState<TrustedExecutionReceipt[] | null>(null);
+  const [historyUnavailable, setHistoryUnavailable] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [frozen, setFrozen] = useState<FrozenOperation | null>(null);
+  const [receipt, setReceipt] = useState<TrustedExecutionReceipt | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const pending = useRef(false);
+
+  const fetchHistory = useCallback(async (): Promise<TrustedExecutionReceipt[]> => {
+    const raw = await invoke<unknown>('list_trusted_executions', { actionId });
+    if (!Array.isArray(raw)) throw new Error('unreadable');
+    const receipts: TrustedExecutionReceipt[] = [];
+    for (const row of raw) {
+      if (!isTrustedExecutionReceipt(row) || row.action_id !== actionId) {
+        throw new Error('malformed');
+      }
+      receipts.push(row);
+    }
+    return receipts;
+  }, [actionId]);
+
+  const loadHistory = useCallback(async (): Promise<boolean> => {
+    try {
+      const receipts = await fetchHistory();
+      setHistory(receipts);
+      setHistoryUnavailable(false);
+      setHistoryError(null);
+      return true;
+    } catch {
+      setHistoryUnavailable(true);
+      setHistoryError('Could not read native operation history; new operations are disabled.');
+      return false;
+    }
+  }, [fetchHistory]);
+
+  useEffect(() => {
+    setFrozen(readStoredOperation(actionId));
+    setReceipt(null);
+    setReadError(null);
+    setMessage(null);
+    void loadHistory();
+  }, [actionId, record.manifest_id, record.registry_version, loadHistory]);
+
+  const latestUnresolved =
+    history?.find((row) => UNRESOLVED_OPERATION_STATUSES.includes(row.status)) ?? null;
+  const displayReceipt = receipt ?? history?.[0] ?? null;
+  const cancellable =
+    displayReceipt !== null && CANCELLABLE_OPERATION_STATUSES.includes(displayReceipt.status);
+
+  const readback = useCallback(
+    async (op: FrozenOperation): Promise<void> => {
+      try {
+        const raw = await invoke<unknown>('get_trusted_execution', {
+          executionId: op.operationId,
+        });
+        if (!isTrustedExecutionReceipt(raw) || !receiptMatchesFrozen(raw, op)) {
+          throw new Error('identity');
+        }
+        setReceipt(raw);
+        setReadError(null);
+        setMessage(null);
+        await loadHistory();
+      } catch {
+        setReadError(
+          'The operation receipt could not be read back from native. The frozen operation is kept for retry; no outcome is claimed.',
+        );
+      }
+    },
+    [loadHistory],
+  );
+
+  const dispatch = useCallback(
+    async (op: FrozenOperation): Promise<void> => {
+      setMessage(null);
+      try {
+        await invoke('execute_trusted_manifest_action', {
+          actionId: op.actionId,
+          manifestId: op.manifestId,
+          operationId: op.operationId,
+          expectedManifestVersion: op.expectedManifestVersion,
+          expectedManifestHash: op.expectedManifestHash,
+        });
+      } catch (e) {
+        setMessage(
+          `Dispatch returned an error (${typeof e === 'string' ? e : 'unknown'}). Reading back the exact receipt…`,
+        );
+      }
+      await readback(op);
+    },
+    [readback],
+  );
+
+  const runNew = useCallback(async (): Promise<void> => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setMessage(null);
+    try {
+      let receipts: TrustedExecutionReceipt[];
+      try {
+        receipts = await fetchHistory();
+      } catch {
+        setHistoryUnavailable(true);
+        setHistoryError('Could not read native operation history; new operations are disabled.');
+        setMessage('Cannot read native operation history; a new operation is disabled.');
+        return;
+      }
+      setHistory(receipts);
+      setHistoryUnavailable(false);
+      setHistoryError(null);
+      const unresolved = receipts.find((row) =>
+        UNRESOLVED_OPERATION_STATUSES.includes(row.status),
+      );
+      if (unresolved) {
+        const op = frozen ?? reconstructFrozen(unresolved);
+        if (!frozen) {
+          storeOperation(op);
+          setFrozen(op);
+        }
+        setMessage(
+          `An unresolved operation (${unresolved.status}) already exists for this action. Use “Retry / reconcile this operation”.`,
+        );
+        return;
+      }
+      const operationId = newOperationId();
+      if (!operationId) {
+        setMessage('This environment cannot generate an operation id; no operation was started.');
+        return;
+      }
+      // Freeze the exact tuple locally BEFORE invoking native.
+      const op: FrozenOperation = {
+        operationId,
+        actionId,
+        manifestId: record.manifest_id,
+        expectedManifestVersion: record.registry_version,
+        expectedManifestHash: record.content_hash,
+      };
+      storeOperation(op);
+      setFrozen(op);
+      await dispatch(op);
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }, [actionId, record.manifest_id, record.registry_version, frozen, fetchHistory, dispatch]);
+
+  const retry = useCallback(async (): Promise<void> => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy(true);
+    setMessage(null);
+    try {
+      let op = frozen;
+      if (!op) {
+        let receipts: TrustedExecutionReceipt[];
+        try {
+          receipts = await fetchHistory();
+        } catch {
+          setMessage('Cannot read native operation history to reconstruct the operation.');
+          return;
+        }
+        const unresolved = receipts.find((row) =>
+          UNRESOLVED_OPERATION_STATUSES.includes(row.status),
+        );
+        if (!unresolved) {
+          setMessage('No local operation tuple and no unresolved native operation to reconcile.');
+          return;
+        }
+        op = reconstructFrozen(unresolved);
+        storeOperation(op);
+        setFrozen(op);
+      }
+      await dispatch(op);
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }, [frozen, fetchHistory, dispatch]);
+
+  const cancelOperation = useCallback(async (): Promise<void> => {
+    if (pending.current) return;
+    const op = frozen ?? (displayReceipt ? reconstructFrozen(displayReceipt) : null);
+    if (!op) {
+      setMessage('No operation identity is available to cancel.');
+      return;
+    }
+    if (
+      !confirm(
+        'Cancel this exact operation? Native will abort the in-flight run and return durable cancellation state.',
+      )
+    ) {
+      return;
+    }
+    pending.current = true;
+    setBusy(true);
+    setMessage(null);
+    try {
+      try {
+        await invoke('cancel_trusted_execution', { executionId: op.operationId });
+      } catch (e) {
+        setMessage(
+          `Cancel request failed (${typeof e === 'string' ? e : 'unknown'}). No terminal state is claimed.`,
+        );
+      }
+      await readback(op);
+    } finally {
+      pending.current = false;
+      setBusy(false);
+    }
+  }, [frozen, displayReceipt, readback]);
+
+  return (
+    <div className="mt-2 rounded-md border border-iron/30 p-2 space-y-2">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-bone/40">Operations</span>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <button
+            type="button"
+            onClick={() => void runNew()}
+            disabled={busy || historyUnavailable || latestUnresolved !== null}
+            className="px-2 py-0.5 text-[10px] font-mono rounded border border-cyan-neon/40 text-cyan-glow hover:bg-cyan-neon/10 disabled:opacity-50 transition-colors"
+          >
+            {busy ? 'Working…' : 'Run manifest'}
+          </button>
+          {frozen && (latestUnresolved !== null || readError !== null) && (
+            <button
+              type="button"
+              onClick={() => void retry()}
+              disabled={busy}
+              className="px-2 py-0.5 text-[10px] font-mono rounded border border-royal/40 text-royal-light hover:bg-royal/10 disabled:opacity-50 transition-colors"
+            >
+              Retry / reconcile this operation
+            </button>
+          )}
+          {cancellable && (
+            <button
+              type="button"
+              onClick={() => void cancelOperation()}
+              disabled={busy}
+              className="px-2 py-0.5 text-[10px] font-mono rounded border border-error/40 text-error hover:bg-error/10 disabled:opacity-50 transition-colors"
+            >
+              Cancel operation
+            </button>
+          )}
+        </div>
+      </div>
+
+      {historyUnavailable && (
+        <div role="alert" className="text-[11px] text-red-200">
+          {historyError ?? 'Native operation history is unavailable.'}
+        </div>
+      )}
+      {readError && (
+        <div role="alert" className="text-[11px] text-red-200">
+          {readError}
+        </div>
+      )}
+      {message && (
+        <div role="status" className="text-[11px] text-bone/50">
+          {message}
+        </div>
+      )}
+
+      {displayReceipt && (
+        <div className="text-[11px] font-mono text-bone/70">
+          <div className="flex items-center gap-2 flex-wrap">
+            <Pill variant={operationStatusVariant(displayReceipt.status)}>
+              {displayReceipt.status}
+            </Pill>
+            <span className="break-all">op {displayReceipt.execution_id}</span>
+          </div>
+          {displayReceipt.terminal_reason && (
+            <div className="text-bone/50">reason: {displayReceipt.terminal_reason}</div>
+          )}
+          <div className="text-bone/40">
+            runtime {displayReceipt.runtime_started_at ?? '—'} → {displayReceipt.runtime_finished_at ?? '—'}
+            {displayReceipt.cancel_requested_at
+              ? ` · cancel requested ${displayReceipt.cancel_requested_at}`
+              : ''}
+          </div>
+        </div>
+      )}
+
+      {history && history.length > 0 && (
+        <div className="space-y-1">
+          <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">History</div>
+          {history.slice(0, 8).map((row) => (
+            <div key={row.execution_id} className="text-[11px] font-mono text-bone/70">
+              <div className="flex items-center gap-2 flex-wrap">
+                <Pill variant={operationStatusVariant(row.status)}>{row.status}</Pill>
+                <span className="break-all">op {row.execution_id}</span>
+              </div>
+              {row.terminal_reason && (
+                <div className="text-bone/50">reason: {row.terminal_reason}</div>
+              )}
+              <div className="text-bone/40">
+                runtime {row.runtime_started_at ?? '—'} → {row.runtime_finished_at ?? '—'}
+                {row.cancel_requested_at ? ` · cancel requested ${row.cancel_requested_at}` : ''}
+              </div>
+              {evidenceSummary(row.evidence) && (
+                <div className="text-bone/40">evidence: {evidenceSummary(row.evidence)}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="text-[10px] font-mono text-bone-faint">
+        pending_acceptance is not completion: this panel never runs acceptance or completes a Goal. A
+        successful tool run alone is not acceptance.
+      </p>
+    </div>
+  );
+}
+
 function TrustedManifestsPanel() {
   const [manifests, setManifests] = useState<TrustedManifestRecord[]>([]);
   const [agents, setAgents] = useState<TrustedManifestAgentRow[]>([]);
@@ -5239,6 +5722,12 @@ function TrustedManifestsPanel() {
                   Remove
                 </button>
               </div>
+              {record.action_id && (
+                <TrustedManifestOperations
+                  key={`${record.manifest_id}:${record.registry_version}`}
+                  record={record}
+                />
+              )}
             </li>
           ))}
         </ul>
