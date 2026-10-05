@@ -2,7 +2,7 @@
 
 **Established:** 2026-10-04\
 **Status:** Accepted direction; implementation proceeds one priority at a time.\
-**Current priority:** #1 — Make memory change how Jarvis behaves.\
+**Current priority:** #2 — Connect goals, commitments, scheduling, and execution (source work authorized by the user on 2026-10-05; Priority #1 acceptance remains open).\
 **Owner:** Ethan, with implementation tracked in this repository.\
 **Canonical location:** `docs/CURRENT_ROADMAP.md`.
 
@@ -18,14 +18,14 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 | Order | Priority | Status | Completion evidence |
 |---|---|---|---|
-| 1 | Make memory change how Jarvis behaves | Active; Phases 1–4 source implemented; all runtime/test gates open | Correct, scoped recall and capture in live turns; continuity across Sessions and restart |
-| 2 | Connect goals, commitments, scheduling, and execution | Queued behind #1 | A goal progresses through approved execution, interruption, resumption, and verified delivery |
+| 1 | Make memory change how Jarvis behaves | Incomplete/open; Phases 1–4 source implemented; all runtime/test acceptance gates NOT RUN | Correct, scoped recall and capture in live turns; continuity across Sessions and restart |
+| 2 | Connect goals, commitments, scheduling, and execution | Active for source work by explicit user direction; runtime acceptance open | A goal progresses through approved execution, interruption, resumption, and verified delivery |
 | 3 | Prove that learning improves future work | Queued behind #2 | Controlled comparisons show a reusable improvement on separate related tasks |
 | 4 | Build complete workflows beyond coding | Queued behind #3 | Project stewardship, research, and recurring work produce usable outputs end to end |
 | 5 | Measure local usefulness before expanding orchestration research | Queued behind #4 | Actual hardware measurements identify which changes improve accepted outcomes per resource spent |
 
-1. Work on one numbered priority at a time, including its design, implementation, validation, and evidence record.
-2. Advance only after the active priority's completion criteria have evidence. An unfinished criterion remains open with its concrete blocker.
+1. Work on one numbered priority at a time, including its design, implementation, validation, and evidence record. The user may explicitly direct a sequence change; record the ruling and preserve all unfinished acceptance gates.
+2. Advance only after the active priority's completion criteria have evidence, unless the user explicitly directs source work on another priority. Such direction does not close or satisfy the earlier priority: unfinished criteria remain open with their concrete blocker.
 3. Supporting fixes belong to the active priority when they are necessary to deliver or validate it. Record that relationship explicitly.
 4. Urgent regressions may interrupt the sequence; record the reason and return to the active priority afterward. Changes to the agreed ordering require Ethan's direction.
 5. Distinguish source implementation, automated checks, live runtime behavior, and packaged behavior. State which was verified.
@@ -35,7 +35,7 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 ### Current implementation checkpoint
 
-Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review and coordination; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Roadmap priorities #2–#5 remain queued. Final Phase 4 source checkpoint: `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; all five allowed checks passed and the final scoped review was clean.
+Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review and coordination; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Priority #1 acceptance remains open; the user has explicitly directed source work on #2. Priorities #3–#5 remain queued. Final Phase 4 source checkpoint: `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; all five allowed checks passed and the final scoped review was clean.
 
 ### Intended outcome
 
@@ -96,9 +96,9 @@ Priority #1 is divided into four sequential phases. The [phase design](superpowe
 | 3 | Idempotent capture, accepted correction, forgetting, and objective continuity | [Safe capture](superpowers/plans/2026-10-04-memory-phase-3-safe-capture.md) |
 | 4 | User controls, stale-context handling, and cross-Session/restart proof | [Continuity and controls](superpowers/plans/2026-10-04-memory-phase-4-continuity-controls.md) |
 
-**Phase 4 source checkpoint (Part 4.4, final source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`):** native classification and operator controls (4.1), persisted Session Agent/project identity and bound-workspace resolution (4.2), conservative fresh-source revalidation receipts (4.3), and turn-status/continuity UI plus closure (4.4) are implemented in source. All five permitted compiler/type/build checks passed against the exact source SHA, and final fresh source review was clean. **NOT RUN:** tests, fixtures, scripted provider, live inference, cross-Session/restart, packaging, installation, and acceptance scenarios. Source compilation is not runtime proof; priority #1 stays active and no runtime-complete claim is made.
+**Phase 4 source checkpoint (Part 4.4, final source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`):** native classification and operator controls (4.1), persisted Session Agent/project identity and bound-workspace resolution (4.2), conservative fresh-source revalidation receipts (4.3), and turn-status/continuity UI plus closure (4.4) are implemented in source. All five permitted compiler/type/build checks passed against the exact source SHA, and final fresh source review was clean. **NOT RUN:** tests, fixtures, scripted provider, live inference, cross-Session/restart, packaging, installation, and acceptance scenarios. Source compilation is not runtime proof; priority #1 remains incomplete/open and no runtime-complete claim is made.
 
-Finish and verify each phase before implementing the next. Completing these phases completes priority #1 only; priorities #2–#5 retain their separate gates.
+Priority #1 source Phases 1–4 are implemented, but #1 remains incomplete: tests and live/runtime/restart acceptance are NOT RUN and every completion criterion remains open. On 2026-10-05 the user explicitly directed source work to begin on Priority #2 while that acceptance remains outstanding. This recorded sequence override does not claim #1 complete or accepted. Priorities #3–#5 remain queued.
 
 ## 2. Connect goals, commitments, scheduling, and execution
 
@@ -118,6 +118,23 @@ Durable TaskPlans, cron execution, approvals, commitments, and an action registr
 - Preserve checkpoints across restart; make retry and scheduling behavior safe against duplicate effects.
 - Apply Permission policy, cancellation, and resource bounds to unattended work.
 - Notify on meaningful progress, completion, failure, or required user action according to the user's preferences.
+
+### Current implementation checkpoint
+
+Priority #2 source work was explicitly authorized by the user on 2026-10-05 while Priority #1 acceptance remains incomplete/open. Luna authored four sequential plans and reviewed Part 1; DeepSeek v4.1 Flash is the sole production source executor through the OpenCode CLI. This direction changes source sequencing only. Priority #2 has no runtime or real-goal acceptance evidence yet. See the [Priority 2 status record](implementation/roadmap-priority-2-status.md) for the current checkpoint and [Part 1 source evidence](implementation/roadmap-priority-2-part-1-progress.md).
+
+**Part 1 source checkpoint:** the durable native Goal authority and its additive association contracts are implemented in source — an additive SQLite migration (`goals`, `goal_criteria`, `goal_events`, `goal_links`, plus nullable `goal_id` columns on `session_runs`/`cron_jobs`/`cron_runs`), native create/read/list/update/transition/link commands with validated identities and lifecycle transitions, and a Goal view. Scope attribution is validated against native authorities (enabled Agent row, canonicalized project root), links resolve through each target's authoritative store (cron/run in SQLite, commitment in its native JSON store) with unwired kinds rejected, and the Goal view discards stale detail reads and guards duplicate transitions. All five allowed compiler/type/build/diff checks passed on the Part 1 worktree; details are in the status record. **NOT RUN:** tests, fixtures, live execution, real-goal acceptance, restart/interruption, packaging, and installation. This is source progress only: Priority #1 remains incomplete/open and Priority #2 runtime acceptance remains open.
+
+### Sequential implementation parts
+
+| Part | Deliverable | Plan |
+|---|---|---|
+| 1 | Durable Goal authority and association contracts | [Goal authority](superpowers/plans/2026-10-05-roadmap-priority-2-part-1-goal-authority.md) |
+| 2 | Goal-linked TaskRun, native run evidence, checkpoints, and recovery | [Execution and recovery](superpowers/plans/2026-10-05-roadmap-priority-2-part-2-execution-recovery.md) |
+| 3 | Goal-linked commitments, scheduling, cancellation, resource gates, and notifications | [Commitments and scheduling](superpowers/plans/2026-10-05-roadmap-priority-2-part-3-commitments-scheduling.md) |
+| 4 | Trusted acceptance-manifest execution and verified delivery evidence | [Trusted delivery](superpowers/plans/2026-10-05-roadmap-priority-2-part-4-trusted-delivery.md) |
+
+All parts are source implementation plans. Tests, live execution, restart/interruption demonstrations, and all Priority #2 completion criteria remain NOT RUN/open.
 
 ### Completion criteria
 

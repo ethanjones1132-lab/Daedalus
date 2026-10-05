@@ -88,6 +88,11 @@ pub struct Commitment {
     pub created_at: String,
     pub completed_at: Option<String>,
     pub agent_id: Option<String>,
+    /// Stable optional association to a durable Goal (Roadmap Priority #2,
+    /// Part 1). Defaulted for backward compatibility with existing JSON store
+    /// rows; not populated or acted on until the association part.
+    #[serde(default)]
+    pub goal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,6 +822,16 @@ pub fn get_commitments() -> Result<Vec<Commitment>, String> {
     Ok(store.commitments)
 }
 
+/// Read one Commitment record from the Commitment authority (the same JSON
+/// store used by the commitment commands above). Used by native Goal link
+/// validation so a Goal cannot be linked to a non-existent Commitment and so
+/// the target's own Agent/Goal association can be checked before linking. It
+/// fails closed: an unreadable store is an error, never a false "absent".
+pub(crate) fn fetch_commitment(id: &str) -> Result<Option<Commitment>, String> {
+    let store = load_store()?;
+    Ok(store.commitments.into_iter().find(|c| c.id == id))
+}
+
 #[tauri::command]
 pub fn add_commitment(text: String, due: Option<String>) -> Result<Commitment, String> {
     let mut store = load_store()?;
@@ -828,6 +843,7 @@ pub fn add_commitment(text: String, due: Option<String>) -> Result<Commitment, S
         created_at: now_iso(),
         completed_at: None,
         agent_id: None,
+        goal_id: None,
     };
     store.commitments.push(c.clone());
     save_store(&store)?;

@@ -281,6 +281,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_scoped_memory_migrations(conn)?;
     apply_memory_turn_migrations(conn)?;
     apply_memory_capture_migrations(conn)?;
+    apply_goal_migrations(conn)?;
 
     Ok(())
 }
@@ -1321,6 +1322,123 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT memory_capture_migration; \
                  RELEASE SAVEPOINT memory_capture_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 1 — durable native Goal authority. Additive only
+/// and idempotent: it creates the goal authority tables and adds nullable
+/// `goal_id` association columns to existing native run/schedule tables without
+/// touching or backfilling existing Session, run, cron, memory, or commitment
+/// rows. No relationship is wired in this part; the columns and `goal_links`
+/// table are declared association points only. The whole group runs inside a
+/// named savepoint so a partial failure cannot leave the store half-migrated.
+pub fn apply_goal_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT goal_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            -- User-owned goal objective. `objective_authority` is constrained to
+            -- `user_statement`: a model-generated summary can never be promoted
+            -- into an accepted objective. Lifecycle `status` is one of the eight
+            -- declared states; the command layer enforces the transition graph.
+            CREATE TABLE IF NOT EXISTS goals (
+                id                  TEXT PRIMARY KEY,
+                objective           TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK(status IN ('pending','running','waiting_for_user','blocked','paused','completed','failed','cancelled')),
+                agent_id            TEXT NOT NULL DEFAULT 'jarvis',
+                project_root        TEXT,
+                objective_authority TEXT NOT NULL DEFAULT 'user_statement'
+                                    CHECK(objective_authority IN ('user_statement')),
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goals_status       ON goals(status);
+            CREATE INDEX IF NOT EXISTS idx_goals_agent_status ON goals(agent_id, status);
+            CREATE INDEX IF NOT EXISTS idx_goals_scope        ON goals(agent_id, project_root);
+
+            -- User-provided acceptance criteria with stable per-criterion
+            -- identity. `authority` is constrained to `user_statement` so a
+            -- model summary or tool output can never become an accepted
+            -- criterion. `ordinal` is the stable display order within a goal.
+            CREATE TABLE IF NOT EXISTS goal_criteria (
+                id         TEXT PRIMARY KEY,
+                goal_id    TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                ordinal    INTEGER NOT NULL,
+                text       TEXT NOT NULL,
+                authority  TEXT NOT NULL DEFAULT 'user_statement'
+                           CHECK(authority IN ('user_statement')),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(goal_id, ordinal)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_criteria_goal ON goal_criteria(goal_id, ordinal);
+
+            -- Append-only lifecycle audit. Records creation, objective/criteria
+            -- edits, and explicit transitions with the previous/next status.
+            CREATE TABLE IF NOT EXISTS goal_events (
+                id          TEXT PRIMARY KEY,
+                goal_id     TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                event_type  TEXT NOT NULL CHECK(event_type IN ('created','updated','transition')),
+                from_status TEXT,
+                to_status   TEXT,
+                actor       TEXT NOT NULL DEFAULT 'user',
+                reason      TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_events_goal ON goal_events(goal_id, created_at);
+
+            -- Generic association point for entities that do not own a goal_id
+            -- column (TaskPlan/TaskRun in Bun, output evidence) and for explicit
+            -- operator linking. Nothing in this part writes it automatically.
+            CREATE TABLE IF NOT EXISTS goal_links (
+                id          TEXT PRIMARY KEY,
+                goal_id     TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                target_kind TEXT NOT NULL
+                            CHECK(target_kind IN ('task_plan','task_run','commitment','cron_job','cron_run','session_run','evidence')),
+                target_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(goal_id, target_kind, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_links_goal   ON goal_links(goal_id);
+            CREATE INDEX IF NOT EXISTS idx_goal_links_target ON goal_links(target_kind, target_id);
+            "#,
+        )?;
+
+        // Stable optional `goal_id` association contracts on existing native
+        // tables. Nullable and unwired in Part 1; later parts populate them.
+        add_column_if_missing(conn, "session_runs", "goal_id", "goal_id TEXT")?;
+        add_column_if_missing(conn, "cron_jobs", "goal_id", "goal_id TEXT")?;
+        add_column_if_missing(conn, "cron_runs", "goal_id", "goal_id TEXT")?;
+
+        // A terminal goal's status is immutable at the storage layer. The
+        // command layer also rejects terminal transitions; this guards against
+        // any other writer silently reviving closed work.
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS goal_terminal_status_immutable_bu
+            BEFORE UPDATE OF status ON goals
+            WHEN OLD.status IN ('completed','failed','cancelled')
+             AND NEW.status IS NOT OLD.status
+            BEGIN
+                SELECT RAISE(ABORT, 'terminal goal status is immutable');
+            END;
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT goal_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT goal_migration; \
+                 RELEASE SAVEPOINT goal_migration;",
             );
             Err(err)
         }

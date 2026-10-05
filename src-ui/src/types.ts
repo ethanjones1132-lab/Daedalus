@@ -1,7 +1,7 @@
 export type ViewId =
   | 'overview' | 'chat-feeds' | 'jarvis' | 'channels' | 'instances' | 'sessions'
   | 'usage' | 'cron' | 'agents' | 'skills' | 'nodes'
-  | 'models' | 'control' | 'config' | 'logs' | 'hooks' | 'commitments' | 'devices'
+  | 'models' | 'control' | 'config' | 'logs' | 'hooks' | 'commitments' | 'devices' | 'goals'
   | 'approvals' | 'gateway' | 'hermes' | 'doctor' | 'health' | 'plugins'
   | 'memory' | 'action-registry'
   | 'jarvis-hub' | 'jarvis-chat' | 'jarvis-sessions' | 'jarvis-skills'

@@ -22,6 +22,11 @@ pub use memory_turn::*;
 pub mod memory_capture;
 pub use memory_capture::*;
 
+// Native durable Goal authority and association contracts
+// (Roadmap Priority #2, Part 1)
+pub mod goals;
+pub use goals::*;
+
 // Skills command handlers (SQLite-backed)
 pub mod skills;
 pub use skills::*;

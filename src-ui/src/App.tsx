@@ -45,6 +45,7 @@ import DevicesView from './components/jarvis/DevicesView';
 import NodesView from './components/jarvis/NodesView';
 import HooksView from './components/jarvis/HooksView';
 import CommitmentsView from './components/jarvis/CommitmentsView';
+import GoalsView from './components/jarvis/GoalsView';
 import ApprovalsView from './components/jarvis/ApprovalsView';
 import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
@@ -75,6 +76,7 @@ const NAV_SECTIONS: NavSection[] = [
     title: 'INFRASTRUCTURE',
     items: [
       { id: 'approvals', label: 'Approvals', icon: 'P' },
+      { id: 'goals', label: 'Goals', icon: 'G' },
       { id: 'commitments', label: 'Commitments', icon: 'C' },
       { id: 'hooks', label: 'Hooks', icon: 'H' },
       { id: 'devices', label: 'Devices', icon: 'D' },
@@ -759,6 +761,7 @@ function AppInner() {
       case 'nodes': return <ErrorBoundary><NodesView /></ErrorBoundary>;
       case 'hooks': return <ErrorBoundary><HooksView /></ErrorBoundary>;
       case 'commitments': return <ErrorBoundary><CommitmentsView /></ErrorBoundary>;
+      case 'goals': return <ErrorBoundary><GoalsView /></ErrorBoundary>;
       case 'approvals': return <ErrorBoundary><ApprovalsView /></ErrorBoundary>;
       case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
       case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
