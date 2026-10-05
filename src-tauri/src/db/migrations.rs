@@ -1530,6 +1530,31 @@ pub fn apply_cron_activation_migrations(conn: &Connection) -> Result<(), rusqlit
             "schedule_occurrence TEXT",
         )?;
         add_column_if_missing(conn, "cron_runs", "terminal_reason", "terminal_reason TEXT")?;
+
+        // Durable cancellation intent. `claim_state`'s CHECK does not include a
+        // cancellation-pending value, so intent lives in dedicated nullable
+        // columns instead of an unreviewed enum member. `cancel_requested_at`
+        // set + `cancel_acknowledged_at` null means a request exists that no
+        // task has confirmed; after a restart these reconcile to `ambiguous`
+        // rather than being reported as `cancelled`.
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_requested_at",
+            "cancel_requested_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_requested_reason",
+            "cancel_requested_reason TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_acknowledged_at",
+            "cancel_acknowledged_at TEXT",
+        )?;
         Ok(())
     })();
 

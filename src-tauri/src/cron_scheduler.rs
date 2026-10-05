@@ -38,6 +38,49 @@ pub fn get_pending_missed_registry() -> &'static Mutex<HashSet<String>> {
     PENDING_MISSED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Jobs whose in-flight execution the user (or a Goal/disable event) has asked
+/// to cancel. The scheduler registers a `CancellationToken` here keyed by job id
+/// and aborts it when a cancel is requested; the token's abort is what actually
+/// stops the tracked `/cron/run` request. The entry is written BEFORE the token
+/// is registered so an early cancel is already visible to `execute_job`.
+static CANCEL_REQUESTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn cancel_requests() -> &'static Mutex<HashSet<String>> {
+    CANCEL_REQUESTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn take_cancel_request(job_id: &str) -> bool {
+    let mut guard = cancel_requests().lock().unwrap_or_else(|p| p.into_inner());
+    guard.remove(job_id)
+}
+
+fn is_cancel_requested(job_id: &str) -> bool {
+    cancel_requests()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(job_id)
+}
+
+/// Execution abort channels keyed by job id. A running `execute_job` inserts a
+/// `watch` sender while dispatching; a cancel request flips it to `true`, which
+/// cancels the underlying `/cron/run` request through `dispatch_cron_job`.
+/// Per-job cancellation registration held for the lifetime of one tracked
+/// execution. It carries a signal into `execute_job`/`dispatch_cron_job` and a
+/// broadcast used by the worker to acknowledge when it has actually observed the
+/// cancellation and its request has completed.
+struct CancelControl {
+    activation_id: String,
+    signal_tx: tokio::sync::watch::Sender<bool>,
+    ack_tx: tokio::sync::broadcast::Sender<()>,
+}
+
+static CANCEL_TOKENS: OnceLock<Mutex<std::collections::HashMap<String, CancelControl>>> =
+    OnceLock::new();
+
+fn cancel_registry() -> &'static Mutex<std::collections::HashMap<String, CancelControl>> {
+    CANCEL_TOKENS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn get_pending_missed_jobs() -> Vec<String> {
     let guard = get_pending_missed_registry()
         .lock()
@@ -109,6 +152,13 @@ fn claim_activation(
     // A disabled job never activates (disable stops future scheduling).
     if enabled == 0 {
         return Err(format!("cron job '{}' is disabled", job_id));
+    }
+
+    // A user cancel intent recorded before this dispatch must be honoured before
+    // any claim/dispatch. The intent was already persisted by the caller; this
+    // path simply refuses to start.
+    if is_cancel_requested(job_id) {
+        return Err(format!("cron job '{}' was cancelled before dispatch", job_id));
     }
 
     let occurrence_source = next_run_override
@@ -246,6 +296,246 @@ fn reconcile_activations(app: &AppHandle) {
     ) {
         eprintln!("[cron] failed to reconcile dispatched activations: {}", e);
     }
+
+    // A cancellation request persisted before the previous shutdown had no live
+    // task to acknowledge it, so the effect cannot be confirmed cancelled.
+    // Surface the actionable `ambiguous` state rather than asserting cancellation
+    // or leaving the intent stuck.
+    if let Err(e) = conn.execute(
+        "UPDATE cron_activations SET claim_state = 'ambiguous', \
+         terminal_reason = 'cancellation requested but not acknowledged before restart; reconciliation required', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE cancel_requested_at IS NOT NULL AND cancel_acknowledged_at IS NULL \
+         AND claim_state NOT IN ('completed','failed','cancelled','ambiguous')",
+        [],
+    ) {
+        eprintln!("[cron] failed to reconcile pending cancellations: {}", e);
+    }
+}
+
+/// A cancellation request that was persisted but for which no tracked execution
+/// acknowledged the abort. The activation is settled to `ambiguous` with a
+/// truthful reason instead of claiming a cancellation that may not have taken
+/// effect. The recorded `cancel_requested_at` intent is left in place for audit
+/// so a retry or later reconcile remains possible. Returns `Err` if the durable
+/// write fails so the caller does not report an actionable persisted state that
+/// did not commit.
+fn settle_cancellation_unconfirmed(app: &AppHandle, job_id: &str) -> Result<(), String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    conn.execute(
+        "UPDATE cron_activations SET claim_state = 'ambiguous', \
+         terminal_reason = 'cancellation requested but no tracked execution acknowledged it; reconciliation required', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE cron_job_id = ?1 AND cancel_requested_at IS NOT NULL \
+         AND cancel_acknowledged_at IS NULL \
+         AND claim_state NOT IN ('completed','failed','cancelled')",
+        [job_id],
+    )
+    .map_err(|e| format!("failed to persist unconfirmed cancellation for '{job_id}': {e}"))?;
+    Ok(())
+}
+
+/// Record a durable cancellation request on the job's active activation without
+/// asserting that it stopped. Writes the intent columns (schema-valid
+/// `claim_state` is left untouched) and returns the activation id it applied to,
+/// if any. Fails closed if the intent write does not commit.
+pub fn persist_cancellation_intent(app: &AppHandle, job_id: &str, reason: &str) -> Result<Option<String>, String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let activation_id: Option<String> = conn
+        .query_row(
+            "SELECT activation_id FROM cron_activations \
+             WHERE cron_job_id = ?1 AND claim_state NOT IN ('completed','failed','cancelled') \
+             ORDER BY claimed_at DESC LIMIT 1",
+            [job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("failed to read active cron activation: {e}"))?;
+
+    if let Some(ref id) = activation_id {
+        conn.execute(
+            "UPDATE cron_activations SET cancel_requested_at = COALESCE(cancel_requested_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')), \
+             cancel_requested_reason = COALESCE(cancel_requested_reason, ?1), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE activation_id = ?2 AND claim_state NOT IN ('completed','failed','cancelled')",
+            rusqlite::params![reason, id],
+        )
+        .map_err(|e| format!("failed to record cron cancellation intent: {e}"))?;
+    }
+    Ok(activation_id)
+}
+
+/// Mark an activation `cancelled` after its tracked execution actually
+/// acknowledged the abort (observed the signal AND its request completed).
+/// Repeated cancels are idempotent and a completed/failed activation is never
+/// overwritten with a cancelled state. Records the acknowledgement timestamp.
+/// Returns `Err` if the durable write fails so the caller never reports a
+/// confirmed cancellation that was not persisted.
+pub fn mark_activation_cancelled(
+    app: &AppHandle,
+    activation_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    conn.execute(
+        "UPDATE cron_activations SET claim_state = 'cancelled', terminal_reason = ?1, \
+         cancel_acknowledged_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE activation_id = ?2 AND claim_state NOT IN ('completed','failed','cancelled')",
+        rusqlite::params![reason, activation_id],
+    )
+    .map_err(|e| format!("failed to persist cancellation for activation {activation_id}: {e}"))?;
+    Ok(())
+}
+
+/// Whether a job currently has a non-terminal activation (an active/possible
+/// in-flight run). Used by delete to avoid removing a job whose run is still
+/// running. Fails closed: a read error is returned so the caller does not delete
+/// a job whose active status cannot be established.
+pub fn has_active_activation(app: &AppHandle, job_id: &str) -> Result<bool, String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM cron_activations \
+         WHERE cron_job_id = ?1 AND claim_state NOT IN ('completed','failed','cancelled'))",
+        [job_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|v| v != 0)
+    .map_err(|e| format!("failed to determine active cron activation for '{job_id}': {e}"))
+}
+
+/// Cancel an in-flight or pending cron activation.
+///
+/// Order is deliberate: (1) persist the durable cancellation request, (2)
+/// subscribe to the task acknowledgement, (3) signal the tracked `/cron/run`
+/// operation, (4) await (bounded) the task's acknowledgement that it observed
+/// the cancellation and its request actually completed. Only then is the
+/// activation recorded `cancelled`, and only after that write commits is success
+/// reported. If no tracked execution exists or no acknowledgement arrives, the
+/// durable request is kept and the activation is settled to the actionable
+/// `ambiguous` state — cancellation is never asserted without proof. Returns
+/// `Ok(true)` when the cancel is proven and persisted, OR as an idempotent
+/// no-op success when no active activation exists (nothing was running to
+/// stop); `Ok(false)` only when an active run's cancellation is durable but
+/// unconfirmed; `Err` when a durable write could not be completed. No SQLite or
+/// registry lock is held while awaiting the acknowledgement.
+pub async fn request_cron_cancellation(
+    app: &AppHandle,
+    job_id: &str,
+    reason: &str,
+) -> Result<bool, String> {
+    // Persist intent first, before any signalling.
+    let activation_id = persist_cancellation_intent(app, job_id, reason)?;
+
+    // No durable active activation means no in-flight effect exists. This is an
+    // idempotent successful no-op: there is no run to stop, so report success
+    // without setting a process-local cancel flag (which would block future
+    // recurrence) and without claiming an active run was cancelled.
+    let Some(id) = activation_id else {
+        take_cancel_request(job_id);
+        return Ok(true);
+    };
+
+    // Subscribe to the acknowledgement BEFORE signalling so a fast worker cannot
+    // publish before the receiver exists. Take the signal sender under the same
+    // lock, then release all locks before awaiting.
+    let control = {
+        let guard = cancel_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.get(job_id).and_then(|control| {
+            if control.activation_id != id {
+                return None;
+            }
+            Some((control.signal_tx.clone(), control.ack_tx.subscribe()))
+        })
+    };
+
+    // Record the in-process cancel flag so concurrent claims observe it.
+    {
+        let mut guard = cancel_requests().lock().unwrap_or_else(|p| p.into_inner());
+        guard.insert(job_id.to_string());
+    }
+
+    let Some((signal_tx, mut ack_rx)) = control else {
+        // No tracked execution for this activation: signal sent is impossible,
+        // so settle to the actionable ambiguous state (persisted).
+        settle_cancellation_unconfirmed(app, job_id)?;
+        return Ok(false);
+    };
+
+    // Signal after subscribing so the ack cannot be missed.
+    let _ = signal_tx.send(true);
+
+    // Only `Ok(Ok(()))` is an acknowledgement; a closed channel (`Ok(Err(_))`)
+    // or a timeout is NOT.
+    let acknowledged = matches!(
+        tokio::time::timeout(Duration::from_secs(15), ack_rx.recv()).await,
+        Ok(Ok(()))
+    );
+
+    if acknowledged {
+        // Persist the confirmed terminal state; only then report success.
+        mark_activation_cancelled(app, &id, reason)?;
+        Ok(true)
+    } else {
+        settle_cancellation_unconfirmed(app, job_id)?;
+        Ok(false)
+    }
+}
+
+/// Cancel only the cron jobs linked to a specific Goal, including their active
+/// runs. Job ids come from the authoritative `cron_jobs.goal_id` column; a DB
+/// error fails closed (no cancellation is attempted). Unrelated and unlinked
+/// jobs are never touched. Future activation for a terminal Goal is separately
+/// blocked at claim time. Every linked job is attempted; per-job persistence
+/// failures are collected and surfaced so a partial failure cannot be mistaken
+/// for a clean cancellation.
+pub async fn cancel_goal_in_flight(
+    app: &AppHandle,
+    goal_id: &str,
+    reason: &str,
+) -> Result<usize, String> {
+    let job_ids: Vec<String> = {
+        let db = app.state::<AppDb>();
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT id FROM cron_jobs WHERE goal_id = ?1")
+            .map_err(|e| format!("failed to resolve goal cron jobs: {e}"))?;
+        let rows = stmt
+            .query_map([goal_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("failed to resolve goal cron jobs: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to resolve goal cron jobs: {e}"))?;
+        rows
+    };
+
+    let mut confirmed = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for job_id in &job_ids {
+        // A persistence failure for one job does not prevent cancelling the
+        // others, but it must be surfaced rather than swallowed.
+        match request_cron_cancellation(app, job_id, reason).await {
+            Ok(true) => confirmed += 1,
+            // Durable-but-unconfirmed stays ambiguous; not silently confirmed.
+            Ok(false) => {}
+            Err(e) => errors.push(format!("{job_id}: {e}")),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "cancellation persistence failed for {} of {} goal-linked cron job(s): {}",
+            errors.len(),
+            job_ids.len(),
+            errors.join("; ")
+        ));
+    }
+    Ok(confirmed)
 }
 
 /// Validate that `schedule_expr` can be parsed into a valid cron schedule.
@@ -388,6 +678,11 @@ pub struct CronDispatchResult {
     /// The Bun-executed run identity from `execution_evidence.run_id`, used to
     /// correlate the durable run record with the accepted-output evidence chain.
     pub bun_run_id: Option<String>,
+    /// True only when the dispatch was actually aborted by the cancellation
+    /// branch winning the request/response `select!`. A signal that arrives after
+    /// the response already completed is NOT reflected here, so a successful run
+    /// is never misclassified as cancelled.
+    pub cancelled: bool,
 }
 
 /// Dispatch a cron job via the Bun server's `/cron/run` endpoint.
@@ -402,6 +697,7 @@ pub async fn dispatch_cron_job(
     app: &AppHandle,
     job_id: &str,
     activation_id: Option<&str>,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<CronDispatchResult, String> {
     let (prompt, agent_id, snapshot) = {
         let db = app.state::<AppDb>();
@@ -448,13 +744,39 @@ pub async fn dispatch_cron_job(
         body["projection_snapshot"] = serde_json::to_value(snap).unwrap_or(serde_json::Value::Null);
     }
 
-    let response = client
+    let request = client
         .post(&url)
         .json(&body)
         .timeout(Duration::from_secs(STREAM_TIMEOUT_SECS))
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+        .send();
+
+    // Race the request send/response-header wait against cancellation. Dropping
+    // the in-progress request future closes the connection, which aborts the
+    // upstream `/cron/run` request signal Bun passes into inference. This also
+    // stops a stalled header wait, not just the body read. `biased;` with the
+    // request branch first makes a simultaneously-ready completion win the tie:
+    // an already-arrived response is recorded as its actual success/failure, and
+    // cancellation is reported only when the request is still pending.
+    let response = match cancel.clone() {
+        Some(mut rx) => {
+            tokio::select! {
+                biased;
+                result = request => result.map_err(|e| format!("HTTP request failed: {}", e))?,
+                _ = rx.changed() => {
+                    return Ok(CronDispatchResult {
+                        output: String::new(),
+                        error: Some("cron execution cancelled".to_string()),
+                        execution_evidence: None,
+                        bun_run_id: None,
+                        cancelled: true,
+                    });
+                }
+            }
+        }
+        None => request
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?,
+    };
 
     if !response.status().is_success() {
         let status = response.status();
@@ -462,10 +784,38 @@ pub async fn dispatch_cron_job(
         return Err(format!("Cron run server returned {}: {}", status, text));
     }
 
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse cron run response: {}", e))?;
+    // Read the body while racing the tracked cancel signal. Dropping the response
+    // future closes the connection, which aborts the upstream `/cron/run` request
+    // (the request signal Bun passes into inference). `biased;` with the body
+    // branch first makes an already-completed body win the tie, so a response
+    // that arrived before/with the cancel is recorded as its actual result and
+    // cancellation fires only while the body read is still pending.
+    let text_future = response.text();
+    let raw_body: String = match cancel {
+        Some(mut rx) => {
+            tokio::select! {
+                biased;
+                result = text_future => {
+                    result.map_err(|e| format!("Failed to read cron run response: {}", e))?
+                }
+                _ = rx.changed() => {
+                    return Ok(CronDispatchResult {
+                        output: String::new(),
+                        error: Some("cron execution cancelled".to_string()),
+                        execution_evidence: None,
+                        bun_run_id: None,
+                        cancelled: true,
+                    });
+                }
+            }
+        }
+        None => text_future
+            .await
+            .map_err(|e| format!("Failed to read cron run response: {}", e))?,
+    };
+
+    let result: serde_json::Value =
+        serde_json::from_str(&raw_body).map_err(|e| format!("Failed to parse cron run response: {}", e))?;
 
     let output = result["output"].as_str().unwrap_or("").to_string();
     let error = result["error"].as_str().map(|s| s.to_string());
@@ -482,6 +832,7 @@ pub async fn dispatch_cron_job(
             error: None,
             execution_evidence,
             bun_run_id,
+            cancelled: false,
         })
     } else {
         Ok(CronDispatchResult {
@@ -489,13 +840,17 @@ pub async fn dispatch_cron_job(
             error: error.or(Some("cron run failed with unknown error".to_string())),
             execution_evidence,
             bun_run_id,
+            cancelled: false,
         })
     }
 }
 
 /// Insert a `cron_runs` row and update the job's `last_run` / `next_run`, then
 /// settle the correlated activation claim. Correlation columns are nullable so
-/// legacy/unlinked runs remain readable.
+/// legacy/unlinked runs remain readable. Returns true when the terminal claim
+/// settlement was durably applied (or there was no activation to settle), false
+/// when the settle write failed, so a cancellation acknowledgement is never sent
+/// before its terminal state is persisted.
 #[allow(clippy::too_many_arguments)]
 fn record_run(
     app: &AppHandle,
@@ -508,7 +863,7 @@ fn record_run(
     next_run: Option<&str>,
     execution_evidence: Option<&str>,
     activation: Option<&ActivationContext>,
-) {
+) -> bool {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -566,8 +921,12 @@ fn record_run(
         );
     }
 
-    // Settle the activation claim. A completed/failed terminal state is never
-    // revived and no occurrence is replayed.
+    // Settle the activation claim. A completed/failed/cancelled terminal state
+    // is never revived: in particular a late success can never overwrite an
+    // accepted cancellation. The `WHERE` guard makes late/duplicate settles
+    // idempotent no-ops. `settled` tracks whether the durable settlement write
+    // succeeded so a caller never acknowledges before persisting.
+    let mut settled = true;
     if let Some(ctx) = activation {
         let claim_state = if status == "success" {
             "completed"
@@ -580,7 +939,8 @@ fn record_run(
             "UPDATE cron_activations SET claim_state = ?1, run_id = ?2, bun_run_id = ?3, \
              terminal_reason = ?4, settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
-             WHERE activation_id = ?5",
+             WHERE activation_id = ?5 \
+             AND (claim_state NOT IN ('cancelled','completed','failed') OR claim_state = ?1)",
             rusqlite::params![
                 claim_state,
                 run_id,
@@ -593,6 +953,24 @@ fn record_run(
                 "[cron] Failed to settle activation {} for job {}: {}",
                 ctx.activation_id, job_id, e
             );
+            settled = false;
+        }
+        // A settled non-cancelled outcome clears any stale cancel intent (both
+        // the in-process flag and the durable columns) so the next legitimate
+        // recurring occurrence can start clean and is never blocked by an old
+        // cancellation request.
+        if claim_state != "cancelled" {
+            take_cancel_request(job_id);
+            let _ = conn.execute(
+                "UPDATE cron_activations SET cancel_requested_at = NULL, \
+                 cancel_requested_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 WHERE activation_id = ?1",
+                [ctx.activation_id.as_str()],
+            );
+        } else {
+            // A proven cancellation also clears the in-process flag so a future
+            // recurring activation is permitted.
+            take_cancel_request(job_id);
         }
     }
 
@@ -614,6 +992,8 @@ fn record_run(
             job_id, e
         );
     }
+
+    settled
 }
 
 /// Correlation carried from the claimed activation into the dispatch/run record.
@@ -667,13 +1047,93 @@ pub async fn execute_job(
     // mid-dispatch is recoverable as `ambiguous`, not a silent replay.
     update_claim_state(app, &activation_id, "dispatched", None);
 
+    // Register a cancellation control for this execution and re-check the cancel
+    // intent under the registry lock so a cancel cannot slip between the
+    // pre-claim check and registration.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (ack_tx, _ack_keepalive) = tokio::sync::broadcast::channel::<()>(4);
+    let mut pre_cancelled = false;
+    {
+        let mut guard = cancel_registry()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.insert(
+            job_id.to_string(),
+            CancelControl {
+                activation_id: activation_id.clone(),
+                signal_tx: cancel_tx.clone(),
+                ack_tx: ack_tx.clone(),
+            },
+        );
+        if is_cancel_requested(job_id) {
+            pre_cancelled = true;
+        }
+    }
+    if pre_cancelled {
+        let _ = cancel_tx.send(true);
+        release_cancel_registration(job_id);
+        // Persist the cancelled terminal state BEFORE acknowledging: the ack must
+        // represent task-observed abort + durable settlement. If persistence
+        // fails, do not ack (a concurrent waiter then settles ambiguous).
+        if mark_activation_cancelled(app, &activation_id, "cancelled before dispatch").is_ok() {
+            let _ = ack_tx.send(());
+        }
+        release_in_flight(job_id);
+        return Ok(String::new());
+    }
+
     let started_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let start = std::time::Instant::now();
-    let result = dispatch_cron_job(app, job_id, Some(&activation_id)).await;
+    let dispatch_result =
+        dispatch_cron_job(app, job_id, Some(&activation_id), Some(cancel_rx)).await;
     let duration_ms = start.elapsed().as_millis() as i64;
     let next_run = compute_next_run(schedule_expr);
 
-    match &result {
+    // Always release the registration before recording so a cancel that arrives
+    // after the channel is removed sees no target and settles as unconfirmed.
+    release_cancel_registration(job_id);
+
+    // Cancellation is only real when dispatch itself was aborted by the cancel
+    // branch winning the request/response `select!`. A signal that arrived after
+    // the response already completed did NOT cancel the run: the actual
+    // completed/failed result is preserved, and any concurrent cancellation
+    // request remains unconfirmed (the caller settles it as `ambiguous`).
+    let cancelled = matches!(&dispatch_result, Ok(dispatch) if dispatch.cancelled);
+    if cancelled {
+        let reason = if is_cancel_requested(job_id) {
+            "user cancelled"
+        } else {
+            "execution aborted"
+        };
+        let context = ActivationContext {
+            activation_id: activation_id.clone(),
+            schedule_occurrence: schedule_occurrence.clone().unwrap_or_default(),
+            goal_id: goal_id.clone(),
+            bun_run_id: None,
+        };
+        // record_run settles the activation to `cancelled`. The ack must only be
+        // sent after that durable settlement succeeds, so it represents
+        // task-observed abort + closed request + durable terminal state.
+        let settled = record_run(
+            app,
+            job_id,
+            "cancelled",
+            "",
+            reason,
+            duration_ms,
+            &started_at,
+            next_run.as_deref(),
+            None,
+            Some(&context),
+        );
+        if settled {
+            let _ = ack_tx.send(());
+        }
+        release_in_flight(job_id);
+        return Ok(String::new());
+    }
+
+    match &dispatch_result {
         Ok(dispatch) => {
             let status = if dispatch.error.is_none() {
                 "success"
@@ -721,14 +1181,25 @@ pub async fn execute_job(
         }
     }
 
-    {
-        let mut guard = get_in_flight_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        guard.remove(job_id);
-    }
+    release_in_flight(job_id);
 
-    result.map(|d| d.output)
+    dispatch_result.map(|d| d.output)
+}
+
+/// Remove the abort token registration for a job.
+fn release_cancel_registration(job_id: &str) {
+    let mut guard = cancel_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    guard.remove(job_id);
+}
+
+/// Remove the in-flight guard for a job.
+fn release_in_flight(job_id: &str) {
+    let mut guard = get_in_flight_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    guard.remove(job_id);
 }
 
 /// Read the occurrence key that `claim_activation` derived, for correlation into

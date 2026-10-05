@@ -1037,39 +1037,60 @@ pub fn goal_update(
 /// Explicitly transition a Goal's lifecycle state. Terminal states are distinct
 /// and immutable, and `completed` is refused until verified evidence exists.
 #[tauri::command]
-pub fn goal_transition(
-    db: State<AppDb>,
+pub async fn goal_transition(
+    app: tauri::AppHandle,
     id: String,
     to_status: String,
     reason: Option<String>,
 ) -> Result<GoalDetail, String> {
     let to_status = to_status.trim().to_string();
+    let cancelling = to_status == "cancelled";
 
-    let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let detail = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let id = id.clone();
+        let to_status = to_status.clone();
+        move || {
+            let db = app.state::<AppDb>();
+            let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-    let goal = load_goal(&tx, &id)?;
-    validate_transition(&goal.status, &to_status)?;
+            let goal = load_goal(&tx, &id)?;
+            validate_transition(&goal.status, &to_status)?;
 
-    let now = now_iso();
-    let reason = reason.unwrap_or_default();
-    tx.execute(
-        "UPDATE goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        rusqlite::params![&to_status, &now, &id],
-    )
-    .map_err(|e| e.to_string())?;
-    insert_event(
-        &tx,
-        &id,
-        "transition",
-        Some(&goal.status),
-        Some(&to_status),
-        &reason,
-        &now,
-    )?;
+            let now = now_iso();
+            let reason = reason.unwrap_or_default();
+            tx.execute(
+                "UPDATE goals SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![&to_status, &now, &id],
+            )
+            .map_err(|e| e.to_string())?;
+            insert_event(
+                &tx,
+                &id,
+                "transition",
+                Some(&goal.status),
+                Some(&to_status),
+                &reason,
+                &now,
+            )?;
 
-    let detail = build_detail(&tx, &id)?;
-    tx.commit().map_err(|e| e.to_string())?;
+            let detail = build_detail(&tx, &id)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok::<GoalDetail, String>(detail)
+        }
+    })
+    .await
+    .map_err(|e| format!("goal transition join error: {e}"))??;
+
+    // Goal cancellation stops future scheduled activations (validated at claim
+    // time) and propagates to the in-flight cron executions linked to THIS exact
+    // Goal only. Unrelated or unlinked jobs are never affected. A resolution
+    // error fails closed and is surfaced.
+    if cancelling {
+        crate::cron_scheduler::cancel_goal_in_flight(&app, &id, "goal cancelled").await?;
+    }
+
     Ok(detail)
 }
 

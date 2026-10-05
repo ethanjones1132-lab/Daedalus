@@ -480,7 +480,8 @@ pub fn edit_cron_job(
 
 /// Enable a cron job (set enabled = 1).
 #[tauri::command]
-pub fn enable_cron_job(db: State<AppDb>, id: String) -> Result<bool, String> {
+pub fn enable_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
     let affected = conn
@@ -493,27 +494,74 @@ pub fn enable_cron_job(db: State<AppDb>, id: String) -> Result<bool, String> {
     Ok(affected > 0)
 }
 
-/// Disable a cron job (set enabled = 0).
+/// Disable a cron job (set enabled = 0). Also stops any in-flight execution so a
+/// disabled job cannot keep producing effects; a job with no in-flight run
+/// simply stops producing future activations.
 #[tauri::command]
-pub fn disable_cron_job(db: State<AppDb>, id: String) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-
-    let affected = conn
-        .execute(
+pub async fn disable_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    let affected = {
+        let db = app.state::<AppDb>();
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
             "UPDATE cron_jobs SET enabled = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?",
             [&id],
         )
-        .map_err(|e| format!("Failed to disable cron job '{}': {}", id, e))?;
+        .map_err(|e| format!("Failed to disable cron job '{}': {}", id, e))?
+    };
+
+    if affected > 0 {
+        // Propagate to any in-flight execution. The disable itself already
+        // succeeded; the cancellation request is durable before signalling and
+        // returns false when no tracked execution could prove it stopped. An
+        // intent-persistence error is surfaced rather than silently dropped.
+        crate::cron_scheduler::request_cron_cancellation(&app, &id, "disabled").await?;
+    }
 
     Ok(affected > 0)
+}
+
+/// Cancel a running or pending cron execution by job id. Persists a durable
+/// cancellation request, signals the tracked `/cron/run` operation, and reports
+/// (and records) `cancelled` only after that task observes the abort and
+/// acknowledges its request completed. Returns true on a proven cancel or as an
+/// idempotent no-op when no active execution remained; false only when an active
+/// run's request is durable but unconfirmed (the activation is left in an
+/// actionable `ambiguous` reconcile state); and an error when the request could
+/// not be persisted.
+#[tauri::command]
+pub async fn cancel_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    crate::cron_scheduler::request_cron_cancellation(&app, &id, "user cancelled").await
 }
 
 /// Delete a cron job by id. The job row and its Goal-link projection are removed
 /// in one transaction so a deleted job never leaves a dangling association;
 /// activation/run rows cascade via the `cron_jobs` foreign key. A cleanup failure
 /// rolls back and is surfaced, not ignored.
+///
+/// A job with an active run is only deleted after that run's cancellation is
+/// acknowledged (or there is no active run). If the cancellation request is
+/// durable but the abort cannot be proven, the row is deliberately preserved so
+/// the ambiguous activation remains recoverable; the caller receives an error
+/// rather than a false successful deletion.
 #[tauri::command]
-pub fn delete_cron_job(db: State<AppDb>, id: String) -> Result<bool, String> {
+pub async fn delete_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    // Record the cancellation intent durably before removing the row so a
+    // deleted job cannot keep producing effects. An intent-persistence failure
+    // aborts the delete rather than removing the job with an unrecorded stop.
+    let active = crate::cron_scheduler::has_active_activation(&app, &id)?;
+    if active {
+        let confirmed = crate::cron_scheduler::request_cron_cancellation(&app, &id, "job deleted")
+            .await?;
+        if !confirmed {
+            return Err(format!(
+                "Cron job '{}' has an active run whose cancellation could not be confirmed; \
+                 the job was not deleted. Resolve the ambiguous activation and retry.",
+                id
+            ));
+        }
+    }
+
+    let db = app.state::<AppDb>();
     let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;

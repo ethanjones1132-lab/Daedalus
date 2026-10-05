@@ -798,6 +798,7 @@ function CronJobCard({
   onRun,
   onDelete,
   onRetry,
+  onCancel,
 }: {
   job: CronJob;
   onRefresh: () => void;
@@ -807,6 +808,7 @@ function CronJobCard({
   onRun: (job: CronJob) => void;
   onDelete: (job: CronJob) => void;
   onRetry: (job: CronJob) => void;
+  onCancel: (job: CronJob) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const operationBlocked = operation !== undefined;
@@ -929,6 +931,17 @@ function CronJobCard({
               >
                 {operation?.kind === 'run' && operation.phase === 'writing' ? 'Running…' : isInFlight ? 'Running…' : 'Run Now'}
               </motion.button>
+
+              {isInFlight && (
+                <motion.button
+                  type="button"
+                  aria-label={`Cancel ${job.name}`}
+                  onClick={() => onCancel(job)}
+                  disabled={operationBlocked}
+                  className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-error/10 text-error border border-error/30 rounded-md hover:bg-error/20 transition-colors disabled:opacity-50"
+                  whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
+                >{operation?.kind === 'cancel' && operation.phase === 'writing' ? 'Cancelling…' : 'Cancel'}</motion.button>
+              )}
 
               <motion.button
                 type="button"
@@ -1066,6 +1079,13 @@ export default function CronView() {
     }
   }, [hasMutation, updateJobs]);
 
+  const refreshAfterCancel = useCallback(async () => {
+    // A confirmed cancel has no operation to reconcile; refresh authoritative job
+    // and in-flight state directly.
+    await fetchJobs();
+    await fetchInFlight();
+  }, [fetchJobs, fetchInFlight]);
+
   const fetchPendingMissed = useCallback(async () => {
     if (hasMutation()) return;
     const requestId = ++missedRequestId.current;
@@ -1163,10 +1183,34 @@ export default function CronView() {
         result = await invoke<boolean>(job.enabled ? 'disable_cron_job' : 'enable_cron_job', { id: job.id });
       } else if (kind === 'run') {
         result = await invoke<boolean>('run_cron_job', { id: job.id });
+      } else if (kind === 'cancel') {
+        result = await invoke<boolean>('cancel_cron_job', { id: job.id });
       } else {
         result = await invoke<boolean>('delete_cron_job', { id: job.id });
       }
-      if (result !== true) throw new Error('Cron operation was not confirmed');
+      if (kind === 'cancel') {
+        // A cancel that was requested but whose in-flight abort could not be
+        // proven returns false. Keep it explicitly unconfirmed/actionable and do
+        // not assert the work stopped; never reconcile it as success just because
+        // the recurring job row still exists.
+        if (result !== true) {
+          const failed = transitionCronOperation(operation, 'write-failed');
+          if (failed) publishOperations({ ...operationsRef.current, [job.id]: failed });
+          return;
+        }
+        // A `true` result means the cancellation request completed: either the
+        // run's abort was confirmed and durably settled, or no active execution
+        // remained (idempotent no-op). Clear the operation and refresh
+        // job/in-flight state rather than running the row-based reconciler, which
+        // cannot confirm a cancel from mere row existence.
+        const next = { ...operationsRef.current };
+        delete next[job.id];
+        publishOperations(next);
+        await refreshAfterCancel();
+        return;
+      } else if (result !== true) {
+        throw new Error('Cron operation was not confirmed');
+      }
     } catch {
       const failed = transitionCronOperation(operation, 'write-failed');
       if (failed) publishOperations({ ...operationsRef.current, [job.id]: failed });
@@ -1177,7 +1221,7 @@ export default function CronView() {
     if (!reconciling) return;
     publishOperations({ ...operationsRef.current, [job.id]: reconciling });
     await reconcileOperation(reconciling);
-  }, [invalidateResourceReads, publishOperations, reconcileOperation]);
+  }, [invalidateResourceReads, publishOperations, reconcileOperation, refreshAfterCancel]);
 
   const handleToggle = useCallback((job: CronJob) => {
     void handleOperation('toggle', job);
@@ -1185,6 +1229,10 @@ export default function CronView() {
 
   const handleRun = useCallback((job: CronJob) => {
     void handleOperation('run', job);
+  }, [handleOperation]);
+
+  const handleCancel = useCallback((job: CronJob) => {
+    void handleOperation('cancel', job);
   }, [handleOperation]);
 
   const handleDelete = useCallback((job: CronJob) => {
@@ -1725,6 +1773,7 @@ export default function CronView() {
               onRun={handleRun}
               onDelete={handleDelete}
               onRetry={handleRetry}
+              onCancel={handleCancel}
             />
           ))}
         </AnimatedList>

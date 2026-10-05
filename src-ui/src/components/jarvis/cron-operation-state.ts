@@ -1,4 +1,4 @@
-export type CronOperationKind = 'toggle' | 'run' | 'delete';
+export type CronOperationKind = 'toggle' | 'run' | 'delete' | 'cancel';
 export type CronOperationPhase = 'writing' | 'write-failed' | 'reconciling' | 'read-failed';
 export type CronOperationEvent = 'write-succeeded' | 'write-failed' | 'read-failed' | 'retry-read' | 'read-succeeded';
 
@@ -59,6 +59,10 @@ export function cronOperationConfirmed<T extends { id: string; enabled: boolean 
 ): boolean {
   const observed = snapshot.find(row => row.id === operation.id);
   if (operation.kind === 'delete') return observed === undefined;
+  // A cancel cannot be confirmed merely because the recurring job row still
+  // exists. Only a confirmed cancel path (the run no longer in flight) may
+  // clear it; otherwise it stays explicitly unconfirmed/actionable.
+  if (operation.kind === 'cancel') return false;
   if (operation.kind === 'run') return observed !== undefined;
   return observed !== undefined && observed.enabled === operation.targetEnabled;
 }

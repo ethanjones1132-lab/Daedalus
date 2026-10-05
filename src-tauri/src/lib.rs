@@ -1732,6 +1732,7 @@ pub fn run() {
             edit_cron_job,
             enable_cron_job,
             disable_cron_job,
+            cancel_cron_job,
             delete_cron_job,
             run_cron_job,
             get_cron_runs,
