@@ -1,7 +1,7 @@
 # Priority 2 Part 3 — UI slice handoff
 
 **Scope:** Roadmap Priority #2, Part 3 (commitments and scheduled activations), Goal-detail UI slice.
-**Final production source checkpoint:** `015772e52e0279c53680630cd40a54939cb85e74` (`fix(goals): reconcile only on evidence relevant to each schedule op`), following the initial UI slice `f655346437071e98a75c14a779f750113efff2ba` and the honesty/usability slice `5e085baf8450dc1467cf1e3ceaf945d934037ef9`.
+**Final production source checkpoint:** `2b226db1e9989445a1c10465ec6f5bf39430f3fd` (`fix(goals): reconcile each schedule op against its requested effect`), following the initial UI slice `f655346437071e98a75c14a779f750113efff2ba`, the honesty/usability slice `5e085baf8450dc1467cf1e3ceaf945d934037ef9`, and the evidence-gated slice `015772e52e0279c53680630cd40a54939cb85e74`.
 **Production path:** `src-ui/src/components/jarvis/GoalsView.tsx` only. No native API, migration, permission, or App-routing change was needed; every control is backed by an existing native durable command.
 
 ## Complete in this slice
@@ -15,12 +15,16 @@
 - Goal detail retains the existing rule that completion is withheld pending the Part 4 trusted-acceptance gate. A successful scheduled run, a submission, or an attempted transition is never used to infer Goal completion.
 - Unlinked cron/commitment consumers and the existing `GoalRunProgress` view are preserved; no new permissions were introduced.
 
-## Final correction behaviors (`5e085baf`, refined in `015772e5`)
+## Final correction behaviors (`5e085baf`, refined in `015772e5` and `2b226db1`)
 
 - **Commitments availability:** a failed or malformed (non-array) `get_commitments` response is treated as unavailable. The panel shows the read error and never the authoritative "no commitments linked" empty state; if previously loaded commitments remain, they are marked possibly stale.
 - **Schedule availability:** a failed or malformed (non-array) `list_cron_jobs` or `get_in_flight_cron_jobs` response marks schedule authority unavailable. The UI never shows "no schedules linked" and never leaves stale controls actionable: previously loaded schedules are explicitly marked stale and all schedule controls are disabled while the authority is unreadable.
 - **Read-only reconciliation:** a **Refresh** action re-reads the authoritative schedule + activation/run state. It never re-submits the mutation and is not named or treated as retry; it keeps any in-flight write.
-- **Evidence-gated clearing (`015772e5`):** Refresh (and the mutation's own confirming readback) clears a pending failed/uncertain operation only when the readbacks relevant to that operation succeeded. Pause/resume depend only on the native schedule list (`enabled` state). Run now requires both the activation and run history readbacks for that job that would evidence the new execution. Cancel requires the in-flight readback (itself required for any `ok` result) plus the same activation/run history. If a relevant history readback fails or returns a non-array, schedule authority may still be available and history UI still shows "could not be read", but the operation remains uncertain (controls stay disabled) until a later successful reconciliation. A job missing from the refreshed linked list is never treated as reconciled.
+- **Effect-aware clearing (`2b226db1`):** the single predicate `scheduleOpReconciled` is applied both immediately after the command readback and later by Refresh. It clears a pending failed/uncertain operation only when the observed state shows that operation's own requested effect:
+  - **pause/resume** — the job must now show the expected enabled value (`false`/`true`); a still-enabled pause or still-disabled resume is not reconciled.
+  - **Run now** — the `ScheduleOp` captures an immutable baseline of activation ids, run ids, and the submission time. Clearing requires readable activation+run history for that job and newly observed evidence beyond the baseline (a new activation or run id). If the baseline history was unavailable before submission, it instead requires evidence timestamped at/after the recorded submission time, so readability alone is never treated as confirmation.
+  - **cancel** — the tracked in-flight execution must be absent after the refresh with activation/run history still readable.
+  - A job missing from the refreshed linked list, unreadable relevant history, or an unchanged effect leaves the operation uncertain (controls stay disabled) until a later successful reconciliation.
 - History responses (`get_cron_activations`/`get_cron_runs`) that are non-array or fail are shown as "could not be read", never as "no history".
 
 ## Canonical doc updates
@@ -37,4 +41,4 @@
 
 ## Remaining Part 3 items
 
-With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `015772e52e0279c53680630cd40a54939cb85e74`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
+With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `2b226db1e9989445a1c10465ec6f5bf39430f3fd`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
