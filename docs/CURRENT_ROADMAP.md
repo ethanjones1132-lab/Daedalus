@@ -18,7 +18,7 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 | Order | Priority | Status | Completion evidence |
 |---|---|---|---|
-| 1 | Make memory change how Jarvis behaves | Active; Phases 1–2 source implemented; runtime gates open; Phases 3–4 pending | Correct, scoped recall and capture in live turns; continuity across Sessions and restart |
+| 1 | Make memory change how Jarvis behaves | Active; Phases 1–3 source implemented; runtime gates open; Phase 4 pending | Correct, scoped recall and capture in live turns; continuity across Sessions and restart |
 | 2 | Connect goals, commitments, scheduling, and execution | Queued behind #1 | A goal progresses through approved execution, interruption, resumption, and verified delivery |
 | 3 | Prove that learning improves future work | Queued behind #2 | Controlled comparisons show a reusable improvement on separate related tasks |
 | 4 | Build complete workflows beyond coding | Queued behind #3 | Project stewardship, research, and recurring work produce usable outputs end to end |
@@ -35,7 +35,7 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 ### Current implementation checkpoint
 
-Memory Phases 1 and 2 have compiled source checkpoints. Phase 2 was divided into four sequential subphases planned by Luna and implemented through DeepSeek v4.1 Flash on OpenCode. The [Phase 2 source handoff](implementation/memory-phase-2-summary.md) records the source revision, plans, ledgers and checks. Tests/live acceptance remain NOT RUN; the completion criteria below remain open. Memory Phases 3–4 and roadmap priorities #2–#5 have not started.
+Memory Phases 1–3 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2 and 3; DeepSeek v4.1 Flash implemented them through OpenCode, with root source review and independent compiler/type/build checks. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md) and [Phase 3 handoff](implementation/memory-phase-3-summary.md). Tests/live acceptance remain NOT RUN and all completion criteria remain open. Memory Phase 4 remains pending; roadmap priorities #2–#5 remain queued.
 
 ### Intended outcome
 
@@ -87,7 +87,7 @@ Do not wire the current housekeeping helper wholesale without reviewing its side
 
 ### Four implementation phases
 
-Priority #1 is divided into four sequential phases. The [phase design](superpowers/specs/2026-10-04-memory-four-phase-design.md) defines their shared architecture, interfaces, and acceptance scenarios. A separate planning agent has drafted each full implementation plan; implementation and runtime validation remain pending.
+Priority #1 is divided into four sequential phases. The [phase design](superpowers/specs/2026-10-04-memory-four-phase-design.md) defines their shared architecture, interfaces, and acceptance scenarios. The four parent plans and Luna's sequential subplans define the implementation. Phases 1–3 have reviewed source checkpoints; Phase 4 and all runtime acceptance remain pending.
 
 | Phase | Deliverable | Implementation plan |
 |---|---|---|
