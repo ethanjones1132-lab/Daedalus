@@ -2,7 +2,7 @@
 
 **As of:** 2026-10-05
 **Scope:** Roadmap Priority #2, “Connect goals, commitments, scheduling, and execution.”
-**State:** Four source plans are complete; Parts 1 and 2 source checkpoints are committed and all five allowed checks passed against each exact SHA. Part 3 is active. No Priority #2 runtime acceptance has been run.
+**State:** Four source plans are complete; Parts 1 and 2 are source-checkpointed, and Part 3 has two reviewed source checkpoints. All five allowed checks passed against each exact source SHA. Part 3 remains active for cancellation/resource gates, notifications, and Goal schedule/activation UI. No Priority #2 runtime acceptance has been run.
 
 ## Sequencing ruling
 
@@ -50,3 +50,9 @@ Part 1 review and allowed-check evidence: [Part 1 progress](roadmap-priority-2-p
 Source commit `1157cc6fff5dd8fb09ae9af007e681ec01f2dc19` adds a native-validated Goal run registration bound to Goal/Agent/workspace, Session, turn, exact persisted user source-row ID and SHA-256 body hash, with a stable TaskRun/run identity. The Bun process consumes it once only when the actual `/chat/stream` request carries the same bounded source-row ID and exact message body. Direct UI and native relay paths transport that identity; missing or mismatched source IDs remain Goal-less. Native terminal recording verifies the private consumed receipt and rejects client-supplied Goal attribution. Goal-linked TaskRuns persist resumable checkpoints and expose authorized checkpoint references; completion remains pending trusted accepted-output evidence for Part 4.
 
 Independent coordinator checks against exact committed SHA `1157cc6fff5dd8fb09ae9af007e681ec01f2dc19`: Rust `cargo check`, server typecheck, server build, UI TypeScript + Vite build, and `git diff --check` all PASS. Rust reported two existing warnings (`src/supervisor.rs` deprecated atomic method and `src/wsl.rs` unused helper); UI emitted the existing bundle-size advisory. Focused Luna review confirmed exact source-ID transport and compare/hash/one-shot enforcement. No test file was changed and no tests were run. **NOT RUN:** tests, runtime, restart/interruption demonstration, real-goal acceptance, package, or installation. Part 2 source is checkpointed; Priority #1 remains incomplete/open; Priority #2 runtime acceptance remains open; #3–#5 remain queued.
+
+## Part 3 in progress — Commitments and scheduled activations
+
+Part 3 is **not complete**. The Commitment checkpoint `5b1d6211b879ec80a4ee620d05687a7f47b26e9a` validates optional Commitment Goal references against native Goal authority, preserves unlinked JSON records, and makes the Commitment JSON `goal_id` authoritative for Goal detail, including an explicit-clear marker and fail-closed reads. The cron occurrence checkpoint `0baf5b4f4cec6102397bde2553a635e2dde3de73` adds native Goal-linked cron CRUD, stable activation identities, unique deterministic occurrence claims, startup ambiguous reconciliation, and run attribution. All five allowed checks passed against each exact checkpoint SHA.
+
+Still pending in Part 3 source: in-flight cancellation propagation and terminal reasons; activation/resume revalidation of Agent lifecycle, permission and resource bounds; meaningful preference-aware notifications; Goal detail links and schedule/activation history with pause/cancel/retry and actionable blockers. Cron/scheduler runtime, restart, missed-run, cancellation, and acceptance demonstrations remain NOT RUN. Part 3 must not be treated as delivered until these planned source slices are reviewed and checkpointed. Part 4 remains reserved for trusted acceptance-manifest execution and final output evidence.
