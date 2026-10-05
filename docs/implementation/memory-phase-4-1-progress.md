@@ -2,7 +2,7 @@
 
 **Execution:** DeepSeek v4.1 Flash (`opencode-go/deepseek-v4.1-flash`) via OpenCode CLI.
 **Branch:** `codex/memory-deepseek-20261004`.
-**Source SHA (execution HEAD):** `b9e0a4f432b4e7b1d59e164b74c4114aafb46cb4`.
+**Source SHA:** `c9987dc95f6939bbb99af01693ddb6a305cadbad` (Part 4.1 checkpoint).
 **Status:** Production source implemented; permitted compiler/type/build checks pass. **No tests, fixtures, or live/restart acceptance were written or run.** Priority #1 remains active and is not runtime-complete.
 
 ## Scope delivered

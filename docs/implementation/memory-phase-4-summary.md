@@ -1,8 +1,8 @@
 # Memory Phase 4 — Source implementation handoff
 
-**Status:** Four sequential source parts implemented; the final fresh source review and Phase 4.4 commit are pending. Tests and runtime acceptance remain open.
+**Status:** Four sequential source parts implemented and source-reviewed. All five allowed checks pass on the final source checkpoint; tests and runtime acceptance remain open.
 
-**Checked source revision:** Phase 4.3 commit `34ea355a5f342e33282911875991cf83e10bc0f1`, plus uncommitted Part 4.4 working-tree source. The latest five-check report is `phase4-precommit-review-checks.json`; a fresh post-commit run is pending.
+**Source checkpoint:** `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5` (Part 4.4 implementation commit `39203cc85314b2597a030cb2efc714e8b095cc9b` plus ambiguity-safe objective retry follow-up). The final five-check report is `phase4-source-final-2f6a226-checks.json`.
 
 **Branch:** `codex/memory-deepseek-20261004`
 
@@ -18,12 +18,12 @@
 
 | Part | Scope | Source checkpoint | Plan |
 |---|---|---|---|
-| 4.1 | Native statement classification and scoped operator controls | `b9e0a4f432b4e7b1d59e164b74c4114aafb46cb4` | [Operator controls](../superpowers/plans/2026-10-04-memory-phase-4-1-operator-controls.md) |
-| 4.2 | Persisted Session Agent/project identity and bound workspace | `bbda00fee0af9ff51af8a160d1a3ef52a0c4098a` | [Session identity](../superpowers/plans/2026-10-04-memory-phase-4-2-session-identity.md) |
-| 4.3 | Fresh workspace evidence and revalidation receipts | `34ea355a5f342e33282911875991cf83e10bc0f1` | [Fresh source](../superpowers/plans/2026-10-04-memory-phase-4-3-fresh-source.md) |
-| 4.4 | Turn status, continuity UX, and source handoff | pending commit | [Status handoff](../superpowers/plans/2026-10-04-memory-phase-4-4-status-handoff.md) |
+| 4.1 | Native statement classification and scoped operator controls | `c9987dc95f6939bbb99af01693ddb6a305cadbad` | [Operator controls](2026-10-04-memory-phase-4-1-operator-controls.md) |
+| 4.2 | Persisted Session Agent/project identity and bound workspace | `bbda00fee0af9ff51af8a160d1a3ef52a0c4098a` | [Session identity](2026-10-04-memory-phase-4-2-session-identity.md) |
+| 4.3 | Fresh workspace evidence and revalidation receipts | `34ea355a5f342e33282911875991cf83e10bc0f1` | [Fresh source](2026-10-04-memory-phase-4-3-fresh-source.md) |
+| 4.4 | Turn status, continuity UX, and source handoff | `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5` | [Status handoff](2026-10-04-memory-phase-4-4-status-handoff.md) |
 
-Root reviewed production source and corrective continuations before each sequential handoff. Per-part ledgers record changes and actual checks. These checkpoints establish source evidence; they do not establish runtime acceptance.
+Luna planned, coordinated, and performed source review; fresh read-only Luna reviewers reported targeted findings, and all production corrections were made by the DeepSeek CLI executor. Root coordinated the work. Per-part ledgers record changes and actual checks. These checkpoints establish source evidence; they do not establish runtime acceptance.
 
 ## Implemented scope
 
@@ -37,7 +37,7 @@ Root reviewed production source and corrective continuations before each sequent
 
 ## Independent final source checks
 
-All checks below passed on the final Part 4.4 working tree with unmasked exit codes.
+All checks below passed on exact source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5` with unmasked exit codes. A fresh read-only source review of the final objective-retry fix was clean.
 
 | Check | Result |
 |---|---|
@@ -47,13 +47,8 @@ All checks below passed on the final Part 4.4 working tree with unmasked exit co
 | `src-ui: bun run build` | PASS; 2,722 modules; existing large-chunk warning |
 | `git diff --check` | PASS |
 
-No tests or live acceptance experiments were added or run. Compiler/type/build checks establish source compilation and bundling only. A final fresh source review and post-commit source checks remain pending.
+No tests or live acceptance experiments were added or run. Compiler/type/build checks establish source compilation and bundling only.
 
 ## Open acceptance work — NOT RUN
 
-**NOT RUN / requires explicit user request:** every native and UI test, test declaration, and fixture; the deterministic scripted provider and the four scripted native integration scenarios; live inference on any backend; direct-SSE and native-relay actual-context inspection; cross-Session recall; correction/forget; side-question/resume; failure/interruption and duplicate-terminal behavior; Bun/Jarvis restart continuity; packaging/install and installed-application behavior. Generic automatic `verified_observation` capture remains unsupported. Priorities #2–#5 remain queued.
-
-- [Part 4.1 ledger](memory-phase-4-1-progress.md)
-- [Part 4.2 ledger](memory-phase-4-2-progress.md)
-- [Part 4.3 ledger](memory-phase-4-3-progress.md)
-- [Part 4.4 ledger](memory-phase-4-4-progress.md)
+**NOT RUN:** every native and UI test, test declaration, and fixture; the deterministic scripted provider and the four scripted native integration scenarios; live inference on any backend; direct-SSE and native-relay actual-context inspection; cross-Session recall; correction/forget; side-question/resume; failure/interruption and duplicate-terminal behavior; Bun/Jarvis restart continuity; packaging/install and installed-application behavior. Generic automatic `verified_observation` capture remains unsupported. Priorities #2–#5 remain queued.

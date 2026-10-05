@@ -3,8 +3,8 @@
 **Executor:** OpenCode CLI `opencode-go/deepseek-v4.1-flash` only. Luna performed planning, source review, coordination, and validation.
 **Branch:** `codex/memory-deepseek-20261004`.
 **Base checkpoint:** Phase 4.3 commit `34ea355a5f342e33282911875991cf83e10bc0f1`.
-**Source SHA:** pending coordinator commit (working tree on top of the base above; nothing staged or committed).
-**State:** Production source implemented; permitted compiler/type/build/diff checks pass on the current working tree. **No tests, fixtures, test declarations, scripted providers, live inference, restarts, packaging, or acceptance experiments were added or run.** Roadmap priority #1 remains active and is not runtime-complete.
+**Source SHA:** `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5` (final Phase 4 source checkpoint; main Part 4.4 implementation commit `39203cc85314b2597a030cb2efc714e8b095cc9b`).
+**State:** Production source implemented and fresh-reviewed; all five permitted compiler/type/build/diff checks pass on the exact source SHA. **No tests, fixtures, test declarations, scripted providers, live inference, restarts, packaging, or acceptance experiments were added or run.** Roadmap priority #1 remains active and is not runtime-complete.
 
 ## Scope delivered
 
@@ -56,11 +56,11 @@ Both corrections are UI-only; no native contract changed. Post-correction permit
 
 A later focused source review found that the linear pipeline's no-synthesizer `executeSegment` exit could return planner/executor prose without invoking the Phase 4.3 gate. The exact DeepSeek executor added a shared `finishGated` boundary for answer-capable early exits, including no-synth and reviewer/repair terminal paths, and retained the existing pre-synthesis gate before the only orchestrator stage marked `surfaceAsAnswer`. The speculative planner-only and cascade paths already checked the same gate before returning an answer or starting synthesis. The HTTP route forwards user-visible `stream_event` text only for direct answer and `surfaceAsAnswer` synthesis; conductor `stage_token` is internal and is not forwarded as answer text. The direct provider path filters out freshness-required selections until authenticated current-turn reads satisfy the existing assessor, and the external CLI/delegate paths exclude those selections. A missing or invalid native receipt now fails closed when the prepared policy required current source; it does not substitute prepared IDs or another receipt.
 
-The independent coordinator check `phase4-precommit-review` then passed all five allowed checks against the combined working tree (base HEAD `34ea355a5f342e33282911875991cf83e10bc0f1`): Rust `cargo check` 0, server typecheck 0, server build 0, UI build 0 (2,722 modules; existing large-chunk warning), and `git diff --check` 0. The checker restored only exact-version dependency files from the existing Bun cache before building. A final fresh source review and a second five-check run against the committed Part 4.4 SHA remain pending.
+The scoped final reviewer found one further issue: a continuity mutation could commit while its response was lost, but the UI claimed the old objective was unchanged. DeepSeek corrected the UI to preserve the exact Session/revision/source/payload/operation-id tuple across an unchanged retry, read back current continuity only for display under Session/generation guards, and report the operation as ambiguous unless the native set response confirms it. The fresh scoped rereview was clean.
 
 ## Permitted checks actually run (unmasked exit codes)
 
-All checks ran on the final Phase 4.4 working tree; the source SHA is pending commit.
+The coordinator ran the five checks below against exact source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; evidence is in `phase4-source-final-2f6a226-checks.json`.
 
 | Check | Command | Result |
 |---|---|---|
@@ -72,7 +72,7 @@ All checks ran on the final Phase 4.4 working tree; the source SHA is pending co
 
 No check was masked by a pipeline. Compiler/type/build success establishes source compilation and bundling only.
 
-## NOT RUN gates (requires explicit user request)
+## NOT RUN gates
 
 - Every native and UI test, test declaration, and fixture.
 - The scripted deterministic provider and the four scripted native integration scenarios.
@@ -97,7 +97,7 @@ Created (production only):
 
 Created (this record): `docs/implementation/memory-phase-4-4-progress.md`, `docs/implementation/memory-phase-4-summary.md`.
 
-No test, fixture, or test-declaration file was added or edited. The pre-existing dirty baseline files (`AGENTS.md`, `PRIORITIES.md`, `README.md`, `docs/COMPLETION_BACKLOG.md`, `docs/MASTER_PLAN_LEARNED_ORCHESTRATION.md`) and the untracked `outputs/` and `src-tauri/gen/schemas/*` artifacts were left untouched. Nothing was staged or committed.
+No test, fixture, or test-declaration file was added or edited. The pre-existing dirty baseline files (`AGENTS.md`, `PRIORITIES.md`, `README.md`, `docs/COMPLETION_BACKLOG.md`, `docs/MASTER_PLAN_LEARNED_ORCHESTRATION.md`) and the untracked schema artifacts were left untouched. Four duplicate plan copies initially landed in the worktree-local `outputs/`; they were confirmed byte-identical to the user-facing copies in `/Users/charlottehughes/Documents/Codex/2026-10-04/ca/outputs` and removed from the worktree. The Phase 4.4 source checkpoint was committed with explicit paths.
 
 ## Gaps and limitations
 
@@ -116,4 +116,4 @@ No test, fixture, or test-declaration file was added or edited. The pre-existing
 - **Parent Task 5 (fresh-source revalidation):** the revalidation result is displayed as evidence-availability metadata separate from statement meaning; no durable memory rewrite, truth verdict, or verified-observation capture is introduced.
 - **Parent Task 6 (scripted/live acceptance):** explicitly NOT RUN; no tests, provider, restart, or package evidence was produced.
 - **Phase 1–3 contracts preserved:** no second writable store; scope/authority/provenance/revision, derived-gated invalidation, capture idempotency/receipts/suppression, and objective continuity semantics are unchanged. The only native change is the additive relay diagnostic projection, which narrows nothing.
-- The no-synth pre-answer gate finding was corrected and the independent allowed source checks passed. A final fresh source review after checkpoint is still pending. Runtime/test gates remain NOT RUN under the task instruction.
+- Fresh source review found and DeepSeek corrected the no-synth pre-answer gate gap and ambiguous continuity-set outcome. The scoped rereview was clean and all five allowed checks passed against the final source SHA. Runtime/test gates remain NOT RUN under the task instruction.

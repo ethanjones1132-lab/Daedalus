@@ -35,7 +35,7 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 ### Current implementation checkpoint
 
-Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review, coordination, and validation; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Roadmap priorities #2–#5 remain queued. The Phase 4 source checkpoint SHA is pending coordinator commit.
+Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review and coordination; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Roadmap priorities #2–#5 remain queued. Final Phase 4 source checkpoint: `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; all five allowed checks passed and the final scoped review was clean.
 
 ### Intended outcome
 
@@ -96,7 +96,7 @@ Priority #1 is divided into four sequential phases. The [phase design](superpowe
 | 3 | Idempotent capture, accepted correction, forgetting, and objective continuity | [Safe capture](superpowers/plans/2026-10-04-memory-phase-3-safe-capture.md) |
 | 4 | User controls, stale-context handling, and cross-Session/restart proof | [Continuity and controls](superpowers/plans/2026-10-04-memory-phase-4-continuity-controls.md) |
 
-**Phase 4 source checkpoint (Part 4.4, awaiting commit; SHA pending):** native classification and operator controls (4.1), persisted Session Agent/project identity and bound-workspace resolution (4.2), conservative fresh-source revalidation receipts (4.3), and turn-status/continuity UI plus closure (4.4) are implemented in source. Permitted compiler/type/build checks pass on the working tree. **NOT RUN / requires user request:** every test, test declaration, fixture, scripted provider, live inference, cross-Session/restart, packaging, installation, and acceptance scenario. Source compilation is not runtime proof; priority #1 stays active and no runtime-complete claim is made.
+**Phase 4 source checkpoint (Part 4.4, final source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`):** native classification and operator controls (4.1), persisted Session Agent/project identity and bound-workspace resolution (4.2), conservative fresh-source revalidation receipts (4.3), and turn-status/continuity UI plus closure (4.4) are implemented in source. All five permitted compiler/type/build checks passed against the exact source SHA, and final fresh source review was clean. **NOT RUN:** tests, fixtures, scripted provider, live inference, cross-Session/restart, packaging, installation, and acceptance scenarios. Source compilation is not runtime proof; priority #1 stays active and no runtime-complete claim is made.
 
 Finish and verify each phase before implementing the next. Completing these phases completes priority #1 only; priorities #2–#5 retain their separate gates.
 
