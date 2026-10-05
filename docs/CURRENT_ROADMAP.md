@@ -2,7 +2,7 @@
 
 **Established:** 2026-10-04\
 **Status:** Accepted direction; implementation proceeds one priority at a time.\
-**Current priority:** #2 — Connect goals, commitments, scheduling, and execution (source work authorized by the user on 2026-10-05; Priority #1 acceptance remains open).\
+**Current priority:** #3 — Prove that learning improves future work (source work and controlled roadmap evaluation explicitly authorized by the user on 2026-10-05; Priority #1 and #2 acceptance remain open).\
 **Owner:** Ethan, with implementation tracked in this repository.\
 **Canonical location:** `docs/CURRENT_ROADMAP.md`.
 
@@ -19,9 +19,9 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 | Order | Priority | Status | Completion evidence |
 |---|---|---|---|
 | 1 | Make memory change how Jarvis behaves | Incomplete/open; Phases 1–4 source implemented; all runtime/test acceptance gates NOT RUN | Correct, scoped recall and capture in live turns; continuity across Sessions and restart |
-| 2 | Connect goals, commitments, scheduling, and execution | Active for source work by explicit user direction; runtime acceptance open | A goal progresses through approved execution, interruption, resumption, and verified delivery |
-| 3 | Prove that learning improves future work | Queued behind #2 | Controlled comparisons show a reusable improvement on separate related tasks |
-| 4 | Build complete workflows beyond coding | Queued behind #3 | Project stewardship, research, and recurring work produce usable outputs end to end |
+| 2 | Connect goals, commitments, scheduling, and execution | Source plan complete; runtime acceptance open and deferred by explicit user direction | A goal progresses through approved execution, interruption, resumption, and verified delivery |
+| 3 | Prove that learning improves future work | Active for source implementation and controlled evaluation by explicit user direction | Controlled comparisons show a reusable improvement on separate related tasks |
+| 4 | Build complete workflows beyond coding | Queued until Priority #3 meets its completion criteria | Project stewardship, research, and recurring work produce usable outputs end to end |
 | 5 | Measure local usefulness before expanding orchestration research | Queued behind #4 | Actual hardware measurements identify which changes improve accepted outcomes per resource spent |
 
 1. Work on one numbered priority at a time, including its design, implementation, validation, and evidence record. The user may explicitly direct a sequence change; record the ruling and preserve all unfinished acceptance gates.
@@ -35,7 +35,7 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 ### Current implementation checkpoint
 
-Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review and coordination; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Priority #1 acceptance remains open; the user has explicitly directed source work on #2. Priorities #3–#5 remain queued. Final Phase 4 source checkpoint: `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; all five allowed checks passed and the final scoped review was clean.
+Memory Phases 1–4 have compiled source checkpoints. Luna planned the four sequential source parts of Phases 2, 3, and 4 and performed source review and coordination; DeepSeek v4.1 Flash implemented every production source change through the OpenCode CLI. See the [Phase 2 handoff](implementation/memory-phase-2-summary.md), [Phase 3 handoff](implementation/memory-phase-3-summary.md), and [Phase 4 summary](implementation/memory-phase-4-summary.md). **Tests and runtime acceptance remain NOT RUN and all completion criteria remain open.** Priority #1 and #2 acceptance remain open. The user later explicitly directed Priority #3 source work and controlled evaluation before those acceptance gates; Priority #4 remains queued. Final Phase 4 source checkpoint: `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`; all five allowed checks passed and the final scoped review was clean.
 
 ### Intended outcome
 
@@ -98,7 +98,7 @@ Priority #1 is divided into four sequential phases. The [phase design](superpowe
 
 **Phase 4 source checkpoint (Part 4.4, final source SHA `2f6a226cf36ecd2aa351357b3fcb4ae7d7bafae5`):** native classification and operator controls (4.1), persisted Session Agent/project identity and bound-workspace resolution (4.2), conservative fresh-source revalidation receipts (4.3), and turn-status/continuity UI plus closure (4.4) are implemented in source. All five permitted compiler/type/build checks passed against the exact source SHA, and final fresh source review was clean. **NOT RUN:** tests, fixtures, scripted provider, live inference, cross-Session/restart, packaging, installation, and acceptance scenarios. Source compilation is not runtime proof; priority #1 remains incomplete/open and no runtime-complete claim is made.
 
-Priority #1 source Phases 1–4 are implemented, but #1 remains incomplete: tests and live/runtime/restart acceptance are NOT RUN and every completion criterion remains open. On 2026-10-05 the user explicitly directed source work to begin on Priority #2 while that acceptance remains outstanding. This recorded sequence override does not claim #1 complete or accepted. Priorities #3–#5 remain queued.
+Priority #1 source Phases 1–4 are implemented, but #1 remains incomplete: tests and live/runtime/restart acceptance are NOT RUN and every completion criterion remains open. On 2026-10-05 the user first directed source work to begin on Priority #2 while that acceptance remained outstanding, then explicitly directed Priority #3 source work and controlled evaluation before Priority #1/#2 acceptance. These sequence overrides do not claim either priority complete or accepted. Priority #3 is active; Priorities #4–#5 remain queued.
 
 ## 2. Connect goals, commitments, scheduling, and execution
 
@@ -155,6 +155,8 @@ All parts are source implementation plans. Tests, live execution, restart/interr
 - [ ] Completion references acceptance evidence and a reviewable output.
 
 ## 3. Prove that learning improves future work
+
+**Sequence override — 2026-10-05:** At the user's explicit direction, Priority #3 source work and the roadmap's controlled evaluation are active before Priority #1 or #2 runtime acceptance is complete. Priority #1 and Priority #2 acceptance remain **open/NOT RUN**; this direction does not waive or satisfy those gates. Priority #4 remains queued until Priority #3 has its required independent controlled-transfer evidence. The full Luna plan is [Priority 3 learning effectiveness](superpowers/plans/2026-10-05-roadmap-priority-3-learning-effectiveness.md).
 
 ### Intended outcome
 
