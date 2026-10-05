@@ -41,6 +41,20 @@ export type MemoryTurnTerminalStatus =
   | 'failed'
   | 'unterminated';
 
+/** Phase 4.3 `MemoryRevalidationState` values (evidence availability only). */
+export type MemoryRevalidationState =
+  | 'not_required'
+  | 'required'
+  | 'fresh_evidence'
+  | 'unavailable';
+
+const REVALIDATION_STATES: ReadonlySet<string> = new Set<MemoryRevalidationState>([
+  'not_required',
+  'required',
+  'fresh_evidence',
+  'unavailable',
+]);
+
 const RECALL_STATUSES: ReadonlySet<string> = new Set<MemoryRecallStatus>([
   'ready',
   'empty',
@@ -150,6 +164,20 @@ export interface MemoryTurnDiagnosticView {
   selectedIds: string[];
   appliedSelectedIds: string[];
   storeRevision: number;
+  /**
+   * Phase 4.3 current-source evidence availability. `null` when the native
+   * diagnostic predates the field or lacks a well-formed result. Never a truth
+   * verdict or a verified-observation capture.
+   */
+  revalidation: MemoryRevalidationView | null;
+}
+
+/** Decoded native `MemoryRevalidationResult` (field names camel-cased). */
+export interface MemoryRevalidationView {
+  state: MemoryRevalidationState;
+  memoryIds: string[];
+  evidenceToolCallIds: string[];
+  reasonCode: string | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -162,6 +190,31 @@ function isStringArray(value: unknown): value is string[] {
 
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Decode an optional Phase 4.3 native revalidation result. A missing or
+ * malformed value decodes to `null` (predates the field / unavailable), never
+ * to an invented success.
+ */
+export function decodeMemoryRevalidation(value: unknown): MemoryRevalidationView | null {
+  if (!isRecord(value)) return null;
+  const state = value.state;
+  if (typeof state !== 'string' || !REVALIDATION_STATES.has(state)) return null;
+  const memoryIds = isStringArray(value.memory_ids) ? value.memory_ids : null;
+  const evidenceToolCallIds = isStringArray(value.evidence_tool_call_ids)
+    ? value.evidence_tool_call_ids
+    : null;
+  const reason = value.reason_code;
+  if (memoryIds === null || evidenceToolCallIds === null) return null;
+  if (reason !== undefined && reason !== null && typeof reason !== 'string') return null;
+  if (state === 'fresh_evidence' && evidenceToolCallIds.length === 0) return null;
+  return {
+    state: state as MemoryRevalidationState,
+    memoryIds,
+    evidenceToolCallIds,
+    reasonCode: typeof reason === 'string' ? reason : null,
+  };
 }
 
 /**
@@ -258,6 +311,7 @@ export function decodeMemoryTurnDiagnostic(value: unknown): MemoryTurnDiagnostic
     selectedIds,
     appliedSelectedIds,
     storeRevision,
+    revalidation: decodeMemoryRevalidation(value.revalidation),
   };
 }
 

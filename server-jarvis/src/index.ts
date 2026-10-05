@@ -30,6 +30,14 @@ import {
   type AppliedTurnMemory,
 } from "./turn-memory-context";
 import type { PreparedMemoryTurn } from "./memory-contract";
+import type { MemoryRevalidationPolicy, MemoryRevalidationResult } from "./memory-contract";
+import type { ToolCallRecord } from "./orchestration/stage-output";
+import {
+  appliedRevalidationPolicy,
+  assessMemoryRevalidation,
+  buildMemoryRevalidationPolicy,
+  unavailableForUntrustedTransport,
+} from "./memory-revalidation";
 import {
   configureMemoryDerivedState,
   invalidateMemoryDerivedState,
@@ -1592,6 +1600,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       }
     : null;
   const turnMemoryEnvelope = activeTurnMemory?.envelope ?? null;
+  // Phase 4.3: build the fresh-source policy from the authenticated prepared
+  // selection and the canonical workspace only. Public `/chat/stream` fields
+  // (`memory`, `scope`, `agent_id`, message text) can never set it.
+  const memoryRevalidationPolicy: MemoryRevalidationPolicy = buildMemoryRevalidationPolicy(
+    turnMemoryEnvelope?.selected.map((item) => item.selection) ?? [],
+    activeWorkspacePath,
+  );
   // Snapshot the current invalidation watermark for this started turn. This
   // guard applies to EVERY turn that has a Session (native and ordinary HTTP),
   // not just native-provided turn ids. If a semantic mutation advances it
@@ -1799,6 +1814,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
     // evidence or a terminal outcome to any receipt. Frames carry IDs and
     // status only — never recalled content.
     let memoryTerminalRecorded = false;
+    // Phase 4.3: actual runtime tool records for THIS turn, used only to assess
+    // current-source evidence. Cache hits never reach `ctx.onToolResult`.
+    const observedToolCallRecords: ToolCallRecord[] = [];
+    // Set when the turn runs through a transport that cannot produce trusted
+    // Jarvis runtime read refs (e.g. the external Claude CLI runner).
+    let memoryRevalidationUntrusted = false;
     const emitMemoryStatusFrame = async (
       status: ConsumeMemoryResult["status"],
       envelope: PreparedMemoryTurn | null,
@@ -1850,6 +1871,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         digest = "";
       }
       if (!digest) return;
+      observedToolCallRecords.push({
+        name: call.name,
+        arguments: call.arguments,
+        output: rawOutput ?? "",
+        is_error: result.is_error,
+        ...(result.error_code ? { error_code: result.error_code } : {}),
+        duration_ms: result.duration_ms ?? 0,
+      });
       nativeMemoryRegistry.observeToolEvidence(activeTurnMemory.preparationId, {
         tool_call_id: call.id,
         tool_name: call.name,
@@ -1896,6 +1925,40 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // accepted facts, so the derived-persistence watermark does NOT gate the
       // authenticated runtime lifecycle.
       memoryTerminalRecorded = true;
+      // Phase 4.3: attach current-source evidence availability before the
+      // terminal outcome freezes the receipt. Revalidation covers only the
+      // relevant project descriptive/unknown selections ACTUALLY APPLIED this
+      // turn (authenticated registry applied-selected IDs), never a
+      // prepared-but-budget-omitted selection. A turn that requires fresh
+      // workspace reads but ran on an untrusted transport (external CLI) is
+      // explicitly `unavailable`; it is never reported as fresh.
+      const terminalReceipt = nativeMemoryRegistry.receipt(activeTurnMemory.preparationId);
+      const terminalPolicy = appliedRevalidationPolicy(
+        memoryRevalidationPolicy,
+        terminalReceipt?.applied_selected_ids ?? [],
+      );
+      let revalidation: MemoryRevalidationResult;
+      if (memoryRevalidationUntrusted) {
+        revalidation = unavailableForUntrustedTransport(terminalPolicy);
+      } else {
+        try {
+          revalidation = assessMemoryRevalidation(
+            terminalPolicy,
+            observedToolCallRecords,
+            terminalReceipt?.runtime_evidence ?? [],
+            message,
+            activeWorkspacePath,
+          );
+        } catch {
+          revalidation = {
+            state: "unavailable",
+            memory_ids: terminalPolicy.memory_ids,
+            evidence_tool_call_ids: [],
+            reason_code: "unsupported_evidence_path",
+          };
+        }
+      }
+      nativeMemoryRegistry.observeRevalidation(activeTurnMemory.preparationId, revalidation);
       nativeMemoryRegistry.observeTerminal(activeTurnMemory.preparationId, {
         terminal_status: status,
         finished_at: new Date().toISOString(),
@@ -2012,6 +2075,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       // ── Claude CLI path ──────────────────────────────────────────
       if (cfg.active_backend === "claude_cli") {
+        // The external CLI runs its own tools and cannot produce trusted Jarvis
+        // runtime read refs, so a turn requiring fresh workspace reads is never
+        // reported as fresh.
+        memoryRevalidationUntrusted = true;
         const reasoningParser = new ReasoningParser(sessionId);
         // Memory-enabled fresh-turn mode. A consumed snapshot must never ride
         // on `cliSessionMap` resume: deleted/invalidated memory could otherwise
@@ -3704,7 +3771,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : "";
         const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against the ordered allowed roots.${grantedRootsHint}`;
         const memoryHints = mergeSharedContextHints(
-          sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
+          sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath, {
+            freshWorkspaceReads: memoryRevalidationPolicy.requires_fresh_workspace_reads,
+          }),
           { relevant_memories: [workspaceRootHint] },
         );
         // M8: route-entry owns the decision tree; wall-clock still starts here so
@@ -4153,6 +4222,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
+          // Phase 4.3: bypass the workspace read-result cache for this turn when
+          // a descriptive/unknown project fact requires current source.
+          memoryRevalidation: memoryRevalidationPolicy,
           sessionGrants: activeTaskRun.sessionGrants,
           workspaceRoot: activeWorkspacePath,
           // F6 latency: a low-complexity turn's synthesis does not need the

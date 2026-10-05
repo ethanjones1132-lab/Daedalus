@@ -40,6 +40,12 @@ export interface SessionMemoryIdentityProps {
   selection: SessionMemorySelection;
   agents: readonly AgentOption[];
   disabled?: boolean;
+  /**
+   * Lock only the Agent selector, leaving the workspace and user-scope controls
+   * usable. Set while a created-but-unbound native Session is being retried, so
+   * its Agent ownership cannot drift from the Session the retry would reuse.
+   */
+  agentLocked?: boolean;
   onSelectAgent: (agentId: string) => void;
   onBindWorkspace: (root: string | null) => void;
   onIncludeUserScope: (value: boolean) => void;
@@ -149,6 +155,7 @@ function SessionIdentityControls({
   selection,
   agents,
   disabled = false,
+  agentLocked = false,
   onSelectAgent,
   onBindWorkspace,
   onIncludeUserScope,
@@ -176,7 +183,7 @@ function SessionIdentityControls({
           id={agentLabel}
           aria-label="Session Agent"
           value={selection.agent_id}
-          disabled={disabled || existingSession}
+          disabled={disabled || existingSession || agentLocked}
           onChange={(event) => onSelectAgent(event.target.value)}
           className="min-w-[10rem] rounded-lg border border-white/10 bg-white/5 px-2 py-1.5 text-sm text-bone"
         >

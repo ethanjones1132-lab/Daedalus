@@ -1077,10 +1077,41 @@ pub fn apply_memory_turn_migrations(conn: &Connection) -> Result<(), rusqlite::E
           finished_at TEXT,
           terminal_status TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('completed','partial','cancelled','failed','unterminated')),
           run_id TEXT,
-          runtime_evidence_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(runtime_evidence_json))
+          runtime_evidence_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(runtime_evidence_json)),
+          revalidation_json TEXT NOT NULL DEFAULT '{"state":"not_required","memory_ids":[],"evidence_tool_call_ids":[],"reason_code":null}' CHECK(json_valid(revalidation_json))
         );
         CREATE INDEX IF NOT EXISTS idx_memory_turn_session ON memory_turn_preparations(session_id, prepared_at);
         CREATE INDEX IF NOT EXISTS idx_memory_turn_pending ON memory_turn_preparations(state, expires_at);
+        "#,
+    )?;
+    // Existing databases created before Phase 4.3 need the additive column. The
+    // SQLite ALTER TABLE cannot add a CHECK constraint, so the JSON validity is
+    // enforced by the table definition above for new databases and by native
+    // serialization for upgraded ones.
+    add_column_if_missing(
+        conn,
+        "memory_turn_preparations",
+        "revalidation_json",
+        "revalidation_json TEXT NOT NULL DEFAULT '{\"state\":\"not_required\",\"memory_ids\":[],\"evidence_tool_call_ids\":[],\"reason_code\":null}'",
+    )?;
+    // Upgraded databases cannot gain a CHECK constraint through ALTER TABLE, so
+    // the JSON validity is enforced by equivalent triggers. New databases also
+    // carry the column CHECK; these triggers are idempotent and harmless there.
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS memory_turn_revalidation_valid_bi
+        BEFORE INSERT ON memory_turn_preparations
+        WHEN NEW.revalidation_json IS NULL OR json_valid(NEW.revalidation_json) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid memory turn revalidation json');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_turn_revalidation_valid_bu
+        BEFORE UPDATE ON memory_turn_preparations
+        WHEN NEW.revalidation_json IS NULL OR json_valid(NEW.revalidation_json) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid memory turn revalidation json');
+        END;
         "#,
     )
 }

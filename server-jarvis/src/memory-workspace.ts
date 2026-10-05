@@ -49,26 +49,6 @@ export interface BoundWorkspaceResolution {
   memory_status: MemoryRecallStatus | null;
 }
 
-/**
- * The most recent explicit workspace path named by the user. The current raw
- * message wins; otherwise the latest user-authored history entry. This is the
- * "latest explicit choice" that a binding must never silently override.
- */
-function latestExplicitWorkspace(
-  rawMessage: string,
-  history: readonly WorkspaceHistoryMessage[],
-): string | undefined {
-  const fromMessage = findExistingWorkspacePath(rawMessage);
-  if (fromMessage) return fromMessage;
-  for (let i = history.length - 1; i >= 0; i -= 1) {
-    const item = history[i];
-    if (!item || item.role !== "user") continue;
-    const recovered = findExistingWorkspacePath(item.content);
-    if (recovered) return recovered;
-  }
-  return undefined;
-}
-
 function candidateProjectRoot(
   identity: ScopeCandidateIdentity | null,
   registry: NativeMemoryRegistry,
@@ -81,14 +61,17 @@ function candidateProjectRoot(
 
 /**
  * Resolve the turn's effective workspace from an authenticated project
- * candidate only when (a) the current request names no workspace at all and
- * (b) the existing Tool runtime/sandbox authorization accepts the candidate as
- * a write root. The candidate is never passed as its own `workspaceOverride`
- * during authorization, so a bound project cannot authorize itself.
+ * candidate only when the current raw request names no workspace and the
+ * existing Tool runtime/sandbox authorization accepts the candidate as a write
+ * root. The candidate is never passed as its own `workspaceOverride` during
+ * authorization, so a bound project cannot authorize itself.
  *
- * A latest explicit user path always wins: the ordinary affinity result is
- * returned and `scope_mismatch` is reported so native recall does not inject
- * the conflicting project's memory.
+ * Precedence: a path the user names in the CURRENT raw message wins outright —
+ * the ordinary affinity result is returned and `scope_mismatch` is reported
+ * when it conflicts with the binding. Otherwise a valid authenticated binding
+ * supersedes any older explicit path recovered from conversation history. When
+ * there is no usable binding, ordinary history-based affinity fallback is
+ * preserved.
  */
 export function resolveBoundMemoryWorkspace(input: BoundWorkspaceInput): BoundWorkspaceResolution {
   const {
@@ -103,9 +86,12 @@ export function resolveBoundMemoryWorkspace(input: BoundWorkspaceInput): BoundWo
   } = input;
 
   const candidateRoot = candidateProjectRoot(identity, registry);
-  const explicit = latestExplicitWorkspace(rawMessage, history);
+  // Only a path named in the CURRENT raw message outranks an authenticated
+  // binding. An older explicit path from history does not: a valid binding
+  // supersedes that stale choice, while a current explicit message still wins.
+  const explicitInMessage = findExistingWorkspacePath(rawMessage);
 
-  if (explicit !== undefined) {
+  if (explicitInMessage !== undefined) {
     // Latest explicit user choice is authoritative for this turn. A bound
     // project that conflicts is reported as a mismatch and never forced.
     const active = affinity.resolve(sessionId, rawMessage, [...history], cfg.jarvis_path);

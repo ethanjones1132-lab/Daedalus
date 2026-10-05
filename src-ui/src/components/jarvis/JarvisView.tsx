@@ -763,6 +763,14 @@ export function ChatPanel({
   // A Session created for a first send whose workspace binding then failed.
   // It is reused on retry so a rejected bind never creates a second Session.
   const pendingNewSessionRef = useRef<string | null>(null);
+  // Render-visible mirror of `pendingNewSessionRef`. It exists only so the
+  // identity controls can lock the Agent selector while that created-but-
+  // unbound Session is awaiting retry; the ref stays the value `handleSend`
+  // reads. Cleared whenever the pending identity is consumed or abandoned.
+  const [pendingNativeSessionId, setPendingNativeSessionId] = useState<string | null>(null);
+  // Agent the pending native Session was actually created with, so a retry can
+  // never reuse it on behalf of a different displayed Agent selection.
+  const pendingNewSessionAgentRef = useRef('main');
   // The owning relay memory turn currently displayed. Used to drop stale
   // warnings/diagnostics when a different relay submission becomes active.
   const memoryOwnerRef = useRef<{ sessionId: string; turnId: string } | null>(null);
@@ -786,6 +794,8 @@ export function ChatPanel({
     // relay correlation: no old warning/diagnostic may survive it. It also
     // abandons any orphan pending-Session identity from a failed first bind.
     pendingNewSessionRef.current = null;
+    pendingNewSessionAgentRef.current = 'main';
+    setPendingNativeSessionId(null);
     setIncludeUserScope(false);
     setMemoryLiveStatus(null);
     setMemoryDiagnostic(null);
@@ -2555,7 +2565,11 @@ export function ChatPanel({
 
   const handleSelectAgent = useCallback((agentId: string) => {
     // Agent selection applies to a future Session only; an existing Session's
-    // Agent ownership is immutable. Changing it resets the local opt-in.
+    // Agent ownership is immutable. While a created-but-unbound Session is
+    // pending retry its Agent is fixed: honoring a change here would let the
+    // retry reuse a native Session owned by a different Agent. The visible
+    // control is locked in this state; this guard is the authoritative block.
+    if (pendingNewSessionRef.current) return;
     setPendingAgentId(agentId);
     setIncludeUserScope(false);
   }, []);
@@ -2665,14 +2679,25 @@ export function ChatPanel({
       if (!effectiveSessionId) {
         // Create the native Session once. A Session whose workspace bind then
         // fails is reused on retry rather than re-created.
+        const selectedAgentId = pendingAgentId && pendingAgentId !== 'main' ? pendingAgentId : 'main';
         let newSessionId = pendingNewSessionRef.current;
+        if (newSessionId && pendingNewSessionAgentRef.current !== selectedAgentId) {
+          // The pending native Session was created for a different Agent than
+          // the displayed selection. Never reuse it for the wrong Agent:
+          // abandon the orphan identity so a fresh Session is created below.
+          newSessionId = null;
+          pendingNewSessionRef.current = null;
+          setPendingNativeSessionId(null);
+        }
         if (!newSessionId) {
           const newSession = await invoke<JarvisSession>('jarvis_new_session', {
             name: userMsg.slice(0, 60),
-            ...(pendingAgentId && pendingAgentId !== 'main' ? { agentId: pendingAgentId } : {}),
+            ...(selectedAgentId !== 'main' ? { agentId: selectedAgentId } : {}),
           });
           newSessionId = newSession.id;
           pendingNewSessionRef.current = newSession.id;
+          pendingNewSessionAgentRef.current = selectedAgentId;
+          setPendingNativeSessionId(newSession.id);
           onSessionCreated();
         }
         if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
@@ -2704,6 +2729,8 @@ export function ChatPanel({
         activeSessionRef.current = newSessionId;
         setActiveSession(newSessionId);
         pendingNewSessionRef.current = null;
+        pendingNewSessionAgentRef.current = 'main';
+        setPendingNativeSessionId(null);
         onSessionsChanged();
       }
 
@@ -2868,6 +2895,13 @@ export function ChatPanel({
     setActiveSession(null);
     activeSessionRef.current = null;
     sessionIdRef.current = '';
+    // Explicit abandon path for a created-but-unbound Session: clearing the
+    // pending identity here (while `activeSession` may already be null, so the
+    // Session-change effect cannot fire) releases the Agent lock so the next
+    // New Session may choose a different Agent.
+    pendingNewSessionRef.current = null;
+    pendingNewSessionAgentRef.current = 'main';
+    setPendingNativeSessionId(null);
     setError(null);
     setPipelineStage('');
     setRecursionDepth(null);
@@ -3292,6 +3326,7 @@ export function ChatPanel({
           selection={sessionSelection}
           agents={sessionAgents}
           disabled={isStreaming}
+          agentLocked={pendingNativeSessionId !== null}
           onSelectAgent={handleSelectAgent}
           onBindWorkspace={(root) => { void handleBindWorkspace(root); }}
           onIncludeUserScope={setIncludeUserScope}

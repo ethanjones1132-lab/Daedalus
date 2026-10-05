@@ -333,6 +333,55 @@ export interface MemoryRuntimeEvidence {
   success: boolean;
 }
 
+// ── Phase 4.3 fresh-source revalidation wire contracts ───────────────────────
+// Evidence-availability metadata only. `fresh_evidence` records that current
+// source was freshly read this turn; it is NOT a semantic truth verdict, a
+// verified-observation capture, or a permission grant. The policy is derived
+// exclusively from authenticated prepared rows plus the canonical workspace;
+// public `/chat/stream` fields can never set it.
+
+export type MemoryRevalidationState =
+  | "not_required"
+  | "required"
+  | "fresh_evidence"
+  | "unavailable";
+
+export interface MemoryRevalidationPolicy {
+  memory_ids: string[];
+  requires_fresh_workspace_reads: boolean;
+}
+
+export interface MemoryRevalidationResult {
+  state: MemoryRevalidationState;
+  memory_ids: string[];
+  evidence_tool_call_ids: string[];
+  reason_code: string | null;
+}
+
+/** The exact `not_required` result native persists for an ordinary turn. */
+export const MEMORY_REVALIDATION_NOT_REQUIRED: MemoryRevalidationResult = {
+  state: "not_required",
+  memory_ids: [],
+  evidence_tool_call_ids: [],
+  reason_code: null,
+};
+
+/**
+ * The exact reason vocabulary reported for an `unavailable` result. Native
+ * normalizes any malformed receipt to `malformed_receipt`.
+ */
+export const MEMORY_REVALIDATION_REASON_CODES: ReadonlySet<string> = new Set<string>([
+  "no_current_read",
+  "insufficient_current_evidence",
+  "evidence_unavailable",
+  "workspace_unavailable",
+  "read_denied",
+  "source_missing",
+  "unsupported_cli_evidence",
+  "unsupported_evidence_path",
+  "malformed_receipt",
+]);
+
 export interface PersistedMemoryTurn {
   turn_id: string;
   preparation_id: string | null;
@@ -358,6 +407,8 @@ export interface PersistedMemoryTurn {
   terminal_status: MemoryTurnTerminalStatus | null;
   run_id: string | null;
   runtime_evidence: MemoryRuntimeEvidence[];
+  /** Phase 4.3 current-source evidence availability. Metadata only. */
+  revalidation: MemoryRevalidationResult;
 }
 
 export interface MemoryTurnDiagnostic {
@@ -371,6 +422,8 @@ export interface MemoryTurnDiagnostic {
   recall_status: MemoryRecallStatus;
   error_code: string | null;
   terminal_status: MemoryTurnTerminalStatus | null;
+  /** Phase 4.3 current-source evidence availability. Metadata only. */
+  revalidation: MemoryRevalidationResult;
 }
 
 export interface PromptHistoryMessage {

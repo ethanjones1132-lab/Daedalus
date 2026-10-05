@@ -17,6 +17,7 @@ import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "..
 import type { CallModelFn, ChatMessage } from "./router";
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
 import type { SessionMemory } from "./session-memory";
+import type { MemoryRevalidationPolicy } from "../memory-contract";
 import { resolveStagePrompt, stagePromptFile } from "./worker-prompt";
 import type { ToolCall, ToolDefinition, ToolResult } from "../tool-types";
 import { outcomeCollector } from "../self-tuning/mod";
@@ -294,6 +295,13 @@ export interface PipelineExecuteOptions {
   sharedContext?: SharedContextHints;
   /** Inter-workflow session memory for tool-cache recording and read short-circuit. */
   sessionMemory?: SessionMemory;
+  /**
+   * Phase 4.3 fresh-source revalidation policy. When
+   * `requires_fresh_workspace_reads` is set, the per-turn workspace read-result
+   * cache is bypassed so a cached/historical result can never satisfy current
+   * source evidence. Independent TaskRun/check evidence is untouched.
+   */
+  memoryRevalidation?: MemoryRevalidationPolicy;
   /** Absolute filesystem roots granted by raw user messages for this Session. */
   sessionGrants?: string[];
   workspaceRoot?: string;
@@ -1600,20 +1608,25 @@ export class PipelineExecutor {
     }
 
     if (memory && sessionId && READ_CACHE_TOOLS.has(call.name)) {
-      const cached = memory.lookupCachedToolResult(
-        sessionId,
-        call.name,
-        call.arguments,
-        this.ctx.workspace_path,
-      );
-      if (cached) {
-        return {
-          call_id: call.id,
-          name: call.name,
-          output: cached,
-          is_error: false,
-          duration_ms: 0,
-        };
+      // Phase 4.3: a turn that requires a current source read must not be
+      // served by the cross-turn read-result cache. The call executes through
+      // the real Tool runtime and is recorded normally.
+      if (options.memoryRevalidation?.requires_fresh_workspace_reads !== true) {
+        const cached = memory.lookupCachedToolResult(
+          sessionId,
+          call.name,
+          call.arguments,
+          this.ctx.workspace_path,
+        );
+        if (cached) {
+          return {
+            call_id: call.id,
+            name: call.name,
+            output: cached,
+            is_error: false,
+            duration_ms: 0,
+          };
+        }
       }
     }
 

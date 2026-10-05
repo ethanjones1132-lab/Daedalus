@@ -16,11 +16,13 @@ import type {
   ContinuityPreview,
   MemoryDerivedInvalidation,
   MemoryRecallStatus,
+  MemoryRevalidationResult,
   MemoryRuntimeEvidence,
   MemoryScope,
   PreparedMemoryTurn,
   SessionContinuity,
 } from "./memory-contract";
+import { MEMORY_REVALIDATION_NOT_REQUIRED, MEMORY_REVALIDATION_REASON_CODES } from "./memory-contract";
 import { noteMemoryDerivedActivity } from "./memory-derived-state";
 import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 
@@ -42,6 +44,8 @@ export const NATIVE_MEMORY_BODY_CAP_BYTES = 128 * 1024;
 export const NATIVE_MEMORY_EVIDENCE_REF_CAP = 100;
 export const NATIVE_MEMORY_EVIDENCE_BYTES_CAP = 64 * 1024;
 export const NATIVE_MEMORY_TTL_MS = 120_000;
+/** Phase 4.3 revalidation reason bound (native `MAX_REVALIDATION_REASON_CHARS`). */
+const MAX_REVALIDATION_REASON_LENGTH = 128;
 
 const MAX_ITEMS = 5;
 const MAX_ITEM_SCALARS = 600;
@@ -142,6 +146,8 @@ export interface NativeMemoryRuntimeReceipt {
   error_code: string | null;
   applied_selected_ids: string[];
   runtime_evidence: MemoryRuntimeEvidence[];
+  /** Phase 4.3 current-source evidence availability; metadata only. */
+  revalidation: MemoryRevalidationResult;
 }
 
 export interface NativeMemoryRegistry {
@@ -151,6 +157,8 @@ export interface NativeMemoryRegistry {
   observeApplied(preparationId: string, observation: MemoryAppliedObservation): void;
   observeTerminal(preparationId: string, event: MemoryTerminalObservation): void;
   observeToolEvidence(preparationId: string, ref: MemoryRuntimeEvidence): void;
+  /** Attach Phase 4.3 current-source evidence availability before terminal. */
+  observeRevalidation(preparationId: string, result: MemoryRevalidationResult): void;
   receipt(id: string): NativeMemoryRuntimeReceipt | null;
   ack(id: string, turnId: string): void;
   /**
@@ -255,6 +263,78 @@ function deepEqual(a: unknown, b: unknown): boolean {
 
 function cloneReceipt(receipt: NativeMemoryRuntimeReceipt): NativeMemoryRuntimeReceipt {
   return JSON.parse(JSON.stringify(receipt)) as NativeMemoryRuntimeReceipt;
+}
+
+const REVALIDATION_STATES = new Set<string>([
+  "not_required",
+  "required",
+  "fresh_evidence",
+  "unavailable",
+]);
+
+function malformedRevalidation(): MemoryRevalidationResult {
+  return {
+    state: "unavailable",
+    memory_ids: [],
+    evidence_tool_call_ids: [],
+    reason_code: "malformed_receipt",
+  };
+}
+
+/**
+ * Defensive bound of one revalidation result before it can be attached to a
+ * receipt. The native side re-validates against the immutable turn tuple; this
+ * only prevents a malformed Bun computation from being persisted verbatim.
+ * Ids are checked against the turn's prepared selection and this turn's
+ * recorded evidence refs.
+ */
+function sanitizeRevalidation(
+  result: MemoryRevalidationResult,
+  record: ReceiptRecord,
+): MemoryRevalidationResult {
+  if (typeof result !== "object" || result === null || !REVALIDATION_STATES.has(result.state)) {
+    return malformedRevalidation();
+  }
+  const allowedIds = new Set(record.selectedIds);
+  const allowedEvidence = new Set(record.receipt.runtime_evidence.map((ref) => ref.tool_call_id));
+  const ids = (value: unknown, allowed: Set<string>): string[] | null => {
+    if (!Array.isArray(value)) return null;
+    const out: string[] = [];
+    for (const id of value) {
+      if (typeof id !== "string" || id.length === 0 || id.length > MAX_DERIVED_ID_LENGTH) return null;
+      if (!allowed.has(id)) return null;
+      out.push(id);
+    }
+    return out;
+  };
+  const memoryIds = ids(result.memory_ids, allowedIds);
+  const evidenceIds = ids(result.evidence_tool_call_ids, allowedEvidence);
+  if (!memoryIds || !evidenceIds) return malformedRevalidation();
+  let reason: string | null = null;
+  if (result.reason_code !== null && result.reason_code !== undefined) {
+    if (
+      typeof result.reason_code !== "string" ||
+      result.reason_code.length === 0 ||
+      result.reason_code.length > MAX_REVALIDATION_REASON_LENGTH ||
+      !MEMORY_REVALIDATION_REASON_CODES.has(result.reason_code)
+    ) {
+      return malformedRevalidation();
+    }
+    reason = result.reason_code;
+  }
+  if (result.state === "fresh_evidence" && evidenceIds.length === 0) return malformedRevalidation();
+  if (
+    result.state === "not_required" &&
+    (memoryIds.length > 0 || evidenceIds.length > 0 || reason !== null)
+  ) {
+    return malformedRevalidation();
+  }
+  return {
+    state: result.state,
+    memory_ids: memoryIds,
+    evidence_tool_call_ids: evidenceIds,
+    reason_code: reason,
+  };
 }
 
 function freezeDeep<T>(value: T): T {
@@ -529,6 +609,7 @@ export function createNativeMemoryRegistry(
         error_code: errorCode,
         applied_selected_ids: [],
         runtime_evidence: [],
+        revalidation: { ...MEMORY_REVALIDATION_NOT_REQUIRED },
       },
       selectedIds: source.selectedIds,
     };
@@ -691,6 +772,15 @@ export function createNativeMemoryRegistry(
         return;
       }
       record.receipt.runtime_evidence.push(ref);
+    },
+
+    observeRevalidation(preparationId: string, result: MemoryRevalidationResult): void {
+      const record = receipts.get(preparationId);
+      if (!record || record.receipt.started_at == null) return;
+      // Availability metadata is only meaningful before the terminal outcome;
+      // a finished receipt is immutable.
+      if (record.receipt.terminal_status != null) return;
+      record.receipt.revalidation = sanitizeRevalidation(result, record);
     },
 
     receipt(id: string): NativeMemoryRuntimeReceipt | null {

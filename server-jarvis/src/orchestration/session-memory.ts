@@ -593,16 +593,30 @@ export class SessionMemory {
     this.persist(session);
   }
 
-  toSharedContextHints(sessionId: string, workspacePath?: string): SharedContextHints | undefined {
+  toSharedContextHints(
+    sessionId: string,
+    workspacePath?: string,
+    options?: { freshWorkspaceReads?: boolean },
+  ): SharedContextHints | undefined {
     if (!this.config().enabled) return undefined;
     const session = this.getSession(sessionId);
     this.pruneExpired(session);
     const activeWorkspace = normalizeWorkspacePath(workspacePath);
+    // Phase 4.3: when a descriptive/unknown project fact requires a current
+    // source read, historical workspace tool results and discovered facts must
+    // not be offered as inference hints for this turn. This fails closed even
+    // when there is no active workspace: the requirement is set independent of
+    // workspace presence, so an absent workspace must not re-enable stale
+    // history. Independent TaskRun/check evidence is not part of
+    // SharedContextHints and is left untouched.
+    const omitWorkspaceHistory = options?.freshWorkspaceReads === true;
 
     const prior_tool_results: Record<string, string> = {};
-    for (const entry of Object.values(session.toolResults)) {
-      if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
-      prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
+    if (!omitWorkspaceHistory) {
+      for (const entry of Object.values(session.toolResults)) {
+        if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
+        prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
+      }
     }
 
     const failure_patterns = session.failureHistory
@@ -611,11 +625,13 @@ export class SessionMemory {
       .slice(0, this.config().max_failure_patterns)
       .map((f) => (f.count > 1 ? `${f.pattern} (seen ${f.count}x)` : f.pattern));
 
-    const relevant_memories = Object.values(session.discoveredFacts)
-      .filter((fact) => !activeWorkspace || fact.workspacePath === activeWorkspace)
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 16)
-      .map((f) => f.value);
+    const relevant_memories = omitWorkspaceHistory
+      ? []
+      : Object.values(session.discoveredFacts)
+        .filter((fact) => !activeWorkspace || fact.workspacePath === activeWorkspace)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 16)
+        .map((f) => f.value);
 
     return mergeSharedContextHints(undefined, {
       prior_tool_results: Object.keys(prior_tool_results).length > 0 ? prior_tool_results : undefined,
