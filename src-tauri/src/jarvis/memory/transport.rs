@@ -610,13 +610,37 @@ pub fn execute_trusted_acceptance(
     Ok(Some(parsed))
 }
 
+/// Structured acknowledgement of one trusted-execution cancellation request.
+/// `cancelled` is true only when the exact live owned child reported aborting
+/// the real AbortSignal. `ambiguous` means the acknowledgement could not be
+/// bound to the exact live owned process and must not be treated as success.
+#[derive(Debug, Clone)]
+pub struct TrustedCancelAcknowledgement {
+    pub cancelled: bool,
+    pub ambiguous: bool,
+    pub reason: Option<String>,
+}
+
+impl TrustedCancelAcknowledgement {
+    fn ambiguous(reason: impl Into<String>) -> Self {
+        Self {
+            cancelled: false,
+            ambiguous: true,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 /// Request cancellation of one in-flight trusted execution by exact execution
-/// id. Returns whether the live owned child reported that it aborted the real
-/// AbortSignal for that operation. Writes nothing.
+/// id. The acknowledgement is bound to the exact live owned process: the
+/// current Bun generation and bound `bun_instance_id` are captured, live
+/// ownership is required, and both the response instance id and the post-request
+/// generation/ownership are validated. A malformed, replaced, or stale ack is
+/// reported as `ambiguous`, never as cancellation. Writes nothing.
 pub fn cancel_trusted_execution(
     transport: &NativeMemoryTransport,
     execution_id: &str,
-) -> Result<bool, String> {
+) -> TrustedCancelAcknowledgement {
     #[derive(Serialize)]
     struct CancelRequest<'a> {
         execution_id: &'a str,
@@ -624,20 +648,63 @@ pub fn cancel_trusted_execution(
     #[derive(Deserialize)]
     struct CancelResponse {
         cancelled: bool,
+        #[serde(default)]
+        bun_instance_id: String,
     }
     if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
-        return Ok(false);
+        return TrustedCancelAcknowledgement::ambiguous("owned Bun runtime is not live");
     }
-    let body = transport
-        .post_json(
-            "/internal/trusted/cancel",
-            &CancelRequest { execution_id },
-            200,
-        )
-        .map_err(|_| "trusted cancel transport unavailable".to_string())?;
-    let parsed: CancelResponse =
-        serde_json::from_str(&body).map_err(|_| "trusted cancel response could not be read".to_string())?;
-    Ok(parsed.cancelled)
+    // Capture the currently bound instance and generation before the request;
+    // update the bound metadata only briefly after it.
+    let bound_instance = transport.lock_state().bound_bun_instance_id.clone();
+    let generation = crate::process_lifecycle::bun_generation();
+    let body = match transport.post_json(
+        "/internal/trusted/cancel",
+        &CancelRequest { execution_id },
+        200,
+    ) {
+        Ok(body) => body,
+        Err(_) => {
+            return TrustedCancelAcknowledgement::ambiguous("trusted cancel transport unavailable")
+        }
+    };
+    let parsed: CancelResponse = match serde_json::from_str(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return TrustedCancelAcknowledgement::ambiguous(
+                "trusted cancel response could not be read",
+            )
+        }
+    };
+    if parsed.bun_instance_id.trim().is_empty() {
+        return TrustedCancelAcknowledgement::ambiguous(
+            "trusted cancel ack is missing the Bun instance identity",
+        );
+    }
+    if let Some(bound) = bound_instance.as_deref() {
+        if parsed.bun_instance_id != bound {
+            return TrustedCancelAcknowledgement::ambiguous(
+                "trusted cancel ack came from a different Bun instance",
+            );
+        }
+    }
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+    {
+        return TrustedCancelAcknowledgement::ambiguous(
+            "owned Bun child was replaced during trusted cancel",
+        );
+    }
+    {
+        let mut state = transport.lock_state();
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    }
+    TrustedCancelAcknowledgement {
+        cancelled: parsed.cancelled,
+        ambiguous: false,
+        reason: None,
+    }
 }
 
 /// Prepare a native turn and register its bounded envelope with the owned Bun

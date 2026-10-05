@@ -155,6 +155,8 @@ pub struct TrustedActionExecution {
     /// Actual Bun runtime bounds from the execution response.
     pub runtime_started_at: Option<String>,
     pub runtime_finished_at: Option<String>,
+    /// Durable cancellation intent for this exact execution, if any.
+    pub cancel_requested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -356,6 +358,7 @@ fn record_from_row(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
         String,
         String,
     ),
@@ -379,6 +382,7 @@ fn record_from_row(
         settled_at,
         runtime_started_at,
         runtime_finished_at,
+        cancel_requested_at,
         created_at,
         updated_at,
     ) = row;
@@ -408,6 +412,7 @@ fn record_from_row(
         settled_at,
         runtime_started_at,
         runtime_finished_at,
+        cancel_requested_at,
         created_at,
         updated_at,
         conflict: None,
@@ -417,7 +422,8 @@ fn record_from_row(
 const EXECUTION_COLS: &str = "execution_id, idempotency_key, action_id, manifest_id, \
      manifest_registry_version, manifest_content_hash, manifest_schema_version, agent_id, \
      project_root, status, terminal_reason, run_id, bun_run_id, evidence_json, started_at, \
-     settled_at, runtime_started_at, runtime_finished_at, created_at, updated_at";
+     settled_at, runtime_started_at, runtime_finished_at, cancel_requested_at, created_at, \
+     updated_at";
 
 #[allow(clippy::type_complexity)]
 fn map_execution_row(
@@ -433,6 +439,7 @@ fn map_execution_row(
     String,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -465,6 +472,7 @@ fn map_execution_row(
         row.get(17)?,
         row.get(18)?,
         row.get(19)?,
+        row.get(20)?,
     ))
 }
 
@@ -762,6 +770,95 @@ fn mark_dispatched(conn: &Connection, execution_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Whether an execution receipt is already settled/terminal for dispatch
+/// purposes. A terminal row is never overwritten by a late dispatch result, so
+/// settled `cancelled`/`ambiguous` evidence is preserved.
+fn is_execution_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_PENDING_ACCEPTANCE
+            | STATUS_BLOCKED
+            | STATUS_FAILED
+            | STATUS_CANCELLED
+            | STATUS_PARTIAL
+            | STATUS_WAITING_FOR_USER
+            | STATUS_AMBIGUOUS
+    )
+}
+
+/// Persist durable cancellation intent for the exact execution, only while it is
+/// in a cancelable/unresolved state. The first intent timestamp is retained
+/// (idempotent re-request). Returns the number of rows updated.
+fn persist_cancel_intent(conn: &Connection, execution_id: &str) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE trusted_action_executions
+         SET cancel_requested_at = COALESCE(cancel_requested_at,
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE execution_id = ?1 AND status IN ('claimed','dispatched')",
+        [execution_id],
+    )
+    .map_err(|e| format!("failed to persist cancellation intent for '{execution_id}': {e}"))
+}
+
+/// Settle a dispatched execution from its runtime result while honoring
+/// persisted cancellation intent and preserving already-terminal state:
+///   * an already-terminal receipt is never overwritten;
+///   * if cancellation was requested, any non-`cancelled` outcome becomes
+///     `ambiguous` (a late success cannot erase cancellation intent or turn the
+///     operation into pending acceptance);
+///   * an exact `cancelled` runtime outcome settles `cancelled`.
+#[allow(clippy::too_many_arguments)]
+fn settle_dispatch_result(
+    conn: &Connection,
+    execution_id: &str,
+    incoming_status: &str,
+    reason: Option<&str>,
+    run_id: Option<&str>,
+    bun_run_id: Option<&str>,
+    evidence: Option<&serde_json::Value>,
+    runtime_started_at: Option<&str>,
+    runtime_finished_at: Option<&str>,
+) -> TrustedActionExecution {
+    let current = match load_execution(conn, execution_id) {
+        Ok(row) => row,
+        Err(_) => {
+            return settle_and_verify(
+                conn,
+                execution_id,
+                incoming_status,
+                reason,
+                run_id,
+                bun_run_id,
+                evidence,
+            )
+        }
+    };
+    if is_execution_terminal(&current.status) {
+        return current;
+    }
+    let cancelled_intent = current.cancel_requested_at.is_some();
+    let (effective_status, effective_reason) =
+        if cancelled_intent && incoming_status != STATUS_CANCELLED {
+            (
+                STATUS_AMBIGUOUS,
+                Some("cancellation intent present; late outcome cannot be confirmed"),
+            )
+        } else {
+            (incoming_status, reason)
+        };
+    let _ = set_execution_runtime_bounds(conn, execution_id, runtime_started_at, runtime_finished_at);
+    settle_and_verify(
+        conn,
+        execution_id,
+        effective_status,
+        effective_reason,
+        run_id,
+        bun_run_id,
+        evidence,
+    )
+}
+
 /// Persist the actual Bun runtime bounds (distinct from the native claim time).
 /// A read failure here is non-fatal to the outcome; the columns are read back
 /// with the receipt.
@@ -841,6 +938,7 @@ fn settle_and_verify(
             settled_at: None,
             runtime_started_at: None,
             runtime_finished_at: None,
+            cancel_requested_at: None,
             created_at: String::new(),
             updated_at: String::new(),
             conflict: None,
@@ -1111,6 +1209,22 @@ fn run_trusted_execution(
     {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+        // Honor a pre-dispatch cancellation intent FIRST: never send the manifest
+        // to Bun once cancellation was requested for this exact execution.
+        let current = load_execution(&conn, &execution_id)?;
+        if current.cancel_requested_at.is_some() {
+            return Ok(settle_and_verify(
+                &conn,
+                &execution_id,
+                STATUS_CANCELLED,
+                Some("cancelled before dispatch"),
+                None,
+                None,
+                None,
+            ));
+        }
+
         let manifest = load_manifest_scope(&conn, manifest_id)?
             .ok_or_else(|| format!("trusted manifest not found: {manifest_id}"))?;
 
@@ -1158,6 +1272,7 @@ fn run_trusted_execution(
                 ));
             }
         }
+
         mark_dispatched(&conn, &execution_id)?;
     }
 
@@ -1167,7 +1282,7 @@ fn run_trusted_execution(
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     match response {
-        Ok(None) => Ok(settle_and_verify(
+        Ok(None) => Ok(settle_dispatch_result(
             &conn,
             &execution_id,
             STATUS_BLOCKED,
@@ -1175,12 +1290,16 @@ fn run_trusted_execution(
             None,
             None,
             None,
+            None,
+            None,
         )),
-        Err(reason) => Ok(settle_and_verify(
+        Err(reason) => Ok(settle_dispatch_result(
             &conn,
             &execution_id,
             STATUS_AMBIGUOUS,
             Some(&reason),
+            None,
+            None,
             None,
             None,
             None,
@@ -1198,15 +1317,9 @@ fn run_trusted_execution(
                     Some("unrecognized execution outcome; receipt preserved for reconciliation"),
                 ),
             };
-            let _ = set_execution_runtime_bounds(
-                &conn,
-                &execution_id,
-                Some(&wire_response.started_at),
-                Some(&wire_response.finished_at),
-            );
             let evidence = serde_json::to_value(&wire_response.calls)
                 .map_err(|e| format!("failed to serialize execution evidence: {e}"))?;
-            Ok(settle_and_verify(
+            Ok(settle_dispatch_result(
                 &conn,
                 &execution_id,
                 status,
@@ -1214,6 +1327,8 @@ fn run_trusted_execution(
                 Some(&wire_response.run_id),
                 Some(&wire_response.bun_instance_id),
                 Some(&evidence),
+                Some(&wire_response.started_at),
+                Some(&wire_response.finished_at),
             ))
         }
     }
@@ -1266,9 +1381,20 @@ pub fn list_trusted_executions(
     rows.into_iter().map(record_from_row).collect()
 }
 
-/// Explicit private cancel route. Only a non-terminal execution owned by this
-/// native registry can be cancelled; the request aborts the real Bun
-/// AbortSignal for that exact execution and never manufactures a terminal state.
+/// Bound on waiting for authoritative native terminal readback after a
+/// cancellation signal.
+const CANCEL_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Explicit private cancel route. Cancellation intent is persisted FIRST for the
+/// exact execution (only while it is cancelable/unresolved), then the exact ID
+/// is signalled through the private authenticated capability path, and the
+/// command returns ONLY after an exact persisted `cancelled` or `ambiguous`
+/// receipt is read back. A `cancelled:true` HTTP response alone is not success:
+/// if the ack is unbound/ambiguous, the signal returns no confirmation, or the
+/// bounded wait expires without a terminal durable receipt, the receipt is
+/// settled `ambiguous` with a reason while preserving the intent. It never
+/// returns `dispatched` as cancellation confirmation.
 #[tauri::command]
 pub async fn cancel_trusted_execution(
     app: tauri::AppHandle,
@@ -1278,28 +1404,74 @@ pub async fn cancel_trusted_execution(
     if execution_id.is_empty() {
         return Err("an exact execution id is required".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        use tauri::Manager;
-        let db = app.state::<AppDb>();
+    tauri::async_runtime::spawn_blocking(move || cancel_execution(&app, &execution_id))
+        .await
+        .map_err(|error| format!("trusted cancel task join error: {error}"))?
+}
+
+fn cancel_execution(
+    app: &tauri::AppHandle,
+    execution_id: &str,
+) -> Result<TrustedActionExecution, String> {
+    use tauri::Manager;
+    let db = app.state::<AppDb>();
+
+    // 1. Persist cancellation intent first, only for a cancelable/unresolved
+    //    execution. Already-terminal (including pending_acceptance) receipts are
+    //    returned unchanged and are not made cancelable.
+    {
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let current = load_execution(&conn, &execution_id)?;
-        if matches!(
-            current.status.as_str(),
-            STATUS_PENDING_ACCEPTANCE
-                | STATUS_BLOCKED
-                | STATUS_FAILED
-                | STATUS_CANCELLED
-                | STATUS_PARTIAL
-                | STATUS_WAITING_FOR_USER
-        ) {
+        let current = load_execution(&conn, execution_id)?;
+        if is_execution_terminal(&current.status) {
             return Ok(current);
         }
-        drop(conn);
-        let transport = crate::jarvis::memory::transport::native_memory_transport();
-        let _ = crate::jarvis::memory::transport::cancel_trusted_execution(transport, &execution_id);
-        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        load_execution(&conn, &execution_id)
-    })
-    .await
-    .map_err(|error| format!("trusted cancel task join error: {error}"))?
+        if persist_cancel_intent(&conn, execution_id)? == 0 {
+            return load_execution(&conn, execution_id);
+        }
+    }
+
+    // 2. Signal the exact ID through the private authenticated capability path.
+    let transport = crate::jarvis::memory::transport::native_memory_transport();
+    let ack = crate::jarvis::memory::transport::cancel_trusted_execution(transport, execution_id);
+    let ack_reason = if ack.ambiguous {
+        ack.reason
+            .clone()
+            .or_else(|| Some("cancel acknowledgement was not bound to the exact live process".to_string()))
+    } else {
+        None
+    };
+
+    // 3. Wait for authoritative terminal readback; the HTTP ack alone is never
+    //    treated as cancellation success.
+    let deadline = std::time::Instant::now() + CANCEL_ACK_WAIT;
+    loop {
+        {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let row = load_execution(&conn, execution_id)?;
+            if row.status == STATUS_CANCELLED || row.status == STATUS_AMBIGUOUS {
+                return Ok(row);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            let row = load_execution(&conn, execution_id)?;
+            if row.status == STATUS_CANCELLED || row.status == STATUS_AMBIGUOUS {
+                return Ok(row);
+            }
+            let reason = ack_reason
+                .clone()
+                .unwrap_or_else(|| "cancellation not durably confirmed within the wait bound".to_string());
+            let _ = settle_execution(
+                &conn,
+                execution_id,
+                STATUS_AMBIGUOUS,
+                Some(&reason),
+                None,
+                None,
+                None,
+            );
+            return load_execution(&conn, execution_id);
+        }
+        std::thread::sleep(CANCEL_POLL);
+    }
 }

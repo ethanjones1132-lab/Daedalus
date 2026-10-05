@@ -1726,6 +1726,7 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
                 evidence_json                 TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
                 started_at                    TEXT,
                 settled_at                    TEXT,
+                cancel_requested_at           TEXT,
                 created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 updated_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );
@@ -1741,6 +1742,13 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
             "trusted_action_executions",
             "projection_source_path",
             "projection_source_path TEXT NOT NULL DEFAULT ''",
+        )?;
+        // Migration-safe durable cancellation intent for the exact execution.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "cancel_requested_at",
+            "cancel_requested_at TEXT",
         )?;
         // Migration-safe index change: the earlier shape had a non-unique
         // (action_id, status) index. Replace it with a partial unique guard that
