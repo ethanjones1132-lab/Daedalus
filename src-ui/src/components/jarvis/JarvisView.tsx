@@ -5007,16 +5007,45 @@ interface FrozenOperation {
 
 const UNRESOLVED_OPERATION_STATUSES = ['claimed', 'dispatched', 'ambiguous', 'pending_acceptance'];
 const CANCELLABLE_OPERATION_STATUSES = ['claimed', 'dispatched'];
+const KNOWN_EXECUTION_STATUSES = new Set([
+  'claimed',
+  'dispatched',
+  'pending_acceptance',
+  'waiting_for_user',
+  'blocked',
+  'failed',
+  'cancelled',
+  'partial',
+  'ambiguous',
+]);
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const HEX64_PATTERN = /^[0-9a-f]{64}$/;
+
+function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+function isHex64(value: unknown): value is string {
+  return typeof value === 'string' && HEX64_PATTERN.test(value);
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === 'string';
+}
 
 function operationStorageKey(actionId: string): string {
   return `jarvis.trusted.operation.${actionId}`;
 }
 
-function storeOperation(op: FrozenOperation): void {
+/** Persist the exact frozen tuple locally. Returns false when it could not be
+ *  stored, so a fresh dispatch can refuse to run without a durable local tuple. */
+function storeOperation(op: FrozenOperation): boolean {
   try {
     localStorage.setItem(operationStorageKey(op.actionId), JSON.stringify(op));
+    return true;
   } catch {
-    // Local storage is untrusted and best-effort; native remains authority.
+    return false;
   }
 }
 
@@ -5032,11 +5061,11 @@ function readStoredOperation(actionId: string): FrozenOperation | null {
     const manifestId = value.manifestId;
     const version = value.expectedManifestVersion;
     const hash = value.expectedManifestHash;
-    if (typeof operationId !== 'string' || operationId.length === 0) return null;
+    if (!isUuid(operationId)) return null;
     if (typeof a !== 'string' || a !== actionId) return null;
     if (typeof manifestId !== 'string' || manifestId.length === 0) return null;
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return null;
-    if (typeof hash !== 'string' || hash.length === 0) return null;
+    if (!isHex64(hash)) return null;
     return {
       operationId,
       actionId: a,
@@ -5076,13 +5105,23 @@ function isTrustedExecutionReceipt(value: unknown): value is TrustedExecutionRec
   if (!value || typeof value !== 'object') return false;
   const row = value as Record<string, unknown>;
   return (
-    typeof row.execution_id === 'string' &&
-    row.execution_id.length > 0 &&
+    isUuid(row.execution_id) &&
     typeof row.action_id === 'string' &&
+    row.action_id.length > 0 &&
     typeof row.manifest_id === 'string' &&
+    row.manifest_id.length > 0 &&
     typeof row.manifest_registry_version === 'number' &&
-    typeof row.manifest_content_hash === 'string' &&
-    typeof row.status === 'string'
+    Number.isInteger(row.manifest_registry_version) &&
+    row.manifest_registry_version >= 1 &&
+    isHex64(row.manifest_content_hash) &&
+    typeof row.status === 'string' &&
+    KNOWN_EXECUTION_STATUSES.has(row.status) &&
+    isNullableString(row.terminal_reason) &&
+    isNullableString(row.cancel_requested_at) &&
+    isNullableString(row.run_id) &&
+    isNullableString(row.bun_run_id) &&
+    isNullableString(row.runtime_started_at) &&
+    isNullableString(row.runtime_finished_at)
   );
 }
 
@@ -5190,6 +5229,11 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
   const displayReceipt = receipt ?? history?.[0] ?? null;
   const cancellable =
     displayReceipt !== null && CANCELLABLE_OPERATION_STATUSES.includes(displayReceipt.status);
+  // Retry is available whenever native history holds an unresolved receipt, even
+  // without a local frozen tuple (it reconstructs from the native receipt), or
+  // when a frozen operation's exact readback failed.
+  const canRetry =
+    latestUnresolved !== null || (frozen !== null && readError !== null);
 
   const readback = useCallback(
     async (op: FrozenOperation): Promise<void> => {
@@ -5256,11 +5300,14 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
         UNRESOLVED_OPERATION_STATUSES.includes(row.status),
       );
       if (unresolved) {
-        const op = frozen ?? reconstructFrozen(unresolved);
-        if (!frozen) {
-          storeOperation(op);
-          setFrozen(op);
-        }
+        // Never keep a stale local tuple over the currently unresolved native
+        // operation: align to the exact native tuple and direct reconciliation.
+        const op =
+          frozen && receiptMatchesFrozen(unresolved, frozen)
+            ? frozen
+            : reconstructFrozen(unresolved);
+        storeOperation(op);
+        setFrozen(op);
         setMessage(
           `An unresolved operation (${unresolved.status}) already exists for this action. Use “Retry / reconcile this operation”.`,
         );
@@ -5271,7 +5318,8 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
         setMessage('This environment cannot generate an operation id; no operation was started.');
         return;
       }
-      // Freeze the exact tuple locally BEFORE invoking native.
+      // Freeze the exact tuple locally BEFORE invoking native; refuse to invoke
+      // if the durable local tuple could not be persisted.
       const op: FrozenOperation = {
         operationId,
         actionId,
@@ -5279,7 +5327,12 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
         expectedManifestVersion: record.registry_version,
         expectedManifestHash: record.content_hash,
       };
-      storeOperation(op);
+      if (!storeOperation(op)) {
+        setMessage(
+          'The exact operation tuple could not be persisted locally, so no operation was started.',
+        );
+        return;
+      }
       setFrozen(op);
       await dispatch(op);
     } finally {
@@ -5294,25 +5347,31 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
     setBusy(true);
     setMessage(null);
     try {
-      let op = frozen;
-      if (!op) {
-        let receipts: TrustedExecutionReceipt[];
-        try {
-          receipts = await fetchHistory();
-        } catch {
-          setMessage('Cannot read native operation history to reconstruct the operation.');
-          return;
-        }
-        const unresolved = receipts.find((row) =>
-          UNRESOLVED_OPERATION_STATUSES.includes(row.status),
-        );
-        if (!unresolved) {
-          setMessage('No local operation tuple and no unresolved native operation to reconcile.');
-          return;
-        }
-        op = reconstructFrozen(unresolved);
+      let target: TrustedExecutionReceipt | null = null;
+      try {
+        const receipts = await fetchHistory();
+        setHistory(receipts);
+        setHistoryUnavailable(false);
+        setHistoryError(null);
+        target =
+          receipts.find((row) => UNRESOLVED_OPERATION_STATUSES.includes(row.status)) ?? null;
+      } catch {
+        setHistoryUnavailable(true);
+        setHistoryError('Could not read native operation history; retry is unavailable.');
+      }
+      let op: FrozenOperation | null;
+      if (target) {
+        // Always prefer the exact current native target over a stale local tuple.
+        op =
+          frozen && receiptMatchesFrozen(target, frozen) ? frozen : reconstructFrozen(target);
         storeOperation(op);
         setFrozen(op);
+      } else {
+        op = frozen;
+      }
+      if (!op) {
+        setMessage('No local operation tuple and no unresolved native operation to reconcile.');
+        return;
       }
       await dispatch(op);
     } finally {
@@ -5323,7 +5382,17 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
 
   const cancelOperation = useCallback(async (): Promise<void> => {
     if (pending.current) return;
-    const op = frozen ?? (displayReceipt ? reconstructFrozen(displayReceipt) : null);
+    // Prefer the exact displayed native cancellable receipt over a stale local
+    // tuple; if they differ, use the native receipt's exact identity.
+    let op: FrozenOperation | null;
+    if (displayReceipt && CANCELLABLE_OPERATION_STATUSES.includes(displayReceipt.status)) {
+      op =
+        frozen && receiptMatchesFrozen(displayReceipt, frozen)
+          ? frozen
+          : reconstructFrozen(displayReceipt);
+    } else {
+      op = frozen;
+    }
     if (!op) {
       setMessage('No operation identity is available to cancel.');
       return;
@@ -5366,7 +5435,7 @@ function TrustedManifestOperations({ record }: { record: TrustedManifestRecord }
           >
             {busy ? 'Working…' : 'Run manifest'}
           </button>
-          {frozen && (latestUnresolved !== null || readError !== null) && (
+          {canRetry && (
             <button
               type="button"
               onClick={() => void retry()}
