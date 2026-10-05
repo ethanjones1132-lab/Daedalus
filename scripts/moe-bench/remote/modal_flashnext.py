@@ -48,7 +48,8 @@ image = (
 bench_image = (
     image.add_local_file(HERE.parent / "slice_experts.py", "/opt/slice_experts.py")
     .add_local_file(HERE.parent / "tier2b_llama.py", "/opt/tier2b_llama.py")
-    .add_local_dir(HERE.parents[1] / "benchmark-tier2b", "/opt/benchmark-tier2b")
+    .add_local_dir(HERE.parent.parent / "benchmark-tier2b", "/opt/benchmark-tier2b")  # not parents[1]: the
+    # container re-imports this file from /root, which has no grandparent
 )
 vol = modal.Volume.from_name("flashnext", create_if_missing=True)
 app = modal.App("flashnext-expert-usage", image=image)

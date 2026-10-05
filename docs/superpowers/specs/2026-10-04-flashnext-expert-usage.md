@@ -2,6 +2,8 @@
 
 **Question.** The Qwen family took expert pruning well: Qwen3.6 kept 96 of 256 experts and still scored 99/117. Could an optimal prune, config and quant put Qwen3.8-Flash-Next on 8 GB VRAM + 16 GB RAM?
 
+**Measured (tier2b, thinking off):** the unpruned Coder scores 97/117. keep96 (13.85 GB, the size that fits this PC) scores 83. It is damaged on harder tasks but not collapsed. Both are below Qwen3.6 keep96 (101), which already runs here at 274 tok/s. Details in the tier2b section below.
+
 **Short answer.** Not by pruning on 16 GB of RAM. ISTA's Coder release already removed the redundant half of the experts, and the 256 that remain are all in steady use. Fitting 16 GB needs about 112 or fewer, which keeps only 82% of expert energy, below the level where gpt-oss collapsed. With a second 16 GB stick (32 GB, dual channel), 224 of 256 experts fit (98.5% of the energy), so the Coder would run at essentially full quality.
 
 ## What was measured
@@ -67,14 +69,33 @@ The dense 4.45 GB, KV, compute buffers and the desktop take about 6 GB of the RT
 - *Keep all 256 and page cold experts from the SSD.* With the top 128 resident, about 20% of routings miss. That is about 200 MB per token from the NV2, a few tok/s at best, on the drive that already bugchecked under heavy I/O.
 - *Heal a deeper prune by distillation.* This needs training passes over a 177B-parameter model, which is out of scope here.
 
+## tier2b: keep96 against the unpruned release (measured 2026-10-04)
+
+The run was `modal_flashnext.py::bench`: one L40S per variant, tier2b with 39 tasks × 3 samples. Settings were temperature 0.2 / top-p 0.95, **thinking off**, no speculation, and the same harness as every local score.
+
+| | Total | A algorithmic | B hidden-package | C robustness | D file I/O | E library use | Answer tokens (median / mean) | Hit the 2,048 cap |
+|---|---|---|---|---|---|---|---|---|
+| Unpruned Coder (256) | **97** | 34/36 | 14/21 | 20/21 | 21/21 | 8/18 | 79 / 161 | 2 |
+| keep96 (13.85 GB) | **83** | 28/36 | **3/21** | 21/21 | 19/21 | 12/18 | 75 / 306 | 10 |
+
+Both ran at about 66 tok/s single-stream on the L40S. Job time was 9.6 and 14.3 minutes. The two runs together cost about $1.15.
+
+- **keep96 is damaged, not collapsed.** It lost 23 samples the unpruned model passed and won 9 that it failed. Most of the gain was in E, where the unpruned model's failures are mostly SyntaxErrors (prose leaking into the extracted file).
+- **The energy metric was too pessimistic.** 0.775 energy kept cost 14 points here, while gpt-oss lost 31 at 0.836. The always-on shared expert is a likely reason.
+- **The failure mode is derailment on hard prompts.** Hidden-package fixes fell from 14 to 3. 10 answers ran to the token cap with runaway number lists or self-repeating prose, which then fails as a SyntaxError. Simple and robustness tasks are untouched.
+- **The unpruned Coder scores only 97 with thinking off.** That is below what already runs on this PC: Qwen3.6 keep96 scores 101 at 274 tok/s, Gemma 4 26B 105, and gpt-oss-20b 108. ISTA's published scores use extra-high reasoning effort, so thinking may be what this model needs. That is untested on tier2b.
+
 ## Next steps
 
-1. **Recommended:** add a second 16 GB DDR5 stick, then slice keep224 (or keep192 for more headroom). Run it locally with `--n-cpu-moe` plus n-gram speculation, and score it on tier2b.
-2. **If a 16 GB answer is wanted first:** slice keep112 and keep160 on Modal (CPU container, about 30 GB download each) and run tier2b on the L40S. That measures the actual quality cliff instead of inferring it from energy. Estimated cost $2–3. It needs `gguf-py` from the llama.cpp tree, because PyPI `gguf` lacks Q2_0 (type 42).
+1. **Don't run keep96 locally.** At 83 it trails Qwen3.6 keep96, which is faster and already fits.
+2. **Before buying RAM for Flash-Next, score the unpruned Coder with thinking on.** One more Modal run of about $1, using `tier2b_llama.py --budget 2048` or `-1`. If thinking lifts it well past 105, the 32 GB / keep224 path is worth it. If not, the current local lineup is as good on this benchmark.
+3. The keep96 slice (13.85 GB) is kept in the Modal volume `flashnext` under `keep96/`, with its expert list in `keep96-experts.json`.
 
 ## Files
 
-- `docs/benchmarks/2026-10-04/flashnext/`: `expert-usage-summary.json` (per-layer energy and counts, top-N expert lists), `transcripts.jsonl`, `calib.txt`, `server.log`, `imatrix.log`
+- `docs/benchmarks/2026-10-04/flashnext/`:
+  - `expert-usage-summary.json` (per-layer energy and counts, top-N expert lists), `transcripts.jsonl`, `calib.txt`, `server.log`, `imatrix.log`
+  - `tier2b-unpruned.jsonl`, `tier2b-keep96.jsonl` (per-sample results with raw answers) and `keep96-experts.json`
 - The 283 MB imatrix is not committed. It is in `C:\qwen3-forge-stage\flashnext-results\results\` and in the Modal volume `flashnext`.
 - ISTA's per-tensor and per-expert allocation (`...rco-allocation.txt`) is in the same local folder. It is also downloadable from the model repo.
 - Scripts: `scripts/moe-bench/remote/modal_flashnext.py`, `flashnext_calib.py`
