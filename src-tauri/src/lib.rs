@@ -1735,6 +1735,7 @@ pub fn run() {
             delete_cron_job,
             run_cron_job,
             get_cron_runs,
+            get_cron_activations,
             get_in_flight_cron_jobs,
             list_pending_missed_jobs,
             dismiss_missed_cron_job,

@@ -731,6 +731,74 @@ pub fn validate_commitment_goal_binding(
     Ok(())
 }
 
+/// Whether a Goal status is terminal and therefore cannot start new work.
+pub fn goal_is_terminal(status: &str) -> bool {
+    TERMINAL_GOAL_STATUSES.contains(&status)
+}
+
+/// Validate a cron job's Goal association immediately before activation.
+/// Returns the loaded, non-terminal Goal. Reuses the same native authority
+/// checks as link validation (owning Agent, bound Session Agent, canonical
+/// workspace). A terminal Goal cannot start new activation so scheduled work for
+/// a closed Goal stops rather than dispatching under stale authority.
+pub fn validate_cron_goal_activation(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+    cron_job_id: &str,
+) -> Result<Goal, String> {
+    let goal = load_goal(conn, goal_id)?;
+    if goal_is_terminal(&goal.status) {
+        return Err(format!(
+            "goal is terminal ('{}'); scheduled activation is disabled",
+            goal.status
+        ));
+    }
+    validate_cron_job(conn, &goal, cron_job_id)?;
+    Ok(goal)
+}
+
+/// Validate a prospective cron job Goal association from the native CRUD flow,
+/// before the job row exists or before a patch is applied. Uses the supplied
+/// Agent and optional bound Session instead of an existing job row and applies
+/// the same Agent/Session/workspace scope checks. A terminal Goal is refused.
+/// A caller-supplied project path is never consulted.
+pub fn validate_cron_goal_binding_prospective(
+    conn: &rusqlite::Connection,
+    goal_id: &str,
+    agent_id: &str,
+    session_id: Option<&str>,
+) -> Result<Goal, String> {
+    let goal = load_goal(conn, goal_id)?;
+    if goal_is_terminal(&goal.status) {
+        return Err(format!(
+            "goal is terminal ('{}'); a cron job cannot be linked to it",
+            goal.status
+        ));
+    }
+    require_same_agent(agent_id, &goal, "cron job", "(cron job)")?;
+    match session_id {
+        Some(sid) => {
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+                    [sid],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let (session_agent, session_root) =
+                row.ok_or_else(|| format!("session not found: {}", sid))?;
+            require_bound_session_agent(&session_agent, agent_id, &goal, "cron job", "(cron job)")?;
+            require_same_workspace(session_root.as_deref(), &goal, "cron job", "(cron job)")?;
+            Ok(goal)
+        }
+        None => {
+            require_same_workspace(None, &goal, "cron job", "(cron job)")?;
+            Ok(goal)
+        }
+    }
+}
+
 /// Validate that a link target actually exists in its authoritative store and
 /// that its Agent/workspace identity is compatible with the loaded Goal before
 /// any link is persisted. Only kinds whose authority is reachable from this
@@ -1062,6 +1130,16 @@ pub fn goal_link_add(
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let now = now_iso();
     let id = new_id();
+    // `cron_jobs.goal_id` is the association the scheduler reads at activation.
+    // It and the `goal_links` projection live in the same SQLite transaction, so
+    // they cannot disagree.
+    if target_kind == "cron_job" {
+        tx.execute(
+            "UPDATE cron_jobs SET goal_id = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![&goal_id, &now, &target_id],
+        )
+        .map_err(|e| format!("Failed to associate cron job with goal: {}", e))?;
+    }
     tx.execute(
         "INSERT OR IGNORE INTO goal_links (id, goal_id, target_kind, target_id, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1114,6 +1192,17 @@ pub fn goal_link_remove(
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     load_goal(&tx, &goal_id)?;
+    // Clear the scheduler-visible association as well as the projection, in the
+    // same transaction, only when the job currently names this Goal.
+    if target_kind.trim() == "cron_job" {
+        tx.execute(
+            "UPDATE cron_jobs SET goal_id = NULL, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE id = ?1 AND goal_id = ?2",
+            rusqlite::params![&target_id, &goal_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let affected = tx
         .execute(
             "DELETE FROM goal_links WHERE goal_id = ?1 AND target_kind = ?2 AND target_id = ?3",

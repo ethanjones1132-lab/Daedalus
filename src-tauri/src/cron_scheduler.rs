@@ -66,6 +66,188 @@ pub fn compute_next_run(schedule_expr: &str) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
 }
 
+/// Deterministic UTC-millisecond occurrence key for the scheduled fire time of
+/// a due job. This is stable across scheduler polls and restarts because it is
+/// derived from the persisted `next_run` wall-clock value, never a fresh UUID.
+fn scheduled_occurrence_at(next_run: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(next_run.trim())
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Claim the deterministic occurrence for one due job so a given schedule fire
+/// dispatches at most once, even across a restart or overlapping polls.
+///
+/// Returns `Ok(Some(activation_id))` when this caller newly claimed the
+/// occurrence, `Ok(None)` when the occurrence is already durable (completed,
+/// cancelled, or previously attempted) and must not be re-dispatched. A terminal
+/// `cancelled`/`failed` claim is never revived; any other existing claim is
+/// marked `ambiguous` for explicit reconciliation instead of replay. Fails closed
+/// if the job is missing/disabled, the occurrence cannot be derived, or the
+/// insert/update does not commit.
+fn claim_activation(
+    app: &AppHandle,
+    job_id: &str,
+    schedule_expr: &str,
+    trigger_kind: &str,
+    next_run_override: Option<&str>,
+) -> Result<Option<String>, String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    let row: Option<(i64, Option<String>, String, Option<String>)> = conn
+        .query_row(
+            "SELECT enabled, next_run, agent_id, session_id FROM cron_jobs WHERE id = ?1",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (enabled, stored_next, agent_id, session_id) =
+        row.ok_or_else(|| format!("cron job not found: {job_id}"))?;
+
+    // A disabled job never activates (disable stops future scheduling).
+    if enabled == 0 {
+        return Err(format!("cron job '{}' is disabled", job_id));
+    }
+
+    let occurrence_source = next_run_override
+        .map(|s| s.to_string())
+        .or(stored_next)
+        .ok_or_else(|| format!("cron job '{}' has no occurrence time", job_id))?;
+    let occurrence = scheduled_occurrence_at(&occurrence_source)
+        .ok_or_else(|| format!("cron job '{}' has an invalid next_run", job_id))?;
+
+    // Goal-cancellation guard, native-side and fail-closed. A missing Goal (or
+    // an unreachable Goal authority) blocks activation rather than dispatching
+    // under stale authority.
+    let goal_id: Option<String> = conn
+        .query_row(
+            "SELECT goal_id FROM cron_jobs WHERE id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let mut goal_scope: Option<String> = None;
+    if let Some(ref gid) = goal_id {
+        let goal = crate::commands::goals::validate_cron_goal_activation(&conn, gid, job_id)
+            .map_err(|e| format!("goal association blocks activation: {e}"))?;
+        goal_scope = goal.project_root;
+    }
+
+    // Dedupe: this occurrence key is unique per job. A prior claim means the
+    // effect may already exist and must not be reissued.
+    let existing: Option<(String, String)> = conn
+        .query_row(
+            "SELECT activation_id, claim_state FROM cron_activations \
+             WHERE cron_job_id = ?1 AND schedule_occurrence = ?2",
+            rusqlite::params![job_id, occurrence.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some((existing_id, state)) = existing {
+        if state != "cancelled" && state != "failed" {
+            conn.execute(
+                "UPDATE cron_activations SET claim_state = 'ambiguous', \
+                 terminal_reason = COALESCE(terminal_reason, 'unresolved prior attempt; reconciliation required'), \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 WHERE activation_id = ?1",
+                [&existing_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        return Ok(None);
+    }
+
+    let activation_id = uuid::Uuid::new_v4().to_string();
+    let affected = conn
+        .execute(
+            "INSERT INTO cron_activations \
+             (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
+              schedule_occurrence, trigger_kind, claim_state, claimed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'claimed', \
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params![
+                &activation_id,
+                job_id,
+                goal_id,
+                &agent_id,
+                &session_id,
+                &goal_scope,
+                occurrence.to_string(),
+                trigger_kind,
+            ],
+        )
+        .map_err(|e| format!("failed to claim activation: {e}"))?;
+    if affected != 1 {
+        return Err("activation claim was not committed".to_string());
+    }
+    let _ = schedule_expr;
+    Ok(Some(activation_id))
+}
+
+/// Reconcile activation claims left pending across a restart. A claimed, not-yet-
+/// dispatched occurrence that has already passed is a missed-missed state: mark
+/// it `ambiguous` (reconciliation required) or `missed`-cancelled so it is never
+/// silently replayed. Dispatched-but-unsettled claims become `ambiguous` so a
+/// possibly-in-flight effect is surfaced for review rather than re-issued.
+fn reconcile_activations(app: &AppHandle) {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    let claimed: Vec<String> = match conn
+        .prepare(
+            "SELECT activation_id FROM cron_activations \
+             WHERE claim_state = 'claimed' \
+             AND schedule_occurrence < ?1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([Utc::now().timestamp_millis().to_string()], |row| {
+                row.get::<_, String>(0)
+            })
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        }) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("[cron] activation reconcile query failed: {}", e);
+            return;
+        }
+    };
+
+    if !claimed.is_empty() {
+        for id in &claimed {
+            if let Err(e) = conn.execute(
+                "UPDATE cron_activations SET claim_state = 'ambiguous', \
+                 terminal_reason = 'claim survived restart without dispatch; reconciliation required', \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+                 WHERE activation_id = ?1 AND claim_state = 'claimed'",
+                [id],
+            ) {
+                eprintln!("[cron] failed to reconcile activation {}: {}", id, e);
+            }
+        }
+        eprintln!(
+            "[cron] reconciled {} interrupted activation claim(s) to ambiguous",
+            claimed.len()
+        );
+    }
+
+    // A dispatched claim that never settled after a restart is ambiguous: the
+    // external effect may or may not have occurred, so never auto-replay it.
+    if let Err(e) = conn.execute(
+        "UPDATE cron_activations SET claim_state = 'ambiguous', \
+         terminal_reason = 'dispatch outcome unknown after restart; reconciliation required', \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE claim_state = 'dispatched'",
+        [],
+    ) {
+        eprintln!("[cron] failed to reconcile dispatched activations: {}", e);
+    }
+}
+
 /// Validate that `schedule_expr` can be parsed into a valid cron schedule.
 pub fn validate_cron_schedule(schedule_expr: &str) -> Result<(), String> {
     let seven = five_to_seven_field(schedule_expr);
@@ -203,6 +385,9 @@ pub struct CronDispatchResult {
     pub output: String,
     pub error: Option<String>,
     pub execution_evidence: Option<String>,
+    /// The Bun-executed run identity from `execution_evidence.run_id`, used to
+    /// correlate the durable run record with the accepted-output evidence chain.
+    pub bun_run_id: Option<String>,
 }
 
 /// Dispatch a cron job via the Bun server's `/cron/run` endpoint.
@@ -216,6 +401,7 @@ pub struct CronDispatchResult {
 pub async fn dispatch_cron_job(
     app: &AppHandle,
     job_id: &str,
+    activation_id: Option<&str>,
 ) -> Result<CronDispatchResult, String> {
     let (prompt, agent_id, snapshot) = {
         let db = app.state::<AppDb>();
@@ -250,6 +436,9 @@ pub async fn dispatch_cron_job(
         "prompt": prompt,
         "session_id": run_session,
     });
+    if let Some(aid) = activation_id {
+        body["activation_id"] = serde_json::Value::String(aid.to_string());
+    }
 
     // Attach agent_id and projection snapshot if available
     if let Some(ref aid) = agent_id {
@@ -281,23 +470,32 @@ pub async fn dispatch_cron_job(
     let output = result["output"].as_str().unwrap_or("").to_string();
     let error = result["error"].as_str().map(|s| s.to_string());
     let execution_evidence = result.get("execution_evidence").map(|v| v.to_string());
+    let bun_run_id = result
+        .get("execution_evidence")
+        .and_then(|v| v.get("run_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     if result["success"].as_bool().unwrap_or(false) {
         Ok(CronDispatchResult {
             output,
             error: None,
             execution_evidence,
+            bun_run_id,
         })
     } else {
         Ok(CronDispatchResult {
             output,
             error: error.or(Some("cron run failed with unknown error".to_string())),
             execution_evidence,
+            bun_run_id,
         })
     }
 }
 
-/// Insert a `cron_runs` row and update the job's `last_run` / `next_run`.
+/// Insert a `cron_runs` row and update the job's `last_run` / `next_run`, then
+/// settle the correlated activation claim. Correlation columns are nullable so
+/// legacy/unlinked runs remain readable.
 #[allow(clippy::too_many_arguments)]
 fn record_run(
     app: &AppHandle,
@@ -309,16 +507,28 @@ fn record_run(
     started_at: &str,
     next_run: Option<&str>,
     execution_evidence: Option<&str>,
+    activation: Option<&ActivationContext>,
 ) {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let run_id = uuid::Uuid::new_v4().to_string();
     let finished_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
+    let (activation_id, schedule_occurrence, goal_id, bun_run_id) = match activation {
+        Some(ctx) => (
+            Some(ctx.activation_id.as_str()),
+            Some(ctx.schedule_occurrence.as_str()),
+            ctx.goal_id.as_deref(),
+            ctx.bun_run_id.as_deref(),
+        ),
+        None => (None, None, None, None),
+    };
+
     if let Err(e) = conn.execute(
         "INSERT INTO cron_runs \
-         (id, cron_job_id, status, output, error, duration_ms, started_at, finished_at, execution_evidence) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, cron_job_id, status, output, error, duration_ms, started_at, finished_at, \
+          execution_evidence, activation_id, schedule_occurrence, goal_id, terminal_reason) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rusqlite::params![
             run_id,
             job_id,
@@ -328,7 +538,11 @@ fn record_run(
             duration_ms,
             started_at,
             finished_at,
-            execution_evidence
+            execution_evidence,
+            activation_id,
+            schedule_occurrence,
+            goal_id,
+            error,
         ],
     ) {
         eprintln!(
@@ -352,6 +566,36 @@ fn record_run(
         );
     }
 
+    // Settle the activation claim. A completed/failed terminal state is never
+    // revived and no occurrence is replayed.
+    if let Some(ctx) = activation {
+        let claim_state = if status == "success" {
+            "completed"
+        } else if status == "cancelled" {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        if let Err(e) = conn.execute(
+            "UPDATE cron_activations SET claim_state = ?1, run_id = ?2, bun_run_id = ?3, \
+             terminal_reason = ?4, settled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+             WHERE activation_id = ?5",
+            rusqlite::params![
+                claim_state,
+                run_id,
+                bun_run_id,
+                error,
+                ctx.activation_id.as_str()
+            ],
+        ) {
+            eprintln!(
+                "[cron] Failed to settle activation {} for job {}: {}",
+                ctx.activation_id, job_id, e
+            );
+        }
+    }
+
     // Prune runs for this job to keep only the last 100 entries.
     // This prevents SQLite database footprint bloat over time.
     if let Err(e) = conn.execute(
@@ -372,25 +616,60 @@ fn record_run(
     }
 }
 
-/// Execute a single cron job: dispatch it and record the result.
+/// Correlation carried from the claimed activation into the dispatch/run record.
+struct ActivationContext {
+    activation_id: String,
+    schedule_occurrence: String,
+    goal_id: Option<String>,
+    bun_run_id: Option<String>,
+}
+
+/// Execute a single cron job: claim the deterministic occurrence, dispatch it,
+/// and record the correlated result. `occurrence_override` supplies the due
+/// occurrence for scheduled polls; when `None` (manual/missed triggers) the
+/// current stored `next_run` is used as the occurrence key.
 pub async fn execute_job(
     app: &AppHandle,
     job_id: &str,
     schedule_expr: &str,
+    trigger_kind: &str,
+    occurrence_override: Option<&str>,
 ) -> Result<String, String> {
+    // Claim first. A durable prior claim for this occurrence is never
+    // re-dispatched; errors (disabled/missing job, terminal Goal association,
+    // invalid occurrence) fail closed before any dispatch.
+    let claim = claim_activation(app, job_id, schedule_expr, trigger_kind, occurrence_override)?;
+    let Some(activation_id) = claim else {
+        eprintln!(
+            "[cron] {} occurrence already claimed; skipping dispatch",
+            job_id
+        );
+        return Ok(String::new());
+    };
+
     {
         let mut guard = get_in_flight_registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         if guard.contains(job_id) {
+            // The claim is durable but the in-flight guard refused. Leave the
+            // claim as `claimed`; reconcile marks it ambiguous rather than
+            // replaying blindly.
             return Err(format!("Cron job '{}' is already running.", job_id));
         }
         guard.insert(job_id.to_string());
     }
 
+    let schedule_occurrence = occurrence_source(app, job_id, occurrence_override);
+    let goal_id = cron_job_goal_id(app, job_id);
+
+    // Transition the claim to `dispatched` before the external effect so a crash
+    // mid-dispatch is recoverable as `ambiguous`, not a silent replay.
+    update_claim_state(app, &activation_id, "dispatched", None);
+
     let started_at = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let start = std::time::Instant::now();
-    let result = dispatch_cron_job(app, job_id).await;
+    let result = dispatch_cron_job(app, job_id, Some(&activation_id)).await;
     let duration_ms = start.elapsed().as_millis() as i64;
     let next_run = compute_next_run(schedule_expr);
 
@@ -400,6 +679,12 @@ pub async fn execute_job(
                 "success"
             } else {
                 "failed"
+            };
+            let context = ActivationContext {
+                activation_id: activation_id.clone(),
+                schedule_occurrence: schedule_occurrence.clone().unwrap_or_default(),
+                goal_id: goal_id.clone(),
+                bun_run_id: dispatch.bun_run_id.clone(),
             };
             record_run(
                 app,
@@ -411,9 +696,16 @@ pub async fn execute_job(
                 &started_at,
                 next_run.as_deref(),
                 dispatch.execution_evidence.as_deref(),
+                Some(&context),
             );
         }
         Err(err) => {
+            let context = ActivationContext {
+                activation_id: activation_id.clone(),
+                schedule_occurrence: schedule_occurrence.clone().unwrap_or_default(),
+                goal_id: goal_id.clone(),
+                bun_run_id: None,
+            };
             record_run(
                 app,
                 job_id,
@@ -424,6 +716,7 @@ pub async fn execute_job(
                 &started_at,
                 next_run.as_deref(),
                 None,
+                Some(&context),
             );
         }
     }
@@ -436,6 +729,55 @@ pub async fn execute_job(
     }
 
     result.map(|d| d.output)
+}
+
+/// Read the occurrence key that `claim_activation` derived, for correlation into
+/// the run record. Mirrors the claim derivation (override, else stored next_run).
+fn occurrence_source(app: &AppHandle, job_id: &str, override_next: Option<&str>) -> Option<String> {
+    if let Some(value) = override_next {
+        return scheduled_occurrence_at(value).map(|ms| ms.to_string());
+    }
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let stored: Option<String> = conn
+        .query_row("SELECT next_run FROM cron_jobs WHERE id = ?1", [job_id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    stored.and_then(|value| scheduled_occurrence_at(&value).map(|ms| ms.to_string()))
+}
+
+/// Read the cron job's validated Goal association for run attribution.
+fn cron_job_goal_id(app: &AppHandle, job_id: &str) -> Option<String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    conn.query_row("SELECT goal_id FROM cron_jobs WHERE id = ?1", [job_id], |r| {
+        r.get(0)
+    })
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// Move one activation claim to a new state, preserving a stable terminal reason.
+fn update_claim_state(app: &AppHandle, activation_id: &str, state: &str, reason: Option<&str>) {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(e) = conn.execute(
+        "UPDATE cron_activations SET claim_state = ?1, \
+         terminal_reason = COALESCE(?2, terminal_reason), \
+         dispatched_at = CASE WHEN ?1 = 'dispatched' THEN strftime('%Y-%m-%dT%H:%M:%fZ','now') ELSE dispatched_at END, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE activation_id = ?3",
+        rusqlite::params![state, reason, activation_id],
+    ) {
+        eprintln!(
+            "[cron] Failed to update activation {} state to {}: {}",
+            activation_id, state, e
+        );
+    }
 }
 
 /// Detect jobs whose `next_run` has already passed (missed while the app was closed).
@@ -507,6 +849,10 @@ pub async fn start_cron_scheduler(app: AppHandle) {
     }
     tokio::time::sleep(Duration::from_secs(INITIAL_DELAY_SECS)).await;
 
+    // Reconcile any activation claims interrupted by the previous shutdown before
+    // scheduling resumes; ambiguous claims are never auto-replayed.
+    reconcile_activations(&app);
+
     detect_missed_jobs(&app);
 
     let mut ticker = interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -515,11 +861,11 @@ pub async fn start_cron_scheduler(app: AppHandle) {
     loop {
         ticker.tick().await;
 
-        let due_jobs: Vec<(String, String)> = {
+        let due_jobs: Vec<(String, String, Option<String>)> = {
             let db = app.state::<AppDb>();
             let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
             let mut stmt = match conn.prepare(
-                "SELECT id, schedule FROM cron_jobs \
+                "SELECT id, schedule, next_run FROM cron_jobs \
                  WHERE enabled = 1 \
                  AND next_run IS NOT NULL \
                  AND next_run <= strftime('%Y-%m-%dT%H:%M:%fZ','now')",
@@ -530,18 +876,19 @@ pub async fn start_cron_scheduler(app: AppHandle) {
                     continue;
                 }
             };
-            let collected: Vec<(String, String)> =
-                match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?))) {
-                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                    Err(e) => {
-                        eprintln!("[cron] row error: {}", e);
-                        vec![]
-                    }
-                };
+            let collected: Vec<(String, String, Option<String>)> = match stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(e) => {
+                    eprintln!("[cron] row error: {}", e);
+                    vec![]
+                }
+            };
             collected
         };
 
-        for (job_id, schedule_expr) in due_jobs {
+        for (job_id, schedule_expr, due_next_run) in due_jobs {
             {
                 let pending_missed = get_pending_missed_registry()
                     .lock()
@@ -566,8 +913,17 @@ pub async fn start_cron_scheduler(app: AppHandle) {
             }
 
             let app_clone = app.clone();
+            let occurrence = due_next_run;
             tokio::spawn(async move {
-                match execute_job(&app_clone, &job_id, &schedule_expr).await {
+                match execute_job(
+                    &app_clone,
+                    &job_id,
+                    &schedule_expr,
+                    "schedule",
+                    occurrence.as_deref(),
+                )
+                .await
+                {
                     Ok(out) => println!("[cron] {} done ({} chars)", job_id, out.len()),
                     Err(e) => eprintln!("[cron] {} failed: {}", job_id, e),
                 }
@@ -626,7 +982,9 @@ pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, Strin
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?
     };
 
-    execute_job(app, id, &schedule_expr).await.map(|_| true)
+    execute_job(app, id, &schedule_expr, "missed", None)
+        .await
+        .map(|_| true)
 }
 
 fn ensure_inference_feedback_job(conn: &rusqlite::Connection) -> Result<bool, String> {

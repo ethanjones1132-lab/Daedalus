@@ -46,6 +46,7 @@ interface CronJob {
   next_run: string | null;
   run_count: number;
   metadata: string | null;
+  goal_id?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -92,6 +93,10 @@ interface CronRun {
   started_at: string;
   finished_at: string | null;
   execution_evidence?: ExecutionEvidence;
+  activation_id?: string | null;
+  schedule_occurrence?: string | null;
+  goal_id?: string | null;
+  terminal_reason?: string | null;
 }
 
 // ── Job Types ────────────────────────────────────────────────────────────────

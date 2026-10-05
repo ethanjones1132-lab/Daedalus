@@ -282,6 +282,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_memory_turn_migrations(conn)?;
     apply_memory_capture_migrations(conn)?;
     apply_goal_migrations(conn)?;
+    apply_cron_activation_migrations(conn)?;
 
     Ok(())
 }
@@ -1470,6 +1471,77 @@ pub fn apply_goal_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT goal_migration; \
                  RELEASE SAVEPOINT goal_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 3 — durable cron activation/occurrence authority.
+/// Additive and idempotent. A `cron_activations` row is the durable claim for one
+/// deterministic schedule occurrence of one cron job. The unique
+/// `(cron_job_id, schedule_occurrence)` constraint is the dedupe key: a claimed
+/// occurrence can never be claimed again, so a confirmed/completed effect can
+/// never be re-dispatched across restarts. `goal_id`/`agent_id`/`session_id` are
+/// the validated association snapshot; pending, non-terminal claims become an
+/// explicit `ambiguous` reconcile state on restart rather than being replayed.
+/// No existing cron row is backfilled.
+pub fn apply_cron_activation_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT cron_activation_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cron_activations (
+                activation_id       TEXT PRIMARY KEY,
+                cron_job_id         TEXT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+                goal_id             TEXT,
+                agent_id            TEXT NOT NULL,
+                session_id          TEXT,
+                project_root        TEXT,
+                schedule_occurrence TEXT NOT NULL,
+                trigger_kind        TEXT NOT NULL DEFAULT 'schedule'
+                                    CHECK(trigger_kind IN ('schedule','manual','missed')),
+                claim_state         TEXT NOT NULL DEFAULT 'claimed'
+                                    CHECK(claim_state IN ('claimed','dispatched','completed','failed','cancelled','ambiguous','waiting_for_user','blocked')),
+                run_id              TEXT,
+                bun_run_id          TEXT,
+                terminal_reason     TEXT,
+                claimed_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                dispatched_at       TEXT,
+                settled_at          TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(cron_job_id, schedule_occurrence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_job   ON cron_activations(cron_job_id, claim_state);
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_goal  ON cron_activations(goal_id, claim_state);
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_state ON cron_activations(claim_state);
+            "#,
+        )?;
+
+        // Correlate the append-only run history with the durable activation and
+        // its deterministic occurrence. Nullable/additive: existing rows keep
+        // their history and read back as unlinked.
+        add_column_if_missing(conn, "cron_runs", "activation_id", "activation_id TEXT")?;
+        add_column_if_missing(
+            conn,
+            "cron_runs",
+            "schedule_occurrence",
+            "schedule_occurrence TEXT",
+        )?;
+        add_column_if_missing(conn, "cron_runs", "terminal_reason", "terminal_reason TEXT")?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT cron_activation_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT cron_activation_migration; \
+                 RELEASE SAVEPOINT cron_activation_migration;",
             );
             Err(err)
         }
