@@ -766,9 +766,24 @@ export function ChatPanel({
   // Stable indirection so the finalizer/listener callbacks can request a
   // post-turn read without joining their dependency arrays.
   const refreshMemoryTurnRef = useRef<((sid: string, turnId: string | null) => void) | null>(null);
-  // Stable operation identity for an explicit continuity set: an unchanged
-  // target/payload retry reuses the same id; editing it mints a new one.
-  const continuityOperationRef = useRef<{ key: string; id: string } | null>(null);
+  // Exact pending explicit continuity operation, captured once at first
+  // attempt. `key` is the logical target (Session id + source message id +
+  // objective payload) and never includes the revision. An ambiguous set
+  // (committed but the response was lost/rejected) keeps this tuple so an
+  // unchanged-target retry replays the SAME operation id and expected revision,
+  // even if a read-back refreshed the displayed revision. A changed
+  // source/objective starts a new operation against the current authoritative
+  // continuity. Cleared only on a confirmed decoded native set response.
+  const continuityOperationRef = useRef<{
+    key: string;
+    request: {
+      session_id: string;
+      expected_revision: number;
+      source_message_id: string;
+      objective: string | null;
+      operation_id: string;
+    };
+  } | null>(null);
   // Explicit per-turn user-wide opt-in. Default false; cleared whenever the
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
@@ -2709,9 +2724,12 @@ export function ChatPanel({
 
   // Phase 4.4 — explicit objective set/clear. A new operation is validated
   // natively against the exact persisted user source, the expected continuity
-  // revision, and the exact substring rule; the result is confirmed only from
-  // the decoded native `SessionContinuity` read-back. An unchanged retry reuses
-  // the same operation id so native replay is idempotent.
+  // revision, and the exact substring rule; success is confirmed only from the
+  // decoded native `SessionContinuity` response for the captured Session. On a
+  // lost or rejected set response the mutation is ambiguous — it may have
+  // committed — so the UI does a read-only current-state refresh and keeps the
+  // exact original request tuple so an unchanged-target retry replays the same
+  // operation id and expected revision (native replay is idempotent).
   const handleSetObjective = useCallback(async (input: {
     source_message_id: string;
     objective: string | null;
@@ -2723,24 +2741,28 @@ export function ChatPanel({
       setMemoryContinuityError('Objective state unavailable.');
       return;
     }
-    const key = JSON.stringify([sid, input.source_message_id, input.objective, continuity.revision]);
-    if (!continuityOperationRef.current || continuityOperationRef.current.key !== key) {
-      continuityOperationRef.current = { key, id: crypto.randomUUID() };
+    // Reuse the captured tuple ONLY for the unchanged logical target. A changed
+    // source/objective (or Session) starts a new operation whose expected
+    // revision is the current authoritative continuity revision.
+    const targetKey = JSON.stringify([sid, input.source_message_id, input.objective]);
+    let request = continuityOperationRef.current?.key === targetKey
+      ? continuityOperationRef.current.request
+      : null;
+    if (!request) {
+      request = {
+        session_id: sid,
+        expected_revision: continuity.revision,
+        source_message_id: input.source_message_id,
+        objective: input.objective,
+        operation_id: crypto.randomUUID(),
+      };
+      continuityOperationRef.current = { key: targetKey, request };
     }
-    const operation_id = continuityOperationRef.current.id;
     const seq = ++memoryReadSeqRef.current;
     setMemoryContinuityPending(true);
     setMemoryContinuityError(null);
     try {
-      const raw = await invoke<unknown>('memory_continuity_set', {
-        request: {
-          session_id: sid,
-          expected_revision: continuity.revision,
-          source_message_id: input.source_message_id,
-          objective: input.objective,
-          operation_id,
-        },
-      });
+      const raw = await invoke<unknown>('memory_continuity_set', { request });
       const decoded = decodeSessionContinuity(raw);
       if (decoded.session_id !== sid) throw new Error('continuity identity mismatch');
       if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
@@ -2749,12 +2771,26 @@ export function ChatPanel({
       setMemoryContinuityPending(false);
       continuityOperationRef.current = null;
     } catch {
-      if (seq === memoryReadSeqRef.current && mountedRef.current && activeSessionRef.current === sid) {
-        setMemoryContinuityError(
-          'Could not update the active objective. The previous objective is unchanged.',
-        );
-        setMemoryContinuityPending(false);
+      if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
+      // Ambiguous: a native commit may have landed before the response was
+      // lost/rejected. Refresh the CURRENT continuity for the captured Session
+      // as a display-only read; a continuity read carries no operation identity,
+      // so it never confirms this operation. The exact pending request tuple is
+      // retained for an unchanged-target retry.
+      let refreshed: SessionContinuity | null = null;
+      try {
+        refreshed = decodeSessionContinuity(await invoke('memory_continuity_read', {
+          request: { session_id: sid },
+        }));
+      } catch {
+        refreshed = null;
       }
+      if (seq !== memoryReadSeqRef.current || !mountedRef.current || activeSessionRef.current !== sid) return;
+      if (refreshed && refreshed.session_id === sid) setMemoryContinuity(refreshed);
+      setMemoryContinuityError(
+        'Could not confirm the active objective update — it may or may not have been saved. Retry to replay this exact request, or change the source/objective to start a new one.',
+      );
+      setMemoryContinuityPending(false);
     }
   }, [activeSession, isStreaming, memoryContinuity]);
 
