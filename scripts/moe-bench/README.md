@@ -1,6 +1,6 @@
 # moe-bench: MoE serving and pruning on the 8 GB RTX 4060
 
-These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-results.md`. They are checked in here because their original home, `D:\qwen3-forge`, is on a USB drive that failed on 2026-10-04.
+These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-results.md` and `2026-10-04-final-report.md`. They are checked in here because their original home, `D:\qwen3-forge`, is on a USB drive that failed on 2026-10-04.
 
 **Layout.** Paths are absolute and assume this layout on C:.
 
@@ -25,6 +25,12 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `serve-qwen36-35b.ps1` | Serve the full model or the keep96/keep64 slices with the measured settings. |
 | `build_llama.ps1` | Build one llama.cpp branch with CUDA 13.4 for sm_89 using VS 2026 + Ninja. |
 | `after_*.ps1` | Detached chains that run the next step when the previous process exits, so they survive Claude restarts. |
+| `prune_gptoss.py`, `make_keep24.py` | gpt-oss-20b pruning. Calibrates on the full model's own chat-format transcripts, then slices to 16/24 of 32 experts and probes and benchmarks each slice. `slice_experts.py` now also slices expert and router biases, and combines several imatrix files. |
+| `speedlab.py` | Per model: base placement, then one runtime lever at a time, then the best lossless combination. Levers: threads, priority, KV f16, speculation depth, n-gram lookup on its own and stacked, no speculation, fewer experts, ubatch. |
+| `sampling_sweep.py` | tier2b at each speed-lab winner under current / model-card / greedy sampling (`tier2b_llama.py --sampling`). |
+| `report_tables.py` | Markdown tables from all of the above. |
+| `run_rest.ps1` | The sequential, restart-safe chain that ran the speed lab and sampling sweeps. |
+| `drive-rescue/` | The SSD and D: diagnostics: SMART, openSeaChest self-test, chkdsk and Repair-Volume runs, the NVMe temperature logger and the guard. |
 
 **Lessons that shaped the code**
 
@@ -32,3 +38,7 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 - **VRAM near full is a trap on Windows.** The driver silently spills into system RAM, so a "fitting" placement can be slower. Probe several placements.
 - **K2-Horizon needs `-ot attn_v_exps=CPU`.** Its MoVA attention experts aren't covered by `--n-cpu-moe`.
 - **The Xing4.0 non-MTP GGUF needs `xing4_0.nextn_predict_layers` set to 0** before it will load.
+- **Stack n-gram lookup on the model's own MTP head:** `--spec-type draft-mtp,ngram-mod`. That's 2.1–2.2× on Gemma and Qwen.
+- **For gpt-oss, drop the EAGLE3 draft and use `ngram-mod` alone.** The draft's VRAM forces extra expert layers onto single-channel RAM.
+- **Pruning gpt-oss: calibrate on its own transcripts.** Raw code removes the experts its reasoning needs.
+- **C:'s NVMe faults under heavy load.** Pause after multi-GB writes, keep RAM free so expert pages aren't re-read from it, and watch its temperature (`drive-rescue/ssd_watch.ps1`).

@@ -4,15 +4,19 @@ Importance comes from a llama-imatrix GGUF: for each layer, the summed squared
 activation entering the expert down-projection (`blk.L.ffn_down_exps.weight.in_sum2`),
 i.e. how much signal each expert actually carried on the calibration text.
 This approximates REAP's router-weighted activation criterion without router weights.
-Layers without imatrix data (e.g. an MTP/nextn layer the imatrix run never executed)
-fall back to router-weight row norms.
+Several imatrix files can be combined (repeat --imatrix): each one's per-layer energies
+are normalized to sum to 1, then added, so experts that matter on any of the
+calibration sets survive. Layers without imatrix data (e.g. an MTP/nextn layer the
+imatrix run never executed) fall back to router-weight row norms.
 
 Slicing is exact: the stacked expert tensors keep the expert index on the slowest
 axis and quantization blocks live inside rows, so a pruned expert is a removed
 slab of bytes. The router (`ffn_gate_inp`) and its bias (`exp_probs_b`) are sliced
-the same way; `<arch>.expert_count` is rewritten. Everything else is copied verbatim.
+the same way, as are per-expert biases where the architecture has them (gpt-oss:
+`ffn_{gate,up,down}_exps.bias` and the router bias `ffn_gate_inp.bias`);
+`<arch>.expert_count` is rewritten. Everything else is copied verbatim.
 
-usage: slice_experts.py IN.gguf OUT.gguf --keep N --imatrix IMATRIX.gguf [--report keep.json]
+usage: slice_experts.py IN.gguf OUT.gguf --keep N --imatrix IMATRIX.gguf [--imatrix ...] [--report keep.json]
 """
 import argparse
 import json
@@ -22,8 +26,8 @@ import sys
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGUFWriter
 
-EXPERT_TENSOR = re.compile(r"^blk\.(\d+)\.(ffn_(gate|up|down)_exps\.weight|ffn_gate_up_exps\.weight|"
-                           r"ffn_gate_inp\.weight|exp_probs_b\.bias)$")
+EXPERT_TENSOR = re.compile(r"^blk\.(\d+)\.(ffn_(gate|up|down)_exps\.(weight|bias)|ffn_gate_up_exps\.(weight|bias)|"
+                           r"ffn_gate_inp\.(weight|bias)|exp_probs_b\.bias)$")
 
 
 def field_value(field):
@@ -55,7 +59,8 @@ def main():
     ap.add_argument("inp")
     ap.add_argument("out")
     ap.add_argument("--keep", type=int, required=True)
-    ap.add_argument("--imatrix", required=True)
+    ap.add_argument("--imatrix", required=True, action="append",
+                    help="imatrix GGUF; repeat to combine several calibration sets")
     ap.add_argument("--report", default="")
     a = ap.parse_args()
 
@@ -65,14 +70,16 @@ def main():
     n_used = field_value(r.fields[f"{arch}.expert_used_count"])[0]
     if not n_used <= a.keep < n_expert:
         sys.exit(f"--keep must be in [{n_used}, {n_expert})")
-    imp = importance_from_imatrix(a.imatrix)
+    imps = [importance_from_imatrix(p) for p in a.imatrix]
 
     keep = {}
     tensors = {t.name: t for t in r.tensors}
     layers = sorted({int(m.group(1)) for n in tensors if (m := EXPERT_TENSOR.match(n))})
     for layer in layers:
-        if layer in imp and len(imp[layer]) == n_expert:
-            score, source = imp[layer], "imatrix"
+        found = [v[layer] / max(v[layer].sum(), 1e-30) for v in imps
+                 if layer in v and len(v[layer]) == n_expert]
+        if found:
+            score, source = np.sum(found, axis=0), "imatrix"
         else:  # no calibration signal for this layer: fall back to router row norms
             router = np.asarray(tensors[f"blk.{layer}.ffn_gate_inp.weight"].data, dtype=np.float64)
             score, source = np.linalg.norm(router, axis=1), "router-norm"

@@ -68,6 +68,9 @@ def main():
     p.add_argument("--chat-kwargs", default="{}", help="extra chat_template_kwargs as JSON")
     p.add_argument("--max-tokens", type=int, default=0, help="0 = derive from budget")
     p.add_argument("--extra-args", default="[]", help="extra llama-server args as a JSON list")
+    p.add_argument("--sampling", default='{"temperature": 0.2, "top_p": 0.95}',
+                   help="sampling fields merged into each request (temperature, top_p, top_k, min_p, "
+                        "presence_penalty, repeat_penalty); default is the t5_tier2b convention")
     p.add_argument("--out", required=True)
     a = p.parse_args()
 
@@ -83,6 +86,7 @@ def main():
             args += ["-md", a.draft_model]
     max_tokens = a.max_tokens or (2048 if a.budget == 0 else 4096 if a.budget < 0 else 2048 + a.budget)
     chat_kwargs = {"enable_thinking": a.budget != 0, **json.loads(a.chat_kwargs)}
+    sampling = json.loads(a.sampling)
 
     out = pathlib.Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -113,7 +117,7 @@ def main():
                         try:
                             resp = post("/v1/chat/completions", {
                                 "messages": [{"role": "user", "content": baseline_prompt(task)}],
-                                "max_tokens": max_tokens, "temperature": 0.2, "top_p": 0.95,
+                                "max_tokens": max_tokens, **sampling,
                                 "seed": sample, "cache_prompt": True,
                                 "chat_template_kwargs": chat_kwargs},
                                 timeout=600)
@@ -146,7 +150,8 @@ def main():
                     print(f"{task['name']}#{sample} {'PASS' if ok else 'fail'} ({passed}/{total})", flush=True)
             summary = {"summary": True, "model": pathlib.Path(a.model).name, "server": a.server,
                        "ncmoe": a.ncmoe, "mtp": a.mtp, "spec_type": a.spec_type if a.mtp else None,
-                       "budget": a.budget, "chat_kwargs": chat_kwargs, "passed": passed,
+                       "budget": a.budget, "chat_kwargs": chat_kwargs, "sampling": sampling,
+                       "extra_args": json.loads(a.extra_args), "passed": passed,
                        "total": total, "server_restarts": restarts,
                        "minutes": round((time.time() - t_start) / 60, 1)}
             f.write(json.dumps(summary) + "\n")

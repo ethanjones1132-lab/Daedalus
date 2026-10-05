@@ -181,7 +181,9 @@ def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts):
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
-        time.sleep(3)
+        # Breathing room between multi-GB model loads: C:'s Kingston NV2 crashed the PC
+        # twice on 2026-10-04 (bugcheck 0x124 from stornvme) during heavy load.
+        time.sleep(30)
 
 
 def main():

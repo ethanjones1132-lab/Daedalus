@@ -107,3 +107,242 @@
 2026-10-04 08:40:14   tier2b result: 92/117 in 3.0 min, restarts 0
 2026-10-04 08:40:14 prune2 done
 2026-10-04 08:40:14 after_k2: pruning pilot part 2 exited
+2026-10-04 09:29:49 === gpt-oss-20b expert pruning  (C: free 41.1 GB)
+2026-10-04 09:46:48   downloaded gpt-oss-20b-MXFP4.gguf (12.11 GB, sha256 ok) in 1019 s
+2026-10-04 09:48:05   downloaded eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB, sha256 ok) in 76 s
+2026-10-04 09:48:07 gptoss-prune: generating 64 calibration transcripts with the full model
+2026-10-04 09:54:46 gptoss-prune: calibration 8/64 (7 min so far)
+2026-10-04 09:59:25 gptoss-prune: calibration 16/64 (11 min so far)
+2026-10-04 10:04:27 gptoss-prune: calibration 24/64 (16 min so far)
+2026-10-04 10:11:10 gptoss-prune: calibration 32/64 (23 min so far)
+2026-10-04 10:16:55 gptoss-prune: calibration 40/64 (29 min so far)
+2026-10-04 10:22:00 gptoss-prune: calibration 48/64 (34 min so far)
+2026-10-04 10:28:27 gptoss-prune: calibration 56/64 (40 min so far)
+2026-10-04 10:32:01 gptoss-prune: calibration 64/64 (44 min so far)
+2026-10-04 10:32:02 gptoss-prune: calibration text 333 KB from 64 transcripts; template ends 'file.<|end|><|start|>assistant'
+2026-10-04 10:36:14 gptoss-prune: imatrix imatrix-gptoss-selfgen.gguf done in 4.2 min
+2026-10-04 10:39:44 gptoss-prune: imatrix imatrix-gptoss-code.gguf done in 3.5 min
+2026-10-04 10:40:08 === gpt-oss-20b expert pruning  (C: free 28.9 GB)
+2026-10-04 10:40:09   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 10:40:10   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 10:42:56 gptoss-prune: sliced to 16: {"arch": "gpt-oss", "experts": "32->16", "mean_importance_retained": 0.8361, "fallback_layers": []} (7.02 GB)
+2026-10-04 10:44:24   probe ncmoe 2 mtp 3: 56.83 tok/s, VRAM 7291 MiB, paging_risk=False, error=None
+2026-10-04 10:45:52   probe ncmoe 4 mtp 3: 45.31 tok/s, VRAM 6910 MiB, paging_risk=False, error=None
+2026-10-04 10:47:40   probe ncmoe 6 mtp 3: 39.72 tok/s, VRAM 6509 MiB, paging_risk=True, error=None
+2026-10-04 10:47:40   chosen: ncmoe 4 mtp 3 -> 45.31 tok/s, 6910 MiB
+2026-10-04 10:48:32   probe ncmoe 0 mtp 0: 75.78 tok/s, VRAM 6563 MiB, paging_risk=False, error=None
+2026-10-04 10:49:27   probe ncmoe 1 mtp 0: 69.16 tok/s, VRAM 6355 MiB, paging_risk=False, error=None
+2026-10-04 10:49:27   chosen: ncmoe 0 mtp 0 -> 75.78 tok/s, 6563 MiB
+2026-10-04 10:49:27   tier2b -> tier2b-gptoss20b-keep16-b-1-2026-10-04.jsonl
+2026-10-04 11:06:38   tier2b result: 77/117 in 17.1 min, restarts 0
+2026-10-04 11:09:34 === gpt-oss-20b expert pruning  (C: free 21.9 GB)
+2026-10-04 11:09:42   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 11:09:42   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 11:12:39 gptoss-prune: sliced keep16-code: {"arch": "gpt-oss", "experts": "32->16", "mean_importance_retained": 0.8969, "fallback_layers": []} (7.02 GB)
+2026-10-04 11:35:44 === gpt-oss-20b expert pruning  (C: free 27.6 GB)
+2026-10-04 11:35:45   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 11:35:45   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 11:44:35   probe ncmoe 0 mtp 0: 15.0 tok/s, VRAM 6127 MiB, paging_risk=False, error=None
+2026-10-04 11:44:35   chosen: ncmoe 0 mtp 0 -> 15.0 tok/s, 6127 MiB
+2026-10-04 11:44:35   tier2b -> tier2b-gptoss20b-keep16-code-b-1-2026-10-04.jsonl
+2026-10-04 11:47:26 === gpt-oss-20b expert pruning  (C: free 27.6 GB)
+2026-10-04 11:47:26   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 11:47:26   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 11:50:52   probe ncmoe 2 mtp 0: 52.89 tok/s, VRAM 6133 MiB, paging_risk=True, error=None
+2026-10-04 11:55:53   probe ncmoe 3 mtp 0: 55.37 tok/s, VRAM 5962 MiB, paging_risk=True, error=None
+2026-10-04 12:00:01   probe ncmoe 4 mtp 0: 51.76 tok/s, VRAM 5785 MiB, paging_risk=False, error=None
+2026-10-04 12:00:01   chosen: ncmoe 3 mtp 0 -> 55.37 tok/s, 5962 MiB
+2026-10-04 12:00:01   tier2b -> tier2b-gptoss20b-keep16-code-b-1-2026-10-04.jsonl
+2026-10-04 12:33:20 === gpt-oss-20b expert pruning  (C: free 117.8 GB)
+2026-10-04 12:33:21   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 12:33:21   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 12:35:52 gptoss-prune: sliced keep24-selfgen: {"arch": "gpt-oss", "experts": "32->24", "mean_importance_retained": 0.9565, "fallback_layers": []} (9.56 GB)
+2026-10-04 12:35:52 gptoss-prune: letting C: settle 180 s after writing gpt-oss-20b-MXFP4-keep24-selfgen.gguf
+2026-10-04 12:40:53   probe ncmoe 10 mtp 0: 35.74 tok/s, VRAM 5987 MiB, paging_risk=False, error=None
+2026-10-04 12:42:59   probe ncmoe 11 mtp 0: 32.82 tok/s, VRAM 5742 MiB, paging_risk=True, error=None
+2026-10-04 12:45:10   probe ncmoe 12 mtp 0: 31.36 tok/s, VRAM 5406 MiB, paging_risk=True, error=None
+2026-10-04 12:45:10   chosen: ncmoe 10 mtp 0 -> 35.74 tok/s, 5987 MiB
+2026-10-04 12:48:24   probe ncmoe 14 mtp 3: 20.9 tok/s, VRAM 5958 MiB, paging_risk=True, error=None
+2026-10-04 12:51:37   probe ncmoe 15 mtp 3: 20.84 tok/s, VRAM 5646 MiB, paging_risk=False, error=None
+2026-10-04 12:51:37   chosen: ncmoe 14 mtp 3 -> 20.9 tok/s, 5958 MiB
+2026-10-04 12:51:37   tier2b -> tier2b-gptoss20b-keep24-selfgen-b-1-2026-10-04.jsonl
+2026-10-04 13:59:59 === gpt-oss-20b expert pruning  (C: free 107.1 GB)
+2026-10-04 14:00:00   using staged gpt-oss-20b-MXFP4.gguf (12.11 GB)
+2026-10-04 14:00:01   using staged eagle3-gpt-oss-20b-Q8_0.gguf (0.92 GB)
+2026-10-04 14:01:56   probe ncmoe 7 mtp 0: 40.77 tok/s, VRAM 6734 MiB, paging_risk=False, error=None
+2026-10-04 14:03:56   probe ncmoe 8 mtp 0: 39.75 tok/s, VRAM 6609 MiB, paging_risk=True, error=None
+2026-10-04 14:05:57   probe ncmoe 9 mtp 0: 37.59 tok/s, VRAM 6307 MiB, paging_risk=True, error=None
+2026-10-04 14:05:57   chosen: ncmoe 7 mtp 0 -> 40.77 tok/s, 6734 MiB
+2026-10-04 14:05:57   tier2b -> tier2b-gptoss20b-keep24-selfgen-b-1-2026-10-04.jsonl
+2026-10-04 14:19:22   tier2b result: 107/117 in 13.1 min, restarts 0
+2026-10-04 14:19:23 gptoss-prune: removed tested gpt-oss-20b-MXFP4-keep24-selfgen.gguf (C: free 117.7 GB)
+2026-10-04 14:19:23 gptoss-prune done
+2026-10-04 14:19:32 after_keep24: starting speed lab (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 14:19:33 === speed lab: gptoss20b
+2026-10-04 14:23:35   speedlab gptoss20b place-14           ncmoe 14: gen 25.86 | edit2k 27.81 | long10k 10.23 (mean 21.3); prefill10k 499.3; accept 0.356; VRAM 6998; paging True; error None
+2026-10-04 14:26:05 run_rest: speed lab (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 14:26:06 === speed lab: gptoss20b
+2026-10-04 14:30:13   speedlab gptoss20b place-15           ncmoe 15: gen 24.32 | edit2k 25.49 | long10k 10.12 (mean 19.98); prefill10k 520.8; accept 0.349; VRAM 6557; paging True; error None
+2026-10-04 14:34:19   speedlab gptoss20b place-16           ncmoe 16: gen 22.33 | edit2k 24.46 | long10k 10.04 (mean 18.94); prefill10k 493.3; accept 0.356; VRAM 6170; paging True; error None
+2026-10-04 14:34:19   speedlab gptoss20b: base = ncmoe 14, 21.3 tok/s, paging True
+2026-10-04 14:38:15   speedlab gptoss20b threads6           ncmoe 14: gen 22.51 | edit2k 23.23 | long10k 10.29 (mean 18.68); prefill10k 551.4; accept 0.356; VRAM 6983; paging False; error None
+2026-10-04 14:42:07   speedlab gptoss20b threads6-prio2     ncmoe 14: gen 25.16 | edit2k 25.91 | long10k 10.27 (mean 20.45); prefill10k 567.5; accept 0.356; VRAM 6983; paging False; error None
+2026-10-04 14:45:47   speedlab gptoss20b threads10          ncmoe 14: gen 27.23 | edit2k 27.99 | long10k 11.45 (mean 22.22); prefill10k 577.1; accept 0.356; VRAM 6983; paging True; error None
+2026-10-04 14:45:56   speedlab gptoss20b no-mmap            ncmoe 14: gen None | edit2k None | long10k None (mean None); prefill10k None; accept None; VRAM None; paging None; error server exited 1 during load
+2026-10-04 14:49:33   speedlab gptoss20b kv-f16             ncmoe 14: gen 28.01 | edit2k 27.22 | long10k 11.57 (mean 22.27); prefill10k 571.2; accept 0.361; VRAM 7046; paging False; error None
+2026-10-04 14:52:55   speedlab gptoss20b depth2             ncmoe 14: gen 29.08 | edit2k 30.3 | long10k 14.34 (mean 24.57); prefill10k 565.1; accept 0.446; VRAM 6983; paging True; error None
+2026-10-04 14:56:53   speedlab gptoss20b depth4             ncmoe 14: gen 25.35 | edit2k 25.37 | long10k 9.48 (mean 20.07); prefill10k 570.0; accept 0.291; VRAM 6983; paging True; error None
+2026-10-04 15:01:00   speedlab gptoss20b depth5             ncmoe 14: gen 23.14 | edit2k 22.97 | long10k 8.57 (mean 18.23); prefill10k 564.0; accept 0.246; VRAM 6983; paging False; error None
+2026-10-04 15:04:01   speedlab gptoss20b plus-ngram         ncmoe 14: gen 45.48 | edit2k 61.34 | long10k 21.87 (mean 42.9); prefill10k 572.9; accept 0.555; VRAM 6997; paging True; error None
+2026-10-04 15:06:35   speedlab gptoss20b nospec-11          ncmoe 11: gen 34.18 | edit2k 33.89 | long10k 33.95 (mean 34.01); prefill10k 709.6; accept None; VRAM 7052; paging False; error None
+2026-10-04 15:09:04   speedlab gptoss20b ngram-only-11      ncmoe 11: gen 36.34 | edit2k 70.87 | long10k 31.58 (mean 46.26); prefill10k 689.2; accept 0.534; VRAM 7071; paging False; error None
+2026-10-04 15:11:52   speedlab gptoss20b nospec-12          ncmoe 12: gen 32.94 | edit2k 31.61 | long10k 32.05 (mean 32.2); prefill10k 702.1; accept None; VRAM 6649; paging True; error None
+2026-10-04 15:14:23   speedlab gptoss20b ngram-only-12      ncmoe 12: gen 37.11 | edit2k 74.56 | long10k 33.75 (mean 48.47); prefill10k 714.5; accept 0.641; VRAM 6666; paging True; error None
+2026-10-04 15:17:17   speedlab gptoss20b nospec-13          ncmoe 13: gen 31.75 | edit2k 30.7 | long10k 30.98 (mean 31.14); prefill10k 662.1; accept None; VRAM 6252; paging True; error None
+2026-10-04 15:19:58   speedlab gptoss20b ngram-only-13      ncmoe 13: gen 32.34 | edit2k 85.38 | long10k 30.21 (mean 49.31); prefill10k 637.6; accept 0.645; VRAM 6263; paging True; error None
+2026-10-04 15:23:33   speedlab gptoss20b experts3           ncmoe 14: gen 30.28 | edit2k 34.76 | long10k 14.52 (mean 26.52); prefill10k 588.0; accept 0.324; VRAM 6972; paging True; error None
+2026-10-04 15:27:26   speedlab gptoss20b ub1024             ncmoe 14: gen 25.93 | edit2k 27.27 | long10k 11.37 (mean 21.52); prefill10k 683.2; accept 0.361; VRAM 7189; paging True; error None
+2026-10-04 15:29:48   speedlab gptoss20b combined           ncmoe 11: gen 33.75 | edit2k 68.21 | long10k 88.71 (mean 63.56); prefill10k 703.4; accept 0.739; VRAM 7243; paging False; error None
+2026-10-04 15:29:48   speedlab gptoss20b: WINNER ngram-only-11 -> 46.26 tok/s (base 21.3): ncmoe 11, spec ngram-mod depth 16, extra []
+2026-10-04 15:29:48 === speed lab: gemma26b
+2026-10-04 15:32:00   speedlab gemma26b place-14           ncmoe 14: gen 47.21 | edit2k 46.18 | long10k 36.49 (mean 43.29); prefill10k 787.8; accept 0.853; VRAM 7278; paging True; error None
+2026-10-04 15:34:05   speedlab gemma26b place-16           ncmoe 16: gen 44.64 | edit2k 48.02 | long10k 46.12 (mean 46.26); prefill10k 728.1; accept 0.868; VRAM 6843; paging True; error None
+2026-10-04 15:36:20   speedlab gemma26b place-18           ncmoe 18: gen 40.75 | edit2k 44.62 | long10k 42.86 (mean 42.74); prefill10k 676.6; accept 0.863; VRAM 6259; paging True; error None
+2026-10-04 15:38:44   speedlab gemma26b place-20           ncmoe 20: gen 36.59 | edit2k 40.81 | long10k 40.0 (mean 39.13); prefill10k 625.9; accept 0.858; VRAM 5677; paging True; error None
+2026-10-04 15:38:44   speedlab gemma26b: base = ncmoe 16, 46.26 tok/s, paging True
+2026-10-04 15:40:58   speedlab gemma26b threads6           ncmoe 16: gen 40.47 | edit2k 45.99 | long10k 41.75 (mean 42.74); prefill10k 754.3; accept 0.868; VRAM 6836; paging False; error None
+2026-10-04 15:43:10   speedlab gemma26b threads6-prio2     ncmoe 16: gen 41.51 | edit2k 44.81 | long10k 42.58 (mean 42.97); prefill10k 735.6; accept 0.868; VRAM 6846; paging False; error None
+2026-10-04 15:45:22   speedlab gemma26b threads10          ncmoe 16: gen 46.76 | edit2k 49.48 | long10k 47.72 (mean 47.99); prefill10k 739.8; accept 0.868; VRAM 6843; paging True; error None
+2026-10-04 15:45:30   speedlab gemma26b no-mmap            ncmoe 16: gen None | edit2k None | long10k None (mean None); prefill10k None; accept None; VRAM None; paging None; error server exited 1 during load
+2026-10-04 15:47:34   speedlab gemma26b kv-f16             ncmoe 16: gen 47.53 | edit2k 49.74 | long10k 49.21 (mean 48.83); prefill10k 743.1; accept 0.852; VRAM 7085; paging False; error None
+2026-10-04 15:49:46   speedlab gemma26b depth1             ncmoe 16: gen 42.6 | edit2k 44.74 | long10k 43.88 (mean 43.74); prefill10k 734.3; accept 0.909; VRAM 6843; paging False; error None
+2026-10-04 15:51:51   speedlab gemma26b depth3             ncmoe 16: gen 45.56 | edit2k 51.76 | long10k 47.55 (mean 48.29); prefill10k 743.8; accept 0.835; VRAM 6843; paging True; error None
+2026-10-04 15:54:21   speedlab gemma26b depth4             ncmoe 16: gen 42.97 | edit2k 51.75 | long10k 46.3 (mean 47.01); prefill10k 739.7; accept 0.763; VRAM 6843; paging True; error None
+2026-10-04 15:56:07   speedlab gemma26b plus-ngram         ncmoe 16: gen 70.81 | edit2k 128.14 | long10k 106.14 (mean 101.7); prefill10k 743.3; accept 0.832; VRAM 6861; paging True; error None
+2026-10-04 15:58:02   speedlab gemma26b experts6           ncmoe 16: gen 54.79 | edit2k 59.96 | long10k 52.73 (mean 55.83); prefill10k 793.9; accept 0.822; VRAM 6841; paging True; error None
+2026-10-04 15:59:41 run_rest: speed lab (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 15:59:41 === speed lab: gptoss20b
+2026-10-04 15:59:41   speedlab gptoss20b: base = ncmoe 14, 21.3 tok/s, paging True
+2026-10-04 15:59:41   speedlab gptoss20b: WINNER ngram-only-11 -> 46.26 tok/s (base 21.3): ncmoe 11, spec ngram-mod depth 16, extra []
+2026-10-04 15:59:41 === speed lab: gemma26b
+2026-10-04 15:59:41   speedlab gemma26b: base = ncmoe 16, 46.26 tok/s, paging True
+2026-10-04 16:01:43   speedlab gemma26b ub1024             ncmoe 16: gen 45.17 | edit2k 47.37 | long10k 45.61 (mean 46.05); prefill10k 1149.6; accept 0.854; VRAM 7024; paging True; error None
+2026-10-04 16:03:36   speedlab gemma26b combined:draft-mtp,ngram-mod:16:2:-t 10 -ctk f16 -ctv f16 ncmoe 16: gen 78.29 | edit2k 85.5 | long10k 63.46 (mean 75.75); prefill10k 721.1; accept 0.727; VRAM 7101; paging True; error None
+2026-10-04 16:03:36   speedlab gemma26b: WINNER plus-ngram -> 101.7 tok/s (base 46.26): ncmoe 16, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 16:03:36 === speed lab: qwen36keep96
+2026-10-04 16:04:28   speedlab qwen36keep96 place-0            ncmoe  0: gen 120.97 | edit2k 138.6 | long10k 131.4 (mean 130.32); prefill10k 2068.0; accept 0.858; VRAM 5697; paging False; error None
+2026-10-04 16:04:28   speedlab qwen36keep96: base = ncmoe 0, 130.32 tok/s, paging False
+2026-10-04 16:05:12   speedlab qwen36keep96 kv-f16             ncmoe  0: gen 112.01 | edit2k 139.92 | long10k 133.79 (mean 128.57); prefill10k 2077.2; accept 0.798; VRAM 5847; paging False; error None
+2026-10-04 16:06:00   speedlab qwen36keep96 depth1             ncmoe  0: gen 105.47 | edit2k 109.22 | long10k 97.07 (mean 103.92); prefill10k 2068.4; accept 0.879; VRAM 5633; paging False; error None
+2026-10-04 16:06:43   speedlab qwen36keep96 depth3             ncmoe  0: gen 116.23 | edit2k 148.07 | long10k 142.88 (mean 135.73); prefill10k 2054.8; accept 0.784; VRAM 5759; paging False; error None
+2026-10-04 16:07:28   speedlab qwen36keep96 depth4             ncmoe  0: gen 96.79 | edit2k 148.99 | long10k 143.84 (mean 129.87); prefill10k 2057.7; accept 0.652; VRAM 5823; paging False; error None
+2026-10-04 16:08:07   speedlab qwen36keep96 plus-ngram         ncmoe  0: gen 158.13 | edit2k 342.25 | long10k 294.53 (mean 264.97); prefill10k 2053.1; accept 0.821; VRAM 5736; paging True; error None
+2026-10-04 16:09:04   speedlab qwen36keep96 nospec-0           ncmoe  0: gen 77.42 | edit2k 74.73 | long10k 70.92 (mean 74.36); prefill10k 2171.6; accept None; VRAM 5277; paging True; error None
+2026-10-04 16:09:51   speedlab qwen36keep96 ngram-only-0       ncmoe  0: gen 83.4 | edit2k 242.87 | long10k 293.28 (mean 206.52); prefill10k 2174.0; accept 0.781; VRAM 5285; paging True; error None
+2026-10-04 16:10:36   speedlab qwen36keep96 experts6           ncmoe  0: gen 119.33 | edit2k 142.14 | long10k 135.97 (mean 132.48); prefill10k 2116.0; accept 0.821; VRAM 5655; paging False; error None
+2026-10-04 16:11:21   speedlab qwen36keep96 ub1024             ncmoe  0: gen 120.76 | edit2k 137.33 | long10k 127.0 (mean 128.36); prefill10k 2344.0; accept 0.842; VRAM 5906; paging False; error None
+2026-10-04 16:12:00   speedlab qwen36keep96 combined:draft-mtp,ngram-mod:0:2: ncmoe  0: gen 159.06 | edit2k 361.55 | long10k 302.78 (mean 274.46); prefill10k 2066.0; accept 0.821; VRAM 5706; paging False; error None
+2026-10-04 16:12:00   speedlab qwen36keep96: WINNER combined:draft-mtp,ngram-mod:0:2: -> 274.46 tok/s (base 130.32): ncmoe 0, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 16:12:00 speed lab done
+2026-10-04 16:12:00 run_rest: sampling sweep (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 16:12:01   sampling gptoss20b base: {'temperature': 0.2, 'top_p': 0.95} -> tier2b-gptoss20b-samp-base-2026-10-04.jsonl
+2026-10-04 16:29:22   sampling gptoss20b base: 107/117 in 16.9 min {'A': '34/36', 'B': '14/21', 'C': '21/21', 'D': '20/21', 'E': '18/18'}
+2026-10-04 16:29:22   sampling gptoss20b card: {'temperature': 1.0, 'top_p': 1.0} -> tier2b-gptoss20b-samp-card-2026-10-04.jsonl
+2026-10-04 16:48:05   sampling gptoss20b card: 107/117 in 18.4 min {'A': '35/36', 'B': '14/21', 'C': '21/21', 'D': '20/21', 'E': '17/18'}
+2026-10-04 16:48:05   sampling gptoss20b greedy: {'temperature': 0.0} -> tier2b-gptoss20b-samp-greedy-2026-10-04.jsonl
+2026-10-04 17:02:48   sampling gptoss20b greedy: 108/117 in 14.3 min {'A': '35/36', 'B': '14/21', 'C': '21/21', 'D': '20/21', 'E': '18/18'}
+2026-10-04 17:02:48   sampling gemma26b base: {'temperature': 0.2, 'top_p': 0.95} -> tier2b-gemma26b-samp-base-2026-10-04.jsonl
+2026-10-04 17:08:03   sampling gemma26b base: 103/117 in 4.9 min {'A': '32/36', 'B': '14/21', 'C': '21/21', 'D': '18/21', 'E': '18/18'}
+2026-10-04 17:08:03   sampling gemma26b card: {'temperature': 1.0, 'top_p': 0.95, 'top_k': 64} -> tier2b-gemma26b-samp-card-2026-10-04.jsonl
+2026-10-04 17:14:31   sampling gemma26b card: 102/117 in 6.3 min {'A': '32/36', 'B': '13/21', 'C': '21/21', 'D': '18/21', 'E': '18/18'}
+2026-10-04 17:14:31   sampling gemma26b greedy: {'temperature': 0.0} -> tier2b-gemma26b-samp-greedy-2026-10-04.jsonl
+2026-10-04 17:20:26   sampling gemma26b greedy: 105/117 in 5.7 min {'A': '33/36', 'B': '15/21', 'C': '21/21', 'D': '18/21', 'E': '18/18'}
+2026-10-04 17:20:26   sampling qwen36keep96 base: {'temperature': 0.2, 'top_p': 0.95} -> tier2b-qwen36keep96-samp-base-2026-10-04.jsonl
+2026-10-04 17:22:18   sampling qwen36keep96 base: 101/117 in 1.7 min {'A': '36/36', 'B': '6/21', 'C': '21/21', 'D': '20/21', 'E': '18/18'}
+2026-10-04 17:22:18   sampling qwen36keep96 card: {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 1.5} -> tier2b-qwen36keep96-samp-card-2026-10-04.jsonl
+2026-10-04 17:24:37   sampling qwen36keep96 card: 93/117 in 2.2 min {'A': '32/36', 'B': '10/21', 'C': '19/21', 'D': '15/21', 'E': '17/18'}
+2026-10-04 17:24:37   sampling qwen36keep96 card-nopp: {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20, 'min_p': 0.0} -> tier2b-qwen36keep96-samp-card-nopp-2026-10-04.jsonl
+2026-10-04 17:26:44   sampling qwen36keep96 card-nopp: 95/117 in 2.0 min {'A': '35/36', 'B': '6/21', 'C': '20/21', 'D': '20/21', 'E': '14/18'}
+2026-10-04 17:26:44   sampling qwen36keep96 greedy: {'temperature': 0.0} -> tier2b-qwen36keep96-samp-greedy-2026-10-04.jsonl
+2026-10-04 17:28:12   sampling qwen36keep96 greedy: 93/117 in 1.4 min {'A': '36/36', 'B': '0/21', 'C': '18/21', 'D': '21/21', 'E': '18/18'}
+2026-10-04 17:28:12 sampling sweep done
+2026-10-04 17:28:12 run_rest: rebuilding the keep24 slice
+2026-10-04 17:29:38 gptoss-prune: sliced keep24-selfgen: {"arch": "gpt-oss", "experts": "32->24", "mean_importance_retained": 0.9565, "fallback_layers": []} (9.56 GB)
+2026-10-04 17:29:38 make_keep24: letting C: settle 180 s after writing gpt-oss-20b-MXFP4-keep24-selfgen.gguf
+2026-10-04 17:32:38 make_keep24: slice ready
+2026-10-04 17:32:38 run_rest: speed lab (gptoss20b-keep24)
+2026-10-04 17:32:39 === speed lab: gptoss20b-keep24
+2026-10-04 17:35:32   speedlab gptoss20b-keep24 place-11           ncmoe 11: gen 29.73 | edit2k 34.45 | long10k 13.92 (mean 26.03); prefill10k 836.3; accept 0.329; VRAM 6826; paging True; error None
+2026-10-04 17:38:32   speedlab gptoss20b-keep24 place-12           ncmoe 12: gen 25.57 | edit2k 31.07 | long10k 13.14 (mean 23.26); prefill10k 760.7; accept 0.319; VRAM 6555; paging False; error None
+2026-10-04 17:38:32   speedlab gptoss20b-keep24: base = ncmoe 11, 26.03 tok/s, paging True
+2026-10-04 17:41:37   speedlab gptoss20b-keep24 threads6           ncmoe 11: gen 26.42 | edit2k 29.83 | long10k 11.85 (mean 22.7); prefill10k 788.9; accept 0.329; VRAM 6833; paging False; error None
+2026-10-04 17:44:35   speedlab gptoss20b-keep24 threads6-prio2     ncmoe 11: gen 27.09 | edit2k 31.49 | long10k 12.47 (mean 23.68); prefill10k 799.2; accept 0.329; VRAM 6833; paging False; error None
+2026-10-04 17:47:21   speedlab gptoss20b-keep24 threads10          ncmoe 11: gen 31.08 | edit2k 33.54 | long10k 14.23 (mean 26.28); prefill10k 811.8; accept 0.329; VRAM 6835; paging False; error None
+2026-10-04 17:47:29   speedlab gptoss20b-keep24 no-mmap            ncmoe 11: gen None | edit2k None | long10k None (mean None); prefill10k None; accept None; VRAM None; paging None; error server exited 1 during load
+2026-10-04 17:50:18   speedlab gptoss20b-keep24 kv-f16             ncmoe 11: gen 30.19 | edit2k 34.42 | long10k 14.74 (mean 26.45); prefill10k 807.0; accept 0.332; VRAM 7017; paging False; error None
+2026-10-04 17:52:54   speedlab gptoss20b-keep24 depth2             ncmoe 11: gen 30.51 | edit2k 36.71 | long10k 17.51 (mean 28.24); prefill10k 806.3; accept 0.407; VRAM 6853; paging True; error None
+2026-10-04 17:55:15   speedlab gptoss20b-keep24 plus-ngram         ncmoe 11: gen 38.76 | edit2k 96.63 | long10k 22.11 (mean 52.5); prefill10k 798.3; accept 0.46; VRAM 6848; paging False; error None
+2026-10-04 17:57:00   speedlab gptoss20b-keep24 nospec-6           ncmoe  6: gen 44.27 | edit2k 43.09 | long10k 41.47 (mean 42.94); prefill10k 1214.9; accept None; VRAM 7165; paging True; error None
+2026-10-04 17:58:39   speedlab gptoss20b-keep24 ngram-only-6       ncmoe  6: gen 43.07 | edit2k 94.38 | long10k 65.91 (mean 67.79); prefill10k 1119.6; accept 0.66; VRAM 7178; paging True; error None
+2026-10-04 18:00:27   speedlab gptoss20b-keep24 nospec-7           ncmoe  7: gen 44.23 | edit2k 42.3 | long10k 41.5 (mean 42.68); prefill10k 1124.7; accept None; VRAM 6918; paging True; error None
+2026-10-04 18:02:03   speedlab gptoss20b-keep24 ngram-only-7       ncmoe  7: gen 43.54 | edit2k 122.8 | long10k 88.78 (mean 85.04); prefill10k 1129.7; accept 0.731; VRAM 6931; paging False; error None
+2026-10-04 18:03:46   speedlab gptoss20b-keep24 nospec-8           ncmoe  8: gen 40.66 | edit2k 40.2 | long10k 39.51 (mean 40.12); prefill10k 1040.2; accept None; VRAM 6613; paging True; error None
+2026-10-04 18:40:28 ssd_guard: watching C: NVMe temperature, limit 70 C
+2026-10-04 19:05:19 run_rest: speed lab (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 19:05:20 === speed lab: gptoss20b
+2026-10-04 19:05:20   speedlab gptoss20b: base = ncmoe 14, 21.3 tok/s, paging True
+2026-10-04 19:05:20   speedlab gptoss20b: WINNER ngram-only-11 -> 46.26 tok/s (base 21.3): ncmoe 11, spec ngram-mod depth 16, extra []
+2026-10-04 19:05:20 === speed lab: gemma26b
+2026-10-04 19:05:20   speedlab gemma26b: base = ncmoe 16, 46.26 tok/s, paging True
+2026-10-04 19:05:20   speedlab gemma26b: WINNER plus-ngram -> 101.7 tok/s (base 46.26): ncmoe 16, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 19:05:20 === speed lab: qwen36keep96
+2026-10-04 19:05:20   speedlab qwen36keep96: base = ncmoe 0, 130.32 tok/s, paging False
+2026-10-04 19:05:20   speedlab qwen36keep96: WINNER combined:draft-mtp,ngram-mod:0:2: -> 274.46 tok/s (base 130.32): ncmoe 0, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 19:05:20 speed lab done
+2026-10-04 19:05:20 run_rest: sampling sweep (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 19:05:21 sampling sweep done
+2026-10-04 19:05:21 run_rest: rebuilding the keep24 slice
+2026-10-04 19:05:23 make_keep24: slice ready
+2026-10-04 19:05:23 run_rest: speed lab (gptoss20b-keep24)
+2026-10-04 19:05:23 === speed lab: gptoss20b-keep24
+2026-10-04 19:05:23   speedlab gptoss20b-keep24: base = ncmoe 11, 26.03 tok/s, paging True
+2026-10-04 19:07:43   speedlab gptoss20b-keep24 ngram-only-8       ncmoe  8: gen 42.54 | edit2k 100.23 | long10k 47.04 (mean 63.27); prefill10k 1114.4; accept 0.563; VRAM 6595; paging True; error None
+2026-10-04 19:10:42   speedlab gptoss20b-keep24 experts3           ncmoe 11: gen 38.55 | edit2k 44.46 | long10k 18.67 (mean 33.89); prefill10k 851.8; accept 0.319; VRAM 6823; paging False; error None
+2026-10-04 19:14:03   speedlab gptoss20b-keep24 ub1024             ncmoe 11: gen 30.72 | edit2k 34.46 | long10k 15.12 (mean 26.77); prefill10k 719.2; accept 0.331; VRAM 7176; paging False; error None
+2026-10-04 19:16:02   speedlab gptoss20b-keep24 combined:ngram-mod:7:16: ncmoe  7: gen 44.71 | edit2k 125.91 | long10k 90.0 (mean 86.87); prefill10k 1160.1; accept 0.731; VRAM 6929; paging False; error None
+2026-10-04 19:16:02   speedlab gptoss20b-keep24: WINNER combined:ngram-mod:7:16: -> 86.87 tok/s (base 26.03): ncmoe 7, spec ngram-mod depth 16, extra []
+2026-10-04 19:16:02 speed lab done
+2026-10-04 19:16:02 run_rest: sampling sweep (gptoss20b-keep24)
+2026-10-04 19:16:03   sampling gptoss20b-keep24 base: {'temperature': 0.2, 'top_p': 0.95} -> tier2b-gptoss20b-keep24-samp-base-2026-10-04.jsonl
+2026-10-04 19:28:59   sampling gptoss20b-keep24 base: 103/117 in 12.8 min {'A': '35/36', 'B': '11/21', 'C': '21/21', 'D': '20/21', 'E': '16/18'}
+2026-10-04 19:29:29   sampling gptoss20b-keep24 card: {'temperature': 1.0, 'top_p': 1.0} -> tier2b-gptoss20b-keep24-samp-card-2026-10-04.jsonl
+2026-10-04 19:46:45 ssd_guard: new peak 55 C
+2026-10-04 19:51:01 ssd_guard: new peak 56 C
+2026-10-04 20:49:52 ssd_guard: watching C: NVMe temperature, limit 70 C
+2026-10-04 20:49:52 run_rest: speed lab (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 20:49:54 === speed lab: gptoss20b
+2026-10-04 20:49:54   speedlab gptoss20b: base = ncmoe 14, 21.3 tok/s, paging True
+2026-10-04 20:49:54   speedlab gptoss20b: WINNER ngram-only-11 -> 46.26 tok/s (base 21.3): ncmoe 11, spec ngram-mod depth 16, extra []
+2026-10-04 20:49:54 === speed lab: gemma26b
+2026-10-04 20:49:54   speedlab gemma26b: base = ncmoe 16, 46.26 tok/s, paging True
+2026-10-04 20:49:54   speedlab gemma26b: WINNER plus-ngram -> 101.7 tok/s (base 46.26): ncmoe 16, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 20:49:54 === speed lab: qwen36keep96
+2026-10-04 20:49:54   speedlab qwen36keep96: base = ncmoe 0, 130.32 tok/s, paging False
+2026-10-04 20:49:54   speedlab qwen36keep96: WINNER combined:draft-mtp,ngram-mod:0:2: -> 274.46 tok/s (base 130.32): ncmoe 0, spec draft-mtp,ngram-mod depth 2, extra []
+2026-10-04 20:49:54 speed lab done
+2026-10-04 20:49:54 run_rest: sampling sweep (gptoss20b, gemma26b, qwen36keep96)
+2026-10-04 20:49:55 sampling sweep done
+2026-10-04 20:49:55 run_rest: rebuilding the keep24 slice
+2026-10-04 20:49:57 make_keep24: slice ready
+2026-10-04 20:49:57 run_rest: speed lab (gptoss20b-keep24)
+2026-10-04 20:49:58 === speed lab: gptoss20b-keep24
+2026-10-04 20:49:58   speedlab gptoss20b-keep24: base = ncmoe 11, 26.03 tok/s, paging True
+2026-10-04 20:49:58   speedlab gptoss20b-keep24: WINNER combined:ngram-mod:7:16: -> 86.87 tok/s (base 26.03): ncmoe 7, spec ngram-mod depth 16, extra []
+2026-10-04 20:49:58 speed lab done
+2026-10-04 20:49:58 run_rest: sampling sweep (gptoss20b-keep24)
+2026-10-04 20:49:58   sampling gptoss20b-keep24 card: {'temperature': 1.0, 'top_p': 1.0} -> tier2b-gptoss20b-keep24-samp-card-2026-10-04.jsonl
+2026-10-04 20:58:41   sampling gptoss20b-keep24 card: 102/117 in 8.3 min {'A': '33/36', 'B': '9/21', 'C': '21/21', 'D': '21/21', 'E': '18/18'}
+2026-10-04 20:59:11   sampling gptoss20b-keep24 greedy: {'temperature': 0.0} -> tier2b-gptoss20b-keep24-samp-greedy-2026-10-04.jsonl
+2026-10-04 21:10:10   sampling gptoss20b-keep24 greedy: 105/117 in 10.6 min {'A': '36/36', 'B': '10/21', 'C': '21/21', 'D': '21/21', 'E': '17/18'}
+2026-10-04 21:10:40 sampling sweep done
+2026-10-04 21:10:40 run_rest: all runs finished
