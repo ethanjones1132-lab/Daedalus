@@ -44,13 +44,13 @@ No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `rem
 {
   "schema_version": 1,
   "execution": [
-    { "tool": "read_file", "arguments": { "path": "README.md" } }
+    { "tool": "write_file", "arguments": { "path": "notes/result.md", "content": "Hello from Jarvis\n" } }
   ],
   "acceptance": {
     "<stable-goal-criterion-uuid>": [
       {
         "tool": "read_file",
-        "arguments": { "path": "README.md" },
+        "arguments": { "path": "notes/result.md" },
         "expect_sha256": "<64-char lowercase sha256>"
       }
     ]
@@ -59,24 +59,34 @@ No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `rem
 ```
 
 - `execution` is the explicit approved call list; `acceptance` is keyed by stable Goal criterion UUID and each check carries the deterministic result's expected SHA-256.
-- Tool identity and arguments are the only call data. There is no `command`, `shell`, `script`, `template`, free-form `args`, or `content` field anywhere in the shape.
+- Tool identity and arguments are the only call data. There is no `command`, `shell`, `script`, `template`, or free-form `args` field anywhere in the shape. The only free-text fields are the bounded writer payloads `content`, `old_string`, and `new_string`, which are permitted solely for execution writers.
+- **Execution vs acceptance allowlists (distinct):** `execution` may use the read tools `read_file`, `list_directory`, `glob`, `grep` plus the minimal bounded writers `write_file` and `edit_file`, so the approved action can perform state-changing filesystem work. `acceptance` remains separately restricted to the deterministic read-only tools `read_file`, `list_directory`, `glob`, `grep`. A writer never appears under `acceptance`.
 
 ### Strict validation
 
 - `deny_unknown_fields` at every level: unknown keys are rejected.
 - `schema_version` must equal `1`; `execution`/`acceptance` must be non-empty.
-- Tools are restricted to the deterministic, read-only v1 allowlist `read_file`, `list_directory`, `glob`, `grep`. Shell tools (`bash`, `powershell`), content-bearing writers (`write_file`, `edit_file`, `multi_edit`, `apply_patch`), and web tools are rejected — so no shell command string, script, or unbounded file content can be encoded. Mutating calls are deferred to a future schema version; v1 grants no execution authority.
-- Per-tool arguments are exact and bounded: `read_file` requires `path` and allows bounded `offset`/`limit`; `list_directory` requires `path`; `glob` requires `pattern` and optional `path`; `grep` requires `pattern`, optional `path`/`output_mode` (one of `files_with_matches`, `content`, `count`)/`head_limit`. Any other field for a tool is rejected.
+- Shell tools (`bash`, `powershell`), the unbounded/array writers (`apply_patch`, `multi_edit`), web tools, and any template/script field are rejected — so no shell command string, script, or unbounded payload can be encoded. A writer is rejected if its exact arguments cannot be bounded safely.
+- Per-tool arguments are exact and bounded:
+  - `read_file` requires `path`, allows bounded `offset`/`limit`.
+  - `list_directory` requires `path`.
+  - `glob` requires `pattern` and optional `path`.
+  - `grep` requires `pattern`, optional `path`/`output_mode` (`files_with_matches`, `content`, `count`)/`head_limit`.
+  - `write_file` (execution only) requires `path` and `content` (bounded UTF-8 payload).
+  - `edit_file` (execution only) requires `path`, non-empty `old_string`, and `new_string` (bounded UTF-8 payloads).
+  - Any other field for a tool is rejected, and the writer payload fields are rejected on every read-only tool and on all acceptance checks.
 - Paths must be relative, non-empty, ≤ 1024 chars, free of control characters, and must not be absolute, drive-prefixed, root, or contain `..`.
 - Patterns must be non-empty, ≤ 512 chars, and free of control characters.
+- Writer payloads (`content`, `old_string`, `new_string`) are valid UTF-8 by construction, must contain no NUL byte, and are ≤ 64 KiB each; the 64 KiB manifest cap bounds their total.
 - `expect_sha256` must be exactly 64 lowercase hex characters.
 - Acceptance criterion keys must be well-formed UUIDs (resolved against the bound Goal's `goal_criteria.id` at resolution time, which is not implemented in slice 1).
-- Bounds: content ≤ 64 KiB, ≤ 50 execution calls, ≤ 100 acceptance criteria, ≤ 50 checks per criterion, ≤ 200 total checks.
+- Bounds: whole manifest ≤ 64 KiB; each writer payload ≤ 64 KiB; ≤ 50 execution calls; ≤ 100 acceptance criteria; ≤ 50 checks per criterion; ≤ 200 total checks.
 
 ### Trust invariants
 
 - The SQLite registry is the only native trust authority; the file-backed Action Registry remains untrusted.
-- Manifest scope binds an exact existing **enabled** Agent and a canonical existing workspace root. Registration is attribution only and grants no tool permission; later dispatch still passes current ToolRuntime Permission policy.
+- Manifest scope binds an exact existing **enabled** Agent and a canonical existing workspace root. Registration is attribution only and grants no tool permission.
+- Listing `write_file`/`edit_file` in `execution` grants no permission and bypasses no approval. Later execution must run through the canonical ToolRuntime in an Agent context under current Permission policy; if policy denies or requires approval it persists a `blocked`/`waiting` state and is never treated as dispatched.
 - Content is never supplied or authorized by Goal, model, task, Action Registry, or Action Registry text. Goal/model/registry text may reference a manifest ID only.
 - Canonical content SHA-256 is computed over the re-serialized validated content (struct-field order, sorted criterion keys, omitted absent optionals), so equivalent inputs hash identically.
 
