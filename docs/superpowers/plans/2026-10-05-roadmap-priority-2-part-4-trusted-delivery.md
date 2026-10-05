@@ -34,9 +34,17 @@ Table `trusted_acceptance_manifests` in the app-owned `jarvis.db` (via `AppDb`):
 | `content_json` | Canonical validated JSON (`json_valid` enforced). |
 | `agent_id` | Exact existing, enabled native Agent row id. |
 | `project_root` | Canonical existing directory from `normalize_project_root`. |
+| `action_id` | Exact Action Registry `id` this manifest is bound to (opaque identity). Nullable only for legacy rows created before action binding; those stay unbound/unavailable. |
 | `created_at`, `updated_at` | Native timestamps. |
 
-No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `remove` require an optimistic `expected_version` and/or `expected_hash`; the write is guarded by `WHERE registry_version = ? AND content_hash = ?`, so a stale caller cannot silently overwrite or delete a changed record.
+No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `remove` require an optimistic `expected_version` and/or `expected_hash`; the write is guarded by `WHERE registry_version = ? AND content_hash = ?`, so a stale caller cannot silently overwrite or delete a changed record. Uniqueness is enforced per canonical project root + `action_id` (unique index `idx_trusted_manifests_root_action`); SQLite treats NULLs as distinct, so legacy unbound rows never collide.
+
+### Action binding
+
+- Every trusted manifest is tied to **exactly one** Action Registry `id`, supplied explicitly by the user on add/replace.
+- `create`/`replace` call the native resolver `resolve_bindable_action_conn`, which reads the file-backed Action Registry `active` bucket and requires the id to resolve to exactly one item that is `open`/`in_progress` and already satisfies the same approval condition `dispatch_approved_action` enforces (`approval_required` false, or `approval_status` in `approved`/`waived`).
+- The action id is **opaque identity only**. The action title, description, and any other Action Registry text are never read as tool calls, arguments, or acceptance content, and Goal/model text may only select a manifest ID.
+- Missing, duplicated, non-active, or approval-ambiguous/unavailable action ids are rejected with an actionable error; binding never infers approval. Rebinding a legacy unbound row requires an explicit `replace` with a valid action id.
 
 ### Content JSON v1 (exact shape)
 
@@ -80,6 +88,7 @@ No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `rem
 - Writer payloads (`content`, `old_string`, `new_string`) are valid UTF-8 by construction, must contain no NUL byte, and are ≤ 64 KiB each; the 64 KiB manifest cap bounds their total.
 - `expect_sha256` must be exactly 64 lowercase hex characters.
 - Acceptance criterion keys must be well-formed UUIDs (resolved against the bound Goal's `goal_criteria.id` at resolution time, which is not implemented in slice 1).
+- The bound `action_id` must be non-empty and must resolve to exactly one active `open`/`in_progress` Action Registry item that satisfies the existing approval condition; otherwise binding is refused.
 - Bounds: whole manifest ≤ 64 KiB; each writer payload ≤ 64 KiB; ≤ 50 execution calls; ≤ 100 acceptance criteria; ≤ 50 checks per criterion; ≤ 200 total checks.
 
 ### Trust invariants
@@ -87,7 +96,8 @@ No row is auto-seeded. `create` mints `registry_version = 1`. `replace` and `rem
 - The SQLite registry is the only native trust authority; the file-backed Action Registry remains untrusted.
 - Manifest scope binds an exact existing **enabled** Agent and a canonical existing workspace root. Registration is attribution only and grants no tool permission.
 - Listing `write_file`/`edit_file` in `execution` grants no permission and bypasses no approval. Later execution must run through the canonical ToolRuntime in an Agent context under current Permission policy; if policy denies or requires approval it persists a `blocked`/`waiting` state and is never treated as dispatched.
-- Content is never supplied or authorized by Goal, model, task, Action Registry, or Action Registry text. Goal/model/registry text may reference a manifest ID only.
+- Content is never supplied or authorized by Goal, model, task, Action Registry, or Action Registry text. Goal/model/registry text may reference a manifest ID only — never action calls, arguments, or acceptance checks.
+- Each manifest binds exactly one Action Registry id as opaque identity; its title/description are never read as tool calls, args, or acceptance.
 - Canonical content SHA-256 is computed over the re-serialized validated content (struct-field order, sorted criterion keys, omitted absent optionals), so equivalent inputs hash identically.
 
 ## Implementation scope
