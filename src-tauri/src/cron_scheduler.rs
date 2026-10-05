@@ -160,6 +160,43 @@ fn record_claim_denial<T>(
     Err(format!("activation denied: {reason}"))
 }
 
+/// Additive, idempotent projection-identity columns on the durable
+/// `cron_activations` authority. A claim records the exact validated Agent
+/// projection snapshot it resolved; final dispatch must re-resolve and match it
+/// field-for-field before any external effect. The columns are ensured lazily by
+/// the only writer here rather than in `db/migrations.rs` so the durable claim
+/// can carry projection identity without widening the migration batch.
+fn ensure_activation_projection_columns(conn: &rusqlite::Connection) -> Result<(), String> {
+    let existing: HashSet<String> = conn
+        .prepare("PRAGMA table_info(cron_activations)")
+        .map_err(|e| format!("failed to inspect cron_activations: {e}"))?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| format!("failed to inspect cron_activations: {e}"))?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| format!("failed to inspect cron_activations: {e}"))?;
+    let additions = [
+        ("projection_slug", "projection_slug TEXT"),
+        ("projection_source_path", "projection_source_path TEXT"),
+        ("projection_source_hash", "projection_source_hash TEXT"),
+        (
+            "projection_active_source_hash",
+            "projection_active_source_hash TEXT",
+        ),
+        ("projection_version", "projection_version INTEGER"),
+        ("projection_activated_at", "projection_activated_at TEXT"),
+    ];
+    for (column, ddl) in additions {
+        if !existing.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE cron_activations ADD COLUMN {ddl}"),
+                [],
+            )
+            .map_err(|e| format!("failed to add cron_activations.{column}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Claim the deterministic occurrence for one due job so a given schedule fire
 /// dispatches at most once, even across a restart or overlapping polls.
 ///
@@ -179,6 +216,10 @@ fn claim_activation(
 ) -> Result<Option<String>, String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+
+    // The durable activation authority must be able to carry claim-time Agent
+    // projection identity before any claim/denial row is written.
+    ensure_activation_projection_columns(&conn)?;
 
     let row: Option<(i64, Option<String>, String, Option<String>)> = conn
         .query_row(
@@ -224,9 +265,28 @@ fn claim_activation(
         .flatten();
     let mut goal_scope: Option<String> = None;
     if let Some(ref gid) = goal_id {
-        let goal = crate::commands::goals::validate_cron_goal_activation(&conn, gid, job_id)
-            .map_err(|e| format!("goal association blocks activation: {e}"))?;
-        goal_scope = goal.project_root;
+        match crate::commands::goals::validate_cron_goal_activation(&conn, gid, job_id) {
+            Ok(goal) => goal_scope = goal.project_root,
+            // A failed Goal validation must not return before the durable
+            // activation denial exists: record the due occurrence as `blocked`
+            // with the truthful reason so a bad association can never be
+            // re-attempted as an unrecorded claim. No workspace is authoritative
+            // here because the Goal scope could not be validated.
+            Err(e) => {
+                return record_claim_denial(
+                    &conn,
+                    job_id,
+                    &goal_id,
+                    &agent_id,
+                    &session_id,
+                    &None,
+                    &occurrence,
+                    trigger_kind,
+                    "blocked",
+                    &format!("goal association blocks activation: {e}"),
+                );
+            }
+        }
     }
 
     // Effective activation scope. A bound Session's actual persisted workspace is
@@ -326,31 +386,37 @@ fn claim_activation(
     // Agent lifecycle/projection boundary, re-checked before the claim. A
     // disabled Agent becomes an explicit `waiting_for_user`; a missing/invalid/
     // stale/mismatched authority becomes `blocked`. Neither dispatches, and
-    // neither substitutes default instructions.
-    if let Err(denial) = crate::commands::agents::resolve_activation_boundary(&conn, &agent_id) {
-        let activation_id = uuid::Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT OR IGNORE INTO cron_activations \
-             (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
-              schedule_occurrence, trigger_kind, claim_state, terminal_reason, claimed_at, settled_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
-                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-            rusqlite::params![
-                &activation_id,
-                job_id,
-                goal_id,
-                &agent_id,
-                &session_id,
-                &effective_scope,
-                occurrence.to_string(),
-                trigger_kind,
-                denial.claim_state(),
-                denial.reason(),
-            ],
-        )
-        .map_err(|e| format!("failed to record denied activation: {e}"))?;
-        return Err(format!("activation denied: {}", denial.reason()));
-    }
+    // neither substitutes default instructions. The resolved snapshot is the
+    // exact claim-time projection identity persisted below and required again at
+    // final dispatch; a custom Agent's validated hash and a built-in Jarvis
+    // default (empty identity) are both carried verbatim.
+    let projection = match crate::commands::agents::resolve_activation_boundary(&conn, &agent_id) {
+        Ok(snapshot) => snapshot,
+        Err(denial) => {
+            let activation_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT OR IGNORE INTO cron_activations \
+                 (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
+                  schedule_occurrence, trigger_kind, claim_state, terminal_reason, claimed_at, settled_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, \
+                         strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                rusqlite::params![
+                    &activation_id,
+                    job_id,
+                    goal_id,
+                    &agent_id,
+                    &session_id,
+                    &effective_scope,
+                    occurrence.to_string(),
+                    trigger_kind,
+                    denial.claim_state(),
+                    denial.reason(),
+                ],
+            )
+            .map_err(|e| format!("failed to record denied activation: {e}"))?;
+            return Err(format!("activation denied: {}", denial.reason()));
+        }
+    };
 
     // Dedupe: this occurrence key is unique per job. A prior claim means the
     // effect may already exist and must not be reissued.
@@ -382,9 +448,11 @@ fn claim_activation(
         .execute(
             "INSERT INTO cron_activations \
              (activation_id, cron_job_id, goal_id, agent_id, session_id, project_root, \
-              schedule_occurrence, trigger_kind, claim_state, claimed_at) \
+              schedule_occurrence, trigger_kind, claim_state, claimed_at, \
+              projection_slug, projection_source_path, projection_source_hash, \
+              projection_active_source_hash, projection_version, projection_activated_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'claimed', \
-                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 &activation_id,
                 job_id,
@@ -394,6 +462,12 @@ fn claim_activation(
                 &effective_scope,
                 occurrence.to_string(),
                 trigger_kind,
+                &projection.slug,
+                &projection.source_path,
+                &projection.source_hash,
+                &projection.active_source_hash,
+                projection.projection_version,
+                &projection.activated_at,
             ],
         )
         .map_err(|e| format!("failed to claim activation: {e}"))?;
@@ -824,7 +898,7 @@ pub async fn resolve_jarvis_url(client: &Client) -> String {
 /// needing direct access to the Tauri SQLite database. A built-in Jarvis
 /// snapshot legitimately has empty source/hash fields (default runtime
 /// instructions); a custom Agent snapshot always carries a validated hash.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ProjectionSnapshot {
     pub slug: String,
     pub source_path: String,
@@ -942,16 +1016,51 @@ pub async fn dispatch_cron_job(
         // compared against the current canonical Goal/Session workspace below.
         let mut claim_root: Option<String> = None;
 
+        // The exact claim-time Agent projection identity. Final dispatch
+        // re-resolves the projection and must match this field-for-field; a
+        // claim row that carries no captured identity fails closed rather than
+        // dispatching under an unverified projection.
+        let mut stored_projection: Option<ProjectionSnapshot> = None;
+
         // When called from a claimed activation, the activation row captured at
         // claim time must still match this job exactly. An unreadable/missing/
         // malformed authority row is a fail-closed denial, not a runtime failure.
         if let Some(aid) = activation_id {
-            let claimed: Option<(String, Option<String>, Option<String>, Option<String>, String)> = conn
+            #[allow(clippy::type_complexity)]
+            let claimed: Option<(
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<String>,
+            )> = conn
                 .query_row(
-                    "SELECT agent_id, session_id, goal_id, project_root, claim_state \
+                    "SELECT agent_id, session_id, goal_id, project_root, claim_state, \
+                     projection_slug, projection_source_path, projection_source_hash, \
+                     projection_active_source_hash, projection_version, projection_activated_at \
                      FROM cron_activations WHERE activation_id = ?1",
                     [aid],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| {
@@ -959,7 +1068,19 @@ pub async fn dispatch_cron_job(
                         format!("activation authority unreadable: {e}"),
                     ))
                 })?;
-            let Some((claim_agent, claim_session, claim_goal, claimed_root, claim_state)) = claimed
+            let Some((
+                claim_agent,
+                claim_session,
+                claim_goal,
+                claimed_root,
+                claim_state,
+                claim_projection_slug,
+                claim_projection_source_path,
+                claim_projection_source_hash,
+                claim_projection_active_source_hash,
+                claim_projection_version,
+                claim_projection_activated_at,
+            )) = claimed
             else {
                 return Err(CronDispatchError::Denied(
                     crate::commands::agents::ActivationDenial::Blocked(format!(
@@ -984,6 +1105,28 @@ pub async fn dispatch_cron_job(
                     ),
                 ));
             }
+            // A schema-valid claim always captured slug and source hash (the
+            // built-in Jarvis default is an explicit empty hash, not NULL). A
+            // NULL means the claim predates projection identity capture; refuse
+            // rather than dispatch under an unverified projection.
+            let (Some(claim_projection_slug), Some(claim_projection_source_hash)) =
+                (claim_projection_slug, claim_projection_source_hash)
+            else {
+                return Err(CronDispatchError::Denied(
+                    crate::commands::agents::ActivationDenial::Blocked(
+                        "activation has no claim-time projection identity; refusing dispatch"
+                            .to_string(),
+                    ),
+                ));
+            };
+            stored_projection = Some(ProjectionSnapshot {
+                slug: claim_projection_slug,
+                source_path: claim_projection_source_path.unwrap_or_default(),
+                source_hash: claim_projection_source_hash,
+                active_source_hash: claim_projection_active_source_hash.unwrap_or_default(),
+                projection_version: claim_projection_version.unwrap_or(0),
+                activated_at: claim_projection_activated_at.unwrap_or_default(),
+            });
             claim_root = claimed_root;
         }
 
@@ -1066,6 +1209,19 @@ pub async fn dispatch_cron_job(
         // snapshot is exactly what the HTTP body will carry.
         let snapshot = crate::commands::agents::resolve_activation_boundary(&conn, sender_agent)
             .map_err(CronDispatchError::Denied)?;
+        // Require exact equality with the claim-time projection identity. A
+        // changed source hash, version, path, or activation time means the Agent
+        // instructions were replaced after the claim; never execute the changed
+        // projection. The denial is persisted durably by the caller as a
+        // blocked activation. The built-in Jarvis default (explicit empty
+        // identity) is preserved: both snapshots are empty and compare equal.
+        if matches!(&stored_projection, Some(stored) if stored != &snapshot) {
+            return Err(CronDispatchError::Denied(
+                crate::commands::agents::ActivationDenial::Blocked(
+                    "agent projection changed after claim; refusing dispatch".to_string(),
+                ),
+            ));
+        }
         let snapshot = if snapshot.source_hash.is_empty() {
             None
         } else {
