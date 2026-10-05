@@ -349,9 +349,229 @@ fn write_acceptance(
     Ok(())
 }
 
-/// Write then read back the exact receipt; if the readback does not show the
-/// expected status the receipt is downgraded to ambiguous. Never claims success
-/// from an unconfirmed write.
+/// Exact readback comparison for one persisted receipt against the expected
+/// identity, status, runtime fields, evidence JSON, and criterion rows. A
+/// count-only comparison is never accepted.
+#[allow(clippy::too_many_arguments)]
+fn receipt_matches_expected(
+    receipt: &TrustedAcceptanceReceipt,
+    execution_id: &str,
+    status: &str,
+    reason: Option<&str>,
+    run_id: Option<&str>,
+    bun_instance_id: Option<&str>,
+    runtime_started_at: Option<&str>,
+    runtime_finished_at: Option<&str>,
+    evidence: Option<&serde_json::Value>,
+    criteria: &[AcceptanceCriterionRow],
+    action_id: &str,
+    manifest_id: &str,
+    goal_id: &str,
+) -> bool {
+    if receipt.acceptance_key != execution_id
+        || receipt.execution_id != execution_id
+        || receipt.action_id != action_id
+        || receipt.manifest_id != manifest_id
+        || receipt.goal_id != goal_id
+        || receipt.status != status
+        || receipt.terminal_reason.as_deref() != reason
+    {
+        return false;
+    }
+    if let Some(run) = run_id {
+        if receipt.bun_run_id.as_deref() != Some(run) {
+            return false;
+        }
+    }
+    if let Some(instance) = bun_instance_id {
+        if receipt.bun_instance_id.as_deref() != Some(instance) {
+            return false;
+        }
+    }
+    if let Some(started) = runtime_started_at {
+        if receipt.runtime_started_at.as_deref() != Some(started) {
+            return false;
+        }
+    }
+    if let Some(finished) = runtime_finished_at {
+        if receipt.runtime_finished_at.as_deref() != Some(finished) {
+            return false;
+        }
+    }
+    if receipt.evidence.as_ref() != evidence {
+        return false;
+    }
+    if receipt.criteria.len() != criteria.len() {
+        return false;
+    }
+    for expected in criteria {
+        let Some(row) = receipt
+            .criteria
+            .iter()
+            .find(|r| r.criterion_id == expected.criterion_id && r.check_index == expected.check_index)
+        else {
+            return false;
+        };
+        if row.tool != expected.tool
+            || row.expected_sha256 != expected.expected_sha256
+            || row.actual_sha256 != expected.actual_sha256
+            || row.accepted != expected.accepted
+            || row.evidence.as_ref() != expected.evidence.as_ref()
+        {
+            return false;
+        }
+    }
+    for row in &receipt.criteria {
+        if !criteria
+            .iter()
+            .any(|e| e.criterion_id == row.criterion_id && e.check_index == row.check_index)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shared validator for an existing persisted ACCEPTED receipt used before
+/// terminal delivery. It compares the receipt identity to the current trusted
+/// execution / manifest / Goal / acceptance operation, then compares the
+/// persisted criterion rows one-to-one against the manifest-derived checks by
+/// exact `(criterion_id, check_index, tool, expected_sha256)` and verifies each
+/// accepted row's actual hash and stored evidence entry. Missing, malformed,
+/// duplicate, extra, or inconsistent rows are rejected.
+fn validate_persisted_accepted(
+    receipt: &TrustedAcceptanceReceipt,
+    execution: &TrustedActionExecution,
+    manifest: &ManifestScope,
+    goal_id: &str,
+    acceptance_key: &str,
+    checks: &[TrustedAcceptanceCheckWire],
+) -> Result<(), String> {
+    if receipt.acceptance_key != acceptance_key
+        || receipt.execution_id != execution.execution_id
+        || receipt.action_id != execution.action_id
+        || receipt.manifest_id != manifest.manifest_id
+        || receipt.goal_id != goal_id
+        || receipt.status != STATUS_ACCEPTED
+    {
+        return Err(
+            "persisted acceptance receipt identity does not match the current operation"
+                .to_string(),
+        );
+    }
+    if manifest.action_id.as_deref() != Some(execution.action_id.as_str()) {
+        return Err("manifest is no longer bound to the execution action".to_string());
+    }
+    let execution_bun_instance = execution.bun_run_id.as_deref().unwrap_or("");
+    if execution_bun_instance.trim().is_empty()
+        || receipt.bun_instance_id.as_deref() != Some(execution_bun_instance)
+    {
+        return Err(
+            "persisted acceptance Bun instance does not match the execution receipt".to_string(),
+        );
+    }
+    if receipt
+        .bun_run_id
+        .as_deref()
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+        || receipt
+            .runtime_started_at
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        || receipt
+            .runtime_finished_at
+            .as_deref()
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+    {
+        return Err("persisted acceptance run identity or bounds are missing".to_string());
+    }
+
+    // Persisted acceptance evidence array, one entry per check.
+    let evidence_entries: Vec<TrustedAcceptanceCheckEvidenceWire> = receipt
+        .evidence
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or_else(|| "persisted acceptance evidence is missing or malformed".to_string())?;
+    if evidence_entries.len() != checks.len() {
+        return Err("persisted acceptance evidence does not match the check count".to_string());
+    }
+
+    use std::collections::BTreeMap;
+    let mut rows: BTreeMap<(String, i64), &TrustedAcceptanceCriterionReceipt> = BTreeMap::new();
+    for row in &receipt.criteria {
+        if rows
+            .insert((row.criterion_id.clone(), row.check_index), row)
+            .is_some()
+        {
+            return Err("persisted acceptance criteria contain a duplicate row".to_string());
+        }
+    }
+    if rows.len() != checks.len() {
+        return Err("persisted acceptance criteria do not match the check count".to_string());
+    }
+    let mut entries: BTreeMap<(String, i64), &TrustedAcceptanceCheckEvidenceWire> = BTreeMap::new();
+    for entry in &evidence_entries {
+        if entries
+            .insert((entry.criterion_id.clone(), entry.index as i64), entry)
+            .is_some()
+        {
+            return Err("persisted acceptance evidence contains a duplicate entry".to_string());
+        }
+    }
+
+    for check in checks {
+        let key = (check.criterion_id.clone(), check.index as i64);
+        let row = rows
+            .get(&key)
+            .ok_or_else(|| "persisted acceptance criteria are missing a required check".to_string())?;
+        let entry = entries
+            .get(&key)
+            .ok_or_else(|| "persisted acceptance evidence is missing a required check".to_string())?;
+        if row.tool != check.tool
+            || row.expected_sha256 != check.expect_sha256
+            || !row.accepted
+            || row.actual_sha256.as_deref() != Some(check.expect_sha256.as_str())
+        {
+            return Err("persisted acceptance criterion row is inconsistent".to_string());
+        }
+        if entry.tool != check.tool
+            || entry.status != "ok"
+            || !entry.matched
+            || entry.output_sha256.as_deref() != Some(check.expect_sha256.as_str())
+            || entry.output_bytes.is_none()
+        {
+            return Err("persisted acceptance evidence entry is inconsistent".to_string());
+        }
+        let row_entry: TrustedAcceptanceCheckEvidenceWire = row
+            .evidence
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .ok_or_else(|| "persisted criterion evidence is malformed".to_string())?;
+        if row_entry.criterion_id != entry.criterion_id
+            || row_entry.index != entry.index
+            || row_entry.tool != entry.tool
+            || row_entry.status != entry.status
+            || row_entry.output_sha256 != entry.output_sha256
+            || row_entry.output_bytes != entry.output_bytes
+            || row_entry.matched != entry.matched
+        {
+            return Err("persisted criterion evidence does not match the acceptance evidence".to_string());
+        }
+    }
+
+    // No extras beyond the required checks.
+    if rows.len() != checks.len() || entries.len() != checks.len() {
+        return Err("persisted acceptance rows contain extras".to_string());
+    }
+    Ok(())
+}
+
+/// Write then read back the exact receipt; if the readback does not match the
+/// expected identity/status/runtime/evidence/rows the receipt is downgraded to
+/// ambiguous. Never claims success from an unconfirmed write.
 #[allow(clippy::too_many_arguments)]
 fn write_and_confirm(
     conn: &Connection,
@@ -386,7 +606,21 @@ fn write_and_confirm(
     .is_ok()
     {
         if let Some(receipt) = load_acceptance(conn, execution_id)? {
-            if receipt.status == status {
+            if receipt_matches_expected(
+                &receipt,
+                execution_id,
+                status,
+                reason,
+                run_id,
+                bun_instance_id,
+                runtime_started_at,
+                runtime_finished_at,
+                evidence,
+                criteria,
+                action_id,
+                manifest_id,
+                goal_id,
+            ) {
                 return Ok(receipt);
             }
         }
@@ -760,11 +994,17 @@ fn run_acceptance(
         if existing.status != STATUS_ACCEPTED {
             return Ok(existing);
         }
-        if existing.criteria.iter().filter(|c| c.accepted).count() != checks.len() {
-            return Err(
-                "persisted accepted evidence does not cover every acceptance check".to_string(),
-            );
-        }
+        // Never trust an accepted receipt by count alone: validate its exact
+        // identity and rows against the current operation before delivery.
+        let execution_now = load_execution(&conn, execution_id)?;
+        validate_persisted_accepted(
+            &existing,
+            &execution_now,
+            &manifest,
+            &goal_id,
+            &acceptance_key,
+            &checks,
+        )?;
         criteria = existing
             .criteria
             .iter()
@@ -1023,14 +1263,34 @@ fn run_acceptance(
         return Ok(receipt);
     }
 
-    // Exact readback before confirming: Goal terminal proof, receipt + criteria.
+    // Final confirmation: re-load and run the same exact persisted validator
+    // after Goal completion, then verify the Goal link/event and the Action
+    // Registry exact-evidence proof. `confirmed` is true only when every
+    // identity/row comparison and readback passed.
+    {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let receipt_now = load_acceptance(&conn, execution_id)?
+            .ok_or_else(|| "acceptance receipt missing after confirmation".to_string())?;
+        let execution_now = load_execution(&conn, execution_id)?;
+        validate_persisted_accepted(
+            &receipt_now,
+            &execution_now,
+            &manifest,
+            &goal_id,
+            &acceptance_key,
+            &checks,
+        )?;
+        crate::commands::goals::verify_goal_terminal_evidence(&conn, &goal_id, &receipt_ref)?;
+    }
+    crate::commands::action_registry::verify_action_registry_done(
+        db.inner(),
+        &action_id,
+        &evidence_report,
+    )?;
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    crate::commands::goals::verify_goal_terminal_evidence(&conn, &goal_id, &receipt_ref)?;
     let mut receipt = load_acceptance(&conn, execution_id)?
         .ok_or_else(|| "acceptance receipt missing after confirmation".to_string())?;
-    let accepted_ok = receipt.status == STATUS_ACCEPTED
-        && receipt.criteria.iter().filter(|c| c.accepted).count() == checks.len();
-    receipt.confirmed = accepted_ok;
+    receipt.confirmed = true;
     Ok(receipt)
 }
 
