@@ -12,9 +12,11 @@ sample being recorded as a connection failure (2026-10-03: one server death
 turned 105 samples into instant "connection refused" fails).
 
 Lives on C: since 2026-10-04 (the D: copy is on a drive that went offline).
+TIER2B_DIR overrides the benchmark location (the Modal runs use a Linux copy).
 """
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -23,7 +25,7 @@ import time
 import urllib.error
 import urllib.request
 
-BENCH = pathlib.Path(r"C:\Projects\home-base-recovered\scripts\benchmark-tier2b")
+BENCH = pathlib.Path(os.environ.get("TIER2B_DIR", r"C:\Projects\home-base-recovered\scripts\benchmark-tier2b"))
 sys.path.insert(0, str(BENCH))
 from runbench2b import baseline_prompt, extract_code, run_test, seed  # noqa: E402
 from tasks import K, TASKS  # noqa: E402
