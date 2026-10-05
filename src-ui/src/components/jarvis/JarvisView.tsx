@@ -7,6 +7,8 @@ import type { CompanionState } from './types';
 import {
   JarvisSession, JarvisMessage, JarvisConfig, JarvisStatus,
   OPENROUTER_MODELS,
+  type AgentOption,
+  type SessionMemorySelection,
 } from './types';
 import ControlCenterView, { type ControlCenterTab } from './ControlCenterView';
 import { sessionScroll } from './session-scroll';
@@ -22,6 +24,7 @@ import {
 import MarkdownView from './MarkdownView';
 import SessionRunsView from './SessionRunsView';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
+import MemoryScopeControls from './MemoryScopeControls';
 import SystemStatusBar from './SystemStatusBar';
 import {
   createUnknownFrameReporter,
@@ -149,6 +152,20 @@ const sessionInvokeArgs = (sessionId: string) => ({
   sessionId,
   session_id: sessionId,
 });
+
+/**
+ * Decode the native `MemoryScope` read-back from `memory_bind_session_workspace`
+ * or `jarvis_new_session`. A malformed/absent result is never treated as a
+ * confirmed binding. Only the canonical native value is accepted; the UI never
+ * fabricates `project_root`.
+ */
+function decodeBoundScope(value: unknown): { kind: string; agent_id: string; project_root: string | null } | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.kind !== 'string' || typeof record.agent_id !== 'string') return null;
+  if (record.project_root !== null && typeof record.project_root !== 'string') return null;
+  return { kind: record.kind, agent_id: record.agent_id, project_root: record.project_root ?? null };
+}
 
 // ── Durable run record (Task 4.1) ────────────────────────────────────
 // `record_terminal_run` is Native's only writer for `session_runs` and
@@ -526,6 +543,8 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : config.active_backend === 'llama_cpp' ? config.llama_cpp.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
                 onSessionCreated={loadSessions}
                 onRunRecordSettled={setRunRecord}
+                sessions={sessions}
+                onSessionsChanged={() => { void loadSessions(); }}
               />
             </motion.div>
           )}
@@ -662,6 +681,7 @@ const CURATED_SUGGESTIONS: string[] = [
 
 export function ChatPanel({
   activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated, onRunRecordSettled,
+  sessions = [], onSessionsChanged = () => {},
 }: {
   activeSession: string | null;
   setActiveSession: (id: string | null) => void;
@@ -670,6 +690,10 @@ export function ChatPanel({
   modelLabel: string;
   onSessionCreated: () => void;
   onRunRecordSettled?: (state: RunRecordState | null) => void;
+  /** Persisted Session identity projection; optional for older render sites. */
+  sessions?: JarvisSession[];
+  /** Refresh the persisted Session list after a native binding change. */
+  onSessionsChanged?: () => void;
 }) {
   const [messages, setMessages] = useState<JarvisMessage[]>([]);
   const [draftStore, setDraftStore] = useState<SessionDraftStore>(() => createSessionDraftStore());
@@ -730,6 +754,15 @@ export function ChatPanel({
   // selected Session (and therefore Agent scope) changes so it can never carry
   // silently into a different Session/Agent.
   const [includeUserScope, setIncludeUserScope] = useState(false);
+  // Phase 4.2 Session identity. The Agent applies to a Session created on the
+  // next send; the project binding is applied to an existing Session through
+  // the native command. Both are never inferred from user prose.
+  const [sessionAgents, setSessionAgents] = useState<AgentOption[]>([]);
+  const [pendingAgentId, setPendingAgentId] = useState('main');
+  const [pendingProjectRoot, setPendingProjectRoot] = useState<string | null>(null);
+  // A Session created for a first send whose workspace binding then failed.
+  // It is reused on retry so a rejected bind never creates a second Session.
+  const pendingNewSessionRef = useRef<string | null>(null);
   // The owning relay memory turn currently displayed. Used to drop stale
   // warnings/diagnostics when a different relay submission becomes active.
   const memoryOwnerRef = useRef<{ sessionId: string; turnId: string } | null>(null);
@@ -750,7 +783,9 @@ export function ChatPanel({
   const settledRelayOwnersRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     // A Session change invalidates the previous turn's memory surface and any
-    // relay correlation: no old warning/diagnostic may survive it.
+    // relay correlation: no old warning/diagnostic may survive it. It also
+    // abandons any orphan pending-Session identity from a failed first bind.
+    pendingNewSessionRef.current = null;
     setIncludeUserScope(false);
     setMemoryLiveStatus(null);
     setMemoryDiagnostic(null);
@@ -763,6 +798,38 @@ export function ChatPanel({
     conversationEpochRef.current += 1;
     clearRelayMemoryTurn();
   }, [activeSession]);
+
+  // The user-wide opt-in is local to the selected Session/Agent and must never
+  // carry silently across an Agent change. It also defaults off on mount and
+  // after an app restart because it is never persisted.
+  useEffect(() => {
+    setIncludeUserScope(false);
+  }, [pendingAgentId]);
+
+  // Enabled native Agents for the New Session identity selector. A failed or
+  // malformed read leaves the selector at the safe `main` default rather than
+  // inventing an Agent.
+  useEffect(() => {
+    let cancelled = false;
+    invoke<unknown>('list_agents')
+      .then((rows) => {
+        if (cancelled || !Array.isArray(rows)) return;
+        const next: AgentOption[] = [];
+        for (const row of rows) {
+          if (typeof row !== 'object' || row === null) continue;
+          const record = row as Record<string, unknown>;
+          if (typeof record.id !== 'string' || typeof record.enabled !== 'boolean') continue;
+          next.push({
+            id: record.id,
+            name: typeof record.name === 'string' ? record.name : undefined,
+            enabled: record.enabled,
+          });
+        }
+        setSessionAgents(next);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   // Phase 3.3 — token / cost tally for the current turn.
   const [turnCost, setTurnCost] = useState<{ tokens: number; costUsd: number } | null>(null);
@@ -2470,6 +2537,52 @@ export function ChatPanel({
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
   }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
+  // Phase 4.2 — bind a canonical workspace through the native command and
+  // confirm the native read-back. A rejected/malformed result is never a
+  // confirmed binding. The native canonicalizer owns path validation; the UI
+  // never parses workspace scope from user prose or grant chips.
+  const bindWorkspaceForSession = useCallback(async (sid: string, root: string): Promise<boolean> => {
+    try {
+      const scope = await invoke<unknown>('memory_bind_session_workspace', {
+        request: { session_id: sid, workspace_root: root },
+      });
+      const decoded = decodeBoundScope(scope);
+      return decoded !== null && decoded.kind === 'project' && typeof decoded.project_root === 'string' && decoded.project_root.length > 0;
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const handleSelectAgent = useCallback((agentId: string) => {
+    // Agent selection applies to a future Session only; an existing Session's
+    // Agent ownership is immutable. Changing it resets the local opt-in.
+    setPendingAgentId(agentId);
+    setIncludeUserScope(false);
+  }, []);
+
+  const handleBindWorkspace = useCallback(async (root: string | null) => {
+    const sid = activeSession;
+    if (!sid) {
+      // Pending New Session: hold the choice; it is applied on first send.
+      setPendingProjectRoot(root);
+      return;
+    }
+    if (isStreaming) return;
+    try {
+      const scope = await invoke<unknown>('memory_bind_session_workspace', {
+        request: { session_id: sid, workspace_root: root },
+      });
+      const decoded = decodeBoundScope(scope);
+      const expectedKind = root === null ? 'agent' : 'project';
+      if (!decoded || decoded.kind !== expectedKind) {
+        throw new Error('invalid binding read-back');
+      }
+      onSessionsChanged();
+    } catch {
+      setError('Could not update the Session workspace binding. The previous binding is unchanged.');
+    }
+  }, [activeSession, isStreaming, onSessionsChanged]);
+
   const handleSend = useCallback(async () => {
     // 2026-07-13 live incident (session 7254c3ae): the `isStreaming` React
     // state guard below misses rapid double-Enter presses because setState
@@ -2550,20 +2663,48 @@ export function ChatPanel({
     let effectiveSessionId = activeSession || sessionId;
     try {
       if (!effectiveSessionId) {
-        const newSession = await invoke<JarvisSession>('jarvis_new_session', {
-          name: userMsg.slice(0, 60),
-        });
+        // Create the native Session once. A Session whose workspace bind then
+        // fails is reused on retry rather than re-created.
+        let newSessionId = pendingNewSessionRef.current;
+        if (!newSessionId) {
+          const newSession = await invoke<JarvisSession>('jarvis_new_session', {
+            name: userMsg.slice(0, 60),
+            ...(pendingAgentId && pendingAgentId !== 'main' ? { agentId: pendingAgentId } : {}),
+          });
+          newSessionId = newSession.id;
+          pendingNewSessionRef.current = newSession.id;
+          onSessionCreated();
+        }
         if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
-        effectiveSessionId = newSession.id;
+        if (!newSessionId) {
+          throw new Error('Could not create a Session for this message.');
+        }
+        // A selected project must bind BEFORE the user row is appended and
+        // before preparation/fetch. A binding failure preserves the draft and
+        // never launches inference.
+        if (pendingProjectRoot) {
+          const bound = await bindWorkspaceForSession(newSessionId, pendingProjectRoot);
+          if (!bound) {
+            if (mountedRef.current && sendGateRef.current.isCurrent(sendGeneration)) {
+              setIsStreaming(false);
+              setError('Could not bind the selected workspace to the new Session. The Session was created but no message was sent; choose a valid absolute directory and retry.');
+              setMessages(prev => prev.filter(m => m.id !== clientMessageId && m.id !== assistantClientMessageId));
+              publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+            }
+            return;
+          }
+        }
+        effectiveSessionId = newSessionId;
         // Suppress the history-load effect that setActiveSession is about to
         // trigger — otherwise it overwrites the optimistic messages above with
         // the empty history of this brand-new session.
-         suppressHistoryLoadRef.current = newSession.id;
-         setSessionId(newSession.id);
-         sessionIdRef.current = newSession.id;
-         activeSessionRef.current = newSession.id;
-         setActiveSession(newSession.id);
-        onSessionCreated();
+        suppressHistoryLoadRef.current = newSessionId;
+        setSessionId(newSessionId);
+        sessionIdRef.current = newSessionId;
+        activeSessionRef.current = newSessionId;
+        setActiveSession(newSessionId);
+        pendingNewSessionRef.current = null;
+        onSessionsChanged();
       }
 
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
@@ -2617,7 +2758,7 @@ export function ChatPanel({
       // now" check that needs a single finish() on every exit.
       sendInFlightRef.current.finish();
     }
-  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope]);
+  }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, onSessionsChanged, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope, pendingAgentId, pendingProjectRoot, bindWorkspaceForSession]);
 
   // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
   // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
@@ -2794,6 +2935,19 @@ export function ChatPanel({
   // diagnostic; while the turn is live a transient status may be shown without
   // counts.
   const memoryStatusLabel = formatMemoryTurnLabel(memoryLiveStatus, memoryDiagnostic);
+
+  // Phase 4.2 Session memory identity. For an existing Session the Agent and
+  // binding come from the persisted native row; a New Session uses the local
+  // pending selection until first send creates and binds the native Session.
+  const currentSession = activeSession
+    ? sessions.find((session) => session.id === activeSession) ?? null
+    : null;
+  const sessionSelection: SessionMemorySelection = {
+    session_id: activeSession,
+    agent_id: currentSession?.agent_id ?? (pendingAgentId || 'main'),
+    project_root: currentSession ? currentSession.project_root ?? null : pendingProjectRoot,
+    include_user_scope: includeUserScope,
+  };
 
   return (
     <div className="h-full flex flex-col">
@@ -3129,6 +3283,21 @@ export function ChatPanel({
         )}
       </AnimatePresence>
 
+      {/* Phase 4.2 — explicit Session Agent/project identity. For an existing
+          Session the Agent is fixed and Apply/Unbind bind the current Session;
+          for a New Session the choice is applied on first send. This control is
+          not a filesystem grant. */}
+      <div className="shrink-0 pb-2">
+        <MemoryScopeControls
+          selection={sessionSelection}
+          agents={sessionAgents}
+          disabled={isStreaming}
+          onSelectAgent={handleSelectAgent}
+          onBindWorkspace={(root) => { void handleBindWorkspace(root); }}
+          onIncludeUserScope={setIncludeUserScope}
+        />
+      </div>
+
       {/* Input area — single-slot morph: Send | Stop (the user's chosen UX). */}
       <div className="shrink-0">
         <div className="relative">
@@ -3201,18 +3370,7 @@ export function ChatPanel({
             via {displayedRoute}
           </span>
         </div>
-        <div className="flex items-center justify-between gap-3 mt-1.5 px-1">
-          <label className="flex items-center gap-1.5 text-[10px] font-mono text-bone-faint cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={includeUserScope}
-              onChange={(e) => setIncludeUserScope(e.target.checked)}
-              disabled={isStreaming}
-              className="accent-royal"
-              aria-label="Include user-wide memory"
-            />
-            Include user-wide memory
-          </label>
+        <div className="flex items-center justify-end gap-3 mt-1.5 px-1">
           {memoryStatusLabel && (
             <span
               role="status"

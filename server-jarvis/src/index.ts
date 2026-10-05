@@ -18,7 +18,9 @@ import {
   type ConsumeMemoryResult,
   type MemoryAppliedObservation,
   type MemoryTurnTerminalStatus,
+  type ScopeCandidateIdentity,
 } from "./native-memory";
+import { resolveBoundMemoryWorkspace } from "./memory-workspace";
 import {
   fitTurnMemory,
   resolveTurnMemoryInputBudget,
@@ -570,6 +572,13 @@ export interface JarvisSession {
   message_count: number;
   last_active?: string;
   total_tokens?: number;
+  /**
+   * Canonical persisted Agent identity for the Session. Scope input only; it
+   * is never a filesystem grant or memory authority.
+   */
+  agent_id: string;
+  /** Explicit validated project binding, if any. `null` is Agent scope. */
+  project_root: string | null;
 }
 
 export interface JarvisMessage {
@@ -1486,12 +1495,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
       return msg;
     });
-  const activeWorkspacePath = workspaceAffinity.resolve(
-    sessionId,
-    message,
-    turnHistory,
-    cfg.jarvis_path,
-  );
   // Roots named by the RAW current message. For an explicit native objective
   // control (`Objective: ...`, clear, resume) the message text is CONTEXT, not
   // a permission source: a goal may name arbitrary paths and must never create
@@ -1500,8 +1503,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   let turnSessionGrants = cfg.tools.grant_session_roots
     ? extractRootGrants(message)
     : [];
-  const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
-  console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
 
   // ── Native memory: resolve the trusted reference at the real workspace boundary ──
   // References only. The client cannot supply memory text, scope, Agent
@@ -1521,6 +1522,34 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   const memoryPreparationId = typeof options.memoryPreparationId === "string" && options.memoryPreparationId.length > 0
     ? options.memoryPreparationId
     : undefined;
+  const scopeCandidateIdentity: ScopeCandidateIdentity | null =
+    providedTurnId && memoryPreparationId
+      ? {
+          preparation_id: memoryPreparationId,
+          turn_id: providedTurnId,
+          session_id: sessionId,
+          message,
+        }
+      : null;
+  // Resolve the effective workspace BEFORE consuming memory. An authenticated
+  // project binding may supply a missing root for a new bound Session only
+  // within existing authorized roots; a latest explicit user path always wins.
+  // Binding is not a grant, and the candidate is never its own authorization
+  // override. This resets no permission and widens no read/write grant.
+  const boundWorkspace = resolveBoundMemoryWorkspace({
+    sessionId,
+    identity: scopeCandidateIdentity,
+    registry: nativeMemoryRegistry,
+    affinity: workspaceAffinity,
+    cfg,
+    rawMessage: message,
+    history: turnHistory,
+    sessionGrants: turnSessionGrants,
+  });
+  const activeWorkspacePath = boundWorkspace.active_workspace;
+  const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
+  console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
+
   let turnMemoryConsume: ConsumeMemoryResult | null = null;
   if (providedTurnId && memoryPreparationId) {
     try {
@@ -1544,6 +1573,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       );
       turnMemoryConsume = { envelope: null, status: "unavailable", code: "memory_unavailable" };
     }
+  }
+  // A bound project that could not supply this turn's workspace (unauthorized
+  // or conflicting with an explicit user choice) is reported without injecting
+  // its memory. The registry consume above remains authoritative when it ran.
+  if (!turnMemoryConsume && boundWorkspace.memory_status !== null) {
+    turnMemoryConsume = {
+      envelope: null,
+      status: boundWorkspace.memory_status,
+      code: boundWorkspace.memory_status,
+    };
   }
   const activeTurnMemory: ActiveTurnMemory | null = turnMemoryConsume?.envelope
     ? {

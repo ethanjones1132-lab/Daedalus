@@ -17,6 +17,7 @@ import type {
   MemoryDerivedInvalidation,
   MemoryRecallStatus,
   MemoryRuntimeEvidence,
+  MemoryScope,
   PreparedMemoryTurn,
   SessionContinuity,
 } from "./memory-contract";
@@ -93,6 +94,19 @@ export interface ResolveTurnMemoryIdentity {
   message: string;
 }
 
+/**
+ * Phase 4.2 non-consuming scope probe. References only: the caller supplies
+ * the opaque preparation reference plus the immutable Session/turn/message
+ * tuple and receives only the authenticated scope. The registered envelope is
+ * never consumed, returned, or made mutable by this call.
+ */
+export interface ScopeCandidateIdentity {
+  preparation_id: string;
+  turn_id: string;
+  session_id: string;
+  message: string;
+}
+
 export interface MemoryAppliedObservation {
   stage: string;
   selected_ids: string[];
@@ -139,6 +153,13 @@ export interface NativeMemoryRegistry {
   observeToolEvidence(preparationId: string, ref: MemoryRuntimeEvidence): void;
   receipt(id: string): NativeMemoryRuntimeReceipt | null;
   ack(id: string, turnId: string): void;
+  /**
+   * Authenticated, non-consuming scope probe. Returns the registered
+   * envelope's scope only when the immutable tuple (Session, turn, exact UTF-8
+   * message hash), process generation, expiry, and invalidation state all
+   * validate; otherwise null. Never consumes or exposes recalled text.
+   */
+  inspectScopeCandidate(identity: ScopeCandidateIdentity): MemoryScope | null;
 }
 
 interface UnconsumedEntry {
@@ -675,6 +696,30 @@ export function createNativeMemoryRegistry(
     receipt(id: string): NativeMemoryRuntimeReceipt | null {
       const record = receipts.get(id);
       return record ? cloneReceipt(record.receipt) : null;
+    },
+
+    inspectScopeCandidate(identity: ScopeCandidateIdentity): MemoryScope | null {
+      prune();
+      if (!bootstrap) return null;
+      if (
+        typeof identity.preparation_id !== "string" || identity.preparation_id.length === 0 ||
+        typeof identity.turn_id !== "string" || identity.turn_id.length === 0 ||
+        typeof identity.session_id !== "string" || identity.session_id.length === 0
+      ) {
+        return null;
+      }
+      const entry = unconsumed.get(identity.preparation_id);
+      // A consumed/invalidated/expired preparation is absent here (or already
+      // tombstoned), so a replay of an old reference cannot select a root.
+      if (!entry) return null;
+      if (nowMonotonic() >= entry.expiresAtMonotonic) return null;
+      if (entry.turnId !== identity.turn_id || entry.sessionId !== identity.session_id) return null;
+      if (entry.messageHash !== sha256Hex(identity.message)) return null;
+      // Process generation: the envelope must belong to THIS Bun instance.
+      if (entry.appInstanceId !== bootstrap.appInstanceId) return null;
+      const scope = entry.envelope.scope;
+      if (typeof scope !== "object" || scope === null) return null;
+      return { kind: scope.kind, agent_id: scope.agent_id, project_root: scope.project_root };
     },
 
     ack(id: string, turnId: string): void {

@@ -384,12 +384,15 @@ fn summary_to_jarvis_session(s: crate::commands::SessionSummary) -> JarvisSessio
         created_at: s.created_at,
         model: s.model,
         message_count: s.message_count.max(0) as u32,
+        agent_id: s.agent_id,
+        project_root: s.project_root,
     }
 }
 
 #[tauri::command]
 pub async fn jarvis_new_session(
     name: Option<String>,
+    agent_id: Option<String>,
     state: State<'_, JarvisState>,
     db: State<'_, crate::db::AppDb>,
 ) -> Result<JarvisSession, String> {
@@ -405,10 +408,33 @@ pub async fn jarvis_new_session(
         };
         (config.active_backend.to_string(), model)
     };
+    // An omitted Agent preserves the historical `main` alias behavior (a
+    // Session may carry `main` even when no Agent row exists). An explicit
+    // selection must resolve to an enabled native Agent identity; an unknown
+    // or disabled identity fails WITHOUT creating a Session. Agent ownership is
+    // immutable for the life of the Session.
+    let resolved_agent = match agent_id {
+        Some(raw) => {
+            let candidate = raw.trim().to_string();
+            if candidate.is_empty() {
+                return Err("Agent selection must not be empty".to_string());
+            }
+            let agent = {
+                let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+                crate::commands::agents::fetch_agent(&conn, &candidate)?
+            };
+            match agent {
+                Some(agent) if agent.enabled => agent.id,
+                Some(_) => return Err(format!("Agent is disabled: {candidate}")),
+                None => return Err(format!("Unknown Agent: {candidate}")),
+            }
+        }
+        None => "main".to_string(),
+    };
     let s = crate::commands::create_session_row(
         &db,
         name,
-        Some("main".to_string()),
+        Some(resolved_agent),
         Some(backend),
         Some(model),
     )?;

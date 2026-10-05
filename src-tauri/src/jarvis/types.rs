@@ -563,6 +563,13 @@ pub struct JarvisSession {
     pub created_at: String,
     pub model: String,
     pub message_count: u32,
+    /// Canonical persisted Agent identity from the Session row. This is scope
+    /// input only; it never becomes a filesystem grant or memory authority.
+    #[serde(default)]
+    pub agent_id: String,
+    /// Explicit validated project binding, if any. `None` is Agent scope.
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -130,6 +130,34 @@ export interface JarvisSession {
   last_active?: string;
   total_tokens?: number;
   backend: string;
+  /**
+   * Canonical persisted Agent identity for the Session. Scope input only; it
+   * is never a filesystem grant or memory authority. Optional so older UI
+   * fixtures that predate Phase 4.2 still decode; native always emits it.
+   */
+  agent_id?: string;
+  /** Explicit validated project binding, if any. `null`/absent is Agent scope. */
+  project_root?: string | null;
+}
+
+/**
+ * Phase 4.2 Session memory identity selection. `session_id` is null while a
+ * New Session is pending (the Agent/project apply to the Session created on
+ * first send). For an existing Session, Agent ownership is immutable and only
+ * the workspace binding may change.
+ */
+export interface SessionMemorySelection {
+  session_id: string | null;
+  agent_id: string;
+  project_root: string | null;
+  include_user_scope: boolean;
+}
+
+/** Minimal enabled-Agent projection for Session identity controls. */
+export interface AgentOption {
+  id: string;
+  name?: string;
+  enabled: boolean;
 }
 export interface SessionRunRecord {
   session_id: string;

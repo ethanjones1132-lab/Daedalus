@@ -246,7 +246,16 @@ function decodeScope(value: unknown): MemoryScope {
 
 export function decodeScopedMemoryEntry(value: unknown): ScopedMemoryEntry {
   if (!isRecord(value)) throw new Error('Invalid scoped memory entry');
-  if (!isFiniteNumber(value.revision)) throw new Error('Invalid scoped memory revision');
+  // `revision` feeds every scoped mutation target and the native
+  // `expected_revision`, so fractions, zero, negatives, and values outside
+  // JavaScript's exact integer range are unavailable, not merely finite.
+  if (
+    typeof value.revision !== 'number' ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision <= 0
+  ) {
+    throw new Error('Invalid scoped memory revision');
+  }
   // `source_run_id`/`verified_at` are serialized by the frozen contract as
   // explicit null or string; a missing field is malformed.
   if (
