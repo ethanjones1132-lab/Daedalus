@@ -46,11 +46,20 @@ sys.path.insert(0, str(BENCH))
 from runbench2b import baseline_prompt, extract_code, run_test, seed  # noqa: E402
 from tasks import TASKS  # noqa: E402
 
-SERVER = r"C:\qwen3-forge-stage\tools\llama-master-836d57176\llama-server.exe"
-MODEL = r"C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf"
+STAGE = pathlib.Path(r"C:\qwen3-forge-stage")
+SERVER = str(STAGE / "tools" / "llama-master-836d57176" / "llama-server.exe")
 PORT = 8093
 BASE = f"http://127.0.0.1:{PORT}"
-SAMPLING = {"temperature": 0.2, "top_p": 0.95}  # keep96's best single-shot setting (101/117)
+# Speed-lab winners (logs/speedlab-best-2026-10-04.json, every lever lossless) and each model's best
+# single-shot sampling from the 2026-10-04 sweep, used for candidate 0 and suite 0.
+CONFIGS = {
+    "qwen36keep96": dict(model=STAGE / "models" / "prune-qwen36" / "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf", ncmoe=0,
+                         spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
+    "gemma26b": dict(model=STAGE / "google_gemma-4-26B-A4B-it-IQ2_M.gguf", ncmoe=16,
+                     spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2",
+                           "-md", str(STAGE / "mtp-gemma-4-26B-A4B-it.gguf")], temp=0.0),
+}
+CFG = {}  # the chosen config plus the thinking budget, set by run()
 # Runs plain test_* functions and unittest.TestCase methods (a third of the model's suites use
 # TestCase classes even when asked for functions), one result per test.
 RUNNER = """import importlib.util, inspect, json, sys, unittest
@@ -91,10 +100,12 @@ def post(path, payload, timeout=600):
 
 
 def chat(prompt, seed_, temperature=None):
-    sampling = {**SAMPLING, **({"temperature": temperature} if temperature is not None else {})}
-    r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": prompt}], "max_tokens": 2048,
-                                      **sampling, "seed": seed_, "cache_prompt": True,
-                                      "chat_template_kwargs": {"enable_thinking": False}})
+    b = CFG["budget"]
+    r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": prompt}],
+                                      "max_tokens": 2048 if b == 0 else 4096 if b < 0 else 2048 + b,
+                                      "temperature": CFG["temp"] if temperature is None else temperature,
+                                      "top_p": 0.95, "seed": seed_, "cache_prompt": True,
+                                      "chat_template_kwargs": {"enable_thinking": b != 0}})
     return r["choices"][0]["message"].get("content") or "", r.get("timings", {}).get("predicted_n")
 
 
@@ -179,10 +190,10 @@ def check(task, code, suites):
 
 
 def start_server(log):
-    args = [SERVER, "-m", MODEL, "--host", "127.0.0.1", "--port", str(PORT), "-ngl", "99", "--n-cpu-moe", "0",
-            "-c", "16384", "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on", "-b", "512", "-ub", "512",
-            "-np", "1", "--jinja", "--reasoning-budget", "0", "--no-webui", "--cache-ram", "0",
-            "--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"]
+    args = [SERVER, "-m", str(CFG["model"]), "--host", "127.0.0.1", "--port", str(PORT), "-ngl", "99",
+            "--n-cpu-moe", str(CFG["ncmoe"]), "-c", "16384", "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on",
+            "-b", "512", "-ub", "512", "-np", "1", "--jinja", "--reasoning-budget", str(CFG["budget"]),
+            "--no-webui", "--cache-ram", "0"] + CFG["spec"]
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
     t0 = time.time()
     while time.time() - t0 < 600:
@@ -199,6 +210,9 @@ def start_server(log):
 
 
 def run(a):
+    CFG.update(CONFIGS[a.model], budget=a.budget)
+    print(f"model {a.model}, thinking budget {a.budget}, candidate-0 temperature {CFG['temp']}, "
+          f"others {a.temp_alt}", flush=True)
     out = pathlib.Path(a.out)
     done = collections.Counter()
     if out.exists():
@@ -377,7 +391,10 @@ def main():
     r.add_argument("--trials", type=int, default=3)
     r.add_argument("--tasks", type=int, default=0, help="first N tasks only (smoke test)")
     r.add_argument("--temp-alt", type=float, default=None,
-                   help="temperature for candidates 1..N-1 and suites 1..S-1 (candidate 0 and suite 0 stay at 0.2)")
+                   help="temperature for candidates 1..N-1 and suites 1..S-1 (candidate 0 and suite 0 use the "
+                        "model's best single-shot temperature)")
+    r.add_argument("--model", default="qwen36keep96", choices=sorted(CONFIGS))
+    r.add_argument("--budget", type=int, default=0, help="thinking budget: 0 off, -1 unlimited, N tokens")
     z = sub.add_parser("analyze")
     z.add_argument("out")
     c = sub.add_parser("recheck")
