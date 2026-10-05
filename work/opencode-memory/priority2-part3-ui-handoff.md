@@ -1,7 +1,7 @@
 # Priority 2 Part 3 — UI slice handoff
 
 **Scope:** Roadmap Priority #2, Part 3 (commitments and scheduled activations), Goal-detail UI slice.
-**Production source checkpoint:** `f655346437071e98a75c14a779f750113efff2ba` (`feat(goals): surface linked commitments, schedules, and activations`).
+**Final production source checkpoint:** `5e085baf8450dc1467cf1e3ceaf945d934037ef9` (`fix(goals): distinguish unavailable reads and add read-only schedule reconcile`), a follow-up to the initial UI slice `f655346437071e98a75c14a779f750113efff2ba`.
 **Production path:** `src-ui/src/components/jarvis/GoalsView.tsx` only. No native API, migration, permission, or App-routing change was needed; every control is backed by an existing native durable command.
 
 ## Complete in this slice
@@ -15,10 +15,17 @@
 - Goal detail retains the existing rule that completion is withheld pending the Part 4 trusted-acceptance gate. A successful scheduled run, a submission, or an attempted transition is never used to infer Goal completion.
 - Unlinked cron/commitment consumers and the existing `GoalRunProgress` view are preserved; no new permissions were introduced.
 
+## Final correction behaviors (`5e085baf`)
+
+- **Commitments availability:** a failed or malformed (non-array) `get_commitments` response is treated as unavailable. The panel shows the read error and never the authoritative "no commitments linked" empty state; if previously loaded commitments remain, they are marked possibly stale.
+- **Schedule availability:** a failed or malformed (non-array) `list_cron_jobs` or `get_in_flight_cron_jobs` response marks schedule authority unavailable. The UI never shows "no schedules linked" and never leaves stale controls actionable: previously loaded schedules are explicitly marked stale and all schedule controls are disabled while the authority is unreadable.
+- **Read-only reconciliation:** a **Refresh** action re-reads the authoritative schedule + activation/run state. On successful relevant readback it clears pending failed/uncertain mutation operations (keeping any in-flight write). It never re-submits the mutation and is not named or treated as retry. Mutations that remain failed/uncertain keep their error message and a pointer to Refresh, rather than disabling controls forever without recourse.
+- History responses (`get_cron_activations`/`get_cron_runs`) that are non-array or fail are shown as "could not be read", never as "no history".
+
 ## Canonical doc updates
 
-- `docs/CURRENT_ROADMAP.md` Part 3 checkpoint records this SHA.
-- `docs/implementation/roadmap-priority-2-status.md` Part 3 section records this SHA.
+- `docs/CURRENT_ROADMAP.md` Part 3 checkpoint records the final UI SHA.
+- `docs/implementation/roadmap-priority-2-status.md` Part 3 section records the final UI SHA.
 
 ## Not run / open limits
 
@@ -29,4 +36,4 @@
 
 ## Remaining Part 3 items
 
-With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus this UI slice. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
+With this slice, the seven planned Part 3 source items (Commitment Goal references, cron/activation/run association, deterministic claim/dedupe and restart reconciliation, cancellation propagation, activation/resume authority and resource gates, preference-aware notifications, and Goal schedule/activation UI with actionable blockers) are source-implemented across checkpoints `5b1d6211b879ec80a4ee620d05687a7f47b26e9a`, `0baf5b4f4cec6102397bde2553a635e2dde3de73`, and the cancellation/resource/notification commits up to `2506bc0adadddec0c9ea4293368caea880a01a36`, plus the final UI slice `5e085baf8450dc1467cf1e3ceaf945d934037ef9`. What remains is review plus the allowed checks against the exact SHA and all runtime acceptance evidence, not further planned Part 3 source.
