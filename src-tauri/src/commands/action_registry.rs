@@ -231,6 +231,70 @@ pub fn dispatch_action(db: State<AppDb>, action_id: String) -> Result<ActionDisp
     dispatch_approved_action(db.inner(), action_id)
 }
 
+/// Resolve exactly one active `open`/`in_progress` Action Registry item that
+/// already satisfies the same approval condition `dispatch_approved_action`
+/// enforces, for trusted-manifest binding, and return its exact id as opaque
+/// identity. Only identity, status, and existing approval metadata are read;
+/// the action title, description, and any other text are never consumed or
+/// trusted. This writes nothing.
+///
+/// Callers that already hold the SQLite lock pass the connection so this never
+/// re-enters the mutex. Fail-closed: a missing, duplicated, non-active, or
+/// approval-ambiguous/unavailable action is rejected with an actionable error
+/// rather than inferring approval.
+pub fn resolve_bindable_action_conn(
+    conn: &rusqlite::Connection,
+    action_id: &str,
+) -> Result<String, String> {
+    let action_id = action_id.trim();
+    if action_id.is_empty() {
+        return Err("an exact Action Registry action id is required".to_string());
+    }
+    let config = crate::commands::settings::load_jarvis_config_conn(conn)?;
+    let root = resolve_repo_root(&config.jarvis_path)
+        .join("workspace")
+        .join("action-registry");
+    let active = read_bucket(&root.join("data").join("active.json"))
+        .map_err(|e| format!("could not read the active Action Registry bucket: {e}"))?;
+
+    let matches: Vec<&RegistryAction> = active.iter().filter(|action| action.id == action_id).collect();
+    if matches.is_empty() {
+        return Err(format!(
+            "action '{action_id}' is not present in the active Action Registry bucket; binding requires exactly one active open/in_progress action"
+        ));
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "action '{action_id}' is ambiguous: {} active entries share that id",
+            matches.len()
+        ));
+    }
+    let action = matches[0];
+    if !matches!(action.status.as_str(), "open" | "in_progress") {
+        return Err(format!(
+            "action '{action_id}' is not bindable: status is '{}' (only open/in_progress are allowed)",
+            action.status
+        ));
+    }
+    if action.approval_required {
+        match action.approval_status.as_deref() {
+            Some("approved") | Some("waived") => {}
+            Some(other) => {
+                return Err(format!(
+                    "action '{action_id}' is not approved: approval status is '{other}'"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "action '{action_id}' requires approval but its approval metadata is unavailable; binding is refused rather than inferring approval"
+                ));
+            }
+        }
+    }
+
+    Ok(action.id.clone())
+}
+
 /// Return bucket counts and alert totals for the action registry dashboard.
 #[tauri::command]
 pub fn get_action_registry_summary(db: State<AppDb>) -> Result<ActionRegistrySummary, String> {

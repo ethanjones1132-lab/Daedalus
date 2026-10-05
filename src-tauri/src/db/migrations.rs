@@ -1625,6 +1625,12 @@ pub fn apply_goal_notification_migrations(conn: &Connection) -> Result<(), rusql
 /// `workspace/action-registry` remains untrusted action data. No row is
 /// auto-seeded — every manifest is an explicit user add/replace through
 /// Settings — so an empty table means no trusted executable manifest.
+///
+/// `action_id` is the opaque Action Registry identity a manifest is bound to.
+/// It is nullable only for legacy rows created before this column existed; such
+/// rows stay unbound/unavailable until the user explicitly replaces/rebinds
+/// them with an exact action id. Uniqueness is enforced per canonical project
+/// root + action id.
 pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("SAVEPOINT trusted_manifest_migration;")?;
     let result = (|| -> Result<(), rusqlite::Error> {
@@ -1638,11 +1644,28 @@ pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqli
                 content_json     TEXT NOT NULL CHECK(json_valid(content_json)),
                 agent_id         TEXT NOT NULL,
                 project_root     TEXT NOT NULL,
+                action_id        TEXT,
                 created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );
             CREATE INDEX IF NOT EXISTS idx_trusted_manifests_scope
                 ON trusted_acceptance_manifests(agent_id, project_root);
+            "#,
+        )?;
+        // Additive, fail-closed upgrade for databases created before action
+        // binding existed: existing rows keep a NULL binding and stay unbound.
+        add_column_if_missing(
+            conn,
+            "trusted_acceptance_manifests",
+            "action_id",
+            "action_id TEXT",
+        )?;
+        // One trusted manifest per canonical workspace + Action Registry id.
+        // SQLite treats NULLs as distinct, so legacy unbound rows never collide.
+        conn.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_manifests_root_action
+                ON trusted_acceptance_manifests(project_root, action_id);
             "#,
         )?;
         Ok(())

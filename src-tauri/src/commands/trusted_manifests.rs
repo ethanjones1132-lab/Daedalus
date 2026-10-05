@@ -63,7 +63,7 @@ const EXECUTION_TOOLS: &[&str] = &[
 const ALLOWED_OUTPUT_MODES: &[&str] = &["files_with_matches", "content", "count"];
 
 const TRUSTED_MANIFEST_COLS: &str = "manifest_id, registry_version, schema_version, \
-     content_hash, content_json, agent_id, project_root, created_at, updated_at";
+     content_hash, content_json, agent_id, project_root, action_id, created_at, updated_at";
 
 // ── v1 content shape ─────────────────────────────────────────
 
@@ -142,8 +142,10 @@ pub struct ValidatedTrustedManifest {
 // ── DTO returned to the UI ───────────────────────────────────
 
 /// One registered manifest as shown in Settings. Read-only: the UI displays the
-/// native ID/version/schema/hash and bound Agent/workspace, and never infers
-/// trust from registry/model/Goal text.
+/// native ID/version/schema/hash, bound Action Registry id, and Agent/workspace
+/// scope, and never infers trust from registry/model/Goal text. `action_id` is
+/// `None` only for legacy rows created before action binding existed; such rows
+/// are unbound/unavailable until explicitly replaced/rebound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedAcceptanceManifest {
     pub manifest_id: String,
@@ -153,6 +155,7 @@ pub struct TrustedAcceptanceManifest {
     pub content: serde_json::Value,
     pub agent_id: String,
     pub project_root: String,
+    pub action_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -527,6 +530,33 @@ fn require_expected(
     Ok(())
 }
 
+/// Reject a second trusted manifest that would bind the same canonical workspace
+/// root + Action Registry id. `exclude_manifest_id` is the row being replaced
+/// (`None` on create). The unique index is the final guard; this check yields an
+/// actionable error instead of a raw constraint failure.
+fn reject_conflicting_action_binding(
+    conn: &Connection,
+    project_root: &str,
+    action_id: &str,
+    exclude_manifest_id: Option<&str>,
+) -> Result<(), String> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT manifest_id FROM trusted_acceptance_manifests \
+             WHERE project_root = ?1 AND action_id = ?2 AND manifest_id <> COALESCE(?3, '')",
+            params![project_root, action_id, exclude_manifest_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if let Some(conflict) = existing {
+        return Err(format!(
+            "an existing trusted manifest ('{conflict}') already binds action '{action_id}' for workspace '{project_root}'; replace that manifest instead"
+        ));
+    }
+    Ok(())
+}
+
 fn record_from_row(
     row: (
         String,
@@ -536,6 +566,7 @@ fn record_from_row(
         String,
         String,
         String,
+        Option<String>,
         String,
         String,
     ),
@@ -548,6 +579,7 @@ fn record_from_row(
         content_json,
         agent_id,
         project_root,
+        action_id,
         created_at,
         updated_at,
     ) = row;
@@ -562,6 +594,7 @@ fn record_from_row(
         content,
         agent_id,
         project_root,
+        action_id,
         created_at,
         updated_at,
     })
@@ -577,6 +610,7 @@ fn map_manifest_row(
     String,
     String,
     String,
+    Option<String>,
     String,
     String,
 )> {
@@ -590,6 +624,7 @@ fn map_manifest_row(
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
     ))
 }
 
@@ -631,14 +666,18 @@ pub fn list_trusted_acceptance_manifests(
 }
 
 /// Register a new trusted manifest. Native mints the stable UUID plus registry
-/// version 1, revalidates the enabled Agent and canonical workspace, and stores
-/// strictly validated canonical content with its SHA-256.
+/// version 1, requires an explicit Action Registry action id that resolves to
+/// exactly one active open/in_progress item whose existing approval condition is
+/// satisfied, revalidates the enabled Agent and canonical workspace, and stores
+/// strictly validated canonical content with its SHA-256. The action id is
+/// opaque identity only; action title/description text is never consumed.
 #[tauri::command]
 pub fn create_trusted_acceptance_manifest(
     db: State<AppDb>,
     content_json: String,
     agent_id: String,
     project_root: String,
+    action_id: String,
 ) -> Result<TrustedAcceptanceManifest, String> {
     let agent_id = agent_id.trim().to_string();
     if agent_id.is_empty() {
@@ -649,13 +688,16 @@ pub fn create_trusted_acceptance_manifest(
 
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     require_enabled_agent(&conn, &agent_id)?;
+    let action_id =
+        crate::commands::action_registry::resolve_bindable_action_conn(&conn, &action_id)?;
+    reject_conflicting_action_binding(&conn, &project_root, &action_id, None)?;
 
     let manifest_id = uuid::Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO trusted_acceptance_manifests
              (manifest_id, registry_version, schema_version, content_hash, content_json,
-              agent_id, project_root, created_at, updated_at)
-         VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6,
+              agent_id, project_root, action_id, created_at, updated_at)
+         VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7,
                  strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![
             &manifest_id,
@@ -664,6 +706,7 @@ pub fn create_trusted_acceptance_manifest(
             &validated.canonical_json,
             &agent_id,
             &project_root,
+            &action_id,
         ],
     )
     .map_err(|e| format!("failed to register trusted manifest: {e}"))?;
@@ -671,10 +714,11 @@ pub fn create_trusted_acceptance_manifest(
     load_manifest(&conn, &manifest_id)
 }
 
-/// Replace a trusted manifest's content and scope binding. The caller must
-/// supply the expected current registry version and/or content hash; both are
-/// checked and the write is version/hash guarded so a concurrent change cannot
-/// be silently overwritten. Registry version increments by one.
+/// Replace a trusted manifest's content, Action binding, and scope binding. The
+/// caller must supply the expected current registry version and/or content hash
+/// plus an explicit Action Registry action id; the version/hash CAS and the
+/// workspace+action uniqueness are both enforced, and the registry version
+/// increments by one. A legacy row with no action binding is (re)bound here.
 #[tauri::command]
 pub fn replace_trusted_acceptance_manifest(
     db: State<AppDb>,
@@ -684,6 +728,7 @@ pub fn replace_trusted_acceptance_manifest(
     content_json: String,
     agent_id: String,
     project_root: String,
+    action_id: String,
 ) -> Result<TrustedAcceptanceManifest, String> {
     require_expected(expected_version, expected_hash.as_deref())?;
     let agent_id = agent_id.trim().to_string();
@@ -695,6 +740,8 @@ pub fn replace_trusted_acceptance_manifest(
 
     let mut conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     require_enabled_agent(&conn, &agent_id)?;
+    let action_id =
+        crate::commands::action_registry::resolve_bindable_action_conn(&conn, &action_id)?;
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     let current = tx
@@ -726,6 +773,7 @@ pub fn replace_trusted_acceptance_manifest(
             );
         }
     }
+    reject_conflicting_action_binding(&tx, &project_root, &action_id, Some(&manifest_id))?;
 
     let affected = tx
         .execute(
@@ -736,6 +784,7 @@ pub fn replace_trusted_acceptance_manifest(
                  content_json = ?6,
                  agent_id = ?7,
                  project_root = ?8,
+                 action_id = ?9,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
              WHERE manifest_id = ?1 AND registry_version = ?2 AND content_hash = ?3",
             params![
@@ -747,6 +796,7 @@ pub fn replace_trusted_acceptance_manifest(
                 &validated.canonical_json,
                 &agent_id,
                 &project_root,
+                &action_id,
             ],
         )
         .map_err(|e| format!("failed to replace trusted manifest: {e}"))?;

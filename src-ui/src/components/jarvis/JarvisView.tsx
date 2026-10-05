@@ -4945,8 +4945,14 @@ interface TrustedManifestRecord {
   content: unknown;
   agent_id: string;
   project_root: string;
+  action_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface ActiveActionRow {
+  id: string;
+  status: string;
 }
 
 interface TrustedManifestAgentRow {
@@ -4981,6 +4987,8 @@ function TrustedManifestsPanel() {
   const [contentJson, setContentJson] = useState('');
   const [agentId, setAgentId] = useState('');
   const [projectRoot, setProjectRoot] = useState('');
+  const [actionId, setActionId] = useState('');
+  const [activeActions, setActiveActions] = useState<ActiveActionRow[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expectedVersion, setExpectedVersion] = useState('');
 
@@ -5025,10 +5033,29 @@ function TrustedManifestsPanel() {
     }
   }, []);
 
+  // Active Action Registry ids are a convenience suggestion list; native still
+  // resolves and verifies the exact id, status, and approval before binding.
+  const loadActiveActions = useCallback(async () => {
+    try {
+      const bucket = await invoke<unknown>('get_action_registry_bucket', { bucket: 'active' });
+      const actions = (bucket as { actions?: unknown } | null)?.actions;
+      if (Array.isArray(actions)) {
+        setActiveActions(
+          (actions as ActiveActionRow[]).filter(
+            (a) => a && (a.status === 'open' || a.status === 'in_progress'),
+          ),
+        );
+      }
+    } catch {
+      // Suggestion-only; binding still fails closed natively.
+    }
+  }, []);
+
   useEffect(() => {
     void load();
     void loadAgents();
-  }, [load, loadAgents]);
+    void loadActiveActions();
+  }, [load, loadAgents, loadActiveActions]);
 
   const runAction = useCallback(
     async (label: string, run: () => Promise<unknown>) => {
@@ -5055,8 +5082,10 @@ function TrustedManifestsPanel() {
   );
 
   const handleCreate = () => {
-    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim()) {
-      setActionError('Manifest content, an enabled Agent, and an existing workspace root are required.');
+    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim() || !actionId.trim()) {
+      setActionError(
+        'Manifest content, an enabled Agent, an existing workspace root, and an exact Action Registry id are required.',
+      );
       return;
     }
     void runAction('Add manifest', () =>
@@ -5064,6 +5093,7 @@ function TrustedManifestsPanel() {
         contentJson,
         agentId: agentId.trim(),
         projectRoot: projectRoot.trim(),
+        actionId: actionId.trim(),
       }),
     );
   };
@@ -5073,6 +5103,7 @@ function TrustedManifestsPanel() {
     setExpectedVersion(String(record.registry_version));
     setAgentId(record.agent_id);
     setProjectRoot(record.project_root);
+    setActionId(record.action_id ?? '');
     setContentJson(JSON.stringify(record.content, null, 2));
     setActionError(null);
   };
@@ -5087,8 +5118,10 @@ function TrustedManifestsPanel() {
       setActionError('Enter the current registry version you are replacing.');
       return;
     }
-    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim()) {
-      setActionError('Manifest content, an enabled Agent, and an existing workspace root are required.');
+    if (!contentJson.trim() || !agentId.trim() || !projectRoot.trim() || !actionId.trim()) {
+      setActionError(
+        'Manifest content, an enabled Agent, an existing workspace root, and an exact Action Registry id are required.',
+      );
       return;
     }
     void runAction('Replace manifest', () =>
@@ -5098,6 +5131,7 @@ function TrustedManifestsPanel() {
         contentJson,
         agentId: agentId.trim(),
         projectRoot: projectRoot.trim(),
+        actionId: actionId.trim(),
       }),
     );
   };
@@ -5120,9 +5154,10 @@ function TrustedManifestsPanel() {
         <div>
           <h3 className="text-sm font-semibold text-bone">Trusted acceptance manifests</h3>
           <p className="text-[10px] font-mono text-bone-faint mt-0.5">
-            Native registry in the app-owned jarvis.db. Action Registry files, model output, and Goal
-            or task text cannot create or edit a manifest. Registering here grants no tool permission
-            and runs nothing.
+            Native registry in the app-owned jarvis.db. Each manifest binds exactly one Action Registry
+            id and the manifest content comes only from the JSON you enter here. Action Registry files,
+            model output, and Goal or task text cannot create or edit manifest content. Registering here
+            grants no tool permission and runs nothing.
           </p>
         </div>
         <button
@@ -5172,6 +5207,13 @@ function TrustedManifestsPanel() {
               </div>
               <div className="mt-1 text-[10px] font-mono text-bone-dim break-all">
                 content-sha256 {record.content_hash}
+              </div>
+              <div className="mt-1 text-[10px] font-mono break-all">
+                {record.action_id ? (
+                  <span className="text-bone">action {record.action_id}</span>
+                ) : (
+                  <span className="text-amber-300">action unbound (legacy) — replace to bind</span>
+                )}
               </div>
               <div className="mt-1 text-[10px] font-mono text-bone-faint break-all">
                 agent {record.agent_id} · root {record.project_root}
@@ -5234,6 +5276,30 @@ function TrustedManifestsPanel() {
               className={inputCls}
             />
           </div>
+        </div>
+        <div>
+          <label className="text-[10px] font-mono text-bone-dim block mb-1">
+            Action Registry action id (exact; required)
+          </label>
+          <input
+            type="text"
+            list="trusted-manifest-action-ids"
+            value={actionId}
+            onChange={(e) => setActionId(e.target.value)}
+            disabled={busy}
+            placeholder="exact id from the active Action Registry bucket"
+            className={inputCls}
+          />
+          <datalist id="trusted-manifest-action-ids">
+            {activeActions.map((action) => (
+              <option key={action.id} value={action.id} />
+            ))}
+          </datalist>
+          <p className="text-[10px] font-mono text-bone-faint mt-1">
+            Native resolves this id to exactly one active open/in_progress action with its existing
+            approval condition satisfied, or rejects the binding. Only the id is identity — action
+            title/description/Goal/model text is never trusted.
+          </p>
         </div>
         {selectedId && (
           <div>
