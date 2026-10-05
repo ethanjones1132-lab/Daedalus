@@ -196,6 +196,11 @@ function scheduleOpVerb(kind: ScheduleOpKind): string {
   return 'run';
 }
 
+/** A write is in flight, so a read-only reconcile must not race it. */
+function hasWritingScheduleOp(ops: Record<string, ScheduleOp>): boolean {
+  return Object.values(ops).some((op) => op.phase === 'writing');
+}
+
 export default function GoalsView() {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [detail, setDetail] = useState<GoalDetail | null>(null);
@@ -207,13 +212,20 @@ export default function GoalsView() {
   const [transitioning, setTransitioning] = useState(false);
 
   const [commitments, setCommitments] = useState<CommitmentRecord[]>([]);
+  const [commitmentsUnavailable, setCommitmentsUnavailable] = useState(false);
+  const [commitmentsReadError, setCommitmentsReadError] = useState<string | null>(null);
   const [schedules, setSchedules] = useState<CronSchedule[]>([]);
   const [activations, setActivations] = useState<Record<string, CronActivation[]>>({});
   const [cronRuns, setCronRuns] = useState<Record<string, CronRunRecord[]>>({});
   const [inFlight, setInFlight] = useState<Set<string>>(new Set());
   const [activationErrors, setActivationErrors] = useState<Record<string, boolean>>({});
   const [runErrors, setRunErrors] = useState<Record<string, boolean>>({});
+  // Schedule authority availability is distinct from "authoritative empty": a
+  // failed or malformed read marks it unavailable so nothing claims an empty
+  // list and no stale control stays actionable.
+  const [scheduleUnavailable, setScheduleUnavailable] = useState(false);
   const [scheduleReadError, setScheduleReadError] = useState<string | null>(null);
+  const [reconciling, setReconciling] = useState(false);
   const [scheduleOps, setScheduleOps] = useState<Record<string, ScheduleOp>>({});
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
 
@@ -227,6 +239,7 @@ export default function GoalsView() {
   const selectedIdRef = useRef<string | null>(null);
   const transitionPending = useRef(false);
   const scheduleOpsRef = useRef<Record<string, ScheduleOp>>({});
+  const reconcilePending = useRef(false);
 
   const fetchGoals = useCallback(async () => {
     const request = ++requestId.current;
@@ -247,81 +260,159 @@ export default function GoalsView() {
   // Authoritative native readback for the Goal's associated schedules,
   // activations, and runs. Every schedule mutation calls this before the UI may
   // claim the change succeeded; a failed readback leaves the previous displayed
-  // state in place and reports uncertainty. A stale selection generation is
-  // discarded. History read failures are tracked per job so an unavailable list
-  // is never rendered as "no activations".
+  // state in place, marks it stale/unavailable, and reports uncertainty. A stale
+  // selection generation is discarded. A failed or malformed (non-array) schedule
+  // or in-flight response is unavailable, never an authoritative empty list, and
+  // history read failures are tracked per job so an unavailable list is never
+  // rendered as "no activations" or "no runs".
   const refreshScheduleState = useCallback(
-    async (goalId: string, expectedRequest: number): Promise<boolean> => {
+    async (
+      goalId: string,
+      expectedRequest: number,
+    ): Promise<'ok' | 'unavailable' | 'stale'> => {
+      let jobs: CronSchedule[];
+      let flight: string[];
       try {
-        const [jobs, flight] = await Promise.all([
-          invoke<CronSchedule[]>('list_cron_jobs'),
-          invoke<string[]>('get_in_flight_cron_jobs'),
+        const [jobsResponse, flightResponse] = await Promise.all([
+          invoke<unknown>('list_cron_jobs'),
+          invoke<unknown>('get_in_flight_cron_jobs'),
         ]);
-        if (expectedRequest !== detailRequestId.current) return false;
-        const linked = (Array.isArray(jobs) ? jobs : []).filter(
-          (job) => job.goal_id === goalId,
+        if (expectedRequest !== detailRequestId.current) return 'stale';
+        if (!Array.isArray(jobsResponse) || !Array.isArray(flightResponse)) {
+          setScheduleUnavailable(true);
+          setScheduleReadError(
+            'The native schedule authority returned an unreadable response. Schedule state is unavailable; controls are disabled until it is reconciled.',
+          );
+          return 'unavailable';
+        }
+        jobs = jobsResponse as CronSchedule[];
+        flight = flightResponse as string[];
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return 'stale';
+        setScheduleUnavailable(true);
+        setScheduleReadError(
+          'Could not read goal-linked schedules from the native authority. Schedule state is unavailable; controls are disabled until it is reconciled.',
         );
-        const nextActivations: Record<string, CronActivation[]> = {};
-        const nextRuns: Record<string, CronRunRecord[]> = {};
-        const nextActivationErrors: Record<string, boolean> = {};
-        const nextRunErrors: Record<string, boolean> = {};
-        for (const job of linked) {
-          try {
-            const rows = await invoke<CronActivation[]>('get_cron_activations', {
-              cronId: job.id,
-            });
-            if (expectedRequest !== detailRequestId.current) return false;
-            nextActivations[job.id] = Array.isArray(rows) ? rows : [];
-          } catch {
-            if (expectedRequest !== detailRequestId.current) return false;
+        return 'unavailable';
+      }
+      if (expectedRequest !== detailRequestId.current) return 'stale';
+      const linked = jobs.filter((job) => job.goal_id === goalId);
+      const nextActivations: Record<string, CronActivation[]> = {};
+      const nextRuns: Record<string, CronRunRecord[]> = {};
+      const nextActivationErrors: Record<string, boolean> = {};
+      const nextRunErrors: Record<string, boolean> = {};
+      for (const job of linked) {
+        try {
+          const rows = await invoke<unknown>('get_cron_activations', {
+            cronId: job.id,
+          });
+          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (Array.isArray(rows)) {
+            nextActivations[job.id] = rows as CronActivation[];
+          } else {
             nextActivations[job.id] = [];
             nextActivationErrors[job.id] = true;
           }
-          try {
-            const rows = await invoke<CronRunRecord[]>('get_cron_runs', {
-              cronId: job.id,
-            });
-            if (expectedRequest !== detailRequestId.current) return false;
-            nextRuns[job.id] = Array.isArray(rows) ? rows : [];
-          } catch {
-            if (expectedRequest !== detailRequestId.current) return false;
+        } catch {
+          if (expectedRequest !== detailRequestId.current) return 'stale';
+          nextActivations[job.id] = [];
+          nextActivationErrors[job.id] = true;
+        }
+        try {
+          const rows = await invoke<unknown>('get_cron_runs', {
+            cronId: job.id,
+          });
+          if (expectedRequest !== detailRequestId.current) return 'stale';
+          if (Array.isArray(rows)) {
+            nextRuns[job.id] = rows as CronRunRecord[];
+          } else {
             nextRuns[job.id] = [];
             nextRunErrors[job.id] = true;
           }
+        } catch {
+          if (expectedRequest !== detailRequestId.current) return 'stale';
+          nextRuns[job.id] = [];
+          nextRunErrors[job.id] = true;
         }
-        if (expectedRequest !== detailRequestId.current) return false;
-        setSchedules(linked);
-        setActivations(nextActivations);
-        setCronRuns(nextRuns);
-        setActivationErrors(nextActivationErrors);
-        setRunErrors(nextRunErrors);
-        setInFlight(new Set(Array.isArray(flight) ? flight : []));
-        setScheduleReadError(null);
-        return true;
-      } catch {
-        if (expectedRequest !== detailRequestId.current) return false;
-        setScheduleReadError(
-          'Could not read goal-linked schedules from the native authority.',
-        );
-        return false;
       }
+      if (expectedRequest !== detailRequestId.current) return 'stale';
+      setSchedules(linked);
+      setActivations(nextActivations);
+      setCronRuns(nextRuns);
+      setActivationErrors(nextActivationErrors);
+      setRunErrors(nextRunErrors);
+      setInFlight(new Set(flight));
+      setScheduleUnavailable(false);
+      setScheduleReadError(null);
+      return 'ok';
     },
     [],
   );
 
+  // Read-only reconciliation for the Goal's schedule panel. It re-reads the
+  // authoritative schedule + activation/run state and clears only the pending
+  // error operations (never an in-flight write) after a successful readback. It
+  // never re-submits a mutation, so it is not a retry.
+  const reconcileSchedules = useCallback(async () => {
+    if (reconcilePending.current) return;
+    const goalId = selectedIdRef.current;
+    if (!goalId) return;
+    if (
+      Object.values(scheduleOpsRef.current).some((op) => op.phase === 'writing')
+    ) {
+      return;
+    }
+    reconcilePending.current = true;
+    setReconciling(true);
+    const expectedRequest = detailRequestId.current;
+    const outcome = await refreshScheduleState(goalId, expectedRequest);
+    if (
+      selectedIdRef.current !== goalId ||
+      expectedRequest !== detailRequestId.current
+    ) {
+      reconcilePending.current = false;
+      setReconciling(false);
+      return;
+    }
+    if (outcome === 'ok') {
+      const next: Record<string, ScheduleOp> = {};
+      for (const [jobId, op] of Object.entries(scheduleOpsRef.current)) {
+        if (op.phase === 'writing') next[jobId] = op;
+      }
+      scheduleOpsRef.current = next;
+      setScheduleOps(next);
+    }
+    reconcilePending.current = false;
+    setReconciling(false);
+  }, [refreshScheduleState]);
+
   // Goal-linked Commitments are owned by the Commitment JSON authority, so the
   // display is derived from the authoritative records (never an inferred link).
+  // A failed or malformed (non-array) read is unavailable, never an
+  // authoritative "no commitments" list.
   const loadGoalSupport = useCallback(
     async (goalId: string, expectedRequest: number) => {
       try {
-        const all = await invoke<CommitmentRecord[]>('get_commitments');
+        const all = await invoke<unknown>('get_commitments');
         if (expectedRequest !== detailRequestId.current) return;
-        setCommitments(
-          Array.isArray(all) ? all.filter((c) => c.goal_id === goalId) : [],
-        );
+        if (!Array.isArray(all)) {
+          setCommitmentsUnavailable(true);
+          setCommitmentsReadError(
+            'The native Commitment authority returned an unreadable response. Linked commitments are unavailable.',
+          );
+        } else {
+          setCommitmentsUnavailable(false);
+          setCommitmentsReadError(null);
+          setCommitments(
+            (all as CommitmentRecord[]).filter((c) => c.goal_id === goalId),
+          );
+        }
       } catch {
         if (expectedRequest !== detailRequestId.current) return;
-        setCommitments([]);
+        setCommitmentsUnavailable(true);
+        setCommitmentsReadError(
+          'Could not read linked commitments from the native authority. Linked commitments are unavailable.',
+        );
       }
       await refreshScheduleState(goalId, expectedRequest);
     },
@@ -399,13 +490,16 @@ export default function GoalsView() {
       ) {
         return;
       }
-      if (!readBack) {
+      if (readBack !== 'ok') {
+        // `stale` already returned above; this is an unavailable authority or a
+        // failed read. Keep the previous display and leave the operation
+        // actionable through the read-only reconcile action.
         scheduleOpsRef.current = {
           ...scheduleOpsRef.current,
           [job.id]: {
             ...op,
             phase: 'read-failed',
-            message: `The ${scheduleOpVerb(kind)} was accepted, but the authoritative schedule state could not be re-read. Showing the previous state; it may be stale.`,
+            message: `The ${scheduleOpVerb(kind)} was accepted, but the authoritative schedule state could not be re-read. Showing the previous state; it is stale. Use Refresh to reconcile the schedule status.`,
           },
         };
         setScheduleOps(scheduleOpsRef.current);
@@ -438,7 +532,12 @@ export default function GoalsView() {
     setInFlight((prev) => (prev.size > 0 ? new Set<string>() : prev));
     setActivationErrors((prev) => (Object.keys(prev).length > 0 ? {} : prev));
     setRunErrors((prev) => (Object.keys(prev).length > 0 ? {} : prev));
+    setCommitmentsUnavailable(false);
+    setCommitmentsReadError(null);
+    setScheduleUnavailable(false);
     setScheduleReadError(null);
+    setReconciling(false);
+    reconcilePending.current = false;
     scheduleOpsRef.current = {};
     setScheduleOps({});
     setExpandedJob(null);
@@ -768,12 +867,22 @@ export default function GoalsView() {
                 <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
                   Goal-linked commitments
                 </div>
-                {commitments.length === 0 ? (
+                {commitmentsReadError && (
+                  <div role="alert" className="mt-1 text-sm text-red-200">
+                    {commitmentsReadError}
+                  </div>
+                )}
+                {commitmentsUnavailable && commitments.length > 0 && (
+                  <div className="mt-1 text-[11px] text-warning">
+                    Showing previously loaded commitments; they may be stale.
+                  </div>
+                )}
+                {commitments.length === 0 && !commitmentsUnavailable ? (
                   <div className="text-sm text-bone/40 mt-1">
                     No commitments are linked to this goal. Linking records attribution only;
                     commitment completion is never treated as goal acceptance.
                   </div>
-                ) : (
+                ) : commitments.length > 0 ? (
                   <ul className="mt-2 space-y-2">
                     {commitments.map((commitment) => (
                       <li key={commitment.id} className="text-sm text-bone/80">
@@ -792,7 +901,7 @@ export default function GoalsView() {
                       </li>
                     ))}
                   </ul>
-                )}
+                ) : null}
               </GlassCard>
 
               <GlassCard className="p-4">
@@ -800,8 +909,19 @@ export default function GoalsView() {
                   <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
                     Goal-linked schedules
                   </div>
-                  <div className="text-[11px] text-bone/40">
-                    A successful run is progress evidence, not goal acceptance.
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      aria-label="Refresh schedule state from the native authority"
+                      disabled={reconciling || hasWritingScheduleOp(scheduleOps)}
+                      onClick={() => void reconcileSchedules()}
+                      className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                    >
+                      {reconciling ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                    <div className="text-[11px] text-bone/40">
+                      A successful run is progress evidence, not goal acceptance.
+                    </div>
                   </div>
                 </div>
                 {scheduleReadError && (
@@ -809,12 +929,18 @@ export default function GoalsView() {
                     {scheduleReadError}
                   </div>
                 )}
-                {schedules.length === 0 ? (
+                {scheduleUnavailable && schedules.length > 0 && (
+                  <div role="alert" className="mt-1 text-[11px] text-warning">
+                    Showing previously loaded schedules; they may be stale and their controls are
+                    disabled until the schedule state is reconciled.
+                  </div>
+                )}
+                {schedules.length === 0 && !scheduleUnavailable ? (
                   <div className="text-sm text-bone/40 mt-1">
                     No cron schedules are linked to this goal. Associating a job attributes its
                     future activations to this objective; it does not grant permissions.
                   </div>
-                ) : (
+                ) : schedules.length > 0 ? (
                   <ul className="mt-2 space-y-3">
                     {schedules.map((job) => {
                       const op = scheduleOps[job.id];
@@ -845,7 +971,7 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Pause schedule ${job.name}`}
-                                disabled={op !== undefined}
+                                disabled={op !== undefined || scheduleUnavailable}
                                 onClick={() => void runScheduleOp('pause', job)}
                                 className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
                               >
@@ -855,7 +981,7 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Resume schedule ${job.name}`}
-                                disabled={op !== undefined}
+                                disabled={op !== undefined || scheduleUnavailable}
                                 onClick={() => void runScheduleOp('resume', job)}
                                 className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
                               >
@@ -866,7 +992,9 @@ export default function GoalsView() {
                               type="button"
                               aria-label={`Run schedule ${job.name} now`}
                               title="Starts a new manual occurrence; this is not a replay of a prior activation."
-                              disabled={op !== undefined || running || !job.enabled}
+                              disabled={
+                                op !== undefined || running || !job.enabled || scheduleUnavailable
+                              }
                               onClick={() => void runScheduleOp('run', job)}
                               className="px-2 py-0.5 rounded-md border border-accent/40 text-xs text-accent/90 hover:bg-accent/10 disabled:opacity-40 transition-colors"
                             >
@@ -876,7 +1004,7 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Cancel schedule ${job.name}`}
-                                disabled={op !== undefined}
+                                disabled={op !== undefined || scheduleUnavailable}
                                 onClick={() => void runScheduleOp('cancel', job)}
                                 className="px-2 py-0.5 rounded-md border border-error/40 text-xs text-error/90 hover:bg-error/10 disabled:opacity-40 transition-colors"
                               >
@@ -898,6 +1026,10 @@ export default function GoalsView() {
                           {op && (op.phase === 'write-failed' || op.phase === 'read-failed') && (
                             <div role="alert" className="mt-1.5 text-[11px] text-red-200">
                               {op.message}
+                              <div className="mt-0.5 text-bone/40">
+                                The mutation is not re-submitted automatically. Use Refresh above to
+                                re-read the authoritative schedule state.
+                              </div>
                             </div>
                           )}
 
@@ -1014,7 +1146,7 @@ export default function GoalsView() {
                       );
                     })}
                   </ul>
-                )}
+                ) : null}
               </GlassCard>
 
               <GlassCard className="p-4">
