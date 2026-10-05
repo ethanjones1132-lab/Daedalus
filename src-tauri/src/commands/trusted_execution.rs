@@ -294,13 +294,39 @@ fn resolve_dispatch_authority(
     })
 }
 
-/// Durable idempotency is anchored to the Action Registry `action_id` alone, so
-/// one approved action can produce at most one durable execution receipt no
-/// matter how the manifest is replaced/rebound or the projection changes. The
-/// exact requested manifest/binding identity is reported separately as a
-/// conflict instead of minting a new execution.
-fn idempotency_key(action_id: &str) -> String {
-    sha256(&format!("trusted-action-v1\n{action_id}"))
+/// Durable idempotency is keyed by the exact `action_id` + `operation_id` pair.
+/// The operation id is the user-authorized operation identity: a fresh click
+/// supplies a fresh UUID, and a process/restart retry must supply the same UUID.
+/// Reusing an operation id for a different action is refused by the global
+/// primary key and the action-binding readback.
+fn idempotency_key(action_id: &str, operation_id: &str) -> String {
+    sha256(&format!("trusted-action-v2\n{action_id}\n{operation_id}"))
+}
+
+/// The pre-insert guard: the most recent unresolved operation for an action.
+/// An unresolved earlier operation (claimed/dispatched/ambiguous/
+/// pending_acceptance) blocks any fresh operation for the same action.
+fn load_unresolved_for_action(
+    conn: &Connection,
+    action_id: &str,
+) -> Result<Option<TrustedActionExecution>, String> {
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT {EXECUTION_COLS} FROM trusted_action_executions \
+                 WHERE action_id = ?1 \
+                   AND status IN ('{STATUS_CLAIMED}','{STATUS_DISPATCHED}','{STATUS_AMBIGUOUS}','{STATUS_PENDING_ACCEPTANCE}') \
+                 ORDER BY created_at DESC LIMIT 1"
+            ),
+            [action_id],
+            map_execution_row,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match row {
+        Some(row) => record_from_row(row).map(Some),
+        None => Ok(None),
+    }
 }
 
 fn record_from_row(
@@ -425,7 +451,10 @@ fn map_execution_row(
     ))
 }
 
-fn load_execution(conn: &Connection, execution_id: &str) -> Result<TrustedActionExecution, String> {
+fn find_execution(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<Option<TrustedActionExecution>, String> {
     let row = conn
         .query_row(
             &format!(
@@ -435,29 +464,16 @@ fn load_execution(conn: &Connection, execution_id: &str) -> Result<TrustedAction
             map_execution_row,
         )
         .optional()
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("trusted execution not found: {execution_id}"))?;
-    record_from_row(row)
-}
-
-fn load_execution_by_key(
-    conn: &Connection,
-    key: &str,
-) -> Result<Option<TrustedActionExecution>, String> {
-    let row = conn
-        .query_row(
-            &format!(
-                "SELECT {EXECUTION_COLS} FROM trusted_action_executions WHERE idempotency_key = ?1"
-            ),
-            [key],
-            map_execution_row,
-        )
-        .optional()
         .map_err(|e| e.to_string())?;
     match row {
         Some(row) => record_from_row(row).map(Some),
         None => Ok(None),
     }
+}
+
+fn load_execution(conn: &Connection, execution_id: &str) -> Result<TrustedActionExecution, String> {
+    find_execution(conn, execution_id)?
+        .ok_or_else(|| format!("trusted execution not found: {execution_id}"))
 }
 
 fn empty_snapshot(slug: &str) -> crate::cron_scheduler::ProjectionSnapshot {
@@ -800,22 +816,32 @@ fn insert_claimed_execution(
 // ── Commands ─────────────────────────────────────────────────
 
 /// Execute the native-approved trusted manifest bound to `manifest_id` for the
-/// active Action Registry `action_id`. Validates every identity, claims a
-/// durable idempotency key, revalidates the projection at final dispatch, and
-/// dispatches the manifest's exact calls through the private canonical
-/// ToolRuntime capability path. Returns the durable receipt.
+/// active Action Registry `action_id`. `operation_id` is an explicit opaque UUID
+/// operation identity supplied by the caller: a fresh user-authorized click uses
+/// a fresh UUID, and a process/restart retry of the *same* operation must reuse
+/// the same UUID. It becomes the durable execution id. Validates every identity,
+/// claims a durable idempotency key, revalidates the payload/projection at final
+/// dispatch, and dispatches the manifest's exact calls through the private
+/// canonical ToolRuntime capability path. Returns the durable receipt.
 #[tauri::command]
 pub async fn execute_trusted_manifest_action(
     app: tauri::AppHandle,
     action_id: String,
     manifest_id: String,
+    operation_id: String,
     expected_manifest_version: Option<i64>,
     expected_manifest_hash: Option<String>,
 ) -> Result<TrustedActionExecution, String> {
     let action_id = action_id.trim().to_string();
     let manifest_id = manifest_id.trim().to_string();
+    let operation_id = operation_id.trim().to_string();
     if action_id.is_empty() || manifest_id.is_empty() {
         return Err("an exact action id and manifest id are required".to_string());
+    }
+    // Explicit operation identity is mandatory and must be a well-formed UUID.
+    // Never minted implicitly; a retry must reuse the original id.
+    if uuid::Uuid::parse_str(&operation_id).is_err() {
+        return Err("operation_id must be a valid UUID".to_string());
     }
     let expected_manifest_hash = normalize_optional(expected_manifest_hash);
 
@@ -824,6 +850,7 @@ pub async fn execute_trusted_manifest_action(
             &app,
             &action_id,
             &manifest_id,
+            &operation_id,
             expected_manifest_version,
             expected_manifest_hash.as_deref(),
         )
@@ -836,12 +863,14 @@ fn run_trusted_execution(
     app: &tauri::AppHandle,
     action_id: &str,
     manifest_id: &str,
+    operation_id: &str,
     expected_manifest_version: Option<i64>,
     expected_manifest_hash: Option<&str>,
 ) -> Result<TrustedActionExecution, String> {
     use tauri::Manager;
 
-    let execution_id;
+    // The durable execution id is the caller-supplied operation identity.
+    let execution_id = operation_id.to_string();
     let wire;
     let captured_snapshot;
 
@@ -851,14 +880,25 @@ fn run_trusted_execution(
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
 
-        // Durable idempotency is action-scoped: never mint a second execution for
-        // the same action, even if the manifest was replaced/rebound or the Agent
-        // projection changed after an ambiguous/partial run. An existing receipt
-        // is returned with an explicit conflict rather than re-executing.
-        let key = idempotency_key(action_id);
-        let existing = load_execution_by_key(&conn, &key)?;
-        let manifest = load_manifest_scope(&conn, manifest_id)?;
-        if let Some(existing) = existing {
+        let key = idempotency_key(action_id, operation_id);
+
+        // (a) Same operation identity already recorded. A retry with the same
+        // operation_id must return the original receipt, never re-run. If the id
+        // belongs to a different action it is refused outright.
+        if let Some(existing) = find_execution(&conn, operation_id)? {
+            if existing.action_id != action_id {
+                return Ok(attach_conflict(
+                    existing,
+                    Some(TrustedExecutionConflict {
+                        kind: "operation_action_mismatch".to_string(),
+                        detail: format!(
+                            "operation '{operation_id}' is bound to action '{}'",
+                            existing.action_id
+                        ),
+                    }),
+                ));
+            }
+            let manifest = load_manifest_scope(&conn, manifest_id)?;
             let conflict = match manifest.as_ref() {
                 Some(manifest) => conflict_for_existing(&conn, action_id, manifest, &existing),
                 None => Some(TrustedExecutionConflict {
@@ -868,7 +908,26 @@ fn run_trusted_execution(
             };
             return Ok(attach_conflict(existing, conflict));
         }
-        let manifest = manifest
+
+        // (b) A fresh operation id, but this action already has an unresolved
+        // operation (claimed/dispatched/ambiguous/pending_acceptance). Refuse the
+        // fresh operation and return the blocking receipt. Ambiguous stays
+        // blocked until it is explicitly reconciled.
+        if let Some(blocking) = load_unresolved_for_action(&conn, action_id)? {
+            return Ok(attach_conflict(
+                blocking,
+                Some(TrustedExecutionConflict {
+                    kind: "action_unresolved".to_string(),
+                    detail: format!(
+                        "action '{action_id}' already has an unresolved operation; \
+                         resolve it before starting a new one"
+                    ),
+                }),
+            ));
+        }
+
+        // (c) Validate the requested manifest/binding/scope.
+        let manifest = load_manifest_scope(&conn, manifest_id)?
             .ok_or_else(|| format!("trusted manifest not found: {manifest_id}"))?;
         if manifest.action_id.as_deref() != Some(action_id) {
             return Err(format!(
@@ -902,15 +961,30 @@ fn run_trusted_execution(
             );
         }
 
-        // Resolve the exact active/approved action and current projection. A
-        // denial is persisted as waiting/blocked without any dispatch.
+        // (d) Claim durably. The partial unique index on (action_id) rejects a
+        // concurrent durable claim for the same action; reload the winner.
+        let deny_unresolved = |conn: &Connection| -> Result<TrustedActionExecution, String> {
+            match load_unresolved_for_action(conn, action_id)? {
+                Some(blocking) => Ok(attach_conflict(
+                    blocking,
+                    Some(TrustedExecutionConflict {
+                        kind: "action_unresolved".to_string(),
+                        detail: format!(
+                            "action '{action_id}' already has an unresolved operation; \
+                             resolve it before starting a new one"
+                        ),
+                    }),
+                )),
+                None => Err("failed to claim trusted execution".to_string()),
+            }
+        };
+
         let authority = match resolve_dispatch_authority(&conn, action_id, &manifest) {
             Ok(authority) => authority,
             Err(denial) => {
-                let execution_id = uuid::Uuid::new_v4().to_string();
-                insert_claimed_execution(
+                if insert_claimed_execution(
                     &conn,
-                    &execution_id,
+                    operation_id,
                     &key,
                     &manifest,
                     &DispatchAuthority {
@@ -918,10 +992,14 @@ fn run_trusted_execution(
                         project_root: manifest.project_root.clone(),
                         snapshot: empty_snapshot(&manifest.agent_id),
                     },
-                )?;
+                )
+                .is_err()
+                {
+                    return deny_unresolved(&conn);
+                }
                 return Ok(settle_and_verify(
                     &conn,
-                    &execution_id,
+                    operation_id,
                     denial.status(),
                     Some(denial.reason()),
                     None,
@@ -932,11 +1010,12 @@ fn run_trusted_execution(
         };
 
         let calls = execution_calls_from_content(&manifest.content_json)?;
-        let execution = uuid::Uuid::new_v4().to_string();
-        insert_claimed_execution(&conn, &execution, &key, &manifest, &authority)?;
+        if insert_claimed_execution(&conn, operation_id, &key, &manifest, &authority).is_err() {
+            return deny_unresolved(&conn);
+        }
         captured_snapshot = authority.snapshot.clone();
         wire = TrustedExecutionRequestWire {
-            execution_id: execution.clone(),
+            execution_id: execution_id.clone(),
             action_id: authority.action_id.clone(),
             manifest_id: manifest_id.to_string(),
             manifest_registry_version: manifest.registry_version,
@@ -952,7 +1031,6 @@ fn run_trusted_execution(
             timeout_ms: WHOLE_RUN_TIMEOUT_MS,
             max_calls: MAX_EXECUTION_CALLS as u64,
         };
-        execution_id = execution;
     }
 
     // Phase 2: final dispatch revalidation against persisted identity. If the

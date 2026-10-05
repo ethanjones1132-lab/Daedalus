@@ -1688,12 +1688,15 @@ pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqli
 }
 
 /// Additive, idempotent durable receipt table for native-approved trusted
-/// manifest executions (Roadmap Priority #2, Part 4). One row is the durable
-/// idempotency claim and actual execution receipt for one
-/// `(action_id, manifest_id, content_hash, workspace, projection)` tuple. The
-/// row records the exact captured Agent/projection/root identity so a stale
-/// authority is detectable, runtime-owned tool outcomes/evidence, and the
-/// `pending_acceptance` state. A tool run never itself completes a Goal.
+/// manifest executions (Roadmap Priority #2, Part 4). `execution_id` is the
+/// caller-supplied opaque `operation_id`; idempotency is keyed by
+/// `(action_id, operation_id)`. A partial unique index permits at most one
+/// unresolved operation per action so a fresh operation is refused while an
+/// earlier one is claimed/dispatched/ambiguous/pending_acceptance, while a new
+/// explicit operation id is allowed after a terminal outcome. The row records
+/// the exact captured Agent/projection/root identity, runtime-owned tool
+/// outcomes/evidence, and the `pending_acceptance` state. A tool run never
+/// itself completes a Goal.
 pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("SAVEPOINT trusted_execution_migration;")?;
     let result = (|| -> Result<(), rusqlite::Error> {
@@ -1724,10 +1727,22 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
                 created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
                 updated_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             );
-            CREATE INDEX IF NOT EXISTS idx_trusted_executions_action
-                ON trusted_action_executions(action_id, status);
             CREATE INDEX IF NOT EXISTS idx_trusted_executions_manifest
                 ON trusted_action_executions(manifest_id);
+            "#,
+        )?;
+        // Migration-safe index change: the earlier shape had a non-unique
+        // (action_id, status) index. Replace it with a partial unique guard that
+        // permits at most one unresolved operation per action, so a fresh
+        // operation is refused (atomically) while an earlier one is claimed,
+        // dispatched, ambiguous, or pending_acceptance. Terminal/retryable
+        // statuses are excluded so an explicit new operation is allowed.
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_trusted_executions_action;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_executions_action_unresolved
+                ON trusted_action_executions(action_id)
+                WHERE status IN ('claimed','dispatched','ambiguous','pending_acceptance');
             "#,
         )?;
         Ok(())
