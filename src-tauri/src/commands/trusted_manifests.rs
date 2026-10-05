@@ -28,7 +28,9 @@ use tauri::State;
 /// validated shape; unknown versions are rejected.
 const TRUSTED_MANIFEST_SCHEMA_VERSION: i64 = 1;
 
-/// Bounds keep the registry from encoding unbounded payloads.
+/// Bounds keep the registry from encoding unbounded payloads. `MAX_CONTENT_BYTES`
+/// is the total manifest cap and therefore also bounds the sum of all write
+/// payloads; each individual payload additionally has `MAX_PAYLOAD_BYTES`.
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_EXECUTION_CALLS: usize = 50;
 const MAX_ACCEPTANCE_CRITERIA: usize = 100;
@@ -36,14 +38,28 @@ const MAX_CHECKS_PER_CRITERION: usize = 50;
 const MAX_TOTAL_ACCEPTANCE_CHECKS: usize = 200;
 const MAX_PATH_LEN: usize = 1024;
 const MAX_PATTERN_LEN: usize = 512;
+const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
-/// v1 call data is restricted to deterministic, read-only canonical
-/// ToolRuntime tools with bounded scalar arguments. Shell tools (`bash`,
-/// `powershell`), content-bearing writers (`write_file`, `edit_file`,
-/// `multi_edit`, `apply_patch`), web calls, and any template/script field are
-/// intentionally excluded, so a manifest cannot smuggle a shell command,
-/// script, template, or unbounded payload.
-const ALLOWED_TOOLS: &[&str] = &["read_file", "list_directory", "glob", "grep"];
+/// Acceptance checks stay deterministic and read-only: only these tools may
+/// appear under `acceptance`.
+const ACCEPTANCE_TOOLS: &[&str] = &["read_file", "list_directory", "glob", "grep"];
+
+/// Approved execution calls may additionally use the minimal bounded writers
+/// `write_file` and `edit_file`, which carry bounded UTF-8 payloads with exact
+/// per-tool argument shapes. Shell tools (`bash`, `powershell`), the
+/// unbounded/array writers (`apply_patch`, `multi_edit`), web tools, and any
+/// template/script field remain excluded, so a manifest cannot smuggle a shell
+/// command, script, or unbounded payload. These tools still run later through
+/// the canonical ToolRuntime in an Agent context under current Permission
+/// policy; listing a writer here grants no permission and bypasses no approval.
+const EXECUTION_TOOLS: &[&str] = &[
+    "read_file",
+    "list_directory",
+    "glob",
+    "grep",
+    "write_file",
+    "edit_file",
+];
 const ALLOWED_OUTPUT_MODES: &[&str] = &["files_with_matches", "content", "count"];
 
 const TRUSTED_MANIFEST_COLS: &str = "manifest_id, registry_version, schema_version, \
@@ -52,8 +68,11 @@ const TRUSTED_MANIFEST_COLS: &str = "manifest_id, registry_version, schema_versi
 // ── v1 content shape ─────────────────────────────────────────
 
 /// Bounded scalar arguments accepted for a v1 ToolRuntime call. Unknown keys
-/// (including any `command`, `shell`, `script`, `template`, or free-form
-/// `args`/`content` field) are rejected by `deny_unknown_fields`.
+/// (including any `command`, `shell`, `script`, `template`, or free-form `args`
+/// field) are rejected by `deny_unknown_fields`. `content`, `old_string`, and
+/// `new_string` are the only payload fields and exist solely for the bounded
+/// execution writers; they are rejected for every read-only tool and for all
+/// acceptance checks.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallArgumentsV1 {
@@ -69,11 +88,19 @@ pub struct ToolCallArgumentsV1 {
     pub output_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_string: Option<String>,
 }
 
 /// One explicit execution call in the approved action's call list. It carries
 /// the canonical ToolRuntime tool identity and bounded arguments only — never a
-/// command string.
+/// command string. Execution calls may use the bounded writers `write_file` and
+/// `edit_file` (bounded UTF-8 payloads, workspace-relative paths); acceptance
+/// checks may not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCallV1 {
@@ -201,12 +228,41 @@ fn reject_present<T>(label: &str, field: &str, value: &Option<T>) -> Result<(), 
     }
 }
 
-/// Validate one ToolRuntime call: the tool must be in the deterministic
-/// allowlist and its arguments must match the exact bounded shape for that tool.
-fn validate_call_tool(label: &str, tool: &str, args: Option<&ToolCallArgumentsV1>) -> Result<(), String> {
-    if !ALLOWED_TOOLS.contains(&tool) {
+/// Reject every payload field. Used by read-only tools and acceptance checks so
+/// a write payload can never ride on a read-only call.
+fn reject_payload_fields(label: &str, a: &ToolCallArgumentsV1) -> Result<(), String> {
+    reject_present(label, "content", &a.content)?;
+    reject_present(label, "old_string", &a.old_string)?;
+    reject_present(label, "new_string", &a.new_string)
+}
+
+/// A bounded UTF-8 payload for the execution writers. Rust strings are already
+/// valid UTF-8; NUL is rejected and length is capped at `MAX_PAYLOAD_BYTES`, with
+/// the overall manifest cap bounding the total.
+fn validate_payload(label: &str, raw: &str) -> Result<(), String> {
+    if raw.len() > MAX_PAYLOAD_BYTES {
+        return Err(format!("{label}: payload exceeds {MAX_PAYLOAD_BYTES} bytes"));
+    }
+    if raw.contains('\0') {
+        return Err(format!("{label}: payload contains a NUL byte"));
+    }
+    Ok(())
+}
+
+/// Validate one ToolRuntime call. `allow_writers` selects the allowlist:
+/// execution calls may use `write_file`/`edit_file`; acceptance checks are
+/// read-only. Every argument must match the exact bounded shape for the tool.
+fn validate_call_tool(
+    label: &str,
+    tool: &str,
+    args: Option<&ToolCallArgumentsV1>,
+    allow_writers: bool,
+) -> Result<(), String> {
+    let allowed = if allow_writers { EXECUTION_TOOLS } else { ACCEPTANCE_TOOLS };
+    if !allowed.contains(&tool) {
+        let kind = if allow_writers { "execution" } else { "acceptance" };
         return Err(format!(
-            "{label}: tool '{tool}' is not an allowlisted deterministic ToolRuntime tool"
+            "{label}: tool '{tool}' is not allowlisted for {kind} calls"
         ));
     }
     let empty = ToolCallArgumentsV1::default();
@@ -223,6 +279,7 @@ fn validate_call_tool(label: &str, tool: &str, args: Option<&ToolCallArgumentsV1
             reject_present(label, "head_limit", &a.head_limit)?;
             validate_opt_range(&format!("{label}.offset"), a.offset, 1, 1_000_000)?;
             validate_opt_range(&format!("{label}.limit"), a.limit, 1, 10_000)?;
+            reject_payload_fields(label, a)?;
         }
         "list_directory" => {
             let path = a
@@ -235,6 +292,7 @@ fn validate_call_tool(label: &str, tool: &str, args: Option<&ToolCallArgumentsV1
             reject_present(label, "limit", &a.limit)?;
             reject_present(label, "output_mode", &a.output_mode)?;
             reject_present(label, "head_limit", &a.head_limit)?;
+            reject_payload_fields(label, a)?;
         }
         "glob" => {
             let pattern = a
@@ -249,6 +307,7 @@ fn validate_call_tool(label: &str, tool: &str, args: Option<&ToolCallArgumentsV1
             reject_present(label, "limit", &a.limit)?;
             reject_present(label, "output_mode", &a.output_mode)?;
             reject_present(label, "head_limit", &a.head_limit)?;
+            reject_payload_fields(label, a)?;
         }
         "grep" => {
             let pattern = a
@@ -267,6 +326,52 @@ fn validate_call_tool(label: &str, tool: &str, args: Option<&ToolCallArgumentsV1
             validate_opt_range(&format!("{label}.head_limit"), a.head_limit, 1, 1000)?;
             reject_present(label, "offset", &a.offset)?;
             reject_present(label, "limit", &a.limit)?;
+            reject_payload_fields(label, a)?;
+        }
+        "write_file" => {
+            let path = a
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("{label}: write_file requires 'path'"))?;
+            validate_relative_path(&format!("{label}.path"), path)?;
+            let content = a
+                .content
+                .as_deref()
+                .ok_or_else(|| format!("{label}: write_file requires 'content'"))?;
+            validate_payload(&format!("{label}.content"), content)?;
+            reject_present(label, "pattern", &a.pattern)?;
+            reject_present(label, "offset", &a.offset)?;
+            reject_present(label, "limit", &a.limit)?;
+            reject_present(label, "output_mode", &a.output_mode)?;
+            reject_present(label, "head_limit", &a.head_limit)?;
+            reject_present(label, "old_string", &a.old_string)?;
+            reject_present(label, "new_string", &a.new_string)?;
+        }
+        "edit_file" => {
+            let path = a
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("{label}: edit_file requires 'path'"))?;
+            validate_relative_path(&format!("{label}.path"), path)?;
+            let old_string = a
+                .old_string
+                .as_deref()
+                .ok_or_else(|| format!("{label}: edit_file requires 'old_string'"))?;
+            if old_string.is_empty() {
+                return Err(format!("{label}: edit_file requires a non-empty 'old_string'"));
+            }
+            validate_payload(&format!("{label}.old_string"), old_string)?;
+            let new_string = a
+                .new_string
+                .as_deref()
+                .ok_or_else(|| format!("{label}: edit_file requires 'new_string'"))?;
+            validate_payload(&format!("{label}.new_string"), new_string)?;
+            reject_present(label, "pattern", &a.pattern)?;
+            reject_present(label, "offset", &a.offset)?;
+            reject_present(label, "limit", &a.limit)?;
+            reject_present(label, "output_mode", &a.output_mode)?;
+            reject_present(label, "head_limit", &a.head_limit)?;
+            reject_present(label, "content", &a.content)?;
         }
         _ => unreachable!("tool allowlist checked above"),
     }
@@ -282,7 +387,9 @@ fn validate_sha256(label: &str, raw: &str) -> Result<(), String> {
 
 /// Strictly validate and canonicalize v1 manifest content. Unknown keys,
 /// unsupported schema versions, shell/script/template fields, non-allowlisted
-/// tools, malformed paths/patterns, and unbounded values are rejected.
+/// tools, malformed paths/patterns/payloads, and unbounded values are rejected.
+/// Execution calls use the bounded writer+reader allowlist; acceptance checks
+/// use the read-only allowlist only.
 pub fn validate_trusted_manifest_content(
     content_json: &str,
 ) -> Result<ValidatedTrustedManifest, String> {
@@ -317,6 +424,7 @@ pub fn validate_trusted_manifest_content(
             &format!("execution[{index}]"),
             &call.tool,
             call.arguments.as_ref(),
+            true,
         )?;
     }
 
@@ -351,6 +459,7 @@ pub fn validate_trusted_manifest_content(
                 &format!("acceptance[{criterion_id}][{index}]"),
                 &check.tool,
                 check.arguments.as_ref(),
+                false,
             )?;
             validate_sha256(
                 &format!("acceptance[{criterion_id}][{index}].expect_sha256"),

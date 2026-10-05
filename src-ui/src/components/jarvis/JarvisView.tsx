@@ -4958,11 +4958,11 @@ interface TrustedManifestAgentRow {
 const TRUSTED_MANIFEST_EXAMPLE = `{
   "schema_version": 1,
   "execution": [
-    { "tool": "read_file", "arguments": { "path": "README.md" } }
+    { "tool": "write_file", "arguments": { "path": "notes/result.md", "content": "Hello from Jarvis\\n" } }
   ],
   "acceptance": {
     "<goal-criterion-uuid>": [
-      { "tool": "read_file", "arguments": { "path": "README.md" }, "expect_sha256": "<64-char-lowercase-sha256>" }
+      { "tool": "read_file", "arguments": { "path": "notes/result.md" }, "expect_sha256": "<64-char-lowercase-sha256>" }
     ]
   }
 }`;
@@ -5272,8 +5272,12 @@ function TrustedManifestsPanel() {
             className={cn(inputCls, 'resize-y')}
           />
           <p className="text-[10px] font-mono text-bone-faint mt-1">
-            Unknown keys, shell tools/commands, scripts, templates, and unbounded values are rejected
-            by native validation.
+            Execution calls may use read tools plus the bounded writers write_file/edit_file (bounded
+            UTF-8 payloads, workspace-relative paths). Acceptance checks stay read-only. Unknown keys,
+            shell tools/commands, apply_patch/multi_edit, web tools, scripts, templates, and unbounded
+            values are rejected by native validation. Later execution still runs through the canonical
+            ToolRuntime under current Agent/Permission policy; if policy denies or requires approval it
+            becomes a blocked/waiting state and is never bypassed.
           </p>
         </div>
         <div className="flex items-center gap-2">
