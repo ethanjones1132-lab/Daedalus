@@ -134,7 +134,7 @@ def lab(name, m):
         levers["threads6-prio2"] = run("threads6-prio2", n0, m["spec"], m["depth"], ["-t", "6", "--prio", "2"])
         levers["threads10"] = run("threads10", n0, m["spec"], m["depth"], ["-t", "10"])
         # Only the CPU-side tensors live in RAM, instead of mapping the whole file:
-        levers["no-mmap"] = run("no-mmap", n0, m["spec"], m["depth"], ["--no-mmap"])
+        levers["no-mmap"] = run("no-mmap", n0, m["spec"], m["depth"], ["--load-mode", "none"])
     levers["kv-f16"] = run("kv-f16", n0, m["spec"], m["depth"], ["-ctk", "f16", "-ctv", "f16"])
     spec_rows = [base]
     for d in m["depths"]:
@@ -160,7 +160,7 @@ def lab(name, m):
             break
     nm = levers.get("no-mmap")
     if nm and fits(nm) and (helped(nm) or (base.get("paging_risk") and not nm.get("paging_risk"))):
-        extra += ["--no-mmap"]  # adopted if faster, or if it ends the RAM squeeze at no cost
+        extra += ["--load-mode", "none"]  # (836d571 renamed --no-mmap) adopted if faster, or if it ends the RAM squeeze at no cost
     if helped(levers["kv-f16"]):
         extra += ["-ctk", "f16", "-ctv", "f16"]
     combo = run(combo_label(best_spec["spec"], best_spec["ncmoe"], best_spec["depth"] if best_spec["spec"] else 0, extra),

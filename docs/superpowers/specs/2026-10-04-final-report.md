@@ -104,7 +104,7 @@ The overnight results are in `2026-10-04-overnight-results.md`. This report cove
 | KV cache f16 | +5% (+13% at 10k ctx) | +2% | +6% | −1% | Small; costs ~150–200 MiB VRAM |
 | 10 threads | +4% | +1% | +4% | – | Noise level |
 | 6 P-core threads | −12% | −13% | −8% | – | Worse; E-cores help |
-| `--no-mmap` | fails to load | fails | fails | – | Not possible with 16 GB RAM |
+| `--no-mmap` | not tested | not tested | not tested | – | Flag removed in this build ("invalid argument"); `--load-mode none` replaces it. Re-test pending |
 | Fewer experts per token (lossy) | +25% (top-3) | +30% | +21% (top-6) | +2% | Not adopted; quality not measured |
 | ubatch 1024 | prefill +37% | prefill −14% | prefill +58% | prefill +13% | Prompt reading only (generation unchanged); worth it except on keep24 |
 

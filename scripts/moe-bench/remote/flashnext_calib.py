@@ -1,5 +1,5 @@
 """Calibration text and expert-usage summary for Qwen3.8-Flash-Next (ISTA GSQ-RCO Coder),
-run on a rented 32 GB GPU (2026-10-04). Standalone: needs only numpy and gguf.
+run on a rented GPU (2026-10-04; see modal_flashnext.py). Standalone: needs only numpy and gguf.
 
   gen        start llama-server with the Coder, answer ~96 coding prompts built from Python
              standard-library functions (fix an injected bug / implement from a docstring /
@@ -14,7 +14,8 @@ Lessons from the gpt-oss pruning rounds (2026-10-04): calibrate on the model's o
 chat-format answers (raw code alone removed the experts its reasoning used), and do not
 skip library areas (that deleted library knowledge). Nothing here comes from tier2b.
 
-usage: flashnext_calib.py gen --server PATH --model PATH --out DIR [--prompts 96]
+usage: flashnext_calib.py gen --server PATH --model PATH --out DIR [--prompts 96] [--parallel 4]
+                              [--server-args="--load-mode none ..."]
        flashnext_calib.py summarize --imatrix PATH --out DIR
 """
 import argparse
@@ -31,6 +32,7 @@ import textwrap
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STDLIB = [
     "colorsys:rgb_to_hsv", "colorsys:hsv_to_rgb", "colorsys:rgb_to_hls", "colorsys:hls_to_rgb",
@@ -169,6 +171,22 @@ def post(path, payload, timeout=1200):
         return json.loads(r.read())
 
 
+def answer(i, p):
+    think = i % 2 == 1  # half thinking off (how we serve it), half with a 1,024-token budget
+    kw = {"enable_thinking": think}
+    msgs = [{"role": "user", "content": p["prompt"]}]
+    t = time.time()
+    r = post("/v1/chat/completions", {"messages": msgs, "max_tokens": 3072, "temperature": 0.2,
+                                      "top_p": 0.95, "seed": i, "chat_template_kwargs": kw})
+    head = post("/apply-template", {"messages": msgs, "chat_template_kwargs": kw})["prompt"]
+    m = r["choices"][0]["message"]
+    return {"i": i, **p, "think": think, "template_prompt": head,
+            "reasoning": m.get("reasoning_content") or "", "content": m.get("content") or "",
+            "gen_n": r.get("timings", {}).get("predicted_n"),
+            "tps": r.get("timings", {}).get("predicted_per_second"),
+            "secs": round(time.time() - t, 1)}
+
+
 def gen(a):
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -176,8 +194,9 @@ def gen(a):
     done = {json.loads(l)["i"] for l in jl.read_text().splitlines() if l.strip()} if jl.exists() else set()
     prompts = build_prompts(a.prompts)
     args = [a.server, "-m", a.model, "--host", "127.0.0.1", "--port", str(PORT), "-ngl", "99",
-            "--n-cpu-moe", str(a.ncmoe), "-c", "16384", "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on",
-            "-np", "1", "--jinja", "--reasoning-budget", "1024", "--no-webui", "--cache-ram", "0"]
+            "--n-cpu-moe", str(a.ncmoe), "-c", str(max(16384, 8192 * a.parallel)), "-ctk", "q8_0", "-ctv", "q8_0",
+            "--flash-attn", "on", "-np", str(a.parallel), "--jinja", "--reasoning-budget", "1024", "--no-webui",
+            "--cache-ram", "0"] + a.server_args.split()
     log = open(out / "server.log", "a")
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
     try:
@@ -195,30 +214,19 @@ def gen(a):
                 sys.exit("server load timeout")
             time.sleep(2)
         print(f"server up in {time.time() - t0:.0f} s", flush=True)
-        with jl.open("a") as f:
-            for i, p in enumerate(prompts):
-                if i in done:
-                    continue
-                think = i % 2 == 1  # half thinking off (how we serve it), half with a 1,024-token budget
-                kw = {"enable_thinking": think}
-                msgs = [{"role": "user", "content": p["prompt"]}]
-                t = time.time()
+        todo = [(i, p) for i, p in enumerate(prompts) if i not in done]
+        with jl.open("a") as f, ThreadPoolExecutor(a.parallel) as ex:  # one request per server slot
+            futs = {ex.submit(answer, i, p): i for i, p in todo}
+            for n, fut in enumerate(as_completed(futs), 1):
                 try:
-                    r = post("/v1/chat/completions", {"messages": msgs, "max_tokens": 3072, "temperature": 0.2,
-                                                      "top_p": 0.95, "seed": i, "chat_template_kwargs": kw})
-                    head = post("/apply-template", {"messages": msgs, "chat_template_kwargs": kw})["prompt"]
+                    row = fut.result()
                 except Exception as e:
-                    print(f"prompt {i} failed: {e}", flush=True)
+                    print(f"prompt {futs[fut]} failed: {e}", flush=True)
                     continue
-                m = r["choices"][0]["message"]
-                f.write(json.dumps({"i": i, **p, "think": think, "template_prompt": head,
-                                    "reasoning": m.get("reasoning_content") or "", "content": m.get("content") or "",
-                                    "gen_n": r.get("timings", {}).get("predicted_n"),
-                                    "tps": r.get("timings", {}).get("predicted_per_second"),
-                                    "secs": round(time.time() - t, 1)}) + "\n")
+                f.write(json.dumps(row) + "\n")
                 f.flush()
-                print(f"{i + 1}/{len(prompts)} {p['kind']:9s} think={think} {r.get('timings', {}).get('predicted_n')} tok "
-                      f"{r.get('timings', {}).get('predicted_per_second', 0):.0f} tok/s", flush=True)
+                print(f"{n}/{len(todo)} #{row['i']} {row['kind']:9s} think={row['think']} {row['gen_n']} tok "
+                      f"{row['tps'] or 0:.0f} tok/s {row['secs']} s", flush=True)
     finally:
         proc.terminate()
         try:
@@ -229,8 +237,11 @@ def gen(a):
     parts = []
     for r in rows:
         text = r["template_prompt"]
-        if r["reasoning"] and not text.rstrip().endswith("</think>"):
-            text += f"<think>\n{r['reasoning']}\n</think>\n\n"
+        if r["reasoning"]:
+            if text.rstrip().endswith("<think>"):  # the template already opened the thinking block
+                text = text.rstrip() + f"\n{r['reasoning']}\n</think>\n\n"
+            elif not text.rstrip().endswith("</think>"):
+                text += f"<think>\n{r['reasoning']}\n</think>\n\n"
         parts.append(text + r["content"] + "<|im_end|>\n")
     for mod in SOURCE_MODULES:  # about a third of the text: raw library source
         try:
@@ -283,6 +294,8 @@ def main():
     g.add_argument("--out", required=True)
     g.add_argument("--prompts", type=int, default=96)
     g.add_argument("--ncmoe", type=int, default=0)
+    g.add_argument("--parallel", type=int, default=1, help="server slots and concurrent requests")
+    g.add_argument("--server-args", default="", help="extra llama-server flags, space-separated")
     s = sub.add_parser("summarize")
     s.add_argument("--imatrix", required=True)
     s.add_argument("--out", required=True)
