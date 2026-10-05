@@ -648,15 +648,23 @@ pub fn cancel_trusted_execution(
     #[derive(Deserialize)]
     struct CancelResponse {
         cancelled: bool,
+        execution_id: String,
         #[serde(default)]
         bun_instance_id: String,
     }
     if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
         return TrustedCancelAcknowledgement::ambiguous("owned Bun runtime is not live");
     }
-    // Capture the currently bound instance and generation before the request;
-    // update the bound metadata only briefly after it.
+    // Require an already-bound live Bun instance BEFORE dispatching: without one
+    // there is no exact process to bind the ack to, so fail closed and send no
+    // request rather than accepting an arbitrary response instance.
     let bound_instance = transport.lock_state().bound_bun_instance_id.clone();
+    let Some(bound) = bound_instance.as_deref().filter(|v| !v.trim().is_empty()) else {
+        return TrustedCancelAcknowledgement::ambiguous(
+            "no live Bun instance is currently bound",
+        );
+    };
+    let bound = bound.to_string();
     let generation = crate::process_lifecycle::bun_generation();
     let body = match transport.post_json(
         "/internal/trusted/cancel",
@@ -676,17 +684,20 @@ pub fn cancel_trusted_execution(
             )
         }
     };
+    if parsed.execution_id != execution_id {
+        return TrustedCancelAcknowledgement::ambiguous(
+            "trusted cancel ack echoed a different execution id",
+        );
+    }
     if parsed.bun_instance_id.trim().is_empty() {
         return TrustedCancelAcknowledgement::ambiguous(
             "trusted cancel ack is missing the Bun instance identity",
         );
     }
-    if let Some(bound) = bound_instance.as_deref() {
-        if parsed.bun_instance_id != bound {
-            return TrustedCancelAcknowledgement::ambiguous(
-                "trusted cancel ack came from a different Bun instance",
-            );
-        }
+    if parsed.bun_instance_id != bound {
+        return TrustedCancelAcknowledgement::ambiguous(
+            "trusted cancel ack came from a different Bun instance",
+        );
     }
     if crate::process_lifecycle::bun_generation() != generation
         || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)

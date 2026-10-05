@@ -635,14 +635,15 @@ export async function handleTrustedExecutionRequest(
       const body = (await readBoundedBody(req)) as { execution_id?: unknown };
       if (typeof body.execution_id === "string") executionId = body.execution_id;
     } catch {
-      return json({ cancelled: false, bun_instance_id: bunInstanceId }, 400);
+      // Invalid body: echo the (empty) parsed id so native can bind the ack.
+      return json({ cancelled: false, execution_id: executionId, bun_instance_id: bunInstanceId }, 400);
     }
     const controller = executionId ? inFlight.get(executionId) : undefined;
     if (controller) {
       controller.abort("trusted_cancel");
-      return json({ cancelled: true, bun_instance_id: bunInstanceId });
+      return json({ cancelled: true, execution_id: executionId, bun_instance_id: bunInstanceId });
     }
-    return json({ cancelled: false, bun_instance_id: bunInstanceId });
+    return json({ cancelled: false, execution_id: executionId, bun_instance_id: bunInstanceId });
   }
 
   if (path === "/internal/trusted/execute" && req.method === "POST") {
