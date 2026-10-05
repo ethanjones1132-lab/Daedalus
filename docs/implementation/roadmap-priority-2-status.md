@@ -2,7 +2,7 @@
 
 **As of:** 2026-10-05
 **Scope:** Roadmap Priority #2, “Connect goals, commitments, scheduling, and execution.”
-**State:** Four source plans are complete; Part 1 source implementation is complete via the exact DeepSeek v4.1 Flash OpenCode CLI. No Priority #2 runtime acceptance has been run.
+**State:** Four source plans are complete; Part 1 source checkpoint `7bf50fafe01f785252874ccb09ad8de23d4a6a45` is committed and all five allowed checks passed against that exact SHA. Part 2 is next. No Priority #2 runtime acceptance has been run.
 
 ## Sequencing ruling
 
@@ -37,10 +37,10 @@ Implemented in source:
 
 Validated in source: user-owned objective/criteria authority (`user_statement` only), stable criterion identity across updates, an explicit eight-state lifecycle with terminal states distinct, fail-closed missing/invalid Goal IDs and link targets, validated scope attribution, and refusal to set `completed` without an acceptance gate (Part 4). No permissions are granted and no work is dispatched.
 
-Independent coordinator checks on the final pre-commit worktree: Rust `cargo check`, Bun server typecheck, Bun server build, UI TypeScript + Vite build, and `git diff --check` all PASS. Rust emitted only two unrelated existing warnings; UI emitted an existing bundle-size advisory. The exact cached `lucide-react` declaration was restored by the prescribed helper; no manifest or version changed. **NOT RUN:** tests, fixtures, scripted provider, live inference/runtime, restart/interruption, real-goal acceptance, packaging, and installation. Priority #1 remains incomplete/open; Priority #2 runtime acceptance remains open; #3–#5 remain queued.
+Independent coordinator checks against committed source SHA `7bf50fafe01f785252874ccb09ad8de23d4a6a45`: Rust `cargo check`, Bun server typecheck, Bun server build, UI TypeScript + Vite build, and `git diff --check` all PASS. Rust emitted only two unrelated existing warnings; UI emitted an existing bundle-size advisory. The exact cached `lucide-react` declaration was restored by the prescribed helper; no manifest or version changed. **NOT RUN:** tests, fixtures, scripted provider, live inference/runtime, restart/interruption, real-goal acceptance, packaging, and installation. Priority #1 remains incomplete/open; Priority #2 runtime acceptance remains open; #3–#5 remain queued.
 
 ## Execution protocol
 
 Luna owns plans, reviews, coordination and allowed non-test checks. Every production source change is executed only by OpenCode CLI model `opencode-go/deepseek-v4.1-flash`. Tests, fixtures, test declarations, scripted providers, live inference/runtime/restart acceptance, packaging and installation remain NOT RUN. Compiler/type/build/diff/source checks may be recorded by exact source SHA.
 
-Part 1 review and allowed-check evidence: [Part 1 progress](roadmap-priority-2-part-1-progress.md). Detailed sequential checkpoints are tracked in the coordinator ledger at `/Users/charlottehughes/Documents/Codex/2026-10-04/ca/work/opencode-memory/PHASE2-COORDINATION.md`.
+Part 1 review and allowed-check evidence: [Part 1 progress](roadmap-priority-2-part-1-progress.md). Source commit SHA: `7bf50fafe01f785252874ccb09ad8de23d4a6a45`. Detailed sequential checkpoints are tracked in the coordinator ledger at `/Users/charlottehughes/Documents/Codex/2026-10-04/ca/work/opencode-memory/PHASE2-COORDINATION.md`.

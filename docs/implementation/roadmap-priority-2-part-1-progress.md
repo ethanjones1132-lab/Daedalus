@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-05
 **Part:** Durable Goal authority and links
-**Status:** Source implementation and Luna review complete; exact source commit pending. Runtime acceptance remains NOT RUN.
+**Status:** Source implementation and Luna review complete; committed as `7bf50fafe01f785252874ccb09ad8de23d4a6a45`. Runtime acceptance remains NOT RUN.
 
 ## Source changes
 
@@ -18,7 +18,7 @@
 
 Luna reviewed migration idempotency/additivity, Goal identity and state transitions, accepted-completion guard, target authority/scope checks, Agent/project validation, UI request-generation handling, and Goal-less consumer compatibility. Findings from focused passes were corrected through the exact production executor before acceptance.
 
-Independent coordinator check helper ran against the final pre-commit worktree; all five checks passed:
+Independent coordinator check helper ran after commit and recorded source revision `7bf50fafe01f785252874ccb09ad8de23d4a6a45`; all five checks passed:
 
 | Check | Result |
 |---|---|
@@ -34,4 +34,4 @@ The first executor UI typecheck saw missing cached `lucide-react` declarations. 
 
 Tests, fixtures, test declarations, scripted providers, live inference/runtime, real-goal delivery, interruption/restart, missed-schedule replay, acceptance-manifest execution, packaging, and installation remain NOT RUN. Priority #1 remains incomplete/open; Priority #2 remains runtime-incomplete. No completion criterion is checked off.
 
-**Source commit SHA:** pending commit. The coordinator will rerun all five checks against the exact committed source revision and update this checkpoint.
+**Source commit SHA:** `7bf50fafe01f785252874ccb09ad8de23d4a6a45`. All five allowed checks were rerun against the exact committed revision.
