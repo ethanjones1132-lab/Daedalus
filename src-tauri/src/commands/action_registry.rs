@@ -443,6 +443,211 @@ pub fn update_action_approval(
     Ok(true)
 }
 
+// ── Trusted terminal delivery (Roadmap Priority #2, Part 4) ──
+
+/// Bounded proof that one Action Registry action is terminally done. Only
+/// identity/status/evidence fields are read; the action's other JSON fields are
+/// preserved untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRegistryTerminalProof {
+    pub action_id: String,
+    pub done_present: bool,
+    pub active_absent: bool,
+    pub run_id: String,
+    pub acceptance_result: String,
+}
+
+fn data_dir(db: &AppDb) -> Result<PathBuf, String> {
+    Ok(registry_root(db)?.join("data"))
+}
+
+/// Parse a bucket file into `{ "actions": [...] }`, tolerating a bare array.
+/// A missing file is an authoritative empty bucket.
+fn read_bucket_value(path: &Path) -> Result<serde_json::Value, String> {
+    if !path.exists() {
+        return Ok(serde_json::json!({ "actions": [] }));
+    }
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    match parsed {
+        serde_json::Value::Array(actions) => Ok(serde_json::json!({ "actions": actions })),
+        serde_json::Value::Object(mut map) => {
+            if !map.contains_key("actions") {
+                map.insert("actions".to_string(), serde_json::Value::Array(vec![]));
+            }
+            Ok(serde_json::Value::Object(map))
+        }
+        _ => Err(format!("bucket {} has an unsupported shape", path.display())),
+    }
+}
+
+/// Write a bucket via a temp file + rename so a partial write cannot corrupt it.
+fn write_bucket_value(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("serialize {}: {}", path.display(), e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, raw).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename {}: {}", tmp.display(), e))?;
+    Ok(())
+}
+
+fn find_action<'a>(value: &'a serde_json::Value, action_id: &str) -> Option<&'a serde_json::Value> {
+    value
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .and_then(|actions| {
+            actions
+                .iter()
+                .find(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
+        })
+}
+
+fn proof_for(value: &serde_json::Value, action_id: &str) -> Option<ActionRegistryTerminalProof> {
+    let action = find_action(value, action_id)?;
+    let run_id = action
+        .get("execution_evidence")
+        .and_then(|e| e.get("run_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let acceptance_result = action
+        .get("execution_evidence")
+        .and_then(|e| e.get("acceptance_result"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(ActionRegistryTerminalProof {
+        action_id: action_id.to_string(),
+        done_present: true,
+        active_absent: false,
+        run_id,
+        acceptance_result,
+    })
+}
+
+/// After all trusted acceptance checks pass, mark exactly one Action Registry
+/// action terminally done. The exact existing action object is moved to the
+/// `done` bucket with its unknown JSON fields preserved; `status` and the
+/// runtime execution/acceptance evidence are updated. Both files are then
+/// re-read: the done row must be present exactly once with the expected
+/// evidence, and the action must be absent from `active`. Any mismatch returns
+/// an error (the caller persists an ambiguous/pending state and never claims
+/// terminal).
+pub fn finalize_action_registry_done(
+    db: &AppDb,
+    action_id: &str,
+    evidence: &serde_json::Value,
+) -> Result<ActionRegistryTerminalProof, String> {
+    let dir = data_dir(db)?;
+    let active_path = dir.join("active.json");
+    let done_path = dir.join("done.json");
+
+    let mut active = read_bucket_value(&active_path)?;
+    let mut done = read_bucket_value(&done_path)?;
+
+    if find_action(&done, action_id).is_some() {
+        // Idempotent: already terminal. Confirm active is clear.
+        let active_absent = find_action(&active, action_id).is_none();
+        if !active_absent {
+            return Err(format!(
+                "action '{action_id}' is present in both done and active; reconciliation required"
+            ));
+        }
+        let mut proof = proof_for(&done, action_id)
+            .ok_or_else(|| format!("done row for '{action_id}' is malformed"))?;
+        proof.active_absent = true;
+        return Ok(proof);
+    }
+
+    let action = find_action(&active, action_id)
+        .ok_or_else(|| format!("action '{action_id}' is not present in the active bucket"))?
+        .clone();
+    let status = action
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !matches!(status, "open" | "in_progress") {
+        return Err(format!(
+            "action '{action_id}' is not terminally deliverable: status is '{status}'"
+        ));
+    }
+
+    // Build the terminal object from the exact existing action so unknown fields
+    // are preserved; only status/evidence/timestamp are overwritten.
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut terminal = action;
+    terminal["status"] = serde_json::Value::String("done".to_string());
+    terminal["updated_at"] = serde_json::Value::String(now);
+    terminal["execution_evidence"] = evidence.clone();
+    terminal["acceptance_evidence"] = evidence.clone();
+
+    // Move: append/replace in done, remove from active.
+    {
+        let arr = done
+            .get_mut("actions")
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| "done bucket is malformed".to_string())?;
+        arr.retain(|a| a.get("id").and_then(|id| id.as_str()) != Some(action_id));
+        arr.push(terminal);
+    }
+    {
+        let arr = active
+            .get_mut("actions")
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| "active bucket is malformed".to_string())?;
+        arr.retain(|a| a.get("id").and_then(|id| id.as_str()) != Some(action_id));
+    }
+
+    // Write done before active so an interruption cannot leave a done action
+    // still active.
+    write_bucket_value(&done_path, &done)?;
+    write_bucket_value(&active_path, &active)?;
+
+    // Exact readback.
+    let done_after = read_bucket_value(&done_path)?;
+    let active_after = read_bucket_value(&active_path)?;
+    let done_matches = done_after
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .map(|actions| {
+            actions
+                .iter()
+                .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
+                .count()
+        })
+        == Some(1);
+    let active_absent = find_action(&active_after, action_id).is_none();
+    if !done_matches || !active_absent {
+        return Err(format!(
+            "action '{action_id}' terminal write could not be confirmed; reconciliation required"
+        ));
+    }
+    let mut proof = proof_for(&done_after, action_id)
+        .ok_or_else(|| format!("done row for '{action_id}' is missing after write"))?;
+    proof.active_absent = true;
+    Ok(proof)
+}
+
+/// Read back an already-terminal action row exactly (idempotent reconciliation).
+pub fn verify_action_registry_done(
+    db: &AppDb,
+    action_id: &str,
+) -> Result<ActionRegistryTerminalProof, String> {
+    let dir = data_dir(db)?;
+    let done = read_bucket_value(&dir.join("done.json"))?;
+    let active = read_bucket_value(&dir.join("active.json"))?;
+    let mut proof = proof_for(&done, action_id)
+        .ok_or_else(|| format!("action '{action_id}' is not in the done bucket"))?;
+    proof.active_absent = find_action(&active, action_id).is_none();
+    if !proof.active_absent {
+        return Err(format!(
+            "action '{action_id}' is still present in the active bucket"
+        ));
+    }
+    Ok(proof)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

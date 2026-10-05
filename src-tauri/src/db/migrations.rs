@@ -286,6 +286,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     apply_goal_notification_migrations(conn)?;
     apply_trusted_manifest_migrations(conn)?;
     apply_trusted_execution_migrations(conn)?;
+    apply_trusted_acceptance_migrations(conn)?;
 
     Ok(())
 }
@@ -1767,6 +1768,92 @@ pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusql
             let _ = conn.execute_batch(
                 "ROLLBACK TO SAVEPOINT trusted_execution_migration; \
                  RELEASE SAVEPOINT trusted_execution_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent durable acceptance-attempt receipts (Roadmap Priority
+/// #2, Part 4). One `trusted_acceptance_receipts` row per trusted execution
+/// attempt (keyed by execution id) records the runtime-owned acceptance
+/// outcome, and `trusted_acceptance_criteria` holds one accepted-evidence row
+/// per (criterion, check). `runtime_started_at`/`runtime_finished_at` on the
+/// execution receipt capture the actual Bun runtime bounds (distinct from the
+/// native claim time), making them available through exact readback.
+pub fn apply_trusted_acceptance_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_acceptance_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_receipts (
+                acceptance_key       TEXT PRIMARY KEY,
+                execution_id         TEXT NOT NULL UNIQUE,
+                action_id            TEXT NOT NULL,
+                manifest_id          TEXT NOT NULL,
+                goal_id              TEXT NOT NULL,
+                status               TEXT NOT NULL,
+                terminal_reason      TEXT,
+                bun_run_id           TEXT,
+                bun_instance_id      TEXT,
+                evidence_json        TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                runtime_started_at   TEXT,
+                runtime_finished_at  TEXT,
+                settled_at           TEXT,
+                created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_action
+                ON trusted_acceptance_receipts(action_id, status);
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_goal
+                ON trusted_acceptance_receipts(goal_id, status);
+
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_criteria (
+                id              TEXT PRIMARY KEY,
+                acceptance_key  TEXT NOT NULL
+                                REFERENCES trusted_acceptance_receipts(acceptance_key) ON DELETE CASCADE,
+                criterion_id    TEXT NOT NULL,
+                tool            TEXT NOT NULL,
+                check_index     INTEGER NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                actual_sha256   TEXT,
+                accepted        INTEGER NOT NULL DEFAULT 0,
+                evidence_json   TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(acceptance_key, criterion_id, check_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_criteria_key
+                ON trusted_acceptance_criteria(acceptance_key, criterion_id);
+
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_runtime
+                ON trusted_action_executions(status, runtime_finished_at);
+            "#,
+        )?;
+        // Migration-safe runtime-bound columns on the execution receipt.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "runtime_started_at",
+            "runtime_started_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "runtime_finished_at",
+            "runtime_finished_at TEXT",
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_acceptance_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_acceptance_migration; \
+                 RELEASE SAVEPOINT trusted_acceptance_migration;",
             );
             Err(err)
         }

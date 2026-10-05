@@ -63,6 +63,10 @@ pub use trusted_manifests::*;
 pub mod trusted_execution;
 pub use trusted_execution::*;
 
+// Trusted acceptance checks and terminal delivery (Roadmap Priority #2, Part 4)
+pub mod trusted_acceptance;
+pub use trusted_acceptance::*;
+
 // Legacy dashboard/get_* command handlers (WSL-backed)
 pub mod legacy;
 pub use legacy::*;

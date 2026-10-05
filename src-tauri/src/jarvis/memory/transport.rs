@@ -571,6 +571,45 @@ pub fn execute_trusted_manifest(
     Ok(Some(parsed))
 }
 
+/// Dispatch one native-derived trusted acceptance check batch to the live owned
+/// Bun child over the same private authenticated capability path. Returns
+/// `Ok(None)` when no owned child is live; `Err` means the round trip failed
+/// after the request may have been dispatched (the caller must treat the
+/// acceptance attempt as ambiguous and never claim success).
+pub fn execute_trusted_acceptance(
+    transport: &NativeMemoryTransport,
+    request: &crate::commands::trusted_acceptance::TrustedAcceptanceRequestWire,
+) -> Result<Option<crate::commands::trusted_acceptance::TrustedAcceptanceResponseWire>, String> {
+    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        return Ok(None);
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let timeout = std::time::Duration::from_millis(
+        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS
+            + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
+    );
+    let body = transport
+        .post_json_with_timeout("/internal/trusted/acceptance", request, 200, timeout)
+        .map_err(|_| "trusted acceptance transport unavailable".to_string())?;
+    let parsed: crate::commands::trusted_acceptance::TrustedAcceptanceResponseWire =
+        serde_json::from_str(&body)
+            .map_err(|_| "trusted acceptance response could not be read".to_string())?;
+    if parsed.acceptance_id != request.acceptance_id {
+        return Err("trusted acceptance response identity mismatch".to_string());
+    }
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+    {
+        return Err("owned Bun child was replaced during trusted acceptance".to_string());
+    }
+    {
+        let mut state = transport.lock_state();
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(parsed.bun_instance_id.clone());
+    }
+    Ok(Some(parsed))
+}
+
 /// Request cancellation of one in-flight trusted execution by exact execution
 /// id. Returns whether the live owned child reported that it aborted the real
 /// AbortSignal for that operation. Writes nothing.

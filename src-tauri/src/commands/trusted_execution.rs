@@ -149,8 +149,12 @@ pub struct TrustedActionExecution {
     pub run_id: Option<String>,
     pub bun_run_id: Option<String>,
     pub evidence: Option<serde_json::Value>,
+    /// Native claim time (not a runtime start).
     pub started_at: Option<String>,
     pub settled_at: Option<String>,
+    /// Actual Bun runtime bounds from the execution response.
+    pub runtime_started_at: Option<String>,
+    pub runtime_finished_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -159,7 +163,7 @@ pub struct TrustedActionExecution {
 
 // ── Helpers ──────────────────────────────────────────────────
 
-fn sha256(value: &str) -> String {
+pub(crate) fn sha256(value: &str) -> String {
     crate::jarvis::memory::turn::message_sha256(value)
 }
 
@@ -174,18 +178,21 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-struct ManifestScope {
-    manifest_id: String,
-    registry_version: i64,
-    schema_version: i64,
-    content_hash: String,
-    content_json: String,
-    agent_id: String,
-    project_root: String,
-    action_id: Option<String>,
+pub(crate) struct ManifestScope {
+    pub(crate) manifest_id: String,
+    pub(crate) registry_version: i64,
+    pub(crate) schema_version: i64,
+    pub(crate) content_hash: String,
+    pub(crate) content_json: String,
+    pub(crate) agent_id: String,
+    pub(crate) project_root: String,
+    pub(crate) action_id: Option<String>,
 }
 
-fn load_manifest_scope(conn: &Connection, manifest_id: &str) -> Result<Option<ManifestScope>, String> {
+pub(crate) fn load_manifest_scope(
+    conn: &Connection,
+    manifest_id: &str,
+) -> Result<Option<ManifestScope>, String> {
     conn.query_row(
         "SELECT manifest_id, registry_version, schema_version, content_hash, content_json, \
                 agent_id, project_root, action_id \
@@ -347,6 +354,8 @@ fn record_from_row(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
         String,
         String,
     ),
@@ -368,6 +377,8 @@ fn record_from_row(
         evidence_json,
         started_at,
         settled_at,
+        runtime_started_at,
+        runtime_finished_at,
         created_at,
         updated_at,
     ) = row;
@@ -395,6 +406,8 @@ fn record_from_row(
         evidence,
         started_at,
         settled_at,
+        runtime_started_at,
+        runtime_finished_at,
         created_at,
         updated_at,
         conflict: None,
@@ -404,7 +417,7 @@ fn record_from_row(
 const EXECUTION_COLS: &str = "execution_id, idempotency_key, action_id, manifest_id, \
      manifest_registry_version, manifest_content_hash, manifest_schema_version, agent_id, \
      project_root, status, terminal_reason, run_id, bun_run_id, evidence_json, started_at, \
-     settled_at, created_at, updated_at";
+     settled_at, runtime_started_at, runtime_finished_at, created_at, updated_at";
 
 #[allow(clippy::type_complexity)]
 fn map_execution_row(
@@ -420,6 +433,8 @@ fn map_execution_row(
     String,
     String,
     String,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -448,6 +463,8 @@ fn map_execution_row(
         row.get(15)?,
         row.get(16)?,
         row.get(17)?,
+        row.get(18)?,
+        row.get(19)?,
     ))
 }
 
@@ -471,7 +488,10 @@ fn find_execution(
     }
 }
 
-fn load_execution(conn: &Connection, execution_id: &str) -> Result<TrustedActionExecution, String> {
+pub(crate) fn load_execution(
+    conn: &Connection,
+    execution_id: &str,
+) -> Result<TrustedActionExecution, String> {
     find_execution(conn, execution_id)?
         .ok_or_else(|| format!("trusted execution not found: {execution_id}"))
 }
@@ -742,6 +762,27 @@ fn mark_dispatched(conn: &Connection, execution_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// Persist the actual Bun runtime bounds (distinct from the native claim time).
+/// A read failure here is non-fatal to the outcome; the columns are read back
+/// with the receipt.
+pub(crate) fn set_execution_runtime_bounds(
+    conn: &Connection,
+    execution_id: &str,
+    runtime_started_at: Option<&str>,
+    runtime_finished_at: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "UPDATE trusted_action_executions
+         SET runtime_started_at = COALESCE(?1, runtime_started_at),
+             runtime_finished_at = COALESCE(?2, runtime_finished_at),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE execution_id = ?3",
+        params![runtime_started_at, runtime_finished_at, execution_id],
+    )
+    .map_err(|e| format!("failed to persist execution runtime bounds: {e}"))?;
+    Ok(())
+}
+
 /// Persist a receipt and prove it by reading it back. If the readback does not
 /// show the expected status, the row is marked `ambiguous` rather than claiming
 /// a state that was not durably observed.
@@ -798,6 +839,8 @@ fn settle_and_verify(
             evidence: None,
             started_at: None,
             settled_at: None,
+            runtime_started_at: None,
+            runtime_finished_at: None,
             created_at: String::new(),
             updated_at: String::new(),
             conflict: None,
@@ -1155,6 +1198,12 @@ fn run_trusted_execution(
                     Some("unrecognized execution outcome; receipt preserved for reconciliation"),
                 ),
             };
+            let _ = set_execution_runtime_bounds(
+                &conn,
+                &execution_id,
+                Some(&wire_response.started_at),
+                Some(&wire_response.finished_at),
+            );
             let evidence = serde_json::to_value(&wire_response.calls)
                 .map_err(|e| format!("failed to serialize execution evidence: {e}"))?;
             Ok(settle_and_verify(

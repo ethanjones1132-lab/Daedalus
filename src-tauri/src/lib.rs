@@ -1792,6 +1792,8 @@ pub fn run() {
             get_trusted_execution,
             list_trusted_executions,
             cancel_trusted_execution,
+            run_trusted_acceptance,
+            get_trusted_acceptance,
             get_plugins,
             enable_plugin,
             disable_plugin,

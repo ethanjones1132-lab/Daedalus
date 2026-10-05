@@ -854,6 +854,80 @@ fn insert_event(
     Ok(())
 }
 
+/// Complete a Goal ONLY from fully persisted, verified trusted acceptance
+/// evidence. The caller must have already revalidated the accepted receipt rows
+/// inside the same transaction. This reloads the Goal, requires the current
+/// required criterion set to equal the accepted set, flips the status to
+/// `completed`, writes the lifecycle event, links the accepted evidence receipt,
+/// and returns the completed Goal. It never uses the status-only transition
+/// graph. An already-`completed` goal is returned idempotently when the exact
+/// accepted set still matches.
+pub(crate) fn complete_goal_from_accepted_evidence(
+    tx: &rusqlite::Transaction<'_>,
+    goal_id: &str,
+    accepted_criterion_ids: &[String],
+    receipt_ref: &str,
+) -> Result<Goal, String> {
+    let goal = load_goal(tx, goal_id)?;
+    let mut current: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM goal_criteria WHERE goal_id = ?1")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([goal_id], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let mut accepted: Vec<String> = accepted_criterion_ids.to_vec();
+    accepted.sort();
+    accepted.dedup();
+    current.sort();
+
+    if goal.status == "completed" {
+        if current == accepted {
+            return Ok(goal);
+        }
+        return Err(
+            "completed goal criterion set no longer matches the accepted evidence".to_string(),
+        );
+    }
+    if TERMINAL_GOAL_STATUSES.contains(&goal.status.as_str()) {
+        return Err(format!(
+            "goal is terminal ('{}'); cannot complete from acceptance",
+            goal.status
+        ));
+    }
+    if current != accepted {
+        return Err(
+            "goal criterion set does not match the accepted evidence; acceptance is stale"
+                .to_string(),
+        );
+    }
+
+    let now = now_iso();
+    tx.execute(
+        "UPDATE goals SET status = 'completed', updated_at = ?1 WHERE id = ?2",
+        rusqlite::params![&now, goal_id],
+    )
+    .map_err(|e| e.to_string())?;
+    insert_event(
+        tx,
+        goal_id,
+        "transition",
+        Some(&goal.status),
+        Some("completed"),
+        "trusted acceptance accepted all required criteria",
+        &now,
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO goal_links (id, goal_id, target_kind, target_id, created_at) \
+         VALUES (?1, ?2, 'evidence', ?3, ?4)",
+        rusqlite::params![new_id(), goal_id, receipt_ref, now],
+    )
+    .map_err(|e| e.to_string())?;
+    load_goal(tx, goal_id)
+}
+
 // ── Commands ─────────────────────────────────────────────────
 
 /// Create a Goal owned by the user with at least one acceptance criterion.

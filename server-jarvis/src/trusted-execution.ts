@@ -70,6 +70,59 @@ export interface TrustedExecutionResponse {
   finished_at: string;
 }
 
+export interface TrustedAcceptanceCheck {
+  criterion_id: string;
+  index: number;
+  tool: string;
+  arguments?: Record<string, unknown>;
+  expect_sha256: string;
+}
+
+export interface TrustedAcceptanceRequest {
+  acceptance_id: string;
+  execution_id: string;
+  action_id: string;
+  manifest_id: string;
+  manifest_registry_version: number;
+  manifest_content_hash: string;
+  manifest_schema_version: number;
+  agent_id: string;
+  project_root: string;
+  timeout_ms: number;
+  max_checks: number;
+  checks: TrustedAcceptanceCheck[];
+}
+
+export interface TrustedAcceptanceCheckEvidence {
+  criterion_id: string;
+  index: number;
+  tool: string;
+  status: "ok" | "error" | "denied" | "waiting";
+  output_sha256?: string;
+  output_bytes?: number;
+  matched: boolean;
+  error_code?: string;
+  reason?: string;
+}
+
+export interface TrustedAcceptanceResponse {
+  acceptance_id: string;
+  bun_instance_id: string;
+  run_id: string;
+  outcome:
+    | "accepted"
+    | "rejected"
+    | "blocked"
+    | "waiting_for_user"
+    | "failed"
+    | "cancelled"
+    | "partial";
+  reason?: string;
+  calls: TrustedAcceptanceCheckEvidence[];
+  started_at: string;
+  finished_at: string;
+}
+
 /** Deterministic execution allowlist. Writers are execution-only by design. */
 const EXECUTION_TOOLS = new Set([
   "read_file",
@@ -79,6 +132,9 @@ const EXECUTION_TOOLS = new Set([
   "write_file",
   "edit_file",
 ]);
+
+/** Acceptance checks are strictly read-only and deterministic. */
+const ACCEPTANCE_TOOLS = new Set(["read_file", "list_directory", "glob", "grep"]);
 
 const MAX_CALLS = 50;
 const MAX_PAYLOAD_BYTES = 64 * 1024;
@@ -362,6 +418,194 @@ async function executeTrusted(
  * `bunInstanceId` is included in every response so native can detect a replaced
  * child. Returns null for unrelated paths.
  */
+async function executeTrustedAcceptance(
+  request: TrustedAcceptanceRequest,
+  cfg: JarvisConfig,
+  bunInstanceId: string,
+): Promise<TrustedAcceptanceResponse> {
+  const startedAt = new Date().toISOString();
+  const runId = `acceptance_${randomUUID()}`;
+  const checks = Array.isArray(request.checks) ? request.checks : [];
+  const respond = (
+    outcome: TrustedAcceptanceResponse["outcome"],
+    reason: string | undefined,
+    evidence: TrustedAcceptanceCheckEvidence[],
+  ): TrustedAcceptanceResponse => ({
+    acceptance_id: request.acceptance_id,
+    bun_instance_id: bunInstanceId,
+    run_id: runId,
+    outcome,
+    reason,
+    calls: evidence,
+    started_at: startedAt,
+    finished_at: new Date().toISOString(),
+  });
+
+  if (checks.length === 0 || checks.length > 500) {
+    return respond("blocked", "acceptance check list is empty or exceeds the bound", []);
+  }
+  const inflightKey = `accept:${request.acceptance_id}`;
+  if (inFlight.has(inflightKey)) {
+    return respond("blocked", "an acceptance attempt with this identity is already in progress", []);
+  }
+  const controller = new AbortController();
+  inFlight.set(inflightKey, controller);
+  const requestedTimeout = Number(request.timeout_ms);
+  const wholeRunTimeout =
+    Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(requestedTimeout, WHOLE_RUN_TIMEOUT_MS)
+      : WHOLE_RUN_TIMEOUT_MS;
+  const deadlineAt = Date.now() + wholeRunTimeout;
+  const deadlineTimer = setTimeout(() => controller.abort("trusted_timeout"), wholeRunTimeout);
+
+  const runtime = createToolRuntime();
+  registerStandardBundles(runtime);
+
+  const evidence: TrustedAcceptanceCheckEvidence[] = [];
+  let outcome: TrustedAcceptanceResponse["outcome"] = "accepted";
+  let reason: string | undefined;
+  let evidenceBytes = 0;
+
+  try {
+    for (let index = 0; index < checks.length; index += 1) {
+      if (controller.signal.aborted) {
+        outcome = "cancelled";
+        reason = "acceptance cancelled";
+        break;
+      }
+      const check = checks[index];
+      const tool = check && typeof check.tool === "string" ? check.tool : "";
+      const criterionId = check && typeof check.criterion_id === "string" ? check.criterion_id : "";
+      const checkIndex = check && typeof check.index === "number" ? check.index : index;
+      const deny = (error_code: string, why: string, waiting = false): void => {
+        evidence.push({
+          criterion_id: criterionId,
+          index: checkIndex,
+          tool,
+          status: waiting ? "waiting" : "denied",
+          matched: false,
+          error_code,
+          reason: bounded(why),
+        });
+        outcome = waiting ? "waiting_for_user" : "blocked";
+        reason = why;
+      };
+
+      if (!ACCEPTANCE_TOOLS.has(tool)) {
+        deny("tool_not_allowed", "tool is not in the read-only acceptance allowlist");
+        break;
+      }
+      const args =
+        check && check.arguments && typeof check.arguments === "object"
+          ? (check.arguments as Record<string, unknown>)
+          : {};
+      const argError = validateCallArguments(tool, args);
+      if (argError) {
+        deny("invalid_arguments", argError);
+        break;
+      }
+      const def = runtime.listTools().find((d) => d.function.name === tool);
+      if (!def) {
+        deny("unknown_tool", "tool is not registered");
+        break;
+      }
+      const remaining = Math.max(1, deadlineAt - Date.now());
+      const ctx: ExecutionContext = makeExecutionContext("agent", cfg, {
+        interactive: false,
+        workspace_path: request.project_root,
+        timeout_ms: Math.min(remaining, PER_CALL_TIMEOUT_MS),
+        signal: controller.signal,
+      });
+      const policy = evaluatePolicy(def, ctx);
+      if (policy.decision !== "allow") {
+        const needsUser =
+          policy.decision === "ask" ||
+          policy.source === "approval_non_interactive" ||
+          policy.source === "tool_requires_approval" ||
+          policy.source === "config_requires_approval";
+        deny(
+          policy.decision === "ask" ? "approval_required" : "policy_denied",
+          policy.reason || policy.source,
+          needsUser,
+        );
+        break;
+      }
+
+      const result = await runtime.execute({ id: `acceptance-${index}`, name: tool, arguments: args }, ctx);
+      if (result.is_error) {
+        evidence.push({
+          criterion_id: criterionId,
+          index: checkIndex,
+          tool,
+          status: "error",
+          matched: false,
+          error_code: result.error_code,
+          reason: bounded(result.error || result.output || "acceptance check failed"),
+        });
+        if (result.error_code === "cancelled") {
+          outcome = "cancelled";
+          reason = "acceptance cancelled";
+        } else if (result.error_code === "timeout") {
+          outcome = "failed";
+          reason = "acceptance deadline exceeded";
+        } else {
+          outcome = "rejected";
+          reason = result.error || result.output || "acceptance check failed";
+        }
+        break;
+      }
+
+      const output = typeof result.output === "string" ? result.output : String(result.output ?? "");
+      const outputBytes = Buffer.byteLength(output, "utf8");
+      const outputSha256 = createHash("sha256").update(output, "utf8").digest("hex");
+      const matched =
+        typeof check.expect_sha256 === "string" && outputSha256 === check.expect_sha256;
+      evidence.push({
+        criterion_id: criterionId,
+        index: checkIndex,
+        tool,
+        status: "ok",
+        output_sha256: outputSha256,
+        output_bytes: outputBytes,
+        matched,
+      });
+      evidenceBytes += Math.min(outputBytes, MAX_EVIDENCE_BYTES_PER_CALL);
+      if (!matched) {
+        outcome = "rejected";
+        reason = "acceptance check output did not match the trusted expectation";
+        break;
+      }
+      if (evidenceBytes >= MAX_TOTAL_EVIDENCE_BYTES && index < checks.length - 1) {
+        outcome = "partial";
+        reason = "acceptance evidence budget reached; remaining checks were not run";
+        break;
+      }
+    }
+  } finally {
+    clearTimeout(deadlineTimer);
+    inFlight.delete(inflightKey);
+  }
+
+  if (
+    controller.signal.aborted &&
+    outcome !== "waiting_for_user" &&
+    outcome !== "blocked" &&
+    outcome !== "cancelled" &&
+    outcome !== "rejected" &&
+    outcome !== "partial"
+  ) {
+    if (controller.signal.reason === "trusted_timeout") {
+      outcome = "failed";
+      reason = "acceptance deadline exceeded";
+    } else {
+      outcome = "cancelled";
+      reason = "acceptance cancelled";
+    }
+  }
+
+  return respond(outcome, reason, evidence);
+}
+
 export async function handleTrustedExecutionRequest(
   req: Request,
   cfg: JarvisConfig,
@@ -396,6 +640,24 @@ export async function handleTrustedExecutionRequest(
       return json({ code: "invalid_request" }, 400);
     }
     const response = await executeTrusted(request, cfg, bunInstanceId);
+    return json(response);
+  }
+
+  if (path === "/internal/trusted/acceptance" && req.method === "POST") {
+    let request: TrustedAcceptanceRequest;
+    try {
+      request = (await readBoundedBody(req)) as TrustedAcceptanceRequest;
+    } catch {
+      return json({ code: "invalid_request" }, 400);
+    }
+    if (
+      !request ||
+      typeof request.acceptance_id !== "string" ||
+      request.acceptance_id.length === 0
+    ) {
+      return json({ code: "invalid_request" }, 400);
+    }
+    const response = await executeTrustedAcceptance(request, cfg, bunInstanceId);
     return json(response);
   }
 
