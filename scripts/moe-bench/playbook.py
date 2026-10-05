@@ -180,3 +180,92 @@ def mcnemar_p(b, c):
     if n == 0:
         return 1.0
     return min(1.0, 2 * sum(math.comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n)
+
+
+def by_category(rows_ok):
+    """rows_ok: [(category, ok)] -> {category: solved}."""
+    res = collections.Counter()
+    for cat, ok in rows_ok:
+        res[cat] += ok
+    return dict(sorted(res.items()))
+
+
+def fit_cmd(a):
+    calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
+    recs, cards = records(read_jsonl(a.trials), read_jsonl(a.labels), calib)
+    budget = fixed(recs, "R")[1]
+    out = {"budget_secs": round(budget, 3), "records": len(recs)}
+    for name, use_p in (("verify", True), ("noverify", False)):
+        best = fit(recs, cards, budget, use_p)
+        if best is None:
+            sys.exit(f"no {name} rule fits the recipe's {budget:.2f} s budget")
+        rule, solved, secs = best
+        out[name] = rule
+        out[f"{name}_fit"] = {"solved": solved, "mean_secs": round(secs, 3), "playbooks": dict(
+            collections.Counter(choose(cards.get(r["task"]), rule) for r in recs))}
+    out["calib_pool"] = {pb: fixed(recs, pb)[0] for pb in PLAYBOOKS}
+    out["calib_pool"].update(oracle=oracle(recs), n=len(recs))
+    pathlib.Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
+    print(json.dumps(out, indent=1))
+
+
+def report_cmd(a):
+    """Configurations 1, 2 and 6 from the judge set's nested runs, 3-5 from the live files, and the bar (spec §5)."""
+    calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
+    rules = json.loads(pathlib.Path(a.rule).read_text(encoding="utf-8"))
+    recs, cards = records(read_jsonl(a.trials), read_jsonl(a.labels), calib)
+    base = {(r["task"], r["trial"]): bool(outcome(r, "R")[0]) for r in recs}
+    res = {"n": len(recs)}
+    for label, play in (("c1_single", "S"), ("c2_recipe", "R")):
+        solved, secs = fixed(recs, play)
+        res[label] = {"solved": solved, "mean_secs": round(secs, 3),
+                      "by_category": by_category((r["category"], outcome(r, play)[0]) for r in recs)}
+    res["c6_oracle"] = {"solved": oracle(recs)}
+    sim = system(recs, cards, rules["verify"], True)
+    res["c4_simulated"] = {"solved": sim[0], "mean_secs": round(sim[1], 3)}
+    live = {}
+    for spec in a.live:
+        label, path = spec.split("=", 1)
+        rows = {(r["task"], r["trial"]): r for r in read_jsonl(path) if r.get("type") == "live"}
+        live[label] = rows
+        res[label] = {"solved": sum(r["graded_ok"] for r in rows.values()), "n": len(rows),
+                      "mean_secs": round(sum(r["model_secs"] for r in rows.values()) / max(len(rows), 1), 3),
+                      "by_category": by_category((r["category"], r["graded_ok"]) for r in rows.values()),
+                      "playbooks": dict(collections.Counter(r["playbook"] for r in rows.values())),
+                      "early_stops": sum(r["early_stop"] for r in rows.values()),
+                      "escalations": sum(r["escalated"] for r in rows.values()),
+                      "laya_fallbacks": sum(not r["laya_ok"] for r in rows.values())}
+    if "c4" in live:
+        rows4 = live["c4"]
+        b = sum(1 for k, r in rows4.items() if k in base and r["graded_ok"] and not base[k])
+        c = sum(1 for k, r in rows4.items() if k in base and not r["graded_ok"] and base[k])
+        p = mcnemar_p(b, c)
+        res["bar"] = {"c4_only": b, "recipe_only": c, "mcnemar_p": p, "c4_secs": res["c4"]["mean_secs"],
+                      "recipe_secs": res["c2_recipe"]["mean_secs"],
+                      "met": res["c4"]["solved"] > res["c2_recipe"]["solved"] and p < 0.10
+                      and res["c4"]["mean_secs"] <= res["c2_recipe"]["mean_secs"]}
+    if a.out:
+        pathlib.Path(a.out).write_text(json.dumps(res, indent=1), encoding="utf-8")
+    print(json.dumps(res, indent=1))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("fit", "report"):
+        s = sub.add_parser(name)
+        s.add_argument("--trials", required=True)
+        s.add_argument("--labels", required=True)
+        s.add_argument("--calib", required=True)
+        if name == "fit":
+            s.add_argument("--out", required=True)
+        else:
+            s.add_argument("--rule", required=True)
+            s.add_argument("--live", action="append", default=[])
+            s.add_argument("--out")
+    a = ap.parse_args()
+    fit_cmd(a) if a.cmd == "fit" else report_cmd(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -153,5 +153,47 @@ class MatchesBestofnTest(unittest.TestCase):
             self.assertEqual(pb.pick(cands, ("s0",))["cand"], bon.pick(cands, "selftest")["cand"])
 
 
+class CommandsTest(unittest.TestCase):
+    def test_fit_commands_end_to_end(self):
+        import argparse
+        import tempfile
+        import laya_calibrate as lc
+        d = pathlib.Path(tempfile.mkdtemp())
+        trials, labels = [], []
+        for t in range(10):
+            cat = "B" if t < 3 else "A"
+            easy = t >= 6
+            for trial in range(3):
+                cands = []
+                for run, n in (("r8", 8), ("pr", 3)):
+                    for c in range(n):
+                        ok = easy or (cat == "B" and run == "pr") or (c == 1 and run == "r8")
+                        cands.append({"run": run, "cand": c, "secs": 1.0, "compiles": True, "imports": True,
+                                      "graded_ok": ok, "code": "x = 1",
+                                      "self": {s: {"t0": ok} for s in ("r8s0", "r8s1", "prs0")}})
+                        labels.append({"type": "verify", "task": f"t{t}", "trial": trial, "run": run, "cand": c,
+                                       "form": "noul", "p": 0.8 if ok else 0.3, "secs": 0.3})
+                        labels.append({"type": "verify", "task": f"t{t}", "trial": trial, "run": run, "cand": c,
+                                       "form": "rubric", "p": 0.5, "secs": 0.3})
+                trials.append({"type": "trial", "task": f"t{t}", "category": cat, "trial": trial,
+                               "suites": {s: {"secs": 1.0} for s in ("r8s0", "r8s1", "prs0")},
+                               "probe": {"secs_gen": 1.0, "secs_exec": 0.2}, "cands": cands})
+            for w in ("v1", "v2"):
+                labels.append({"type": "card", "task": f"t{t}", "wording": w, "secs": 0.35,
+                               "card": {"kind": "unseen" if cat == "B" else "algorithm", "kind_p": {},
+                                        "unseen": (0.9 if cat == "B" else 0.2) if w == "v1" else 0.5,
+                                        "effort_p": [0.8, 0.1, 0.1] if easy else [0.1, 0.3, 0.6]}})
+        (d / "n.jsonl").write_text("\n".join(map(json.dumps, trials)), encoding="utf-8")
+        (d / "l.jsonl").write_text("\n".join(map(json.dumps, labels)), encoding="utf-8")
+        lc.fit_cmd(argparse.Namespace(trials=str(d / "n.jsonl"), labels=str(d / "l.jsonl"), out=str(d / "c.json")))
+        calib = json.loads((d / "c.json").read_text(encoding="utf-8"))
+        self.assertEqual(calib["classify_wording"], "v1")
+        self.assertEqual(calib["verify_form"], "noul")
+        pb.fit_cmd(argparse.Namespace(trials=str(d / "n.jsonl"), labels=str(d / "l.jsonl"),
+                                      calib=str(d / "c.json"), out=str(d / "r.json")))
+        rule = json.loads((d / "r.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(rule["verify_fit"]["solved"], rule["calib_pool"]["R"])
+        self.assertLessEqual(rule["verify_fit"]["mean_secs"], rule["budget_secs"])
+
 if __name__ == "__main__":
     unittest.main()

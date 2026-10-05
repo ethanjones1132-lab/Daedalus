@@ -113,3 +113,146 @@ def calibrate_card(raw, platt):
             "p_little": platt_apply(ep[0], platt["effort_little"]),
             "p_alot": platt_apply(ep[2], platt["effort_alot"]),
             "effort_top": max(range(3), key=lambda i: ep[i])}
+
+
+def pairs_auc(pairs):
+    return auc([p for p, y in pairs if y], [p for p, y in pairs if not y])
+
+
+def _num(x):
+    return 0.5 if x != x else x  # NaN (one class only) counts as no separation
+
+
+def quantities(cards, cats, s_ok, r_ok):
+    """name -> [(raw probability, label)] for one wording's raw cards."""
+    return {"unseen": [(c["unseen"], cats[t] == "B") for t, c in cards.items() if t in cats],
+            "effort_little": [(cards[t]["effort_p"][0], ok) for (t, _), ok in s_ok.items() if t in cards],
+            "effort_alot": [(cards[t]["effort_p"][2], not ok) for (t, _), ok in r_ok.items() if t in cards]}
+
+
+def outcomes(trial_rows, label_rows):
+    """Labels from the nested runs: categories, single-shot and recipe outcomes per task-trial, grading per
+    candidate."""
+    import playbook  # playbook imports this module, so import it here
+    recs, _ = playbook.records(trial_rows, label_rows, IDENTITY)
+    cats = {r["task"]: r["category"] for r in recs}
+    s_ok = {(r["task"], r["trial"]): bool(playbook.outcome(r, "S")[0]) for r in recs}
+    r_ok = {(r["task"], r["trial"]): bool(playbook.outcome(r, "R")[0]) for r in recs}
+    cand_ok = {(r["task"], r["trial"], c["run"], c["cand"]): c["graded_ok"]
+               for r in recs for run in ("r8", "pr") for c in r["cands"][run]}
+    return cats, s_ok, r_ok, cand_ok
+
+
+def verify_pairs(label_rows, cand_ok, form):
+    return [(r["p"], cand_ok[k]) for r in label_rows if r["type"] == "verify" and r["form"] == form
+            and r["p"] is not None and (k := (r["task"], r["trial"], r["run"], r["cand"])) in cand_ok]
+
+
+def cards_of(label_rows, wording):
+    return {r["task"]: r["card"] for r in label_rows if r["type"] == "card" and r["wording"] == wording}
+
+
+def kind_accuracy(cards, cats):
+    hits = [cards[t]["kind"] == KIND_OF[cats[t]] for t in cards if t in cats]
+    return sum(hits) / max(len(hits), 1)
+
+
+def diagnose(data, platt):
+    """Per quantity: n, AUC, and ECE before and after calibration."""
+    rep = {}
+    for q, v in data.items():
+        probs, ys = [p for p, _ in v], [int(y) for _, y in v]
+        rep[q] = {"n": len(v), "positives": sum(ys), "auc": pairs_auc(v), "ece_raw": ece(probs, ys),
+                  "ece_cal": ece([platt_apply(p, platt[q]) for p in probs], ys)}
+    return rep
+
+
+def fit_cmd(a):
+    trials, labels = read_jsonl(a.trials), read_jsonl(a.labels)
+    cats, s_ok, r_ok, cand_ok = outcomes(trials, labels)
+    wq = {w: quantities(cards_of(labels, w), cats, s_ok, r_ok) for w in WORDINGS}
+    wauc = {w: {q: pairs_auc(v) for q, v in wq[w].items()} for w in WORDINGS}
+    wording = max(WORDINGS, key=lambda w: sum(_num(x) for x in wauc[w].values()))
+    vp = {f: verify_pairs(labels, cand_ok, f) for f in FORMS}
+    vauc = {f: pairs_auc(vp[f]) for f in FORMS}
+    form = max(FORMS, key=lambda f: _num(vauc[f]))
+    data = dict(wq[wording], verify=vp[form])
+    platt = {q: list(platt_fit([p for p, _ in v], [int(y) for _, y in v])) for q, v in data.items()}
+    calib = {"classify_wording": wording, "verify_form": form, "platt": platt,
+             "report": {"wording_auc": wauc, "verify_auc": vauc,
+                        "kind_accuracy": {w: kind_accuracy(cards_of(labels, w), cats) for w in WORDINGS},
+                        "chosen": diagnose(data, platt)}}
+    pathlib.Path(a.out).write_text(json.dumps(calib, indent=1), encoding="utf-8")
+    print(json.dumps(calib, indent=1))
+
+
+def report_cmd(a):
+    """Laya's diagnostics on a scored set, with the committed calibration (judge set: spec §5)."""
+    calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
+    trials, labels = read_jsonl(a.trials), read_jsonl(a.labels)
+    cats, s_ok, r_ok, cand_ok = outcomes(trials, labels)
+    cards = cards_of(labels, calib["classify_wording"])
+    data = dict(quantities(cards, cats, s_ok, r_ok), verify=verify_pairs(labels, cand_ok, calib["verify_form"]))
+    rep = {"diagnostics": diagnose(data, calib["platt"]), "kind_accuracy": kind_accuracy(cards, cats)}
+    if a.out:
+        pathlib.Path(a.out).write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    print(json.dumps(rep, indent=1))
+
+
+def zeroshot_cmd(a):
+    """Zero-shot baseline on tier2b (spec §5), reported once and never used for tuning: both wordings against
+    tier2b's categories and a stored best-of-N run (S = candidate 0; R = candidates 0-2 picked on suite s0), both
+    verify forms against that run's grading."""
+    import collections
+    import playbook
+    rows = [r for r in read_jsonl(a.bestofn) if r.get("type") == "cand"]
+    latest = {(r["task"], r["trial"], r["cand"]): r for r in rows}
+    by = collections.defaultdict(list)
+    for r in latest.values():
+        by[(r["task"], r["trial"])].append(r)
+    cats = {r["task"]: r["category"] for r in rows}
+    s_ok, r_ok = {}, {}
+    for k, cands in by.items():
+        cands.sort(key=lambda r: r["cand"])
+        s_ok[k] = bool(cands[0]["graded_ok"])
+        r_ok[k] = bool(playbook.pick(cands[:3], ("s0",))["graded_ok"])
+    cand_ok = {(t, tr, "bon", c): r["graded_ok"] for (t, tr, c), r in latest.items()}
+    labels = read_jsonl(a.labels)
+    rep = {"tasks": len(cats), "task_trials": len(by), "candidates": len(cand_ok), "wordings": {}, "forms": {}}
+    for w in WORDINGS:
+        cards = cards_of(labels, w)
+        q = quantities(cards, cats, s_ok, r_ok)
+        rep["wordings"][w] = {"auc": {k: pairs_auc(v) for k, v in q.items()},
+                              "kind_accuracy": kind_accuracy(cards, cats)}
+    for f in FORMS:
+        v = verify_pairs(labels, cand_ok, f)
+        right, wrong = [p for p, y in v if y], [p for p, y in v if not y]
+        rep["forms"][f] = {"auc": pairs_auc(v), "n": len(v), "mean_p_right": sum(right) / max(len(right), 1),
+                           "mean_p_wrong": sum(wrong) / max(len(wrong), 1)}
+    if a.out:
+        pathlib.Path(a.out).write_text(json.dumps(rep, indent=1), encoding="utf-8")
+    print(json.dumps(rep, indent=1))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    f = sub.add_parser("fit")
+    f.add_argument("--trials", required=True)
+    f.add_argument("--labels", required=True)
+    f.add_argument("--out", required=True)
+    r = sub.add_parser("report")
+    r.add_argument("--trials", required=True)
+    r.add_argument("--labels", required=True)
+    r.add_argument("--calib", required=True)
+    r.add_argument("--out")
+    z = sub.add_parser("zeroshot")
+    z.add_argument("--bestofn", required=True)
+    z.add_argument("--labels", required=True)
+    z.add_argument("--out")
+    a = ap.parse_args()
+    {"fit": fit_cmd, "report": report_cmd, "zeroshot": zeroshot_cmd}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
