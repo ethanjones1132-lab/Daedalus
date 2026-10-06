@@ -33,6 +33,7 @@ M = f"{MD}/IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
 RESIDENT = ["--load-mode", "none", "--lazy-mode", "off"]
 RATE = 0.000542 + 8 * 0.0000131 + 64 * 0.00000222  # $/s: L40S + 8 cores + 64 GiB
 POOL = f"{R}/docs/benchmarks/laya-calib"
+LLAMA_SRC = pathlib.Path(r"C:\build\wt-master")  # llama.cpp 836d571, the local build's source
 
 image = (
     modal.Image.from_registry(LLAMA_IMAGE, add_python="3.12")
@@ -54,6 +55,10 @@ torch_image = (
     .env({"LD_LIBRARY_PATH": "/app", "PYTHONPATH": "/app/gguf-py:/opt/distill", "HF_HUB_DISABLE_PROGRESS_BARS": "1"})
     .add_local_file(HERE.parent / "distill" / "reverse_map.py", "/opt/distill/reverse_map.py")
     .add_local_file(ROOT / "docs" / "benchmarks" / "adapters" / "heldout.txt", "/opt/heldout.txt")
+    # the LoRA converter from the same 836d571 tree as the local llama.cpp that will load the LoRA
+    .add_local_file(LLAMA_SRC / "convert_lora_to_gguf.py", "/opt/llama/convert_lora_to_gguf.py")
+    .add_local_dir(LLAMA_SRC / "conversion", "/opt/llama/conversion")
+    .add_local_dir(LLAMA_SRC / "gguf-py", "/opt/llama/gguf-py")
 )
 A100_RATE = 0.000694 + 8 * 0.0000131 + 64 * 0.00000222  # $/s
 KEEP96 = f"{W}/keep96/keep96.gguf"  # the served file, uploaded with `modal volume put`
@@ -145,8 +150,8 @@ def names(n_experts: int = 96):
         fla_ok = True
     except Exception as e:  # noqa: BLE001
         fla_ok = repr(e)
-    return {"transformers": transformers.__version__, "torch": torch.__version__, "fla": fla_ok,
-            "params": {n: list(p.shape) for n, p in m.named_parameters()}}
+    return {"transformers": str(transformers.__version__), "torch": str(torch.__version__), "fla": fla_ok,
+            "params": {n: [int(d) for d in p.shape] for n, p in m.named_parameters()}}  # plain types: no torch locally
 
 
 def load_student(gguf_path):
@@ -236,6 +241,96 @@ def parity():
     json.dump(res, open(f"{W}/gates/parity.json", "w"), indent=1)
     vol.commit()
     return res
+
+
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj",  # full attention
+                "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",  # DeltaNet
+                "shared_expert.gate_proj", "shared_expert.up_proj", "shared_expert.down_proj"]  # not the routed experts
+
+
+@app.function(gpu="A100-80GB", volumes={W: vol}, timeout=3600, cpu=8, memory=64 * 1024, image=torch_image)
+def overfit(examples: list, steps: int = 40, rank: int = 16, lr: float = 1e-3):
+    """Gates 2.5 and 2.6: a LoRA on the dequantized student trains (DeltaNet path included), overfits `examples`
+    ([prompt_text, answer_text] in the model's chat format) to >= 95% greedy token reproduction, and
+    convert_lora_to_gguf.py turns it into a GGUF LoRA (on the volume, for the local served check)."""
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    model, hp, rep = load_student(KEEP96)
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.6-35B-A3B")
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})  # frozen inputs
+    model.config.use_cache = False
+    model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.0, target_modules=LORA_TARGETS))
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    batch = []
+    for prompt, answer in examples:
+        p_ids = tok(prompt, add_special_tokens=False).input_ids
+        a_ids = tok(answer, add_special_tokens=False).input_ids
+        ids = torch.tensor([p_ids + a_ids], device="cuda")
+        labels = torch.tensor([[-100] * len(p_ids) + a_ids], device="cuda")
+        batch.append((ids, labels, len(p_ids)))
+
+    def reproduction():
+        model.eval()
+        hit = tot = 0
+        with torch.no_grad():
+            for ids, labels, n_p in batch:
+                pred = model(input_ids=ids).logits[0, n_p - 1:-1].argmax(-1)
+                hit += int((pred == ids[0, n_p:]).sum())
+                tot += ids.shape[1] - n_p
+        model.train()
+        return hit / max(tot, 1)
+
+    before = reproduction()
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
+    losses = []
+    model.train()
+    for step in range(steps):
+        tot = 0.0
+        for ids, labels, _ in batch:
+            loss = model(input_ids=ids, labels=labels).loss
+            loss.backward()
+            tot += float(loss)
+        opt.step()
+        opt.zero_grad()
+        losses.append(round(tot / len(batch), 4))
+    after = reproduction()
+    out = f"{W}/gates/overfit-lora"
+    model.save_pretrained(out)
+    # convert_lora_to_gguf.py needs the base's config: the official one with the served expert count
+    base = "/tmp/student-config"
+    os.makedirs(base, exist_ok=True)
+    student_config(rep["experts"]).save_pretrained(base)
+    tok.save_pretrained(base)
+    cfg = json.load(open(f"{base}/config.json"))
+    cfg["architectures"] = ["Qwen3_5MoeForCausalLM"]
+    json.dump(cfg, open(f"{base}/config.json", "w"))
+    conv = subprocess.run([sys.executable, "/opt/llama/convert_lora_to_gguf.py", "--base", base, "--outfile",
+                           f"{W}/gates/overfit-lora.gguf", "--outtype", "f16", out], capture_output=True, text=True)
+    secs = time.time() - t0
+    res = {"trainable_params": n_train, "steps": steps, "losses": losses[::max(1, steps // 10)] + losses[-1:],
+           "reproduction_before": round(before, 4), "reproduction_after": round(after, 4),
+           "pass_pytorch": after >= 0.95, "convert_exit": conv.returncode, "convert_tail": (conv.stdout + conv.stderr)[-1500:],
+           "lora_gguf_bytes": os.path.getsize(f"{W}/gates/overfit-lora.gguf") if os.path.exists(f"{W}/gates/overfit-lora.gguf") else 0,
+           "names": {k: (v if not isinstance(v, list) else v[:12]) for k, v in rep.items()},
+           "seconds": round(secs), "cost_usd_est": round(secs * A100_RATE, 2)}
+    json.dump(res, open(f"{W}/gates/overfit.json", "w"), indent=1)
+    vol.commit()
+    return res
+
+
+@app.local_entrypoint()
+def gate_overfit(rows: str, n: int = 20, steps: int = 40):
+    """rows: a patch_calib.py rows file; its first n single-shot turns (prompt, answer) are the overfit set."""
+    ex = []
+    for line in open(rows, encoding="utf-8"):
+        r = json.loads(line)
+        head, sep, rest = r["text_single"].rpartition("</think>\n\n")  # served prompts end with the empty think block
+        ex.append([head + sep, rest.removesuffix("\n")])
+        if len(ex) == n:
+            break
+    print(json.dumps(overfit.remote(ex, steps), indent=1))
 
 
 @app.local_entrypoint()
