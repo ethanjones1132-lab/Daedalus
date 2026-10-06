@@ -131,8 +131,8 @@ def chat(url, messages, **kw):
     return json.load(urllib.request.urlopen(req, timeout=900))
 
 
-@app.function(gpu="L40S", volumes={W: vol}, timeout=2 * 3600, cpu=8, memory=64 * 1024)
-def gen_tasks(prompts: list, parallel: int = 4):
+@app.function(gpu="L40S", volumes={W: vol}, timeout=3 * 3600, cpu=8, memory=64 * 1024)
+def gen_tasks(prompts: list, parallel: int = 8):
     """Task 3: Flash-Next (thinking off) writes candidate training tasks, one JSON object per prompt from
     train_tasks/families.py, JSON-constrained. Resumable: /vol/train_tasks/raw.jsonl keeps every answer."""
     import concurrent.futures

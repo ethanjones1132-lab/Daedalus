@@ -121,8 +121,8 @@ def normalize(raw):
     t["name"] = name if name.startswith("t_") else "t_" + name
     t["category"] = fam
     t["topic"] = raw["topic"]
-    return {k: t[k] for k in ("name", "category", "entry", "files", "spec", "reference", "test", "topic")
-            | ({"hidden_file"} if "hidden_file" in t else set())}, None
+    keys = ["name", "category", "entry", "files", "spec", "reference", "test", "topic"]
+    return {k: t[k] for k in keys + (["hidden_file"] if "hidden_file" in t else [])}, None
 
 
 def check_examples(a):

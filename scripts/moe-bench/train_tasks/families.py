@@ -173,13 +173,13 @@ def prompt(family, topic, n):
 
 
 def prompts(per_family, seed=0):
-    """[(id, family, topic, text)]: per_family prompts per family, topics shuffled per family."""
+    """[(id, family, topic, text)]: per_family prompts per family, topics shuffled per family, in round-robin
+    family order so a run cut off early still covers every family (ids and topics do not depend on the order)."""
     rng = random.Random(seed)
-    out = []
+    by = {}
     for fam in FAMILIES:
         topics = TOPICS[:]
         rng.shuffle(topics)
-        for i in range(per_family):
-            topic = topics[i % len(topics)]
-            out.append((f"{fam}{i:04d}", fam, topic, prompt(fam, topic, i % 7 + 1)))
-    return out
+        by[fam] = [(f"{fam}{i:04d}", fam, topics[i % len(topics)], prompt(fam, topics[i % len(topics)], i % 7 + 1))
+                   for i in range(per_family)]
+    return [by[fam][i] for i in range(per_family) for fam in FAMILIES]
