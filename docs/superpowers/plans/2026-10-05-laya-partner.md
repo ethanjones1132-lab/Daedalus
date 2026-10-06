@@ -1970,3 +1970,15 @@ git add docs scripts/moe-bench/README.md
 git commit -m "docs(laya-partner): judge results"
 git push
 ```
+
+---
+
+## Execution notes
+
+- **Task 2:** `platt_fit` gained a backtracking line search. The plain Newton step diverged when every probability was alike; `test_platt_pulls_overconfidence_to_the_base_rate` caught it.
+- **Tasks 8–9:** a check against tier2b's 39 tasks found collisions, and 22 of the tasks named in the tables above were replaced before anything ran on them.
+  - **Shared names:** `merge_sorted`, `roman_to_int`, `clamp`, the hash fingerprint, the money label.
+  - **Shared conventions:** running sums, nested lookups, None on divide by zero, creating parent folders, run-and-capture, JSON-or-default, BOM decoding, appending log lines, chunking.
+  - **Calibration replacements:** `c_matrix_transpose`, `c_lcm_list`, `c_digital_root`, `c_pair_sum_count`, `c_parse_percent`, `c_as_list`, `c_parse_version`, `c_newest_file`, `c_merge_text_files`, `c_initials_lib`, `c_ordinal_lib`, `c_plural_lib`.
+  - **Judge replacements:** `j_wrap_index`, `j_split_file`, `j_dir_size`, `j_copy_tree_ext`, `j_line_endings`, `j_unique_name`, `j_bmi_lib`, `j_mime_lib`, `j_luhn_lib`, `j_duration_lib`.
+  - **Final state:** the three sets share no function names, `lib/` file names or task names. The task files are the source of truth.

@@ -127,69 +127,6 @@ assert tail("app.log", 2) == ["l3", "l4"], tail("app.log", 2)
 assert tail("app.log", 10) == ["l1", "l2", "l3", "l4"]
 assert tail("app.log", 0) == []
 '''),
-    dict(name="c_run_capture", category="D", entry="runner.py",
-         files={"runner.py": '''import subprocess
-
-
-def run(args):
-    """Run a command; return (exit code, stdout without surrounding whitespace)."""
-    r = subprocess.run(args, capture_output=True, text=True, check=True)
-    return r.returncode, r.stdout.strip()
-'''},
-         spec="run(args) must report failing commands instead of raising: a command that exits with code 3 and "
-              "prints 'x' returns (3, 'x').",
-         reference='''import subprocess
-
-
-def run(args):
-    """Run a command; return (exit code, stdout without surrounding whitespace)."""
-    r = subprocess.run(args, capture_output=True, text=True)
-    return r.returncode, r.stdout.strip()
-''',
-         test='''import sys
-from runner import run
-assert run([sys.executable, "-c", "print('hi')"]) == (0, "hi")
-assert run([sys.executable, "-c", "import sys; print('x'); sys.exit(3)"]) == (3, "x")
-'''),
-    dict(name="c_json_set", category="D", entry="store.py",
-         files={"store.py": '''import json
-import os
-
-
-def set_key(path, key, value):
-    """Set key to value in the JSON object stored at path (created if missing)."""
-    data = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    data[key] = value
-    with open(path, "a", encoding="utf-8") as f:
-        json.dump(data, f)
-'''},
-         spec="After any number of set_key calls the file must hold one valid JSON object with every key set so "
-              "far; a second call currently corrupts it.",
-         reference='''import json
-import os
-
-
-def set_key(path, key, value):
-    """Set key to value in the JSON object stored at path (created if missing)."""
-    data = {}
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    data[key] = value
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-''',
-         test='''import json
-from store import set_key
-set_key("s.json", "a", 1)
-set_key("s.json", "b", [2])
-set_key("s.json", "a", 3)
-with open("s.json", encoding="utf-8") as f:
-    assert json.load(f) == {"a": 3, "b": [2]}
-'''),
     dict(name="c_safe_join", category="D", entry="uploads.py",
          files={"uploads.py": '''import os
 
@@ -318,5 +255,63 @@ write_lines("o.txt", ["a", "b"])
 assert open("o.txt", encoding="utf-8").read() == "a\\nb\\n"
 write_lines("e.txt", [])
 assert open("e.txt", encoding="utf-8").read() == ""
+'''),
+    dict(name="c_newest_file", category="D", entry="recent.py",
+         files={"recent.py": '''import os
+
+
+def newest_file(folder):
+    """Name of the most recently modified file in folder, or None if it has no files."""
+    names = os.listdir(folder)
+    return max(names) if names else None
+'''},
+         spec="Pick the file with the latest modification time (not the alphabetically last name), ignore "
+              "sub-folders, and return None when the folder has no files.",
+         reference='''import os
+
+
+def newest_file(folder):
+    """Name of the most recently modified file in folder, or None if it has no files."""
+    files = [n for n in os.listdir(folder) if os.path.isfile(os.path.join(folder, n))]
+    if not files:
+        return None
+    return max(files, key=lambda n: os.path.getmtime(os.path.join(folder, n)))
+''',
+         test='''import os
+from recent import newest_file
+os.makedirs("box/zz_dir", exist_ok=True)
+for name, t in (("a.txt", 3000), ("b.txt", 1000), ("c.txt", 2000)):
+    open(os.path.join("box", name), "w").close()
+    os.utime(os.path.join("box", name), (t, t))
+assert newest_file("box") == "a.txt", newest_file("box")
+os.makedirs("empty/sub", exist_ok=True)
+assert newest_file("empty") is None
+'''),
+    dict(name="c_merge_text_files", category="D", entry="merge.py",
+         files={"merge.py": '''def merge_files(paths, out):
+    """Concatenate text files into out."""
+    with open(out, "w", encoding="utf-8") as w:
+        for p in paths:
+            with open(p, encoding="utf-8") as f:
+                w.write(f.read())
+'''},
+         spec="When a file does not end with a newline, its last line currently runs into the next file's first "
+              "line. Each file's content must end with a newline in the output (empty files add nothing).",
+         reference='''def merge_files(paths, out):
+    """Concatenate text files into out."""
+    with open(out, "w", encoding="utf-8") as w:
+        for p in paths:
+            with open(p, encoding="utf-8") as f:
+                text = f.read()
+            if text and not text.endswith("\\n"):
+                text += "\\n"
+            w.write(text)
+''',
+         test='''from merge import merge_files
+open("a.txt", "w", encoding="utf-8").write("x")
+open("b.txt", "w", encoding="utf-8").write("y\\n")
+open("c.txt", "w", encoding="utf-8").write("")
+merge_files(["a.txt", "c.txt", "b.txt"], "out.txt")
+assert open("out.txt", encoding="utf-8").read() == "x\\ny\\n", repr(open("out.txt", encoding="utf-8").read())
 '''),
 ]

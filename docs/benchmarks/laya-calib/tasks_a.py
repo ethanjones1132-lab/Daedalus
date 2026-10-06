@@ -36,41 +36,6 @@ assert rle_encode("") == []
 assert rle_encode("x") == [("x", 1)]
 assert rle_encode("abba") == [("a", 1), ("b", 2), ("a", 1)]
 '''),
-    dict(name="c_balanced_brackets", category="A", entry="solution.py",
-         files={"solution.py": '''def balanced(s):
-    """True if every bracket in s is closed by the matching kind, in the right order."""
-    depth = 0
-    for ch in s:
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
-'''},
-         spec="balanced(s) must check bracket kinds and nesting order for (), [] and {}: '([]{})' is balanced, "
-              "'(]' and '([)]' are not. Other characters are ignored.",
-         reference='''def balanced(s):
-    """True if every bracket in s is closed by the matching kind, in the right order."""
-    pairs = {")": "(", "]": "[", "}": "{"}
-    stack = []
-    for ch in s:
-        if ch in "([{":
-            stack.append(ch)
-        elif ch in pairs:
-            if not stack or stack.pop() != pairs[ch]:
-                return False
-    return not stack
-''',
-         test='''from solution import balanced
-assert balanced("([]{})") is True
-assert balanced("(]") is False
-assert balanced("([)]") is False
-assert balanced("a(b)c[d]") is True
-assert balanced("((") is False
-assert balanced("") is True
-'''),
     dict(name="c_moving_average", category="A", entry="solution.py",
          files={"solution.py": '''def moving_average(xs, k):
     """Averages of each window of k consecutive values."""
@@ -93,37 +58,6 @@ assert moving_average([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5], moving_average([1, 2,
 assert moving_average([5, 5, 5], 3) == [5.0]
 assert moving_average([1, 2], 3) == []
 assert moving_average([2, 4, 6, 8], 1) == [2.0, 4.0, 6.0, 8.0]
-'''),
-    dict(name="c_roman_to_int", category="A", entry="solution.py",
-         files={"solution.py": '''VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-
-
-def roman_to_int(s):
-    """Convert a Roman numeral to an integer."""
-    return sum(VALUES[ch] for ch in s)
-'''},
-         spec="Convert Roman numerals including subtractive forms: IV is 4, IX is 9, XL is 40, CM is 900; "
-              "MCMXCIV is 1994.",
-         reference='''VALUES = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
-
-
-def roman_to_int(s):
-    """Convert a Roman numeral to an integer."""
-    total = 0
-    for i, ch in enumerate(s):
-        v = VALUES[ch]
-        if i + 1 < len(s) and VALUES[s[i + 1]] > v:
-            total -= v
-        else:
-            total += v
-    return total
-''',
-         test='''from solution import roman_to_int
-assert roman_to_int("III") == 3
-assert roman_to_int("IV") == 4
-assert roman_to_int("IX") == 9
-assert roman_to_int("MCMXCIV") == 1994, roman_to_int("MCMXCIV")
-assert roman_to_int("XL") == 40
 '''),
     dict(name="c_flatten", category="A", entry="solution.py",
          files={"solution.py": '''def flatten(items):
@@ -220,33 +154,6 @@ assert top_k_words("b a c", 3) == ["a", "b", "c"]
 assert top_k_words("x X y", 1) == ["x"]
 assert top_k_words("", 2) == []
 '''),
-    dict(name="c_running_max", category="A", entry="solution.py",
-         files={"solution.py": '''def running_max(xs):
-    """The maximum seen so far, at every position."""
-    out = []
-    best = 0
-    for x in xs:
-        best = max(best, x)
-        out.append(best)
-    return out
-'''},
-         spec="Return the running maximum at every position; it must work for negative numbers too: "
-              "running_max([-3, -5, -1]) == [-3, -3, -1].",
-         reference='''def running_max(xs):
-    """The maximum seen so far, at every position."""
-    out = []
-    best = None
-    for x in xs:
-        best = x if best is None else max(best, x)
-        out.append(best)
-    return out
-''',
-         test='''from solution import running_max
-assert running_max([-3, -5, -1]) == [-3, -3, -1], running_max([-3, -5, -1])
-assert running_max([1, 3, 2, 5]) == [1, 3, 3, 5]
-assert running_max([]) == []
-assert running_max([-2]) == [-2]
-'''),
     dict(name="c_rotate_right", category="A", entry="solution.py",
          files={"solution.py": '''def rotate_right(xs, k):
     """Rotate the list right by k places."""
@@ -271,41 +178,6 @@ xs = [1, 2, 3]
 rotate_right(xs, 1)
 assert xs == [1, 2, 3]
 '''),
-    dict(name="c_merge_sorted", category="A", entry="solution.py",
-         files={"solution.py": '''def merge_sorted(a, b):
-    """Merge two sorted lists into one sorted list."""
-    out = []
-    i = j = 0
-    while i < len(a) and j < len(b):
-        if a[i] <= b[j]:
-            out.append(a[i])
-            i += 1
-        else:
-            out.append(b[j])
-            j += 1
-    return out
-'''},
-         spec="Merge two sorted lists into one sorted list containing every element of both, including whatever "
-              "remains of the longer list.",
-         reference='''def merge_sorted(a, b):
-    """Merge two sorted lists into one sorted list."""
-    out = []
-    i = j = 0
-    while i < len(a) and j < len(b):
-        if a[i] <= b[j]:
-            out.append(a[i])
-            i += 1
-        else:
-            out.append(b[j])
-            j += 1
-    return out + a[i:] + b[j:]
-''',
-         test='''from solution import merge_sorted
-assert merge_sorted([1, 4, 9], [2, 3]) == [1, 2, 3, 4, 9], merge_sorted([1, 4, 9], [2, 3])
-assert merge_sorted([], [1, 2]) == [1, 2]
-assert merge_sorted([5], []) == [5]
-assert merge_sorted([1, 1], [1]) == [1, 1, 1]
-'''),
     dict(name="c_is_anagram", category="A", entry="solution.py",
          files={"solution.py": '''def is_anagram(a, b):
     """True if a and b use the same letters."""
@@ -327,5 +199,96 @@ assert is_anagram("Dormitory", "dirty room") is True
 assert is_anagram("aab", "abb") is False
 assert is_anagram("listen", "silent") is True
 assert is_anagram("abc", "abcd") is False
+'''),
+    dict(name="c_matrix_transpose", category="A", entry="solution.py",
+         files={"solution.py": '''def transpose(m):
+    """Transpose a rectangular matrix given as a list of rows."""
+    n = len(m)
+    return [[m[r][c] for r in range(n)] for c in range(n)]
+'''},
+         spec="transpose must work for any rectangular matrix, not only square ones: [[1, 2, 3], [4, 5, 6]] -> "
+              "[[1, 4], [2, 5], [3, 6]]; [] -> [].",
+         reference='''def transpose(m):
+    """Transpose a rectangular matrix given as a list of rows."""
+    if not m:
+        return []
+    return [[m[r][c] for r in range(len(m))] for c in range(len(m[0]))]
+''',
+         test='''from solution import transpose
+assert transpose([[1, 2, 3], [4, 5, 6]]) == [[1, 4], [2, 5], [3, 6]], transpose([[1, 2, 3], [4, 5, 6]])
+assert transpose([[1, 2], [3, 4]]) == [[1, 3], [2, 4]]
+assert transpose([]) == []
+assert transpose([[7]]) == [[7]]
+'''),
+    dict(name="c_lcm_list", category="A", entry="solution.py",
+         files={"solution.py": '''def lcm_all(nums):
+    """Least common multiple of a list of positive integers."""
+    out = 1
+    for n in nums:
+        out *= n
+    return out
+'''},
+         spec="Return the least common multiple: lcm_all([4, 6]) == 12, lcm_all([2, 3, 4]) == 12, lcm_all([5]) == 5.",
+         reference='''import math
+
+
+def lcm_all(nums):
+    """Least common multiple of a list of positive integers."""
+    out = 1
+    for n in nums:
+        out = out * n // math.gcd(out, n)
+    return out
+''',
+         test='''from solution import lcm_all
+assert lcm_all([4, 6]) == 12, lcm_all([4, 6])
+assert lcm_all([2, 3, 4]) == 12
+assert lcm_all([5]) == 5
+assert lcm_all([3, 5]) == 15
+'''),
+    dict(name="c_digital_root", category="A", entry="solution.py",
+         files={"solution.py": '''def digital_root(n):
+    """Repeatedly sum the digits of a non-negative integer until one digit remains."""
+    return sum(int(d) for d in str(n))
+'''},
+         spec="Keep summing digits until a single digit remains: digital_root(9875) == 2 (9875 -> 29 -> 11 -> 2); "
+              "digital_root(0) == 0.",
+         reference='''def digital_root(n):
+    """Repeatedly sum the digits of a non-negative integer until one digit remains."""
+    while n >= 10:
+        n = sum(int(d) for d in str(n))
+    return n
+''',
+         test='''from solution import digital_root
+assert digital_root(9875) == 2, digital_root(9875)
+assert digital_root(0) == 0
+assert digital_root(7) == 7
+assert digital_root(38) == 2
+'''),
+    dict(name="c_pair_sum_count", category="A", entry="solution.py",
+         files={"solution.py": '''def count_pairs(nums, target):
+    """Number of index pairs i < j with nums[i] + nums[j] == target."""
+    count = 0
+    for i in range(len(nums)):
+        for j in range(len(nums)):
+            if nums[i] + nums[j] == target:
+                count += 1
+    return count
+'''},
+         spec="Count each pair of positions once, with i < j: count_pairs([1, 5, 7, -1, 5], 6) == 3, "
+              "count_pairs([3, 3, 3], 6) == 3.",
+         reference='''def count_pairs(nums, target):
+    """Number of index pairs i < j with nums[i] + nums[j] == target."""
+    count = 0
+    for i in range(len(nums)):
+        for j in range(i + 1, len(nums)):
+            if nums[i] + nums[j] == target:
+                count += 1
+    return count
+''',
+         test='''from solution import count_pairs
+assert count_pairs([1, 5, 7, -1, 5], 6) == 3, count_pairs([1, 5, 7, -1, 5], 6)
+assert count_pairs([3, 3, 3], 6) == 3
+assert count_pairs([], 1) == 0
+assert count_pairs([2], 4) == 0
 '''),
 ]

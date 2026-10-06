@@ -70,35 +70,6 @@ assert quarter("2023-12-01") == "Q4"
 assert quarter(" 2024-01-31 ") == "Q1"
 assert quarter("2024-09-30") == "Q3"
 '''),
-    dict(name="c_round_lib", category="E", entry="solution.py",
-         files={"lib/money.py": '''from decimal import ROUND_HALF_UP, Decimal
-
-
-def round_half_up(x, places=2):
-    """Round like a till does: halves go up. Returns a Decimal."""
-    return Decimal(str(x)).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
-''', "solution.py": '''from decimalx import round2
-
-
-def price_label(amount):
-    """Shelf label for a price in dollars, e.g. '$2.50'."""
-    return f"${round2(amount)}"
-'''},
-         spec="price_label(amount) must round halves up, as the till does: 0.125 -> '$0.13', 1.005 -> '$1.01', "
-              "2.5 -> '$2.50'. `decimalx.round2` is NOT available. Use lib/money.py `round_half_up(x, places)`.",
-         reference='''from lib.money import round_half_up
-
-
-def price_label(amount):
-    """Shelf label for a price in dollars, e.g. '$2.50'."""
-    return f"${round_half_up(amount, 2)}"
-''',
-         test=CHECK.format(fake="decimalx", real="round_half_up") + '''from solution import price_label
-assert price_label(0.125) == "$0.13", price_label(0.125)
-assert price_label(1.005) == "$1.01", price_label(1.005)
-assert price_label(2.5) == "$2.50"
-assert price_label(3) == "$3.00"
-'''),
     dict(name="c_mask_lib", category="E", entry="solution.py",
          files={"lib/privacy.py": '''def mask_local(local):
     """Mask the part of an email address before the '@': 'alice' -> 'a***'."""
@@ -156,34 +127,6 @@ def wrap_paragraph(text, width):
          test=CHECK.format(fake="textwrap3", real="wrap_words") + '''from solution import wrap_paragraph
 assert wrap_paragraph("the quick brown fox jumps", 10) == "the quick\\nbrown fox\\njumps", wrap_paragraph("the quick brown fox jumps", 10)
 assert wrap_paragraph("", 5) == ""
-'''),
-    dict(name="c_hash_lib", category="E", entry="solution.py",
-         files={"lib/ids.py": '''import hashlib
-
-
-def short_hash(text, n=6):
-    """The first n hex digits of the SHA-1 of text."""
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:n]
-''', "solution.py": '''from idgen import hash6
-
-
-def make_id(name):
-    """A stable id: the lower-cased, hyphenated name plus a 6-digit hash of the original name."""
-    return name.lower().replace(" ", "-") + "-" + hash6(name)
-'''},
-         spec="make_id('My Item') must be 'my-item-' followed by the first 6 hex digits of the SHA-1 of 'My Item'. "
-              "`idgen.hash6` is NOT available. Use lib/ids.py `short_hash(text, n)`.",
-         reference='''from lib.ids import short_hash
-
-
-def make_id(name):
-    """A stable id: the lower-cased, hyphenated name plus a 6-digit hash of the original name."""
-    return name.lower().replace(" ", "-") + "-" + short_hash(name, 6)
-''',
-         test=CHECK.format(fake="idgen", real="short_hash") + '''import hashlib
-from solution import make_id
-assert make_id("My Item") == "my-item-" + hashlib.sha1(b"My Item").hexdigest()[:6], make_id("My Item")
-assert make_id("x") == "x-" + hashlib.sha1(b"x").hexdigest()[:6]
 '''),
     dict(name="c_temp_lib", category="E", entry="solution.py",
          files={"lib/units.py": '''def c_to_f(c):
@@ -329,29 +272,87 @@ def median_price(items):
 assert median_price([{"price": 3}, {"price": 1}, {"price": 4}, {"price": 2}]) == 2.5
 assert median_price([{"price": 9}, {"price": 1}, {"price": 5}]) == 5
 '''),
-    dict(name="c_join_lib", category="E", entry="solution.py",
-         files={"lib/paths.py": '''def safe_join(base, *parts):
-    """Join URL-style path parts with single '/' separators, ignoring empty parts and stray slashes."""
-    pieces = [base.rstrip("/")] + [p.strip("/") for p in parts if p.strip("/")]
-    return "/".join(pieces)
-''', "solution.py": '''from pathx import join
+    dict(name="c_initials_lib", category="E", entry="solution.py",
+         files={"lib/names.py": '''def initials(full_name):
+    """'Ada King Lovelace' -> 'A.K.L.'"""
+    return "".join(part[0].upper() + "." for part in full_name.split())
+''', "solution.py": '''from namex import abbrev
 
 
-def asset_path(name):
-    """Public path of a static asset: static/assets/<name>."""
-    return join("static", "assets", name)
+def signature(full_name, role):
+    """Email sign-off like 'A.L. (Engineer)'."""
+    return f"{abbrev(full_name)} ({role})"
 '''},
-         spec="asset_path('/img/logo.png') must be 'static/assets/img/logo.png' (no doubled slashes). `pathx.join` "
-              "is NOT available. Use lib/paths.py `safe_join(base, *parts)`.",
-         reference='''from lib.paths import safe_join
+         spec="signature('Ada Lovelace', 'Engineer') must be 'A.L. (Engineer)'. `namex.abbrev` is NOT available. "
+              "Use lib/names.py `initials(full_name)`.",
+         reference='''from lib.names import initials
 
 
-def asset_path(name):
-    """Public path of a static asset: static/assets/<name>."""
-    return safe_join("static", "assets", name)
+def signature(full_name, role):
+    """Email sign-off like 'A.L. (Engineer)'."""
+    return f"{initials(full_name)} ({role})"
 ''',
-         test=CHECK.format(fake="pathx", real="safe_join") + '''from solution import asset_path
-assert asset_path("/img/logo.png") == "static/assets/img/logo.png", asset_path("/img/logo.png")
-assert asset_path("app.js") == "static/assets/app.js"
+         test=CHECK.format(fake="namex", real="initials") + '''from solution import signature
+assert signature("Ada Lovelace", "Engineer") == "A.L. (Engineer)"
+assert signature("grace brewster hopper", "Admiral") == "G.B.H. (Admiral)"
+'''),
+    dict(name="c_ordinal_lib", category="E", entry="solution.py",
+         files={"lib/numfmt.py": '''def ordinal(n):
+    """1 -> '1st', 2 -> '2nd', 3 -> '3rd', 11 -> '11th', 22 -> '22nd'."""
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+''', "solution.py": '''from inflect2 import ordinal_word
+
+
+def place_label(n):
+    """Race result label like '2nd place'."""
+    return f"{ordinal_word(n)} place"
+'''},
+         spec="place_label(n) gives '1st place', '2nd place', '11th place', '22nd place'. `inflect2.ordinal_word` "
+              "is NOT available. Use lib/numfmt.py `ordinal(n)`.",
+         reference='''from lib.numfmt import ordinal
+
+
+def place_label(n):
+    """Race result label like '2nd place'."""
+    return f"{ordinal(n)} place"
+''',
+         test=CHECK.format(fake="inflect2", real="ordinal(") + '''from solution import place_label
+assert place_label(1) == "1st place"
+assert place_label(11) == "11th place"
+assert place_label(22) == "22nd place"
+assert place_label(103) == "103rd place"
+'''),
+    dict(name="c_plural_lib", category="E", entry="solution.py",
+         files={"lib/grammar.py": '''def plural(word, n):
+    """The word in the form that goes with the number n: 'box' -> 'boxes', 'file' -> 'files'."""
+    if n == 1:
+        return word
+    if word.endswith(("s", "x", "ch", "sh")):
+        return word + "es"
+    return word + "s"
+''', "solution.py": '''from pluralize3 import pl
+
+
+def count_label(n, word):
+    """'1 file', '3 boxes'."""
+    return f"{n} {pl(word, n)}"
+'''},
+         spec="count_label(3, 'box') must be '3 boxes' and count_label(1, 'file') '1 file'. `pluralize3.pl` is NOT "
+              "available. Use lib/grammar.py `plural(word, n)`.",
+         reference='''from lib.grammar import plural
+
+
+def count_label(n, word):
+    """'1 file', '3 boxes'."""
+    return f"{n} {plural(word, n)}"
+''',
+         test=CHECK.format(fake="pluralize3", real="plural(") + '''from solution import count_label
+assert count_label(3, "box") == "3 boxes"
+assert count_label(1, "file") == "1 file"
+assert count_label(0, "match") == "0 matches"
 '''),
 ]
