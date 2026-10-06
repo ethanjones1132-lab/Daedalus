@@ -360,6 +360,22 @@ def train(student: str = KEEP96, tag: str = "keep96-v1", epochs: int = 2, rank: 
     return res
 
 
+@app.function(volumes={W: vol}, cpu=2, memory=4096, timeout=1800)
+def sha256_of(path: str):
+    """A file on the volume, hashed where it sits (checks an upload before the local copy is removed)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(f"{W}/{path}", "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    return {"path": path, "bytes": os.path.getsize(f"{W}/{path}"), "sha256": h.hexdigest()}
+
+
+@app.local_entrypoint()
+def verify_stash(path: str):
+    print(json.dumps(sha256_of.remote(path)))
+
+
 @app.local_entrypoint()
 def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2):
     print(json.dumps(train.remote(student, tag, epochs), indent=1))

@@ -1,0 +1,50 @@
+﻿{
+    "why":  "Moved off the system drive on 2026-10-06 for the adapters expert arm (under 10% free). Nothing was destroyed: each file below was SHA-256-verified identical to the Hugging Face copy at the pinned commit; local-only files went to the Modal volume \"distill\" first.",
+    "restore_hf":  [
+                       {
+                           "local":  "C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\gpt-oss-20b-MXFP4.gguf",
+                           "repo":  "ggml-org/gpt-oss-20b-GGUF",
+                           "commit":  "ef9b12f2ff56c69cf32153a02784e7a3c88bf524",
+                           "file":  "gpt-oss-20b-MXFP4.gguf",
+                           "bytes":  12109566624,
+                           "sha256":  "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+                           "command":  "hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --revision ef9b12f2ff56c69cf32153a02784e7a3c88bf524 --local-dir C:\\qwen3-forge-stage\\models\\prune-gptoss20b"
+                       },
+                       {
+                           "local":  "C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\eagle3-gpt-oss-20b-Q8_0.gguf",
+                           "repo":  "ggml-org/gpt-oss-20b-GGUF",
+                           "commit":  "ef9b12f2ff56c69cf32153a02784e7a3c88bf524",
+                           "file":  "eagle3-gpt-oss-20b-Q8_0.gguf",
+                           "bytes":  921488000,
+                           "sha256":  "6955f98a701e97a8c969f3ff33be8ba17b35bd60e5ac96258d2c42d710c7d63f",
+                           "command":  "hf download ggml-org/gpt-oss-20b-GGUF eagle3-gpt-oss-20b-Q8_0.gguf --revision ef9b12f2ff56c69cf32153a02784e7a3c88bf524 --local-dir C:\\qwen3-forge-stage\\models\\prune-gptoss20b"
+                       },
+                       {
+                           "local":  "C:\\qwen3-forge-stage\\google_gemma-4-26B-A4B-it-IQ2_M.gguf",
+                           "repo":  "bartowski/google_gemma-4-26B-A4B-it-GGUF",
+                           "commit":  "10f3b41bcf8d3047f4e136e7197ffc2dd1654c9d",
+                           "file":  "google_gemma-4-26B-A4B-it-IQ2_M.gguf",
+                           "bytes":  10700622464,
+                           "sha256":  "88c25a0e8ecc975b90bcf3766301d5e565a5378ed04fbdd04c8049d87eab43a5",
+                           "command":  "hf download bartowski/google_gemma-4-26B-A4B-it-GGUF google_gemma-4-26B-A4B-it-IQ2_M.gguf --revision 10f3b41bcf8d3047f4e136e7197ffc2dd1654c9d --local-dir C:\\qwen3-forge-stage"
+                       },
+                       {
+                           "local":  "C:\\qwen3-forge-stage\\mtp-gemma-4-26B-A4B-it.gguf",
+                           "repo":  "unsloth/gemma-4-26B-A4B-it-GGUF",
+                           "commit":  "c099eb48e663fd284577b04978a94ffccb261841",
+                           "file":  "mtp-gemma-4-26B-A4B-it.gguf",
+                           "bytes":  461766816,
+                           "sha256":  "6326fb9f5e487aa8dcdd313a091e3c67724cb2a666ec3b7d2895b5b26d93ed1b",
+                           "command":  "hf download unsloth/gemma-4-26B-A4B-it-GGUF mtp-gemma-4-26B-A4B-it.gguf --revision c099eb48e663fd284577b04978a94ffccb261841 --local-dir C:\\qwen3-forge-stage"
+                       }
+                   ],
+    "restore_modal":  [
+                          {
+                              "local":  "C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
+                              "volume":  "distill",
+                              "path":  "stash/gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
+                              "command":  "python -m modal volume get distill stash/gpt-oss-20b-MXFP4-keep24-selfgen.gguf C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\",
+                              "status":  "uploading"
+                          }
+                      ]
+}

@@ -54,6 +54,15 @@ function Bon($name, $dir, $gguf, $extra) {
             '--temp-alt', '0.7', '--out', $o) $gguf $extra
     }
 }
+function PoolDone($name) { (Test-Path "$L\adapters-$name.jsonl") -and (Select-String -Path "$L\adapters-$name.out" -Pattern 'done in' -Quiet -ErrorAction SilentlyContinue) }
+function Slice($v) {
+    if (Test-Path "$M\keep96-$v.gguf") { return $true }
+    if (-not (FreeOk)) { Say "REFUSED slice $v`: under 10% free"; return $false }
+    Step "slice-$v" $calib @($py, "$mb\slice_experts.py", $full, "$M\keep96-$v.gguf", '--keep-list', "$ad\keeplists\$v.json")
+    Settle
+    return (Test-Path "$M\keep96-$v.gguf")
+}
+function Unslice($v, $why) { if (Test-Path "$M\keep96-$v.gguf") { Remove-Item "$M\keep96-$v.gguf" -Force; Say "deleted keep96-$v.gguf ($why)" } }
 # the vectors are unit-norm per layer, so the spec's relative scales (0.25 / 0.5 / 1.0) are multiplied by a unit per
 # method: the largest scale that kept output coherent on all layers (mean broke at 0.1, pca at 0.4; steer-units.json)
 $unit = @{ mean = 0.05; pca = 0.2 }
@@ -93,34 +102,33 @@ if ($expertArm) {
         Step 'keeplists' $calib @($py, "$mb\expert_patch.py", '--keep96', "$S\models\prune-qwen36\keep96.json", '--new', "$M\imatrix-failure.gguf",
             '--code', "$S\models\prune-qwen36\imatrix-qwen36-code.gguf", '--full', $full, '--out', "$ad\keeplists")
     }
+    # each variant is sliced, measured and deleted again, so at most one slice is on disk at a time (spec section 6:
+    # delete scored variants first; C: has about 98 GB free against the 93 GB that 10% means)
     foreach ($v in 'swap96', 'add108', 'swap108') {
-        if ((Test-Path "$M\keep96-$v.gguf") -or ((Test-Path "$ad\bench-$v.json") -and (Test-Path "$ad\kl-$v.json"))) { continue }
-        if (-not (FreeOk)) { Say "REFUSED slice $v`: under 10% free"; continue }
-        Step "slice-$v" $calib @($py, "$mb\slice_experts.py", $full, "$M\keep96-$v.gguf", '--keep-list', "$ad\keeplists\$v.json")
-        Settle
+        if ((Test-Path "$ad\bench-$v.json") -and (Test-Path "$ad\kl-$v.json")) { continue }
+        if (-not (Slice $v)) { continue }
+        $g = "$M\keep96-$v.gguf"
+        if (-not (Test-Path "$ad\bench-$v.json")) { Step "bench-$v" $calib @($py, "$mb\kl_eval.py", 'bench', '--model', $g, '--out', "$ad\bench-$v.json") }
+        if (-not (Test-Path "$ad\kl-$v.json") -and (Test-Path "$M\kl-ref.bin")) { Step "kl-$v" $calib @($py, "$mb\kl_eval.py", 'score', '--model', $g, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin", '--out', "$ad\kl-$v.json") }
+        Unslice $v 'measured'
     }
 }
-# size/speed (keep96 always, as the reference), closeness
-foreach ($v in 'keep96', 'swap96', 'add108', 'swap108') {
-    $g = if ($v -eq 'keep96') { $k96 } else { "$M\keep96-$v.gguf" }
-    if (-not (Test-Path $g)) { continue }
-    if (-not (Test-Path "$ad\bench-$v.json")) { Step "bench-$v" $calib @($py, "$mb\kl_eval.py", 'bench', '--model', $g, '--out', "$ad\bench-$v.json") }
-    if (-not (Test-Path "$ad\kl-$v.json") -and (Test-Path "$M\kl-ref.bin")) { Step "kl-$v" $calib @($py, "$mb\kl_eval.py", 'score', '--model', $g, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin", '--out', "$ad\kl-$v.json") }
-}
+# keep96's own size/speed and closeness: the reference
+if (-not (Test-Path "$ad\bench-keep96.json")) { Step 'bench-keep96' $calib @($py, "$mb\kl_eval.py", 'bench', '--model', $k96, '--out', "$ad\bench-keep96.json") }
+if (-not (Test-Path "$ad\kl-keep96.json") -and (Test-Path "$M\kl-ref.bin")) { Step 'kl-keep96' $calib @($py, "$mb\kl_eval.py", 'score', '--model', $k96, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin", '--out', "$ad\kl-keep96.json") }
 Decide 'closest'
 $d = Dec
-if ($d -and $null -ne $d.closest) {
-    foreach ($v in 'swap96', 'add108', 'swap108') {
-        if (@($d.closest) -notcontains $v -and (Test-Path "$M\keep96-$v.gguf")) { Remove-Item "$M\keep96-$v.gguf" -Force; Say "deleted keep96-$v.gguf (not among the closest)" }
-    }
-    if (Test-Path "$M\kl-ref.bin") { Remove-Item "$M\kl-ref.bin" -Force; Say 'deleted kl-ref.bin (every variant scored)' }
-}
+if ($d -and $null -ne $d.closest -and (Test-Path "$M\kl-ref.bin")) { Remove-Item "$M\kl-ref.bin" -Force; Say 'deleted kl-ref.bin (every variant scored)' }
 
-# 4. the pool: keep96 and the two closest variants; the winner
+# 4. the pool: keep96 and the two closest variants, sliced again one at a time; the winner
 Bon 'pool-keep96' $calib '' ''
-foreach ($v in (Dec).closest) { Bon "pool-$v" $calib "$M\keep96-$v.gguf" '' }
+foreach ($v in @((Dec).closest)) {
+    if (PoolDone "pool-$v") { continue }
+    if (Slice $v) { Bon "pool-$v" $calib "$M\keep96-$v.gguf" ''; Unslice $v 'pool run done' }
+}
 Decide 'winner'
 $win = (Dec).winner
+if ($win -and -not (Slice $win)) { Say "the winner $win could not be sliced again (disk): steering and judge use keep96"; $win = $null }
 $base = if ($win) { "$M\keep96-$win.gguf" } else { $k96 }
 Say "steering base: $base"
 # the sweep runs on the pool winner (spec 3.4): a winning variant gets its own vectors, probes and decisions (tag)
