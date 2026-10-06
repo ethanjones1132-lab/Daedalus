@@ -101,29 +101,31 @@ def teacher(budgets: list):
     return {"results": out, "job_minutes": round(secs / 60, 1), "cost_usd_est": round(secs * RATE, 2)}
 
 
-def llama_top1(gguf_path, text, n_ctx=2048, chunks=2):
+def llama_top1(gguf_path, text, n_ctx=2048, chunks=2, ngl=99):
     """llama.cpp's own view of `text`: llama-perplexity --kl-divergence-base keeps the evaluated tokens and, for the
     second half of each chunk, every position's log-probs (uint16, monotonic in the logit). -> tokens
     [chunk, n_ctx], top-1 and the target's log-prob at positions n_ctx/2 .. n_ctx-2."""
     import numpy as np
     base = "/tmp/base.bin"
     subprocess.run([f"{BIN}/llama-perplexity", "-m", gguf_path, "-f", text, "-c", str(n_ctx), "--chunks", str(chunks),
-                    "-ngl", "99", "-b", str(n_ctx), "-ub", "512", "--kl-divergence-base", base], check=True)
+                    "-ngl", str(ngl), "-b", str(n_ctx), "-ub", "512", "--kl-divergence-base", base], check=True)
     with open(base, "rb") as f:
         assert f.read(8) == b"_logits_"
         n_ctx_, n_vocab, n_chunk = (int(x) for x in np.frombuffer(f.read(12), dtype=np.int32))
         tokens = np.frombuffer(f.read(4 * n_chunk * n_ctx_), dtype=np.int32).reshape(n_chunk, n_ctx_)
         nv, first = 2 * ((n_vocab + 1) // 2) + 4, n_ctx_ // 2
         n_tok = n_ctx_ - 1 - first
-        top, logp = [], []
+        top, logp, qs, scales = [], [], [], []
         for c in range(n_chunk):
             rows = np.frombuffer(f.read(2 * nv * n_tok), dtype=np.uint16).reshape(n_tok, nv)
             head = rows[:, :4].copy().view(np.float32)  # [scale, min_log_prob] per position
-            q = rows[:, 4:4 + n_vocab]
+            q = rows[:, 4:4 + n_vocab].copy()
             top.append(q.argmax(1))
             tgt = tokens[c, first + 1:first + 1 + n_tok]
             logp.append(head[:, 1] + q[np.arange(n_tok), tgt].astype(np.float32) * head[:, 0])
-    return tokens, first, np.stack(top), np.stack(logp)
+            qs.append(q)
+            scales.append(head[:, 0])
+    return tokens, first, np.stack(top), np.stack(logp), qs, scales
 
 
 def student_config(n_experts):
@@ -154,9 +156,9 @@ def names(n_experts: int = 96):
             "params": {n: [int(d) for d in p.shape] for n, p in m.named_parameters()}}  # plain types: no torch locally
 
 
-def load_student(gguf_path):
+def load_student(gguf_path, dtype="bfloat16"):
     """The served GGUF, dequantized tensor by tensor (gguf-py) and reverse-mapped straight into transformers'
-    Qwen3_5MoeForCausalLM in bf16 on the GPU. -> (model, hparams, report of unmapped and unloaded names)."""
+    Qwen3_5MoeForCausalLM on the GPU (bf16 by default). -> (model, hparams, report of unmapped and unloaded names)."""
     import numpy as np
     import torch
     from gguf import GGUFReader
@@ -175,7 +177,7 @@ def load_student(gguf_path):
           "hidden_size": val("qwen35moe.embedding_length"),
           "num_hidden_layers": val("qwen35moe.block_count") - val("qwen35moe.nextn_predict_layers")}
     cfg = student_config(n_exp)
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(getattr(torch, dtype))
     with torch.device("cuda"):
         model = Qwen3_5MoeForCausalLM(cfg)
     model.eval()
@@ -210,35 +212,54 @@ def load_student(gguf_path):
 
 
 @app.function(gpu="A100-80GB", volumes={W: vol}, timeout=3600, cpu=8, memory=64 * 1024, image=torch_image)
-def parity():
+def parity(dtypes: list = ("bfloat16",)):
     """Gate 2.4 (and the name half of 2.2): transformers on the dequantized served weights must pick llama.cpp's top
-    token on at least 99% of about 2,000 held-out positions."""
+    token on at least 99% of about 2,000 held-out positions. Loads in the first dtype and casts down for the rest.
+    For each disagreement, llama.cpp's own log-prob gap between the two picks says whether it is a near-tie."""
     import numpy as np
     import torch
     t0 = time.time()
-    tokens, first, top_l, logp_l = llama_top1(KEEP96, "/opt/heldout.txt")
+    tokens, first, top_l, logp_l, qs, scales = llama_top1(KEEP96, "/opt/heldout.txt")
+    margin = []
+    for q, s in zip(qs, scales):
+        two = np.partition(q, -2, axis=1)[:, -2:].astype(np.float32)
+        margin.append((two[:, 1] - two[:, 0]) * s)  # llama's own top-1 vs top-2, nats
+    margin = np.concatenate(margin)
     t1 = time.time()
-    model, hp, rep = load_student(KEEP96)
+    model, hp, rep = load_student(KEEP96, dtypes[0])
     t2 = time.time()
-    agree, nll_hf = [], []
-    with torch.no_grad():
-        for c in range(tokens.shape[0]):
-            ids = torch.tensor(tokens[c][None].astype(np.int64), device="cuda")
-            lg = model(input_ids=ids).logits[0].float()
-            pos = slice(first, tokens.shape[1] - 1)
-            agree.append((lg[pos].argmax(-1).cpu().numpy() == top_l[c]))
-            lsm = torch.log_softmax(lg[pos], -1)
-            nll_hf.append(-lsm[torch.arange(lsm.shape[0]), ids[0, first + 1:]].cpu().numpy())
-    a = np.concatenate(agree)
+    res = {"positions": int(margin.size), "ppl_llama": round(float(np.exp(-np.concatenate(logp_l).mean())), 3),
+           "share_llama_margin_lt_0.1": round(float((margin < 0.1).mean()), 4),
+           "names": {k: (v if not isinstance(v, list) else v[:12]) for k, v in rep.items()}, "by_dtype": {}}
+    for dt in dtypes:
+        model.to(getattr(torch, dt))
+        agree, gap, nll_hf = [], [], []
+        with torch.no_grad():
+            for c in range(tokens.shape[0]):
+                ids = torch.tensor(tokens[c][None].astype(np.int64), device="cuda")
+                lg = model(input_ids=ids).logits[0].float()
+                pos = slice(first, tokens.shape[1] - 1)
+                top_h = lg[pos].argmax(-1).cpu().numpy()
+                agree.append(top_h == top_l[c])
+                n = np.arange(top_h.size)
+                gap.append((qs[c][n, top_l[c]].astype(np.float32) - qs[c][n, top_h]) * scales[c])
+                lsm = torch.log_softmax(lg[pos], -1)
+                nll_hf.append(-lsm[torch.arange(lsm.shape[0]), ids[0, first + 1:]].cpu().numpy())
+        a, g = np.concatenate(agree), np.concatenate(gap)
+        d = g[~a]
+        q3 = lambda p: round(float(np.quantile(d, p)), 3) if d.size else None  # noqa: E731
+        res["by_dtype"][dt] = {
+            "top1_agreement": round(float(a.mean()), 4), "pass": bool(a.mean() >= 0.99),
+            "ppl_transformers": round(float(np.exp(np.concatenate(nll_hf).mean())), 3),
+            "agreement_where_llama_margin_ge_0.1": round(float(a[margin >= 0.1].mean()), 4),
+            "agreement_where_llama_margin_ge_0.5": round(float(a[margin >= 0.5].mean()), 4),
+            "disagreements": int(d.size),
+            "llama_gap_at_disagreements_nats": {"median": q3(0.5), "p90": q3(0.9), "max": q3(1.0)}}
     secs = time.time() - t0
-    res = {"positions": int(a.size), "top1_agreement": round(float(a.mean()), 4), "pass": bool(a.mean() >= 0.99),
-           "ppl_llama": round(float(np.exp(-np.concatenate(logp_l).mean())), 3),
-           "ppl_transformers": round(float(np.exp(np.concatenate(nll_hf).mean())), 3),
-           "names": {k: (v if not isinstance(v, list) else v[:12]) for k, v in rep.items()},
-           "seconds": {"llama": round(t1 - t0), "load": round(t2 - t1), "total": round(secs)},
-           "cost_usd_est": round(secs * A100_RATE, 2)}
+    res.update({"seconds": {"llama": round(t1 - t0), "load": round(t2 - t1), "total": round(secs)},
+                "cost_usd_est": round(secs * A100_RATE, 2)})
     os.makedirs(f"{W}/gates", exist_ok=True)
-    json.dump(res, open(f"{W}/gates/parity.json", "w"), indent=1)
+    json.dump(res, open(f"{W}/gates/parity-{'-'.join(dtypes)}.json", "w"), indent=1)
     vol.commit()
     return res
 
@@ -342,9 +363,41 @@ def check_names(out: str = ""):
         open(out, "w").write(json.dumps(res, indent=1))
 
 
+@app.function(gpu="A100-80GB", volumes={W: vol}, timeout=1800, cpu=8, memory=64 * 1024, image=torch_image)
+def noise_floor():
+    """The parity gate's reference: llama.cpp against itself, CUDA (the served path) vs CPU, same tokens and file.
+    Two numerically different but correct implementations of the same quantized model."""
+    import numpy as np
+    t0 = time.time()
+    tok_g, first, top_g, logp_g, qs, scales = llama_top1(KEEP96, "/opt/heldout.txt", ngl=99)
+    tok_c, _, top_c, logp_c, _, _ = llama_top1(KEEP96, "/opt/heldout.txt", ngl=0)
+    assert np.array_equal(tok_g, tok_c)
+    a = (top_g == top_c).ravel()
+    gaps = []
+    for c in range(top_g.shape[0]):
+        n = np.arange(top_g.shape[1])
+        gaps.append((qs[c][n, top_g[c]].astype(np.float32) - qs[c][n, top_c[c]]) * scales[c])
+    d = np.concatenate(gaps)[~a]
+    secs = time.time() - t0
+    res = {"positions": int(a.size), "cuda_vs_cpu_top1_agreement": round(float(a.mean()), 4),
+           "ppl_cuda": round(float(np.exp(-logp_g.mean())), 3), "ppl_cpu": round(float(np.exp(-logp_c.mean())), 3),
+           "disagreements": int(d.size),
+           "cuda_gap_at_disagreements_nats": {"median": round(float(np.median(d)), 3) if d.size else None,
+                                              "max": round(float(d.max()), 3) if d.size else None},
+           "seconds": round(secs), "cost_usd_est": round(secs * A100_RATE, 2)}
+    json.dump(res, open(f"{W}/gates/noise-floor.json", "w"), indent=1)
+    vol.commit()
+    return res
+
+
 @app.local_entrypoint()
-def gate_parity():
-    print(json.dumps(parity.remote(), indent=1))
+def gate_noise_floor():
+    print(json.dumps(noise_floor.remote(), indent=1))
+
+
+@app.local_entrypoint()
+def gate_parity(dtypes: str = "bfloat16"):
+    print(json.dumps(parity.remote(dtypes.split(",")), indent=1))
 
 
 @app.local_entrypoint()
