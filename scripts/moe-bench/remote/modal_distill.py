@@ -188,7 +188,7 @@ def _probs(r):
 
 
 @app.function(gpu="L40S", volumes={W: vol}, timeout=3 * 3600, cpu=8, memory=64 * 1024)
-def teacher_data(tasks: list, prefixes: list, parallel: int = 4, top: int = 20):
+def teacher_data(tasks: list, prefixes: list, parallel: int = 4, top: int = 20, out: str = "teacher_data"):
     """Task 4: the teacher (Flash-Next Coder, thinking off, the teacher test's sampling: temperature 0.2, top-p 0.95)
     answers each training task single shot through the pool's own prompt, with its top-20 log-probs per answer token.
     Only answers that pass the task's test are training targets. Then the regularizer: continuations of code
@@ -199,7 +199,7 @@ def teacher_data(tasks: list, prefixes: list, parallel: int = 4, top: int = 20):
     sys.path[:0] = [POOL, f"{R}/scripts/benchmark-tier2b"]
     from runbench2b import baseline_prompt, extract_code, run_test, seed
     t0 = time.time()
-    d_out = f"{W}/teacher_data"
+    d_out = f"{W}/{out}"
     os.makedirs(d_out, exist_ok=True)
     srv, url = flashnext_server(parallel, 8192, "/tmp/server.log")
     print(f"server up at {time.time() - t0:.0f} s", flush=True)
@@ -273,7 +273,9 @@ def kl_top(logits, top_ids, top_lp):
 
 @app.function(gpu="A100-80GB", volumes={W: vol}, timeout=4 * 3600, cpu=8, memory=64 * 1024, image=torch_image)
 def train(student: str = KEEP96, tag: str = "keep96-v1", epochs: int = 2, rank: int = 16, lr: float = 2e-4,
-          kl_weight: float = 1.0, accum: int = 8, max_len: int = 2048):
+          kl_weight: float = 1.0, accum: int = 8, max_len: int = 2048,
+          answers: list = ("teacher_data/answers.jsonl",), drop: list = (),
+          regularizer: str = "teacher_data/regularizer.jsonl"):
     """Task 5 (spec 4.3): LoRA on full attention, DeltaNet and the shared expert of the dequantized served student.
     Loss: cross-entropy on the teacher's verified answers + kl_weight x KL to its top-20 there, and KL only on the
     regularizer continuations. bf16, gradient checkpointing, batch 1 x `accum`. Then convert_lora_to_gguf.py."""
@@ -289,12 +291,13 @@ def train(student: str = KEEP96, tag: str = "keep96-v1", epochs: int = 2, rank: 
     model.config.use_cache = False
     model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.0, target_modules=LORA_TARGETS))
     ex = []
-    for line in open(f"{W}/teacher_data/answers.jsonl"):
-        r = json.loads(line)
-        if r["ok"] and r["ids"]:
-            ex.append(("answer", tok(r["prompt"], add_special_tokens=False).input_ids, r["ids"] + [end], r["top"]))
+    for i, path in enumerate(answers):  # later files are new versions: they replace earlier answers of the same task
+        for line in open(f"{W}/{path}"):
+            r = json.loads(line)
+            if r["ok"] and r["ids"] and (i or r["category"] not in drop):
+                ex.append(("answer", tok(r["prompt"], add_special_tokens=False).input_ids, r["ids"] + [end], r["top"]))
     n_ans = len(ex)
-    for line in open(f"{W}/teacher_data/regularizer.jsonl"):
+    for line in open(f"{W}/{regularizer}"):
         r = json.loads(line)
         if r["ids"]:
             ex.append(("reg", tok(r["prefix"], add_special_tokens=False).input_ids, r["ids"], r["top"]))
@@ -377,15 +380,19 @@ def verify_stash(path: str):
 
 
 @app.local_entrypoint()
-def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2):
-    print(json.dumps(train.remote(student, tag, epochs), indent=1))
+def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2,
+              answers: str = "teacher_data/answers.jsonl", drop: str = "",
+              regularizer: str = "teacher_data/regularizer.jsonl"):
+    """answers: comma-separated volume paths; drop: categories of the FIRST file to leave out (replaced by later files)."""
+    print(json.dumps(train.remote(student, tag, epochs, answers=answers.split(","),
+                                  drop=[d for d in drop.split(",") if d], regularizer=regularizer), indent=1))
 
 
 @app.local_entrypoint()
-def make_teacher_data(tasks_json: str, prefixes_json: str):
-    tasks = json.load(open(tasks_json, encoding="utf-8"))
-    prefixes = json.load(open(prefixes_json, encoding="utf-8"))
-    print(json.dumps(teacher_data.remote(tasks, prefixes), indent=1))
+def make_teacher_data(tasks_json: str, prefixes_json: str = "", out: str = "teacher_data", category: str = ""):
+    tasks = [t for t in json.load(open(tasks_json, encoding="utf-8")) if not category or t["category"] == category]
+    prefixes = json.load(open(prefixes_json, encoding="utf-8")) if prefixes_json else []
+    print(json.dumps(teacher_data.remote(tasks, prefixes, out=out), indent=1))
 
 
 @app.local_entrypoint()
