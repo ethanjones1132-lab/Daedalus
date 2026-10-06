@@ -17,6 +17,7 @@ import {
   type LearningEvalLifecycleEventV1,
   type LearningEvalLifecycleReasonCode,
   type LearningEvalLifecycleToStatus,
+  type LearningEvalRollbackReasonCode,
 } from "../self-tuning/rollout/learning-eval-decision-store";
 
 export type SkillCandidateReadResult =
@@ -26,6 +27,18 @@ export type SkillCandidateReadResult =
 export function skillCandidateLifecycleVersion(candidate: Pick<SkillCandidate, "lifecycle_version"> | null | undefined): number {
   const version = candidate?.lifecycle_version;
   return Number.isSafeInteger(version) && (version as number) >= 0 ? version as number : 0;
+}
+
+/**
+ * Canonical ISO-8601 timestamp predicate. A value is canonical only when it is
+ * exactly the UTC millisecond-precision rendering that `Date.prototype.toISOString`
+ * produces, so `2026-10-06T12:34:56.789Z` is accepted while offsets, missing
+ * milliseconds, or any other non-canonical spelling is rejected.
+ */
+export function isCanonicalIsoTimestamp(value: string): boolean {
+  if (typeof value !== "string" || value.length === 0) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 function skillCandidatesDirOverride(): string | undefined {
@@ -67,17 +80,24 @@ export function readSkillCandidate(id: string): SkillCandidateReadResult {
 }
 
 /**
- * Private candidate persistence. `allowPromoted` is the single narrow gate that
- * separates the public candidate store (which rejects promoted writes with
- * `evidence_required`) from the evidence-verified promotion transition. The
- * flag is never surfaced through an exported generic save: public
- * `saveSkillCandidate` hard-codes `false`, and only the promotion transition
- * passes `true`, after every durable evidence check has already passed.
+ * Private candidate persistence. `allowPromoted` / `allowRolledBack` are the
+ * two narrow gates that separate the public candidate store (which rejects
+ * promoted and rolled_back writes with `evidence_required`) from the
+ * evidence-verified transitions. Neither flag is surfaced through an exported
+ * generic save: public `saveSkillCandidate` hard-codes both `false`, the
+ * promotion transition passes only `allowPromoted`, and the rollback transition
+ * passes only `allowRolledBack`, each after every durable evidence check has
+ * already passed.
  */
-function persistSkillCandidate(candidate: SkillCandidate, allowPromoted: boolean): void {
+function persistSkillCandidate(
+  candidate: SkillCandidate,
+  allowPromoted: boolean,
+  allowRolledBack = false,
+): void {
   const validated = validateSkillCandidate(candidate);
   if (!validated.ok) throw new Error("invalid_candidate_record");
   if (!allowPromoted && validated.candidate.status === "promoted") throw new Error("evidence_required");
+  if (!allowRolledBack && validated.candidate.status === "rolled_back") throw new Error("evidence_required");
   const path = skillCandidatePath(validated.candidate.id);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(validated.candidate, null, 2), "utf-8");
@@ -120,6 +140,7 @@ export function saveSkillCandidateForEvaluationFixture(candidate: SkillCandidate
 
   const validated = validateSkillCandidate(candidate);
   if (!validated.ok) throw new Error("invalid_candidate_record");
+  if (validated.candidate.status === "rolled_back") throw new Error("evidence_required");
   const path = skillCandidatePath(validated.candidate.id);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(validated.candidate, null, 2), "utf-8");
@@ -163,11 +184,12 @@ export type SkillCandidateTransitionResult =
 /**
  * Private version/status transition. The callback is invoked exactly once and
  * the passed-in `existing` object is deep-cloned before invocation so an
- * in-place mutation into `promoted` is detected independently of the returned
- * patch. `allowPromoted` defaults to `false`; the public exported
- * `transitionSkillCandidate` delegates with `false`, and only the specialized
- * evidence promotion function delegates with `true` after its durable evidence
- * checks. The callback guard itself is always evaluated.
+ * in-place mutation into `promoted`/`rolled_back` is detected independently of
+ * the returned patch. `allowPromoted` and `allowRolledBack` default to `false`;
+ * the public exported `transitionSkillCandidate` delegates with both `false`,
+ * and only the specialized evidence transitions delegate with their single
+ * matching flag after their durable evidence checks. The callback guards are
+ * always evaluated.
  */
 function transitionSkillCandidateInternal(
   id: string,
@@ -175,6 +197,7 @@ function transitionSkillCandidateInternal(
   requiredStatus: SkillCandidateStatus,
   update: (current: SkillCandidate) => Partial<SkillCandidate>,
   allowPromoted: boolean,
+  allowRolledBack = false,
 ): SkillCandidateTransitionResult {
   const read = readSkillCandidate(id);
   if (!read.ok) return { ok: false, error: read.error };
@@ -194,6 +217,11 @@ function transitionSkillCandidateInternal(
   if (!allowPromoted && (returnedPromoted || mutatedToPromoted)) {
     return { ok: false, error: "evidence_required", current: durable };
   }
+  const returnedRolledBack = patch.status === "rolled_back";
+  const mutatedToRolledBack = durableStatus !== "rolled_back" && existing.status === "rolled_back";
+  if (!allowRolledBack && (returnedRolledBack || mutatedToRolledBack)) {
+    return { ok: false, error: "evidence_required", current: durable };
+  }
   const updated = validateSkillCandidate({
     ...existing,
     ...patch,
@@ -202,7 +230,7 @@ function transitionSkillCandidateInternal(
     updated_at: new Date().toISOString(),
   });
   if (!updated.ok) return { ok: false, error: "invalid_candidate_record" };
-  persistSkillCandidate(updated.candidate, allowPromoted);
+  persistSkillCandidate(updated.candidate, allowPromoted, allowRolledBack);
   return { ok: true, candidate: updated.candidate };
 }
 
@@ -224,7 +252,7 @@ export function updateSkillCandidateStatus(
   evalMissed?: string[],
   expectedVersion?: number,
 ): SkillCandidate | null {
-  if (status === "promoted") return null;
+  if (status === "promoted" || status === "rolled_back") return null;
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
   const result = transitionSkillCandidate(
@@ -336,6 +364,7 @@ export type SkillCandidateLifecycleApplyError =
   | "stale_version"
   | "wrong_status"
   | "event_conflict"
+  | "rollback_recorded"
   | "ambiguous";
 
 export type SkillCandidateLifecycleApplyResult =
@@ -396,9 +425,10 @@ type AppendLifecycleEventOutcome =
   | { ok: false; error: "event_conflict" | "ambiguous" };
 
 /**
- * Build, append, and explicitly read back the deterministic lifecycle event. A
- * raced append whose persisted bytes differ only in timestamp is reconciled by
- * deterministic identity; any other conflicting event is refused untouched.
+ * Build, append, and explicitly read back the deterministic lifecycle event.
+ * Success requires the decoded persisted event to be exactly the same canonical
+ * event as the one created, including timestamp and eventHash; any differing
+ * byte is refused as an event conflict.
  */
 function appendAndReadBackLifecycleEvent(
   identity: LifecycleEventIdentity,
@@ -411,14 +441,15 @@ function appendAndReadBackLifecycleEvent(
   if (!appended.ok) {
     if (appended.code !== "conflict") return { ok: false, error: "ambiguous" };
     const raced = readLearningEvalLifecycleEvent(created.value.eventId, options);
-    if (!raced.ok || !lifecycleEventIdentityMatches(raced.value, identity)) {
+    if (!raced.ok) return { ok: false, error: "ambiguous" };
+    if (stableStringify(raced.value) !== stableStringify(created.value)) {
       return { ok: false, error: "event_conflict" };
     }
     return { ok: true, event: raced.value, created: false };
   }
   const readBack = readLearningEvalLifecycleEvent(created.value.eventId, options);
   if (!readBack.ok) return { ok: false, error: "ambiguous" };
-  if (!lifecycleEventIdentityMatches(readBack.value, identity)) {
+  if (stableStringify(readBack.value) !== stableStringify(created.value)) {
     return { ok: false, error: "event_conflict" };
   }
   return { ok: true, event: readBack.value, created: true };
@@ -542,12 +573,26 @@ export function applyLearningEvalDecision(
     return { ok: false, error: "decision_conflict" };
   }
 
+  const lifecycleTimestamp = intent.timestamp ?? durable.report.generatedAt;
+
   // 3. Resolve the intended action against the frozen report decision.
   const reportDecision = durable.report.decision;
   let toStatus: LearningEvalLifecycleToStatus;
   let reasonCode: LearningEvalLifecycleReasonCode;
   if (intent.action === "stage_candidate") {
     if (reportDecision !== "accepted") return { ok: false, error: "action_not_supported" };
+    // A rollback permanently invalidates this accepted report+candidate: the
+    // same report may never be re-staged once its exact rollback event exists.
+    const rollbackEventId = computeLearningEvalLifecycleEventId({
+      reportHash: durable.reportHash,
+      candidateId: durable.candidateArtifact.id,
+      action: "rollback_candidate",
+    });
+    const rollbackRead = readLearningEvalLifecycleEvent(rollbackEventId, options);
+    if (rollbackRead.ok) return { ok: false, error: "rollback_recorded" };
+    if (rollbackRead.code !== "not_found") {
+      return { ok: false, error: "ambiguous", detail: rollbackRead.error };
+    }
     toStatus = "staged";
     reasonCode = "accepted_transfer_gate";
   } else if (intent.action === "reject_candidate") {
@@ -611,9 +656,16 @@ export function applyLearningEvalDecision(
           action: intent.action,
           reasonCode,
         };
+        const expectedEvent = createLearningEvalLifecycleEvent({
+          ...retryIdentity,
+          timestamp: lifecycleTimestamp,
+        });
+        if (!expectedEvent.ok) {
+          return { ok: false, error: "ambiguous", current };
+        }
         if (
           observedPreTransitionMatches &&
-          lifecycleEventIdentityMatches(eventRead.value, retryIdentity) &&
+          stableStringify(eventRead.value) === stableStringify(expectedEvent.value) &&
           currentVersion === preTransitionVersion + 1 &&
           candidateMatchesPostTransitionState(
             current,
@@ -704,11 +756,16 @@ export function applyLearningEvalDecision(
   };
 
   // 5. Resolve the event before any status transition (event-before-success).
+  const expectedEvent = createLearningEvalLifecycleEvent({
+    ...identity,
+    timestamp: lifecycleTimestamp,
+  });
+  if (!expectedEvent.ok) return { ok: false, error: "ambiguous", current };
   const eventRead = readLearningEvalLifecycleEvent(eventId, options);
   let event: LearningEvalLifecycleEventV1;
   let eventCreated: boolean;
   if (eventRead.ok) {
-    if (!lifecycleEventIdentityMatches(eventRead.value, identity)) {
+    if (stableStringify(eventRead.value) !== stableStringify(expectedEvent.value)) {
       return { ok: false, error: "event_conflict", current };
     }
     if (
@@ -721,7 +778,7 @@ export function applyLearningEvalDecision(
     event = eventRead.value;
     eventCreated = false;
   } else if (eventRead.code === "not_found") {
-    const appended = appendAndReadBackLifecycleEvent(identity, intent.timestamp, options);
+    const appended = appendAndReadBackLifecycleEvent(identity, lifecycleTimestamp, options);
     if (!appended.ok) return { ok: false, error: appended.error, current };
     event = appended.event;
     eventCreated = appended.created;
@@ -866,6 +923,7 @@ export type SkillCandidatePromotionError =
   | "candidate_not_found"
   | "record_corrupt"
   | "event_conflict"
+  | "rollback_recorded"
   | "ambiguous";
 
 export type SkillCandidatePromotionResult =
@@ -932,6 +990,22 @@ export function promoteSkillCandidateFromAcceptedDecision(
     recomputedContentDigest !== record.candidateContentDigest
   ) {
     return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // A durable rollback permanently invalidates this accepted report+candidate;
+  // it may never be promoted again.
+  const rollbackEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "rollback_candidate",
+  });
+  const rollbackRead = readLearningEvalLifecycleEvent(rollbackEventId, options);
+  if (rollbackRead.ok) return { ok: false, error: "rollback_recorded" };
+  if (rollbackRead.code !== "not_found") {
+    if (rollbackRead.code === "corrupt_store" || rollbackRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: rollbackRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: rollbackRead.error };
   }
 
   // 7. The durable observed pre-state must be exactly candidate+version or absent.
@@ -1264,6 +1338,22 @@ export function verifySkillCandidatePromotionEvidence(
     return { ok: false, error: "candidate_binding_mismatch" };
   }
 
+  // A durable rollback permanently invalidates this accepted report+candidate;
+  // it may never be promoted again.
+  const rollbackEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "rollback_candidate",
+  });
+  const rollbackRead = readLearningEvalLifecycleEvent(rollbackEventId, options);
+  if (rollbackRead.ok) return { ok: false, error: "rollback_recorded" };
+  if (rollbackRead.code !== "not_found") {
+    if (rollbackRead.code === "corrupt_store" || rollbackRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: rollbackRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: rollbackRead.error };
+  }
+
   // 7. The durable observed pre-state must be exactly candidate+version or absent.
   if (
     !(
@@ -1426,4 +1516,389 @@ export function verifySkillCandidatePromotionEvidence(
   }
 
   return { ok: true, candidate: current, alreadyPromoted: false, pendingEvent: false };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Priority 3 Phase 3.4 — exact accepted-decision rollback
+// ═══════════════════════════════════════════════════════════════
+//
+// `rollbackSkillCandidateFromAcceptedDecision` is the ONLY store path that may
+// persist a `rolled_back` candidate. It is symmetric to the Phase 3.3 promotion
+// writer: it accepts hashes/IDs and a bounded reason code only — never a report
+// body or caller-authored state — and re-derives every enforcement fact from
+// the durable accepted decision plus the exact `stage_candidate` and
+// `promote_candidate` events and the current promoted candidate file.
+//
+//   * strictly re-decodes the durable decision and binds the caller's
+//     `reportHash` / `decisionRecordHash` / `candidateId` to it exactly;
+//   * requires an `accepted` report and the report/artifact/content digests to
+//     match the recomputed digests of the embedded frozen candidate;
+//   * requires the durable observed pre-state to be exactly candidate+version
+//     or absent, then reads the deterministic `stage_candidate` and
+//     `promote_candidate` events and verifies the exact candidate -> staged ->
+//     promoted chain at the exact versions;
+//   * requires the persisted candidate to be the exact promoted projection at
+//     the caller's `expectedLifecycleVersion` before rolling back;
+//   * appends and reads back the deterministic rollback event BEFORE the
+//     mutation (event-before-success), then transitions promoted -> rolled_back
+//     through the version-checked internal path and only returns success after
+//     an exact readback;
+//   * an exact retry of an already rolled-back candidate is verified against
+//     the same decision, stage and promotion events, rollback event, and
+//     post-state; a crash between the event append and the mutation resumes
+//     only from the exact promoted version.
+
+function candidateMatchesRolledBackEventState(
+  candidate: SkillCandidate,
+  frozen: SkillCandidate,
+  lifecycleVersion: number,
+  promotedAt: string,
+): boolean {
+  const validatedActual = validateSkillCandidate(candidate);
+  if (!validatedActual.ok) return false;
+  const actual = validatedActual.candidate;
+  const expected = validateSkillCandidate({
+    ...frozen,
+    status: "rolled_back",
+    promoted_at: promotedAt,
+    rejection_reason: undefined,
+    rejection_detail: undefined,
+    id: frozen.id,
+    lifecycle_version: lifecycleVersion,
+    updated_at: actual.updated_at,
+  });
+  if (!expected.ok) return false;
+  return stableStringify(actual) === stableStringify(expected.candidate);
+}
+
+export interface RollbackSkillCandidateFromAcceptedDecisionInput {
+  candidateId: string;
+  expectedLifecycleVersion: number;
+  reportHash: string;
+  decisionRecordHash: string;
+  reasonCode: LearningEvalRollbackReasonCode;
+  /**
+   * Required canonical ISO-8601 timestamp for the rollback lifecycle event. The
+   * caller generates it once for a new rollback and replays the exact same value
+   * on retries so the persisted event bytes are deterministic.
+   */
+  eventTimestamp: string;
+}
+
+export type SkillCandidateRollbackResult =
+  | { ok: true; candidate: SkillCandidate; event: LearningEvalLifecycleEventV1; eventCreated: boolean }
+  | { ok: false; error: SkillCandidatePromotionError; current?: SkillCandidate; detail?: string };
+
+export function rollbackSkillCandidateFromAcceptedDecision(
+  input: RollbackSkillCandidateFromAcceptedDecisionInput,
+  options?: { root?: string },
+): SkillCandidateRollbackResult {
+  // 1. Public input is identifiers/hashes plus a bounded reason code.
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    typeof input.candidateId !== "string" ||
+    input.candidateId.length === 0 ||
+    !Number.isSafeInteger(input.expectedLifecycleVersion) ||
+    input.expectedLifecycleVersion < 0 ||
+    typeof input.reportHash !== "string" ||
+    input.reportHash.length === 0 ||
+    typeof input.decisionRecordHash !== "string" ||
+    input.decisionRecordHash.length === 0 ||
+    typeof input.reasonCode !== "string" ||
+    typeof input.eventTimestamp !== "string" ||
+    !isCanonicalIsoTimestamp(input.eventTimestamp)
+  ) {
+    return { ok: false, error: "evidence_required" };
+  }
+
+  // 2. Reread the durable accepted-decision record.
+  const durableRead = readLearningEvalDecision(input.reportHash, options);
+  if (!durableRead.ok) {
+    if (durableRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: durableRead.error };
+    }
+    if (durableRead.code === "corrupt_store" || durableRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: durableRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: durableRead.error };
+  }
+
+  // 3. Strictly re-decode the durable record.
+  const redecoded = decodeLearningEvalDecisionRecord(durableRead.value);
+  if (!redecoded.ok) return { ok: false, error: "record_corrupt", detail: redecoded.error };
+  const record = redecoded.value;
+
+  // 4. Bind the caller's hashes to the durable record exactly.
+  if (input.reportHash !== record.reportHash || input.decisionRecordHash !== record.recordHash) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 5. Only an accepted report may roll back.
+  if (record.report.decision !== "accepted") {
+    return { ok: false, error: "decision_not_accepted" };
+  }
+
+  // 6. Bind the report and recomputed digests to the embedded frozen candidate.
+  const frozen = record.candidateArtifact;
+  const recomputedArtifactDigest = computeCandidateArtifactDigest(frozen);
+  const recomputedContentDigest = candidateContentDigestV1(frozen);
+  if (
+    input.candidateId !== frozen.id ||
+    record.report.candidate.id !== frozen.id ||
+    record.report.candidate.artifactDigest !== recomputedArtifactDigest ||
+    record.report.candidate.contentDigest !== computeBodyDigest(frozen.body) ||
+    recomputedArtifactDigest !== record.candidateArtifactDigest ||
+    recomputedContentDigest !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 7. The durable observed pre-state must be exactly candidate+version or absent.
+  if (
+    !(
+      (record.observedCandidateStatus === "candidate" &&
+        record.observedCandidateLifecycleVersion !== null) ||
+      (record.observedCandidateStatus === null &&
+        record.observedCandidateLifecycleVersion === null)
+    )
+  ) {
+    return { ok: false, error: "wrong_status" };
+  }
+  const stagePriorVersion =
+    record.observedCandidateStatus === "candidate"
+      ? record.observedCandidateLifecycleVersion as number
+      : skillCandidateLifecycleVersion(frozen);
+
+  // 8. Read the exact stage_candidate event and verify every frozen binding.
+  const stageEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "stage_candidate",
+  });
+  const stageRead = readLearningEvalLifecycleEvent(stageEventId, options);
+  if (!stageRead.ok) {
+    if (stageRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: stageRead.error };
+    }
+    if (stageRead.code === "corrupt_store" || stageRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: stageRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: stageRead.error };
+  }
+  const stageIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: stagePriorVersion,
+    newLifecycleVersion: stagePriorVersion + 1,
+    fromStatus: "candidate",
+    toStatus: "staged",
+    action: "stage_candidate",
+    reasonCode: "accepted_transfer_gate",
+  };
+  if (!lifecycleEventIdentityMatches(stageRead.value, stageIdentity)) {
+    return { ok: false, error: "event_conflict" };
+  }
+  const stagedVersion = stageRead.value.newLifecycleVersion;
+
+  // 9. Read the exact promote_candidate event and verify every frozen binding.
+  const promoteEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "promote_candidate",
+  });
+  const promoteRead = readLearningEvalLifecycleEvent(promoteEventId, options);
+  if (!promoteRead.ok) {
+    if (promoteRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: promoteRead.error };
+    }
+    if (promoteRead.code === "corrupt_store" || promoteRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: promoteRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: promoteRead.error };
+  }
+  const promoteIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: stagedVersion,
+    newLifecycleVersion: stagedVersion + 1,
+    fromStatus: "staged",
+    toStatus: "promoted",
+    action: "promote_candidate",
+    reasonCode: "accepted_learning_eval",
+  };
+  if (!lifecycleEventIdentityMatches(promoteRead.value, promoteIdentity)) {
+    return { ok: false, error: "event_conflict" };
+  }
+  const promotedVersion = promoteRead.value.newLifecycleVersion;
+  if (promotedVersion !== input.expectedLifecycleVersion) {
+    return { ok: false, error: "stale_version" };
+  }
+
+  // 10. Rollback event identity: promoted -> rolled_back.
+  const rollbackIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: promotedVersion,
+    newLifecycleVersion: promotedVersion + 1,
+    fromStatus: "promoted",
+    toStatus: "rolled_back",
+    action: "rollback_candidate",
+    reasonCode: input.reasonCode,
+  };
+  // The exact full expected rollback event, including timestamp and eventHash.
+  // Every persisted rollback event path must byte-match this canonical event;
+  // a different timestamp or any differing byte is a conflict.
+  const expectedEventResult = createLearningEvalLifecycleEvent({
+    ...rollbackIdentity,
+    timestamp: input.eventTimestamp,
+  });
+  if (!expectedEventResult.ok) return { ok: false, error: "ambiguous" };
+  const expectedEvent = expectedEventResult.value;
+  const rollbackEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "rollback_candidate",
+  });
+  const rollbackRead = readLearningEvalLifecycleEvent(rollbackEventId, options);
+  if (!rollbackRead.ok && rollbackRead.code !== "not_found") {
+    if (rollbackRead.code === "corrupt_store" || rollbackRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: rollbackRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: rollbackRead.error };
+  }
+
+  // 11. Read the persisted candidate and bind it to the frozen artifact.
+  const currentRead = readSkillCandidate(input.candidateId);
+  if (!currentRead.ok) {
+    return {
+      ok: false,
+      error: currentRead.error === "candidate_not_found" ? "candidate_not_found" : "record_corrupt",
+    };
+  }
+  const current = currentRead.candidate;
+  if (
+    current.id !== frozen.id ||
+    candidateContentDigestV1(current) !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+  const currentVersion = skillCandidateLifecycleVersion(current);
+
+  // 12. Exact-retry / lost-response retry for an already rolled-back candidate.
+  if (current.status === "rolled_back") {
+    if (currentVersion !== promotedVersion + 1) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    if (!rollbackRead.ok) return { ok: false, error: "ambiguous", current };
+    if (stableStringify(rollbackRead.value) !== stableStringify(expectedEvent)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    if (
+      !candidateMatchesRolledBackEventState(
+        current,
+        frozen,
+        promotedVersion + 1,
+        promoteRead.value.timestamp,
+      )
+    ) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    return { ok: true, candidate: current, event: rollbackRead.value, eventCreated: false };
+  }
+
+  // 13. Pre-transition candidate must be the exact promoted projection/version.
+  if (current.status !== "promoted") {
+    return { ok: false, error: "wrong_status", current };
+  }
+  if (currentVersion !== promotedVersion) {
+    return { ok: false, error: "stale_version", current };
+  }
+  if (
+    !candidateMatchesPromotedEventState(
+      current,
+      frozen,
+      promotedVersion,
+      promoteRead.value.timestamp,
+      record,
+    )
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+
+  // 14. Resolve the rollback event before mutation (event-before-success). A
+  // crash after the append but before the transition resumes here from the
+  // exact promoted version.
+  let event: LearningEvalLifecycleEventV1;
+  let eventCreated: boolean;
+  if (rollbackRead.ok) {
+    if (stableStringify(rollbackRead.value) !== stableStringify(expectedEvent)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    event = rollbackRead.value;
+    eventCreated = false;
+  } else {
+    const appended = appendAndReadBackLifecycleEvent(rollbackIdentity, input.eventTimestamp, options);
+    if (!appended.ok) return { ok: false, error: appended.error, current };
+    event = appended.event;
+    eventCreated = appended.created;
+  }
+
+  // 15. Transition to rolled_back through the evidence-gated internal path.
+  const transition = transitionSkillCandidateInternal(
+    input.candidateId,
+    promotedVersion,
+    "promoted",
+    (existing) => ({
+      ...existing,
+      status: "rolled_back",
+      promoted_at: existing.promoted_at,
+      rejection_reason: undefined,
+      rejection_detail: undefined,
+    }),
+    false,
+    true,
+  );
+  if (!transition.ok) {
+    const attempted = readSkillCandidate(input.candidateId);
+    if (
+      attempted.ok &&
+      candidateMatchesRolledBackEventState(
+        attempted.candidate,
+        frozen,
+        promotedVersion + 1,
+        promoteRead.value.timestamp,
+      )
+    ) {
+      return { ok: true, candidate: attempted.candidate, event, eventCreated };
+    }
+    if (transition.error === "stale_version" || transition.error === "wrong_status") {
+      return { ok: false, error: transition.error, current: transition.current ?? current };
+    }
+    if (transition.error === "candidate_not_found") {
+      return { ok: false, error: "candidate_not_found", current: transition.current ?? current };
+    }
+    if (transition.error === "invalid_candidate_record") {
+      return { ok: false, error: "record_corrupt", current: transition.current ?? current };
+    }
+    return { ok: false, error: "ambiguous", current: transition.current ?? current };
+  }
+
+  // 16. Authoritative readback: never acknowledge success from the write alone.
+  const finalRead = readSkillCandidate(input.candidateId);
+  if (!finalRead.ok) return { ok: false, error: "ambiguous", current: transition.candidate };
+  if (
+    !candidateMatchesRolledBackEventState(
+      finalRead.candidate,
+      frozen,
+      promotedVersion + 1,
+      promoteRead.value.timestamp,
+    )
+  ) {
+    return { ok: false, error: "ambiguous", current: finalRead.candidate };
+  }
+  return { ok: true, candidate: finalRead.candidate, event, eventCreated };
 }

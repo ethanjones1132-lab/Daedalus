@@ -750,6 +750,54 @@ export function readLearningEvalDecision(
   return { ok: true, value: match.record };
 }
 
+export type ListLearningEvalDecisionsForCandidateResult =
+  | { ok: true; values: LearningEvalDecisionRecordV1[] }
+  | LearningEvalDecisionStoreFailure;
+
+export function listLearningEvalDecisionsForCandidate(
+  candidateId: string,
+  opts?: LearningEvalDecisionStoreOptions,
+): ListLearningEvalDecisionsForCandidateResult {
+  if (typeof candidateId !== "string" || candidateId.trim().length === 0) {
+    return storeError("invalid_record", "invalid candidate id");
+  }
+
+  const layout = prepareLearningEvalStore(opts, false);
+  if (!layout.ok) {
+    if (layout.code === "not_found") {
+      return { ok: true, values: [] };
+    }
+    return layout;
+  }
+
+  const scanned = scanLearningEvalStore(layout.paths.recordsDir, layout.paths.realRecordsDir);
+  if (!scanned.ok) {
+    if (scanned.code === "not_found") {
+      return { ok: true, values: [] };
+    }
+    return scanned;
+  }
+
+  const values = scanned.records
+    .filter(
+      (entry) =>
+        entry.record.candidateArtifact.id === candidateId &&
+        entry.record.report.candidate.id === candidateId,
+    )
+    .map((entry) => entry.record)
+    .sort((left, right) => {
+      if (left.createdAt !== right.createdAt) {
+        return left.createdAt < right.createdAt ? -1 : 1;
+      }
+      if (left.reportHash !== right.reportHash) {
+        return left.reportHash < right.reportHash ? -1 : 1;
+      }
+      return 0;
+    });
+
+  return { ok: true, values };
+}
+
 export function writeLearningEvalDecision(
   record: LearningEvalDecisionRecordV1,
   opts?: LearningEvalDecisionStoreOptions,
@@ -846,14 +894,26 @@ export const LEARNING_EVAL_LIFECYCLE_EVENT_SCHEMA_VERSION = 1 as const;
 export type LearningEvalLifecycleAction =
   | "stage_candidate"
   | "reject_candidate"
-  | "promote_candidate";
+  | "promote_candidate"
+  | "rollback_candidate";
+
+/**
+ * Closed, bounded rollback motivations. A rollback is only ever recorded with
+ * one of these codes; the code is bound into the deterministic rollback event
+ * hash.
+ */
+export type LearningEvalRollbackReasonCode =
+  | "regression_detected"
+  | "superseded_by_newer_evidence"
+  | "manual_rollback";
 
 export type LearningEvalLifecycleReasonCode =
   | "accepted_transfer_gate"
   | "transfer_gate_failed"
-  | "accepted_learning_eval";
+  | "accepted_learning_eval"
+  | LearningEvalRollbackReasonCode;
 
-export type LearningEvalLifecycleToStatus = "staged" | "rejected" | "promoted";
+export type LearningEvalLifecycleToStatus = "staged" | "rejected" | "promoted" | "rolled_back";
 
 export type LearningEvalLifecycleFromStatus =
   | "candidate"
@@ -915,15 +975,25 @@ const LEARNING_EVAL_LIFECYCLE_ACTIONS = [
   "stage_candidate",
   "reject_candidate",
   "promote_candidate",
+  "rollback_candidate",
+] as const;
+
+const LEARNING_EVAL_ROLLBACK_REASON_CODES = [
+  "regression_detected",
+  "superseded_by_newer_evidence",
+  "manual_rollback",
 ] as const;
 
 const LEARNING_EVAL_LIFECYCLE_REASON_CODES = [
   "accepted_transfer_gate",
   "transfer_gate_failed",
   "accepted_learning_eval",
+  "regression_detected",
+  "superseded_by_newer_evidence",
+  "manual_rollback",
 ] as const;
 
-const LEARNING_EVAL_LIFECYCLE_TO_STATUSES = ["staged", "rejected", "promoted"] as const;
+const LEARNING_EVAL_LIFECYCLE_TO_STATUSES = ["staged", "rejected", "promoted", "rolled_back"] as const;
 
 const LEARNING_EVAL_LIFECYCLE_FROM_STATUSES = [
   "candidate",
@@ -985,6 +1055,13 @@ function isLifecycleReasonCode(value: unknown): value is LearningEvalLifecycleRe
   return (
     typeof value === "string" &&
     (LEARNING_EVAL_LIFECYCLE_REASON_CODES as readonly string[]).includes(value)
+  );
+}
+
+function isRollbackReasonCode(value: unknown): value is LearningEvalRollbackReasonCode {
+  return (
+    typeof value === "string" &&
+    (LEARNING_EVAL_ROLLBACK_REASON_CODES as readonly string[]).includes(value)
   );
 }
 
@@ -1211,6 +1288,22 @@ export function decodeLearningEvalLifecycleEvent(
       return {
         ok: false,
         error: "promote_candidate requires reasonCode accepted_learning_eval",
+      };
+    }
+  } else if (action === "rollback_candidate") {
+    if (toStatus !== "rolled_back") {
+      return { ok: false, error: "rollback_candidate requires toStatus rolled_back" };
+    }
+    if (fromStatus !== "promoted") {
+      return { ok: false, error: "rollback_candidate requires fromStatus promoted" };
+    }
+    if (priorLifecycleVersion === null) {
+      return { ok: false, error: "rollback_candidate requires non-null priorLifecycleVersion" };
+    }
+    if (!isRollbackReasonCode(reasonCode)) {
+      return {
+        ok: false,
+        error: "rollback_candidate requires a bounded rollback reasonCode",
       };
     }
   }

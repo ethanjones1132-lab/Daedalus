@@ -26,12 +26,18 @@ import MarkdownRenderer from './MarkdownRenderer';
 import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
 import { applySkillListRead, confirmSkillToggle, type SkillToggleProtection } from './skill-toggle-state';
 import {
+  isCanonicalIsoTimestamp,
   skillCandidateMutationConfirmed,
+  skillCandidateMutationDefinitiveRefusal,
   skillCandidateMutationLocked,
+  skillCandidateMutationRetryPreflight,
   startSkillCandidateMutation,
   transitionSkillCandidateMutation,
   type SkillCandidateAction,
   type SkillCandidateMutation,
+  type SkillCandidateMutationProof,
+  type SkillCandidateSnapshot,
+  type SkillCandidateStatus,
 } from './skill-candidate-operation-state';
 import {
   candidatePerformanceView,
@@ -82,7 +88,7 @@ interface SkillCandidateDetail {
   source_run_ids: string[];
   source_session_id?: string;
   confidence: number;
-  status: 'candidate' | 'promoted' | 'rejected';
+  status: 'candidate' | 'promoted' | 'rejected' | 'staged' | 'rolled_back';
   lifecycle_version?: number;
   eval_score?: number;
   eval_missed?: string[];
@@ -96,6 +102,18 @@ interface SkillCandidateDetail {
 type Filter = 'all' | 'enabled' | 'disabled' | 'candidates';
 
 const BUN_URL = 'http://127.0.0.1:19877';
+
+type RollbackReasonCode = 'regression_detected' | 'superseded_by_newer_evidence' | 'manual_rollback';
+
+const ROLLBACK_REASON_CODES: readonly RollbackReasonCode[] = [
+  'regression_detected',
+  'superseded_by_newer_evidence',
+  'manual_rollback',
+];
+
+function isRollbackReasonCode(value: string | undefined): value is RollbackReasonCode {
+  return typeof value === 'string' && (ROLLBACK_REASON_CODES as readonly string[]).includes(value);
+}
 
 // ── Helpers ────────────────────────────────────────────────────
 
@@ -154,7 +172,7 @@ function candidateIdOf(skill: Skill): string | null {
 }
 
 /** Distilled skills are owned by the Bun candidate store — their lifecycle
- *  moves through Promote/Reject/Demote, not the native enable/disable
+ *  moves through Promote/Reject/Rollback, not the native enable/disable
  *  toggle (which the orchestrator's resolver never reads for these rows). */
 function isDistilledSkill(skill: Skill): boolean {
   return sourceOf(skill) === 'trajectory_distillation';
@@ -171,12 +189,40 @@ async function postSkillCandidateAction(
   action: SkillCandidateAction,
   expectedVersion: number,
   reason?: string,
+  proof?: SkillCandidateMutationProof,
 ): Promise<SkillCandidateActionResponse> {
+  let payload: Record<string, unknown>;
+  if (action === 'promote') {
+    if (proof?.reportHash === undefined || proof.recordHash === undefined) {
+      return { ok: false, status: 0, data: {} };
+    }
+    payload = {
+      report_hash: proof.reportHash,
+      record_hash: proof.recordHash,
+      expected_version: expectedVersion,
+    };
+  } else if (action === 'rollback') {
+    if (proof?.reportHash === undefined || proof.recordHash === undefined || proof.reasonCode === undefined) {
+      return { ok: false, status: 0, data: {} };
+    }
+    if (!isCanonicalIsoTimestamp(proof.eventTimestamp)) {
+      return { ok: false, status: 0, data: {} };
+    }
+    payload = {
+      report_hash: proof.reportHash,
+      record_hash: proof.recordHash,
+      expected_version: expectedVersion,
+      reason_code: proof.reasonCode,
+      event_timestamp: proof.eventTimestamp,
+    };
+  } else {
+    payload = { expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) };
+  }
   try {
     const res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
     return {
@@ -212,6 +258,338 @@ async function readCandidatePerformance(candidateId: string): Promise<CandidateP
   }
 }
 
+// ── Candidate evaluation projection ────────────────────────────
+//
+// Strict read model for the native-backed
+// GET /skills/candidates/:id/evaluation projection. Every field is decoded
+// defensively so a malformed or partial body is reported as itself rather
+// than coerced; a failed read never becomes an empty evaluations list.
+
+export type SkillCandidateEvaluationDecision = 'accepted' | 'rejected' | 'inconclusive';
+
+export interface SkillCandidateEvaluationCandidate {
+  id: string;
+  content_digest: string;
+  artifact_digest: string;
+}
+
+export interface SkillCandidateEvaluationCoverage {
+  planned_task_count: number;
+  seeds_per_task: number;
+  arms_per_block: number;
+  planned_block_count: number;
+  planned_outcome_count: number;
+  observed_outcome_count: number;
+  missing_outcome_count: number;
+}
+
+export interface SkillCandidateEvaluationCriterion {
+  id: string;
+  description: string;
+  threshold: number;
+  observed: number | null;
+  status: string;
+  reason: string | null;
+}
+
+export interface SkillCandidateEvaluation {
+  report_hash: string;
+  record_hash: string;
+  manifest_hash: string;
+  decision: SkillCandidateEvaluationDecision;
+  generated_at: string;
+  candidate: SkillCandidateEvaluationCandidate;
+  coverage: SkillCandidateEvaluationCoverage;
+  criteria: SkillCandidateEvaluationCriterion[];
+  reasons: string[];
+  observed_status: SkillCandidateStatus;
+  observed_version: number;
+  content_match: boolean;
+  stale: boolean;
+}
+
+export interface SkillCandidateEvaluationProjection {
+  candidate_id: string;
+  current_status: SkillCandidateStatus;
+  current_version: number;
+  count: number;
+  evaluations: SkillCandidateEvaluation[];
+}
+
+export type SkillCandidateEvaluationReadResult =
+  | { kind: 'ok'; value: SkillCandidateEvaluationProjection }
+  | { kind: 'http'; status: number }
+  | { kind: 'transport' }
+  | { kind: 'body' }
+  | { kind: 'invalid' };
+
+/**
+ * SkillsView-owned read state for the selected candidate's evaluation
+ * projection. `idle` means no candidate is selected; the unavailable kinds stay
+ * distinct so the evidence section can report why it could not load instead of
+ * rendering a misleading empty list.
+ */
+export type SkillCandidateEvaluationLoadState =
+  | { kind: 'idle' }
+  | { kind: 'loading'; candidateId: string }
+  | { kind: 'loaded'; candidateId: string; projection: SkillCandidateEvaluationProjection }
+  | { kind: 'http'; candidateId: string; status: number }
+  | { kind: 'transport'; candidateId: string }
+  | { kind: 'body'; candidateId: string }
+  | { kind: 'invalid'; candidateId: string };
+
+const SKILL_CANDIDATE_STATUS_VALUES: readonly SkillCandidateStatus[] = [
+  'candidate',
+  'promoted',
+  'rejected',
+  'staged',
+  'rolled_back',
+];
+
+const SKILL_CANDIDATE_DECISIONS: readonly SkillCandidateEvaluationDecision[] = [
+  'accepted',
+  'rejected',
+  'inconclusive',
+];
+
+const HEX_64 = /^[0-9a-fA-F]{64}$/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isHex64(value: unknown): value is string {
+  return typeof value === 'string' && HEX_64.test(value);
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isSkillCandidateStatus(value: unknown): value is SkillCandidateStatus {
+  return typeof value === 'string' && (SKILL_CANDIDATE_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+function isSkillCandidateDecision(value: unknown): value is SkillCandidateEvaluationDecision {
+  return typeof value === 'string' && (SKILL_CANDIDATE_DECISIONS as readonly string[]).includes(value);
+}
+
+function decodeEvaluationCandidate(value: unknown): SkillCandidateEvaluationCandidate | null {
+  if (!isRecord(value)) return null;
+  const id = value.id;
+  const contentDigest = value.content_digest;
+  const artifactDigest = value.artifact_digest;
+  if (!isNonEmptyString(id) || !isHex64(contentDigest) || !isHex64(artifactDigest)) return null;
+  return { id, content_digest: contentDigest, artifact_digest: artifactDigest };
+}
+
+function decodeEvaluationCoverage(value: unknown): SkillCandidateEvaluationCoverage | null {
+  if (!isRecord(value)) return null;
+  const plannedTaskCount = value.planned_task_count;
+  const seedsPerTask = value.seeds_per_task;
+  const armsPerBlock = value.arms_per_block;
+  const plannedBlockCount = value.planned_block_count;
+  const plannedOutcomeCount = value.planned_outcome_count;
+  const observedOutcomeCount = value.observed_outcome_count;
+  const missingOutcomeCount = value.missing_outcome_count;
+  if (!isNonNegativeSafeInteger(plannedTaskCount)) return null;
+  if (!isNonNegativeSafeInteger(seedsPerTask)) return null;
+  if (!isNonNegativeSafeInteger(armsPerBlock)) return null;
+  if (!isNonNegativeSafeInteger(plannedBlockCount)) return null;
+  if (!isNonNegativeSafeInteger(plannedOutcomeCount)) return null;
+  if (!isNonNegativeSafeInteger(observedOutcomeCount)) return null;
+  if (!isNonNegativeSafeInteger(missingOutcomeCount)) return null;
+  return {
+    planned_task_count: plannedTaskCount,
+    seeds_per_task: seedsPerTask,
+    arms_per_block: armsPerBlock,
+    planned_block_count: plannedBlockCount,
+    planned_outcome_count: plannedOutcomeCount,
+    observed_outcome_count: observedOutcomeCount,
+    missing_outcome_count: missingOutcomeCount,
+  };
+}
+
+function decodeEvaluationCriterion(value: unknown): SkillCandidateEvaluationCriterion | null {
+  if (!isRecord(value)) return null;
+  const id = value.id;
+  const description = value.description;
+  const threshold = value.threshold;
+  const observed = value.observed;
+  const status = value.status;
+  const reason = value.reason;
+  if (!isNonEmptyString(id)) return null;
+  if (typeof description !== 'string') return null;
+  if (!isFiniteNumber(threshold)) return null;
+  if (observed !== null && !isFiniteNumber(observed)) return null;
+  if (!isNonEmptyString(status)) return null;
+  if (reason !== null && typeof reason !== 'string') return null;
+  return {
+    id,
+    description,
+    threshold,
+    observed: observed === null ? null : observed,
+    status,
+    reason: reason === null ? null : reason,
+  };
+}
+
+function decodeEvaluation(value: unknown): SkillCandidateEvaluation | null {
+  if (!isRecord(value)) return null;
+  const reportHash = value.report_hash;
+  const recordHash = value.record_hash;
+  const manifestHash = value.manifest_hash;
+  const decision = value.decision;
+  const generatedAt = value.generated_at;
+  if (!isHex64(reportHash) || !isHex64(recordHash) || !isHex64(manifestHash)) return null;
+  if (!isSkillCandidateDecision(decision)) return null;
+  if (!isNonEmptyString(generatedAt)) return null;
+  const candidate = decodeEvaluationCandidate(value.candidate);
+  if (!candidate) return null;
+  const coverage = decodeEvaluationCoverage(value.coverage);
+  if (!coverage) return null;
+  if (!Array.isArray(value.criteria)) return null;
+  const criteria: SkillCandidateEvaluationCriterion[] = [];
+  for (const raw of value.criteria) {
+    const criterion = decodeEvaluationCriterion(raw);
+    if (!criterion) return null;
+    criteria.push(criterion);
+  }
+  if (!Array.isArray(value.reasons)) return null;
+  const reasons: string[] = [];
+  for (const raw of value.reasons) {
+    if (typeof raw !== 'string') return null;
+    reasons.push(raw);
+  }
+  const observedStatus = value.observed_status;
+  const observedVersion = value.observed_version;
+  const contentMatch = value.content_match;
+  const stale = value.stale;
+  if (!isSkillCandidateStatus(observedStatus)) return null;
+  if (!isNonNegativeSafeInteger(observedVersion)) return null;
+  if (typeof contentMatch !== 'boolean') return null;
+  if (typeof stale !== 'boolean') return null;
+  return {
+    report_hash: reportHash,
+    record_hash: recordHash,
+    manifest_hash: manifestHash,
+    decision,
+    generated_at: generatedAt,
+    candidate,
+    coverage,
+    criteria,
+    reasons,
+    observed_status: observedStatus,
+    observed_version: observedVersion,
+    content_match: contentMatch,
+    stale,
+  };
+}
+
+export function decodeSkillCandidateEvaluation(body: unknown): SkillCandidateEvaluationProjection | null {
+  if (!isRecord(body)) return null;
+  const candidateId = body.candidate_id;
+  const currentStatus = body.current_status;
+  const currentVersion = body.current_version;
+  const count = body.count;
+  const evaluationsRaw = body.evaluations;
+  if (!isNonEmptyString(candidateId)) return null;
+  if (!isSkillCandidateStatus(currentStatus)) return null;
+  if (!isNonNegativeSafeInteger(currentVersion)) return null;
+  if (!isNonNegativeSafeInteger(count)) return null;
+  if (!Array.isArray(evaluationsRaw)) return null;
+  if (count !== evaluationsRaw.length) return null;
+  const evaluations: SkillCandidateEvaluation[] = [];
+  for (const raw of evaluationsRaw) {
+    const evaluation = decodeEvaluation(raw);
+    if (!evaluation) return null;
+    if (evaluation.candidate.id !== candidateId) return null;
+    evaluations.push(evaluation);
+  }
+  return {
+    candidate_id: candidateId,
+    current_status: currentStatus,
+    current_version: currentVersion,
+    count,
+    evaluations,
+  };
+}
+
+export async function readCandidateEvaluation(candidateId: string): Promise<SkillCandidateEvaluationReadResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/evaluation`);
+  } catch {
+    return { kind: 'transport' };
+  }
+  const status = typeof res.status === 'number' ? res.status : 0;
+  if (!res.ok) return { kind: 'http', status };
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    return { kind: 'body' };
+  }
+  const value = decodeSkillCandidateEvaluation(body);
+  // The route is candidate-scoped: a body for a different candidate is not a
+  // valid read of this request, regardless of how well-formed it is.
+  if (!value || value.candidate_id !== candidateId) return { kind: 'invalid' };
+  return { kind: 'ok', value };
+}
+
+/**
+ * Authoritative confirmation for one candidate mutation. Eval/reject are
+ * confirmed from the candidate snapshot alone; promote/rollback additionally
+ * require the freshly read evaluation projection to carry the exact pinned
+ * report+record once, accepted, against the same candidate content, with the
+ * record's observed pre-state matching the expected lifecycle transition.
+ * A stale record is only acceptable because the expected transition advanced
+ * the candidate out from under it — any other shape stays unconfirmed.
+ */
+function confirmCandidateMutation(
+  candidateId: string,
+  mutation: SkillCandidateMutation,
+  authoritative: SkillCandidateSnapshot | undefined,
+  readback: SkillCandidateEvaluationReadResult | null,
+): boolean {
+  if (!authoritative) return false;
+  if (mutation.action !== 'promote' && mutation.action !== 'rollback') {
+    return skillCandidateMutationConfirmed(mutation, authoritative);
+  }
+  if (!skillCandidateMutationConfirmed(mutation, authoritative)) return false;
+  if (!readback || readback.kind !== 'ok') return false;
+  const projection = readback.value;
+  if (projection.candidate_id !== candidateId) return false;
+  const targetStatus = mutation.action === 'promote' ? 'promoted' : 'rolled_back';
+  if (projection.current_status !== targetStatus) return false;
+  if (projection.current_version !== mutation.expectedVersion + 1) return false;
+  if (mutation.reportHash === undefined || mutation.recordHash === undefined) return false;
+  const matches = projection.evaluations.filter(
+    (record) => record.record_hash === mutation.recordHash && record.report_hash === mutation.reportHash,
+  );
+  if (matches.length !== 1) return false;
+  const record = matches[0];
+  if (record.decision !== 'accepted') return false;
+  if (record.candidate.id !== candidateId) return false;
+  if (mutation.contentDigest !== undefined && record.candidate.content_digest !== mutation.contentDigest) return false;
+  if (mutation.artifactDigest !== undefined && record.candidate.artifact_digest !== mutation.artifactDigest) return false;
+  if (record.content_match !== true) return false;
+  if (record.stale !== true) return false;
+  const expectedObservedVersion =
+    mutation.action === 'promote' ? mutation.expectedVersion : mutation.expectedVersion - 1;
+  if (record.observed_status !== 'staged') return false;
+  if (record.observed_version !== expectedObservedVersion) return false;
+  return true;
+}
+
 // ── Detail panel ───────────────────────────────────────────────
 
 function SkillDetail({
@@ -219,6 +597,10 @@ function SkillDetail({
   candidateDetail,
   candidateCurrent,
   candidateMutation,
+  evaluationLoad: evaluationLoadProp,
+  selectedEvaluationHash,
+  onSelectEvaluation,
+  onRetryEvaluation,
   onCandidateAction,
   onRetryCandidate,
   onClose,
@@ -231,7 +613,11 @@ function SkillDetail({
   candidateDetail: SkillCandidateDetail | null;
   candidateCurrent: boolean;
   candidateMutation: SkillCandidateMutation | null;
-  onCandidateAction: (action: SkillCandidateAction) => void;
+  evaluationLoad: SkillCandidateEvaluationLoadState;
+  selectedEvaluationHash: string | null;
+  onSelectEvaluation: (recordHash: string) => void;
+  onRetryEvaluation: () => void;
+  onCandidateAction: (action: SkillCandidateAction, reasonCode?: string) => void;
   onRetryCandidate: () => void;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
@@ -243,9 +629,98 @@ function SkillDetail({
   const [revisions, setRevisions] = useState<SkillRevision[] | null>(null);
   const [loadingRevs, setLoadingRevs] = useState(false);
   const [revError, setRevError] = useState<string | null>(null);
+  const [rollbackReasonSelection, setRollbackReasonSelection] = useState<{
+    candidateId: string;
+    reasonCode: RollbackReasonCode;
+  } | null>(null);
+  // The active reason is derived from both the candidate it was chosen for and
+  // the reason itself, so a reason chosen for another candidate is never shown
+  // as this candidate's selection — including on the render before effects run.
+  const rollbackReason: RollbackReasonCode | '' =
+    candidateDetail && rollbackReasonSelection?.candidateId === candidateDetail.id
+      ? rollbackReasonSelection.reasonCode
+      : '';
   const { success, error: toastError } = useToast();
   const distilled = isDistilledSkill(skill);
   const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
+
+  const evaluationRadioName = useId();
+  // A load tagged for a candidate other than the one being shown cannot describe
+  // it. Until effects run for the newly selected candidate, present the previous
+  // selection's load as still-loading rather than rendering its projection or
+  // error under the new candidate.
+  const evaluationLoad: SkillCandidateEvaluationLoadState =
+    evaluationLoadProp.kind === 'idle' || evaluationLoadProp.candidateId === candidateDetail?.id
+      ? evaluationLoadProp
+      : { kind: 'loading', candidateId: evaluationLoadProp.candidateId };
+  const evaluationProjection = evaluationLoad.kind === 'loaded' ? evaluationLoad.projection : null;
+  const candidateLifecycleVersion = candidateDetail?.lifecycle_version ?? 0;
+  // A record may only be marked eligible when it was accepted against the same
+  // candidate, is neither stale nor content-mismatched, and the projection's
+  // current status/version exactly match the candidate detail we are showing.
+  const evaluationEligibility = (record: SkillCandidateEvaluation): boolean => {
+    if (!candidateDetail || !evaluationProjection) return false;
+    return (
+      record.decision === 'accepted' &&
+      record.stale === false &&
+      record.content_match === true &&
+      record.candidate.id === candidateDetail.id &&
+      evaluationProjection.candidate_id === candidateDetail.id &&
+      evaluationProjection.current_status === candidateDetail.status &&
+      evaluationProjection.current_version === candidateLifecycleVersion
+    );
+  };
+  const evaluationIneligibilityReason = (record: SkillCandidateEvaluation): string => {
+    if (!candidateDetail || !evaluationProjection) return 'Ineligible — no current candidate';
+    if (record.decision !== 'accepted') return 'Ineligible — decision not accepted';
+    if (record.stale) return 'Ineligible — stale record';
+    if (!record.content_match) return 'Ineligible — content mismatch';
+    if (record.candidate.id !== candidateDetail.id) return 'Ineligible — different candidate';
+    if (evaluationProjection.candidate_id !== candidateDetail.id) return 'Ineligible — projection for a different candidate';
+    if (evaluationProjection.current_status !== candidateDetail.status) return 'Ineligible — candidate status changed';
+    if (evaluationProjection.current_version !== candidateLifecycleVersion) return 'Ineligible — candidate version changed';
+    return 'Ineligible';
+  };
+
+  // The selection is a hash, never an implicit first row. It only counts when it
+  // resolves to exactly one displayed record.
+  const selectedEvaluationRecord = useMemo<SkillCandidateEvaluation | null>(() => {
+    if (!evaluationProjection || !selectedEvaluationHash) return null;
+    const matches = evaluationProjection.evaluations.filter(
+      (record) => record.record_hash === selectedEvaluationHash,
+    );
+    return matches.length === 1 ? matches[0] : null;
+  }, [evaluationProjection, selectedEvaluationHash]);
+  const selectedEvaluationEligible = selectedEvaluationRecord !== null && evaluationEligibility(selectedEvaluationRecord);
+  // Promotion consumes the record observed at the current staged version;
+  // rollback consumes the record observed at the staged version immediately
+  // before the current promoted version.
+  const selectedPromotionEligible =
+    selectedEvaluationEligible &&
+    candidateDetail?.status === 'staged' &&
+    selectedEvaluationRecord?.observed_status === 'staged' &&
+    selectedEvaluationRecord?.observed_version === candidateLifecycleVersion;
+  const selectedRollbackEligible =
+    candidateDetail?.status === 'promoted' &&
+    evaluationProjection !== null &&
+    evaluationProjection.candidate_id === candidateDetail.id &&
+    evaluationProjection.current_status === candidateDetail.status &&
+    evaluationProjection.current_version === candidateLifecycleVersion &&
+    selectedEvaluationRecord !== null &&
+    selectedEvaluationRecord.decision === 'accepted' &&
+    selectedEvaluationRecord.content_match === true &&
+    selectedEvaluationRecord.stale === true &&
+    selectedEvaluationRecord.candidate.id === candidateDetail.id &&
+    selectedEvaluationRecord.observed_status === 'staged' &&
+    selectedEvaluationRecord.observed_version === candidateLifecycleVersion - 1;
+  // The exact prior staged accepted record selected for rollback stays
+  // meaningful after promotion even though it is now stale. It is not
+  // generically ineligible; it is the prior-state evidence rollback consumes.
+  const isPriorStateRollbackEvidence = (record: SkillCandidateEvaluation): boolean =>
+    selectedRollbackEligible &&
+    selectedEvaluationRecord !== null &&
+    record.report_hash === selectedEvaluationRecord.report_hash &&
+    record.record_hash === selectedEvaluationRecord.record_hash;
 
   const performanceCandidateId = candidateDetail?.status === 'promoted' ? candidateDetail.id : null;
   const [performanceState, setPerformanceState] = useState<CandidatePerformanceState>(initialCandidatePerformanceState);
@@ -341,43 +816,80 @@ function SkillDetail({
               </button>
             )}
             {candidateDetail?.status === 'candidate' && (
-              <>
-                <button
-                  type="button"
-                  disabled={
-                    candidateActionLocked || !candidateCurrent ||
-                    candidateDetail.eval_score === undefined ||
-                    candidateDetail.eval_score < 0.75
-                  }
-                  onClick={() => onCandidateAction('promote')}
-                  title={
-                    candidateDetail.eval_score === undefined || candidateDetail.eval_score < 0.75
-                      ? 'Run eval first — promotion requires a passing judge decision (≥0.75)'
-                      : 'Promote to live skill'
-                  }
-                  className="px-3 py-1.5 text-xs rounded-lg border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
-                >
-                  Promote
-                </button>
-                <button
-                  type="button"
-                  disabled={candidateActionLocked || !candidateCurrent}
-                  onClick={() => onCandidateAction('reject')}
-                  className="px-3 py-1.5 text-xs rounded-lg border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-50"
-                >
-                  Reject
-                </button>
-              </>
-            )}
-            {candidateDetail?.status === 'promoted' && (
               <button
                 type="button"
                 disabled={candidateActionLocked || !candidateCurrent}
-                onClick={() => onCandidateAction('demote')}
-                className="px-3 py-1.5 text-xs rounded-lg border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
+                onClick={() => onCandidateAction('reject')}
+                className="px-3 py-1.5 text-xs rounded-lg border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors disabled:opacity-50"
               >
-                Demote
+                Reject
               </button>
+            )}
+            {candidateDetail?.status === 'staged' && (
+              <button
+                type="button"
+                disabled={candidateActionLocked || !candidateCurrent || !selectedPromotionEligible}
+                title={
+                  selectedPromotionEligible
+                    ? 'Promote this staged candidate against the explicitly selected evaluation record.'
+                    : 'Promotion requires an explicitly selected eligible accepted evaluation record for this staged candidate.'
+                }
+                onClick={() => onCandidateAction('promote')}
+                className="px-3 py-1.5 text-xs rounded-lg border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
+              >
+                Promote
+              </button>
+            )}
+            {candidateDetail?.status === 'promoted' && (
+              <>
+                <select
+                  value={rollbackReason}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setRollbackReasonSelection(
+                      candidateDetail && isRollbackReasonCode(value)
+                        ? { candidateId: candidateDetail.id, reasonCode: value }
+                        : null,
+                    );
+                  }}
+                  aria-label="Rollback reason"
+                  disabled={candidateActionLocked || !candidateCurrent}
+                  className="px-2 py-1.5 text-xs rounded-lg bg-white/5 border border-white/10 text-bone disabled:opacity-50"
+                >
+                  <option value="" disabled>
+                    Rollback reason…
+                  </option>
+                  <option value="regression_detected">Regression detected</option>
+                  <option value="superseded_by_newer_evidence">Superseded by newer evidence</option>
+                  <option value="manual_rollback">Manual rollback</option>
+                </select>
+                <button
+                  type="button"
+                  disabled={
+                    candidateActionLocked ||
+                    !candidateCurrent ||
+                    !selectedRollbackEligible ||
+                    !isRollbackReasonCode(rollbackReason)
+                  }
+                  title={
+                    selectedRollbackEligible
+                      ? 'Roll back this promoted candidate against the selected evaluation record.'
+                      : 'Rollback requires an explicitly selected eligible accepted record and a chosen reason.'
+                  }
+                  onClick={() => {
+                    if (
+                      candidateDetail &&
+                      rollbackReasonSelection?.candidateId === candidateDetail.id &&
+                      isRollbackReasonCode(rollbackReason)
+                    ) {
+                      onCandidateAction('rollback', rollbackReason);
+                    }
+                  }}
+                  className="px-3 py-1.5 text-xs rounded-lg border border-amber-500/30 text-amber-200 hover:bg-amber-500/10 transition-colors disabled:opacity-50"
+                >
+                  Rollback
+                </button>
+              </>
             )}
           </div>
         ) : (
@@ -441,7 +953,10 @@ function SkillDetail({
       )}
       {candidateMutation?.phase === 'read-failed' && (
         <div role="status" aria-label="Candidate lifecycle status" className="mb-3 text-xs text-amber-200">
-          The lifecycle write completed, but its status could not be confirmed. Showing the last confirmed state.{' '}
+          {candidateMutation.writeAccepted
+            ? 'The lifecycle write was accepted, but its completion could not be confirmed.'
+            : 'The request outcome was not confirmed, and the lifecycle write could not be verified.'}{' '}
+          Showing the last confirmed state.{' '}
                            <button type="button" onClick={onRetryCandidate} className="underline">Retry</button>
         </div>
       )}
@@ -535,6 +1050,115 @@ function SkillDetail({
               {performanceView.kind === 'unmeasured' && <p className="text-bone/50">{performanceView.text}</p>}
             </div>
           )}
+        </GlassCard>
+      )}
+
+      {evaluationLoad.kind !== 'idle' && (
+        <GlassCard className="p-3 mb-3 text-xs space-y-2">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h4 className="font-semibold text-bone/80">Evaluation evidence</h4>
+            {evaluationProjection && (
+              <span className="text-bone/40 font-mono text-[10px]">
+                current {evaluationProjection.current_status} v{evaluationProjection.current_version}
+                {' · '}
+                {evaluationProjection.count} record{evaluationProjection.count === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
+          {evaluationLoad.kind === 'loading' && (
+            <p role="status" className="text-bone/50">Loading evaluation evidence…</p>
+          )}
+          {(evaluationLoad.kind === 'http' ||
+            evaluationLoad.kind === 'transport' ||
+            evaluationLoad.kind === 'body' ||
+            evaluationLoad.kind === 'invalid') && (
+            <div role="alert" className="text-amber-200">
+              Evaluation evidence unavailable
+              {evaluationLoad.kind === 'http' ? ` (HTTP ${evaluationLoad.status})` : ''}.{' '}
+              <button type="button" onClick={onRetryEvaluation} className="underline">Retry</button>
+            </div>
+          )}
+          {evaluationLoad.kind === 'loaded' &&
+            (evaluationLoad.projection.evaluations.length === 0 ? (
+              <p className="text-bone/50">No evaluation records recorded for this candidate.</p>
+            ) : (
+              <ul className="space-y-2">
+                {evaluationLoad.projection.evaluations.map((record) => {
+                  const eligible = evaluationEligibility(record);
+                  const priorStateRollbackEvidence = !eligible && isPriorStateRollbackEvidence(record);
+                  const selected = selectedEvaluationHash === record.record_hash;
+                  return (
+                    <li
+                      key={record.record_hash}
+                      className={cn(
+                        'rounded-lg border p-2 space-y-1.5',
+                        selected ? 'border-accent/40 bg-white/[0.06]' : 'border-white/10',
+                      )}
+                    >
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <label className="flex items-center gap-1.5 cursor-pointer">
+                          <input
+                            type="radio"
+                            name={evaluationRadioName}
+                            checked={selected}
+                            onChange={() => onSelectEvaluation(record.record_hash)}
+                          />
+                          <span className="font-medium text-bone">{record.decision}</span>
+                        </label>
+                        {eligible ? (
+                          <Pill variant="success">Eligible</Pill>
+                        ) : priorStateRollbackEvidence ? (
+                          <Pill variant="default">Prior-state rollback evidence (stale)</Pill>
+                        ) : (
+                          <Pill variant="warn">{evaluationIneligibilityReason(record)}</Pill>
+                        )}
+                      </div>
+                      <p className="text-bone/40 font-mono text-[10px] break-all">report {record.report_hash}</p>
+                      <p className="text-bone/40 font-mono text-[10px] break-all">record {record.record_hash}</p>
+                      <p className="text-bone/40 font-mono text-[10px] break-all">manifest {record.manifest_hash}</p>
+                      <div className="text-bone/50 font-mono text-[10px] break-all">
+                        <p>candidate {record.candidate.id}</p>
+                        <p>content {record.candidate.content_digest}</p>
+                        <p>artifact {record.candidate.artifact_digest}</p>
+                      </div>
+                      <p className="text-bone/50">
+                        tasks {record.coverage.planned_task_count}
+                        {' · '}seeds/task {record.coverage.seeds_per_task}
+                        {' · '}arms/block {record.coverage.arms_per_block}
+                        {' · '}blocks {record.coverage.planned_block_count}
+                        {' · '}outcomes {record.coverage.observed_outcome_count}/{record.coverage.planned_outcome_count}
+                        {' · '}missing {record.coverage.missing_outcome_count}
+                      </p>
+                      {record.criteria.length > 0 && (
+                        <ul className="space-y-0.5">
+                          {record.criteria.map((criterion) => (
+                            <li key={criterion.id} className="text-bone/50">
+                              <span className="text-bone/70">{criterion.description || criterion.id}</span>
+                              {' — '}threshold {criterion.threshold}
+                              {' · '}observed {criterion.observed === null ? '—' : criterion.observed}
+                              {' · '}{criterion.status}
+                              {criterion.reason ? ` (${criterion.reason})` : ''}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {record.reasons.length > 0 && (
+                        <ul className="list-disc pl-4 text-bone/50 space-y-0.5">
+                          {record.reasons.map((reason, index) => (
+                            <li key={`${record.record_hash}-reason-${index}`}>{reason}</li>
+                          ))}
+                        </ul>
+                      )}
+                      <p className="text-bone/40">
+                        observed {record.observed_status} v{record.observed_version}
+                        {' · '}content {record.content_match ? 'match' : 'mismatch'}
+                        {' · '}{record.stale ? 'stale' : 'current'}
+                      </p>
+                    </li>
+                  );
+                })}
+              </ul>
+            ))}
         </GlassCard>
       )}
 
@@ -792,27 +1416,219 @@ export function SkillsView() {
    const selectedCandidateId = selected ? candidateIdOf(selected) : null;
    const selectedCandidateMutation = selectedCandidateId ? candidateMutations[selectedCandidateId] ?? null : null;
 
+   const [evaluationLoad, setEvaluationLoad] = useState<SkillCandidateEvaluationLoadState>({ kind: 'idle' });
+   const [selectedEvaluationHash, setSelectedEvaluationHash] = useState<string | null>(null);
+   const evaluationRequestId = useRef(0);
+
+   const loadCandidateEvaluation = useCallback(
+     (candidateId: string): Promise<SkillCandidateEvaluationReadResult | null> => {
+       const requestId = ++evaluationRequestId.current;
+       setEvaluationLoad({ kind: 'loading', candidateId });
+       return readCandidateEvaluation(candidateId).then((result) => {
+         // A late response from a superseded selection must not render here, and
+         // its readback must not be handed to a caller acting on a newer request.
+         if (requestId !== evaluationRequestId.current) return null;
+         if (result.kind === 'ok') setEvaluationLoad({ kind: 'loaded', candidateId, projection: result.value });
+         else if (result.kind === 'http') setEvaluationLoad({ kind: 'http', candidateId, status: result.status });
+         else if (result.kind === 'transport') setEvaluationLoad({ kind: 'transport', candidateId });
+         else if (result.kind === 'body') setEvaluationLoad({ kind: 'body', candidateId });
+         else setEvaluationLoad({ kind: 'invalid', candidateId });
+         return result;
+       });
+     },
+     [],
+   );
+
+   useEffect(() => {
+     // Selection is explicit and candidate-scoped: reset it whenever the
+     // candidate changes, and never fall back to an implicit default record.
+     setSelectedEvaluationHash(null);
+     if (selectedCandidateId) {
+       void loadCandidateEvaluation(selectedCandidateId);
+     } else {
+       evaluationRequestId.current += 1;
+       setEvaluationLoad({ kind: 'idle' });
+     }
+   }, [selectedCandidateId, loadCandidateEvaluation]);
+
+   const retryCandidateEvaluation = useCallback(() => {
+     if (selectedCandidateId) void loadCandidateEvaluation(selectedCandidateId);
+   }, [selectedCandidateId, loadCandidateEvaluation]);
+
    const enabledCount = skills.filter((s) => s.enabled).length;
 
   const runCandidateAction = useCallback(
-    async (skill: Skill, candidateId: string, action: SkillCandidateAction) => {
+    async (
+      skill: Skill,
+      candidateId: string,
+      action: SkillCandidateAction,
+      options?: { reasonCode?: string; retryOf?: SkillCandidateMutation },
+    ) => {
       if (!canUseCandidate()) return;
       const observed = candidates?.[candidateId];
       if (!observed) return;
       const existing = candidateMutationRef.current[candidateId];
       if (skillCandidateMutationLocked(existing)) return;
+
+      const retryOf = options?.retryOf;
+      const isProofAction = action === 'promote' || action === 'rollback';
+      let expectedVersion = observed.lifecycle_version ?? 0;
+      let observedStatus: SkillCandidateStatus = observed.status;
+      let proof: SkillCandidateMutationProof | undefined;
+
+      if (isProofAction) {
+        // Promote/rollback are only ever issued from a confirmed current
+        // observation against an explicitly selected record read fresh here.
+        if (!candidateCurrent) return;
+        if (retryOf) {
+          // Retries replay the exact captured proof tuple. The current UI
+          // selection is never consulted. Before resending, a fresh candidate
+          // read and a fresh evaluation read must both still match every
+          // captured field; otherwise the write-failed state is retained and
+          // nothing is POSTed.
+          if (retryOf.action !== action) return;
+          if (retryOf.reportHash === undefined || retryOf.recordHash === undefined) return;
+          if (action === 'rollback' && !isRollbackReasonCode(retryOf.reasonCode)) return;
+          // The captured rollback timestamp is replayed exactly; a non-canonical
+          // one refuses the retry rather than generating a fresh value.
+          if (action === 'rollback' && !isCanonicalIsoTimestamp(retryOf.eventTimestamp)) return;
+          const capturedReportHash = retryOf.reportHash;
+          const capturedRecordHash = retryOf.recordHash;
+          const freshCandidates = await refreshCandidates();
+          const freshCandidate = freshCandidates?.[candidateId] ?? null;
+          if (!skillCandidateMutationRetryPreflight(retryOf, freshCandidate)) return;
+          expectedVersion = retryOf.expectedVersion;
+          observedStatus = retryOf.observedStatus;
+          const readback = await loadCandidateEvaluation(candidateId);
+          if (!readback || readback.kind !== 'ok') return;
+          const projection = readback.value;
+          if (projection.candidate_id !== candidateId) return;
+          if (projection.current_status !== observedStatus) return;
+          if (projection.current_version !== expectedVersion) return;
+          const pinned = projection.evaluations.filter(
+            (record) =>
+              record.record_hash === capturedRecordHash &&
+              record.report_hash === capturedReportHash,
+          );
+          if (pinned.length !== 1) return;
+          const record = pinned[0];
+          if (record.candidate.id !== candidateId) return;
+          if (record.decision !== 'accepted') return;
+          if (record.content_match !== true) return;
+          if (record.candidate.content_digest !== retryOf.contentDigest) return;
+          if (record.candidate.artifact_digest !== retryOf.artifactDigest) return;
+          if (action === 'promote') {
+            if (record.stale !== false) return;
+            if (record.observed_status !== 'staged') return;
+            if (record.observed_version !== expectedVersion) return;
+          } else {
+            if (record.stale !== true) return;
+            if (record.observed_status !== 'staged') return;
+            if (record.observed_version !== expectedVersion - 1) return;
+          }
+          proof = {
+            reportHash: capturedReportHash,
+            recordHash: capturedRecordHash,
+            reasonCode: retryOf.reasonCode,
+            contentDigest: retryOf.contentDigest,
+            artifactDigest: retryOf.artifactDigest,
+            eventTimestamp: action === 'rollback' ? retryOf.eventTimestamp : undefined,
+          };
+        } else {
+          if (action === 'promote' && observed.status !== 'staged') return;
+          if (action === 'rollback' && observed.status !== 'promoted') return;
+          if (action === 'rollback' && !isRollbackReasonCode(options?.reasonCode)) return;
+          if (selectedEvaluationHash === null) return;
+          const readback = await loadCandidateEvaluation(candidateId);
+          if (!readback || readback.kind !== 'ok') return;
+          const projection = readback.value;
+          if (projection.candidate_id !== candidateId) return;
+          if (projection.current_status !== observed.status) return;
+          if (projection.current_version !== (observed.lifecycle_version ?? 0)) return;
+          const matches = projection.evaluations.filter(
+            (record) => record.record_hash === selectedEvaluationHash,
+          );
+          if (matches.length !== 1) return;
+          const record = matches[0];
+          if (record.decision !== 'accepted') return;
+          if (record.content_match !== true) return;
+          if (record.candidate.id !== candidateId) return;
+          if (action === 'promote') {
+            if (record.stale !== false) return;
+            if (record.observed_status !== 'staged') return;
+            if (record.observed_version !== (observed.lifecycle_version ?? 0)) return;
+          } else {
+            if (record.stale !== true) return;
+            if (record.observed_status !== 'staged') return;
+            if (record.observed_version !== (observed.lifecycle_version ?? 0) - 1) return;
+          }
+          proof = {
+            reportHash: record.report_hash,
+            recordHash: record.record_hash,
+            reasonCode: action === 'rollback' ? options?.reasonCode : undefined,
+            contentDigest: record.candidate.content_digest,
+            artifactDigest: record.candidate.artifact_digest,
+            // One timestamp is minted per explicitly selected rollback action and
+            // captured in the immutable proof tuple before the mutation begins.
+            eventTimestamp: action === 'rollback' ? new Date().toISOString() : undefined,
+          };
+        }
+      }
+
       const token = ++nextCandidateMutationToken.current;
       const mutation = startSkillCandidateMutation(
         candidateId,
         action,
-        observed.lifecycle_version ?? 0,
+        expectedVersion,
         token,
-        observed.status,
+        observedStatus,
+        proof,
       );
       publishCandidateMutation(candidateId, mutation);
       const isCurrent = () => candidateMutationRef.current[candidateId]?.token === token;
-      const response = await postSkillCandidateAction(candidateId, action, mutation.expectedVersion);
+      const response = await postSkillCandidateAction(
+        candidateId,
+        action,
+        expectedVersion,
+        isProofAction ? proof?.reasonCode : options?.reasonCode,
+        proof,
+      );
       if (!isCurrent()) return;
+
+      if (isProofAction) {
+        // The POST is only a request outcome. For promote/rollback success is
+        // whatever the authoritative candidate + evaluation readback confirms,
+        // regardless of the response status. `writeAccepted` records only
+        // whether the request itself was accepted, never confirmation.
+        const reconciling = transitionSkillCandidateMutation(mutation, 'request-finished', response.ok);
+        if (!reconciling) return;
+        publishCandidateMutation(candidateId, reconciling);
+        const snapshot = await refreshCandidates();
+        if (!isCurrent()) return;
+        const authoritative = snapshot?.[candidateId];
+        const readback = await loadCandidateEvaluation(candidateId);
+        if (!isCurrent()) return;
+        if (!confirmCandidateMutation(candidateId, reconciling, authoritative, readback)) {
+          // Only a conclusive readback plus a route error that names a
+          // mutation-free refusal becomes the definitive write-failed state; a
+          // failed/malformed readback or an ambiguous response stays read-failed
+          // so retry/reconciliation can still prove the true state.
+          const readbackConclusive =
+            snapshot !== null && authoritative !== undefined && readback?.kind === 'ok';
+          const refused =
+            readbackConclusive && skillCandidateMutationDefinitiveRefusal(response.status, response.data.error);
+          publishCandidateMutation(
+            candidateId,
+            transitionSkillCandidateMutation(reconciling, refused ? 'write-failed' : 'read-failed'),
+          );
+          return;
+        }
+        publishCandidateMutation(candidateId, null);
+        success(`${action === 'promote' ? 'Promoted' : 'Rolled back'} ${skill.name}`);
+        void fetchSkills(false);
+        return;
+      }
+
       if (!response.ok) {
         if (response.status === 400) {
           publishCandidateMutation(candidateId, transitionSkillCandidateMutation(mutation, 'write-failed'));
@@ -847,7 +1663,17 @@ export function SkillsView() {
       success(`${outcome} ${skill.name}`);
       void fetchSkills(false);
     },
-    [candidates, canUseCandidate, fetchSkills, publishCandidateMutation, refreshCandidates, success],
+    [
+      candidateCurrent,
+      candidates,
+      canUseCandidate,
+      fetchSkills,
+      loadCandidateEvaluation,
+      publishCandidateMutation,
+      refreshCandidates,
+      selectedEvaluationHash,
+      success,
+    ],
   );
 
   const retryCandidateMutation = useCallback(
@@ -855,7 +1681,7 @@ export function SkillsView() {
       const mutation = candidateMutationRef.current[candidateId];
       if (!mutation) return;
       if (mutation.phase === 'write-failed') {
-        await runCandidateAction(skill, candidateId, mutation.action);
+        await runCandidateAction(skill, candidateId, mutation.action, { retryOf: mutation });
         return;
       }
       if (mutation.phase !== 'read-failed') return;
@@ -866,16 +1692,21 @@ export function SkillsView() {
       const snapshot = await refreshCandidates();
       if (candidateMutationRef.current[candidateId]?.token !== token) return;
       const authoritative = snapshot?.[candidateId];
-      if (!snapshot || !authoritative || !skillCandidateMutationConfirmed(reconciling, authoritative)) {
+      let readback: SkillCandidateEvaluationReadResult | null = null;
+      if (reconciling.action === 'promote' || reconciling.action === 'rollback') {
+        readback = await loadCandidateEvaluation(candidateId);
+        if (candidateMutationRef.current[candidateId]?.token !== token) return;
+      }
+      if (!snapshot || !authoritative || !confirmCandidateMutation(candidateId, reconciling, authoritative, readback)) {
         publishCandidateMutation(candidateId, transitionSkillCandidateMutation(reconciling, 'read-failed'));
         return;
       }
       publishCandidateMutation(candidateId, null);
-      const outcome = authoritative.status === 'promoted' ? 'Promoted' : authoritative.status === 'rejected' ? 'Rejected' : 'Evaluated';
+      const outcome = authoritative.status === 'promoted' ? 'Promoted' : authoritative.status === 'rejected' ? 'Rejected' : authoritative.status === 'rolled_back' ? 'Rolled back' : 'Evaluated';
       success(`${outcome} ${skill.name}`);
       void fetchSkills(false);
     },
-    [fetchSkills, publishCandidateMutation, refreshCandidates, runCandidateAction, success],
+    [fetchSkills, loadCandidateEvaluation, publishCandidateMutation, refreshCandidates, runCandidateAction, success],
   );
 
   return (
@@ -958,10 +1789,8 @@ export function SkillsView() {
                 const candidateId = candidateIdOf(s);
                 const candidate = candidateId ? candidates?.[candidateId] : null;
                  const candidateStatus = candidate?.status;
-                 const candidateEvalScore = candidate?.eval_score;
                  const candidateMutation = candidateId ? candidateMutations[candidateId] ?? null : null;
                  const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
-                 const canPromote = candidateCurrent && !candidateActionLocked && candidateEvalScore !== undefined && candidateEvalScore >= 0.75;
                 return (
                   <li key={s.id}>
                     <GlassCard
@@ -1006,35 +1835,17 @@ export function SkillsView() {
                         {distilled && candidateId ? (
                           <div className="ml-auto flex gap-1">
                             {candidateStatus === 'candidate' && (
-                              <>
-                                <button
-                                  type="button"
-                                  disabled={!canPromote}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                     runCandidateAction(s, candidateId, 'promote');
-                                  }}
-                                  title={
-                                    canPromote
-                                      ? 'Promote to live skill'
-                                      : 'Run eval first — promotion requires a passing judge decision (≥0.75)'
-                                  }
-                                  className="text-[11px] px-2 py-0.5 rounded-md border border-emerald-500/30 text-emerald-200 hover:bg-emerald-500/10 transition-colors disabled:opacity-50"
-                                >
-                                  Promote
-                                </button>
-                                <button
-                                  type="button"
-                                   disabled={!candidateCurrent || candidateActionLocked}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                     runCandidateAction(s, candidateId, 'reject');
-                                  }}
-                                  className="text-[11px] px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
-                                >
-                                  Reject
-                                </button>
-                              </>
+                              <button
+                                type="button"
+                                 disabled={!candidateCurrent || candidateActionLocked}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                   runCandidateAction(s, candidateId, 'reject');
+                                }}
+                                className="text-[11px] px-2 py-0.5 rounded-md border border-red-500/30 text-red-200 hover:bg-red-500/10 transition-colors"
+                              >
+                                Reject
+                              </button>
                             )}
                           </div>
                         ) : (
@@ -1065,7 +1876,10 @@ export function SkillsView() {
                        )}
                        {candidateMutation?.phase === 'read-failed' && (
                          <div role="alert" aria-label={`Candidate lifecycle: ${s.name}`} className="mt-1 text-xs text-amber-200">
-                           The lifecycle write completed, but its status could not be confirmed. Showing the last confirmed state.{' '}
+                           {candidateMutation.writeAccepted
+                             ? 'The lifecycle write was accepted, but its completion could not be confirmed.'
+                             : 'The request outcome was not confirmed, and the lifecycle write could not be verified.'}{' '}
+                           Showing the last confirmed state.{' '}
                            <button type="button" onClick={(e) => { e.stopPropagation(); void retryCandidateMutation(s, candidateId!); }} className="underline">Retry</button>
                          </div>
                        )}
@@ -1105,8 +1919,12 @@ export function SkillsView() {
                  candidateDetail={selectedCandidate}
                  candidateCurrent={candidateCurrent}
                  candidateMutation={selectedCandidateMutation}
-                 onCandidateAction={(action) => {
-                   if (selectedCandidate) void runCandidateAction(selected, selectedCandidate.id, action);
+                 evaluationLoad={evaluationLoad}
+                 selectedEvaluationHash={selectedEvaluationHash}
+                 onSelectEvaluation={setSelectedEvaluationHash}
+                 onRetryEvaluation={retryCandidateEvaluation}
+                 onCandidateAction={(action, reasonCode) => {
+                   if (selectedCandidate) void runCandidateAction(selected, selectedCandidate.id, action, { reasonCode });
                  }}
                  onRetryCandidate={() => {
                    if (selectedCandidateId) void retryCandidateMutation(selected, selectedCandidateId);

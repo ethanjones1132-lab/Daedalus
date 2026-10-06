@@ -20,7 +20,7 @@ const VALID_REQUIREMENTS = new Set<TurnRequirement>([
   "full_execution",
 ]);
 
-const VALID_STATUSES = new Set<SkillCandidateStatus>(["candidate", "staged", "promoted", "rejected"]);
+const VALID_STATUSES = new Set<SkillCandidateStatus>(["candidate", "staged", "promoted", "rejected", "rolled_back"]);
 
 const VALID_REJECTION_REASONS = new Set<SkillRejectionReason>([
   "below_eval_delta",
