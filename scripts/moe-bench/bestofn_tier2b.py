@@ -55,6 +55,9 @@ BASE = f"http://127.0.0.1:{PORT}"
 CONFIGS = {
     "qwen36keep96": dict(model=STAGE / "models" / "prune-qwen36" / "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf", ncmoe=0,
                          spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
+    # the unpruned 256-expert model, same quant: the reference for the adapters work (22 expert layers on the CPU)
+    "qwen36full": dict(model=STAGE / "Qwen3.6-35B-A3B-UD-IQ2_M.gguf", ncmoe=22,
+                       spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
     "gemma26b": dict(model=STAGE / "google_gemma-4-26B-A4B-it-IQ2_M.gguf", ncmoe=16,
                      spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2",
                            "-md", str(STAGE / "mtp-gemma-4-26B-A4B-it.gguf")], temp=0.0),
@@ -189,12 +192,18 @@ def check(task, code, suites):
     return out
 
 
+def server_args():
+    """llama-server flags for CFG. Two env overrides let variants run through this same harness
+    (adapters phase 1, 2026-10-05): BON_GGUF replaces the model file, BON_EXTRA (a JSON list) appends flags."""
+    model = os.environ.get("BON_GGUF") or str(CFG["model"])
+    return ([SERVER, "-m", model, "--host", "127.0.0.1", "--port", str(PORT), "-ngl", "99",
+             "--n-cpu-moe", str(CFG["ncmoe"]), "-c", "16384", "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on",
+             "-b", "512", "-ub", "512", "-np", "1", "--jinja", "--reasoning-budget", str(CFG["budget"]),
+             "--no-webui", "--cache-ram", "0"] + CFG["spec"] + json.loads(os.environ.get("BON_EXTRA") or "[]"))
+
+
 def start_server(log):
-    args = [SERVER, "-m", str(CFG["model"]), "--host", "127.0.0.1", "--port", str(PORT), "-ngl", "99",
-            "--n-cpu-moe", str(CFG["ncmoe"]), "-c", "16384", "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on",
-            "-b", "512", "-ub", "512", "-np", "1", "--jinja", "--reasoning-budget", str(CFG["budget"]),
-            "--no-webui", "--cache-ram", "0"] + CFG["spec"]
-    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(server_args(), stdout=log, stderr=subprocess.STDOUT)
     t0 = time.time()
     while time.time() - t0 < 600:
         if proc.poll() is not None:

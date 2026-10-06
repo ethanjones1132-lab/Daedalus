@@ -58,8 +58,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inp")
     ap.add_argument("out")
-    ap.add_argument("--keep", type=int, required=True)
-    ap.add_argument("--imatrix", required=True, action="append",
+    ap.add_argument("--keep", type=int, default=0, help="experts to keep per layer, ranked by --imatrix")
+    ap.add_argument("--keep-list", default="",
+                    help="JSON {layer: [expert indices]}: keep exactly these (adapters phase 1, 2026-10-05)")
+    ap.add_argument("--imatrix", action="append", default=[],
                     help="imatrix GGUF; repeat to combine several calibration sets")
     ap.add_argument("--report", default="")
     a = ap.parse_args()
@@ -68,14 +70,24 @@ def main():
     arch = field_value(r.fields["general.architecture"])[0]
     n_expert = field_value(r.fields[f"{arch}.expert_count"])[0]
     n_used = field_value(r.fields[f"{arch}.expert_used_count"])[0]
-    if not n_used <= a.keep < n_expert:
-        sys.exit(f"--keep must be in [{n_used}, {n_expert})")
-    imps = [importance_from_imatrix(p) for p in a.imatrix]
-
-    keep = {}
     tensors = {t.name: t for t in r.tensors}
     layers = sorted({int(m.group(1)) for n in tensors if (m := EXPERT_TENSOR.match(n))})
-    for layer in layers:
+    keep = {}
+    if a.keep_list:
+        given = {int(k): v for k, v in json.load(open(a.keep_list)).items()}
+        sizes = {len(set(v)) for v in given.values()}
+        if set(given) != set(layers) or len(sizes) != 1 or any(len(set(v)) != len(v) for v in given.values()) \
+                or not all(0 <= i < n_expert for v in given.values() for i in v):
+            sys.exit("--keep-list needs every expert layer, the same count everywhere, unique in-range indices")
+        a.keep = sizes.pop()
+        keep = {L: (np.array(sorted(v)), "list", float("nan")) for L, v in given.items()}
+    if not n_used <= a.keep < n_expert:
+        sys.exit(f"--keep must be in [{n_used}, {n_expert})")
+    if not keep and not a.imatrix:
+        sys.exit("give --imatrix (with --keep) or --keep-list")
+    imps = [importance_from_imatrix(p) for p in a.imatrix]
+
+    for layer in ([] if keep else layers):
         found = [v[layer] / max(v[layer].sum(), 1e-30) for v in imps
                  if layer in v and len(v[layer]) == n_expert]
         if found:
@@ -115,7 +127,7 @@ def main():
     retained = {L: round(f, 4) for L, (_, _, f) in keep.items()}
     print(json.dumps({"arch": arch, "experts": f"{n_expert}->{a.keep}",
                       "mean_importance_retained": round(float(np.mean(list(retained.values()))), 4),
-                      "fallback_layers": [L for L, (_, s, _) in keep.items() if s != "imatrix"]}))
+                      "fallback_layers": [L for L, (_, s, _) in keep.items() if s not in ("imatrix", "list")]}))
     if a.report:
         with open(a.report, "w") as f:
             json.dump({"keep": {L: idx.tolist() for L, (idx, _, _) in keep.items()},

@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)] [string]$Branch,     # local branch in C:\build\llama.cpp
     [Parameter(Mandatory)] [string]$Name,       # short label for the output folder
     [int]$Jobs = 6,
-    [switch]$Force   # the model pipeline builds on demand; the older chain's loop is skipped
+    [switch]$Force,  # the model pipeline builds on demand; the older chain's loop is skipped
+    [string]$Targets = 'llama-server llama-bench llama-imatrix llama-quantize llama-gguf-split llama-cli'
 )
 # 'Continue', not 'Stop': in Windows PowerShell 5.1, git and cmake progress text on stderr
 # becomes an error record when the caller redirects streams, and 'Stop' turned that
@@ -31,7 +32,7 @@ $cfg = @(
     "-DCUDAToolkit_ROOT=`"$cuda`" -DCMAKE_CUDA_COMPILER=`"$cuda\bin\nvcc.exe`"",
     '-DGGML_NATIVE=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF'
 ) -join ' '
-$bld = "`"$vsBin\CMake\bin\cmake.exe`" --build `"$wt\build`" --config Release -j $Jobs --target llama-server llama-bench llama-imatrix llama-quantize llama-gguf-split llama-cli"
+$bld = "`"$vsBin\CMake\bin\cmake.exe`" --build `"$wt\build`" --config Release -j $Jobs --target $Targets"
 
 $env:CUDA_PATH = $cuda
 cmd /c "call `"$vcvars`" >nul && $cfg && $bld"
