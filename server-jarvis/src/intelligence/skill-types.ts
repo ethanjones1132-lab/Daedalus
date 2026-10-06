@@ -1,7 +1,13 @@
 import type { TaskType } from "../orchestration/coordinator";
 import type { TurnRequirement } from "../orchestration/turn-requirements";
 
-export type SkillCandidateStatus = "candidate" | "promoted" | "rejected";
+/**
+ * Candidate lifecycle status. `staged` means the exact frozen candidate passed
+ * the independent learning-transfer acceptance gate and is eligible for a
+ * separate, explicit promotion action, but is deliberately inactive:
+ * `skill-resolver.ts` only ever resolves `promoted` candidates.
+ */
+export type SkillCandidateStatus = "candidate" | "staged" | "promoted" | "rejected";
 
 export interface SkillTrigger {
   task_types: TaskType[];
@@ -17,7 +23,8 @@ export type SkillRejectionReason =
   | "body_length_out_of_range"
   | "missing_signals"
   | "eval_failed"
-  | "manual";
+  | "manual"
+  | "transfer_gate_failed";
 
 export interface SkillCandidate {
   id: string;

@@ -20,7 +20,7 @@ const VALID_REQUIREMENTS = new Set<TurnRequirement>([
   "full_execution",
 ]);
 
-const VALID_STATUSES = new Set<SkillCandidateStatus>(["candidate", "promoted", "rejected"]);
+const VALID_STATUSES = new Set<SkillCandidateStatus>(["candidate", "staged", "promoted", "rejected"]);
 
 const VALID_REJECTION_REASONS = new Set<SkillRejectionReason>([
   "below_eval_delta",
@@ -31,6 +31,7 @@ const VALID_REJECTION_REASONS = new Set<SkillRejectionReason>([
   "missing_signals",
   "eval_failed",
   "manual",
+  "transfer_gate_failed",
 ]);
 
 export type SkillCandidateValidationResult =
