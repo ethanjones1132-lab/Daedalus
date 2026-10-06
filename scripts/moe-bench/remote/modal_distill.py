@@ -107,8 +107,10 @@ def llama_top1(gguf_path, text, n_ctx=2048, chunks=2, ngl=99):
     [chunk, n_ctx], top-1 and the target's log-prob at positions n_ctx/2 .. n_ctx-2."""
     import numpy as np
     base = "/tmp/base.bin"
+    # -ngl 0 alone still offloads big-batch matmuls to the GPU (op offload): hide the GPU for a true CPU pass
+    env = {**os.environ, **({"CUDA_VISIBLE_DEVICES": ""} if ngl == 0 else {})}
     subprocess.run([f"{BIN}/llama-perplexity", "-m", gguf_path, "-f", text, "-c", str(n_ctx), "--chunks", str(chunks),
-                    "-ngl", str(ngl), "-b", str(n_ctx), "-ub", "512", "--kl-divergence-base", base], check=True)
+                    "-ngl", str(ngl), "-b", str(n_ctx), "-ub", "512", "--kl-divergence-base", base], check=True, env=env)
     with open(base, "rb") as f:
         assert f.read(8) == b"_logits_"
         n_ctx_, n_vocab, n_chunk = (int(x) for x in np.frombuffer(f.read(12), dtype=np.int32))

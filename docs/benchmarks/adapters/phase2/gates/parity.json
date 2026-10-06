@@ -1,0 +1,20 @@
+{
+ "positions": 2046,
+ "top1_agreement": 0.9648,
+ "pass": false,
+ "ppl_llama": 1.917,
+ "ppl_transformers": 1.909,
+ "names": {
+  "experts": 96,
+  "unmapped": [],
+  "not_loaded": [],
+  "params": 693,
+  "loaded": 693
+ },
+ "seconds": {
+  "llama": 122,
+  "load": 310,
+  "total": 474
+ },
+ "cost_usd_est": 0.45
+}
