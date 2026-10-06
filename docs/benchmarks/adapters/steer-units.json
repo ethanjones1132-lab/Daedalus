@@ -1,0 +1,11 @@
+{
+ "mean": 0.05,
+ "pca": 0.2,
+ "why": "llama-cvector-generator writes unit-norm directions per layer, so the spec's scales 0.25 / 0.5 / 1.0 are relative: applied scale = relative x unit. The unit is the largest scale that kept keep96's output coherent with the vector on all layers, on one toy fix prompt (no task scoring).",
+ "coherence_screen_all_layers": {
+  "mean": {"0.025": "ok", "0.05": "ok", "0.1": "empty output", "0.2": "token salad"},
+  "pca": {"0.025": "ok", "0.05": "ok", "0.1": "ok", "0.2": "ok", "0.4": "token salad", "0.8": "token salad", "1.6": "token salad"}
+ },
+ "pairs": "201 same-prompt pairs from the calibration pool's rows (steer.py make_pairs)",
+ "measured": "2026-10-06 01:15"
+}

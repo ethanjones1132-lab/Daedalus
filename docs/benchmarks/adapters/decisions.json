@@ -1,0 +1,47 @@
+{
+ "variants": {
+  "swap96": {
+   "fits": false,
+   "missing": true
+  },
+  "add108": {
+   "fits": false,
+   "missing": true
+  },
+  "swap108": {
+   "fits": false,
+   "missing": true
+  }
+ },
+ "closest": [],
+ "pool": {
+  "keep96": {
+   "recipe": 147,
+   "single": 144
+  }
+ },
+ "winner": null,
+ "steer": {
+  "none": {
+   "failures": 24,
+   "solved": 101
+  },
+  "mean-all-0.5": {
+   "failures": 25,
+   "solved": 100
+  },
+  "mean-mid-0.5": {
+   "failures": 25,
+   "solved": 100
+  },
+  "pca-all-0.5": {
+   "failures": 29,
+   "solved": 96
+  },
+  "pca-mid-0.5": {
+   "failures": 25,
+   "solved": 95
+  }
+ },
+ "steer_config": null
+}

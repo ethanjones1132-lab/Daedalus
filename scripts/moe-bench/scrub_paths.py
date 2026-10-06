@@ -9,6 +9,9 @@ PATTERNS = [re.compile(r"[A-Za-z]:\\\\Users\\\\[^\\\"]+\\\\AppData\\\\Local\\\\T
             re.compile(r"[A-Za-z]:\\\\Users\\\\[^\\\"]+\\\\"),  # any other user-profile path, e.g. the uv Python
             re.compile(r"[A-Za-z]:\\Users\\[^\\\"]+\\")]
 REPL = ["<tmp>\\\\", "<tmp>\\", "<home>\\\\", "<home>\\"]
+# whatever is left at any escaping depth (a repr inside JSON doubles the backslashes again) or with forward
+# slashes: keep the path, hide the account name
+ANY = re.compile(r"([A-Za-z]:(?:\\+|/)Users(?:\\+|/))([^\\/\"'\s<>]+)")
 
 for path in sys.argv[1:]:
     text = open(path, encoding="utf-8").read()
@@ -16,6 +19,8 @@ for path in sys.argv[1:]:
     for pat, rep in zip(PATTERNS, REPL):
         text, k = pat.subn(rep.replace("\\", "\\\\"), text)
         n += k
+    text, k = ANY.subn(r"\1<user>", text)
+    n += k
     if n:
         open(path, "w", encoding="utf-8", newline="").write(text)
     print(f"{n:5d} replaced  {path}")
