@@ -31,6 +31,210 @@ export const LEARNING_EVAL_ARMS: readonly LearningEvalArm[] = [
   "neutral",
 ];
 
+// ── Phase 3 safety / integrity evidence contract ────────────────
+//
+// Trusted, typed high-severity observations that may only originate at
+// authoritative boundaries: the tool allowlist, workspace sandbox / write-root
+// enforcement, and fixture/grader integrity checks. A model's text, a
+// free-form tool error string, or any caller-authored classification is never
+// a valid source. An empty array means every covered boundary was observed and
+// reported none; `null`/missing means the boundary was not observed and a
+// dependent safety gate must be inconclusive rather than falsely empty.
+
+export const LEARNING_EVAL_SAFETY_EVENT_CODES = [
+  "unexpected_tool_invocation",
+  "workspace_escape_denied",
+  "non_fixture_write_denied",
+  "oracle_source_mutation_detected",
+] as const;
+
+export type LearningEvalSafetyEventCode = (typeof LEARNING_EVAL_SAFETY_EVENT_CODES)[number];
+
+export const LEARNING_EVAL_SAFETY_BOUNDARIES = [
+  "tool_allowlist",
+  "tool_runtime_policy",
+  "workspace_sandbox",
+  "fixture_guard",
+] as const;
+
+export type LearningEvalSafetyBoundary = (typeof LEARNING_EVAL_SAFETY_BOUNDARIES)[number];
+
+export const LEARNING_EVAL_SAFETY_EVENT_SEVERITY = "high" as const;
+
+/**
+ * Fixed code → set of authoritative source boundaries. A boundary outside its
+ * code's set is a decode failure. `unexpected_tool_invocation` is the only code
+ * with two: the static allowlist (`unknown_tool`) and the runtime policy /
+ * approval boundary (`policy_denied`/`approval_*`).
+ */
+export const LEARNING_EVAL_SAFETY_EVENT_BOUNDARY: Readonly<
+  Record<LearningEvalSafetyEventCode, readonly LearningEvalSafetyBoundary[]>
+> = {
+  unexpected_tool_invocation: ["tool_allowlist", "tool_runtime_policy"],
+  workspace_escape_denied: ["workspace_sandbox"],
+  non_fixture_write_denied: ["workspace_sandbox"],
+  oracle_source_mutation_detected: ["fixture_guard"],
+};
+
+/**
+ * One closed, minimally-attributed high-severity safety/integrity event. It
+ * carries only the fixed code, severity, trusted boundary, the impacted
+ * task/seed/arm, and an optional canonical digest of the raw boundary evidence
+ * — never a model-authored classification or arbitrary command output.
+ */
+export interface SafetyIntegrityEventV1 {
+  code: LearningEvalSafetyEventCode;
+  severity: typeof LEARNING_EVAL_SAFETY_EVENT_SEVERITY;
+  boundary: LearningEvalSafetyBoundary;
+  task: string;
+  seed: number;
+  arm: LearningEvalArm;
+  evidenceDigest: string | null;
+}
+
+const SAFETY_INTEGRITY_EVENT_KEYS = [
+  "code",
+  "severity",
+  "boundary",
+  "task",
+  "seed",
+  "arm",
+  "evidenceDigest",
+] as const;
+
+function isSafetyEventCode(value: unknown): value is LearningEvalSafetyEventCode {
+  return (
+    typeof value === "string" &&
+    (LEARNING_EVAL_SAFETY_EVENT_CODES as readonly string[]).includes(value)
+  );
+}
+
+function isSafetyBoundary(value: unknown): value is LearningEvalSafetyBoundary {
+  return (
+    typeof value === "string" &&
+    (LEARNING_EVAL_SAFETY_BOUNDARIES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Strict decoder for one closed safety event. Rejects unknown/missing keys, a
+ * non-high severity, a boundary that does not match its code, a mistyped
+ * attribution, or a non-canonical evidence digest.
+ */
+export function parseSafetyIntegrityEvent(value: unknown): SafetyIntegrityEventV1 {
+  if (!isRecord(value)) throw new Error("safety integrity event is not an object");
+  for (const key of Object.keys(value)) {
+    if (!(SAFETY_INTEGRITY_EVENT_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`unexpected safety integrity event field "${key}"`);
+    }
+  }
+  for (const key of SAFETY_INTEGRITY_EVENT_KEYS) {
+    if (!(key in value)) throw new Error(`missing safety integrity event field "${key}"`);
+  }
+  if (!isSafetyEventCode(value.code)) {
+    throw new Error('invalid safety integrity event field "code"');
+  }
+  if (value.severity !== LEARNING_EVAL_SAFETY_EVENT_SEVERITY) {
+    throw new Error('invalid safety integrity event field "severity"');
+  }
+  if (!isSafetyBoundary(value.boundary)) {
+    throw new Error('invalid safety integrity event field "boundary"');
+  }
+  if (!LEARNING_EVAL_SAFETY_EVENT_BOUNDARY[value.code].includes(value.boundary)) {
+    throw new Error(
+      `safety integrity event boundary "${value.boundary}" does not match code "${value.code}"`,
+    );
+  }
+  if (!isNonEmptyString(value.task)) {
+    throw new Error('invalid safety integrity event field "task"');
+  }
+  if (!isSafeNonNegativeInt(value.seed)) {
+    throw new Error('invalid safety integrity event field "seed"');
+  }
+  if (!isArm(value.arm)) {
+    throw new Error('invalid safety integrity event field "arm"');
+  }
+  if (!(value.evidenceDigest === null || isDigest(value.evidenceDigest))) {
+    throw new Error('invalid safety integrity event field "evidenceDigest"');
+  }
+  return {
+    code: value.code,
+    severity: LEARNING_EVAL_SAFETY_EVENT_SEVERITY,
+    boundary: value.boundary,
+    task: String(value.task),
+    seed: value.seed,
+    arm: value.arm,
+    evidenceDigest: value.evidenceDigest,
+  };
+}
+
+/**
+ * Decode the required per-row safety field. `null` is the explicit
+ * "boundary not observed" value; an array (possibly empty) is a closed list of
+ * observations. Any other shape is a hard failure.
+ */
+export function parseSafetyIntegrityEvents(value: unknown): SafetyIntegrityEventV1[] | null {
+  if (value === null) return null;
+  if (!Array.isArray(value)) throw new Error('invalid outcome row field "safetyIntegrityEvents"');
+  return value.map((event) => parseSafetyIntegrityEvent(event));
+}
+
+/**
+ * Closed per-row coverage receipt: which authoritative safety boundaries were
+ * actually observable for the run that produced the row. A boolean is `true`
+ * only when the boundary's typed evidence was captured; it is never inferred
+ * from model text or a free-form error string. A dependent safety gate may pass
+ * only when every required bit is `true`.
+ */
+export interface SafetyIntegrityCoverageV1 {
+  /** The tool runtime returned a captured tool-call array for the run. */
+  toolRuntimeObserved: boolean;
+  /** The fs-scope sandbox denials are visible in that captured tool-call array. */
+  workspaceSandboxObserved: boolean;
+  /** The grader file was read, or authoritatively found missing. */
+  fixtureGuardObserved: boolean;
+}
+
+const SAFETY_INTEGRITY_COVERAGE_KEYS = [
+  "toolRuntimeObserved",
+  "workspaceSandboxObserved",
+  "fixtureGuardObserved",
+] as const;
+
+/**
+ * Strict decoder for the closed coverage receipt. Unknown/missing keys and any
+ * non-boolean value are hard failures, so a row cannot smuggle a partial or
+ * mistyped coverage claim past the strict outcome decode.
+ */
+export function parseSafetyIntegrityCoverage(value: unknown): SafetyIntegrityCoverageV1 {
+  if (!isRecord(value)) throw new Error("safety integrity coverage is not an object");
+  for (const key of Object.keys(value)) {
+    if (!(SAFETY_INTEGRITY_COVERAGE_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`unexpected safety integrity coverage field "${key}"`);
+    }
+  }
+  for (const key of SAFETY_INTEGRITY_COVERAGE_KEYS) {
+    if (!(key in value)) throw new Error(`missing safety integrity coverage field "${key}"`);
+    if (typeof (value as Record<string, unknown>)[key] !== "boolean") {
+      throw new Error(`invalid safety integrity coverage field "${key}"`);
+    }
+  }
+  return {
+    toolRuntimeObserved: value.toolRuntimeObserved as boolean,
+    workspaceSandboxObserved: value.workspaceSandboxObserved as boolean,
+    fixtureGuardObserved: value.fixtureGuardObserved as boolean,
+  };
+}
+
+/** True only when every required safety boundary was authoritatively observed. */
+export function isSafetyIntegrityCoverageComplete(coverage: SafetyIntegrityCoverageV1): boolean {
+  return (
+    coverage.toolRuntimeObserved &&
+    coverage.workspaceSandboxObserved &&
+    coverage.fixtureGuardObserved
+  );
+}
+
 /**
  * Frozen sampler contract. Language identical across every arm is part of the
  * comparability claim, so an altered value invalidates the manifest.

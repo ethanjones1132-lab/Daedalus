@@ -114,6 +114,8 @@ export type ToolErrorCode =
   | "approval_rejected"
   | "approval_unavailable"
   | "handler_error"
+  | "workspace_escape_denied"
+  | "non_fixture_write_denied"
   | "execution_error"
   | "spawn_error"
   | "protocol_error"

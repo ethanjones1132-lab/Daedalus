@@ -111,7 +111,7 @@ import {
 } from "./symbol-grounding";
 import { preflightWriteTool, WRITE_EFFECT_TOOL_NAMES } from "../write-preflight";
 import { BASELINE_THETA, policy } from "./orchestration-policy";
-import { safePath } from "../fs-scope";
+import { safePath, WorkspaceSandboxDeniedError } from "../fs-scope";
 import { hasFileBeenRead, markFileRead, unmarkFileRead } from "../fs-read-cache";
 import { promises as fsPromises } from "fs";
 import { join } from "path";
@@ -1693,6 +1693,7 @@ export class PipelineExecutor {
     let resolvedPath: string | undefined;
     let fileContent: string | null | undefined;
     let hasBeenRead: boolean | undefined;
+    let sandboxDenial: WorkspaceSandboxDeniedError | undefined;
 
     if (typeof rawPath === "string" && rawPath.trim()) {
       try {
@@ -1708,7 +1709,8 @@ export class PipelineExecutor {
         } catch {
           fileContent = null;
         }
-      } catch {
+      } catch (error) {
+        if (error instanceof WorkspaceSandboxDeniedError) sandboxDenial = error;
         pathInScope = false;
       }
     } else {
@@ -1724,6 +1726,13 @@ export class PipelineExecutor {
     });
 
     if (!verdict.allow) {
+      const errorCode = sandboxDenial
+        ? sandboxDenial.forWrite
+          ? "non_fixture_write_denied"
+          : "workspace_escape_denied"
+        : verdict.code === "path_out_of_scope"
+          ? "policy_denied"
+          : "handler_error";
       return {
         blocked: true,
         result: {
@@ -1732,7 +1741,7 @@ export class PipelineExecutor {
           output: verdict.reason,
           is_error: true,
           error: verdict.reason,
-          error_code: verdict.code === "path_out_of_scope" ? "policy_denied" : "handler_error",
+          error_code: errorCode,
           duration_ms: 0,
         },
       };

@@ -59,6 +59,8 @@ import {
   computeDigest,
   computeManifestHash,
   decodeLearningEvalManifest,
+  parseSafetyIntegrityCoverage,
+  parseSafetyIntegrityEvents,
   stableStringify,
   validateLearningEvalManifest,
   type FrozenLearningEvalManifest,
@@ -69,6 +71,8 @@ import {
   type LearningEvalModelIdentity,
   type LearningEvalPreflightPlan,
   type LearningEvalTrainingFixture,
+  type SafetyIntegrityCoverageV1,
+  type SafetyIntegrityEventV1,
 } from "./learning-eval-types";
 
 const ALL_TASK_TYPES: readonly TaskType[] = [
@@ -163,9 +167,13 @@ export function computeAcceptanceCodeDigest(): string {
     ["learning-eval-types.ts", join(import.meta.dir, "learning-eval-types.ts")],
     ["orchestration/run-gate.ts", join(import.meta.dir, "..", "..", "orchestration", "run-gate.ts")],
     ["orchestration/run-reward.ts", join(import.meta.dir, "..", "..", "orchestration", "run-reward.ts")],
+    ["fs-scope.ts", join(import.meta.dir, "..", "..", "fs-scope.ts")],
+    ["tool-runtime.ts", join(import.meta.dir, "..", "..", "tool-runtime.ts")],
+    ["tool-types.ts", join(import.meta.dir, "..", "..", "tool-types.ts")],
+    ["orchestration/pipeline.ts", join(import.meta.dir, "..", "..", "orchestration", "pipeline.ts")],
   ];
   const payload = files
-    .map(([label, path]) => `${label}:${computeDigest(readFileSync(path, "utf8"))}`)
+    .map(([label, path]) => `${label}:${createHash("sha256").update(readFileSync(path)).digest("hex")}`)
     .join("|");
   return computeDigest(payload);
 }
@@ -732,6 +740,20 @@ export interface PairedOutcomeRow {
   runOutcome: string | null;
   error: string | null;
   telemetryMissingReason: string | null;
+  /**
+   * Required, closed coverage receipt threaded from the rollout: which
+   * authoritative safety boundaries were observable for this row. A dependent
+   * safety gate may pass only when every bit is true.
+   */
+  safetyIntegrityCoverage: SafetyIntegrityCoverageV1;
+  /**
+   * Trusted, typed high-severity safety/integrity observations from the
+   * sandbox/tool/fixture boundaries. An empty array means every covered
+   * boundary was observed and reported none; `null` means the boundary was not
+   * observed, which makes a dependent safety gate inconclusive. It is never
+   * inferred from model text or a free-form error string.
+   */
+  safetyIntegrityEvents: SafetyIntegrityEventV1[] | null;
 }
 
 export function outcomeKey(row: Pick<PairedOutcomeRow, "campaignId" | "manifestHash" | "task" | "seed" | "arm">): string {
@@ -793,6 +815,12 @@ function outcomeRowFromRollout(
     runOutcome: outcome.runOutcome ?? null,
     error: outcome.error ?? null,
     telemetryMissingReason: telemetry ? null : "rollout ended before telemetry was captured",
+    safetyIntegrityCoverage: outcome.safetyIntegrityCoverage ?? {
+      toolRuntimeObserved: false,
+      workspaceSandboxObserved: false,
+      fixtureGuardObserved: false,
+    },
+    safetyIntegrityEvents: outcome.safetyIntegrityEvents ?? null,
   };
 }
 
@@ -841,6 +869,12 @@ export function failureOutcomeRow(
     runOutcome: null,
     error: message,
     telemetryMissingReason: "arm threw before telemetry was captured",
+    safetyIntegrityCoverage: {
+      toolRuntimeObserved: false,
+      workspaceSandboxObserved: false,
+      fixtureGuardObserved: false,
+    },
+    safetyIntegrityEvents: null,
   };
 }
 
@@ -879,6 +913,8 @@ const OUTCOME_ROW_KEYS: readonly (keyof PairedOutcomeRow)[] = [
   "runOutcome",
   "error",
   "telemetryMissingReason",
+  "safetyIntegrityCoverage",
+  "safetyIntegrityEvents",
 ];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -963,7 +999,19 @@ export function validateOutcomeRow(value: unknown): PairedOutcomeRow {
   if (value.rewardBreakdown !== null && !isRecord(value.rewardBreakdown)) {
     throw new Error('invalid outcome row field "rewardBreakdown"');
   }
-  return value as unknown as PairedOutcomeRow;
+  // Both safety fields are required and closed. The coverage receipt must be a
+  // complete boolean triple; each event must be attributed to exactly its own
+  // task/seed/arm so a foreign or remapped boundary signal can never enter an
+  // outcome row. A task/seed/arm mismatch is a strict decode failure (which the
+  // verifier treats as artifact-integrity inconclusive), never a safety event.
+  const safetyIntegrityCoverage = parseSafetyIntegrityCoverage(value.safetyIntegrityCoverage);
+  const safetyIntegrityEvents = parseSafetyIntegrityEvents(value.safetyIntegrityEvents);
+  for (const event of safetyIntegrityEvents ?? []) {
+    if (event.task !== value.task || event.seed !== value.seed || event.arm !== value.arm) {
+      throw new Error("safety integrity event task/seed/arm does not match its outcome row");
+    }
+  }
+  return { ...value, safetyIntegrityCoverage, safetyIntegrityEvents } as unknown as PairedOutcomeRow;
 }
 
 /**

@@ -9,6 +9,7 @@
 // through separate tool implementations.
 
 import type { JarvisConfig } from "./config";
+import { WorkspaceSandboxDeniedError } from "./fs-scope";
 import { ToolExecutionError } from "./tool-types";
 import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool-types";
 import type { WriteEffectObservation } from "./orchestration/content-fingerprint";
@@ -468,6 +469,20 @@ export function createToolRuntime(): ToolRuntime {
     } catch (e: any) {
       const stopReason = control.reason();
       if (stopReason) return stoppedToolResult(call, start, stopReason, timeoutMs);
+      if (e instanceof WorkspaceSandboxDeniedError) {
+        const message = boundedToolText(e.message || "Tool execution failed");
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: boundedToolText(`Error: ${message}`),
+          is_error: true,
+          error: message,
+          error_code: (e.forWrite
+            ? "non_fixture_write_denied"
+            : "workspace_escape_denied") satisfies ToolErrorCode,
+          duration_ms: Date.now() - start,
+        };
+      }
       if (e instanceof ToolExecutionError) {
         const message = boundedToolText(e.message || "Tool execution failed");
         return {
