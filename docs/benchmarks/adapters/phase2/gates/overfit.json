@@ -1,0 +1,32 @@
+{
+ "trainable_params": 21166080,
+ "steps": 40,
+ "losses": [
+  0.0319,
+  0.0075,
+  0.0001,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "reproduction_before": 0.9907,
+ "reproduction_after": 1.0,
+ "pass_pytorch": true,
+ "convert_exit": 0,
+ "convert_tail": "6, shape = {2048, 16}\nINFO:hf-to-gguf:blk.9.attn_gate.weight.lora_b,        torch.float32 --> F16, shape = {16, 4096}\nINFO:hf-to-gguf:blk.9.ssm_out.weight.lora_a,          torch.float32 --> F16, shape = {4096, 16}\nINFO:hf-to-gguf:blk.9.ssm_out.weight.lora_b,          torch.float32 --> F16, shape = {16, 2048}\nINFO:hf-to-gguf:blk.9.ffn_down_shexp.weight.lora_a,   torch.float32 --> F16, shape = {512, 16}\nINFO:hf-to-gguf:blk.9.ffn_down_shexp.weight.lora_b,   torch.float32 --> F16, shape = {16, 2048}\nINFO:hf-to-gguf:blk.9.ffn_gate_shexp.weight.lora_a,   torch.float32 --> F16, shape = {2048, 16}\nINFO:hf-to-gguf:blk.9.ffn_gate_shexp.weight.lora_b,   torch.float32 --> F16, shape = {16, 512}\nINFO:hf-to-gguf:blk.9.ffn_up_shexp.weight.lora_a,     torch.float32 --> F16, shape = {2048, 16}\nINFO:hf-to-gguf:blk.9.ffn_up_shexp.weight.lora_b,     torch.float32 --> F16, shape = {16, 512}\nINFO:hf-to-gguf:Set meta model\nINFO:hf-to-gguf:Set model parameters\nINFO:hf-to-gguf:Set model quantization version\nINFO:hf-to-gguf:Set model tokenizer\nINFO:gguf.gguf_writer:Writing the following files:\nINFO:gguf.gguf_writer:/vol/gates/overfit-lora.gguf: n_tensors = 620, total_size = 42.3M\n\nWriting:   0%|          | 0.00/42.3M [00:00<?, ?byte/s]\nWriting:  34%|\u2588\u2588\u2588\u258d      | 14.3M/42.3M [00:00<00:00, 143Mbyte/s]\nWriting:  68%|\u2588\u2588\u2588\u2588\u2588\u2588\u258a   | 28.6M/42.3M [00:00<00:00, 140Mbyte/s]\nWriting: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 42.3M/42.3M [00:00<00:00, 143Mbyte/s]\nINFO:lora-to-gguf:Model successfully exported to /vol/gates/overfit-lora.gguf\n",
+ "lora_gguf_bytes": 42376480,
+ "names": {
+  "experts": 96,
+  "unmapped": [],
+  "not_loaded": [],
+  "params": 693,
+  "loaded": 693
+ },
+ "seconds": 1147,
+ "cost_usd_est": 1.08
+}
