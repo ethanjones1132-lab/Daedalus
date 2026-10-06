@@ -44,6 +44,7 @@ import {
   detectUnexpectedOutcomeKeys,
   expectedHeldOutFixtures,
   outcomeKey,
+  validateOutcomeRow,
   validateSourceBindings,
   type PairedOutcomeRow,
 } from "./paired-learning-evaluator";
