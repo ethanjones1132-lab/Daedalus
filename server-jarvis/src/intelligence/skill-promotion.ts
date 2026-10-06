@@ -6,7 +6,15 @@ import {
   type DecodedSkillTrajectory,
 } from "./skill-source-evidence";
 import { isValidSkillCandidate } from "./skill-candidate-validation";
-import { listSkillCandidates, readSkillCandidate, skillCandidateLifecycleVersion, transitionSkillCandidate, updateSkillCandidateStatus } from "./skill-store";
+import {
+  listSkillCandidates,
+  promoteSkillCandidateFromAcceptedDecision,
+  readSkillCandidate,
+  skillCandidateLifecycleVersion,
+  updateSkillCandidateStatus,
+  verifySkillCandidatePromotionEvidence,
+  type SkillCandidatePromotionError,
+} from "./skill-store";
 import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
 import type { CallModelFn } from "../orchestration/coordinator";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
@@ -153,39 +161,59 @@ export function evaluateSkillPromotion(
   return { promote: true, score, baseline };
 }
 
+/** A heuristic-passing candidate that this pass refuses to promote because it
+ *  carries no content-addressed promotion proof. `evidence_required` means,
+ *  literally, that explicit evidence must be supplied through
+ *  `promoteSkillCandidate`/`promoteCandidates` before any promotion. */
+export interface SkillPromotionEvidenceRequired {
+  candidate: SkillCandidate;
+  verdict: SkillPromotionVerdict;
+}
+
 export interface SkillPromotionPassResult {
+  /**
+   * Always empty: this heuristic pass has no promotion authority. Retained so
+   * callers that read a `promoted` field keep a stable shape.
+   */
   promoted: SkillCandidate[];
   rejected: SkillCandidate[];
+  /** Heuristic-passing candidates left untouched, pending explicit proof. */
+  evidence_required: SkillPromotionEvidenceRequired[];
   total_evaluated: number;
 }
 
+/**
+ * Heuristic-only pre-screen. It never promotes: a candidate that clears every
+ * cheap gate is left in place and surfaced as `evidence_required`, because a
+ * heuristic score is not promotion authority. Only a heuristic failure is
+ * persisted, and only for a still-`candidate` record under its lifecycle
+ * version guard — staged/inactive records are never listed here and are never
+ * touched. Promotion itself must go through `promoteSkillCandidate` with
+ * explicit proof.
+ */
 export function runSkillPromotionPass(
   config: SkillDistillationConfig,
 ): SkillPromotionPassResult {
-  const result: SkillPromotionPassResult = { promoted: [], rejected: [], total_evaluated: 0 };
+  const result: SkillPromotionPassResult = {
+    promoted: [],
+    rejected: [],
+    evidence_required: [],
+    total_evaluated: 0,
+  };
   if (!config.enabled) return result;
   for (const candidate of listSkillCandidates("candidate")) {
     result.total_evaluated += 1;
     const verdict = evaluateSkillPromotion(candidate, config);
     if (verdict.promote) {
-      const updated = updateSkillCandidateStatus(
-        candidate.id,
-        "promoted",
-        verdict.score,
-        undefined,
-        undefined,
-        undefined,
-        skillCandidateLifecycleVersion(candidate),
-      );
-      if (updated) result.promoted.push(updated);
+      // No promotion authority here — record the heuristic pass and move on.
+      result.evidence_required.push({ candidate, verdict });
       continue;
     }
-    // Persist the rejection so the operator can diagnose why a candidate
-    // didn't promote and so the next pass doesn't re-evaluate it. Clear
-    // the stale rejection_reason if the candidate was previously
-    // rejected and is now being re-evaluated (only happens after a
-    // manual status reset, which is rare but supported).
-    if (verdict.reason) {
+    // Persist the heuristic rejection so the operator can diagnose why a
+    // candidate didn't promote and so the next pass doesn't re-evaluate it.
+    // Guarded to candidate records under their current lifecycle version so a
+    // concurrent write (e.g. staging) can never be clobbered.
+    if (verdict.reason && candidate.status === "candidate") {
       const updated = updateSkillCandidateStatus(
         candidate.id,
         "rejected",
@@ -204,109 +232,207 @@ export function runSkillPromotionPass(
 export type SkillPromotionDecision = {
   candidate_id: string;
   judge_score: number;
-  decision: "promote" | "reject";
+  decision: "promote" | "reject" | "blocked";
   rationale: string;
+  /**
+   * Machine-readable cause when `decision === "blocked"` — a gate, proof, or
+   * write failure. A blocked decision leaves the staged candidate exactly as
+   * it was; it is not a persisted rejection.
+   */
+  reason?: string;
   /** Snapshot of the candidate JSON before promotion, used for rollback. */
   rollback_revision_id?: string;
 };
 
 /**
- * Bulk-promote only candidates that already have a passing judge decision.
- * Unlike `runSkillPromotionPass` (heuristic-only), this gate refuses to act
- * on any candidate whose `eval_score` is missing or below `min_judge_score`,
- * ensuring scheduled/bulk promotion cannot bypass the semantic judge.
+ * A bulk promotion request: the exact content-addressed proof produced for one
+ * authoritative candidate, bound to that candidate's id. Callers cannot pass
+ * raw ids, caller-supplied metrics, or judge scores; the only authority is the
+ * proof, which `promoteSkillCandidate` re-verifies before any gate runs.
+ */
+export type SkillPromotionRequest = SkillPromotionProof & {
+  candidateId: string;
+};
+
+function isSkillPromotionRequest(value: unknown): value is SkillPromotionRequest {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.candidateId === "string" &&
+    value.candidateId.length > 0 &&
+    typeof value.reportHash === "string" &&
+    value.reportHash.length > 0 &&
+    typeof value.decisionRecordHash === "string" &&
+    value.decisionRecordHash.length > 0 &&
+    typeof value.expectedLifecycleVersion === "number" &&
+    Number.isSafeInteger(value.expectedLifecycleVersion) &&
+    value.expectedLifecycleVersion >= 0
+  );
+}
+
+/**
+ * Bulk-promote candidates that each carry explicit, content-addressed proof.
  *
- * Throws "judge_required" if any requested candidate lacks a passing judge
- * decision, leaving all candidates untouched.
+ * This surface has no id-only authority and never trusts caller metrics. Every
+ * request must name a candidate id and the exact proof tuple produced for it;
+ * empty, malformed, or duplicate-candidate request lists are rejected before
+ * any model call. Each authoritative candidate must be either the exact
+ * staged/version named by the proof or the exact promoted-retry (version + 1).
+ * A fresh staged candidate additionally keeps the saved `eval_score >=
+ * min_judge_score` precondition, which is a precondition only and never
+ * promotion authority.
+ *
+ * All candidate evidence verifications run before any model call; each passing
+ * request is then handed to `promoteSkillCandidate`, which re-verifies the
+ * proof before its own gates. A decision is `"promote"` only when the candidate
+ * reads back exactly as promoted. Every gate, proof, or write failure is an
+ * honest `"blocked"` result that leaves the staged candidate unchanged — it is
+ * never reported as a persisted rejection.
  */
 export async function promoteCandidates(
-  ids: string[],
+  requests: readonly SkillPromotionRequest[],
   callModel: CallModelFn,
   config: SkillDistillationConfig,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
 ): Promise<SkillPromotionDecision[]> {
-  const minJudgeScore = config.min_judge_score ?? 0.75;
-
-  // Pre-flight: every candidate must have a passing judge decision. This is
-  // intentionally strict — a missing decision aborts the whole batch so an
-  // operator cannot accidentally promote an un-judged candidate through a
-  // bulk call.
-  const pending: { candidate: SkillCandidate; priorJson: string }[] = [];
-  for (const id of ids) {
-    const read = readSkillCandidate(id);
-    if (!read.ok) {
-      throw new Error(`judge_required: candidate ${id} ${read.error}`);
+  if (!Array.isArray(requests) || requests.length === 0) {
+    throw new Error("promotion_request_invalid: at least one promotion request is required");
+  }
+  const seenCandidateIds = new Set<string>();
+  for (const request of requests) {
+    if (!isSkillPromotionRequest(request)) {
+      throw new Error("promotion_request_invalid: malformed promotion request");
     }
-    const candidate = read.candidate;
-    if (candidate.status !== "candidate") {
-      throw new Error(
-        `judge_required: candidate ${id} status is ${candidate.status}, expected candidate`,
-      );
+    if (seenCandidateIds.has(request.candidateId)) {
+      throw new Error(`promotion_request_invalid: duplicate candidate ${request.candidateId}`);
     }
-    const score = candidate.eval_score;
-    if (score === undefined || score < minJudgeScore) {
-      throw new Error(
-        `judge_required: candidate ${id} has eval_score ${score ?? "undefined"} < ${minJudgeScore}`,
-      );
-    }
-    pending.push({ candidate, priorJson: JSON.stringify(candidate) });
+    seenCandidateIds.add(request.candidateId);
   }
 
-  const decisions: SkillPromotionDecision[] = [];
-  for (const { candidate, priorJson } of pending) {
+  const minJudgeScore = config.min_judge_score ?? 0.75;
+  const decisions = new Map<string, SkillPromotionDecision>();
+  const preflight: { request: SkillPromotionRequest; candidate: SkillCandidate; priorJson: string; isPromotedRetry: boolean }[] = [];
+
+  const block = (candidateId: string, reason: string, rationale: string, judgeScore = 0): void => {
+    decisions.set(candidateId, {
+      candidate_id: candidateId,
+      judge_score: judgeScore,
+      decision: "blocked",
+      reason,
+      rationale,
+    });
+  };
+
+  // Pre-flight every request before any model call: resolve the authoritative
+  // candidate, pin the permitted lifecycle revision, keep the saved judge
+  // precondition for fresh staged candidates, then verify the proof. This
+  // verification only fails fast — the actual authority is re-verified inside
+  // `promoteSkillCandidate` immediately before its gates.
+  for (const request of requests) {
+    const candidateId = request.candidateId;
+    const read = readSkillCandidate(candidateId);
+    if (!read.ok) {
+      block(candidateId, read.error, `candidate ${candidateId} could not be resolved (${read.error})`);
+      continue;
+    }
+    const candidate = read.candidate;
+    const observedVersion = skillCandidateLifecycleVersion(candidate);
+    const isFreshStaged =
+      candidate.status === "staged" && observedVersion === request.expectedLifecycleVersion;
+    const isPromotedRetry =
+      candidate.status === "promoted" && observedVersion === request.expectedLifecycleVersion + 1;
+    if (!isFreshStaged && !isPromotedRetry) {
+      if (observedVersion !== request.expectedLifecycleVersion) {
+        block(
+          candidateId,
+          "stale_version",
+          `current version is ${observedVersion}, proof expected ${request.expectedLifecycleVersion}`,
+          candidate.eval_score ?? 0,
+        );
+      } else {
+        block(
+          candidateId,
+          "wrong_status",
+          `status is ${candidate.status}, proof expected staged or a promoted retry`,
+          candidate.eval_score ?? 0,
+        );
+      }
+      continue;
+    }
+    if (isFreshStaged) {
+      const score = candidate.eval_score;
+      if (score === undefined || score < minJudgeScore) {
+        block(
+          candidateId,
+          "judge_required",
+          `saved eval_score ${score ?? "undefined"} < min_judge_score ${minJudgeScore}`,
+          score ?? 0,
+        );
+        continue;
+      }
+    }
+    const verification = verifySkillCandidatePromotionEvidence({
+      candidateId,
+      reportHash: request.reportHash,
+      decisionRecordHash: request.decisionRecordHash,
+      expectedLifecycleVersion: request.expectedLifecycleVersion,
+    });
+    if (!verification.ok) {
+      block(
+        candidateId,
+        verification.error,
+        verification.detail ?? "promotion evidence verification failed",
+        candidate.eval_score ?? 0,
+      );
+      continue;
+    }
+    preflight.push({ request, candidate, priorJson: JSON.stringify(candidate), isPromotedRetry });
+  }
+
+  // Only after every request has been resolved and verified do model calls
+  // begin. `promoteSkillCandidate` re-verifies the proof before its gates, so
+  // no model or gate work can establish provenance on its own.
+  for (const { request, candidate, priorJson, isPromotedRetry } of preflight) {
     const result = await promoteSkillCandidate(
       candidate.id,
       callModel,
       config,
+      {
+        reportHash: request.reportHash,
+        decisionRecordHash: request.decisionRecordHash,
+        expectedLifecycleVersion: request.expectedLifecycleVersion,
+      },
       fetchSnapshot,
-      skillCandidateLifecycleVersion(candidate),
     );
-    if (!result.ok) {
-      if (result.error === "stale_version") {
-        throw new Error(`stale_version: candidate ${candidate.id} changed during promotion`);
-      }
-      // Re-evaluate after a fresh judge call failed or returned an invalid
-      // protocol: this is not a grounded rejection. Surface it as a reject
-      // decision but do not leave the candidate promoted.
-      if (result.error === "judge_unavailable" || result.error === "judge_invalid") {
-        decisions.push({
-          candidate_id: candidate.id,
-          judge_score: result.error === "judge_invalid" ? 0 : candidate.eval_score ?? 0,
-          decision: "reject",
-          rationale: result.detail ?? (result.error === "judge_invalid" ? "judge verdict invalid" : "judge unavailable"),
-        });
-        continue;
-      }
-      // For other hard errors (should not happen after pre-flight), treat as reject.
-      decisions.push({
+
+    if (result.ok && result.candidate?.status === "promoted") {
+      decisions.set(candidate.id, {
         candidate_id: candidate.id,
-        judge_score: candidate.eval_score ?? 0,
-        decision: "reject",
-        rationale: result.detail ?? result.error ?? "unknown",
+        judge_score: result.candidate.eval_score ?? result.verdict?.score ?? candidate.eval_score ?? 0,
+        decision: "promote",
+        rationale: "verified promotion proof; candidate reads back as promoted",
+        ...(isPromotedRetry ? {} : { rollback_revision_id: priorJson }),
       });
       continue;
     }
-
-    const finalScore = result.candidate?.eval_score ?? candidate.eval_score ?? 0;
-    if (result.candidate?.status === "promoted") {
-      decisions.push({
-        candidate_id: candidate.id,
-        judge_score: finalScore,
-        decision: "promote",
-        rationale: "passed judge and heuristic gates",
-        rollback_revision_id: priorJson,
-      });
-    } else {
-      decisions.push({
-        candidate_id: candidate.id,
-        judge_score: finalScore,
-        decision: "reject",
-        rationale: result.candidate?.rejection_detail ?? "failed promotion gates",
-      });
-    }
+    block(
+      candidate.id,
+      result.error ?? "promotion_not_confirmed",
+      result.detail ?? result.error ?? "promotion did not read back as promoted",
+      result.verdict?.score ?? candidate.eval_score ?? 0,
+    );
   }
 
-  return decisions;
+  return requests.map((request) => {
+    const decision = decisions.get(request.candidateId);
+    if (decision) return decision;
+    return {
+      candidate_id: request.candidateId,
+      judge_score: 0,
+      decision: "blocked",
+      reason: "promotion_not_confirmed",
+      rationale: "candidate was not processed",
+    };
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -577,109 +703,142 @@ export async function runGroundingJudge(
   }
 }
 
+/** Explicit proof that must accompany a promotion request. The evidence
+ *  report and the accepted-decision record are content-addressed by hash, and
+ *  `expectedLifecycleVersion` pins the exact staged revision the proof was
+ *  produced against so verification cannot race a concurrent write. */
+export type SkillPromotionProof = {
+  reportHash: string;
+  decisionRecordHash: string;
+  expectedLifecycleVersion: number;
+};
+
 export interface PromoteSkillCandidateResult {
   ok: boolean;
-  error?: "candidate_not_found" | "invalid_candidate_record" | "wrong_status" | "stale_version" | "judge_unavailable" | "judge_invalid";
+  error?:
+    | "candidate_not_found"
+    | "invalid_candidate_record"
+    | "wrong_status"
+    | "stale_version"
+    | "evidence_verification_failed"
+    | "heuristic_rejected"
+    | "no_grounding_source"
+    | "judge_unavailable"
+    | "judge_invalid"
+    | "below_judge_threshold"
+    | "promotion_write_failed"
+    | SkillCandidatePromotionError;
   detail?: string;
   candidate?: SkillCandidate;
   verdict?: JudgeVerdict;
 }
 
 /**
- * Promote (or reject) a single candidate: heuristic gates first (reused from
- * `evaluateSkillPromotion`, unchanged), then — only if those pass — a
- * semantic grounding check via `runGroundingJudge` against the candidate's
- * source trajectory. A judge call failure leaves the candidate untouched in
- * "candidate" status (infra failure is not evidence the skill is bad); only
- * an actual sub-threshold score produces a rejection.
+ * Promote a single staged candidate backed by explicit promotion evidence.
+ *
+ * Ordering is load-bearing:
+ *  1. authoritative read + lifecycle-version check,
+ *  2. `verifySkillCandidatePromotionEvidence` — proof is checked *before* any
+ *     heuristic, grounding, or judge work, so none of that work is trusted to
+ *     establish the provenance of the promotion,
+ *  3. `alreadyPromoted` short-circuits without calling the model,
+ *  4. otherwise the existing heuristic, grounding/source, and judge gates run
+ *     against a shallow local copy (persisted object is never mutated),
+ *  5. only after every gate passes is the accepted-decision writer invoked,
+ *     and promotion is reported only if that write reads back as promoted.
+ *
+ * Any gate failure leaves the staged candidate untouched — there is no generic
+ * lifecycle transition or rejection write here.
  */
 export async function promoteSkillCandidate(
   id: string,
   callModel: CallModelFn,
   config: SkillDistillationConfig,
+  proof: SkillPromotionProof,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
-  expectedVersion?: number,
 ): Promise<PromoteSkillCandidateResult> {
+  const proofTuple = {
+    reportHash: proof.reportHash,
+    decisionRecordHash: proof.decisionRecordHash,
+    expectedLifecycleVersion: proof.expectedLifecycleVersion,
+  };
+
   const read = readSkillCandidate(id);
   if (!read.ok) {
     return { ok: false, error: read.error };
   }
   const candidate = read.candidate;
   const observedVersion = skillCandidateLifecycleVersion(candidate);
-  if (expectedVersion !== undefined && expectedVersion !== observedVersion) {
-    return { ok: false, error: "stale_version", detail: `current version is ${observedVersion}` };
-  }
-  if (candidate.status !== "candidate") {
+  const isFreshStaged =
+    candidate.status === "staged" && observedVersion === proof.expectedLifecycleVersion;
+  const isPromotedRetry =
+    candidate.status === "promoted" && observedVersion === proof.expectedLifecycleVersion + 1;
+  if (!isFreshStaged && !isPromotedRetry) {
+    if (observedVersion !== proof.expectedLifecycleVersion) {
+      return { ok: false, error: "stale_version", detail: `current version is ${observedVersion}` };
+    }
     return { ok: false, error: "wrong_status", detail: `status is ${candidate.status}` };
   }
 
-  const commit = (
-    status: "promoted" | "rejected",
-    evalScore: number | undefined,
-    rejectionReason: SkillRejectionReason | undefined,
-    rejectionDetail: string | undefined,
-    evalMissed: string[] | undefined,
-  ): PromoteSkillCandidateResult => {
-    const transitioned = transitionSkillCandidate(id, observedVersion, "candidate", (current) => {
-      const updated: SkillCandidate = {
-        ...current,
-        status,
-        eval_score: evalScore ?? current.eval_score,
-      };
-      if (status === "rejected") {
-        updated.rejection_reason = rejectionReason;
-        updated.rejection_detail = rejectionDetail;
-      } else {
-        updated.rejection_reason = undefined;
-        updated.rejection_detail = undefined;
-      }
-      if (evalMissed !== undefined) updated.eval_missed = evalMissed;
-      if (status === "promoted") updated.promoted_at = new Date().toISOString();
-      else updated.promoted_at = undefined;
-      return updated;
-    });
-    if (!transitioned.ok) {
+  const verification = verifySkillCandidatePromotionEvidence({ candidateId: id, ...proofTuple });
+  if (!verification.ok) {
+    return { ok: false, error: verification.error, detail: verification.detail };
+  }
+  if (isPromotedRetry) {
+    if (verification.alreadyPromoted !== true) {
       return {
         ok: false,
-        error: transitioned.error === "stale_version" ? "stale_version" : "wrong_status",
-        detail: transitioned.error === "stale_version" ? "candidate changed during lifecycle action" : `status is ${transitioned.current?.status ?? "unknown"}`,
-        candidate: transitioned.current,
+        error: "evidence_verification_failed",
+        detail: "promoted retry did not verify as the exact promotion event and post-state",
       };
     }
-    return { ok: true, candidate: transitioned.candidate };
-  };
+    return { ok: true, candidate: verification.candidate };
+  }
+  if (verification.alreadyPromoted === true) {
+    return { ok: true, candidate: verification.candidate };
+  }
 
-  const heuristic = evaluateSkillPromotion(candidate, config);
+  const evaluationCandidate: SkillCandidate = { ...candidate, status: "candidate" };
+  const heuristic = evaluateSkillPromotion(evaluationCandidate, config);
   if (!heuristic.promote) {
-    return commit("rejected", heuristic.score, heuristic.reason, heuristic.detail, undefined);
+    return { ok: false, error: "heuristic_rejected", detail: heuristic.detail, candidate };
   }
 
   const grounding = await runGroundingJudge(candidate, callModel, fetchSnapshot);
   if (!grounding.ok) {
     if (grounding.error === "no_grounding_source") {
-      return commit("rejected", heuristic.score, "eval_failed", "no grounding source available", undefined);
+      return { ok: false, error: "no_grounding_source", detail: grounding.detail, candidate };
     }
     if (grounding.error === "judge_invalid") {
-      return { ok: false, error: "judge_invalid", detail: grounding.detail };
+      return { ok: false, error: "judge_invalid", detail: grounding.detail, candidate };
     }
-    return { ok: false, error: "judge_unavailable", detail: grounding.detail };
+    return { ok: false, error: "judge_unavailable", detail: grounding.detail, candidate };
   }
 
   const verdict = grounding.verdict;
   const minJudgeScore = config.min_judge_score ?? 0.75;
-  if (verdict.score >= minJudgeScore) {
-    return { ...commit("promoted", verdict.score, undefined, undefined, verdict.missed), verdict };
+  if (verdict.score < minJudgeScore) {
+    return {
+      ok: false,
+      error: "below_judge_threshold",
+      detail: `judge score ${verdict.score.toFixed(3)} < min_judge_score ${minJudgeScore}`,
+      candidate,
+      verdict,
+    };
   }
-  return {
-    ...commit(
-      "rejected",
-      verdict.score,
-      "eval_failed",
-      `missed: ${verdict.missed.join("; ")}`,
-      verdict.missed,
-    ),
-    verdict,
-  };
+
+  const writer = promoteSkillCandidateFromAcceptedDecision({ candidateId: id, ...proofTuple });
+  if (!writer.ok) {
+    return {
+      ok: false,
+      error: "promotion_write_failed",
+      detail: writer.detail ?? (typeof writer.error === "string" ? writer.error : "promotion write failed"),
+      candidate,
+      verdict,
+    };
+  }
+
+  return { ok: true, candidate: writer.candidate, verdict };
 }
 
 // ═══════════════════════════════════════════════════════════════

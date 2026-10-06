@@ -843,11 +843,17 @@ export function writeLearningEvalDecision(
 
 export const LEARNING_EVAL_LIFECYCLE_EVENT_SCHEMA_VERSION = 1 as const;
 
-export type LearningEvalLifecycleAction = "stage_candidate" | "reject_candidate";
+export type LearningEvalLifecycleAction =
+  | "stage_candidate"
+  | "reject_candidate"
+  | "promote_candidate";
 
-export type LearningEvalLifecycleReasonCode = "accepted_transfer_gate" | "transfer_gate_failed";
+export type LearningEvalLifecycleReasonCode =
+  | "accepted_transfer_gate"
+  | "transfer_gate_failed"
+  | "accepted_learning_eval";
 
-export type LearningEvalLifecycleToStatus = "staged" | "rejected";
+export type LearningEvalLifecycleToStatus = "staged" | "rejected" | "promoted";
 
 export type LearningEvalLifecycleFromStatus =
   | "candidate"
@@ -908,14 +914,16 @@ export type ReadLearningEvalLifecycleEventResult =
 const LEARNING_EVAL_LIFECYCLE_ACTIONS = [
   "stage_candidate",
   "reject_candidate",
+  "promote_candidate",
 ] as const;
 
 const LEARNING_EVAL_LIFECYCLE_REASON_CODES = [
   "accepted_transfer_gate",
   "transfer_gate_failed",
+  "accepted_learning_eval",
 ] as const;
 
-const LEARNING_EVAL_LIFECYCLE_TO_STATUSES = ["staged", "rejected"] as const;
+const LEARNING_EVAL_LIFECYCLE_TO_STATUSES = ["staged", "rejected", "promoted"] as const;
 
 const LEARNING_EVAL_LIFECYCLE_FROM_STATUSES = [
   "candidate",
@@ -1176,7 +1184,7 @@ export function decodeLearningEvalLifecycleEvent(
         error: "stage_candidate requires reasonCode accepted_transfer_gate",
       };
     }
-  } else {
+  } else if (action === "reject_candidate") {
     if (toStatus !== "rejected") {
       return { ok: false, error: "reject_candidate requires toStatus rejected" };
     }
@@ -1187,6 +1195,22 @@ export function decodeLearningEvalLifecycleEvent(
       return {
         ok: false,
         error: "reject_candidate requires reasonCode transfer_gate_failed",
+      };
+    }
+  } else if (action === "promote_candidate") {
+    if (toStatus !== "promoted") {
+      return { ok: false, error: "promote_candidate requires toStatus promoted" };
+    }
+    if (fromStatus !== "staged") {
+      return { ok: false, error: "promote_candidate requires fromStatus staged" };
+    }
+    if (priorLifecycleVersion === null) {
+      return { ok: false, error: "promote_candidate requires non-null priorLifecycleVersion" };
+    }
+    if (reasonCode !== "accepted_learning_eval") {
+      return {
+        ok: false,
+        error: "promote_candidate requires reasonCode accepted_learning_eval",
       };
     }
   }

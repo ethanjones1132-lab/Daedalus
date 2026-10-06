@@ -18,7 +18,7 @@ import type { ToolDefinition } from "../tool-types";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { saveSkillCandidate } from "../intelligence/skill-store";
+import { saveSkillCandidateForEvaluationFixture } from "../intelligence/skill-store";
 import { resolveSkillsForTurn } from "../intelligence/skill-resolver";
 import { buildGroundingRubric, runGroundingJudge } from "../intelligence/skill-promotion";
 import { defaultConfig } from "../config";
@@ -175,7 +175,7 @@ function runSkillCase(c: SkillCase): EvalCaseResult {
   g.__skillCandidatesDirOverride = tempRoot;
 
   try {
-    saveSkillCandidate(c.fixture);
+    saveSkillCandidateForEvaluationFixture(c.fixture);
     const resolved = resolveSkillsForTurn(c.message, c.taskType);
     const problems: string[] = [];
 

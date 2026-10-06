@@ -4819,15 +4819,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }, distillCfg);
           if (candidate) {
             if (distillCfg.auto_promote) {
-              // Judge-gated promotion for THIS candidate only — not the whole
-              // pending queue. The old unconditional `runSkillPromotionPass`
-              // bulk call auto-promoted on heuristics alone with zero
-              // semantic review; that safety gap is why `auto_promote`
-              // defaults to false below.
-              const promotion = await promoteSkillCandidate(candidate.id, callModel, distillCfg);
+              // Fail closed: a candidate produced here has no user-authorized
+              // accepted proof attached, so we must not auto-promote it. Leave
+              // the just-created candidate unchanged and surface an explicit
+              // evidence_required state awaiting accepted proof. No model or
+              // judge call is made from this path.
               console.log(
                 `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
-                `auto_promote result: ${promotion.ok ? promotion.candidate?.status : `error=${promotion.error}`}`,
+                `auto_promote skipped: evidence_required, awaiting accepted proof`,
               );
             } else {
               // Default (organism loop v1 safety fix): heuristic screen only.
@@ -4837,7 +4836,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // (POST /skills/candidates/:id/promote), which adds the
               // semantic judge gate before anything can inject into prompts.
               const heuristic = evaluateSkillPromotion(candidate, distillCfg);
-              if (!heuristic.promote) {
+              if (!heuristic.promote && candidate.status === "candidate") {
                 updateSkillCandidateStatus(candidate.id, "rejected", heuristic.score, heuristic.reason, heuristic.detail);
               }
               console.log(
@@ -6429,24 +6428,84 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({ candidates: listSkillCandidates(status ?? undefined) });
     }
     if (path === "/skills/promote" && req.method === "POST") {
+      class PromoteRequestInvalidError extends Error {}
+      const parsedBody = await req.json().catch(() => undefined);
+      const rawCandidates =
+        parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+          ? (parsedBody as { candidates?: unknown }).candidates
+          : undefined;
+      let requests: {
+        candidateId: string;
+        reportHash: string;
+        decisionRecordHash: string;
+        expectedLifecycleVersion: number;
+      }[];
+      try {
+        if (!Array.isArray(rawCandidates) || rawCandidates.length === 0) {
+          throw new PromoteRequestInvalidError("candidates must be a nonempty array");
+        }
+        const seenCandidateIds = new Set<string>();
+        requests = rawCandidates.map((entry, index) => {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}] must be a plain object`);
+          }
+          const record = entry as Record<string, unknown>;
+          const candidateId = record.candidate_id;
+          const reportHash = record.report_hash;
+          const decisionRecordHash = record.record_hash;
+          const expectedLifecycleVersion = record.expected_version;
+          if (typeof candidateId !== "string" || candidateId.trim().length === 0) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].candidate_id must be a nonempty string`);
+          }
+          if (seenCandidateIds.has(candidateId)) {
+            throw new PromoteRequestInvalidError(`duplicate candidate_id ${candidateId}`);
+          }
+          seenCandidateIds.add(candidateId);
+          if (typeof reportHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(reportHash)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].report_hash must be 64 hex characters`);
+          }
+          if (typeof decisionRecordHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(decisionRecordHash)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].record_hash must be 64 hex characters`);
+          }
+          if (
+            typeof expectedLifecycleVersion !== "number" ||
+            !Number.isSafeInteger(expectedLifecycleVersion) ||
+            expectedLifecycleVersion < 0
+          ) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].expected_version must be a nonnegative safe integer`);
+          }
+          return { candidateId, reportHash, decisionRecordHash, expectedLifecycleVersion };
+        });
+      } catch (e) {
+        if (e instanceof PromoteRequestInvalidError) {
+          return Response.json({ ok: false, error: "invalid_promotion_request", detail: e.message }, { status: 400 });
+        }
+        throw e;
+      }
+
       const cfg = loadConfig();
       const distillCfg = cfg.orchestrator.skill_distillation;
-      // Bulk promotion now requires a prior passing judge decision for every
-      // candidate. Default to an empty batch when distillation is disabled.
       if (!distillCfg?.enabled) {
         return Response.json({ ok: true, decisions: [] });
       }
-      const candidateIds = listSkillCandidates("candidate").map((c) => c.id);
       try {
         const decisions = await promoteCandidates(
-          candidateIds,
+          requests,
           makeCallModel(cfg, "orchestrator"),
           distillCfg,
         );
+        const allPromoted =
+          decisions.length > 0 && decisions.every((decision) => decision.decision === "promote");
+        if (!allPromoted) {
+          return Response.json({ ok: false, decisions }, { status: 409 });
+        }
         return Response.json({ ok: true, decisions });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        return Response.json({ ok: false, error: "judge_required", detail: message }, { status: 428 });
+        if (message.startsWith("promotion_request_invalid:")) {
+          return Response.json({ ok: false, error: "invalid_promotion_request", detail: message }, { status: 400 });
+        }
+        return Response.json({ ok: false, error: "promotion_failed", detail: message }, { status: 503 });
       }
     }
 

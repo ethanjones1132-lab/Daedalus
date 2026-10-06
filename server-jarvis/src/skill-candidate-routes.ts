@@ -77,6 +77,31 @@ export async function handleSkillCandidateRequest(
   const candidate = read.candidate;
 
   const body = responseBody(await req.json().catch(() => ({})));
+
+  if (action === "promote") {
+    if (
+      !Object.hasOwn(body, "report_hash") ||
+      typeof body.report_hash !== "string" ||
+      !/^[0-9a-fA-F]{64}$/.test(body.report_hash)
+    ) {
+      return Response.json({ error: "invalid_report_hash" }, { status: 400 });
+    }
+    if (
+      !Object.hasOwn(body, "record_hash") ||
+      typeof body.record_hash !== "string" ||
+      !/^[0-9a-fA-F]{64}$/.test(body.record_hash)
+    ) {
+      return Response.json({ error: "invalid_record_hash" }, { status: 400 });
+    }
+    if (
+      !Object.hasOwn(body, "expected_version") ||
+      !Number.isSafeInteger(body.expected_version) ||
+      (body.expected_version as number) < 0
+    ) {
+      return Response.json({ error: "invalid_expected_version" }, { status: 400 });
+    }
+  }
+
   const suppliedVersion = body.expected_version;
   if (suppliedVersion !== undefined && (!Number.isSafeInteger(suppliedVersion) || (suppliedVersion as number) < 0)) {
     return Response.json({ error: "invalid_expected_version" }, { status: 400 });
@@ -88,12 +113,17 @@ export async function handleSkillCandidateRequest(
   const callModel = dependencies.makeCallModel(config);
 
   if (action === "promote") {
+    const proof = {
+      reportHash: body.report_hash as string,
+      decisionRecordHash: body.record_hash as string,
+      expectedLifecycleVersion: body.expected_version as number,
+    };
     const result = await promoteSkillCandidate(
       id,
       callModel,
       config,
+      proof,
       dependencies.fetchSnapshot,
-      expectedVersion,
     );
     if (!result.ok) return promotionErrorResponse(result);
     return Response.json(result.candidate);

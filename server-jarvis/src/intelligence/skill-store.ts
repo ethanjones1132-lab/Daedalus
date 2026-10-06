@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { homedir } from "os";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "fs";
+import { join, dirname, sep } from "path";
+import { homedir, tmpdir } from "os";
 import { validateSkillCandidate } from "./skill-candidate-validation";
 import type { SkillCandidate, SkillCandidateStatus, SkillRejectionReason } from "./skill-types";
-import { computeCandidateArtifactDigest, stableStringify } from "../self-tuning/rollout/learning-eval-types";
+import { computeBodyDigest, computeCandidateArtifactDigest, stableStringify } from "../self-tuning/rollout/learning-eval-types";
 import {
   appendLearningEvalLifecycleEvent,
   candidateContentDigestV1,
@@ -66,7 +66,58 @@ export function readSkillCandidate(id: string): SkillCandidateReadResult {
   return readCandidateFile(path);
 }
 
+/**
+ * Private candidate persistence. `allowPromoted` is the single narrow gate that
+ * separates the public candidate store (which rejects promoted writes with
+ * `evidence_required`) from the evidence-verified promotion transition. The
+ * flag is never surfaced through an exported generic save: public
+ * `saveSkillCandidate` hard-codes `false`, and only the promotion transition
+ * passes `true`, after every durable evidence check has already passed.
+ */
+function persistSkillCandidate(candidate: SkillCandidate, allowPromoted: boolean): void {
+  const validated = validateSkillCandidate(candidate);
+  if (!validated.ok) throw new Error("invalid_candidate_record");
+  if (!allowPromoted && validated.candidate.status === "promoted") throw new Error("evidence_required");
+  const path = skillCandidatePath(validated.candidate.id);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(validated.candidate, null, 2), "utf-8");
+}
+
 export function saveSkillCandidate(candidate: SkillCandidate): void {
+  persistSkillCandidate(candidate, false);
+}
+
+/**
+ * Evaluation-only fixture writer. It exists solely so the eval harness can
+ * materialize promoted skill fixtures into a throwaway temp directory without
+ * re-opening a production promotion path. It NEVER writes to the production
+ * candidate directory: it hard-requires the `__skillCandidatesDirOverride`
+ * global and refuses unless that directory's realpath is strictly contained
+ * below the OS temp directory (realpath-resolved, so traversal/escape and a
+ * symlinked override are rejected). The candidate is still fully validated
+ * before the write.
+ */
+export function saveSkillCandidateForEvaluationFixture(candidate: SkillCandidate): void {
+  const override = skillCandidatesDirOverride();
+  if (typeof override !== "string" || override.length === 0) throw new Error("evidence_required");
+  let overrideStat;
+  try {
+    overrideStat = lstatSync(override);
+  } catch {
+    throw new Error("evidence_required");
+  }
+  if (!overrideStat.isDirectory() || overrideStat.isSymbolicLink()) throw new Error("evidence_required");
+  let resolvedOverride: string;
+  let resolvedTempRoot: string;
+  try {
+    resolvedOverride = realpathSync(override);
+    resolvedTempRoot = realpathSync(tmpdir());
+  } catch {
+    throw new Error("evidence_required");
+  }
+  if (resolvedOverride === resolvedTempRoot) throw new Error("evidence_required");
+  if (!resolvedOverride.startsWith(resolvedTempRoot + sep)) throw new Error("evidence_required");
+
   const validated = validateSkillCandidate(candidate);
   if (!validated.ok) throw new Error("invalid_candidate_record");
   const path = skillCandidatePath(validated.candidate.id);
@@ -104,16 +155,26 @@ export function listSkillCandidates(status?: SkillCandidateStatus): SkillCandida
   });
 }
 
-export type SkillCandidateTransitionError = "candidate_not_found" | "invalid_candidate_record" | "stale_version" | "wrong_status";
+export type SkillCandidateTransitionError = "candidate_not_found" | "invalid_candidate_record" | "stale_version" | "wrong_status" | "evidence_required";
 export type SkillCandidateTransitionResult =
   | { ok: true; candidate: SkillCandidate }
   | { ok: false; error: SkillCandidateTransitionError; current?: SkillCandidate };
 
-export function transitionSkillCandidate(
+/**
+ * Private version/status transition. The callback is invoked exactly once and
+ * the passed-in `existing` object is deep-cloned before invocation so an
+ * in-place mutation into `promoted` is detected independently of the returned
+ * patch. `allowPromoted` defaults to `false`; the public exported
+ * `transitionSkillCandidate` delegates with `false`, and only the specialized
+ * evidence promotion function delegates with `true` after its durable evidence
+ * checks. The callback guard itself is always evaluated.
+ */
+function transitionSkillCandidateInternal(
   id: string,
   expectedVersion: number,
   requiredStatus: SkillCandidateStatus,
   update: (current: SkillCandidate) => Partial<SkillCandidate>,
+  allowPromoted: boolean,
 ): SkillCandidateTransitionResult {
   const read = readSkillCandidate(id);
   if (!read.ok) return { ok: false, error: read.error };
@@ -125,16 +186,33 @@ export function transitionSkillCandidate(
   if (existing.status !== requiredStatus) {
     return { ok: false, error: "wrong_status", current: existing };
   }
+  const durable = JSON.parse(JSON.stringify(existing)) as SkillCandidate;
+  const durableStatus = durable.status;
+  const patch = update(existing);
+  const returnedPromoted = patch.status === "promoted";
+  const mutatedToPromoted = durableStatus !== "promoted" && existing.status === "promoted";
+  if (!allowPromoted && (returnedPromoted || mutatedToPromoted)) {
+    return { ok: false, error: "evidence_required", current: durable };
+  }
   const updated = validateSkillCandidate({
     ...existing,
-    ...update(existing),
+    ...patch,
     id: existing.id,
     lifecycle_version: currentVersion + 1,
     updated_at: new Date().toISOString(),
   });
   if (!updated.ok) return { ok: false, error: "invalid_candidate_record" };
-  saveSkillCandidate(updated.candidate);
+  persistSkillCandidate(updated.candidate, allowPromoted);
   return { ok: true, candidate: updated.candidate };
+}
+
+export function transitionSkillCandidate(
+  id: string,
+  expectedVersion: number,
+  requiredStatus: SkillCandidateStatus,
+  update: (current: SkillCandidate) => Partial<SkillCandidate>,
+): SkillCandidateTransitionResult {
+  return transitionSkillCandidateInternal(id, expectedVersion, requiredStatus, update, false);
 }
 
 export function updateSkillCandidateStatus(
@@ -146,6 +224,7 @@ export function updateSkillCandidateStatus(
   evalMissed?: string[],
   expectedVersion?: number,
 ): SkillCandidate | null {
+  if (status === "promoted") return null;
   const existing = loadSkillCandidate(id);
   if (!existing) return null;
   const result = transitionSkillCandidate(
@@ -166,11 +245,7 @@ export function updateSkillCandidateStatus(
         updated.rejection_detail = undefined;
       }
       if (evalMissed !== undefined) updated.eval_missed = evalMissed;
-      if (status === "promoted") {
-        updated.promoted_at = new Date().toISOString();
-      } else {
-        updated.promoted_at = undefined;
-      }
+      updated.promoted_at = undefined;
       return updated;
     },
   );
@@ -720,4 +795,635 @@ export function applyLearningEvalDecision(
     eventCreated,
     candidateCreated,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Priority 3 Phase 3.3 — exact accepted-decision promotion
+// ═══════════════════════════════════════════════════════════════
+//
+// `promoteSkillCandidateFromAcceptedDecision` is the ONLY store path that may
+// persist a `promoted` candidate. It accepts hashes/IDs only — never a report
+// body, metric, or caller-authored decision — and derives every enforcement
+// fact from the durable accepted decision record, the exact `stage_candidate`
+// event, and the current candidate file. It is deliberately conservative:
+//
+//   * strictly re-decodes the durable decision and binds the caller's
+//     `reportHash` / `decisionRecordHash` / `candidateId` to it exactly;
+//   * requires an `accepted` report and the report/artifact/content digests to
+//     match the recomputed digests of the embedded frozen candidate;
+//   * requires the durable observed candidate pre-state to be exactly
+//     candidate+version or absent+null, then reads the deterministic
+//     `stage_candidate` event and verifies candidate -> staged with the exact
+//     `accepted_transfer_gate` evidence and version;
+//   * verifies the persisted staged projection against the frozen artifact
+//     before promoting;
+//   * appends and reads back the deterministic promotion event BEFORE the
+//     mutation (event-before-success), then transitions and only returns
+//     success after an exact readback;
+//   * an exact retry of an already-promoted candidate is verified against the
+//     same decision, stage event, promotion event, and post-state, and a crash
+//     between the event append and the mutation resumes only from the exact
+//     staged version.
+
+function candidateMatchesPromotedEventState(
+  candidate: SkillCandidate,
+  frozen: SkillCandidate,
+  lifecycleVersion: number,
+  promotedAt: string,
+  decision: LearningEvalDecisionRecordV1,
+): boolean {
+  const validatedActual = validateSkillCandidate(candidate);
+  if (!validatedActual.ok) return false;
+  const actual = validatedActual.candidate;
+  const expected = validateSkillCandidate({
+    ...frozen,
+    ...candidateLifecycleUpdate(frozen, "promoted", decision),
+    status: "promoted",
+    rejection_reason: undefined,
+    rejection_detail: undefined,
+    promoted_at: promotedAt,
+    id: frozen.id,
+    lifecycle_version: lifecycleVersion,
+    updated_at: actual.updated_at,
+  });
+  if (!expected.ok) return false;
+  return stableStringify(actual) === stableStringify(expected.candidate);
+}
+
+export interface PromoteSkillCandidateFromAcceptedDecisionInput {
+  candidateId: string;
+  expectedLifecycleVersion: number;
+  reportHash: string;
+  decisionRecordHash: string;
+}
+
+export type SkillCandidatePromotionError =
+  | "evidence_required"
+  | "decision_not_accepted"
+  | "candidate_binding_mismatch"
+  | "stale_version"
+  | "wrong_status"
+  | "candidate_not_found"
+  | "record_corrupt"
+  | "event_conflict"
+  | "ambiguous";
+
+export type SkillCandidatePromotionResult =
+  | { ok: true; candidate: SkillCandidate; event: LearningEvalLifecycleEventV1; eventCreated: boolean }
+  | { ok: false; error: SkillCandidatePromotionError; current?: SkillCandidate; detail?: string };
+
+export function promoteSkillCandidateFromAcceptedDecision(
+  input: PromoteSkillCandidateFromAcceptedDecisionInput,
+  options?: { root?: string },
+): SkillCandidatePromotionResult {
+  // 1. Public input is identifiers/hashes only.
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    typeof input.candidateId !== "string" ||
+    input.candidateId.length === 0 ||
+    !Number.isSafeInteger(input.expectedLifecycleVersion) ||
+    input.expectedLifecycleVersion < 0 ||
+    typeof input.reportHash !== "string" ||
+    input.reportHash.length === 0 ||
+    typeof input.decisionRecordHash !== "string" ||
+    input.decisionRecordHash.length === 0
+  ) {
+    return { ok: false, error: "evidence_required" };
+  }
+
+  // 2. Reread the durable accepted-decision record.
+  const durableRead = readLearningEvalDecision(input.reportHash, options);
+  if (!durableRead.ok) {
+    if (durableRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: durableRead.error };
+    }
+    if (durableRead.code === "corrupt_store" || durableRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: durableRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: durableRead.error };
+  }
+
+  // 3. Strictly re-decode the durable record.
+  const redecoded = decodeLearningEvalDecisionRecord(durableRead.value);
+  if (!redecoded.ok) return { ok: false, error: "record_corrupt", detail: redecoded.error };
+  const record = redecoded.value;
+
+  // 4. Bind the caller's hashes to the durable record exactly.
+  if (input.reportHash !== record.reportHash || input.decisionRecordHash !== record.recordHash) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 5. Only an accepted report may promote.
+  if (record.report.decision !== "accepted") {
+    return { ok: false, error: "decision_not_accepted" };
+  }
+
+  // 6. Bind the report and recomputed digests to the embedded frozen candidate.
+  const frozen = record.candidateArtifact;
+  const recomputedArtifactDigest = computeCandidateArtifactDigest(frozen);
+  const recomputedContentDigest = candidateContentDigestV1(frozen);
+  if (
+    input.candidateId !== frozen.id ||
+    record.report.candidate.id !== frozen.id ||
+    record.report.candidate.artifactDigest !== recomputedArtifactDigest ||
+    record.report.candidate.contentDigest !== computeBodyDigest(frozen.body) ||
+    recomputedArtifactDigest !== record.candidateArtifactDigest ||
+    recomputedContentDigest !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 7. The durable observed pre-state must be exactly candidate+version or absent.
+  if (
+    !(
+      (record.observedCandidateStatus === "candidate" &&
+        record.observedCandidateLifecycleVersion !== null) ||
+      (record.observedCandidateStatus === null &&
+        record.observedCandidateLifecycleVersion === null)
+    )
+  ) {
+    return { ok: false, error: "wrong_status" };
+  }
+  const stagePriorVersion =
+    record.observedCandidateStatus === "candidate"
+      ? record.observedCandidateLifecycleVersion as number
+      : skillCandidateLifecycleVersion(frozen);
+
+  // 8. Read the exact stage_candidate event and verify every frozen binding.
+  const stageEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "stage_candidate",
+  });
+  const stageRead = readLearningEvalLifecycleEvent(stageEventId, options);
+  if (!stageRead.ok) {
+    if (stageRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: stageRead.error };
+    }
+    if (stageRead.code === "corrupt_store" || stageRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: stageRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: stageRead.error };
+  }
+  const stageIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: stagePriorVersion,
+    newLifecycleVersion: stagePriorVersion + 1,
+    fromStatus: "candidate",
+    toStatus: "staged",
+    action: "stage_candidate",
+    reasonCode: "accepted_transfer_gate",
+  };
+  if (!lifecycleEventIdentityMatches(stageRead.value, stageIdentity)) {
+    return { ok: false, error: "event_conflict" };
+  }
+  if (stageRead.value.newLifecycleVersion !== input.expectedLifecycleVersion) {
+    return { ok: false, error: "stale_version" };
+  }
+
+  // 9. Read the persisted candidate and bind it to the frozen artifact.
+  const currentRead = readSkillCandidate(input.candidateId);
+  if (!currentRead.ok) {
+    return {
+      ok: false,
+      error: currentRead.error === "candidate_not_found" ? "candidate_not_found" : "record_corrupt",
+    };
+  }
+  const current = currentRead.candidate;
+  if (
+    current.id !== frozen.id ||
+    candidateContentDigestV1(current) !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+  const currentVersion = skillCandidateLifecycleVersion(current);
+  if (current.status === "promoted") {
+    // Exact-retry pre-state: only the version immediately after promotion is
+    // admissible. Anything else is ambiguous, never a fresh promotion.
+    if (currentVersion !== input.expectedLifecycleVersion + 1) {
+      return { ok: false, error: "ambiguous", current };
+    }
+  } else if (current.status === "staged") {
+    if (currentVersion !== input.expectedLifecycleVersion) {
+      return { ok: false, error: "stale_version", current };
+    }
+  } else {
+    return { ok: false, error: "wrong_status", current };
+  }
+
+  // 10. Promotion event identity: staged -> promoted.
+  const promoteIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: input.expectedLifecycleVersion,
+    newLifecycleVersion: input.expectedLifecycleVersion + 1,
+    fromStatus: "staged",
+    toStatus: "promoted",
+    action: "promote_candidate",
+    reasonCode: "accepted_learning_eval",
+  };
+  const promoteEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "promote_candidate",
+  });
+  const promoteRead = readLearningEvalLifecycleEvent(promoteEventId, options);
+  if (!promoteRead.ok && promoteRead.code !== "not_found") {
+    if (promoteRead.code === "corrupt_store" || promoteRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: promoteRead.error, current };
+    }
+    return { ok: false, error: "ambiguous", detail: promoteRead.error, current };
+  }
+
+  // 11. Exact retry for an already-promoted candidate.
+  if (current.status === "promoted") {
+    if (!promoteRead.ok) return { ok: false, error: "ambiguous", current };
+    if (!lifecycleEventIdentityMatches(promoteRead.value, promoteIdentity)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    if (currentVersion !== input.expectedLifecycleVersion + 1) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    if (
+      !candidateMatchesPromotedEventState(
+        current,
+        frozen,
+        input.expectedLifecycleVersion + 1,
+        promoteRead.value.timestamp,
+        record,
+      )
+    ) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    return { ok: true, candidate: current, event: promoteRead.value, eventCreated: false };
+  }
+
+  // 12. Staged candidate: verify the exact staged projection before mutation.
+  if (
+    !candidateMatchesPostTransitionState(
+      current,
+      frozen,
+      "staged",
+      input.expectedLifecycleVersion,
+      record,
+    )
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+
+  // 13. Resolve the promotion event before mutation (event-before-success). A
+  // crash after the append but before the transition resumes here from the
+  // exact staged version.
+  let event: LearningEvalLifecycleEventV1;
+  let eventCreated: boolean;
+  if (promoteRead.ok) {
+    if (!lifecycleEventIdentityMatches(promoteRead.value, promoteIdentity)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    event = promoteRead.value;
+    eventCreated = false;
+  } else {
+    const appended = appendAndReadBackLifecycleEvent(promoteIdentity, undefined, options);
+    if (!appended.ok) return { ok: false, error: appended.error, current };
+    event = appended.event;
+    eventCreated = appended.created;
+  }
+
+  // 14. Transition to promoted through the evidence-gated internal path.
+  const transition = transitionSkillCandidateInternal(
+    input.candidateId,
+    input.expectedLifecycleVersion,
+    "staged",
+    (existing) => ({
+      ...existing,
+      status: "promoted",
+      promoted_at: event.timestamp,
+      rejection_reason: undefined,
+      rejection_detail: undefined,
+    }),
+    true,
+  );
+  if (!transition.ok) {
+    const attempted = readSkillCandidate(input.candidateId);
+    if (
+      attempted.ok &&
+      candidateMatchesPromotedEventState(
+        attempted.candidate,
+        frozen,
+        input.expectedLifecycleVersion + 1,
+        event.timestamp,
+        record,
+      )
+    ) {
+      return { ok: true, candidate: attempted.candidate, event, eventCreated };
+    }
+    if (transition.error === "stale_version" || transition.error === "wrong_status") {
+      return { ok: false, error: transition.error, current: transition.current ?? current };
+    }
+    if (transition.error === "candidate_not_found") {
+      return { ok: false, error: "candidate_not_found", current: transition.current ?? current };
+    }
+    if (transition.error === "invalid_candidate_record") {
+      return { ok: false, error: "record_corrupt", current: transition.current ?? current };
+    }
+    return { ok: false, error: "ambiguous", current: transition.current ?? current };
+  }
+
+  // 15. Authoritative readback: never acknowledge success from the write alone.
+  const finalRead = readSkillCandidate(input.candidateId);
+  if (!finalRead.ok) return { ok: false, error: "ambiguous", current: transition.candidate };
+  if (
+    !candidateMatchesPromotedEventState(
+      finalRead.candidate,
+      frozen,
+      input.expectedLifecycleVersion + 1,
+      event.timestamp,
+      record,
+    )
+  ) {
+    return { ok: false, error: "ambiguous", current: finalRead.candidate };
+  }
+  return { ok: true, candidate: finalRead.candidate, event, eventCreated };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Priority 3 Phase 3.3 — read-only promotion-evidence proof
+// ═══════════════════════════════════════════════════════════════
+//
+// `verifySkillCandidatePromotionEvidence` is a pure, read-only proof that the
+// exact evidence `promoteSkillCandidateFromAcceptedDecision` requires is
+// already durable. It performs NO writes and appends NO events, so a caller
+// (e.g. skill-promotion.ts) can fail closed on missing/stale evidence BEFORE
+// spending a grounding/judge call.
+//
+// Drift note: this verifier is deliberately self-contained rather than sharing
+// a single read/validate helper with the mutating writer, because the writer's
+// read/append/transition sequence is crash-recovery sensitive and factoring it
+// would risk changing existing mutation/event behavior. The mutating writer
+// therefore ALWAYS repeats this exact validation inline immediately before its
+// event append and mutation, remains the authoritative final check, and never
+// trusts a caller-supplied verification result. The shared pure building blocks
+// (`lifecycleEventIdentityMatches`, `candidateMatchesPostTransitionState`,
+// `candidateMatchesPromotedEventState`, `computeLearningEvalLifecycleEventId`)
+// are reused by both paths so the identity/projection rules cannot drift.
+
+export interface VerifySkillCandidatePromotionEvidenceInput {
+  candidateId: string;
+  expectedLifecycleVersion: number;
+  reportHash: string;
+  decisionRecordHash: string;
+}
+
+export type VerifySkillCandidatePromotionEvidenceResult =
+  | { ok: true; candidate: SkillCandidate; alreadyPromoted: boolean; pendingEvent?: boolean }
+  | { ok: false; error: SkillCandidatePromotionError; current?: SkillCandidate; detail?: string };
+
+/**
+ * Read-only mirror of the writer's evidence gate. Returns `ok: true` with
+ * `alreadyPromoted: false, pendingEvent: false` when the candidate is staged at
+ * exactly `expectedLifecycleVersion` with a full frozen-derived staged
+ * projection and NO promotion event yet; `alreadyPromoted: false,
+ * pendingEvent: true` when the candidate is still staged but the exact
+ * deterministic promotion event is already durable (the writer appended the
+ * event, then crashed or lost the response before the event-before-success
+ * mutation); and `alreadyPromoted: true` only for the exact lost-response retry
+ * of an already-promoted candidate (version `expectedLifecycleVersion + 1`,
+ * exact matching promotion event, complete promoted post-state with
+ * `promoted_at === event.timestamp`).
+ *
+ * A `pendingEvent: true` result is resumable, not a failure: a high-level
+ * caller may continue only through its existing grounding/judge gates, and the
+ * mutating writer revalidates this exact evidence and resumes
+ * event-before-transition. Every other status/state, and any corrupt,
+ * unreadable, or otherwise non-ok promotion-event read, is a typed fail-closed
+ * failure — a non-ok read is never treated as event absence.
+ */
+export function verifySkillCandidatePromotionEvidence(
+  input: VerifySkillCandidatePromotionEvidenceInput,
+  options?: { root?: string },
+): VerifySkillCandidatePromotionEvidenceResult {
+  // 1. Identifier/hash-only input, identical shape to the writer.
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    typeof input.candidateId !== "string" ||
+    input.candidateId.length === 0 ||
+    !Number.isSafeInteger(input.expectedLifecycleVersion) ||
+    input.expectedLifecycleVersion < 0 ||
+    typeof input.reportHash !== "string" ||
+    input.reportHash.length === 0 ||
+    typeof input.decisionRecordHash !== "string" ||
+    input.decisionRecordHash.length === 0
+  ) {
+    return { ok: false, error: "evidence_required" };
+  }
+
+  // 2. Reread the durable accepted-decision record.
+  const durableRead = readLearningEvalDecision(input.reportHash, options);
+  if (!durableRead.ok) {
+    if (durableRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: durableRead.error };
+    }
+    if (durableRead.code === "corrupt_store" || durableRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: durableRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: durableRead.error };
+  }
+
+  // 3. Strictly re-decode the durable record.
+  const redecoded = decodeLearningEvalDecisionRecord(durableRead.value);
+  if (!redecoded.ok) return { ok: false, error: "record_corrupt", detail: redecoded.error };
+  const record = redecoded.value;
+
+  // 4. Bind the caller's hashes to the durable record exactly.
+  if (input.reportHash !== record.reportHash || input.decisionRecordHash !== record.recordHash) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 5. Only an accepted report may promote.
+  if (record.report.decision !== "accepted") {
+    return { ok: false, error: "decision_not_accepted" };
+  }
+
+  // 6. Bind the report and recomputed digests to the embedded frozen candidate.
+  const frozen = record.candidateArtifact;
+  const recomputedArtifactDigest = computeCandidateArtifactDigest(frozen);
+  const recomputedContentDigest = candidateContentDigestV1(frozen);
+  if (
+    input.candidateId !== frozen.id ||
+    record.report.candidate.id !== frozen.id ||
+    record.report.candidate.artifactDigest !== recomputedArtifactDigest ||
+    record.report.candidate.contentDigest !== computeBodyDigest(frozen.body) ||
+    recomputedArtifactDigest !== record.candidateArtifactDigest ||
+    recomputedContentDigest !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch" };
+  }
+
+  // 7. The durable observed pre-state must be exactly candidate+version or absent.
+  if (
+    !(
+      (record.observedCandidateStatus === "candidate" &&
+        record.observedCandidateLifecycleVersion !== null) ||
+      (record.observedCandidateStatus === null &&
+        record.observedCandidateLifecycleVersion === null)
+    )
+  ) {
+    return { ok: false, error: "wrong_status" };
+  }
+  const stagePriorVersion =
+    record.observedCandidateStatus === "candidate"
+      ? record.observedCandidateLifecycleVersion as number
+      : skillCandidateLifecycleVersion(frozen);
+
+  // 8. Read the exact stage_candidate event and verify every frozen binding.
+  const stageEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "stage_candidate",
+  });
+  const stageRead = readLearningEvalLifecycleEvent(stageEventId, options);
+  if (!stageRead.ok) {
+    if (stageRead.code === "not_found") {
+      return { ok: false, error: "evidence_required", detail: stageRead.error };
+    }
+    if (stageRead.code === "corrupt_store" || stageRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: stageRead.error };
+    }
+    return { ok: false, error: "ambiguous", detail: stageRead.error };
+  }
+  const stageIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: stagePriorVersion,
+    newLifecycleVersion: stagePriorVersion + 1,
+    fromStatus: "candidate",
+    toStatus: "staged",
+    action: "stage_candidate",
+    reasonCode: "accepted_transfer_gate",
+  };
+  if (!lifecycleEventIdentityMatches(stageRead.value, stageIdentity)) {
+    return { ok: false, error: "event_conflict" };
+  }
+  if (stageRead.value.newLifecycleVersion !== input.expectedLifecycleVersion) {
+    return { ok: false, error: "stale_version" };
+  }
+
+  // 9. Read the persisted candidate and bind it to the frozen artifact.
+  const currentRead = readSkillCandidate(input.candidateId);
+  if (!currentRead.ok) {
+    return {
+      ok: false,
+      error: currentRead.error === "candidate_not_found" ? "candidate_not_found" : "record_corrupt",
+    };
+  }
+  const current = currentRead.candidate;
+  if (
+    current.id !== frozen.id ||
+    candidateContentDigestV1(current) !== record.candidateContentDigest
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+  const currentVersion = skillCandidateLifecycleVersion(current);
+  if (current.status === "promoted") {
+    // Exact-retry pre-state: only the version immediately after promotion is
+    // admissible. Anything else is ambiguous, never a fresh promotion.
+    if (currentVersion !== input.expectedLifecycleVersion + 1) {
+      return { ok: false, error: "ambiguous", current };
+    }
+  } else if (current.status === "staged") {
+    if (currentVersion !== input.expectedLifecycleVersion) {
+      return { ok: false, error: "stale_version", current };
+    }
+  } else {
+    return { ok: false, error: "wrong_status", current };
+  }
+
+  // 10. Promotion event identity: staged -> promoted.
+  const promoteIdentity: LifecycleEventIdentity = {
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    candidateContentDigest: record.candidateContentDigest,
+    priorLifecycleVersion: input.expectedLifecycleVersion,
+    newLifecycleVersion: input.expectedLifecycleVersion + 1,
+    fromStatus: "staged",
+    toStatus: "promoted",
+    action: "promote_candidate",
+    reasonCode: "accepted_learning_eval",
+  };
+  const promoteEventId = computeLearningEvalLifecycleEventId({
+    reportHash: record.reportHash,
+    candidateId: frozen.id,
+    action: "promote_candidate",
+  });
+  const promoteRead = readLearningEvalLifecycleEvent(promoteEventId, options);
+  if (!promoteRead.ok && promoteRead.code !== "not_found") {
+    if (promoteRead.code === "corrupt_store" || promoteRead.code === "invalid_record") {
+      return { ok: false, error: "record_corrupt", detail: promoteRead.error, current };
+    }
+    return { ok: false, error: "ambiguous", detail: promoteRead.error, current };
+  }
+
+  // 11. Exact lost-response retry for an already-promoted candidate.
+  if (current.status === "promoted") {
+    if (!promoteRead.ok) return { ok: false, error: "ambiguous", current };
+    if (!lifecycleEventIdentityMatches(promoteRead.value, promoteIdentity)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    if (currentVersion !== input.expectedLifecycleVersion + 1) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    if (
+      !candidateMatchesPromotedEventState(
+        current,
+        frozen,
+        input.expectedLifecycleVersion + 1,
+        promoteRead.value.timestamp,
+        record,
+      )
+    ) {
+      return { ok: false, error: "ambiguous", current };
+    }
+    return { ok: true, candidate: current, alreadyPromoted: true };
+  }
+
+  // 12. Verify the exact frozen-derived staged projection BEFORE accepting any
+  // staged success, including the resumable pending-event state. A
+  // `pendingEvent: true` result must never bypass this check: a staged
+  // candidate whose projection diverges from the frozen artifact is a binding
+  // mismatch regardless of whether the exact promotion event is already
+  // durable.
+  if (
+    !candidateMatchesPostTransitionState(
+      current,
+      frozen,
+      "staged",
+      input.expectedLifecycleVersion,
+      record,
+    )
+  ) {
+    return { ok: false, error: "candidate_binding_mismatch", current };
+  }
+
+  // 13. Staged candidate with a durable promotion event already present: the
+  // event identity was validated at step 10 (a corrupt/unreadable/non-ok read
+  // failed closed there and never reached here as absence). The writer
+  // appended the event but did not complete the event-before-success mutation,
+  // so this is a distinct resumable pending-event state — not `alreadyPromoted`
+  // and not generic ambiguity. A high-level caller may continue only through
+  // its existing grounding/judge gates; the mutating writer revalidates this
+  // exact evidence and resumes event-before-transition.
+  if (promoteRead.ok) {
+    if (!lifecycleEventIdentityMatches(promoteRead.value, promoteIdentity)) {
+      return { ok: false, error: "event_conflict", current };
+    }
+    return { ok: true, candidate: current, alreadyPromoted: false, pendingEvent: true };
+  }
+
+  return { ok: true, candidate: current, alreadyPromoted: false, pendingEvent: false };
 }
