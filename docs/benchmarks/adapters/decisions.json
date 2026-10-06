@@ -78,5 +78,26 @@
   }
  },
  "steer_config": null,
- "steer_base": "swap108"
+ "steer_base": "swap108",
+ "judge": {
+  "keep96": {
+   "recipe": 153,
+   "single": 143
+  },
+  "patch": {
+   "recipe": 164,
+   "single": 163
+  },
+  "patch_better": 16,
+  "keep96_better": 5,
+  "mcnemar_p": 0.0266,
+  "category_delta": {
+   "E": 2,
+   "B": 8,
+   "A": 1,
+   "D": 0,
+   "C": 0
+  },
+  "bar_met": true
+ }
 }

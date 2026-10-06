@@ -380,11 +380,12 @@ def verify_stash(path: str):
 
 
 @app.local_entrypoint()
-def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2,
+def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2, rank: int = 16,
               answers: str = "teacher_data/answers.jsonl", drop: str = "",
               regularizer: str = "teacher_data/regularizer.jsonl"):
-    """answers: comma-separated volume paths; drop: categories of the FIRST file to leave out (replaced by later files)."""
-    print(json.dumps(train.remote(student, tag, epochs, answers=answers.split(","),
+    """answers: comma-separated volume paths; drop: categories of the FIRST file to leave out (replaced by later files).
+    rank: 16, or 8 on a 108-expert student so student + LoRA stay within +0.5 GB (spec 4.3)."""
+    print(json.dumps(train.remote(student, tag, epochs, rank=rank, answers=answers.split(","),
                                   drop=[d for d in drop.split(",") if d], regularizer=regularizer), indent=1))
 
 

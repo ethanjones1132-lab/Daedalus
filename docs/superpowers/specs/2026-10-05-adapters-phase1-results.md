@@ -1,19 +1,57 @@
 # Adapters phase 1: results
 
-- **Run:** 2026-10-06, 00:05–01:30, unattended (`scripts/moe-bench/adapters-runs/run_phase1.ps1`).
+- **Runs:**
+  - 2026-10-06, 00:05–01:30: the steering arm on keep96. The expert arm was deferred for disk.
+  - 13:14–15:56: the expert arm, then steering on its winner, the pre-registration and the judge runs.
 - **Spec:** `2026-10-05-adapters-design.md`. **Plan:** `plans/2026-10-05-adapters-phase1.md`.
-- **Data:** `docs/benchmarks/adapters/` (`decisions.json`, `runs/`, `steer-units.json`). Local paths scrubbed.
+- **Pre-registration:** `2026-10-05-adapters-prereg.md`, commit 312ce12 at 15:14:02. The first judge run started at 15:14:05.
+- **Data:** `docs/benchmarks/adapters/` (`decisions.json`, `runs/`, `bench-*`, `kl-*`, `steer-units.json`). Local paths scrubbed.
 
-## Outcome: null
+## Outcome: the expert patch swap108 meets the bar on the sealed judge set
+
+**swap108** keeps the top 108 experts per layer by the combined energy of two imatrices:
+- the failure-targeted one, from the full model's answers on the pool;
+- the code one keep96 was built with.
+
+Sealed judge set: 60 tasks × 3 trials, scored once, against keep96 with the same harness and seeds.
+
+| | keep96 | swap108 |
+|---|---|---|
+| Recipe (3 candidates + 1 self-test suite) | 153 | **164** |
+| Single shot | 143 | **163** |
+| Recipe by category, A / B / C / D / E (of 36) | 34 / 16 / 33 / 36 / 34 | 35 / **24** / 33 / 36 / 36 |
+| Single shot by category | 31 / 17 / 27 / 34 / 34 | 35 / **26** / 31 / 35 / 36 |
+
+The bar (pre-registered):
+
+| Condition | Result |
+|---|---|
+| Paired McNemar on the recipe | swap108-only 16, keep96-only 5, **p = 0.027 < 0.10** |
+| Speed | 81.8 vs 78.4 tok/s (llama-bench decode) |
+| Size | +0.48 GB (6.00 vs 5.52 GB) |
+| Largest category drop | none: B +8, E +2, A +1 |
+
+**Steering:** null twice.
+- On keep96 (night run) and again on swap108 (spec §3.4: on the winner), no configuration cut discipline failures.
+- On swap108: 24 without the vector; 24–25 with it.
+
+**Caveat for serving:** swap108 is 0.48 GB larger. One long probe-then-fix prompt ran the 8 GB card out of memory once, and the runner resumed it. Watch the VRAM headroom when serving swap108 with long prompts.
+
+### The expert arm, step by step
+
+| Step | Result |
+|---|---|
+| Space | C: freed by verified moves only (`phase2/moved-off-c.json`). At most one slice was on disk at a time (§6: delete scored variants first). |
+| Closeness: mean KL to the full model on the held-out text | keep96 0.360, **add108 0.353**, swap108 0.391, swap96 0.436. Re-picked sets moved away from the full model on general text. |
+| Pool, recipe / single (of 180) | keep96 147 / 144, add108 153 / 148, **swap108 155 / 151** (the winner) |
+| Pool B (hidden conventions), recipe | keep96 10, add108 21. The pool is in-sample, since the imatrix came from the full model's answers on it; the judge set is not. |
+
+## The night run (00:05–01:30), kept for the record
 
 | Arm | What happened |
 |---|---|
 | Steering vector | Ran. No configuration cut discipline failures at the screening scale, so by §3.4's rule the arm is null. |
-| Expert patch | Did not run: C: had 7.9% free, and §6 forbids writing a variant or the KL reference under 10%. |
-
-With both arms null:
-- there is no pre-registration and no judge run;
-- the sealed judge set is untouched.
+| Expert patch | Did not run then: C: had 7.9% free, and §6 forbids writing a variant or the KL reference under 10%. |
 
 ## Measured
 

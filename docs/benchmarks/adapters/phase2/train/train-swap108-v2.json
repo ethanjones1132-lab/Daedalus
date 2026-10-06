@@ -1,0 +1,175 @@
+{
+ "tag": "swap108-v2",
+ "student": "/vol/students/keep96-swap108.gguf",
+ "answers": 648,
+ "regularizer": 300,
+ "epochs": 2,
+ "optimizer_steps": 237,
+ "log": [
+  {
+   "step": 10,
+   "epoch": 0,
+   "ce": 0.1845,
+   "kl": 0.3793,
+   "s": 487
+  },
+  {
+   "step": 20,
+   "epoch": 0,
+   "ce": 0.0367,
+   "kl": 0.4058,
+   "s": 546
+  },
+  {
+   "step": 30,
+   "epoch": 0,
+   "ce": 0.0214,
+   "kl": 0.21,
+   "s": 608
+  },
+  {
+   "step": 40,
+   "epoch": 0,
+   "ce": 0.0412,
+   "kl": 0.2908,
+   "s": 668
+  },
+  {
+   "step": 50,
+   "epoch": 0,
+   "ce": 0.0336,
+   "kl": 0.1503,
+   "s": 728
+  },
+  {
+   "step": 60,
+   "epoch": 0,
+   "ce": 0.029,
+   "kl": 0.1697,
+   "s": 786
+  },
+  {
+   "step": 70,
+   "epoch": 0,
+   "ce": 0.0271,
+   "kl": 0.1782,
+   "s": 845
+  },
+  {
+   "step": 80,
+   "epoch": 0,
+   "ce": 0.0388,
+   "kl": 0.1833,
+   "s": 905
+  },
+  {
+   "step": 90,
+   "epoch": 0,
+   "ce": 0.0261,
+   "kl": 0.2019,
+   "s": 966
+  },
+  {
+   "step": 100,
+   "epoch": 0,
+   "ce": 0.0299,
+   "kl": 0.2062,
+   "s": 1025
+  },
+  {
+   "step": 110,
+   "epoch": 0,
+   "ce": 0.0363,
+   "kl": 0.1761,
+   "s": 1086
+  },
+  {
+   "step": 120,
+   "epoch": 1,
+   "ce": 0.0162,
+   "kl": 0.1843,
+   "s": 1146
+  },
+  {
+   "step": 130,
+   "epoch": 1,
+   "ce": 0.0226,
+   "kl": 0.196,
+   "s": 1206
+  },
+  {
+   "step": 140,
+   "epoch": 1,
+   "ce": 0.027,
+   "kl": 0.1977,
+   "s": 1265
+  },
+  {
+   "step": 150,
+   "epoch": 1,
+   "ce": 0.0212,
+   "kl": 0.2503,
+   "s": 1326
+  },
+  {
+   "step": 160,
+   "epoch": 1,
+   "ce": 0.0243,
+   "kl": 0.0885,
+   "s": 1386
+  },
+  {
+   "step": 170,
+   "epoch": 1,
+   "ce": 0.0256,
+   "kl": 0.1989,
+   "s": 1445
+  },
+  {
+   "step": 180,
+   "epoch": 1,
+   "ce": 0.0204,
+   "kl": 0.179,
+   "s": 1504
+  },
+  {
+   "step": 190,
+   "epoch": 1,
+   "ce": 0.0187,
+   "kl": 0.1448,
+   "s": 1562
+  },
+  {
+   "step": 200,
+   "epoch": 1,
+   "ce": 0.0132,
+   "kl": 0.1752,
+   "s": 1622
+  },
+  {
+   "step": 210,
+   "epoch": 1,
+   "ce": 0.0149,
+   "kl": 0.1823,
+   "s": 1681
+  },
+  {
+   "step": 220,
+   "epoch": 1,
+   "ce": 0.0349,
+   "kl": 0.1378,
+   "s": 1741
+  },
+  {
+   "step": 230,
+   "epoch": 1,
+   "ce": 0.0329,
+   "kl": 0.1122,
+   "s": 1801
+  }
+ ],
+ "convert_exit": 0,
+ "convert_tail": "odel\nINFO:hf-to-gguf:Set model parameters\nINFO:hf-to-gguf:Set model quantization version\nINFO:hf-to-gguf:Set model tokenizer\nINFO:gguf.gguf_writer:Writing the following files:\nINFO:gguf.gguf_writer:/vol/train/swap108-v2/lora.gguf: n_tensors = 620, total_size = 21.2M\n\nWriting:   0%|          | 0.00/21.2M [00:00<?, ?byte/s]\nWriting:  37%|\u2588\u2588\u2588\u258b      | 7.88M/21.2M [00:00<00:00, 78.8Mbyte/s]\nWriting:  77%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258b  | 16.3M/21.2M [00:00<00:00, 82.1Mbyte/s]\nWriting: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 21.2M/21.2M [00:00<00:00, 82.4Mbyte/s]\nINFO:lora-to-gguf:Model successfully exported to /vol/train/swap108-v2/lora.gguf\n",
+ "minutes": 30.8,
+ "cost_usd_est": 1.74
+}
