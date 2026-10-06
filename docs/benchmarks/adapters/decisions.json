@@ -1,47 +1,82 @@
 {
  "variants": {
   "swap96": {
-   "fits": false,
-   "missing": true
+   "model": "keep96-swap96.gguf",
+   "bytes": 5522700576,
+   "tps": 81.920109,
+   "exit": 0,
+   "mean_kld": 0.435587,
+   "p99_kld": 5.044235,
+   "same_top_p": 81.564,
+   "fits": true
   },
   "add108": {
-   "fits": false,
-   "missing": true
+   "model": "keep96-add108.gguf",
+   "bytes": 5999720736,
+   "tps": 81.607925,
+   "exit": 0,
+   "mean_kld": 0.35326,
+   "p99_kld": 4.23879,
+   "same_top_p": 83.441,
+   "fits": true
   },
   "swap108": {
-   "fits": false,
-   "missing": true
+   "model": "keep96-swap108.gguf",
+   "bytes": 5999720736,
+   "tps": 81.778822,
+   "exit": 0,
+   "mean_kld": 0.3912,
+   "p99_kld": 4.635123,
+   "same_top_p": 83.167,
+   "fits": true
   }
  },
- "closest": [],
+ "closest": [
+  "add108",
+  "swap108"
+ ],
  "pool": {
   "keep96": {
    "recipe": 147,
    "single": 144
+  },
+  "add108": {
+   "recipe": 153,
+   "single": 148
+  },
+  "swap108": {
+   "recipe": 155,
+   "single": 151
   }
  },
- "winner": null,
+ "winner": "swap108",
  "steer": {
   "none": {
    "failures": 24,
-   "solved": 101
+   "solved": 101,
+   "rows": 120
   },
   "mean-all-0.5": {
    "failures": 25,
-   "solved": 100
+   "solved": 102,
+   "rows": 120
   },
   "mean-mid-0.5": {
-   "failures": 25,
-   "solved": 100
+   "failures": 24,
+   "solved": 103,
+   "rows": 120
   },
   "pca-all-0.5": {
-   "failures": 29,
-   "solved": 96
+   "failures": 25,
+   "solved": 94,
+   "rows": 120
   },
   "pca-mid-0.5": {
-   "failures": 25,
-   "solved": 95
+   "failures": 24,
+   "solved": 101,
+   "rows": 120
   }
  },
- "steer_config": null
+ "steer_config": null,
+ "steer_base": "swap108"
 }

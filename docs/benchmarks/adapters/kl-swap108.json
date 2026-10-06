@@ -1,0 +1,7 @@
+{
+ "model": "keep96-swap108.gguf",
+ "exit": 0,
+ "mean_kld": 0.3912,
+ "p99_kld": 4.635123,
+ "same_top_p": 83.167
+}

@@ -1,0 +1,7 @@
+{
+ "model": "keep96-add108.gguf",
+ "exit": 0,
+ "mean_kld": 0.35326,
+ "p99_kld": 4.23879,
+ "same_top_p": 83.441
+}
