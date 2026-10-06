@@ -42,9 +42,9 @@
                           {
                               "local":  "C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
                               "volume":  "distill",
-                              "path":  "stash/gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
-                              "command":  "python -m modal volume get distill stash/gpt-oss-20b-MXFP4-keep24-selfgen.gguf C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\",
-                              "status":  "uploading"
+                              "path":  "stash/regen/gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
+                              "command":  "python -m modal volume get distill stash/regen/gpt-oss-20b-MXFP4-keep24-selfgen.gguf C:\\qwen3-forge-stage\\models\\prune-gptoss20b\\",
+                              "status":  "verified: rebuilt in the volume (slice_experts.py at 02b4de2, PyPI gguf 0.19.0, numpy 2.5.3, keep 24, the selfgen imatrix, the Hugging Face base above); sha256 d3152c7070d2ecc09a75ea0882f03683181c861390aafc6dba7440bbe164c2de equals the local file\u0027s"
                           }
                       ]
 }

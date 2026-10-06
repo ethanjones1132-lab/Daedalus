@@ -1,0 +1,203 @@
+{
+ "tag": "keep96-v1",
+ "student": "/vol/keep96/keep96.gguf",
+ "answers": 794,
+ "regularizer": 300,
+ "epochs": 2,
+ "optimizer_steps": 273,
+ "log": [
+  {
+   "step": 10,
+   "epoch": 0,
+   "ce": 0.1784,
+   "kl": 0.2447,
+   "s": 501
+  },
+  {
+   "step": 20,
+   "epoch": 0,
+   "ce": 0.0406,
+   "kl": 0.1804,
+   "s": 571
+  },
+  {
+   "step": 30,
+   "epoch": 0,
+   "ce": 0.0286,
+   "kl": 0.2225,
+   "s": 642
+  },
+  {
+   "step": 40,
+   "epoch": 0,
+   "ce": 0.0195,
+   "kl": 0.1558,
+   "s": 712
+  },
+  {
+   "step": 50,
+   "epoch": 0,
+   "ce": 0.0354,
+   "kl": 0.1492,
+   "s": 783
+  },
+  {
+   "step": 60,
+   "epoch": 0,
+   "ce": 0.0295,
+   "kl": 0.185,
+   "s": 854
+  },
+  {
+   "step": 70,
+   "epoch": 0,
+   "ce": 0.0286,
+   "kl": 0.2791,
+   "s": 924
+  },
+  {
+   "step": 80,
+   "epoch": 0,
+   "ce": 0.0292,
+   "kl": 0.2032,
+   "s": 994
+  },
+  {
+   "step": 90,
+   "epoch": 0,
+   "ce": 0.0263,
+   "kl": 0.1908,
+   "s": 1065
+  },
+  {
+   "step": 100,
+   "epoch": 0,
+   "ce": 0.0245,
+   "kl": 0.2154,
+   "s": 1135
+  },
+  {
+   "step": 110,
+   "epoch": 0,
+   "ce": 0.0385,
+   "kl": 0.1604,
+   "s": 1206
+  },
+  {
+   "step": 120,
+   "epoch": 0,
+   "ce": 0.0393,
+   "kl": 0.207,
+   "s": 1277
+  },
+  {
+   "step": 130,
+   "epoch": 0,
+   "ce": 0.0177,
+   "kl": 0.1853,
+   "s": 1347
+  },
+  {
+   "step": 140,
+   "epoch": 1,
+   "ce": 0.0224,
+   "kl": 0.147,
+   "s": 1418
+  },
+  {
+   "step": 150,
+   "epoch": 1,
+   "ce": 0.0228,
+   "kl": 0.1349,
+   "s": 1488
+  },
+  {
+   "step": 160,
+   "epoch": 1,
+   "ce": 0.0213,
+   "kl": 0.1432,
+   "s": 1558
+  },
+  {
+   "step": 170,
+   "epoch": 1,
+   "ce": 0.0115,
+   "kl": 0.1083,
+   "s": 1628
+  },
+  {
+   "step": 180,
+   "epoch": 1,
+   "ce": 0.0127,
+   "kl": 0.1773,
+   "s": 1699
+  },
+  {
+   "step": 190,
+   "epoch": 1,
+   "ce": 0.0249,
+   "kl": 0.1867,
+   "s": 1769
+  },
+  {
+   "step": 200,
+   "epoch": 1,
+   "ce": 0.0118,
+   "kl": 0.1502,
+   "s": 1839
+  },
+  {
+   "step": 210,
+   "epoch": 1,
+   "ce": 0.0185,
+   "kl": 0.1957,
+   "s": 1910
+  },
+  {
+   "step": 220,
+   "epoch": 1,
+   "ce": 0.0197,
+   "kl": 0.1705,
+   "s": 1980
+  },
+  {
+   "step": 230,
+   "epoch": 1,
+   "ce": 0.0294,
+   "kl": 0.1649,
+   "s": 2050
+  },
+  {
+   "step": 240,
+   "epoch": 1,
+   "ce": 0.0214,
+   "kl": 0.1271,
+   "s": 2121
+  },
+  {
+   "step": 250,
+   "epoch": 1,
+   "ce": 0.0168,
+   "kl": 0.1575,
+   "s": 2191
+  },
+  {
+   "step": 260,
+   "epoch": 1,
+   "ce": 0.0178,
+   "kl": 0.1372,
+   "s": 2262
+  },
+  {
+   "step": 270,
+   "epoch": 1,
+   "ce": 0.0136,
+   "kl": 0.0712,
+   "s": 2333
+  }
+ ],
+ "convert_exit": 0,
+ "convert_tail": "eta model\nINFO:hf-to-gguf:Set model parameters\nINFO:hf-to-gguf:Set model quantization version\nINFO:hf-to-gguf:Set model tokenizer\nINFO:gguf.gguf_writer:Writing the following files:\nINFO:gguf.gguf_writer:/vol/train/keep96-v1/lora.gguf: n_tensors = 620, total_size = 42.3M\n\nWriting:   0%|          | 0.00/42.3M [00:00<?, ?byte/s]\nWriting:  35%|\u2588\u2588\u2588\u258c      | 14.9M/42.3M [00:00<00:00, 149Mbyte/s]\nWriting:  73%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u258e  | 31.0M/42.3M [00:00<00:00, 156Mbyte/s]\nWriting: 100%|\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588| 42.3M/42.3M [00:00<00:00, 159Mbyte/s]\nINFO:lora-to-gguf:Model successfully exported to /vol/train/keep96-v1/lora.gguf\n",
+ "minutes": 39.4,
+ "cost_usd_est": 2.23
+}
