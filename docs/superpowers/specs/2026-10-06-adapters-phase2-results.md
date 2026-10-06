@@ -3,6 +3,51 @@
 - **Run:** 2026-10-06, 01:33–02:46, after phase 1 concluded (owner: "start phase 2 if phase 1 concludes").
 - **Plan:** `plans/2026-10-06-adapters-phase2.md`. **Data:** `docs/benchmarks/adapters/phase2/`.
 
+## Outcome, 16:21: no phase-2 patch. The LoRA does not beat its student on the pool
+
+- **Every gate passes:** 2.4 under the owner's recalibrated bar, and 2.5 / 2.6 with the served LoRA reproducing its 20 overfit targets.
+- **The rule (Task 6) stopped it:** the patched recipe must beat the student's own pool recipe, and it did not. There is no phase-2 pre-registration and no phase-2 judge run.
+- **The student changed mid-phase:** phase 1's swap108 met its judge bar at 15:56, so swap108 replaced keep96.
+
+| Student | LoRA | Pool recipe (of 180) | Single shot | Recipe by category A / B / C / D / E |
+|---|---|---|---|---|
+| keep96 | none | 147 | 144 | 36 / 10 / 34 / 31 / 36 |
+| keep96 | v1, rank 16 | 146 | 145 | 36 / **17** / 33 / 28 / 32 |
+| swap108 | none | **155** | 151 | 34 / 23 / 32 / 30 / 36 |
+| swap108 | v2, rank 8 | 151 | 153 | 36 / 20 / 33 / 26 / 36 |
+
+- **Hidden conventions (B).** Distillation from Flash-Next gave keep96 +7 there, the teacher's strongest category. swap108's experts already capture that gain (10 → 23), and on top of swap108 the LoRA costs 3.
+- **File I/O (D) fell both times** (−3, −4). Next suspect: the teacher's file-I/O answers. For example, v1 counted lines as `count("\n") + 1`, which is wrong for files that end in a newline.
+- **Library use (E):** v1 lost 4 there. The cause was the generated tasks' shape:
+  - their buggy files already imported from `lib.<module>`, so v1 learned to keep the import path;
+  - `train_tasks/rewrite_e.py` fixed it for v2 (36 → 36).
+- **Rank:** v2 on swap108 is rank 8, as the spec sets for a 108-expert student, which keeps the total within +0.5 GB.
+
+### Spend (container-time estimates; Modal's dashboard is authoritative)
+
+| Step | About |
+|---|---|
+| Teacher test | $2.55 |
+| Gates: parity ×2, noise floor ×2, names, overfit | $2.40 |
+| Task writer, two runs (1,800 candidates → 896 tasks) | $5.30 |
+| Teacher data: 896 answers + 300 regularizer continuations; E redo | $2.70 |
+| Training: v1, v2 on keep96, v2 on swap108 | $6.60 |
+| Rebuilding the keep24 slice on the volume (space on C:) | $0.07 |
+| **Total** | **about $19.6 of $30** |
+
+The volume `distill` holds:
+- the stash, as moved off C: (restore commands in `moved-off-c.json`);
+- both students;
+- the teacher data and the LoRAs.
+
+Storage there may count against the monthly credit.
+
+### Next, if phase 2 is revisited
+
+- Audit the teacher's file-I/O answers, or train without family D.
+- Grow the hidden-convention family. It is where the teacher leads, but swap108 has already taken most of that gap.
+- A per-task LoRA chosen by Laya's classification (spec 4.5's optional arm) would not help on swap108 by these pool numbers.
+
 ## Update, 08:45: the owner recalibrated gate 2.4
 
 - **New bar:** top-1 agreement at least llama.cpp's own CPU-vs-CUDA agreement, and perplexity within 1%.
