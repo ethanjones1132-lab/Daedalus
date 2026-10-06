@@ -94,13 +94,17 @@ def winner(a, d, dec):
     print("pool:", dec["pool"], "winner:", dec["winner"])
 
 
+T = os.environ.get("STEER_TAG", "")  # "-<variant>" when the sweep runs on a winning variant (run_phase1.ps1)
+
+
 def config(a, d, dec):
     L = pathlib.Path(a.logs)
-    base_bad, base_ok = discipline_counts(L / "adapters-steer-none.jsonl")
+    base_bad, base_ok = discipline_counts(L / f"adapters-steer{T}-none.jsonl")
+    dec["steer_base"] = T.lstrip("-") or "keep96"
     dec["steer"] = {"none": {"failures": base_bad, "solved": base_ok}}
     best = None
     for c in CONFIGS:
-        p = L / f"adapters-steer-{c}-0.5.jsonl"
+        p = L / f"adapters-steer{T}-{c}-0.5.jsonl"
         if not p.exists():
             continue
         bad, ok = discipline_counts(p)
@@ -116,7 +120,7 @@ def scale(a, d, dec):
     c, base = dec["steer_config"], dec["steer"]["none"]
     best = None
     for s in SCALES:
-        p = L / f"adapters-steer-{c}-{s}.jsonl"
+        p = L / f"adapters-steer{T}-{c}-{s}.jsonl"
         if not p.exists():
             continue
         bad, ok = discipline_counts(p)
@@ -130,7 +134,7 @@ def scale(a, d, dec):
 def keep(a, d, dec):
     L = pathlib.Path(a.logs)
     base = dec["pool"][dec["winner"] or "keep96"]
-    r, s, _ = recipe_scores(L / "adapters-pool-steer.jsonl")
+    r, s, _ = recipe_scores(L / f"adapters-pool-steer{T}.jsonl")
     dec["pool"]["steer"] = {"recipe": r, "single": s}
     dec["steer_final"] = (f"{dec['steer_config']}@{dec['steer_scale']}"
                           if r >= base["recipe"] and s >= base["single"] else None)

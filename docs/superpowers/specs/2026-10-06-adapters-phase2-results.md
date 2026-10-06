@@ -3,7 +3,14 @@
 - **Run:** 2026-10-06, 01:33–02:46, after phase 1 concluded (owner: "start phase 2 if phase 1 concludes").
 - **Plan:** `plans/2026-10-06-adapters-phase2.md`. **Data:** `docs/benchmarks/adapters/phase2/`.
 
-## Status: stopped at gate 2.4, pending the owner
+## Update, 08:45: the owner recalibrated gate 2.4
+
+- **New bar:** top-1 agreement at least llama.cpp's own CPU-vs-CUDA agreement, and perplexity within 1%.
+- **Result:** gate 2.4 passes (97.26% float32, 96.92% bf16, against 95.89%; perplexity 1.912 / 1.905 against 1.917).
+- **Next:** phase 2 continues with gates 2.5 and 2.6.
+- **Also:** C: is being freed for phase 1's expert arm, which runs first because its winner is the phase-2 student.
+
+## Status at 02:46: stopped at gate 2.4, pending the owner
 
 - **Teacher test:** done; Flash-Next Coder qualifies.
 - **Gates:** three of four checks pass. Load parity misses its 99% bar.

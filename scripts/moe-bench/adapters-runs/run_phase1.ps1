@@ -28,9 +28,11 @@ function Say($meth) {
     }
 }
 function Gate($verb) { Push-Location 'C:\Projects\Versutus'; $r = cmd /c "node gate\cli.mjs service $verb 2>&1"; Pop-Location; Say "Versutus gate $verb`: $r" }
-function Late { (Get-Date) -gt (Get-Date -Hour 8 -Minute 10 -Second 0) -and (Get-Date).Hour -lt 12 }
+# optional stop time (ADAPTERS_DEADLINE, e.g. "2026-10-07 08:10"): steps after it are skipped so the gate is restored
+$deadline = if ($env:ADAPTERS_DEADLINE) { [datetime]$env:ADAPTERS_DEADLINE } else { $null }
+function Late { $deadline -and (Get-Date) -gt $deadline }
 function Step($name, $taskdir, [string[]]$cmd, $gguf = '', $extra = '') {
-    if (Late) { Say "SKIP $name`: past 08:10"; return }
+    if (Late) { Say "SKIP $name`: past $deadline"; return }
     $env:TIER2B_DIR = $taskdir; $env:USE_TF = '0'; $env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'
     $env:BON_GGUF = $gguf; $env:BON_EXTRA = $extra
     $out = "$L\adapters-$name.out"
@@ -121,6 +123,10 @@ Decide 'winner'
 $win = (Dec).winner
 $base = if ($win) { "$M\keep96-$win.gguf" } else { $k96 }
 Say "steering base: $base"
+# the sweep runs on the pool winner (spec 3.4): a winning variant gets its own vectors, probes and decisions (tag)
+$tag = if ($win) { "-$win" } else { '' }
+$sd = "$M\steer$tag"
+$env:STEER_TAG = $tag
 
 # 5. steering vector: pairs, both methods, a 4-configuration screen at 0.5, the scale sweep, the recipe check
 if (-not (Test-Path "$M\steer\positive.txt")) {
@@ -128,28 +134,32 @@ if (-not (Test-Path "$M\steer\positive.txt")) {
         "$repo\docs\benchmarks\2026-10-05\validation-b\valb-probe-qwen36keep96.jsonl", "$repo\docs\benchmarks\2026-10-05\validation-b\valb-probe2-qwen36keep96.jsonl",
         '--out-dir', "$M\steer")
 }
-foreach ($meth in 'mean', 'pca') { if (-not (Test-Path "$M\steer\cv-$meth.gguf")) { Step "cv-$meth" $calib @($py, "$mb\steer.py", 'build', '--model', $base, '--dir', "$M\steer", '--method', $meth) } }
-Probe 'steer-none' $base ''
+if ($tag -and -not (Test-Path "$sd\positive.txt")) {  # the pairs are text, so they carry over to the new base
+    New-Item -ItemType Directory -Force $sd | Out-Null
+    Copy-Item "$M\steer\positive.txt", "$M\steer\negative.txt" $sd
+}
+foreach ($meth in 'mean', 'pca') { if (-not (Test-Path "$sd\cv-$meth.gguf")) { Step "cv$tag-$meth" $calib @($py, "$mb\steer.py", 'build', '--model', $base, '--dir', $sd, '--method', $meth) } }
+Probe "steer$tag-none" $base ''
 $range = '"--control-vector-layer-range","10","29"'
 foreach ($c in 'mean-all', 'mean-mid', 'pca-all', 'pca-mid') {
     $meth, $layers = $c.Split('-')
-    if (-not (Test-Path "$M\steer\cv-$meth.gguf")) { continue }
-    $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth '0.5')`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
-    Probe "steer-$c-0.5" $base ($x -replace '\\', '\\')
+    if (-not (Test-Path "$sd\cv-$meth.gguf")) { continue }
+    $x = "[`"--control-vector-scaled`",`"$cvrel$tag\cv-$meth.gguf:$(CvScale $meth '0.5')`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+    Probe "steer$tag-$c-0.5" $base ($x -replace '\\', '\\')
 }
 Decide 'config'
 $cfg = (Dec).steer_config
 if ($cfg) {
     $meth, $layers = $cfg.Split('-')
     foreach ($s in '0.25', '1.0') {
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth $s)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
-        Probe "steer-$cfg-$s" $base ($x -replace '\\', '\\')
+        $x = "[`"--control-vector-scaled`",`"$cvrel$tag\cv-$meth.gguf:$(CvScale $meth $s)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+        Probe "steer$tag-$cfg-$s" $base ($x -replace '\\', '\\')
     }
     Decide 'scale'
     $sc = (Dec).steer_scale
     if ($sc) {
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth $sc)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
-        Bon 'pool-steer' $calib $base ($x -replace '\\', '\\')
+        $x = "[`"--control-vector-scaled`",`"$cvrel$tag\cv-$meth.gguf:$(CvScale $meth $sc)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+        Bon "pool-steer$tag" $calib $base ($x -replace '\\', '\\')
         Decide 'keep'
     }
 }
@@ -170,7 +180,7 @@ if (Test-Path $pre) {
     $x = ''
     if ($fin) {
         $c2, $s2 = $fin.Split('@'); $m2, $l2 = $c2.Split('-')
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m2.gguf:$(CvScale $m2 $s2)`"" + $(if ($l2 -eq 'mid') { ",$range" } else { '' }) + ']'
+        $x = "[`"--control-vector-scaled`",`"$cvrel$tag\cv-$m2.gguf:$(CvScale $m2 $s2)`"" + $(if ($l2 -eq 'mid') { ",$range" } else { '' }) + ']'
         $x = $x -replace '\\', '\\'
     }
     Bon 'judge-keep96' $judge '' ''

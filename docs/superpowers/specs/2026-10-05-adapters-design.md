@@ -144,7 +144,9 @@ All scored single shot on the calibration pool (180 samples), never on tier2b or
 Each gate is cheap, and a failure stops phase 2:
 
 1. **Round trip.** The reverse-mapped tensors, run back through llama.cpp's own forward converter (`Qwen3_5MoeTextModel`), reproduce the served tensors exactly. The converter reorders some linear-attention tensors, and this is where mapping bugs would hide.
-2. **Load parity.** The dequantized model in PyTorch picks the same top token as llama.cpp's served model on at least 99% of 2,000 positions. llama.cpp's top tokens are recorded locally and compared offline.
+2. **Load parity.** The dequantized model in PyTorch picks the same top token as llama.cpp's served model on at least as many of about 2,000 held-out positions as llama.cpp's own CPU backend does, and its perplexity is within 1%.
+   - Owner, 2026-10-06: the original bar was 99%. That sits above the floor: llama.cpp CPU agrees with llama.cpp CUDA on only 95.9% for keep96.
+   - llama.cpp's top tokens come from `llama-perplexity --kl-divergence-base`.
 3. **Toolchain.** The DeltaNet path trains, and `convert_lora_to_gguf.py` produces a GGUF LoRA that llama.cpp loads.
 4. **Overfit test.** A LoRA trained on 20 examples reproduces at least 95% of them, both in PyTorch and in the served GGUF.
 

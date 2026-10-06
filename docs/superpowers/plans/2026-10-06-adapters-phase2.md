@@ -82,7 +82,7 @@ Teacher test, gates, training tasks, teacher data, training, served evaluation, 
 - [ ] **2.4 Load parity.**
   - Record llama.cpp's top-1 tokens locally on 2,000 positions of `docs/benchmarks/adapters/heldout.txt` (llama-server `n_probs`, keep96, no speculation). This file is never used for training.
   - Run the transformers forward on the same tokens.
-  - Pass: at least 99% agreement.
+  - Pass (recalibrated by the owner 2026-10-06; it was 99%): agreement at least llama.cpp's own CPU-vs-CUDA agreement on the same tokens, and perplexity within 1%. Measured: 97.26% float32, 96.92% bf16, against a floor of 95.89%; perplexity 1.912 / 1.905 against 1.917. **Pass.**
 - [ ] **2.5 Toolchain.**
   - Put a peft LoRA at r=16 on the full-attention q/k/v/o, DeltaNet in_proj_qkv, in_proj_z, in_proj_a, in_proj_b and out_proj, and the shared expert's gate/up/down. Not the routed experts, not the router.
   - Run one training step.
