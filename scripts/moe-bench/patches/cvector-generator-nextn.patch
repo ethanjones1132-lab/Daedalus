@@ -1,0 +1,29 @@
+diff --git a/tools/cvector-generator/cvector-generator.cpp b/tools/cvector-generator/cvector-generator.cpp
+index af05031f2..9d0c88a22 100644
+--- a/tools/cvector-generator/cvector-generator.cpp
++++ b/tools/cvector-generator/cvector-generator.cpp
+@@ -440,6 +440,24 @@ int main(int argc, char ** argv) {
+     char model_hint[128];
+     llama_model_meta_val_str(model, "general.architecture", model_hint, 128);
+ 
++    // how many layer outputs get captured depends on the architecture (an MTP layer, for one): count them on a
++    // short probe prompt instead of assuming n_layer - 1
++    {
++        std::vector<llama_token> probe = common_tokenize(ctx, "The quick brown fox jumps over the lazy dog.", true);
++        cb_data.n_layers = 4 * n_layers;
++        cb_data.n_tokens = probe.size();
++        cb_data.is_eval_pos = true;
++        if (get_hidden_layers(ctx, probe)) {
++            fprintf(stderr, "probe: captured %zu layer outputs (n_layer %d):", cb_data.v_pos.size(), n_layers);
++            for (auto * t : cb_data.v_pos) {
++                fprintf(stderr, " %s", t->name);
++            }
++            fprintf(stderr, "\n");
++            n_layers = (int) cb_data.v_pos.size() + 1;
++        }
++        cb_data.reset();
++    }
++
+     // init train_context
+     train_context ctx_train(n_embd, n_layers);
+ 

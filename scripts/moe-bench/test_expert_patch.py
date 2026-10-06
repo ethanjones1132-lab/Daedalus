@@ -79,6 +79,33 @@ class DisciplineTest(unittest.TestCase):
         self.assertEqual(steer.discipline(TASK, no_import)[1], "dropped ['import math']")
 
 
+class PairsTest(unittest.TestCase):
+    def test_pairs_share_their_prompt(self):
+        import types
+        from unittest import mock
+        fake = types.SimpleNamespace(fix_prompt=lambda task, script, output: f"fix {task['name']}: {script} -> {output}")
+        good = "import math\nfrom rules import rate\n\n\ndef total(x):\n    return x\n\n\nclass Cart:\n    pass\n"
+        bad = "import calc\nprint(calc.total(3))\n"
+        task, other = dict(TASK, name="t"), dict(TASK, name="u")
+        rows = [(task, {"probe": "p1", "probe_output": "o1"}, good, True),
+                (task, {"probe": "p2", "probe_output": "o2"}, bad, False),
+                (other, {"probe": "p3", "probe_output": "o3"}, bad, False)]  # no disciplined row of its task: no pair
+        with mock.patch.dict(sys.modules, {"probe_tier2b": fake}):
+            pos, neg = steer.make_pairs(rows)
+        self.assertEqual(len(pos), 3)
+        for p, n in zip(pos, neg):
+            self.assertEqual(p.split("</think>")[0], n.split("</think>")[0])  # the same prompt
+            self.assertNotEqual(p, n)
+        self.assertIn("p2 -> o2", pos[2])
+        self.assertIn("def total", pos[2])  # the failed row's prompt with the disciplined opening
+        self.assertIn("import calc", neg[2])
+        no_imports = dict(TASK, name="v")
+        plain = "def total(x):\n    return x\n"
+        with mock.patch.dict(sys.modules, {"probe_tier2b": fake}):
+            pos, neg = steer.make_pairs([(no_imports, {"probe": "p", "probe_output": "o"}, plain, True)])
+        self.assertEqual(len(pos), 1)  # the import-less negative equals the positive and is skipped
+
+
 class KeepListTest(unittest.TestCase):
     def test_slice_with_keep_list(self):
         from gguf import GGUFReader, GGUFWriter

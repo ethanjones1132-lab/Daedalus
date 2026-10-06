@@ -147,7 +147,7 @@ def prereg(a, d, dec):
 
 **The patch:**
 - expert variant: `{dec.get('winner') or 'keep96 (expert arm null)'}`
-- steering vector: `{dec.get('steer_final') or 'none'}` (method-layers@scale)
+- steering vector: `{dec.get('steer_final') or 'none'}` (method-layers@relative scale; the applied scale is the relative scale times the method's unit, {json.loads((d / 'steer-units.json').read_text()) if (d / 'steer-units.json').exists() else 'units not recorded'})
 
 **Chosen on the calibration pool only.** The numbers are in `docs/benchmarks/adapters/decisions.json`.
 

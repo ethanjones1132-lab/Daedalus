@@ -21,8 +21,8 @@ $cvrel = '\qwen3-forge-stage\models\adapters\steer'
 $log = "$L\adapters-chain.log"
 $utf8 = New-Object System.Text.UTF8Encoding $false
 New-Item -ItemType Directory -Force $M, $ad, "$M\steer" | Out-Null
-function Say($m) {
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m`r`n"
+function Say($meth) {
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $meth`r`n"
     foreach ($target in @($log, "$log.alt")) {
         for ($i = 0; $i -lt 10; $i++) { try { [IO.File]::AppendAllText($target, $line, $utf8); return } catch { Start-Sleep -Milliseconds 500 } }
     }
@@ -52,6 +52,10 @@ function Bon($name, $dir, $gguf, $extra) {
             '--temp-alt', '0.7', '--out', $o) $gguf $extra
     }
 }
+# the vectors are unit-norm per layer, so the spec's relative scales (0.25 / 0.5 / 1.0) are multiplied by a unit per
+# method: the largest scale that kept output coherent on all layers (mean broke at 0.1, pca at 0.4; steer-units.json)
+$unit = @{ mean = 0.05; pca = 0.2 }
+function CvScale($meth, $rel) { ([double]$rel * $unit[$meth]).ToString([Globalization.CultureInfo]::InvariantCulture) }
 function Probe($name, $gguf, $extra) {
     $o = "$L\adapters-$name.jsonl"
     if (-not (Test-Path $o) -or (Get-Content $o | Measure-Object -Line).Lines -lt 120) {
@@ -124,27 +128,27 @@ if (-not (Test-Path "$M\steer\positive.txt")) {
         "$repo\docs\benchmarks\2026-10-05\validation-b\valb-probe-qwen36keep96.jsonl", "$repo\docs\benchmarks\2026-10-05\validation-b\valb-probe2-qwen36keep96.jsonl",
         '--out-dir', "$M\steer")
 }
-foreach ($m in 'mean', 'pca') { if (-not (Test-Path "$M\steer\cv-$m.gguf")) { Step "cv-$m" $calib @($py, "$mb\steer.py", 'build', '--model', $base, '--dir', "$M\steer", '--method', $m) } }
+foreach ($meth in 'mean', 'pca') { if (-not (Test-Path "$M\steer\cv-$meth.gguf")) { Step "cv-$meth" $calib @($py, "$mb\steer.py", 'build', '--model', $base, '--dir', "$M\steer", '--method', $meth) } }
 Probe 'steer-none' $base ''
 $range = '"--control-vector-layer-range","10","29"'
 foreach ($c in 'mean-all', 'mean-mid', 'pca-all', 'pca-mid') {
-    $m, $layers = $c.Split('-')
-    if (-not (Test-Path "$M\steer\cv-$m.gguf")) { continue }
-    $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m.gguf:0.5`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+    $meth, $layers = $c.Split('-')
+    if (-not (Test-Path "$M\steer\cv-$meth.gguf")) { continue }
+    $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth '0.5')`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
     Probe "steer-$c-0.5" $base ($x -replace '\\', '\\')
 }
 Decide 'config'
 $cfg = (Dec).steer_config
 if ($cfg) {
-    $m, $layers = $cfg.Split('-')
+    $meth, $layers = $cfg.Split('-')
     foreach ($s in '0.25', '1.0') {
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m.gguf:$s`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth $s)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
         Probe "steer-$cfg-$s" $base ($x -replace '\\', '\\')
     }
     Decide 'scale'
     $sc = (Dec).steer_scale
     if ($sc) {
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m.gguf:$sc`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
+        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$meth.gguf:$(CvScale $meth $sc)`"" + $(if ($layers -eq 'mid') { ",$range" } else { '' }) + ']'
         Bon 'pool-steer' $calib $base ($x -replace '\\', '\\')
         Decide 'keep'
     }
@@ -154,8 +158,11 @@ if ($cfg) {
 Decide 'prereg'
 $pre = "$repo\docs\superpowers\specs\2026-10-05-adapters-prereg.md"
 if (Test-Path $pre) {
+    # the repo is public: local paths carry the account name (probe tracebacks), so scrub before committing
+    $files = @(Get-ChildItem $ad -File | Where-Object { $_.Extension -in '.json', '.jsonl' } | ForEach-Object { $_.FullName })
+    Say "scrub: $((& $py "$mb\scrub_paths.py" $files 2>&1 | Out-String).Trim() -replace '\s+', ' ')"
     Push-Location $repo
-    $r = cmd /c "git add docs/superpowers/specs/2026-10-05-adapters-prereg.md docs/benchmarks/adapters && git commit -q -m ""docs(adapters): phase 1 pre-registration (before any judge run)"" -m ""Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"" && git push -q origin claude/micro-agent-swarm-design-929d42 2>&1"
+    $r = cmd /c "git add docs/superpowers/specs/2026-10-05-adapters-prereg.md docs/benchmarks/adapters/*.json docs/benchmarks/adapters/*.jsonl && git commit -q -m ""docs(adapters): phase 1 pre-registration (before any judge run)"" -m ""Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"" && git push -q origin claude/micro-agent-swarm-design-929d42 2>&1"
     Pop-Location
     Say "pre-registration committed: $r"
     $d = Dec
@@ -163,7 +170,7 @@ if (Test-Path $pre) {
     $x = ''
     if ($fin) {
         $c2, $s2 = $fin.Split('@'); $m2, $l2 = $c2.Split('-')
-        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m2.gguf:$s2`"" + $(if ($l2 -eq 'mid') { ",$range" } else { '' }) + ']'
+        $x = "[`"--control-vector-scaled`",`"$cvrel\cv-$m2.gguf:$(CvScale $m2 $s2)`"" + $(if ($l2 -eq 'mid') { ",$range" } else { '' }) + ']'
         $x = $x -replace '\\', '\\'
     }
     Bon 'judge-keep96' $judge '' ''
