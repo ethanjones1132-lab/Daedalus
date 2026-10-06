@@ -67,6 +67,9 @@ def closest(a, d, dec):
     base = json.loads((d / "bench-keep96.json").read_text())
     ok = []
     for v in VARIANTS:
+        if not ((d / f"bench-{v}.json").exists() and (d / f"kl-{v}.json").exists()):
+            dec.setdefault("variants", {})[v] = {"fits": False, "missing": True}  # refused or failed: not measured
+            continue
         b, k = json.loads((d / f"bench-{v}.json").read_text()), json.loads((d / f"kl-{v}.json").read_text())
         fits = b["bytes"] - base["bytes"] <= 0.5e9 and b["tps"] >= 0.95 * base["tps"] and k["mean_kld"] is not None
         dec.setdefault("variants", {})[v] = {**b, **k, "fits": fits}

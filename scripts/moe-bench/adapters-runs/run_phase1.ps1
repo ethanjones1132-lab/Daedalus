@@ -40,6 +40,8 @@ function Step($name, $taskdir, [string[]]$cmd, $gguf = '', $extra = '') {
     Say "end $name (exit $LASTEXITCODE)"
 }
 function Settle { Say 'settle 180 s'; Start-Sleep -Seconds 180 }
+# spec section 6: no variant or KL reference is written with under 10% free on C: (the Kingston NV2 crashed under big
+# write-then-read work when nearly full)
 function FreeOk { $d = Get-PSDrive C; ($d.Free / ($d.Free + $d.Used)) -ge 0.10 }
 function Decide($what) { Step "decide-$what" $calib @($py, "$mb\phase1_decide.py", $what, '--dir', $ad) }
 function Dec { Get-Content "$ad\decisions.json" -Raw | ConvertFrom-Json }
@@ -60,36 +62,53 @@ function Probe($name, $gguf, $extra) {
 Say 'phase 1 start'
 Gate 'stop'
 Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force
+# decided once, so the expert arm runs whole or not at all
+$expertArm = FreeOk
+if (-not $expertArm) { Say "expert arm deferred: C: has $([math]::Round((Get-PSDrive C).Free / 1GB)) GB free, under 10% (spec section 6); the steering arm runs on keep96" }
 
-# 1. failure-targeted calibration text and the full model's imatrix
+# 1. failure-targeted calibration text (the steering pairs use it too) and, for the expert arm, the full model's imatrix
 if (-not (Test-Path "$M\calib.txt")) { Step 'calib' $calib @($py, "$mb\patch_calib.py", '--out-text', "$M\calib.txt", '--out-rows', "$ad\calib-answers.jsonl") }
-if (-not (Test-Path "$M\imatrix-failure.gguf")) {
-    Step 'imatrix' $calib @("$tools\llama-imatrix.exe", '-m', $full, '-f', "$M\calib.txt", '-o', "$M\imatrix-failure.gguf",
-        '--parse-special', '-c', '2048', '-b', '2048', '-ngl', '99', '--n-cpu-moe', '22')
-}
+if ($expertArm) {
+    if (-not (Test-Path "$M\imatrix-failure.gguf")) {
+        Step 'imatrix' $calib @("$tools\llama-imatrix.exe", '-m', $full, '-f', "$M\calib.txt", '-o', "$M\imatrix-failure.gguf",
+            '--parse-special', '-c', '2048', '-b', '2048', '-ngl', '99', '--n-cpu-moe', '22')
+    }
 
-# 2. the held-out file and the KL reference
-if (-not (Test-Path "$ad\heldout.txt")) { Step 'heldout' $calib @($py, "$mb\kl_eval.py", 'heldout', '--out', "$ad\heldout.txt") }
-if (-not (Test-Path "$M\kl-ref.bin")) { Step 'klref' $calib @($py, "$mb\kl_eval.py", 'ref', '--model', $full, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin") }
+    # 2. the held-out file and the KL reference
+    if (-not (Test-Path "$ad\heldout.txt")) { Step 'heldout' $calib @($py, "$mb\kl_eval.py", 'heldout', '--out', "$ad\heldout.txt") }
+    $unscored = @('keep96', 'swap96', 'add108', 'swap108' | Where-Object { -not (Test-Path "$ad\kl-$_.json") })
+    if ($unscored.Count -and -not (Test-Path "$M\kl-ref.bin")) {
+        if (FreeOk) { Step 'klref' $calib @($py, "$mb\kl_eval.py", 'ref', '--model', $full, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin") }
+        else { Say 'REFUSED klref: under 10% free' }
+    }
 
-# 3. keep lists, slices, size/speed, closeness
-if (-not (Test-Path "$ad\keeplists\add108.json")) {
-    Step 'keeplists' $calib @($py, "$mb\expert_patch.py", '--keep96', "$S\models\prune-qwen36\keep96.json", '--new', "$M\imatrix-failure.gguf",
-        '--code', "$S\models\prune-qwen36\imatrix-qwen36-code.gguf", '--full', $full, '--out', "$ad\keeplists")
-}
-foreach ($v in 'swap96', 'add108', 'swap108') {
-    if (-not (Test-Path "$M\keep96-$v.gguf")) {
+    # 3. keep lists, slices
+    if (-not (Test-Path "$ad\keeplists\add108.json")) {
+        Step 'keeplists' $calib @($py, "$mb\expert_patch.py", '--keep96', "$S\models\prune-qwen36\keep96.json", '--new', "$M\imatrix-failure.gguf",
+            '--code', "$S\models\prune-qwen36\imatrix-qwen36-code.gguf", '--full', $full, '--out', "$ad\keeplists")
+    }
+    foreach ($v in 'swap96', 'add108', 'swap108') {
+        if ((Test-Path "$M\keep96-$v.gguf") -or ((Test-Path "$ad\bench-$v.json") -and (Test-Path "$ad\kl-$v.json"))) { continue }
         if (-not (FreeOk)) { Say "REFUSED slice $v`: under 10% free"; continue }
         Step "slice-$v" $calib @($py, "$mb\slice_experts.py", $full, "$M\keep96-$v.gguf", '--keep-list', "$ad\keeplists\$v.json")
         Settle
     }
 }
+# size/speed (keep96 always, as the reference), closeness
 foreach ($v in 'keep96', 'swap96', 'add108', 'swap108') {
     $g = if ($v -eq 'keep96') { $k96 } else { "$M\keep96-$v.gguf" }
+    if (-not (Test-Path $g)) { continue }
     if (-not (Test-Path "$ad\bench-$v.json")) { Step "bench-$v" $calib @($py, "$mb\kl_eval.py", 'bench', '--model', $g, '--out', "$ad\bench-$v.json") }
-    if (-not (Test-Path "$ad\kl-$v.json")) { Step "kl-$v" $calib @($py, "$mb\kl_eval.py", 'score', '--model', $g, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin", '--out', "$ad\kl-$v.json") }
+    if (-not (Test-Path "$ad\kl-$v.json") -and (Test-Path "$M\kl-ref.bin")) { Step "kl-$v" $calib @($py, "$mb\kl_eval.py", 'score', '--model', $g, '--text', "$ad\heldout.txt", '--ref', "$M\kl-ref.bin", '--out', "$ad\kl-$v.json") }
 }
 Decide 'closest'
+$d = Dec
+if ($d -and $null -ne $d.closest) {
+    foreach ($v in 'swap96', 'add108', 'swap108') {
+        if (@($d.closest) -notcontains $v -and (Test-Path "$M\keep96-$v.gguf")) { Remove-Item "$M\keep96-$v.gguf" -Force; Say "deleted keep96-$v.gguf (not among the closest)" }
+    }
+    if (Test-Path "$M\kl-ref.bin") { Remove-Item "$M\kl-ref.bin" -Force; Say 'deleted kl-ref.bin (every variant scored)' }
+}
 
 # 4. the pool: keep96 and the two closest variants; the winner
 Bon 'pool-keep96' $calib '' ''
