@@ -60,7 +60,7 @@ def discipline_counts(path):
     tasks = steer.tasks_by_name()
     rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     bad = sum(not steer.discipline(tasks[r["task"]], extract_code(r["answer"]))[0] for r in rows)
-    return bad, sum(r["ok"] for r in rows)
+    return bad, sum(r["ok"] for r in rows), len(rows)
 
 
 def closest(a, d, dec):
@@ -99,16 +99,18 @@ T = os.environ.get("STEER_TAG", "")  # "-<variant>" when the sweep runs on a win
 
 def config(a, d, dec):
     L = pathlib.Path(a.logs)
-    base_bad, base_ok = discipline_counts(L / f"adapters-steer{T}-none.jsonl")
+    base_bad, base_ok, base_n = discipline_counts(L / f"adapters-steer{T}-none.jsonl")
     dec["steer_base"] = T.lstrip("-") or "keep96"
-    dec["steer"] = {"none": {"failures": base_bad, "solved": base_ok}}
+    dec["steer"] = {"none": {"failures": base_bad, "solved": base_ok, "rows": base_n}}
     best = None
     for c in CONFIGS:
         p = L / f"adapters-steer{T}-{c}-0.5.jsonl"
         if not p.exists():
             continue
-        bad, ok = discipline_counts(p)
-        dec["steer"][f"{c}-0.5"] = {"failures": bad, "solved": ok}
+        bad, ok, n = discipline_counts(p)
+        dec["steer"][f"{c}-0.5"] = {"failures": bad, "solved": ok, "rows": n}
+        if n < base_n:  # a short run would look better by having fewer answers
+            continue
         if bad < base_bad and (best is None or (base_bad - bad, ok) > best[0]):
             best = ((base_bad - bad, ok), c)
     dec["steer_config"] = best[1] if best else None
@@ -123,9 +125,9 @@ def scale(a, d, dec):
         p = L / f"adapters-steer{T}-{c}-{s}.jsonl"
         if not p.exists():
             continue
-        bad, ok = discipline_counts(p)
-        dec["steer"][f"{c}-{s}"] = {"failures": bad, "solved": ok}
-        if bad < base["failures"] and ok >= base["solved"] and (best is None or (bad, -ok) < best[0]):
+        bad, ok, n = discipline_counts(p)
+        dec["steer"][f"{c}-{s}"] = {"failures": bad, "solved": ok, "rows": n}
+        if n >= base.get("rows", 0) and bad < base["failures"] and ok >= base["solved"] and (best is None or (bad, -ok) < best[0]):
             best = ((bad, -ok), s)
     dec["steer_scale"] = best[1] if best else None
     print("scale:", dec["steer_scale"])

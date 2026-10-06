@@ -49,7 +49,8 @@ function Decide($what) { Step "decide-$what" $calib @($py, "$mb\phase1_decide.py
 function Dec { Get-Content "$ad\decisions.json" -Raw | ConvertFrom-Json }
 function Bon($name, $dir, $gguf, $extra) {
     $o = "$L\adapters-$name.jsonl"
-    if (-not (Test-Path $o) -or (Select-String -Path "$L\adapters-$name.out" -Pattern 'done in' -Quiet -ErrorAction SilentlyContinue) -eq $false) {
+    for ($try = 0; $try -lt 3 -and -not (PoolDone $name); $try++) {  # resumes after a crashed server
+        if ($try) { Say "resuming $name" }
         Step $name $dir @($py, "$mb\bestofn_tier2b.py", 'run', '--model', 'qwen36keep96', '--n', '3', '--suites', '1', '--trials', '3',
             '--temp-alt', '0.7', '--out', $o) $gguf $extra
     }
@@ -69,7 +70,9 @@ $unit = @{ mean = 0.05; pca = 0.2 }
 function CvScale($meth, $rel) { ([double]$rel * $unit[$meth]).ToString([Globalization.CultureInfo]::InvariantCulture) }
 function Probe($name, $gguf, $extra) {
     $o = "$L\adapters-$name.jsonl"
-    if (-not (Test-Path $o) -or (Get-Content $o | Measure-Object -Line).Lines -lt 120) {
+    # a crashed server (CUDA out of memory once on swap108, 2026-10-06) leaves a short file; the runner resumes it
+    for ($try = 0; $try -lt 3 -and (-not (Test-Path $o) -or (Get-Content $o | Measure-Object -Line).Lines -lt 120); $try++) {
+        if ($try) { Say "resuming $name ($((Get-Content $o | Measure-Object -Line).Lines) of 120 rows)" }
         Step $name $calib @($py, "$mb\probe_tier2b.py", 'run', '--model', 'qwen36keep96', '--trials', '2', '--out', $o) $gguf $extra
     }
 }
