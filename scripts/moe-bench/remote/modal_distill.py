@@ -101,6 +101,284 @@ def teacher(budgets: list):
     return {"results": out, "job_minutes": round(secs / 60, 1), "cost_usd_est": round(secs * RATE, 2)}
 
 
+def flashnext_server(parallel, ctx_per_slot, log_path):
+    """Flash-Next Coder on the L40S as in the teacher test (all on the GPU, the n-gram table resident), with
+    `parallel` slots. -> (process, base URL) once /health answers."""
+    import urllib.request
+    from huggingface_hub import snapshot_download
+    snapshot_download(REPO, allow_patterns=["IQ1_M/*"], local_dir=MD, max_workers=16)
+    log = open(log_path, "w")
+    srv = subprocess.Popen([f"{BIN}/llama-server", "-m", M, "--host", "127.0.0.1", "--port", "8080", "-ngl", "99",
+                            "-c", str(ctx_per_slot * parallel), "-np", str(parallel), "--jinja", "--no-webui",
+                            "--flash-attn", "on", *RESIDENT], stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(1800):
+        try:
+            if json.load(urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5)).get("status") == "ok":
+                return srv, "http://127.0.0.1:8080"
+        except Exception:  # noqa: BLE001
+            pass
+        if srv.poll() is not None:
+            raise RuntimeError("llama-server exited: " + "".join(open(log_path).readlines()[-20:]))
+        time.sleep(2)
+    raise RuntimeError("llama-server never became healthy")
+
+
+def chat(url, messages, **kw):
+    import urllib.request
+    body = {"messages": messages, "chat_template_kwargs": {"enable_thinking": False}, **kw}
+    req = urllib.request.Request(f"{url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=900))
+
+
+@app.function(gpu="L40S", volumes={W: vol}, timeout=2 * 3600, cpu=8, memory=64 * 1024)
+def gen_tasks(prompts: list, parallel: int = 4):
+    """Task 3: Flash-Next (thinking off) writes candidate training tasks, one JSON object per prompt from
+    train_tasks/families.py, JSON-constrained. Resumable: /vol/train_tasks/raw.jsonl keeps every answer."""
+    import concurrent.futures
+    import zlib
+    t0 = time.time()
+    out = f"{W}/train_tasks/raw.jsonl"
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    done = {json.loads(l)["id"] for l in open(out) if l.strip()} if os.path.exists(out) else set()
+    todo = [p for p in prompts if p[0] not in done]
+    srv, url = flashnext_server(parallel, 6144, "/tmp/server.log")
+    print(f"server up at {time.time() - t0:.0f} s; {len(todo)} prompts to go", flush=True)
+
+    def ask(p):
+        pid, fam, topic, text = p
+        try:
+            r = chat(url, [{"role": "user", "content": text}], temperature=0.8, top_p=0.95, max_tokens=2500,
+                     seed=zlib.crc32(pid.encode()), response_format={"type": "json_object"})
+            return {"id": pid, "family": fam, "topic": topic, "content": r["choices"][0]["message"]["content"],
+                    "tokens": r["usage"]["completion_tokens"]}
+        except Exception as e:  # noqa: BLE001  (not written: a rerun retries it)
+            return {"id": pid, "error": repr(e)}
+
+    n_ok = n_err = toks = 0
+    with open(out, "a") as f, concurrent.futures.ThreadPoolExecutor(parallel) as ex:
+        for i, res in enumerate(ex.map(ask, todo)):
+            if "error" in res:
+                n_err += 1
+                continue
+            f.write(json.dumps(res) + "\n")
+            f.flush()
+            n_ok += 1
+            toks += res["tokens"]
+            if n_ok % 50 == 0:
+                vol.commit()
+                print(f"{n_ok} written, {toks} tokens, {time.time() - t0:.0f} s", flush=True)
+    vol.commit()
+    srv.terminate()
+    secs = time.time() - t0
+    return {"written": n_ok, "errors": n_err, "tokens": toks, "minutes": round(secs / 60, 1),
+            "cost_usd_est": round(secs * RATE, 2)}
+
+
+def _post(url, path, body):
+    import urllib.request
+    req = urllib.request.Request(f"{url}{path}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=900))
+
+
+def _probs(r):
+    """llama-server completion_probabilities -> (sampled ids, [[ [id, logprob] x top ] per position])."""
+    cp = r.get("completion_probabilities") or []
+    return [e["id"] for e in cp], [[[t["id"], round(t["logprob"], 4)] for t in e["top_logprobs"]] for e in cp]
+
+
+@app.function(gpu="L40S", volumes={W: vol}, timeout=3 * 3600, cpu=8, memory=64 * 1024)
+def teacher_data(tasks: list, prefixes: list, parallel: int = 4, top: int = 20):
+    """Task 4: the teacher (Flash-Next Coder, thinking off, the teacher test's sampling: temperature 0.2, top-p 0.95)
+    answers each training task single shot through the pool's own prompt, with its top-20 log-probs per answer token.
+    Only answers that pass the task's test are training targets. Then the regularizer: continuations of code
+    prefixes (KL only). Resumable: /vol/teacher_data/{answers,regularizer}.jsonl."""
+    import concurrent.futures
+    import shutil
+    import tempfile
+    sys.path[:0] = [POOL, f"{R}/scripts/benchmark-tier2b"]
+    from runbench2b import baseline_prompt, extract_code, run_test, seed
+    t0 = time.time()
+    d_out = f"{W}/teacher_data"
+    os.makedirs(d_out, exist_ok=True)
+    srv, url = flashnext_server(parallel, 8192, "/tmp/server.log")
+    print(f"server up at {time.time() - t0:.0f} s", flush=True)
+
+    def answer(task):
+        try:
+            prompt = _post(url, "/apply-template", {"messages": [{"role": "user", "content": baseline_prompt(task)}],
+                                                     "chat_template_kwargs": {"enable_thinking": False}})["prompt"]
+            r = _post(url, "/completion", {"prompt": prompt, "n_predict": 2048, "temperature": 0.2, "top_p": 0.95,
+                                           "seed": 0, "n_probs": top, "cache_prompt": False})
+            d = tempfile.mkdtemp(prefix="td-")
+            try:
+                seed(pathlib.Path(d), task)
+                (pathlib.Path(d) / task["entry"]).write_text(extract_code(r["content"]), encoding="utf-8")
+                ok = bool(run_test(pathlib.Path(d), task["test"])[0])
+            finally:
+                shutil.rmtree(d, ignore_errors=True)
+            ids, tops = _probs(r)
+            return {"task": task["name"], "category": task["category"], "prompt": prompt, "answer": r["content"],
+                    "ok": ok, "ids": ids, "top": tops}
+        except Exception as e:  # noqa: BLE001
+            return {"task": task["name"], "error": repr(e)}
+
+    def cont(item):
+        pid, text = item
+        try:
+            r = _post(url, "/completion", {"prompt": text, "n_predict": 1000, "temperature": 0.8, "top_p": 0.95,
+                                           "seed": 0, "n_probs": top, "cache_prompt": False})
+            ids, tops = _probs(r)
+            return {"id": pid, "prefix": text, "continuation": r["content"], "ids": ids, "top": tops}
+        except Exception as e:  # noqa: BLE001
+            return {"id": pid, "error": repr(e)}
+
+    stats = {}
+    for fname, items, fn, key in (("answers.jsonl", tasks, answer, "task"), ("regularizer.jsonl", prefixes, cont, "id")):
+        path = f"{d_out}/{fname}"
+        done = {json.loads(l)[key] for l in open(path) if l.strip()} if os.path.exists(path) else set()
+        todo = [x for x in items if (x["name"] if key == "task" else x[0]) not in done]
+        n = err = ok = toks = 0
+        with open(path, "a") as f, concurrent.futures.ThreadPoolExecutor(parallel) as ex:
+            for res in ex.map(fn, todo):
+                if "error" in res:
+                    err += 1
+                    continue
+                f.write(json.dumps(res) + "\n")
+                f.flush()
+                n += 1
+                ok += res.get("ok", False)
+                toks += len(res["ids"])
+                if n % 50 == 0:
+                    vol.commit()
+                    print(f"{fname}: {n} written ({ok} passing), {toks} tokens, {time.time() - t0:.0f} s", flush=True)
+        vol.commit()
+        stats[fname] = {"written": n, "errors": err, "passing": ok, "tokens": toks}
+    srv.terminate()
+    secs = time.time() - t0
+    return {**stats, "minutes": round(secs / 60, 1), "cost_usd_est": round(secs * RATE, 2)}
+
+
+def kl_top(logits, top_ids, top_lp):
+    """KL(teacher || student) per position over the teacher's top-k plus one bucket for the remaining mass.
+    logits [n, V] (float32), top_ids / top_lp [n, k]."""
+    import torch
+    lsm = torch.log_softmax(logits, -1)
+    p_top = lsm.gather(-1, top_ids).exp()
+    q_top = top_lp.exp()
+    p_rest = (1 - p_top.sum(-1)).clamp_min(1e-6)
+    q_rest = (1 - q_top.sum(-1)).clamp_min(1e-6)
+    return (q_top * (top_lp - torch.log(p_top.clamp_min(1e-9)))).sum(-1) + q_rest * (q_rest.log() - p_rest.log())
+
+
+@app.function(gpu="A100-80GB", volumes={W: vol}, timeout=4 * 3600, cpu=8, memory=64 * 1024, image=torch_image)
+def train(student: str = KEEP96, tag: str = "keep96-v1", epochs: int = 2, rank: int = 16, lr: float = 2e-4,
+          kl_weight: float = 1.0, accum: int = 8, max_len: int = 2048):
+    """Task 5 (spec 4.3): LoRA on full attention, DeltaNet and the shared expert of the dequantized served student.
+    Loss: cross-entropy on the teacher's verified answers + kl_weight x KL to its top-20 there, and KL only on the
+    regularizer continuations. bf16, gradient checkpointing, batch 1 x `accum`. Then convert_lora_to_gguf.py."""
+    import random
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoTokenizer
+    t0 = time.time()
+    model, hp, rep = load_student(student)
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.6-35B-A3B")
+    end = tok.convert_tokens_to_ids("<|im_end|>")
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.config.use_cache = False
+    model = get_peft_model(model, LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.0, target_modules=LORA_TARGETS))
+    ex = []
+    for line in open(f"{W}/teacher_data/answers.jsonl"):
+        r = json.loads(line)
+        if r["ok"] and r["ids"]:
+            ex.append(("answer", tok(r["prompt"], add_special_tokens=False).input_ids, r["ids"] + [end], r["top"]))
+    n_ans = len(ex)
+    for line in open(f"{W}/teacher_data/regularizer.jsonl"):
+        r = json.loads(line)
+        if r["ids"]:
+            ex.append(("reg", tok(r["prefix"], add_special_tokens=False).input_ids, r["ids"], r["top"]))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.0)
+    steps_total = epochs * len(ex) // accum
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 20) * max(0.05, 1 - s / max(1, steps_total)))
+    rng = random.Random(0)
+    log, step, acc = [], 0, {"ce": 0.0, "kl": 0.0, "n": 0}
+    model.train()
+    for ep in range(epochs):
+        order = list(range(len(ex)))
+        rng.shuffle(order)
+        for i, k in enumerate(order):
+            kind, p_ids, a_ids, tops = ex[k]
+            a_ids = a_ids[:max(1, max_len - len(p_ids))]
+            ids = torch.tensor([p_ids + a_ids], device="cuda")
+            n_p = len(p_ids)
+            logits = model(input_ids=ids).logits[0, n_p - 1:n_p - 1 + len(a_ids)].float()
+            k_top = min(len(tops), len(a_ids))
+            loss = 0.0
+            if k_top:
+                t_ids = torch.tensor([[t[0] for t in row] for row in tops[:k_top]], device="cuda")
+                t_lp = torch.tensor([[t[1] for t in row] for row in tops[:k_top]], device="cuda")
+                kl = kl_top(logits[:k_top], t_ids, t_lp).mean()
+                loss = loss + kl_weight * kl
+                acc["kl"] += float(kl)
+            if kind == "answer":
+                ce = torch.nn.functional.cross_entropy(logits, ids[0, n_p:])
+                loss = loss + ce
+                acc["ce"] += float(ce)
+            (loss / accum).backward()
+            acc["n"] += 1
+            if acc["n"] % accum == 0:
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+                opt.step()
+                sched.step()
+                opt.zero_grad()
+                step += 1
+                if step % 10 == 0:
+                    log.append({"step": step, "epoch": ep, "ce": round(acc["ce"] / acc["n"], 4),
+                                "kl": round(acc["kl"] / acc["n"], 4), "s": round(time.time() - t0)})
+                    print(json.dumps(log[-1]), flush=True)
+                    acc = {"ce": 0.0, "kl": 0.0, "n": 0}
+    out = f"{W}/train/{tag}"
+    os.makedirs(out, exist_ok=True)
+    model.save_pretrained(f"{out}/adapter")
+    base = "/tmp/student-config"
+    os.makedirs(base, exist_ok=True)
+    student_config(rep["experts"]).save_pretrained(base)
+    tok.save_pretrained(base)
+    cfg = json.load(open(f"{base}/config.json"))
+    cfg["architectures"] = ["Qwen3_5MoeForCausalLM"]
+    json.dump(cfg, open(f"{base}/config.json", "w"))
+    conv = subprocess.run([sys.executable, "/opt/llama/convert_lora_to_gguf.py", "--base", base, "--outfile",
+                           f"{out}/lora.gguf", "--outtype", "f16", f"{out}/adapter"], capture_output=True, text=True)
+    secs = time.time() - t0
+    res = {"tag": tag, "student": student, "answers": n_ans, "regularizer": len(ex) - n_ans, "epochs": epochs,
+           "optimizer_steps": step, "log": log, "convert_exit": conv.returncode,
+           "convert_tail": (conv.stdout + conv.stderr)[-600:], "minutes": round(secs / 60, 1),
+           "cost_usd_est": round(secs * A100_RATE, 2)}
+    json.dump(res, open(f"{out}/train.json", "w"), indent=1)
+    vol.commit()
+    return res
+
+
+@app.local_entrypoint()
+def run_train(tag: str = "keep96-v1", student: str = KEEP96, epochs: int = 2):
+    print(json.dumps(train.remote(student, tag, epochs), indent=1))
+
+
+@app.local_entrypoint()
+def make_teacher_data(tasks_json: str, prefixes_json: str):
+    tasks = json.load(open(tasks_json, encoding="utf-8"))
+    prefixes = json.load(open(prefixes_json, encoding="utf-8"))
+    print(json.dumps(teacher_data.remote(tasks, prefixes), indent=1))
+
+
+@app.local_entrypoint()
+def gen_train_tasks(per_family: int = 360):
+    sys.path.insert(0, str(HERE.parent / "train_tasks"))
+    import families
+    print(json.dumps(gen_tasks.remote([list(p) for p in families.prompts(per_family)]), indent=1))
+
+
 def llama_top1(gguf_path, text, n_ctx=2048, chunks=2, ngl=99):
     """llama.cpp's own view of `text`: llama-perplexity --kl-divergence-base keeps the evaluated tokens and, for the
     second half of each chunk, every position's log-probs (uint16, monotonic in the logit). -> tokens
