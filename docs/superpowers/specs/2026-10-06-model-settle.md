@@ -74,3 +74,23 @@ p is the exact two-sided McNemar test; "6 vs 7" counts samples only that model s
 - **On C: (97 GB free):** add108's file. swap108's file was removed by the owner's choice to keep C: above 10% free. The rebuild command and checksum are in `swap108-manifest.json`, and a copy is on the Modal volume `distill`.
 - **Laya:** `playbook_tier2b.py` gained `--model`, and each row records its GGUF. Laya's plan stays on keep96 (deviation 9). GPU session 1 started on keep96 at 20:09; 23 earlier swap108 rows are set aside.
 - **Not done:** a judge-set look at add108. It would be its own pre-registered comparison, and tier2b already rules add108 out as the default.
+
+## Recounted per task (added 21:15)
+
+Each task's 3 trials are correlated, so the honest unit is the task. An exact sign test counts the tasks where each model solved more trials:
+
+| Comparison | Per sample | Per task |
+|---|---|---|
+| Judge, swap108 vs keep96, recipe | 16 vs 5, p = 0.027 | 8 vs 3, p = 0.23 |
+| Judge, swap108 vs keep96, single shot | 23 vs 3 | **12 vs 1, p = 0.003** (all five categories) |
+| tier2b, swap108 vs keep96, recipe | 0 vs 6, p = 0.031 | 0 vs 5, p = 0.06 |
+| tier2b, add108 vs keep96, recipe | 0 vs 5, p = 0.062 | 0 vs 3, p = 0.25 |
+| Calibration pool, every patch and LoRA | p 0.12–1.0 | p 0.69–1.0 |
+
+- **Only one effect is solid at the task level:** swap108's single-shot gain on the same-writer judge set.
+- **keep96's recipe misses are mostly hidden-convention tasks:** 10 of 10 on tier2b, 26 of 33 on the pool, 20 of 27 on the judge set.
+
+## Next (owner, 21:30)
+
+1. Configure and conclude the symbiotic Laya architecture first.
+2. Then rebuild and re-test training, distillation and expert patching with a new approach. It will use DeepSeek v4.1 Flash on OpenCode Go as the only teacher (no more extensive Modal runs), designed around what failed here and a review of published methods that worked.
