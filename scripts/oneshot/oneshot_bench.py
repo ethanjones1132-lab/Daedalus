@@ -26,6 +26,8 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -146,6 +148,145 @@ def run_keep96(seeds, runs, prompt, max_tokens=32768):
         log.close()
 
 
+# Round two (2026-10-07, owner): every MoE tested on tier2b, at its 2026-10-04 tuned placement and speculation
+# (model_pipeline.py and the final report). ncmoe is the starting placement; the fit step raises it until the model
+# fits at the benchmark's window. Thinking off except gpt-oss, which keeps reasoning effort low (its best).
+STAGE = pathlib.Path(r"C:\qwen3-forge-stage")
+EM = pathlib.Path(r"E:\qwen3-forge\models")
+BUILDS = {"master": STAGE / "tools" / "llama-master-836d57176" / "llama-server.exe",
+          "xing4": STAGE / "tools" / "llama-xing4-63c16fb97" / "llama-server.exe",
+          "k2h": STAGE / "tools" / "llama-k2h-50abacf42" / "llama-server.exe"}
+GPTOSS = dict(spec="ngram", budget=-1, chat_kwargs={"reasoning_effort": "low"})
+MODELS = {
+    "qwen36full": dict(path=STAGE / "Qwen3.6-35B-A3B-UD-IQ2_M.gguf", ncmoe=22, spec="mtp"),
+    "qwen36full-iq3xxs": dict(path=EM / "Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf", ncmoe=26, spec="mtp"),
+    "gptoss20b": dict(path=EM / "gpt-oss-20b-MXFP4.gguf", ncmoe=11, **GPTOSS),
+    "gptoss20b-keep24": dict(path=EM / "gpt-oss-20b-MXFP4-keep24-selfgen.gguf", ncmoe=7, **GPTOSS),
+    "gemma26b": dict(path=EM / "google_gemma-4-26B-A4B-it-IQ2_M.gguf", ncmoe=16, spec="mtp",
+                     draft=EM / "mtp-gemma-4-26B-A4B-it.gguf"),
+    "tiel": dict(path=EM / "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", ncmoe=24, spec="mtp"),
+    "lfm25-8b-a1b": dict(path=pathlib.Path(r"E:\models\gguf\LFM2.5-8B-A1B-Q4_K_M.gguf"), ncmoe=0, spec="ngram"),
+    "xing4": dict(path=EM / "Xing4.0-29B-A4B-IQ3_XXS.gguf", ncmoe=22, spec="none", build="xing4"),
+    "k2h": dict(path=EM / "K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf", ncmoe=30, spec="none", build="k2h",
+                extra=["-ot", "attn_v_exps=CPU"]),
+}
+CTX = 40960  # prompt (~5k tokens) + the 32k output budget
+PORT = 8095
+VRAM_CAP_MIB = 8188 - 250  # absolute use, desktop included: above this, Windows spills VRAM into system RAM
+
+
+def llama_args(name, ncmoe):
+    m = MODELS[name]
+    args = [str(BUILDS[m.get("build", "master")]), "-m", str(m["path"]), "--host", "127.0.0.1", "--port", str(PORT),
+            "-ngl", "99", "--n-cpu-moe", str(ncmoe), "-c", str(CTX), "-ctk", "q8_0", "-ctv", "q8_0",
+            "--flash-attn", "on", "-b", "512", "-ub", "512", "-np", "1", "--jinja",
+            "--reasoning-budget", str(m.get("budget", 0)), "--no-webui", "--cache-ram", "0"]
+    if m["spec"] == "mtp":
+        args += ["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"]
+        if m.get("draft"):
+            args += ["-md", str(m["draft"])]
+    elif m["spec"] == "ngram":
+        args += ["--spec-type", "ngram-mod"]
+    return args + list(m.get("extra", []))
+
+
+def next_placement(ncmoe, used_mib, loaded):
+    """None if the placement fits; else the next number of CPU expert layers to try."""
+    if not loaded:
+        return ncmoe + 4
+    return None if used_mib <= VRAM_CAP_MIB else ncmoe + 2
+
+
+def _post(path, payload, timeout):
+    req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", data=json.dumps(payload).encode(), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _start(args, log):
+    proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
+    t0 = time.time()
+    while time.time() - t0 < 900:
+        if proc.poll() is not None:
+            return None
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=2) as r:
+                if r.status == 200:
+                    return proc
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            pass
+        time.sleep(2)
+    _stop(proc)
+    return None
+
+
+def _stop(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    time.sleep(15)  # let the driver release VRAM before the next load
+
+
+def run_llama(name, seeds, runs, prompt, max_tokens=32768, stop_file=None):
+    sys.path.insert(0, str(MB))
+    import moe_sweep
+    m = MODELS[name]
+    todo = [s for s in seeds if not (runs / name / str(s) / "response.md").exists()]
+    if not todo:
+        return
+    if not m["path"].exists():
+        raise SystemExit(f"{name}: model file missing: {m['path']}")
+    log = open(runs / f"{name}-server.log", "a", encoding="utf-8", errors="replace")
+    ncmoe, proc, fit = m["ncmoe"], None, []
+    try:
+        for _ in range(6):
+            proc = _start(llama_args(name, ncmoe), log)
+            used = None
+            if proc:
+                _post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 16,
+                                               "temperature": 0, "chat_template_kwargs": m.get("chat_kwargs") or
+                                               {"enable_thinking": False}}, 600)
+                used = moe_sweep.vram_used_mib()
+            fit.append({"ncmoe": ncmoe, "loaded": bool(proc), "vram_used_mib": used})
+            nxt = next_placement(ncmoe, used, bool(proc))
+            print(f"{time.strftime('%H:%M:%S')} {name}: ncmoe {ncmoe} loaded {bool(proc)} VRAM {used} MiB", flush=True)
+            if nxt is None:
+                break
+            if proc:
+                _stop(proc)
+                proc = None
+            ncmoe = nxt
+        if proc is None:
+            raise SystemExit(f"{name}: no placement fits ({fit})")
+        for s in todo:
+            if stop_file and pathlib.Path(stop_file).exists():
+                print("stop file found", flush=True)
+                return
+            t = time.time()
+            r = _post("/v1/chat/completions", {
+                "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.2,
+                "top_p": 0.95, "seed": s, "cache_prompt": False,
+                "chat_template_kwargs": m.get("chat_kwargs") or {"enable_thinking": False}}, 4000)
+            choice, tm = r["choices"][0], r.get("timings", {})
+            msg = choice.get("message") or {}
+            meta = {"model": name, "file": m["path"].name, "seed": s, "ncmoe": ncmoe, "fit": fit,
+                    "wall_s": round(time.time() - t, 1), "finish_reason": choice.get("finish_reason"),
+                    "prompt_n": tm.get("prompt_n"), "gen_n": tm.get("predicted_n"),
+                    "gen_tps": round(tm.get("predicted_per_second", 0), 1),
+                    "has_reasoning": bool(msg.get("reasoning_content")), "ram_avail_gb": moe_sweep.ram_avail_gb()}
+            d = runs / name / str(s)
+            write_build(d, msg.get("content") or "", meta)
+            if msg.get("reasoning_content"):
+                (d / "reasoning.md").write_text(msg["reasoning_content"], encoding="utf-8")
+    finally:
+        if proc:
+            _stop(proc)
+        log.close()
+
+
 def run_deepseek(seeds, runs, prompt, max_tokens=32768):
     import deepseek
     key = deepseek.read_key()
@@ -178,8 +319,10 @@ def write_build(d, content, meta):
 EXTERNAL = re.compile(r"""(?:src|href)\s*=\s*["']?(?:https?:)?//""", re.I)
 
 
-def check(runs, params, set_name, shots, assembled=False):
+def check(runs, params, set_name, shots, assembled=False, only=""):
     for d in builds(runs):
+        if only and d.parent.name != only:
+            continue
         text = (d / "response.md").read_text(encoding="utf-8")
         ex = extract(text)
         (d / "plan.md").write_text(ex["plan"], encoding="utf-8")
@@ -259,7 +402,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--model", choices=["keep96", "deepseek"], required=True)
+    r.add_argument("--model", choices=["keep96", "deepseek"] + sorted(MODELS), required=True)
+    r.add_argument("--stop-file", default="")
     r.add_argument("--seeds", default="1-5")
     r.add_argument("--runs", required=True)
     r.add_argument("--max-tokens", type=int, default=32768,
@@ -270,6 +414,7 @@ def main():
     c.add_argument("--set", default="dev")
     c.add_argument("--shots", action="store_true")
     c.add_argument("--assembled", action="store_true", help="exploratory: check the format-forgiven app")
+    c.add_argument("--only", default="", help="one model's builds")
     b = sub.add_parser("blind")
     b.add_argument("--runs", required=True)
     b.add_argument("--out", required=True)
@@ -285,9 +430,12 @@ def main():
         runs = pathlib.Path(a.runs)
         runs.mkdir(parents=True, exist_ok=True)
         prompt = (LAB / "prompt.md").read_text(encoding="utf-8")
-        (run_keep96 if a.model == "keep96" else run_deepseek)(seeds_of(a.seeds), runs, prompt, a.max_tokens)
+        if a.model in MODELS:
+            run_llama(a.model, seeds_of(a.seeds), runs, prompt, a.max_tokens, a.stop_file)
+        else:
+            (run_keep96 if a.model == "keep96" else run_deepseek)(seeds_of(a.seeds), runs, prompt, a.max_tokens)
     elif a.cmd == "check":
-        check(a.runs, a.params, a.set, a.shots, a.assembled)
+        check(a.runs, a.params, a.set, a.shots, a.assembled, a.only)
     elif a.cmd == "blind":
         blind(a.runs, a.out, a.map)
     else:

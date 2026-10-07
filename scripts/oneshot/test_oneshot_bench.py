@@ -75,6 +75,33 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(ob.area_means(runs), {"algo": 0.25, "logic": 0.75})
 
 
+class ModelArgsTest(unittest.TestCase):
+    def test_mtp_with_draft_head(self):
+        a = ob.llama_args("gemma26b", 18)
+        self.assertEqual(a[a.index("--n-cpu-moe") + 1], "18")
+        self.assertEqual(a[a.index("-c") + 1], str(ob.CTX))
+        self.assertEqual(a[a.index("--spec-type") + 1], "draft-mtp,ngram-mod")
+        self.assertIn("-md", a)
+        self.assertEqual(a[a.index("--reasoning-budget") + 1], "0")
+
+    def test_ngram_reasoning_model(self):
+        a = ob.llama_args("gptoss20b", 11)
+        self.assertEqual(a[a.index("--spec-type") + 1], "ngram-mod")
+        self.assertNotIn("-md", a)
+        self.assertEqual(a[a.index("--reasoning-budget") + 1], "-1")
+
+    def test_branch_build_without_speculation(self):
+        a = ob.llama_args("k2h", 30)
+        self.assertNotIn("--spec-type", a)
+        self.assertTrue(a[0].endswith(str(ob.BUILDS["k2h"].name)) or "k2h" in a[0])
+        self.assertEqual(a[a.index("-ot") + 1], "attn_v_exps=CPU")
+
+    def test_fit_steps(self):
+        self.assertEqual(ob.next_placement(16, used_mib=7600, loaded=True), None)
+        self.assertEqual(ob.next_placement(16, used_mib=8100, loaded=True), 18)
+        self.assertEqual(ob.next_placement(16, used_mib=None, loaded=False), 20)
+
+
 class BlindTest(unittest.TestCase):
     def test_ids_unique_and_hide_models(self):
         keys = [f"keep96/{s}" for s in range(1, 6)] + [f"deepseek/{s}" for s in range(1, 6)]
