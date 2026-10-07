@@ -39,6 +39,28 @@ class ExtractTest(unittest.TestCase):
         text = "## Plan\n```js\nfunction mulberry32() {}\n```\n```html\n" + APP + "\n```"
         self.assertEqual(ob.extract(text)["app"], APP)
 
+    def test_plan_found_after_the_app(self):
+        text = "```html\n" + APP + "\n```\n\n## Plan\nTick order: grass first.\n\n```js\nlet a;\n```"
+        self.assertEqual(ob.extract(text)["plan"], "## Plan\nTick order: grass first.")
+
+
+SKELETON = "<!doctype html>\n<html><head><title>t</title></head><body><canvas></canvas></body></html>"
+JS = "window.lab = { reset() {} };\n" + "// filler\n" * 30
+
+
+class AssembleTest(unittest.TestCase):
+    def test_inlines_first_js_and_css_into_a_scriptless_skeleton(self):
+        text = ("```html\n" + SKELETON + "\n```\n```css\nbody { margin: 0; }\n```\n```javascript\n" + JS + "```\n"
+                "```javascript\n" + JS + "```\n")
+        app = ob.assemble(text)
+        self.assertEqual(app.count("window.lab"), 1)
+        self.assertIn("<style>\nbody { margin: 0; }\n</style></head>", app)
+        self.assertLess(app.index("window.lab"), app.index("</body>"))
+
+    def test_leaves_a_complete_app_alone(self):
+        text = "```html\n" + APP.replace("window.lab = {};", JS) + "\n```\n```js\nconsole.log(1);\n```"
+        self.assertEqual(ob.assemble(text), ob.extract(text)["app"])
+
 
 class ScoreTest(unittest.TestCase):
     def test_summary(self):

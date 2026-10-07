@@ -53,7 +53,33 @@ def extract(text):
         else:
             app, plan = "", text
         app = re.sub(r"\n?```\s*$", "", app).strip()
+    heading = re.search(r"^#+\s*Plan\b", text, re.M | re.I)
+    if heading:  # the plan section wherever it is: from its heading to the next code fence
+        end = text.find("```", heading.end())
+        plan = text[heading.start(): end if end >= 0 else len(text)]
     return {"plan": plan.strip(), "app": app, "truncated": "</html>" not in app.lower()}
+
+
+SCRIPT = re.compile(r"<script[^>]*>(.*?)</script>", re.S | re.I)
+
+
+def assemble(text):
+    """Exploratory, not the pre-registered score: when the extracted app carries no real script (under 200 chars of
+    inline code) but the response has separate JS/CSS blocks, inline the first of each into the HTML. Repeated
+    blocks are dropped. Measures what a build does once its output format is forgiven."""
+    app = extract(text)["app"]
+    if any(len(code.strip()) >= 200 for code in SCRIPT.findall(app)):
+        return app
+    blocks = [(m.group(1).strip().lower(), m.group(2).strip()) for m in FENCE.finditer(text)]
+    js = next((body for lang, body in blocks if lang in ("js", "javascript")), None)
+    css = next((body for lang, body in blocks if lang == "css"), None)
+    if js is None:
+        return app
+    if css is not None:
+        style = f"<style>\n{css}\n</style>"
+        app = app.replace("</head>", style + "</head>", 1) if "</head>" in app else style + app
+    script = f"<script>\n{js}\n</script>"
+    return app.replace("</body>", script + "</body>", 1) if "</body>" in app else app + script
 
 
 def summarize(scores):
@@ -89,7 +115,7 @@ def builds(runs):
 
 
 # ---------- generation ----------
-def run_keep96(seeds, runs, prompt):
+def run_keep96(seeds, runs, prompt, max_tokens=32768):
     sys.path.insert(0, str(MB))
     import bestofn_tier2b as bon
     os.environ["BON_EXTRA"] = json.dumps(["--load-mode", "none", "-c", "65536"])  # harness default is b/ub 512
@@ -103,7 +129,7 @@ def run_keep96(seeds, runs, prompt):
         for s in todo:
             t = time.time()
             r = bon.post("/v1/chat/completions", {
-                "messages": [{"role": "user", "content": prompt}], "max_tokens": 32768, "temperature": 0.2,
+                "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.2,
                 "top_p": 0.95, "seed": s, "cache_prompt": False, "chat_template_kwargs": {"enable_thinking": False}},
                 timeout=3600)
             choice, tm = r["choices"][0], r.get("timings", {})
@@ -120,7 +146,7 @@ def run_keep96(seeds, runs, prompt):
         log.close()
 
 
-def run_deepseek(seeds, runs, prompt):
+def run_deepseek(seeds, runs, prompt, max_tokens=32768):
     import deepseek
     key = deepseek.read_key()
     model = deepseek.pick_model(key)
@@ -128,7 +154,7 @@ def run_deepseek(seeds, runs, prompt):
         if (runs / "deepseek" / str(s) / "response.md").exists():
             continue
         t = time.time()
-        r = deepseek.chat(key, model, [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=32768)
+        r = deepseek.chat(key, model, [{"role": "user", "content": prompt}], temperature=0.2, max_tokens=max_tokens)
         usage = r.get("usage") or {}
         meta = {"model": r["model"], "seed": s, "wall_s": round(time.time() - t, 1), "finish_reason": r["finish_reason"],
                 "prompt_n": usage.get("prompt_tokens"), "gen_n": usage.get("completion_tokens"),
@@ -152,18 +178,24 @@ def write_build(d, content, meta):
 EXTERNAL = re.compile(r"""(?:src|href)\s*=\s*["']?(?:https?:)?//""", re.I)
 
 
-def check(runs, params, set_name, shots):
+def check(runs, params, set_name, shots, assembled=False):
     for d in builds(runs):
-        ex = extract((d / "response.md").read_text(encoding="utf-8"))
+        text = (d / "response.md").read_text(encoding="utf-8")
+        ex = extract(text)
         (d / "plan.md").write_text(ex["plan"], encoding="utf-8")
         (d / "app.html").write_text(ex["app"], encoding="utf-8")
+        app_file, suffix = d / "app.html", ""
+        if assembled:  # exploratory: the format forgiven (see assemble)
+            app_file, suffix = d / "app-assembled.html", "-assembled"
+            app_file.write_text(assemble(text), encoding="utf-8")
+            shots = False
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         static = {"truncated": ex["truncated"], "app_bytes": len(ex["app"].encode()), "app_lines": ex["app"].count("\n") + 1,
                   "external_refs": len(EXTERNAL.findall(ex["app"])), "plan_words": len(ex["plan"].split()),
                   "gen_n": meta.get("gen_n"), "gen_tps": meta.get("gen_tps"), "wall_s": meta.get("wall_s"),
                   "finish_reason": meta.get("finish_reason")}
-        out = d / f"checks-{set_name}.json"
-        cmd = ["node", str(LAB / "checks.mjs"), "--app", str(d / "app.html"), "--ref", str(LAB / "reference.html"),
+        out = d / f"checks-{set_name}{suffix}.json"
+        cmd = ["node", str(LAB / "checks.mjs"), "--app", str(app_file), "--ref", str(LAB / "reference.html"),
                "--params", str(params), "--out", str(out)]
         if shots:
             cmd += ["--shots", str(d / "shots")]
@@ -172,7 +204,8 @@ def check(runs, params, set_name, shots):
             res = json.loads(out.read_text(encoding="utf-8"))
             static["console_errors"] = len(res.get("console_errors", []))
             static["blocked_requests"] = res.get("blocked_requests")
-        (d / "static.json").write_text(json.dumps(static, indent=1), encoding="utf-8")
+        if not assembled:
+            (d / "static.json").write_text(json.dumps(static, indent=1), encoding="utf-8")
         print(f"{d.parent.name}/{d.name}: {(r.stdout.strip().splitlines() or [r.stderr.strip()[-200:]])[-1]}", flush=True)
 
 
@@ -229,11 +262,14 @@ def main():
     r.add_argument("--model", choices=["keep96", "deepseek"], required=True)
     r.add_argument("--seeds", default="1-5")
     r.add_argument("--runs", required=True)
+    r.add_argument("--max-tokens", type=int, default=32768,
+                   help="output budget; for a reasoning model it includes the reasoning (deepseek round 1: 65536)")
     c = sub.add_parser("check")
     c.add_argument("--runs", required=True)
     c.add_argument("--params", required=True)
     c.add_argument("--set", default="dev")
     c.add_argument("--shots", action="store_true")
+    c.add_argument("--assembled", action="store_true", help="exploratory: check the format-forgiven app")
     b = sub.add_parser("blind")
     b.add_argument("--runs", required=True)
     b.add_argument("--out", required=True)
@@ -249,9 +285,9 @@ def main():
         runs = pathlib.Path(a.runs)
         runs.mkdir(parents=True, exist_ok=True)
         prompt = (LAB / "prompt.md").read_text(encoding="utf-8")
-        (run_keep96 if a.model == "keep96" else run_deepseek)(seeds_of(a.seeds), runs, prompt)
+        (run_keep96 if a.model == "keep96" else run_deepseek)(seeds_of(a.seeds), runs, prompt, a.max_tokens)
     elif a.cmd == "check":
-        check(a.runs, a.params, a.set, a.shots)
+        check(a.runs, a.params, a.set, a.shots, a.assembled)
     elif a.cmd == "blind":
         blind(a.runs, a.out, a.map)
     else:

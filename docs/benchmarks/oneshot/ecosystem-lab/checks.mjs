@@ -41,6 +41,7 @@ async function open(file, { width = 1280, height = 900, clock = false, context =
     return route.abort();
   });
   const page = await ctx.newPage();
+  page.setDefaultTimeout(4000);  // a missing element fails its check in 4 s, not Playwright's 30 s
   const errors = [];
   page.on("pageerror", e => errors.push(String(e).slice(0, 300)));
   page.on("console", m => { if (m.type() === "error") errors.push(m.text().slice(0, 300)); });
