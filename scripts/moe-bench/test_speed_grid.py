@@ -21,11 +21,11 @@ class ServerCmdTest(unittest.TestCase):
 import speed_pair as sp  # noqa: E402
 
 
-def grow(ctx, ub, tps, spill, ctk="q8_0"):
+def grow(ctx, ub, tps, spill, ctk="q8_0", deep_gen=100.0):
     return {"tag": f"c{ctx}u{ub}{ctk}", "ctx": ctx, "ubatch": ub, "ctk": ctk, "shared_spill_mib": spill,
             "vram_delta_mib_peak": 6000,
             "runs": [{"prompt": "gen#0", "gen_tps": tps}, {"prompt": "edit2k#0", "gen_tps": 2 * tps},
-                     {"prompt": "deep54k", "gen_tps": 1.0, "prompt_tps": 900}]}
+                     {"prompt": "deep54k", "gen_tps": deep_gen, "prompt_tps": 900}]}
 
 
 class GridTest(unittest.TestCase):
@@ -51,10 +51,17 @@ class GridTest(unittest.TestCase):
                           "deep26k", "deep54k"])
 
     def test_verdict(self):
-        v = sp.verdict(self.rows + [grow(131072, 512, 99, 210, "q4_0")])
-        self.assertEqual([r["pass"] for r in v["rows"]], [True, True, False, False, True])
-        self.assertEqual(v["ctk"], {"16384": "q8_0", "65536": "q8_0", "131072": "q4_0"})
+        # 2026-10-07 deviation: the shared-memory counter grows with the window at unchanged speed, so overflow is
+        # judged by speed: the same deep prompt within 5% of the smallest q8_0 ub-512 window that ran it
+        v = sp.verdict(self.rows + [grow(131072, 512, 99, 210, "q4_0", deep_gen=50.0)])
+        self.assertEqual([r["pass"] for r in v["rows"]], [True, True, False, True, False])
+        self.assertEqual(v["ctk"], {"16384": "q8_0", "65536": "q8_0", "131072": "q8_0"})
         self.assertEqual(v["largest_pass"], 131072)
+        self.assertEqual(v["rows"][4]["depth_ratio"], 0.5)
+
+    def test_a_slower_deep_prompt_fails_the_row(self):
+        v = sp.verdict([self.rows[0], self.rows[1], grow(98304, 512, 100, 200, deep_gen=94.0)])
+        self.assertEqual([r["pass"] for r in v["rows"]], [True, True, False])
 
     def test_a_failed_prompt_fails_the_row(self):
         bad = grow(32768, 512, 100, 200)
@@ -62,8 +69,8 @@ class GridTest(unittest.TestCase):
         self.assertFalse(sp.verdict([self.rows[0], bad])["rows"][1]["pass"])
 
     def test_extra_and_top_rows(self):
-        self.assertEqual(sp.extra_rows(self.rows), [(98304, 512, "q4_0"), (131072, 512, "q4_0")])
-        self.assertEqual(sp.top_row(self.rows + [grow(131072, 512, 99, 210, "q4_0")]), [(131072, 1024, "q4_0")])
+        self.assertEqual(sp.extra_rows(self.rows), [(98304, 512, "q4_0")])
+        self.assertEqual(sp.top_row(self.rows), [(131072, 1024, "q8_0")])
         self.assertEqual(sp.top_row(self.rows[:2]), [])
 
 

@@ -83,22 +83,50 @@ def short_tps(row):
     return sum(v) / len(v) if v else None
 
 
-def verdict(rows, tol=0.05, spill_tol=100):
+def depth_refs(rows):
+    """Each deep prompt's (gen tps, prompt tps) in the smallest q8_0 ub-512 window that answered it."""
+    refs = {}
+    for r in sorted((r for r in rows if r["ubatch"] == 512 and r.get("ctk", "q8_0") == "q8_0" and "error" not in r),
+                    key=lambda r: r["ctx"]):
+        for x in r.get("runs", []):
+            if x["prompt"].startswith("deep") and x.get("gen_tps") and x["prompt"] not in refs:
+                refs[x["prompt"]] = (x["gen_tps"], x.get("prompt_tps") or 0)
+    return refs
+
+
+def depth_ratio(row, refs):
+    """The worst ratio, over the row's deep prompts, of generation or reading speed to the reference's."""
+    ratios = []
+    for x in row.get("runs", []):
+        if x["prompt"] in refs and x.get("gen_tps"):
+            gen, read = refs[x["prompt"]]
+            ratios.append(x["gen_tps"] / gen)
+            if read and x.get("prompt_tps"):
+                ratios.append(x["prompt_tps"] / read)
+    return round(min(ratios), 3) if ratios else None
+
+
+def verdict(rows, tol=0.05):
     """A row passes if it loaded, every prompt was answered, short-prompt generation is within tol of the 16k
-    control's, and overflow into shared memory is at most spill_tol MiB above the control's (spec §2). Returns the
-    rows' verdicts, the cache type per passing window (ub 512 rows; q8_0 preferred) and the largest one."""
+    control's, and each deep prompt's generation and reading speed is within tol of the smallest q8_0 ub-512 window
+    that ran it. Overflow into shared memory is reported, not judged: on 2026-10-07 the counter grew with the window
+    at unchanged speed, and with less VRAM in use (q4_0), so it tracks a host buffer, not overflow (owner-approved
+    deviation from spec §2, which judged that counter). Returns the rows' verdicts, the cache type per passing window
+    (ub 512 rows; q8_0 preferred) and the largest one."""
     control = next((r for r in rows if r["ctx"] == 16384 and r["ubatch"] == 512 and "error" not in r), None)
     if control is None or not short_tps(control):
         raise ValueError("no usable 16k control row")
     c_tps, c_spill = short_tps(control), control.get("shared_spill_mib") or 0
+    refs = depth_refs(rows)
     out, ctk = [], {}
     for r in rows:
         ok = "error" not in r and bool(r.get("runs")) and all("error" not in x for x in r["runs"])
         ratio = short_tps(r) / c_tps if ok and short_tps(r) else None
-        spill = (r.get("shared_spill_mib") or 0) - c_spill if ok else None
-        passed = ratio is not None and ratio >= 1 - tol and spill <= spill_tol
+        depth = depth_ratio(r, refs) if ok else None
+        passed = ratio is not None and ratio >= 1 - tol and (depth is None or depth >= 1 - tol)
         out.append({"tag": r["tag"], "ctx": r["ctx"], "ubatch": r["ubatch"], "ctk": r.get("ctk", "q8_0"),
-                    "speed_ratio": round(ratio, 3) if ratio else None, "spill_over_control_mib": spill,
+                    "speed_ratio": round(ratio, 3) if ratio else None, "depth_ratio": depth,
+                    "spill_over_control_mib": (r.get("shared_spill_mib") or 0) - c_spill if ok else None,
                     "vram_peak_mib": r.get("vram_delta_mib_peak"), "pass": passed,
                     "error": r.get("error") or next((x["error"] for x in r.get("runs", []) if "error" in x), None)})
         if passed and r["ubatch"] == 512 and ctk.get(str(r["ctx"])) != "q8_0":
@@ -168,6 +196,7 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--min-ram-gb", type=float, default=1.0)
     ap.add_argument("--grid", action="store_true")
+    ap.add_argument("--rescore", action="store_true", help="with --grid: rewrite OUT.verdict.json from OUT.jsonl only")
     ap.add_argument("models", nargs="+")
     a = ap.parse_args()
     out = pathlib.Path(a.out)
@@ -180,6 +209,15 @@ def main():
     if a.grid:
         if len(a.models) != 1:
             sys.exit("--grid takes one GGUF")
+        if a.rescore:
+            rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines() if line.strip()]
+            v = verdict([r for r in rows if not str(r.get("error", "")).startswith("skipped")])
+            vpath = out.with_suffix(".verdict.json")
+            if vpath.exists():
+                v["idle_vram_mib"] = json.loads(vpath.read_text(encoding="utf-8")).get("idle_vram_mib")
+            vpath.write_text(json.dumps(v, indent=1), encoding="utf-8")
+            print(json.dumps({k: v[k] for k in ("ctk", "largest_pass")}), flush=True)
+            return
         grid(a, a.models[0], out, logdir)
         return
     ps = prompts()
