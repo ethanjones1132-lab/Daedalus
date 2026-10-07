@@ -43,7 +43,7 @@ def pick_model(key):
 
 def chat(key, model, messages, temperature=0.2, max_tokens=32768):
     """Returns {content, reasoning, finish_reason, usage, model, max_tokens}. Retries 429/5xx/network errors three
-    times with backoff; on an HTTP 400 that mentions tokens, retries once with max_tokens 16384."""
+    times with backoff; on an HTTP 400 that mentions tokens, retries once with max_tokens 32768."""
     body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
     session = uuid.uuid4().hex  # stable across this conversation's retries
     waits = [10, 30, 60]
@@ -58,8 +58,8 @@ def chat(key, model, messages, temperature=0.2, max_tokens=32768):
                     "max_tokens": body["max_tokens"]}
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            if e.code == 400 and "token" in detail.lower() and body["max_tokens"] > 16384:
-                body["max_tokens"] = 16384
+            if e.code == 400 and "token" in detail.lower() and body["max_tokens"] > 32768:
+                body["max_tokens"] = 32768  # the endpoint's cap is lower than asked; record what was used
                 continue
             if (e.code == 429 or e.code >= 500) and attempt < len(waits):
                 time.sleep(waits[attempt])
