@@ -15,7 +15,7 @@
   - `C:\qwen3-forge-stage\venv`: the runner and tests;
   - `C:\qwen3-forge-stage\venv-laya`: `laya` 0.3.27 and CPU torch.
 - `unittest`; neither venv has pytest.
-- llama-server 836d571, with Qwen3.6-35B-A3B keep96 as in `bestofn_tier2b.CONFIGS`.
+- llama-server 836d571, with Qwen3.6-35B-A3B keep96 as in `bestofn_tier2b.CONFIGS` (deviation 9 records the 2026-10-06 check of swap108 and add108).
 
 ---
 
@@ -40,6 +40,13 @@
 6. **One shared validator,** `scripts/moe-bench/validate_tasks.py`, driven by `TIER2B_DIR`, replaces a `validate.py` copy per task set.
 7. **The probe uses prompt v1,** which is `probe_tier2b`'s default and Qwen's better version last night (tier2b 95 vs 90, fresh 16 vs 13).
 8. **Ties:** today's `selftest` pick breaks ties by the largest agreeing group, then the first candidate. Laya's P(correct) is inserted after the pass count and before the group size.
+9. **The coder stays keep96, after a check of swap108 and add108** (2026-10-06, before GPU session 1).
+   - Adapters phase 1 found that swap108 beats keep96 on the sealed judge set (recipe 164 vs 153, McNemar p = 0.027), and the owner first moved Laya to it.
+   - On tier2b with the same recipe harness and seeds, swap108 lost to keep96 (101 vs 107, 0 vs 6 discordant, p = 0.031), and so did add108 (102 vs 107, p = 0.062). By a rule written before add108's run (`docs/benchmarks/adapters/swap108-manifest.json`), keep96 stays. Details: `docs/superpowers/specs/2026-10-06-model-settle.md`.
+   - 23 nested rows run on swap108 before the check are set aside (`laya-calib-nested-swap108-partial.jsonl`), not mixed in.
+   - `playbook_tier2b.py` gained `--model` (default `qwen36keep96`), and every nested and live row records the GGUF it ran on.
+   - **Configuration 2 on the judge set is already known.** Phase 1 ran keep96's recipe there with the same harness, prompts and seeds (153/180, single shot 143). The judge nested run repeats that measurement; the pre-registration states the known score.
+   - **RAM.** On 2026-10-06 a 4 GB VM outside this project held RAM, so the 2 GB guard may stop the live runs (configurations 3–5). The guard is the spec's and stays as is.
 
 ## File map
 

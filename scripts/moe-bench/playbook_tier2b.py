@@ -14,15 +14,18 @@ Probe-run candidates 1-2 use 40000 + 100 * trial + c; the probe-run suite 50000 
 Cost is model seconds: Qwen generation, probe execution and Laya calls. Self-test and grading runs are excluded
 everywhere (bon.check runs them together; they cost the same per candidate in every configuration).
 
-usage: playbook_tier2b.py nested --out NESTED.jsonl [--trials 3] [--temp-alt 0.7]
+usage: playbook_tier2b.py nested --out NESTED.jsonl [--trials 3] [--temp-alt 0.7] [--model qwen36keep96]
        playbook_tier2b.py live --out LIVE.jsonl --rule RULE.json --calib CALIB.json [--note on|off] [--verify on|off]
+                               [--model qwen36keep96]
        playbook_tier2b.py summarize LIVE.jsonl
-(TIER2B_DIR selects the task set, as for the other harnesses.)
+(TIER2B_DIR selects the task set, as for the other harnesses. --model is a bestofn_tier2b config, keep96 by default.
+Every row records the GGUF it ran on, including a BON_GGUF override.)
 """
 import argparse
 import collections
 import ctypes
 import json
+import os
 import pathlib
 import queue
 import subprocess
@@ -134,8 +137,10 @@ class LayaClient:
                 self.proc.kill()
 
 
-def start():
-    bon.CFG.update(bon.CONFIGS["qwen36keep96"], budget=0)
+def start(model):
+    """Set the server config; returns the GGUF file name the rows record."""
+    bon.CFG.update(bon.CONFIGS[model], budget=0)
+    return pathlib.Path(os.environ.get("BON_GGUF") or bon.CFG["model"]).name
 
 
 def stop(proc, log):
@@ -191,7 +196,7 @@ def nested_trial(task, trial, temp_alt, ex):
 def nested(a):
     out = pathlib.Path(a.out)
     done = done_keys(out)
-    start()
+    gguf = start(a.model)
     log = open(out.with_suffix(".server.log"), "a", encoding="utf-8", errors="replace")
     proc = bon.start_server(log)
     t_start = time.time()
@@ -202,7 +207,7 @@ def nested(a):
                     if (task["name"], trial) in done:
                         continue
                     t = time.time()
-                    row = nested_trial(task, trial, a.temp_alt, ex)
+                    row = dict(nested_trial(task, trial, a.temp_alt, ex), model=gguf)
                     f.write(json.dumps(row) + "\n")
                     f.flush()
                     ok = collections.Counter(c["run"] for c in row["cands"] if c["graded_ok"])
@@ -300,7 +305,7 @@ def live(a):
     rule = rules["verify" if use_p else "noverify"]
     out = pathlib.Path(a.out)
     done = done_keys(out)
-    start()
+    gguf = start(a.model)
     log = open(out.with_suffix(".server.log"), "a", encoding="utf-8", errors="replace")
     proc = bon.start_server(log)
     lc = None
@@ -316,7 +321,7 @@ def live(a):
                 for trial in range(a.trials):
                     if (task["name"], trial) in done:
                         continue
-                    row = live_trial(task, trial, rule, lc, a.note == "on", use_p, a.temp_alt)
+                    row = dict(live_trial(task, trial, rule, lc, a.note == "on", use_p, a.temp_alt), model=gguf)
                     f.write(json.dumps(row) + "\n")
                     f.flush()
                     print(f"{task['name']} t{trial}: {row['playbook']}{' early' if row['early_stop'] else ''}"
@@ -349,6 +354,7 @@ def main():
     n.add_argument("--out", required=True)
     n.add_argument("--trials", type=int, default=3)
     n.add_argument("--temp-alt", type=float, default=0.7)
+    n.add_argument("--model", default="qwen36keep96", choices=sorted(bon.CONFIGS))
     lv = sub.add_parser("live")
     lv.add_argument("--out", required=True)
     lv.add_argument("--rule", required=True)
@@ -357,6 +363,7 @@ def main():
     lv.add_argument("--verify", choices=["on", "off"], default="on")
     lv.add_argument("--trials", type=int, default=3)
     lv.add_argument("--temp-alt", type=float, default=0.7)
+    lv.add_argument("--model", default="qwen36keep96", choices=sorted(bon.CONFIGS))
     s = sub.add_parser("summarize")
     s.add_argument("path")
     a = ap.parse_args()
