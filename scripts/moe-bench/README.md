@@ -24,6 +24,10 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `prune_experiment.py`, `prune_more.py` | The Qwen3.6-35B-A3B pruning pilot: 256 → 192/128/96/64 experts. |
 | `serve-qwen36-35b.ps1` | Serve the full model or the keep96/swap108/add108/keep64 slices with the measured settings. keep96 is the default and the settled model (2026-10-06 check). |
 | `speed_pair.py` | Paired speed and VRAM probe for several GGUFs at the Qwen speed-lab winner, alternating the models over rounds; adds a near-full 15k-token prompt for VRAM headroom. |
+| `speed_pair.py --grid` | Long-context memory and speed grid (2026-10-07): windows 16k–128k with deep prompts, overflow into shared memory, a follow-up-turn probe, and a verdict per window. |
+| `longctx_build.py` | Builds long agent sessions from the calibration pool and stdlib files; tier2b and judge-set names are blocked. |
+| `longctx_sessions.py` | Short / Late / Early runs at a window, graded by tier2b's tests; the report with bar (b), the chain's queries, and bar (a). |
+| `longctx-runs/run_longctx.sh` | The long-context GPU chain: grid, 64k, the largest window, bar (a), Early; a watchdog stops it before 01:00. |
 | `pair_bestofn.py` | Paired comparison of two `bestofn_tier2b` runs on the same tasks and seeds: single shot and recipe totals by category, discordant samples, exact McNemar p, the tasks that differ. |
 | `settle-runs/run_settle.sh`, `settle-runs/run_add108.sh` | The 2026-10-06 model check: the paired probe of swap108 against keep96, tier2b with the recipe harness on swap108, keep96 and add108. |
 | `laya-runs/run_session1.sh`, `run_fit.sh`, `run_session2.sh` | The Laya partner's chains: GPU session 1 (the calibration pool's nested runs and Laya's labels), the calibration and rule fits, and GPU session 2 (judge nested runs, configurations 3–5 on the judge set and tier2b, labels, the report). Results: `docs/superpowers/specs/2026-10-07-laya-partner-results.md`. |
