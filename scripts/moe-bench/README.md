@@ -26,7 +26,9 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `speed_pair.py` | Paired speed and VRAM probe for several GGUFs at the Qwen speed-lab winner, alternating the models over rounds; adds a near-full 15k-token prompt for VRAM headroom. |
 | `pair_bestofn.py` | Paired comparison of two `bestofn_tier2b` runs on the same tasks and seeds: single shot and recipe totals by category, discordant samples, exact McNemar p, the tasks that differ. |
 | `settle-runs/run_settle.sh`, `settle-runs/run_add108.sh` | The 2026-10-06 model check: the paired probe of swap108 against keep96, tier2b with the recipe harness on swap108, keep96 and add108. |
-| `laya-runs/run_session1.sh` | Laya partner GPU session 1: the calibration pool's nested runs, then Laya's labels. |
+| `laya-runs/run_session1.sh`, `run_fit.sh`, `run_session2.sh` | The Laya partner's chains: GPU session 1 (the calibration pool's nested runs and Laya's labels), the calibration and rule fits, and GPU session 2 (judge nested runs, configurations 3–5 on the judge set and tier2b, labels, the report). Results: `docs/superpowers/specs/2026-10-07-laya-partner-results.md`. |
+| `laya-runs/ram_check.py` | Available RAM with Qwen and the Laya worker loaded, under the default mmap load and `--load-mode none`, and whether both loads give identical answers. |
+| `playbook.py`, `laya_calibrate.py`, `laya_partner.py`, `playbook_tier2b.py` | The Laya partner: the rule, selection, offline simulation and fitting; Laya's calibration; the Laya worker and labeller; the nested and live runners. v2 (2026-10-06) adds the targeted probe form and the hidden-code signal. |
 | `build_llama.ps1` | Build one llama.cpp branch with CUDA 13.4 for sm_89 using VS 2026 + Ninja. |
 | `after_*.ps1` | Detached chains that run the next step when the previous process exits, so they survive Claude restarts. |
 | `prune_gptoss.py`, `make_keep24.py` | gpt-oss-20b pruning. Calibrates on the full model's own chat-format transcripts, then slices to 16/24 of 32 experts and probes and benchmarks each slice. `slice_experts.py` now also slices expert and router biases, and combines several imatrix files. |
