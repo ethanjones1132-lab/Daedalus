@@ -38,6 +38,11 @@ MODELS = {
     "qwen36keep96": dict(path=mp.MODELS_DIR / "prune-qwen36" / "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf", draft=None,
                          spec="draft-mtp", depth=2, depths=[1, 3, 4], arch="qwen35moe", used=8, fewer=6,
                          place=[0], place_nospec=[0], cpu_bound=False),
+    # Adapters phase 1's expert patch (2026-10-06); 0.48 GB larger, still all on the GPU. Not the default: it lost to
+    # keep96 on tier2b (docs/superpowers/specs/2026-10-06-model-settle.md).
+    "qwen36swap108": dict(path=mp.MODELS_DIR / "adapters" / "keep96-swap108.gguf", draft=None,
+                          spec="draft-mtp", depth=2, depths=[1, 3, 4], arch="qwen35moe", used=8, fewer=6,
+                          place=[0], place_nospec=[0], cpu_bound=False),
     # Added at the user's request after keep24 scored 107/117 (full 109) at 40.8 tok/s with
     # 7 CPU layers and no draft; with EAGLE3 it needed 14 CPU layers and ran at 20.9.
     "gptoss20b-keep24": dict(path=GPTOSS / "gpt-oss-20b-MXFP4-keep24-selfgen.gguf",

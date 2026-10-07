@@ -1,0 +1,16 @@
+
+117 task-trials, N = 3 candidates each
+policy                    score       A       B       C       D       E
+('first' is candidate 0, the single-shot answer; 'mean of candidates' averages candidates 1..N-1)
+first                    99.0/117    36.0     8.0    18.0    21.0    16.0
+mean of candidates       95.0/117    35.5     7.5    19.0    18.5    14.5
+compile                  99.0/117    36.0     8.0    18.0    21.0    16.0
+selftest                102.0/117    36.0     9.0    20.0    21.0    16.0
+codet                   101.0/117    36.0     9.0    19.0    21.0    16.0
+oracle                  102.0/117    36.0     9.0    20.0    21.0    16.0
+verifier diagnostics (codet):
+  no signal (self-tests cannot tell candidates apart): 103
+  no correct candidate: 15
+  false accept (passes every self-test, fails grading): 1
+  miss (a correct candidate existed): 1
+  self-tests failed by grading-correct candidates: 196/2217 (8.8%) -> wrong or over-specified tests

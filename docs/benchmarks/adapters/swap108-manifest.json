@@ -1,0 +1,15 @@
+{
+  "file": "C:\\qwen3-forge-stage\\models\\adapters\\keep96-swap108.gguf",
+  "bytes": 5999720736,
+  "sha256": "31bf807e796c75f45947103313a8c249c644f7a6b29092227e4cceee4bd3be4c",
+  "removed_locally": "2026-10-06 ~19:52, owner's choice: make room on C: (10% rule) to test add108",
+  "rebuild": "C:\\qwen3-forge-stage\\venv\\Scripts\\python.exe scripts\\moe-bench\\slice_experts.py C:\\qwen3-forge-stage\\Qwen3.6-35B-A3B-UD-IQ2_M.gguf C:\\qwen3-forge-stage\\models\\adapters\\keep96-swap108.gguf --keep-list docs\\benchmarks\\adapters\\keeplists\\swap108.json",
+  "backup": "Modal volume distill: students/keep96-swap108.gguf",
+  "decision_rule_before_add108_tier2b": [
+    "Written 2026-10-06 ~19:52, before any add108 tier2b result.",
+    "swap108 is out as the general settled model: on tier2b its recipe is significantly worse than keep96's (101 vs 107; 0 vs 6 discordant, exact McNemar p = 0.031), even though it beat keep96 on the judge set (164 vs 153, p = 0.027).",
+    "add108 replaces keep96 if, on tier2b with the same harness and seeds, neither its recipe nor its single shot is significantly worse than keep96's (paired exact McNemar p >= 0.10, or add108 solves at least as many). Its practice-set gain (recipe 153 vs 147) is in-sample, so it is a tiebreak, not evidence on its own.",
+    "Otherwise keep96 stays the settled model.",
+    "A judge-set confirmation of add108 would be its own pre-registered single look, proposed to the owner and not run automatically."
+  ]
+}

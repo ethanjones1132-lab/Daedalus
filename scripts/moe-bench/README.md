@@ -22,7 +22,11 @@ These are the scripts behind `docs/superpowers/specs/2026-10-04-overnight-result
 | `tier2b_llama.py` | The tier2b suite (39 tasks × 3 samples) against llama-server. Resumable; restarts a dead server and retries the sample; keeps raw answers. |
 | `slice_experts.py` | Keep the top-N routed experts per layer in a MoE GGUF, ranked by imatrix activation energy. Slices the expert tensors and router exactly. |
 | `prune_experiment.py`, `prune_more.py` | The Qwen3.6-35B-A3B pruning pilot: 256 → 192/128/96/64 experts. |
-| `serve-qwen36-35b.ps1` | Serve the full model or the keep96/keep64 slices with the measured settings. |
+| `serve-qwen36-35b.ps1` | Serve the full model or the keep96/swap108/add108/keep64 slices with the measured settings. keep96 is the default and the settled model (2026-10-06 check). |
+| `speed_pair.py` | Paired speed and VRAM probe for several GGUFs at the Qwen speed-lab winner, alternating the models over rounds; adds a near-full 15k-token prompt for VRAM headroom. |
+| `pair_bestofn.py` | Paired comparison of two `bestofn_tier2b` runs on the same tasks and seeds: single shot and recipe totals by category, discordant samples, exact McNemar p, the tasks that differ. |
+| `settle-runs/run_settle.sh`, `settle-runs/run_add108.sh` | The 2026-10-06 model check: the paired probe of swap108 against keep96, tier2b with the recipe harness on swap108, keep96 and add108. |
+| `laya-runs/run_session1.sh` | Laya partner GPU session 1: the calibration pool's nested runs, then Laya's labels. |
 | `build_llama.ps1` | Build one llama.cpp branch with CUDA 13.4 for sm_89 using VS 2026 + Ninja. |
 | `after_*.ps1` | Detached chains that run the next step when the previous process exits, so they survive Claude restarts. |
 | `prune_gptoss.py`, `make_keep24.py` | gpt-oss-20b pruning. Calibrates on the full model's own chat-format transcripts, then slices to 16/24 of 32 experts and probes and benchmarks each slice. `slice_experts.py` now also slices expert and router biases, and combines several imatrix files. |

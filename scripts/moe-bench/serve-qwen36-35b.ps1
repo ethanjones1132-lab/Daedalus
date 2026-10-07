@@ -12,6 +12,14 @@
     keep96 slice     5.5 GB   0                 MTP 2              132.2   99/117
     keep96 slice     5.5 GB   0                 MTP 2 + n-gram     274.5   101/117 (1.7 min)
     keep64 slice     4.3 GB   0                 MTP 2              136.6   92/117
+    swap108 slice    6.0 GB   0                 MTP 2 + n-gram     ~310    95/117 (recipe 101)
+    add108 slice     6.0 GB   0                 MTP 2 + n-gram     -       99/117 (recipe 102)
+
+  The 108-expert slices are adapters phase 1's expert patches (2026-10-06). swap108 beat
+  keep96 on the sealed judge set (recipe 164 vs 153) but lost on tier2b (recipe 101 vs
+  107, p 0.031), and add108 lost there too (102 vs 107), so keep96 stays the default.
+  See docs/superpowers/specs/2026-10-06-model-settle.md. swap108's file was removed
+  from C: and is rebuilt per docs/benchmarks/adapters/swap108-manifest.json.
 
   Default since the 2026-10-04 speed lab: MTP stacked with n-gram lookup
   (--spec-type draft-mtp,ngram-mod), which copies spans from the prompt; 2.1x on
@@ -26,7 +34,7 @@
   --cache-ram 0: the default 8 GiB host prompt cache starved this 16 GB machine.
 
 .PARAMETER Variant
-  full | keep96 | keep64. Default keep96.
+  full | keep96 | swap108 | add108 | keep64. Default keep96.
 
 .PARAMETER NoThink
   Disable reasoning. By default the reasoning budget is 1536; send
@@ -37,7 +45,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('full', 'keep96', 'keep64')]
+    [ValidateSet('full', 'keep96', 'swap108', 'add108', 'keep64')]
     [string]$Variant = 'keep96',
     [int]$Port = 8080,
     [switch]$NoThink,
@@ -46,9 +54,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $server = 'C:\qwen3-forge-stage\tools\llama-master-836d57176\llama-server.exe'
 $models = @{
-    full   = @{ path = 'C:\qwen3-forge-stage\Qwen3.6-35B-A3B-UD-IQ2_M.gguf'; ncmoe = 22 }
-    keep96 = @{ path = 'C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf'; ncmoe = 0 }
-    keep64 = @{ path = 'C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep64.gguf'; ncmoe = 0 }
+    full    = @{ path = 'C:\qwen3-forge-stage\Qwen3.6-35B-A3B-UD-IQ2_M.gguf'; ncmoe = 22 }
+    keep96  = @{ path = 'C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf'; ncmoe = 0 }
+    swap108 = @{ path = 'C:\qwen3-forge-stage\models\adapters\keep96-swap108.gguf'; ncmoe = 0 }
+    add108  = @{ path = 'C:\qwen3-forge-stage\models\adapters\keep96-add108.gguf'; ncmoe = 0 }
+    keep64  = @{ path = 'C:\qwen3-forge-stage\models\prune-qwen36\Qwen3.6-35B-A3B-UD-IQ2_M-keep64.gguf'; ncmoe = 0 }
 }
 $m = $models[$Variant]
 foreach ($p in $server, $m.path) { if (-not (Test-Path $p)) { throw "not found: $p" } }

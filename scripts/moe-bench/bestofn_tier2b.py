@@ -53,6 +53,15 @@ BASE = f"http://127.0.0.1:{PORT}"
 # Speed-lab winners (logs/speedlab-best-2026-10-04.json, every lever lossless) and each model's best
 # single-shot sampling from the 2026-10-04 sweep, used for candidate 0 and suite 0.
 CONFIGS = {
+    # Adapters phase 1 expert patches (2026-10-06), same flags as keep96. swap108 (top 108 by failure-targeted + code
+    # imatrix energy) beat keep96 on the sealed judge set (recipe 164 vs 153, p 0.027) but lost on tier2b (101 vs 107,
+    # p 0.031); add108 lost on tier2b too (102 vs 107, p 0.062). keep96 stays the default. swap108's file is rebuilt
+    # from docs/benchmarks/adapters/swap108-manifest.json when needed.
+    "qwen36swap108": dict(model=STAGE / "models" / "adapters" / "keep96-swap108.gguf", ncmoe=0,
+                          spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
+    # keep96's 96 experts per layer plus the 12 highest failure-targeted ones (drops none of keep96's).
+    "qwen36add108": dict(model=STAGE / "models" / "adapters" / "keep96-add108.gguf", ncmoe=0,
+                         spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
     "qwen36keep96": dict(model=STAGE / "models" / "prune-qwen36" / "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf", ncmoe=0,
                          spec=["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"], temp=0.2),
     # the unpruned 256-expert model, same quant: the reference for the adapters work (22 expert layers on the CPU)
