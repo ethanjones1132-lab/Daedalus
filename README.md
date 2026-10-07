@@ -12,6 +12,8 @@ Rust/Tauri shell · Bun orchestration server · React UI · SQLite · MIT
 
 ## What this is
 
+**Current development direction:** [Current Product Roadmap](docs/CURRENT_ROADMAP.md) is the source of truth for priority order and completion criteria. Work proceeds one priority at a time: memory, goals and execution, demonstrated learning, complete daily workflows, then measured local usefulness. **Priority #3 — Prove that learning improves future work — is active:** Phases 1–3 source are implemented, while the controlled campaign and empirical acceptance remain NOT RUN/open pending an available pinned loopback Ollama model. Priorities #1 and #2 runtime acceptance remain open; Priority #4 source is implemented, while real-task acceptance remains open.
+
 **Jarvis** is a desktop application that runs AI agents on your own machine. It owns its full stack — native window, HTTP server, database, tool runtime, and agent lifecycle — and depends on no external agent platform. It can call out to cloud models if you configure it to, or run against local models through Ollama or llama.cpp.
 
 **Daedalus** is the GitHub repository. **Jarvis** is the application. Same project; the names come from different layers of the stack, and the [Repo origins](#repo-origins) section explains why.

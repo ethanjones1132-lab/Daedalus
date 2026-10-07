@@ -1,5 +1,7 @@
 # Learned Orchestration — Roadmap
 
+> **Current priority authority — 2026-10-04:** [Current Product Roadmap](CURRENT_ROADMAP.md) supersedes this document's development ordering. This file remains a technical and research reference. Learned orchestration expansion is governed by priority #5, after priorities #1–#4 meet their completion criteria.
+
 **Date:** 2026-08-05
 **Status:** strategy. Phases A–D are actionable; Phase E is research.
 

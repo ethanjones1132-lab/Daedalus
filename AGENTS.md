@@ -8,6 +8,8 @@ This file gives autonomous AI agents the minimal project-specific context needed
 
 ## Read first
 
+- `docs/CURRENT_ROADMAP.md` — current product priorities, sequence, and completion criteria
+
 - `CONTEXT.md` — terminology and architecture vocabulary
 
 - `README.md` — lightweight repo overview
@@ -22,13 +24,13 @@ This file gives autonomous AI agents the minimal project-specific context needed
 
 ## Current priorities
 
-- Build provenance and stale-binary prevention
+- Follow `docs/CURRENT_ROADMAP.md`; it supersedes historical priority ordering.
 
-- Eval / regression harness work
+- Active priority: **#3 — Prove that learning improves future work.** Phases 1–3 source are implemented; the Phase 4 controlled campaign and empirical acceptance remain NOT RUN/open because no pinned loopback Ollama model is available.
 
-- Bridge and runtime reliability
+- Complete and verify one priority before advancing to the next: memory → goals and execution → demonstrated learning → complete workflows → measured local usefulness.
 
-- Follow-through on already-identified platform items: profile provisioning UI, frontier scaffolding, OpenClaw bridge, Tauri shell rewire, eval harness
+- Priority #1 and #2 runtime acceptance remain open/NOT RUN. Priority #4 source was implemented and committed under an explicit sequence override, but real-task acceptance remains open. Source delivery does not close any runtime or empirical acceptance gate. Reliability, build provenance, UI honesty, and regression work support the active priority. Record urgent interruptions and return to it afterward.
 
 
 
@@ -57,4 +59,3 @@ This file gives autonomous AI agents the minimal project-specific context needed
 4. Prefer fixes that preserve architecture intent over quick hacks.
 
     30|5. If docs and code diverge, say which side you verified.
-
