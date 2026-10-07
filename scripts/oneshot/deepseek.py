@@ -1,6 +1,8 @@
 """Minimal OpenCode Go chat client for the one-shot benchmark (2026-10-07).
 
 The key is read from OpenCode's auth.json (provider "opencode-go") at call time and is never printed or logged.
+OpenCode Go requires its own user agent and a stable `x-opencode-session` per conversation (opencode.ai/docs/go,
+"Where can I use it?"); each build is one conversation, so each gets one session id.
 Kept separate from the Laya v3 plan's scripts/moe-bench/opencode_go.py so the two runs don't share files.
 """
 import json
@@ -8,6 +10,7 @@ import pathlib
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 BASE = "https://opencode.ai/zen/go/v1"
 PREFER = ("deepseek-v4.1-flash", "deepseek-v4-flash")
@@ -19,11 +22,12 @@ def read_key():
     return entry["key"] if isinstance(entry, dict) else entry
 
 
-def _request(method, path, key, body=None, timeout=1800):
+def _request(method, path, key, body=None, timeout=1800, session=None):
     req = urllib.request.Request(BASE + path, method=method,
                                  data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
-                                          "Accept": "application/json", "User-Agent": "oneshot-bench/1.0"})
+                                          "Accept": "application/json", "User-Agent": "oneshot-bench/1.0",
+                                          "x-opencode-session": session or uuid.uuid4().hex})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
@@ -41,11 +45,12 @@ def chat(key, model, messages, temperature=0.2, max_tokens=32768):
     """Returns {content, reasoning, finish_reason, usage, model, max_tokens}. Retries 429/5xx/network errors three
     times with backoff; on an HTTP 400 that mentions tokens, retries once with max_tokens 16384."""
     body = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    session = uuid.uuid4().hex  # stable across this conversation's retries
     waits = [10, 30, 60]
     attempt = 0
     while True:
         try:
-            r = _request("POST", "/chat/completions", key, body)
+            r = _request("POST", "/chat/completions", key, body, session=session)
             choice = r["choices"][0]
             msg = choice.get("message") or {}
             return {"content": msg.get("content") or "", "reasoning": msg.get("reasoning_content") or msg.get("reasoning"),
