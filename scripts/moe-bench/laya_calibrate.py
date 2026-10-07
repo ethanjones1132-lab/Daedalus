@@ -25,7 +25,9 @@ WORDINGS = ("v1", "v2")
 FORMS = ("noul", "rubric")
 QUANTITIES = ("unseen", "effort_little", "effort_alot", "verify")
 KIND_OF = {"A": "algorithm", "B": "unseen", "C": "input", "D": "files", "E": "library"}
-IDENTITY = {"classify_wording": "v1", "verify_form": "noul", "platt": {q: [1.0, 0.0] for q in QUANTITIES}}
+HIDDEN_SIGNALS = ("noul", "kind_p")  # the v2 rule's task signal (spec 2026-10-06-laya-v2-design.md §3)
+IDENTITY = {"classify_wording": "v1", "verify_form": "noul", "hidden_signal": "noul",
+            "platt": {q: [1.0, 0.0] for q in QUANTITIES}}
 
 
 def read_jsonl(path):
@@ -105,14 +107,21 @@ def platt_apply(p, ab):
     return None if p is None else sigmoid(ab[0] * logit(p) + ab[1])
 
 
-def calibrate_card(raw, platt):
+def calibrate_card(raw, platt, hidden_signal="noul"):
     """Laya's raw task card -> the card the rule reads (playbook.choose). The most likely effort level comes
-    from the raw probabilities, so calibrating two of them separately cannot reorder it."""
+    from the raw probabilities, so calibrating two of them separately cannot reorder it. `hidden` is the v2 rule's
+    raw task signal, used by rank only."""
     ep = raw["effort_p"]
     return {"kind": raw["kind"], "unseen": platt_apply(raw["unseen"], platt["unseen"]),
             "p_little": platt_apply(ep[0], platt["effort_little"]),
             "p_alot": platt_apply(ep[2], platt["effort_alot"]),
-            "effort_top": max(range(3), key=lambda i: ep[i])}
+            "effort_top": max(range(3), key=lambda i: ep[i]),
+            "hidden": hidden_of(raw, hidden_signal)}
+
+
+def hidden_of(raw, signal):
+    """The yes/no "unseen" probability, or the kind question's probability for the hidden-code option."""
+    return raw["kind_p"]["unseen"] if signal == "kind_p" else raw["unseen"]
 
 
 def pairs_auc(pairs):
@@ -152,6 +161,16 @@ def cards_of(label_rows, wording):
     return {r["task"]: r["card"] for r in label_rows if r["type"] == "card" and r["wording"] == wording}
 
 
+def hidden_aucs(label_rows, cats, wordings=WORDINGS):
+    """(wording, signal) -> AUC of the signal for category-B tasks (spec v2 §3)."""
+    out = {}
+    for w in wordings:
+        cards = cards_of(label_rows, w)
+        for s in HIDDEN_SIGNALS:
+            out[(w, s)] = pairs_auc([(hidden_of(c, s), cats[t] == "B") for t, c in cards.items() if t in cats])
+    return out
+
+
 def kind_accuracy(cards, cats):
     hits = [cards[t]["kind"] == KIND_OF[cats[t]] for t in cards if t in cats]
     return sum(hits) / max(len(hits), 1)
@@ -172,14 +191,18 @@ def fit_cmd(a):
     cats, s_ok, r_ok, cand_ok = outcomes(trials, labels)
     wq = {w: quantities(cards_of(labels, w), cats, s_ok, r_ok) for w in WORDINGS}
     wauc = {w: {q: pairs_auc(v) for q, v in wq[w].items()} for w in WORDINGS}
-    wording = max(WORDINGS, key=lambda w: sum(_num(x) for x in wauc[w].values()))
+    # v2 (spec 2026-10-06 §3): the wording and signal are chosen together by the rule's one input, the hidden-code
+    # signal's AUC for category-B tasks. v1 summed three AUCs and never looked at the kind probabilities.
+    hauc = hidden_aucs(labels, cats)
+    wording, signal = max(hauc, key=lambda k: _num(hauc[k]))
     vp = {f: verify_pairs(labels, cand_ok, f) for f in FORMS}
     vauc = {f: pairs_auc(vp[f]) for f in FORMS}
     form = max(FORMS, key=lambda f: _num(vauc[f]))
     data = dict(wq[wording], verify=vp[form])
     platt = {q: list(platt_fit([p for p, _ in v], [int(y) for _, y in v])) for q, v in data.items()}
-    calib = {"classify_wording": wording, "verify_form": form, "platt": platt,
-             "report": {"wording_auc": wauc, "verify_auc": vauc,
+    calib = {"classify_wording": wording, "verify_form": form, "hidden_signal": signal, "platt": platt,
+             "report": {"hidden_auc": {f"{w}/{s}": v for (w, s), v in hauc.items()},
+                        "wording_auc": wauc, "verify_auc": vauc,
                         "kind_accuracy": {w: kind_accuracy(cards_of(labels, w), cats) for w in WORDINGS},
                         "chosen": diagnose(data, platt)}}
     pathlib.Path(a.out).write_text(json.dumps(calib, indent=1), encoding="utf-8")

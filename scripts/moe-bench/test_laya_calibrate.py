@@ -39,6 +39,23 @@ class CalibrateTest(unittest.TestCase):
         self.assertAlmostEqual(card["p_alot"], 0.5, places=3)
         self.assertEqual(card["effort_top"], 2)
 
+    def test_hidden_signal_on_the_card(self):
+        raw = {"kind": "library", "kind_p": {"unseen": 0.2, "library": 0.7}, "unseen": 0.9,
+               "effort_p": [0.5, 0.3, 0.2]}
+        self.assertEqual(lc.calibrate_card(raw, lc.IDENTITY["platt"])["hidden"], 0.9)
+        self.assertEqual(lc.calibrate_card(raw, lc.IDENTITY["platt"], "kind_p")["hidden"], 0.2)
+
+    def test_hidden_aucs_pick_the_separating_signal(self):
+        def raw(ku, nu):
+            return {"kind": "library", "kind_p": {"unseen": ku}, "unseen": nu, "effort_p": [0.4, 0.3, 0.3]}
+        cats = {"b1": "B", "b2": "B", "e1": "E", "a1": "A"}
+        labels = [{"type": "card", "task": t, "wording": "v1", "card": raw(*v)}
+                  for t, v in {"b1": (0.3, 0.5), "b2": (0.4, 0.4), "e1": (0.1, 0.9), "a1": (0.05, 0.6)}.items()]
+        aucs = lc.hidden_aucs(labels, cats, wordings=("v1",))
+        self.assertEqual(aucs[("v1", "kind_p")], 1.0)
+        self.assertLess(aucs[("v1", "noul")], 0.5)
+        self.assertEqual(max(aucs, key=aucs.get), ("v1", "kind_p"))
+
 
 if __name__ == "__main__":
     unittest.main()

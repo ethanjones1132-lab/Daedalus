@@ -135,6 +135,16 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(pb.mcnemar_p(0, 0), 1.0)
         self.assertAlmostEqual(pb.mcnemar_p(8, 1), 0.0390625)
 
+    def test_task_sign_counts_tasks_not_trials(self):
+        # (task, a_ok, b_ok) per trial: t1 a wins 3-0, t2 a wins 2-1, t3 tie 1-1, t4 b wins 0-1
+        pairs = ([("t1", True, False)] * 3 + [("t2", True, True), ("t2", True, False), ("t2", False, False)]
+                 + [("t3", True, False), ("t3", False, True), ("t3", False, False)]
+                 + [("t4", False, True), ("t4", False, False), ("t4", False, False)])
+        wins, losses, p = pb.task_sign(pairs)
+        self.assertEqual((wins, losses), (2, 1))
+        self.assertAlmostEqual(p, pb.mcnemar_p(2, 1))
+        self.assertEqual(pb.task_sign([]), (0, 0, 1.0))
+
 
 class MatchesBestofnTest(unittest.TestCase):
     def test_pick_equals_bestofn_selftest_on_a_stored_run(self):
@@ -180,7 +190,8 @@ class CommandsTest(unittest.TestCase):
                                "probe": {"secs_gen": 1.0, "secs_exec": 0.2}, "cands": cands})
             for w in ("v1", "v2"):
                 labels.append({"type": "card", "task": f"t{t}", "wording": w, "secs": 0.35,
-                               "card": {"kind": "unseen" if cat == "B" else "algorithm", "kind_p": {},
+                               "card": {"kind": "unseen" if cat == "B" else "algorithm",
+                                        "kind_p": {"unseen": 0.6 if cat == "B" else 0.1},
                                         "unseen": (0.9 if cat == "B" else 0.2) if w == "v1" else 0.5,
                                         "effort_p": [0.8, 0.1, 0.1] if easy else [0.1, 0.3, 0.6]}})
         (d / "n.jsonl").write_text("\n".join(map(json.dumps, trials)), encoding="utf-8")
