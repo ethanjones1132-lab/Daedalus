@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ecosystem Lab</title>
+<style>
+  :root { --bg: #f4f6f3; --panel: #ffffff; --ink: #1d2a1f; --muted: #5b6b5e; --line: #d8dfd6; --accent: #2f7d4a; --fox: #dc5014; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 20px 4px; }
+  h1 { margin: 0; font-size: 1.35rem; }
+  h2 { margin: 0 0 8px; font-size: 1rem; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; padding: 12px 20px 24px; align-items: start; }
+  @media (max-width: 899px) { .layout { grid-template-columns: minmax(0, 1fr); padding: 10px 12px 20px; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .panel + .panel, .card + .card { margin-top: 0; }
+  .card { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+  .card:first-child { border-top: 0; padding-top: 0; margin-top: 0; }
+  canvas { display: block; width: 100%; max-width: 100%; height: auto; image-rendering: pixelated; border-radius: 6px; background: #1e3c1e; }
+  .counters { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 10px 0; font-variant-numeric: tabular-nums; }
+  .counters b { font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid #b9c5b6; border-radius: 6px; background: #eef3ec; color: var(--ink); cursor: pointer; }
+  button:hover { background: #e2ebdf; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  :focus-visible { outline: 3px solid #3b82f6; outline-offset: 2px; }
+  input[type=number], input[type=text], textarea { font: inherit; padding: 5px 7px; border: 1px solid #b9c5b6; border-radius: 6px; max-width: 100%; }
+  input[type=number] { width: 7em; }
+  textarea { width: 100%; min-height: 70px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .sliders { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 16px; border: 0; padding: 0; margin: 8px 0 0; }
+  @media (max-width: 480px) { .sliders { grid-template-columns: minmax(0, 1fr); } }
+  .slider label { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); }
+  .slider input { width: 100%; }
+  .ode-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+  @media (max-width: 480px) { .ode-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .ode-grid label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; }
+  .ode-grid input { width: 100%; }
+  .out { font-family: ui-monospace, Consolas, monospace; font-size: 13px; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin-top: 8px; }
+  svg { width: 100%; height: auto; display: block; }
+  .error { color: #b42318; min-height: 1.2em; font-size: 13px; }
+  ul.presets { list-style: none; padding: 0; margin: 8px 0 0; }
+  ul.presets li { display: flex; gap: 8px; align-items: center; padding: 4px 0; border-bottom: 1px solid var(--line); }
+  ul.presets li span { flex: 1; overflow-wrap: anywhere; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header><h1>Ecosystem Lab</h1></header>
+<main class="layout">
+  <section class="panel" data-testid="panel-world" aria-label="Simulation">
+    <canvas data-testid="world" aria-label="Simulation grid"></canvas>
+    <div class="counters" aria-label="Counters">
+      <span>Tick <b data-testid="tick">0</b></span>
+      <span>Rabbits <b data-testid="count-rabbits">0</b></span>
+      <span>Foxes <b data-testid="count-foxes">0</b></span>
+      <span>Grass <b data-testid="count-grass">0</b></span>
+    </div>
+    <div class="row">
+      <button class="primary" data-testid="play" id="btn-play">Play</button>
+      <button data-testid="pause" id="btn-pause">Pause</button>
+      <button data-testid="step" id="btn-step">Step</button>
+      <button data-testid="reset" id="btn-reset">Reset</button>
+    </div>
+    <div class="row">
+      <label for="seed">Seed</label>
+      <input id="seed" type="number" data-testid="seed" value="42" step="1">
+      <label for="speed">Speed</label>
+      <input id="speed" type="range" data-testid="speed" min="1" max="60" value="10">
+      <output id="speed-val" for="speed">10</output>/s
+    </div>
+    <fieldset class="sliders" id="sliders"><legend class="sr-only">Parameters (applied on reset)</legend></fieldset>
+  </section>
+
+  <section class="panel" data-testid="panel-side" aria-label="Analysis">
+    <div class="card">
+      <h2>Populations</h2>
+      <div class="legend"><span><i class="sw" style="background:#9aa39a"></i>Rabbits</span><span><i class="sw" style="background:var(--fox)"></i>Foxes</span></div>
+      <svg data-testid="chart" viewBox="0 0 420 220" role="img" aria-label="Population chart">
+        <line x1="40" y1="190" x2="410" y2="190" stroke="#8a978a"/>
+        <line x1="40" y1="10" x2="40" y2="190" stroke="#8a978a"/>
+        <text x="225" y="214" text-anchor="middle" font-size="12" fill="#5b6b5e">tick</text>
+        <text x="12" y="100" text-anchor="middle" font-size="12" fill="#5b6b5e" transform="rotate(-90 12 100)">count</text>
+        <text id="ax-xmax" x="410" y="204" text-anchor="end" font-size="10" fill="#5b6b5e">0</text>
+        <text id="ax-ymax" x="36" y="16" text-anchor="end" font-size="10" fill="#5b6b5e">0</text>
+        <polyline data-testid="series-rabbits" fill="none" stroke="#9aa39a" stroke-width="1.5" points=""/>
+        <polyline data-testid="series-foxes" fill="none" stroke="#dc5014" stroke-width="1.5" points=""/>
+      </svg>
+      <div class="row"><button data-testid="csv-export" id="btn-csv">Download CSV</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Lotka–Volterra (RK4)</h2>
+      <div class="ode-grid">
+        <label>α <input data-testid="ode-alpha" type="number" step="any" value="1.1"></label>
+        <label>β <input data-testid="ode-beta" type="number" step="any" value="0.4"></label>
+        <label>γ <input data-testid="ode-gamma" type="number" step="any" value="0.4"></label>
+        <label>δ <input data-testid="ode-delta" type="number" step="any" value="0.1"></label>
+        <label>x₀ <input data-testid="ode-x0" type="number" step="any" value="10"></label>
+        <label>y₀ <input data-testid="ode-y0" type="number" step="any" value="10"></label>
+        <label>t <input data-testid="ode-t" type="number" step="any" value="50"></label>
+        <label>dt <input data-testid="ode-dt" type="number" step="any" value="0.01"></label>
+      </div>
+      <div class="row"><button data-testid="ode-run" id="btn-ode">Solve</button></div>
+      <div class="out">
+        <span>x(t)</span><span data-testid="ode-x">–</span>
+        <span>y(t)</span><span data-testid="ode-y">–</span>
+        <span>equilibrium x</span><span data-testid="ode-eq-x">–</span>
+        <span>equilibrium y</span><span data-testid="ode-eq-y">–</span>
+        <span>V drift</span><span data-testid="ode-drift">–</span>
+      </div>
+      <svg data-testid="ode-chart" viewBox="0 0 420 160" role="img" aria-label="Lotka–Volterra trajectory">
+        <line x1="10" y1="150" x2="410" y2="150" stroke="#8a978a"/>
+        <polyline data-testid="ode-series-x" fill="none" stroke="#2f7d4a" stroke-width="1.5" points=""/>
+        <polyline data-testid="ode-series-y" fill="none" stroke="#dc5014" stroke-width="1.5" points=""/>
+      </svg>
+    </div>
+
+    <div class="card">
+      <h2>Scenario</h2>
+      <label for="scenario" class="sr-only">Scenario JSON</label>
+      <textarea id="scenario" data-testid="scenario-json" spellcheck="false"></textarea>
+      <div class="row">
+        <button data-testid="scenario-export" id="btn-sc-export">Export</button>
+        <button data-testid="scenario-load" id="btn-sc-load">Load</button>
+      </div>
+      <div class="error" data-testid="scenario-error" role="alert"></div>
+    </div>
+
+    <div class="card">
+      <h2>Presets</h2>
+      <div class="row">
+        <label for="preset-name" class="sr-only">Preset name</label>
+        <input id="preset-name" type="text" data-testid="preset-name" placeholder="Preset name">
+        <button data-testid="preset-save" id="btn-preset-save">Save preset</button>
+      </div>
+      <ul class="presets" data-testid="preset-list"></ul>
+    </div>
+  </section>
+</main>
+<div class="sr-only" data-testid="announcer" aria-live="polite"></div>
+
+<script>
+"use strict";
+// ---------- simulation (no DOM) ----------
+const DEFAULTS = { width: 40, height: 30, grassMax: 4, rabbits0: 100, foxes0: 6, rabbitStart: 6, rabbitGain: 1,
+  rabbitCost: 1, rabbitBreed: 12, foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40 };
+const PARAM_KEYS = Object.keys(DEFAULTS);
+
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const sim = { params: null, seed: 0, rand: null, tick: 0, nextId: 1, grass: null, rabbitAt: null, foxAt: null,
+  rabbits: new Map(), foxes: new Map(), history: [] };
+
+function pick(list) { return list[Math.floor(sim.rand() * list.length)]; }
+
+function neighbours(x, y) {
+  const { width: W, height: H } = sim.params, out = [];
+  if (y > 0) out.push(y * W - W + x);
+  if (x < W - 1) out.push(y * W + x + 1);
+  if (y < H - 1) out.push(y * W + W + x);
+  if (x > 0) out.push(y * W + x - 1);
+  return out;
+}
+
+function addAnimal(map, at, k, energy) {
+  const W = sim.params.width;
+  const a = { id: sim.nextId++, x: k % W, y: Math.floor(k / W), energy };
+  map.set(a.id, a);
+  at[k] = a.id;
+  return a;
+}
+
+function grassSum() { let s = 0; for (const g of sim.grass) s += g; return s; }
+function record() { sim.history.push({ tick: sim.tick, rabbits: sim.rabbits.size, foxes: sim.foxes.size, grass: grassSum() }); }
+
+function simReset(seed, params) {
+  const p = Object.assign({}, DEFAULTS, params || {});
+  const W = p.width, H = p.height, N = W * H;
+  Object.assign(sim, { params: p, seed: seed | 0, rand: mulberry32(seed), tick: 0, nextId: 1, history: [],
+    grass: new Int32Array(N), rabbitAt: new Int32Array(N), foxAt: new Int32Array(N),
+    rabbits: new Map(), foxes: new Map() });
+  for (let k = 0; k < N; k++) sim.grass[k] = Math.floor(sim.rand() * (p.grassMax + 1));
+  for (let i = 0; i < p.rabbits0; i++) {
+    const free = [];
+    for (let k = 0; k < N; k++) if (!sim.rabbitAt[k]) free.push(k);
+    if (free.length) addAnimal(sim.rabbits, sim.rabbitAt, pick(free), p.rabbitStart);
+  }
+  for (let i = 0; i < p.foxes0; i++) {
+    const free = [];
+    for (let k = 0; k < N; k++) if (!sim.foxAt[k]) free.push(k);
+    if (free.length) addAnimal(sim.foxes, sim.foxAt, pick(free), p.foxStart);
+  }
+  record();
+}
+
+function moveTo(a, at, k) {
+  const W = sim.params.width;
+  at[a.y * W + a.x] = 0;
+  a.x = k % W; a.y = Math.floor(k / W);
+  at[k] = a.id;
+}
+
+function simTick() {
+  const p = sim.params, W = p.width;
+  for (let k = 0; k < sim.grass.length; k++) sim.grass[k] = Math.min(p.grassMax, sim.grass[k] + 1);
+
+  const rabbits = [...sim.rabbits.values()].sort((a, b) => a.id - b.id);
+  for (const r of rabbits) {
+    if (!sim.rabbits.has(r.id)) continue;
+    const moves = neighbours(r.x, r.y).filter(k => !sim.rabbitAt[k]);
+    if (moves.length) moveTo(r, sim.rabbitAt, pick(moves));
+    const here = r.y * W + r.x;
+    r.energy += p.rabbitGain * sim.grass[here];
+    sim.grass[here] = 0;
+    r.energy -= p.rabbitCost;
+    if (r.energy > p.rabbitBreed) {
+      const spots = neighbours(r.x, r.y).filter(k => !sim.rabbitAt[k]);
+      if (spots.length) {
+        const spot = pick(spots), child = Math.floor(r.energy / 2);
+        r.energy -= child;
+        addAnimal(sim.rabbits, sim.rabbitAt, spot, child);
+      }
+    }
+    if (r.energy <= 0) { sim.rabbits.delete(r.id); sim.rabbitAt[r.y * W + r.x] = 0; }
+  }
+
+  const foxes = [...sim.foxes.values()].sort((a, b) => a.id - b.id);
+  for (const f of foxes) {
+    if (!sim.foxes.has(f.id)) continue;
+    const nb = neighbours(f.x, f.y);
+    const prey = nb.filter(k => sim.rabbitAt[k] && !sim.foxAt[k]);
+    if (prey.length) moveTo(f, sim.foxAt, pick(prey));
+    else {
+      const free = nb.filter(k => !sim.foxAt[k]);
+      if (free.length) moveTo(f, sim.foxAt, pick(free));
+    }
+    const here = f.y * W + f.x;
+    if (sim.rabbitAt[here]) {
+      sim.rabbits.delete(sim.rabbitAt[here]);
+      sim.rabbitAt[here] = 0;
+      f.energy += p.foxGain;
+    }
+    f.energy -= p.foxCost;
+    if (f.energy >= p.foxBreed) {
+      const spots = neighbours(f.x, f.y).filter(k => !sim.foxAt[k]);
+      if (spots.length) {
+        const spot = pick(spots), child = Math.floor(f.energy / 2);
+        f.energy -= child;
+        addAnimal(sim.foxes, sim.foxAt, spot, child);
+      }
+    }
+    if (f.energy <= 0) { sim.foxes.delete(f.id); sim.foxAt[here] = 0; }
+  }
+  sim.tick += 1;
+  record();
+}
+
+function counts() { return { rabbits: sim.rabbits.size, foxes: sim.foxes.size, grass: grassSum() }; }
+
+function cellInfo(x, y) {
+  const k = y * sim.params.width + x, r = sim.rabbitAt[k], f = sim.foxAt[k];
+  return { grass: sim.grass[k],
+    rabbit: r ? { id: r, energy: sim.rabbits.get(r).energy } : null,
+    fox: f ? { id: f, energy: sim.foxes.get(f).energy } : null };
+}
+
+function toCSV() {
+  return "tick,rabbits,foxes,grass\n" + sim.history.map(h => `${h.tick},${h.rabbits},${h.foxes},${h.grass}`).join("\n") + "\n";
+}
+
+function scenarioObject() { return { version: 1, seed: sim.seed, params: Object.assign({}, sim.params) }; }
+
+function parseScenario(text) {
+  let obj;
+  try { obj = JSON.parse(text); } catch (e) { return { error: "Not valid JSON: " + e.message }; }
+  if (!obj || typeof obj !== "object") return { error: "Scenario must be a JSON object." };
+  if (obj.version !== 1) return { error: "Unsupported scenario version (expected 1)." };
+  if (!Number.isInteger(obj.seed)) return { error: "Scenario seed must be an integer." };
+  const params = {};
+  if (obj.params && typeof obj.params === "object") for (const key of PARAM_KEYS) if (key in obj.params) params[key] = obj.params[key];
+  return { seed: obj.seed, params };
+}
+
+// ---------- Lotka-Volterra ----------
+function lvDeriv(p, x, y) { return [p.alpha * x - p.beta * x * y, p.delta * x * y - p.gamma * y]; }
+function odeTrajectory(p, t, dt) {
+  const n = Math.round(t / dt);
+  let x = p.x0, y = p.y0;
+  const xs = [x], ys = [y];
+  for (let i = 0; i < n; i++) {
+    const k1 = lvDeriv(p, x, y);
+    const k2 = lvDeriv(p, x + dt / 2 * k1[0], y + dt / 2 * k1[1]);
+    const k3 = lvDeriv(p, x + dt / 2 * k2[0], y + dt / 2 * k2[1]);
+    const k4 = lvDeriv(p, x + dt * k3[0], y + dt * k3[1]);
+    x += dt / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]);
+    y += dt / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+    xs.push(x); ys.push(y);
+  }
+  return { x, y, xs, ys };
+}
+function lvV(p, x, y) { return p.delta * x - p.gamma * Math.log(x) + p.beta * y - p.alpha * Math.log(y); }
+
+// ---------- rendering ----------
+const $ = sel => document.querySelector(`[data-testid="${sel}"]`);
+const canvas = $("world"), ctx = canvas.getContext("2d");
+
+function draw() {
+  const p = sim.params, W = p.width, H = p.height;
+  if (canvas.width !== W * 10) canvas.width = W * 10;
+  if (canvas.height !== H * 10) canvas.height = H * 10;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const g = sim.grass[y * W + x];
+    ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / p.grassMax)}, 30)`;
+    ctx.fillRect(x * 10, y * 10, 10, 10);
+  }
+  ctx.fillStyle = "rgb(240, 240, 240)";
+  for (const r of sim.rabbits.values()) { ctx.beginPath(); ctx.arc(r.x * 10 + 5, r.y * 10 + 5, 3.6, 0, 2 * Math.PI); ctx.fill(); }
+  ctx.fillStyle = "rgb(220, 80, 20)";
+  for (const f of sim.foxes.values()) { ctx.beginPath(); ctx.arc(f.x * 10 + 5, f.y * 10 + 5, 4.4, 0, 2 * Math.PI); ctx.fill(); }
+}
+
+function drawChart() {
+  const h = sim.history, last = Math.max(1, h[h.length - 1].tick);
+  let ymax = 1;
+  for (const e of h) ymax = Math.max(ymax, e.rabbits, e.foxes);
+  const X = t => (40 + 370 * t / last).toFixed(2), Y = v => (190 - 180 * v / ymax).toFixed(2);
+  $("series-rabbits").setAttribute("points", h.map(e => `${X(e.tick)},${Y(e.rabbits)}`).join(" "));
+  $("series-foxes").setAttribute("points", h.map(e => `${X(e.tick)},${Y(e.foxes)}`).join(" "));
+  document.getElementById("ax-xmax").textContent = String(h[h.length - 1].tick);
+  document.getElementById("ax-ymax").textContent = String(ymax);
+}
+
+function updateCounters() {
+  const c = counts();
+  $("tick").textContent = String(sim.tick);
+  $("count-rabbits").textContent = String(c.rabbits);
+  $("count-foxes").textContent = String(c.foxes);
+  $("count-grass").textContent = String(c.grass);
+}
+
+function render() { draw(); drawChart(); updateCounters(); }
+
+// ---------- API ----------
+window.lab = {
+  reset(seed, params = {}) { simReset(seed, params); render(); return counts(); },
+  step(n = 1) { for (let i = 0; i < n; i++) simTick(); render(); return counts(); },
+  counts,
+  tick: () => sim.tick,
+  cell: cellInfo,
+  history: () => sim.history.map(e => Object.assign({}, e)),
+  ode(p, t, dt) { const r = odeTrajectory(p, t, dt); return { x: r.x, y: r.y }; },
+  exportCSV: toCSV,
+  exportScenario: () => JSON.stringify(scenarioObject()),
+  loadScenario(text) {
+    const res = parseScenario(text), err = $("scenario-error");
+    if (res.error) { err.textContent = res.error; return false; }
+    err.textContent = "";
+    window.lab.reset(res.seed, res.params);
+    syncControls();
+    return true;
+  },
+};
+
+// ---------- controls ----------
+const SLIDERS = [["rabbits0", "Rabbits at start", 0, 300], ["foxes0", "Foxes at start", 0, 60],
+  ["rabbitBreed", "Rabbit breed energy", 2, 40], ["foxBreed", "Fox breed energy", 2, 60],
+  ["foxGain", "Fox gain per rabbit", 1, 30], ["grassMax", "Max grass", 1, 10]];
+const sliderBox = document.getElementById("sliders");
+for (const [key, label, min, max] of SLIDERS) {
+  const div = document.createElement("div");
+  div.className = "slider";
+  div.innerHTML = `<label for="p-${key}"><span>${label}</span><output id="p-${key}-val">${DEFAULTS[key]}</output></label>` +
+    `<input id="p-${key}" type="range" data-testid="param-${key}" min="${min}" max="${max}" step="1" value="${DEFAULTS[key]}">`;
+  sliderBox.appendChild(div);
+  const input = div.querySelector("input"), out = div.querySelector("output");
+  input.addEventListener("input", () => { out.textContent = input.value; });
+}
+
+function sliderParams() {
+  const p = {};
+  for (const [key] of SLIDERS) p[key] = parseInt($(`param-${key}`).value, 10);
+  return p;
+}
+function syncControls() {
+  $("seed").value = String(sim.seed);
+  for (const [key] of SLIDERS) {
+    const el = $(`param-${key}`);
+    el.value = String(sim.params[key]);
+    document.getElementById(`p-${key}-val`).textContent = el.value;
+  }
+}
+function uiReset() {
+  const seed = parseInt($("seed").value, 10);
+  window.lab.reset(Number.isFinite(seed) ? seed : 0, sliderParams());
+}
+
+// play loop: a fixed-period timer advancing by elapsed time, so the rate never depends on the frame rate
+let timer = null, lastTime = 0, carry = 0;
+const speed = () => parseInt($("speed").value, 10) || 1;
+function frame() {
+  const now = performance.now();
+  carry += (now - lastTime) * speed() / 1000;
+  lastTime = now;
+  let n = Math.min(Math.floor(carry), 600);
+  carry -= Math.floor(carry);
+  if (n > 0) { while (n-- > 0) simTick(); render(); }
+}
+function play() { if (timer) return; lastTime = performance.now(); carry = 0; timer = setInterval(frame, 16); }
+function pause() {
+  if (!timer) return;
+  frame();
+  clearInterval(timer); timer = null;
+  const c = counts();
+  $("announcer").textContent = `Tick ${sim.tick}: ${c.rabbits} rabbits, ${c.foxes} foxes`;
+}
+$("speed").addEventListener("input", () => {
+  if (timer) frame();  // bank the time run at the old speed before the new one applies
+  document.getElementById("speed-val").textContent = $("speed").value;
+});
+
+$("play").addEventListener("click", play);
+$("pause").addEventListener("click", pause);
+$("step").addEventListener("click", () => window.lab.step(1));
+$("reset").addEventListener("click", uiReset);
+$("csv-export").addEventListener("click", () => {
+  const url = URL.createObjectURL(new Blob([toCSV()], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "ecolab.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+$("ode-run").addEventListener("click", () => {
+  const num = id => parseFloat($(id).value);
+  const p = { alpha: num("ode-alpha"), beta: num("ode-beta"), gamma: num("ode-gamma"), delta: num("ode-delta"),
+    x0: num("ode-x0"), y0: num("ode-y0") };
+  const r = odeTrajectory(p, num("ode-t"), num("ode-dt"));
+  $("ode-x").textContent = r.x.toPrecision(10);
+  $("ode-y").textContent = r.y.toPrecision(10);
+  $("ode-eq-x").textContent = (p.gamma / p.delta).toPrecision(10);
+  $("ode-eq-y").textContent = (p.alpha / p.beta).toPrecision(10);
+  $("ode-drift").textContent = Math.abs(lvV(p, r.x, r.y) - lvV(p, p.x0, p.y0)).toExponential(3);
+  const n = r.xs.length, stride = Math.max(1, Math.ceil(n / 800));
+  let vmax = 1e-9;
+  for (let i = 0; i < n; i++) vmax = Math.max(vmax, r.xs[i], r.ys[i]);
+  const pts = arr => { const out = []; for (let i = 0; i < n; i += stride) out.push(`${(10 + 400 * i / Math.max(1, n - 1)).toFixed(1)},${(150 - 140 * arr[i] / vmax).toFixed(1)}`); return out.join(" "); };
+  $("ode-series-x").setAttribute("points", pts(r.xs));
+  $("ode-series-y").setAttribute("points", pts(r.ys));
+});
+
+$("scenario-export").addEventListener("click", () => { $("scenario-json").value = window.lab.exportScenario(); });
+$("scenario-load").addEventListener("click", () => { window.lab.loadScenario($("scenario-json").value); });
+
+// presets
+const STORE = "ecolab.presets";
+function readPresets() {
+  try {
+    const v = JSON.parse(localStorage.getItem(STORE) || "{}");
+    return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  } catch (e) { return {}; }
+}
+function writePresets(obj) { localStorage.setItem(STORE, JSON.stringify(obj)); }
+function renderPresets() {
+  const list = $("preset-list"), presets = readPresets();
+  list.textContent = "";
+  for (const name of Object.keys(presets).sort()) {
+    const li = document.createElement("li");
+    li.setAttribute("data-testid", "preset-item");
+    const span = document.createElement("span");
+    span.textContent = name;
+    const load = document.createElement("button");
+    load.textContent = "Load"; load.setAttribute("data-testid", "preset-load");
+    load.setAttribute("aria-label", `Load preset ${name}`);
+    load.addEventListener("click", () => window.lab.loadScenario(JSON.stringify(readPresets()[name])));
+    const del = document.createElement("button");
+    del.textContent = "Delete"; del.setAttribute("data-testid", "preset-delete");
+    del.setAttribute("aria-label", `Delete preset ${name}`);
+    del.addEventListener("click", () => { const p = readPresets(); delete p[name]; writePresets(p); renderPresets(); });
+    li.append(span, load, del);
+    list.appendChild(li);
+  }
+}
+$("preset-save").addEventListener("click", () => {
+  const name = $("preset-name").value.trim();
+  if (!name) return;
+  const p = readPresets();
+  p[name] = scenarioObject();
+  writePresets(p);
+  renderPresets();
+});
+
+// keyboard shortcuts: only when no input, textarea, select or button has focus
+document.addEventListener("keydown", e => {
+  const t = document.activeElement;
+  if (t && t.matches("input, textarea, select, button")) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === " ") { e.preventDefault(); timer ? pause() : play(); }
+  else if (e.key === "s" || e.key === "S") window.lab.step(1);
+  else if (e.key === "r" || e.key === "R") uiReset();
+});
+
+renderPresets();
+window.lab.reset(42, {});
+syncControls();
+</script>
+</body>
+</html>

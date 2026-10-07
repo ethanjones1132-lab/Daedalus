@@ -14,17 +14,17 @@ Follow every rule below exactly. An automated test suite checks the app through 
 |---|---|---|
 | `width` | 40 | Grid columns |
 | `height` | 30 | Grid rows |
-| `grassMax` | 5 | Maximum grass level of a cell |
-| `rabbits0` | 60 | Rabbits placed at reset |
-| `foxes0` | 8 | Foxes placed at reset |
+| `grassMax` | 4 | Maximum grass level of a cell |
+| `rabbits0` | 100 | Rabbits placed at reset |
+| `foxes0` | 6 | Foxes placed at reset |
 | `rabbitStart` | 6 | Energy of each rabbit placed at reset |
 | `rabbitGain` | 1 | Energy a rabbit gains per grass unit eaten |
 | `rabbitCost` | 1 | Energy a rabbit loses per tick |
 | `rabbitBreed` | 12 | Energy at which a rabbit breeds |
 | `foxStart` | 12 | Energy of each fox placed at reset |
-| `foxGain` | 8 | Energy a fox gains per rabbit eaten |
-| `foxCost` | 1 | Energy a fox loses per tick |
-| `foxBreed` | 20 | Energy at which a fox breeds |
+| `foxGain` | 4 | Energy a fox gains per rabbit eaten |
+| `foxCost` | 2 | Energy a fox loses per tick |
+| `foxBreed` | 40 | Energy at which a fox breeds |
 
 Any parameter object passed to the app is merged over these **defaults**, not over the current values.
 
@@ -207,7 +207,7 @@ A reset leaves one point per series.
 - Every control can be reached with Tab and operated from the keyboard. Buttons are `<button>` elements.
 - Focus is clearly visible: an outline or ring on the focused control.
 - **The announcer:** an element `announcer` with `aria-live="polite"`. When play is paused, set its text to exactly `Tick N: R rabbits, F foxes`, for example `Tick 37: 52 rabbits, 7 foxes`.
-- **Shortcuts,** active when focus is **not** in a text input, number input or textarea:
+- **Shortcuts,** active only when **no** input, textarea, select or button has focus (for example, focus on the page body). A focused button keeps its own Space/Enter behaviour:
   - Space toggles play and pause;
   - `s` runs one tick;
   - `r` resets the way the `reset` button does.
