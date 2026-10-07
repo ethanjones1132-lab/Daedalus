@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ecosystem Lab</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:#0b1220;color:#dbe4f0;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    font-size:14px;line-height:1.4;
+  }
+  h1{font-size:18px;margin:0 0 12px;letter-spacing:.01em}
+  h2{font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.08em;color:#8fb0d8}
+  .wrap{display:flex;flex-wrap:wrap;gap:16px;padding:16px;align-items:flex-start}
+  .panel{background:#131c2e;border:1px solid #26344d;border-radius:12px;padding:14px;min-width:0}
+  .panel-world{flex:1 1 420px;max-width:520px}
+  .panel-side{flex:1 1 380px;min-width:0}
+  .block + .block{border-top:1px solid #26344d;margin-top:14px;padding-top:14px}
+  .canvas-wrap{width:100%;display:flex;justify-content:center}
+  canvas{
+    width:100%;height:auto;display:block;background:#000;border-radius:8px;
+    image-rendering:pixelated;border:1px solid #26344d;
+  }
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 8px}
+  button{
+    font:inherit;color:#e8f0fb;background:#22304a;border:1px solid #35486b;border-radius:8px;
+    padding:6px 12px;cursor:pointer;transition:background .12s ease;
+  }
+  button:hover{background:#2b3d5e}
+  button:active{background:#1b2740}
+  button:focus,input:focus,textarea:focus,select:focus{outline:2px solid #6aa9ff;outline-offset:2px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+  .row label{color:#a9bcd6}
+  input[type=number],input[type=text],textarea{
+    background:#0e1728;border:1px solid #35486b;border-radius:8px;color:#e8f0fb;
+    padding:5px 8px;font:inherit;
+  }
+  input[type=number]{width:88px}
+  input[type=text]{flex:1 1 120px;min-width:0}
+  textarea{
+    width:100%;min-height:92px;font-family:ui-monospace,Menlo,Consolas,monospace;
+    font-size:12px;resize:vertical;
+  }
+  input[type=range]{accent-color:#6aa9ff;background:transparent}
+  #speed{flex:1 1 120px;min-width:80px}
+  .val{min-width:34px;text-align:right;font-variant-numeric:tabular-nums;color:#eaf2ff}
+  .unit{color:#6f86a8;font-size:12px}
+  .sliders{margin-top:6px}
+  .slider-row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .slider-row label{flex:0 0 108px;color:#a9bcd6;font-size:13px}
+  .slider-row input[type=range]{flex:1 1 auto;min-width:70px}
+  .slider-row .val{flex:0 0 34px;font-size:13px}
+  .counters{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+  .counter{
+    background:#0e1728;border:1px solid #26344d;border-radius:8px;padding:6px 10px;
+    display:flex;gap:8px;align-items:baseline;
+  }
+  .clabel{color:#8fb0d8;font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+  .counter span[data-testid]{font-size:16px;font-variant-numeric:tabular-nums}
+  .chart{width:100%;height:auto;display:block;background:#0b1220;border:1px solid #26344d;border-radius:8px}
+  .axis{stroke:#33456a;stroke-width:1}
+  .axlabel{fill:#8fb0d8;font-size:11px}
+  .legend{display:flex;gap:16px;font-size:12px;color:#a9bcd6;margin-top:8px;flex-wrap:wrap}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+  .ode-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin-bottom:10px}
+  .ode-grid label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:#a9bcd6}
+  .ode-grid input{width:100%;min-width:0}
+  .ode-out{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:4px 14px;
+    font-size:12px;color:#a9bcd6;margin:10px 0}
+  .ode-out b{color:#eaf2ff;font-weight:600;font-variant-numeric:tabular-nums}
+  .error{color:#ff9b9b;font-size:13px;min-height:18px;margin-top:6px}
+  .preset-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+  [data-testid="preset-item"]{
+    display:flex;align-items:center;gap:8px;background:#0e1728;border:1px solid #26344d;
+    border-radius:8px;padding:6px 8px;
+  }
+  .pname{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);white-space:nowrap;border:0}
+  @media (max-width:999px){
+    .panel-world,.panel-side{flex:1 1 100%;max-width:100%}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="panel panel-world" id="panel-world" data-testid="panel-world">
+    <h1>Ecosystem Lab</h1>
+    <div class="canvas-wrap"><canvas data-testid="world" width="400" height="300"></canvas></div>
+
+    <div class="controls">
+      <button data-testid="play" id="btn-play">Play</button>
+      <button data-testid="pause" id="btn-pause">Pause</button>
+      <button data-testid="step" id="btn-step">Step</button>
+      <button data-testid="reset" id="btn-reset">Reset</button>
+    </div>
+
+    <div class="row">
+      <label for="seed">Seed</label>
+      <input id="seed" data-testid="seed" type="number" step="1" value="42">
+      <label for="speed">Speed</label>
+      <input id="speed" data-testid="speed" type="range" min="1" max="60" step="1" value="10">
+      <span class="val" id="speed-val">10</span><span class="unit">ticks/s</span>
+    </div>
+
+    <div class="sliders">
+      <div class="slider-row">
+        <label for="param-rabbits0">Rabbits</label>
+        <input id="param-rabbits0" data-testid="param-rabbits0" type="range" min="0" max="300" step="1" value="100">
+        <span class="val" id="v-param-rabbits0">100</span>
+      </div>
+      <div class="slider-row">
+        <label for="param-foxes0">Foxes</label>
+        <input id="param-foxes0" data-testid="param-foxes0" type="range" min="0" max="60" step="1" value="6">
+        <span class="val" id="v-param-foxes0">6</span>
+      </div>
+      <div class="slider-row">
+        <label for="param-rabbitBreed">Rabbit breed</label>
+        <input id="param-rabbitBreed" data-testid="param-rabbitBreed" type="range" min="2" max="40" step="1" value="12">
+        <span class="val" id="v-param-rabbitBreed">12</span>
+      </div>
+      <div class="slider-row">
+        <label for="param-foxBreed">Fox breed</label>
+        <input id="param-foxBreed" data-testid="param-foxBreed" type="range" min="2" max="60" step="1" value="40">
+        <span class="val" id="v-param-foxBreed">40</span>
+      </div>
+      <div class="slider-row">
+        <label for="param-foxGain">Fox gain</label>
+        <input id="param-foxGain" data-testid="param-foxGain" type="range" min="1" max="30" step="1" value="4">
+        <span class="val" id="v-param-foxGain">4</span>
+      </div>
+      <div class="slider-row">
+        <label for="param-grassMax">Max grass</label>
+        <input id="param-grassMax" data-testid="param-grassMax" type="range" min="1" max="10" step="1" value="4">
+        <span class="val" id="v-param-grassMax">4</span>
+      </div>
+    </div>
+
+    <div class="counters">
+      <div class="counter"><span class="clabel">Tick</span><span data-testid="tick">0</span></div>
+      <div class="counter"><span class="clabel">Rabbits</span><span data-testid="count-rabbits">0</span></div>
+      <div class="counter"><span class="clabel">Foxes</span><span data-testid="count-foxes">0</span></div>
+      <div class="counter"><span class="clabel">Grass</span><span data-testid="count-grass">0</span></div>
+    </div>
+  </section>
+
+  <section class="panel panel-side" id="panel-side" data-testid="panel-side">
+    <div class="block">
+      <h2>Populations</h2>
+      <svg data-testid="chart" class="chart" viewBox="0 0 400 200" preserveAspectRatio="none" role="img" aria-label="Population history">
+        <line class="axis" x1="36" y1="10" x2="36" y2="174"></line>
+        <line class="axis" x1="36" y1="174" x2="390" y2="174"></line>
+        <polyline data-testid="series-rabbits" fill="none" stroke="#7fb2ff" stroke-width="1.6" points=""></polyline>
+        <polyline data-testid="series-foxes" fill="none" stroke="#ff8a4c" stroke-width="1.6" points=""></polyline>
+        <text class="axlabel" x="213" y="193" text-anchor="middle">tick</text>
+        <text class="axlabel" x="12" y="92" text-anchor="middle" transform="rotate(-90 12 92)">count</text>
+      </svg>
+      <div class="legend">
+        <span><span class="swatch" style="background:#7fb2ff"></span>Rabbits</span>
+        <span><span class="swatch" style="background:#ff8a4c"></span>Foxes</span>
+      </div>
+    </div>
+
+    <div class="block">
+      <h2>Lotka&ndash;Volterra</h2>
+      <div class="ode-grid">
+        <label>alpha<input data-testid="ode-alpha" type="number" step="0.01" value="1.1"></label>
+        <label>beta<input data-testid="ode-beta" type="number" step="0.01" value="0.4"></label>
+        <label>gamma<input data-testid="ode-gamma" type="number" step="0.01" value="0.4"></label>
+        <label>delta<input data-testid="ode-delta" type="number" step="0.01" value="0.1"></label>
+        <label>x0<input data-testid="ode-x0" type="number" step="1" value="10"></label>
+        <label>y0<input data-testid="ode-y0" type="number" step="1" value="10"></label>
+        <label>t<input data-testid="ode-t" type="number" step="1" value="50"></label>
+        <label>dt<input data-testid="ode-dt" type="number" step="0.001" value="0.01"></label>
+      </div>
+      <button data-testid="ode-run" id="btn-ode-run">Run</button>
+      <div class="ode-out">
+        <div>final x: <b data-testid="ode-x"></b></div>
+        <div>final y: <b data-testid="ode-y"></b></div>
+        <div>equilibrium x = &gamma;/&delta;: <b data-testid="ode-eq-x"></b></div>
+        <div>equilibrium y = &alpha;/&beta;: <b data-testid="ode-eq-y"></b></div>
+        <div>drift: <b data-testid="ode-drift"></b></div>
+      </div>
+      <svg data-testid="ode-chart" class="chart" viewBox="0 0 400 200" preserveAspectRatio="none" role="img" aria-label="ODE trajectory">
+        <line class="axis" x1="36" y1="10" x2="36" y2="174"></line>
+        <line class="axis" x1="36" y1="174" x2="390" y2="174"></line>
+        <polyline data-testid="ode-series-x" fill="none" stroke="#7fb2ff" stroke-width="1.6" points=""></polyline>
+        <polyline data-testid="ode-series-y" fill="none" stroke="#ff8a4c" stroke-width="1.6" points=""></polyline>
+        <text class="axlabel" x="213" y="193" text-anchor="middle">time</text>
+        <text class="axlabel" x="12" y="92" text-anchor="middle" transform="rotate(-90 12 92)">value</text>
+      </svg>
+    </div>
+
+    <div class="block">
+      <h2>Scenario</h2>
+      <textarea data-testid="scenario-json" spellcheck="false" placeholder='{"version":1,"seed":42,"params":{}}'></textarea>
+      <div class="row">
+        <button data-testid="scenario-export" id="btn-scenario-export">Export scenario</button>
+        <button data-testid="scenario-load" id="btn-scenario-load">Load scenario</button>
+        <button data-testid="csv-export" id="btn-csv-export">Export CSV</button>
+      </div>
+      <div class="error" data-testid="scenario-error"></div>
+    </div>
+
+    <div class="block">
+      <h2>Presets</h2>
+      <div class="row">
+        <label for="preset-name">Name</label>
+        <input id="preset-name" data-testid="preset-name" type="text" placeholder="my scenario">
+        <button data-testid="preset-save" id="btn-preset-save">Save preset</button>
+      </div>
+      <div class="preset-list" data-testid="preset-list"></div>
+    </div>
+  </section>
+</div>
+
+<div id="announcer" data-testid="announcer" class="sr-only" aria-live="polite"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- randomness ---------- */
+  function mulberry32(seed) {
+    let a = seed | 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------- parameters ---------- */
+  const DEFAULTS = {
+    width: 40,
+    height: 30,
+    grassMax: 4,
+    rabbits0: 100,
+    foxes0: 6,
+    rabbitStart: 6,
+    rabbitGain: 1,
+    rabbitCost: 1,
+    rabbitBreed: 12,
+    foxStart: 12,
+    foxGain: 4,
+    foxCost: 2,
+    foxBreed: 40
+  };
+
+  /* ---------- state ---------- */
+  let params = Object.assign({}, DEFAULTS);
+  let rand = mulberry32(42);
+  let currentSeed = 42;
+  let tickNum = 0;
+  let nextId = 1;
+  let W = DEFAULTS.width;
+  let H = DEFAULTS.height;
+  let grass = [];
+  let rGrid = [];
+  let fGrid = [];
+  let rabbits = [];
+  let foxes = [];
+  let hist = [];
+
+  /* ---------- helpers ---------- */
+  function pick(list) {
+    if (!list || list.length === 0) return null;
+    return list[Math.floor(rand() * list.length)];
+  }
+
+  function neighbours(x, y) {
+    const out = [];
+    if (y > 0) out.push((y - 1) * W + x);
+    if (x < W - 1) out.push(y * W + x + 1);
+    if (y < H - 1) out.push((y + 1) * W + x);
+    if (x > 0) out.push(y * W + x - 1);
+    return out;
+  }
+
+  function addRabbit(x, y, energy) {
+    const a = { id: nextId++, x: x, y: y, energy: energy, alive: true };
+    rabbits.push(a);
+    rGrid[y * W + x] = a;
+    return a;
+  }
+
+  function addFox(x, y, energy) {
+    const a = { id: nextId++, x: x, y: y, energy: energy, alive: true };
+    foxes.push(a);
+    fGrid[y * W + x] = a;
+    return a;
+  }
+
+  function killRabbit(a) {
+    if (!a || !a.alive) return;
+    a.alive = false;
+    const i = a.y * W + a.x;
+    if (rGrid[i] === a) rGrid[i] = null;
+  }
+
+  function killFox(a) {
+    if (!a || !a.alive) return;
+    a.alive = false;
+    const i = a.y * W + a.x;
+    if (fGrid[i] === a) fGrid[i] = null;
+  }
+
+  function grassSum() {
+    let g = 0;
+    for (let i = 0; i < grass.length; i++) g += grass[i];
+    return g;
+  }
+
+  function counts() {
+    return { rabbits: rabbits.length, foxes: foxes.length, grass: grassSum() };
+  }
+
+  function recordHistory() {
+    hist.push({
+      tick: tickNum,
+      rabbits: rabbits.length,
+      foxes: foxes.length,
+      grass: grassSum()
+    });
+  }
+
+  /* ---------- reset ---------- */
+  function resetSim(seedValue, p) {
+    params = Object.assign({}, DEFAULTS, p || {});
+    const s = Number(seedValue);
+    currentSeed = Number.isFinite(s) ? Math.trunc(s) : 0;
+    rand = mulberry32(currentSeed);
+    tickNum = 0;
+    nextId = 1;
+    hist = [];
+
+    let w = Math.floor(Number(params.width));
+    let h = Math.floor(Number(params.height));
+    if (!(w > 0)) w = DEFAULTS.width;
+    if (!(h > 0)) h = DEFAULTS.height;
+    W = w;
+    H = h;
+
+    const n = W * H;
+    grass = new Array(n);
+    rGrid = new Array(n).fill(null);
+    fGrid = new Array(n).fill(null);
+    rabbits = [];
+    foxes = [];
+
+    /* grass */
+    for (let i = 0; i < n; i++) {
+      grass[i] = Math.floor(rand() * (params.grassMax + 1));
+    }
+
+    /* rabbits */
+    const r0 = Math.max(0, Math.floor(Number(params.rabbits0)) || 0);
+    for (let k = 0; k < r0; k++) {
+      const free = [];
+      for (let i = 0; i < n; i++) if (!rGrid[i]) free.push(i);
+      const c = pick(free);
+      if (c === null) continue;
+      addRabbit(c % W, Math.floor(c / W), params.rabbitStart);
+    }
+
+    /* foxes */
+    const f0 = Math.max(0, Math.floor(Number(params.foxes0)) || 0);
+    for (let k = 0; k < f0; k++) {
+      const free = [];
+      for (let i = 0; i < n; i++) if (!fGrid[i]) free.push(i);
+      const c = pick(free);
+      if (c === null) continue;
+      addFox(c % W, Math.floor(c / W), params.foxStart);
+    }
+
+    recordHistory();
+  }
+
+  /* ---------- one tick ---------- */
+  function doTick() {
+    const gmax = params.grassMax;
+    const n = W * H;
+
+    /* 1. grass growth */
+    for (let i = 0; i < n; i++) {
+      if (grass[i] < gmax) grass[i]++;
+    }
+
+    /* 2. rabbits */
+    const rlist = rabbits.filter(function (a) { return a.alive; }).sort(function (a, b) { return a.id - b.id; });
+    for (let k = 0; k < rlist.length; k++) {
+      const r = rlist[k];
+      if (!r.alive) continue;
+
+      /* move */
+      const nb = neighbours(r.x, r.y);
+      const free = [];
+      for (let j = 0; j < nb.length; j++) if (!rGrid[nb[j]]) free.push(nb[j]);
+      const spot = pick(free);
+      if (spot !== null) {
+        rGrid[r.y * W + r.x] = null;
+        r.x = spot % W;
+        r.y = Math.floor(spot / W);
+        rGrid[spot] = r;
+      }
+
+      /* eat */
+      const ci = r.y * W + r.x;
+      r.energy += params.rabbitGain * grass[ci];
+      grass[ci] = 0;
+
+      /* cost */
+      r.energy -= params.rabbitCost;
+
+      /* breed */
+      if (r.energy >= params.rabbitBreed) {
+        const nb2 = neighbours(r.x, r.y);
+        const free2 = [];
+        for (let j = 0; j < nb2.length; j++) if (!rGrid[nb2[j]]) free2.push(nb2[j]);
+        const s2 = pick(free2);
+        if (s2 !== null) {
+          const child = Math.floor(r.energy / 2);
+          r.energy -= child;
+          addRabbit(s2 % W, Math.floor(s2 / W), child);
+        }
+      }
+
+      /* die */
+      if (r.energy <= 0) killRabbit(r);
+    }
+    rabbits = rabbits.filter(function (a) { return a.alive; });
+
+    /* 3. foxes */
+    const flist = foxes.filter(function (a) { return a.alive; }).sort(function (a, b) { return a.id - b.id; });
+    for (let k = 0; k < flist.length; k++) {
+      const f = flist[k];
+      if (!f.alive) continue;
+
+      /* move */
+      const nb = neighbours(f.x, f.y);
+      let cand = [];
+      for (let j = 0; j < nb.length; j++) {
+        const c = nb[j];
+        if (rGrid[c] && !fGrid[c]) cand.push(c);
+      }
+      let spot = pick(cand);
+      if (spot === null) {
+        cand = [];
+        for (let j = 0; j < nb.length; j++) if (!fGrid[nb[j]]) cand.push(nb[j]);
+        spot = pick(cand);
+      }
+      if (spot !== null) {
+        fGrid[f.y * W + f.x] = null;
+        f.x = spot % W;
+        f.y = Math.floor(spot / W);
+        fGrid[spot] = f;
+      }
+
+      /* eat */
+      const ci = f.y * W + f.x;
+      const prey = rGrid[ci];
+      if (prey && prey.alive) {
+        killRabbit(prey);
+        f.energy += params.foxGain;
+      }
+
+      /* cost */
+      f.energy -= params.foxCost;
+
+      /* breed */
+      if (f.energy >= params.foxBreed) {
+        const nb2 = neighbours(f.x, f.y);
+        const free2 = [];
+        for (let j = 0; j < nb2.length; j++) if (!fGrid[nb2[j]]) free2.push(nb2[j]);
+        const s2 = pick(free2);
+        if (s2 !== null) {
+          const child = Math.floor(f.energy / 2);
+          f.energy -= child;
+          addFox(s2 % W, Math.floor(s2 / W), child);
+        }
+      }
+
+      /* die */
+      if (f.energy <= 0) killFox(f);
+    }
+    foxes = foxes.filter(function (a) { return a.alive; });
+    rabbits = rabbits.filter(function (a) { return a.alive; });
+
+    /* 4. bookkeeping */
+    tickNum++;
+    recordHistory();
+  }
+
+  /* ---------- RK4 ---------- */
+  function integrateODE(p, t, dt) {
+    const alpha = Number(p.alpha) || 0;
+    const beta = Number(p.beta) || 0;
+    const gamma = Number(p.gamma) || 0;
+    const delta = Number(p.delta) || 0;
+    let x = Number(p.x0) || 0;
+    let y = Number(p.y0) || 0;
+    const T = Number(t);
+    const D = Number(dt);
+    let n = (D > 0 && isFinite(T)) ? Math.round(T / D) : 0;
+    if (!isFinite(n) || n < 0) n = 0;
+
+    const traj = [{ t: 0, x: x, y: y }];
+    for (let i = 0; i < n; i++) {
+      const k1x = alpha * x - beta * x * y;
+      const k1y = delta * x * y - gamma * y;
+      const x2 = x + (D / 2) * k1x, y2 = y + (D / 2) * k1y;
+      const k2x = alpha * x2 - beta * x2 * y2;
+      const k2y = delta * x2 * y2 - gamma * y2;
+      const x3 = x + (D / 2) * k2x, y3 = y + (D / 2) * k2y;
+      const k3x = alpha * x3 - beta * x3 * y3;
+      const k3y = delta * x3 * y3 - gamma * y3;
+      const x4 = x + D * k3x, y4 = y + D * k3y;
+      const k4x = alpha * x4 - beta * x4 * y4;
+      const k4y = delta * x4 * y4 - gamma * y4;
+      x = x + (D / 6) * (k1x + 2 * k2x + 2 * k3x + k4x);
+      y = y + (D / 6) * (k1y + 2 * k2y + 2 * k3y + k4y);
+      traj.push({ t: (i + 1) * D, x: x, y: y });
+    }
+    return traj;
+  }
+
+  /* ---------- DOM ---------- */
+  const canvasEl = document.querySelector('[data-testid="world"]');
+  const ctx = canvasEl.getContext('2d');
+  const seedEl = document.querySelector('[data-testid="seed"]');
+  const speedEl = document.querySelector('[data-testid="speed"]');
+  const speedValEl = document.getElementById('speed-val');
+  const tickEl = document.querySelector('[data-testid="tick"]');
+  const countRab = document.querySelector('[data-testid="count-rabbits"]');
+  const countFox = document.querySelector('[data-testid="count-foxes"]');
+  const countGrass = document.querySelector('[data-testid="count-grass"]');
+  const announcerEl = document.querySelector('[data-testid="announcer"]');
+  const chartR = document.querySelector('[data-testid="series-rabbits"]');
+  const chartF = document.querySelector('[data-testid="series-foxes"]');
+  const odeSvg = document.querySelector('[data-testid="ode-chart"]');
+  const odeX = odeSvg.querySelector('[data-testid="ode-series-x"]');
+  const odeY = odeSvg.querySelector('[data-testid="ode-series-y"]');
+  const errEl = document.querySelector('[data-testid="scenario-error"]');
+  const scenarioEl = document.querySelector('[data-testid="scenario-json"]');
+  const presetListEl = document.querySelector('[data-testid="preset-list"]');
+  const presetNameEl = document.querySelector('[data-testid="preset-name"]');
+
+  const SLIDERS = [
+    ['param-rabbits0', 'rabbits0'],
+    ['param-foxes0', 'foxes0'],
+    ['param-rabbitBreed', 'rabbitBreed'],
+    ['param-foxBreed', 'foxBreed'],
+    ['param-foxGain', 'foxGain'],
+    ['param-grassMax', 'grassMax']
+  ];
+
+  /* ---------- rendering ---------- */
+  function drawWorld() {
+    const gmax = params.grassMax > 0 ? params.grassMax : 1;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const g = grass[y * W + x] || 0;
+        const shade = 60 + Math.round(160 * g / gmax);
+        ctx.fillStyle = 'rgb(30,' + shade + ',30)';
+        ctx.fillRect(x * 10, y * 10, 10, 10);
+      }
+    }
+    ctx.fillStyle = 'rgb(240, 240, 240)';
+    for (let i = 0; i < rabbits.length; i++) {
+      const r = rabbits[i];
+      if (r.alive) ctx.fillRect(r.x * 10 + 2, r.y * 10 + 2, 6, 6);
+    }
+    ctx.fillStyle = 'rgb(220, 80, 20)';
+    for (let i = 0; i < foxes.length; i++) {
+      const f = foxes[i];
+      if (f.alive) ctx.fillRect(f.x * 10 + 2, f.y * 10 + 2, 6, 6);
+    }
+  }
+
+  function drawChart() {
+    const L = 36, R = 390, T = 10, B = 174;
+    const maxTick = hist.length ? hist[hist.length - 1].tick : 0;
+    let maxCount = 1;
+    for (let i = 0; i < hist.length; i++) {
+      if (hist[i].rabbits > maxCount) maxCount = hist[i].rabbits;
+      if (hist[i].foxes > maxCount) maxCount = hist[i].foxes;
+    }
+    const px = function (t) { return maxTick > 0 ? L + (t / maxTick) * (R - L) : L; };
+    const py = function (c) { return B - (c / maxCount) * (B - T); };
+    const pts = function (key) {
+      const out = [];
+      for (let i = 0; i < hist.length; i++) {
+        out.push(px(hist[i].tick).toFixed(2) + ',' + py(hist[i][key]).toFixed(2));
+      }
+      return out.join(' ');
+    };
+    if (chartR) chartR.setAttribute('points', pts('rabbits'));
+    if (chartF) chartF.setAttribute('points', pts('foxes'));
+  }
+
+  function updateCounters() {
+    tickEl.textContent = String(tickNum);
+    countRab.textContent = String(rabbits.length);
+    countFox.textContent = String(foxes.length);
+    countGrass.textContent = String(grassSum());
+  }
+
+  function updateAnnouncer() {
+    if (playing) return;
+    announcerEl.textContent = 'Tick ' + tickNum + ': ' + rabbits.length + ' rabbits, ' + foxes.length + ' foxes';
+  }
+
+  function refreshAll() {
+    drawWorld();
+    drawChart();
+    updateCounters();
+    updateAnnouncer();
+  }
+
+  /* ---------- play loop ---------- */
+  let speed = 10;
+  let playing = false;
+  let rafId = null;
+  let lastTs = 0;
+  let acc = 0;
+
+  function frame(ts) {
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    let dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    if (!isFinite(dt) || dt < 0) dt = 0;
+    if (dt > 1) dt = 1;
+    acc += dt * speed;
+    const n = Math.floor(acc);
+    if (n > 0) {
+      acc -= n;
+      const k = Math.min(n, 2000);
+      for (let i = 0; i < k; i++) doTick();
+      refreshAll();
+    }
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function play() {
+    if (playing) return;
+    playing = true;
+    lastTs = 0;
+    acc = 0;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function pause() {
+    playing = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    refreshAll();
+  }
+
+  /* ---------- reset plumbing ---------- */
+  function applyReset(seedValue, p) {
+    resetSim(seedValue, p);
+    canvasEl.width = W * 10;
+    canvasEl.height = H * 10;
+    canvasEl.style.maxWidth = (W * 10) + 'px';
+    seedEl.value = String(currentSeed);
+    refreshAll();
+  }
+
+  function doResetFromUI() {
+    const parsed = parseInt(seedEl.value, 10);
+    const s = Number.isFinite(parsed) ? parsed : 0;
+    const p = {};
+    for (let i = 0; i < SLIDERS.length; i++) {
+      const input = document.querySelector('[data-testid="' + SLIDERS[i][0] + '"]');
+      p[SLIDERS[i][1]] = Number(input.value);
+    }
+    applyReset(s, p);
+  }
+
+  /* ---------- ODE panel ---------- */
+  function fmtNum(v) {
+    return Number.isFinite(v) ? v.toPrecision(12) : String(v);
+  }
+
+  function numInput(id) {
+    const el = document.querySelector('[data-testid="' + id + '"]');
+    return el ? Number(el.value) : NaN;
+  }
+
+  function runODE() {
+    const p = {
+      alpha: numInput('ode-alpha'),
+      beta: numInput('ode-beta'),
+      gamma: numInput('ode-gamma'),
+      delta: numInput('ode-delta'),
+      x0: numInput('ode-x0'),
+      y0: numInput('ode-y0')
+    };
+    const t = numInput('ode-t');
+    const dt = numInput('ode-dt');
+
+    const traj = integrateODE(p, t, dt);
+    const last = traj[traj.length - 1];
+
+    document.querySelector('[data-testid="ode-x"]').textContent = fmtNum(last.x);
+    document.querySelector('[data-testid="ode-y"]').textContent = fmtNum(last.y);
+    document.querySelector('[data-testid="ode-eq-x"]').textContent = fmtNum(p.gamma / p.delta);
+    document.querySelector('[data-testid="ode-eq-y"]').textContent = fmtNum(p.alpha / p.beta);
+
+    const V = function (x, y) {
+      return p.delta * x - p.gamma * Math.log(x) + p.beta * y - p.alpha * Math.log(y);
+    };
+    const drift = Math.abs(V(last.x, last.y) - V(p.x0, p.y0));
+    document.querySelector('[data-testid="ode-drift"]').textContent = String(drift);
+
+    drawODECurves(traj);
+  }
+
+  function drawODECurves(traj) {
+    const L = 36, R = 390, T = 10, B = 174;
+    const maxT = traj.length > 1 ? traj[traj.length - 1].t : 1;
+    let maxV = 1;
+    for (let i = 0; i < traj.length; i++) {
+      if (traj[i].x > maxV) maxV = traj[i].x;
+      if (traj[i].y > maxV) maxV = traj[i].y;
+    }
+    const px = function (t) { return maxT > 0 ? L + (t / maxT) * (R - L) : L; };
+    const py = function (v) {
+      const yv = B - (v / maxV) * (B - T);
+      return Math.max(T, Math.min(B, isFinite(yv) ? yv : B));
+    };
+    const build = function (key) {
+      const out = [];
+      for (let i = 0; i < traj.length; i++) {
+        out.push(px(traj[i].t).toFixed(2) + ',' + py(traj[i][key]).toFixed(2));
+      }
+      return out.join(' ');
+    };
+    odeX.setAttribute('points', build('x'));
+    odeY.setAttribute('points', build('y'));
+  }
+
+  /* ---------- CSV ---------- */
+  function csvText() {
+    let out = 'tick,rabbits,foxes,grass\n';
+    for (let i = 0; i < hist.length; i++) {
+      const h = hist[i];
+      out += h.tick + ',' + h.rabbits + ',' + h.foxes + ',' + h.grass + '\n';
+    }
+    return out;
+  }
+
+  function downloadCSV() {
+    const text = csvText();
+    try {
+      const blob = new Blob([text], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'ecolab.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------- presets ---------- */
+  function readStore() {
+    try {
+      const raw = localStorage.getItem('ecolab.presets');
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object' && !Array.isArray(obj)) return obj;
+      return {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  function writeStore(obj) {
+    try {
+      localStorage.setItem('ecolab.presets', JSON.stringify(obj));
+    } catch (e) { /* ignore */ }
+  }
+
+  function renderPresets() {
+    const store = readStore();
+    presetListEl.innerHTML = '';
+    const names = Object.keys(store);
+    for (let i = 0; i < names.length; i++) {
+      (function (name) {
+        const item = document.createElement('div');
+        item.setAttribute('data-testid', 'preset-item');
+
+        const span = document.createElement('span');
+        span.className = 'pname';
+        span.textContent = name;
+
+        const load = document.createElement('button');
+        load.setAttribute('data-testid', 'preset-load');
+        load.type = 'button';
+        load.textContent = 'Load';
+        load.addEventListener('click', function () {
+          const s = readStore();
+          if (Object.prototype.hasOwnProperty.call(s, name)) {
+            window.lab.loadScenario(JSON.stringify(s[name]));
+          }
+        });
+
+        const del = document.createElement('button');
+        del.setAttribute('data-testid', 'preset-delete');
+        del.type = 'button';
+        del.textContent = 'Delete';
+        del.addEventListener('click', function () {
+          const s = readStore();
+          delete s[name];
+          writeStore(s);
+          renderPresets();
+        });
+
+        item.appendChild(span);
+        item.appendChild(load);
+        item.appendChild(del);
+        presetListEl.appendChild(item);
+      })(names[i]);
+    }
+  }
+
+  /* ---------- public API ---------- */
+  window.lab = {
+    reset: function (seed, p) {
+      applyReset(seed, p || {});
+      return counts();
+    },
+
+    step: function (n) {
+      let count = (n === undefined) ? 1 : Math.floor(Number(n));
+      if (!isFinite(count) || count < 0) count = 0;
+      for (let i = 0; i < count; i++) doTick();
+      refreshAll();
+      return counts();
+    },
+
+    counts: function () {
+      return counts();
+    },
+
+    tick: function () {
+      return tickNum;
+    },
+
+    cell: function (x, y) {
+      const ok = x >= 0 && y >= 0 && x < W && y < H;
+      if (!ok) return { grass: 0, rabbit: null, fox: null };
+      const i = y * W + x;
+      const r = rGrid[i];
+      const f = fGrid[i];
+      return {
+        grass: grass[i],
+        rabbit: (r && r.alive) ? { id: r.id, energy: r.energy } : null,
+        fox: (f && f.alive) ? { id: f.id, energy: f.energy } : null
+      };
+    },
+
+    history: function () {
+      const out = [];
+      for (let i = 0; i < hist.length; i++) {
+        out.push({
+          tick: hist[i].tick,
+          rabbits: hist[i].rabbits,
+          foxes: hist[i].foxes,
+          grass: hist[i].grass
+        });
+      }
+      return out;
+    },
+
+    ode: function (p, t, dt) {
+      const traj = integrateODE(p, t, dt);
+      const last = traj[traj.length - 1];
+      return { x: last.x, y: last.y };
+    },
+
+    exportCSV: function () {
+      return csvText();
+    },
+
+    exportScenario: function () {
+      return JSON.stringify({
+        version: 1,
+        seed: currentSeed,
+        params: Object.assign({}, params)
+      });
+    },
+
+    loadScenario: function (text) {
+      let obj;
+      try {
+        obj = JSON.parse(text);
+      } catch (e) {
+        errEl.textContent = 'Invalid scenario: not valid JSON.';
+        return false;
+      }
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj) || obj.version !== 1 ||
+          !Number.isInteger(obj.seed)) {
+        errEl.textContent = 'Invalid scenario: needs version 1 and an integer seed.';
+        return false;
+      }
+      errEl.textContent = '';
+      const p = (obj.params && typeof obj.params === 'object' && !Array.isArray(obj.params))
+        ? obj.params : {};
+      applyReset(obj.seed, p);
+      return true;
+    }
+  };
+
+  /* ---------- wiring ---------- */
+  document.querySelector('[data-testid="play"]').addEventListener('click', play);
+  document.querySelector('[data-testid="pause"]').addEventListener('click', pause);
+  document.querySelector('[data-testid="step"]').addEventListener('click', function () {
+    window.lab.step(1);
+  });
+  document.querySelector('[data-testid="reset"]').addEventListener('click', doResetFromUI);
+
+  speedEl.addEventListener('input', function () {
+    speed = Number(speedEl.value);
+    speedValEl.textContent = String(speedEl.value);
+  });
+
+  for (let i = 0; i < SLIDERS.length; i++) {
+    (function (pair) {
+      const input = document.querySelector('[data-testid="' + pair[0] + '"]');
+      const out = document.getElementById('v-' + pair[0]);
+      input.addEventListener('input', function () {
+        out.textContent = input.value;
+      });
+      out.textContent = input.value;
+    })(SLIDERS[i]);
+  }
+
+  document.getElementById('btn-ode-run').addEventListener('click', runODE);
+  document.getElementById('btn-csv-export').addEventListener('click', downloadCSV);
+
+  document.getElementById('btn-scenario-export').addEventListener('click', function () {
+    scenarioEl.value = window.lab.exportScenario();
+    errEl.textContent = '';
+  });
+
+  document.getElementById('btn-scenario-load').addEventListener('click', function () {
+    window.lab.loadScenario(scenarioEl.value);
+  });
+
+  document.getElementById('btn-preset-save').addEventListener('click', function () {
+    let name = (presetNameEl.value || '').trim();
+    if (!name) name = 'scenario-' + (Object.keys(readStore()).length + 1);
+    const store = readStore();
+    store[name] = JSON.parse(window.lab.exportScenario());
+    writeStore(store);
+    renderPresets();
+  });
+
+  /* keyboard shortcuts */
+  document.addEventListener('keydown', function (e) {
+    const ae = document.activeElement;
+    const tag = ae ? ae.tagName : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') return;
+    if (ae && ae.isContentEditable) return;
+    if (e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();
+      if (playing) pause(); else play();
+    } else if (e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      window.lab.step(1);
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      doResetFromUI();
+    }
+  });
+
+  /* ---------- boot ---------- */
+  speed = Number(speedEl.value) || 10;
+  speedValEl.textContent = String(speedEl.value);
+  window.lab.reset(42, {});
+  seedEl.value = '42';
+  renderPresets();
+  runODE();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+Error: page.evaluate: TypeError: Cannot set properties of null (setting 'width')
+    at draw (http://127.0.0.1:61080/app.html:270:16)
+    at Object.step (http://127.0.0.1:61080/app.html:112:3)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

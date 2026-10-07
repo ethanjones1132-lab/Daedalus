@@ -1,0 +1,9 @@
+{
+ "model": "keep96",
+ "seed": 1,
+ "wall_s": 33.1,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 3731,
+ "gen_tps": 120.6
+}

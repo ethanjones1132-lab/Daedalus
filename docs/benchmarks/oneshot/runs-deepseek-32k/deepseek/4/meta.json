@@ -1,0 +1,11 @@
+{
+ "model": "deepseek-v4.1-flash",
+ "seed": 4,
+ "wall_s": 155.2,
+ "finish_reason": "length",
+ "prompt_n": 3814,
+ "gen_n": 32768,
+ "max_tokens": 32768,
+ "has_reasoning": true,
+ "gen_tps": 211.1
+}

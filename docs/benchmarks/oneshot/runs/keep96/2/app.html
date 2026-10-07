@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta>
+    <title>Ecosystem Lab</title>
+  </meta>
+</head>
+<body>
+  <div id="panel-world">
+    <canvas data-testid="world"></canvas>
+    <div id="controls">
+      <button data-testid="play">Play</button>
+      <button data-testid="pause">Pause</button>
+      <button data-testid="step">Step</button>
+      <button data-testid="reset">Reset</button>
+      <input type="number" data-testid="seed" value="42">
+      <input type="range" data-testid="speed" min="1" max="60" value="10">
+      <label for="param_rabbits0">Rabbits0:</label>
+      <input type="range" data-testid="param_rabbits0" min="0" max="300" value="100">
+      <label for="param_foxes0">Foxes0:</label>
+      <input type="range" data-testid="param_foxes0" min="0" max="60" value="6">
+      <label for="param_rabbitBreed">RabbitBreed:</label>
+      <input type="range" data-testid="param_rabbitBreed" min="2" max="40" value="12">
+      <label for="param_foxBreed">FoxBreed:</label>
+      <input type="range" data-testid="param_foxBreed" min="2" max="60" value="40">
+      <label for="param_foxGain">FoxGain:</label>
+      <input type="range" data-testid="param_foxGain" min="1" max="30" value="4">
+      <label for="param_grassMax">GrassMax:</label>
+      <input type="range" data-testid="param_grassMax" min="1" max="10" value="4">
+      <div id="counters">
+        <div id="tick">Tick: 0</div>
+        <div id="count_rabbits">Rabbits: 0</div>
+        <div id="count_foxes">Foxes: 0</div>
+        <div id="count_grass">Grass: 0</div>
+      </div>
+    </div>
+  </div>
+  <div id="panel-side">
+    <svg data-testid="chart">
+      <polyline data-testid="series-rabbits"></polyline>
+      <polyline data-testid="series-foxes"></polyline>
+      <text data-testid="x-axis">tick</text>
+      <text data-testid="y-axis">count</text>
+    </svg>
+    <div id="lotka-volterra">
+      <input type="number" data-testid="ode-alpha" value="1.1">
+      <input type="number" data-testid="ode-beta" value="0.4">
+      <input type="number" data-testid="ode-gamma" value="0.4">
+      <input type="number" data-testid="ode-delta" value="0.1">
+      <input type="number" data-testid="ode-x0" value="10">
+      <input type="number" data-testid="ode-y0" value="10">
+      <input type="number" data-testid="ode-t" value="50">
+      <input type="number" data-testid="ode-dt" value="0.01">
+      <button data-testid="ode-run">Run ODE</button>
+      <svg data-testid="ode-chart">
+        <polyline data-testid="ode-series-x"></polyline>
+        <polyline data-testid="ode-series-y"></polyline>
+      </svg>
+    </div>
+    <div id="scenario">
+      <textarea data-testid="scenario-json"></textarea>
+      <button data-testid="scenario-export">Export Scenario</button>
+      <button data-testid="scenario-load">Load Scenario</button>
+      <div data-testid="scenario-error"></div>
+    </div>
+    <div id="presets">
+      <input type="text" data-testid="preset-name">
+      <button data-testid="preset-save">Save Preset</button>
+      <div data-testid="preset-list"></div>
+    </div>
+  </div>
+  <div id="announcer" aria-live="polite"></div>
+</body>
+</html>
