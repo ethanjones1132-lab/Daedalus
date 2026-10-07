@@ -55,7 +55,7 @@ By the pre-registered rule this is a null. On tier2b, written separately and rep
   - On tier2b, Laya rated the library tasks as hidden code, and probing them is what cost points there (E 16–17 vs 18), as on 2026-10-05.
 - **Verify** separated right from wrong candidates at AUC 0.65 on the judge set (pool 0.79).
 - **The diagnostics script** (`laya_calibrate.py report`) scored only the v1 yes/no "unseen" question (AUC 0.36 on the judge set), not the kind signal the rule used.
-  - Fixed at 05:45: the report now leads with `hidden` for the committed signal.
+  - Fixed at 05:24: the report now leads with `hidden` for the committed signal.
   - `laya-judge-diagnostics.json` was regenerated and gives AUC 0.981, matching the live rows.
 - **No Laya fallbacks** in any run.
 
@@ -90,7 +90,7 @@ No cutoff would have passed.
 - Keep probes off library tasks with a second signal: P(kind = library) had pool AUC 0.99.
 - Judge the next design on more and independent tasks.
 
-## Why the probe is weak (from the stored probe transcripts, added 05:40)
+## Why the probe is weak (from the stored probe transcripts, added 05:20)
 
 Hidden-convention task-trials (36 per set), by probe state and whether probe-then-fix (P) passed:
 
