@@ -95,11 +95,10 @@ def build_prompts():
     ]
 
 
-def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts):
-    tag = f"{pathlib.Path(model).stem}_ncmoe{ncmoe}_mtp{mtp}_ctx{ctx}_ub{ubatch}_t{threads or 'def'}"
+def server_cmd(model, ncmoe, mtp, ctx, ubatch, threads, ctk="q8_0"):
     args = [SERVER, "-m", model, "--host", "127.0.0.1", "--port", str(PORT),
             "-ngl", "99", "--n-cpu-moe", str(ncmoe), "-c", str(ctx),
-            "-ctk", "q8_0", "-ctv", "q8_0", "--flash-attn", "on",
+            "-ctk", ctk, "-ctv", ctk, "--flash-attn", "on",
             "-b", str(max(ubatch, 512)), "-ub", str(ubatch), "-np", "1",
             "--jinja", "--reasoning-budget", "0", "--no-webui",
             "--cache-ram", "0"] + list(EXTRA_ARGS)  # default 8 GiB host prompt cache starves 16 GB RAM
@@ -109,8 +108,47 @@ def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts):
         args += ["--spec-type", SPEC_TYPE, "--spec-draft-n-max", str(mtp)]
         if DRAFT_MODEL:  # Gemma ships its MTP head as a separate file
             args += ["-md", DRAFT_MODEL]
+    return args
+
+
+def chat_once(messages, max_tokens, cache_prompt):
+    """One chat request at temperature 0 with thinking off; llama-server's timings plus the text."""
+    t = time.time()
+    _, resp = http("POST", "/v1/chat/completions", {
+        "messages": messages, "max_tokens": max_tokens, "temperature": 0, "cache_prompt": cache_prompt,
+        "chat_template_kwargs": {"enable_thinking": False}})
+    tm = resp.get("timings", {})
+    return {"wall_s": round(time.time() - t, 2), "prompt_n": tm.get("prompt_n"), "cache_n": tm.get("cache_n"),
+            "prompt_ms": round(tm.get("prompt_ms", 0)), "prompt_tps": round(tm.get("prompt_per_second", 0), 1),
+            "gen_n": tm.get("predicted_n"), "gen_tps": round(tm.get("predicted_per_second", 0), 2),
+            "draft_n": tm.get("draft_n"), "draft_accepted": tm.get("draft_n_accepted"),
+            "text": resp["choices"][0]["message"].get("content") or ""}
+
+
+def followup_probe(content):
+    """Reuse across turns on a hybrid model (2026-10-07): the deep prompt with the cache on, the same chat plus one
+    more turn, then the same text with a different closing question. prompt_n is what the server actually read."""
+    msgs = [{"role": "user", "content": content}]
+    first = chat_once(msgs, 300, True)
+    turn = chat_once(msgs + [{"role": "assistant", "content": first["text"]},
+                             {"role": "user", "content": "Now list every top-level function defined above, "
+                                                         "one per line."}], 200, True)
+    head = content.rsplit("\n\n", 1)[0]
+    alt = chat_once([{"role": "user", "content": head + "\n\nHow many classes are defined above? "
+                                                        "Reply with one number."}], 20, True)
+    return {k: {f: v for f, v in r.items() if f != "text"}
+            for k, r in (("first", first), ("next_turn", turn), ("new_ending", alt))}
+
+
+def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts, ctk="q8_0", warm=None, followup=None):
+    """warm: prompt names for the unrecorded warm-up pass (default all). followup: a deep prompt's text for
+    followup_probe, run last. A failed prompt is recorded in its run and the others continue."""
+    tag = f"{pathlib.Path(model).stem}_ncmoe{ncmoe}_mtp{mtp}_ctx{ctx}_ub{ubatch}_t{threads or 'def'}"
+    if ctk != "q8_0":
+        tag += f"_k{ctk}"
+    args = server_cmd(model, ncmoe, mtp, ctx, ubatch, threads, ctk)
     row = {"tag": tag, "model": pathlib.Path(model).name, "ncmoe": ncmoe, "mtp": mtp,
-           "ctx": ctx, "ubatch": ubatch, "threads": threads}
+           "ctx": ctx, "ubatch": ubatch, "threads": threads, "ctk": ctk}
     base_vram, base_ram, base_shared = vram_used_mib(), ram_avail_gb(), gpu_shared_mib()
     log = open(logdir / f"{tag}.log", "w", encoding="utf-8", errors="replace")
     t0 = time.time()
@@ -135,27 +173,31 @@ def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts):
         # Warm-up pass over the full prompt set, not recorded. With experts in RAM,
         # the first pass pages cold expert weights in from disk (measured on Gemma:
         # 4.2 tok/s cold vs 23.7 warm), which is a load cost, not a serving speed.
-        for _, content, max_tokens in prompts:
-            http("POST", "/v1/chat/completions", {
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": max_tokens, "temperature": 0, "cache_prompt": False,
-                "chat_template_kwargs": {"enable_thinking": False}})
+        for name, content, max_tokens in prompts:
+            if warm is None or name in warm:
+                http("POST", "/v1/chat/completions", {
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": max_tokens, "temperature": 0, "cache_prompt": False,
+                    "chat_template_kwargs": {"enable_thinking": False}})
         row["server_working_set_gb"] = working_set_gb(proc.pid)
         for name, content, max_tokens in prompts:
-            t = time.time()
-            _, resp = http("POST", "/v1/chat/completions", {
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": max_tokens, "temperature": 0, "cache_prompt": False,
-                "chat_template_kwargs": {"enable_thinking": False}})
-            peak = max(peak, vram_used_mib() - base_vram)
-            tm = resp.get("timings", {})
-            text = resp["choices"][0]["message"].get("content") or ""
-            results.append({
-                "prompt": name, "wall_s": round(time.time() - t, 2),
-                "prompt_n": tm.get("prompt_n"), "prompt_tps": round(tm.get("prompt_per_second", 0), 1),
-                "gen_n": tm.get("predicted_n"), "gen_tps": round(tm.get("predicted_per_second", 0), 2),
-                "draft_n": tm.get("draft_n"), "draft_accepted": tm.get("draft_n_accepted"),
-                "thinking_leak": "<think>" in text, "head": text[:80]})
+            try:
+                r = chat_once([{"role": "user", "content": content}], max_tokens, False)
+            except Exception as e:  # e.g. a deep prompt over the window: record it, keep the row
+                results.append({"prompt": name, "error": f"{type(e).__name__}: {e}"[:300]})
+                continue
+            vram = vram_used_mib() - base_vram
+            peak = max(peak, vram)
+            text = r.pop("text")
+            results.append({"prompt": name, **r, "thinking_leak": "<think>" in text, "head": text[:80],
+                            "vram_mib": vram, "ram_gb": ram_avail_gb()})
+        if followup:
+            try:
+                row["followup"] = followup_probe(followup)
+                row["followup"]["ram_gb"] = ram_avail_gb()
+                peak = max(peak, vram_used_mib() - base_vram)
+            except Exception as e:
+                row["followup"] = {"error": f"{type(e).__name__}: {e}"[:300]}
         row["vram_delta_mib_peak"] = peak
         # One read after all prompts: a spill, once allocated, persists while the server runs.
         row["shared_spill_mib"] = gpu_shared_mib() - base_shared if base_shared >= 0 else None
@@ -165,7 +207,7 @@ def run_config(model, ncmoe, mtp, ctx, ubatch, threads, logdir, prompts):
         # speed measures the disk, not the config. Flag it rather than trust it.
         row["paging_risk"] = row["ram_avail_gb_during"] < 0.5
         row["runs"] = results
-        gen = [r["gen_tps"] for r in results if r["gen_tps"]]
+        gen = [r["gen_tps"] for r in results if r.get("gen_tps")]
         row["gen_tps_mean"] = round(sum(gen) / len(gen), 2) if gen else None
         acc = [(r["draft_accepted"], r["draft_n"]) for r in results if r.get("draft_n")]
         if acc:
