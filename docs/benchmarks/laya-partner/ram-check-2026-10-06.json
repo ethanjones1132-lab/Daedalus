@@ -1,0 +1,26 @@
+{
+ "rows": [
+  {
+   "mode": "mmap",
+   "extra": [],
+   "load_s": 37.9,
+   "avail_mb_qwen": 243,
+   "laya_up": true,
+   "avail_mb_qwen_laya": 635
+  },
+  {
+   "mode": "load-none",
+   "extra": [
+    "--load-mode",
+    "none"
+   ],
+   "load_s": 11.6,
+   "avail_mb_qwen": 2814,
+   "laya_up": true,
+   "avail_mb_qwen_laya": 1209
+  }
+ ],
+ "identical_answers": true,
+ "n_answers": 8,
+ "differing": []
+}

@@ -47,6 +47,12 @@
    - `playbook_tier2b.py` gained `--model` (default `qwen36keep96`), and every nested and live row records the GGUF it ran on.
    - **Configuration 2 on the judge set is already known.** Phase 1 ran keep96's recipe there with the same harness, prompts and seeds (153/180, single shot 143). The judge nested run repeats that measurement; the pre-registration states the known score.
    - **RAM.** On 2026-10-06 a 4 GB VM outside this project held RAM, so the 2 GB guard may stop the live runs (configurations 3–5). The guard is the spec's and stays as is.
+10. **Cutoff grid from the data.** v1's fixed grid (0.3–0.9) started above every hidden-convention task's calibrated P(unseen) (0.20–0.26), so the fitted rule could never probe them. The targeted form's grid is the deciles of the pool's per-task signal.
+11. **Signal choice.** The wording and the hidden signal are chosen together by the signal's pool AUC for category B, with Laya's kind probabilities as candidates. v1 summed three AUCs and ignored the kind probabilities; v1's P(kind = hidden code) has AUC 1.00 on the pool.
+12. **Targeted rule form.** P when the hidden signal clears c_hidden, else R (spec v2 §2), replacing the four-branch form, whose effort branches read signals at chance.
+13. **Notes only on probed tasks.** Under wording v1 the top kind is "library" for nearly every task, so per-kind notes would mislead.
+14. **`--load-mode none` and an explicit RAM guard.** Session-2 runs use `--load-mode none` (identical answers, 2.5 GB less RAM). `live --min-free-mb` sets the guard per run: 2,048 MB by default, with a 1,024 MB retry delegated by the owner.
+15. **The bar adds a per-task sign test** (owner, 2026-10-06). Each task's 3 trials are correlated, and the per-sample McNemar alone overstated the evening's model comparisons.
 
 ## File map
 

@@ -1,0 +1,55 @@
+{
+ "budget_secs": 6.054,
+ "records": 180,
+ "form": "targeted",
+ "grid": [
+  0.026,
+  0.04,
+  0.0527,
+  0.0614,
+  0.0683,
+  0.0747,
+  0.0828,
+  0.093,
+  0.1423,
+  0.1708,
+  2.0
+ ],
+ "verify": {
+  "form": "targeted",
+  "c_hidden": 0.0828,
+  "t_hi": 0.5,
+  "t_lo": -1.0
+ },
+ "verify_fit": {
+  "solved": 154.0,
+  "mean_secs": 5.917,
+  "playbooks": {
+   "R": 108,
+   "P": 72
+  }
+ },
+ "noverify": {
+  "form": "targeted",
+  "c_hidden": 0.0828,
+  "t_hi": 2.0,
+  "t_lo": -1.0
+ },
+ "noverify_fit": {
+  "solved": 154.0,
+  "mean_secs": 5.851,
+  "playbooks": {
+   "R": 108,
+   "P": 72
+  }
+ },
+ "calib_pool": {
+  "S": 147,
+  "P": 153,
+  "R": 148,
+  "PR": 154,
+  "R8": 149,
+  "oracle": 160,
+  "n": 180
+ }
+}
