@@ -1,0 +1,74 @@
+import pathlib
+import random
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import oneshot_bench as ob  # noqa: E402
+
+APP = "<!doctype html>\n<html><body><script>window.lab = {};</script></body></html>"
+
+
+class ExtractTest(unittest.TestCase):
+    def test_plan_then_fenced_html(self):
+        r = ob.extract("## Plan\nData model: grid.\n\n```html\n" + APP + "\n```\n")
+        self.assertEqual(r["plan"], "## Plan\nData model: grid.")
+        self.assertEqual(r["app"], APP)
+        self.assertFalse(r["truncated"])
+
+    def test_longest_html_block_wins(self):
+        text = "## Plan\nx\n```html\n<p>stub</p>\n```\nthen\n```html\n" + APP + "\n```"
+        self.assertEqual(ob.extract(text)["app"], APP)
+
+    def test_unfenced_document(self):
+        r = ob.extract("Here it is:\n" + APP)
+        self.assertEqual(r["app"], APP)
+        self.assertEqual(r["plan"], "Here it is:")
+
+    def test_truncated_open_fence(self):
+        r = ob.extract("## Plan\np\n```html\n<!doctype html>\n<html><body><script>let a = 1;")
+        self.assertTrue(r["truncated"])
+        self.assertTrue(r["app"].startswith("<!doctype html>"))
+
+    def test_no_plan_heading(self):
+        r = ob.extract("```html\n" + APP + "\n```")
+        self.assertEqual(r["plan"], "")
+        self.assertEqual(r["app"], APP)
+
+    def test_js_block_is_not_the_app(self):
+        text = "## Plan\n```js\nfunction mulberry32() {}\n```\n```html\n" + APP + "\n```"
+        self.assertEqual(ob.extract(text)["app"], APP)
+
+
+class ScoreTest(unittest.TestCase):
+    def test_summary(self):
+        s = ob.summarize([0.5, 0.7, 0.9])
+        self.assertAlmostEqual(s["mean"], 0.7)
+        self.assertEqual((s["min"], s["max"], s["n"]), (0.5, 0.9, 3))
+        self.assertAlmostEqual(s["sd"], 0.2)
+        self.assertEqual(ob.summarize([0.4])["sd"], 0.0)
+
+    def test_area_means(self):
+        runs = [{"areas": {"logic": 1.0, "algo": 0.5}}, {"areas": {"logic": 0.5, "algo": 0.0}}]
+        self.assertEqual(ob.area_means(runs), {"algo": 0.25, "logic": 0.75})
+
+
+class BlindTest(unittest.TestCase):
+    def test_ids_unique_and_hide_models(self):
+        keys = [f"keep96/{s}" for s in range(1, 6)] + [f"deepseek/{s}" for s in range(1, 6)]
+        mapping = ob.blind_ids(keys, random.Random(3))
+        self.assertEqual(sorted(mapping.values()), sorted(keys))
+        self.assertEqual(len(set(mapping)), 10)
+        for bid in mapping:
+            self.assertNotIn("keep", bid)
+            self.assertNotIn("deep", bid)
+            self.assertRegex(bid, r"^[0-9a-f]{6}$")
+
+    def test_order_is_shuffled_not_grouped(self):
+        keys = [f"keep96/{s}" for s in range(1, 6)] + [f"deepseek/{s}" for s in range(1, 6)]
+        order = list(ob.blind_ids(keys, random.Random(1)).values())
+        self.assertNotEqual(order, keys)
+
+
+if __name__ == "__main__":
+    unittest.main()
