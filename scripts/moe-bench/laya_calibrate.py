@@ -171,6 +171,12 @@ def hidden_aucs(label_rows, cats, wordings=WORDINGS):
     return out
 
 
+def hidden_report(cards, cats, signal):
+    """The v2 rule's task signal on a scored set: AUC for category-B tasks (raw cards, one per task)."""
+    pairs = [(hidden_of(c, signal), cats[t] == "B") for t, c in cards.items() if t in cats]
+    return {"signal": signal, "n": len(pairs), "positives": sum(y for _, y in pairs), "auc": pairs_auc(pairs)}
+
+
 def kind_accuracy(cards, cats):
     hits = [cards[t]["kind"] == KIND_OF[cats[t]] for t in cards if t in cats]
     return sum(hits) / max(len(hits), 1)
@@ -216,7 +222,8 @@ def report_cmd(a):
     cats, s_ok, r_ok, cand_ok = outcomes(trials, labels)
     cards = cards_of(labels, calib["classify_wording"])
     data = dict(quantities(cards, cats, s_ok, r_ok), verify=verify_pairs(labels, cand_ok, calib["verify_form"]))
-    rep = {"diagnostics": diagnose(data, calib["platt"]), "kind_accuracy": kind_accuracy(cards, cats)}
+    rep = {"hidden": hidden_report(cards, cats, calib.get("hidden_signal", "noul")),
+           "diagnostics": diagnose(data, calib["platt"]), "kind_accuracy": kind_accuracy(cards, cats)}
     if a.out:
         pathlib.Path(a.out).write_text(json.dumps(rep, indent=1), encoding="utf-8")
     print(json.dumps(rep, indent=1))

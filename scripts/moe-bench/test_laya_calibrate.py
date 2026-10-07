@@ -45,6 +45,13 @@ class CalibrateTest(unittest.TestCase):
         self.assertEqual(lc.calibrate_card(raw, lc.IDENTITY["platt"])["hidden"], 0.9)
         self.assertEqual(lc.calibrate_card(raw, lc.IDENTITY["platt"], "kind_p")["hidden"], 0.2)
 
+    def test_hidden_report_scores_the_rule_signal(self):
+        cards = {"b": {"kind_p": {"unseen": 0.4}, "unseen": 0.1}, "a": {"kind_p": {"unseen": 0.1}, "unseen": 0.9}}
+        cats = {"b": "B", "a": "A"}
+        self.assertEqual(lc.hidden_report(cards, cats, "kind_p"),
+                         {"signal": "kind_p", "n": 2, "positives": 1, "auc": 1.0})
+        self.assertEqual(lc.hidden_report(cards, cats, "noul")["auc"], 0.0)
+
     def test_hidden_aucs_pick_the_separating_signal(self):
         def raw(ku, nu):
             return {"kind": "library", "kind_p": {"unseen": ku}, "unseen": nu, "effort_p": [0.4, 0.3, 0.3]}

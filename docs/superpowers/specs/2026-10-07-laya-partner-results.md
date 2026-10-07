@@ -54,7 +54,9 @@ By the pre-registered rule this is a null. On tier2b, written separately and rep
   - c_hidden = 0.0828 probed 27 of 60 judge tasks (A 6, B 12, C 5, D 4, E 0) and 22 of 39 tier2b tasks (A 6, B 7, C 1, D 3, **E 5 of 6**).
   - On tier2b, Laya rated the library tasks as hidden code, and probing them is what cost points there (E 16–17 vs 18), as on 2026-10-05.
 - **Verify** separated right from wrong candidates at AUC 0.65 on the judge set (pool 0.79).
-- **The diagnostics script** (`laya_calibrate.py report`) still scores the v1 yes/no "unseen" question (AUC 0.36 on the judge set), not the kind signal the rule used. The kind-signal AUCs above were computed from the live rows.
+- **The diagnostics script** (`laya_calibrate.py report`) scored only the v1 yes/no "unseen" question (AUC 0.36 on the judge set), not the kind signal the rule used.
+  - Fixed at 05:45: the report now leads with `hidden` for the committed signal.
+  - `laya-judge-diagnostics.json` was regenerated and gives AUC 0.981, matching the live rows.
 - **No Laya fallbacks** in any run.
 
 ## RAM
@@ -87,6 +89,32 @@ No cutoff would have passed.
 - Strengthen the probe itself, for example probe output in every recipe candidate and suite, two probes, or probe then repair. It is the only lever that moves hidden-convention tasks.
 - Keep probes off library tasks with a second signal: P(kind = library) had pool AUC 0.99.
 - Judge the next design on more and independent tasks.
+
+## Why the probe is weak (from the stored probe transcripts, added 05:40)
+
+Hidden-convention task-trials (36 per set), by probe state and whether probe-then-fix (P) passed:
+
+| | Probe crashed | Probe ran, P failed | Probe ran, P passed |
+|---|---|---|---|
+| Calibration pool | 12 (5 still passed) | 12 | 12 |
+| Judge set | 8 (4 still passed) | 12 | 16 |
+
+Two failure modes, seen in the transcripts:
+
+1. **The probe asks the wrong question.**
+   - It often calls the buggy entry function instead of the hidden helper, or calls the helper with inputs it does not accept.
+   - `j_weight_grams`: the probe printed `total_kg(['book', 'mug']) = 800` (grams) from the entry function and never called `catalog.weight`. The fix missed the unit (P 0/3, though single shot solved 2/3).
+   - `j_basis_points`: it guessed a product id, and the probe crashed on `KeyError: 1000`.
+   - `j_iso_weekday`: it passed day names to a helper that wants ISO dates. The fix ignored the "Invalid isoformat string" errors and rewrote the function around names.
+2. **The fix does not check itself against the requirement's own example.**
+   - `j_utc_offset_west`: the probe showed `offset_minutes('new_york') = 300` and `local_hour(12, 'new_york') = 17`.
+   - The requirement says noon UTC is 7 in the morning in New York, yet the fix still returned 17.
+   - Running that one example after the fix would have caught it.
+
+**What that suggests for a stronger probe** (owner's call; nothing here is tested):
+- A probe prompt that calls the *hidden helper* directly, with inputs taken from how the entry file uses it, and prints its return value and type.
+- One retry with the error when the probe crashes.
+- Then a check of the fix against the requirement's concrete examples, with one repair round on failure.
 
 ## Files
 

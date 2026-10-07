@@ -1,4 +1,10 @@
 {
+ "hidden": {
+  "signal": "kind_p",
+  "n": 60,
+  "positives": 12,
+  "auc": 0.9809027777777778
+ },
  "diagnostics": {
   "unseen": {
    "n": 60,
