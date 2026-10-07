@@ -262,7 +262,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
          CREATE INDEX IF NOT EXISTS idx_agent_projections_status ON agent_projections(status);
-         CREATE INDEX IF NOT EXISTS idx_agent_projections_active ON agent_projections(active, status);
+         -- idx_agent_projections_active is created in apply_schema_patches, after
+         -- `active` is added to tables that predate it.
          CREATE INDEX IF NOT EXISTS idx_agent_projections_hash   ON agent_projections(source_hash);
         "#,
     )?;
@@ -388,6 +389,19 @@ fn add_column_if_missing(
     column: &str,
     ddl: &str,
 ) -> Result<(), rusqlite::Error> {
+    // `ddl` is the full column definition. A bare type ("TEXT") would add a
+    // column literally named TEXT and never create `column`.
+    let names_column = ddl
+        .strip_prefix(column)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if !names_column {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(format!(
+                "add_column_if_missing({table}.{column}): definition must start with the column name, got {ddl:?}"
+            )),
+        ));
+    }
     if !table_has_column(conn, table, column)? {
         // SQL identifiers cannot be parameterised; we already validated
         // the table name with PRAGMA table_info above so reuse it directly.
@@ -1235,7 +1249,7 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             conn,
             "memory_derived_invalidations",
             "source_message_ids_json",
-            "TEXT NOT NULL DEFAULT '[]'",
+            "source_message_ids_json TEXT NOT NULL DEFAULT '[]'",
         )?;
 
         // Phase 3.4 internal action cursor. Records the stable `(created_at,
@@ -1250,10 +1264,10 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             conn,
             "session_continuity",
             "last_action_source_message_id",
-            "TEXT",
+            "last_action_source_message_id TEXT",
         )?;
-        add_column_if_missing(conn, "session_continuity", "last_action_created_at", "TEXT")?;
-        add_column_if_missing(conn, "session_continuity", "last_action_rowid", "INTEGER")?;
+        add_column_if_missing(conn, "session_continuity", "last_action_created_at", "last_action_created_at TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "last_action_rowid", "last_action_rowid INTEGER")?;
         // A manual operator set is a monotonic HIGHWATER boundary: every source
         // already recorded when the operator acted (including one numerically
         // equal to the chosen source) is protected from later automatic
@@ -1261,8 +1275,8 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
         // highest-order message present at the manual call. Automatic
         // directives at or below this boundary are stale; only a source saved
         // strictly after the boundary may change the objective.
-        add_column_if_missing(conn, "session_continuity", "manual_boundary_created_at", "TEXT")?;
-        add_column_if_missing(conn, "session_continuity", "manual_boundary_rowid", "INTEGER")?;
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_created_at", "manual_boundary_created_at TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_rowid", "manual_boundary_rowid INTEGER")?;
 
         // Additive Part 3.2 outbox. Committed Part 3.1 already created
         // `memory_derived_invalidations` WITH a `REFERENCES sessions ON DELETE
@@ -1897,6 +1911,98 @@ mod tests {
         assert!(table_has_column(&conn, "stage_runs", "mode_id").unwrap());
         assert!(table_has_column(&conn, "tuning_proposals", "proposal_type").unwrap());
         assert!(table_has_column(&conn, "tuning_outcomes", "user_rating_delta").unwrap());
+    }
+
+    /// A database created before agent_projections gained `active` keeps its
+    /// old table (CREATE TABLE IF NOT EXISTS is a no-op), so nothing may index
+    /// `active` until apply_schema_patches has added the column. On 2026-10-06
+    /// this aborted every launch on an existing install with "no such column:
+    /// active" before the window opened.
+    #[test]
+    fn migrations_upgrade_pre_activation_agent_projections() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agent_projections (
+                slug                TEXT PRIMARY KEY,
+                source_path         TEXT NOT NULL DEFAULT '',
+                source_hash         TEXT NOT NULL DEFAULT '',
+                projection_version  INTEGER NOT NULL DEFAULT 1,
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK(status IN ('valid', 'invalid', 'pending')),
+                validation_errors   TEXT CHECK(validation_errors IS NULL OR json_valid(validation_errors)),
+                name                TEXT NOT NULL DEFAULT '',
+                description         TEXT,
+                tools_json          TEXT CHECK(tools_json IS NULL OR json_valid(tools_json)),
+                version_tag         TEXT,
+                activated_at        TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX idx_agent_projections_status ON agent_projections(status);
+            CREATE INDEX idx_agent_projections_hash ON agent_projections(source_hash);
+            INSERT INTO agent_projections (slug, status) VALUES ('legacy', 'valid');
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        for column in [
+            "active",
+            "active_source_hash",
+            "source_size_bytes",
+            "last_validated_at",
+            "deactivated_at",
+        ] {
+            assert!(table_has_column(&conn, "agent_projections", column).unwrap(), "{column}");
+        }
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_projections_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        let (status, active): (String, i64) = conn
+            .query_row(
+                "SELECT status, active FROM agent_projections WHERE slug = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), active), ("valid", 0));
+    }
+
+    #[test]
+    fn add_column_rejects_a_definition_without_the_column_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+
+        let error = add_column_if_missing(&conn, "t", "note", "TEXT").unwrap_err();
+        assert!(error.to_string().contains("must start with the column name"), "{error}");
+        assert!(!table_has_column(&conn, "t", "TEXT").unwrap());
+
+        add_column_if_missing(&conn, "t", "note", "note TEXT").unwrap();
+        assert!(table_has_column(&conn, "t", "note").unwrap());
+    }
+
+    #[test]
+    fn fresh_migrations_create_session_continuity_cursor_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for column in [
+            "last_action_source_message_id",
+            "last_action_created_at",
+            "last_action_rowid",
+            "manual_boundary_created_at",
+            "manual_boundary_rowid",
+        ] {
+            assert!(table_has_column(&conn, "session_continuity", column).unwrap(), "{column}");
+        }
+        assert!(!table_has_column(&conn, "session_continuity", "TEXT").unwrap());
+        assert!(table_has_column(&conn, "memory_derived_invalidations", "source_message_ids_json").unwrap());
     }
 
     #[test]
