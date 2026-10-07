@@ -56,7 +56,21 @@ interface CronJobDraft {
   schedule: string;
   prompt: string;
   agentId: string;
+  goalId: string | null;
 }
+
+/** Minimal native Goal row used only to populate the optional create selector. */
+interface GoalSummary {
+  id: string;
+  objective: string;
+  status: string;
+  project_root: string | null;
+}
+
+type GoalsState =
+  | { kind: 'loading' }
+  | { kind: 'error' }
+  | { kind: 'ready'; goals: GoalSummary[] };
 
 type CronOperationMap = Record<string, CronOperation<CronJob>>;
 
@@ -280,12 +294,16 @@ function AddJobForm({
   onCreate,
   onCancel,
   creating,
-  createError,
+  createPreflightError,
+  createUnresolved,
+  onVerifyCreate,
 }: {
   onCreate: (draft: CronJobDraft) => Promise<void>;
   onCancel: () => void;
   creating: boolean;
-  createError: boolean;
+  createPreflightError: string | null;
+  createUnresolved: string | null;
+  onVerifyCreate: () => void;
 }) {
   const [jobType, setJobType] = useState<CronJobType>('learning');
   const [name, setName] = useState('');
@@ -295,6 +313,51 @@ function AddJobForm({
   const [prompt, setPrompt] = useState('');
   const [agentId, setAgentId] = useState('jarvis');
   const [showPreview, setShowPreview] = useState(true);
+  const [goalsState, setGoalsState] = useState<GoalsState>({ kind: 'loading' });
+  const [goalId, setGoalId] = useState('');
+
+  // The optional Goal selector is populated ONLY from a successful native
+  // Goal-list read. A read failure is a distinct unavailable state (the job can
+  // still be created unlinked); a genuine empty list is a distinct empty state.
+  const loadGoals = useCallback(() => {
+    let active = true;
+    setGoalsState({ kind: 'loading' });
+    invoke<unknown>('goal_list')
+      .then((raw) => {
+        if (!active) return;
+        if (!Array.isArray(raw)) {
+          setGoalsState({ kind: 'error' });
+          return;
+        }
+        const goals: GoalSummary[] = [];
+        for (const row of raw) {
+          if (!row || typeof row !== 'object') {
+            setGoalsState({ kind: 'error' });
+            return;
+          }
+          const record = row as Record<string, unknown>;
+          if (typeof record.id !== 'string' || typeof record.objective !== 'string') {
+            setGoalsState({ kind: 'error' });
+            return;
+          }
+          goals.push({
+            id: record.id,
+            objective: record.objective,
+            status: typeof record.status === 'string' ? record.status : '',
+            project_root: typeof record.project_root === 'string' ? record.project_root : null,
+          });
+        }
+        setGoalsState({ kind: 'ready', goals });
+      })
+      .catch(() => {
+        if (active) setGoalsState({ kind: 'error' });
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => loadGoals(), [loadGoals]);
 
   const typeConfig = useMemo(() => JOB_TYPES.find(t => t.id === jobType)!, [jobType]);
 
@@ -322,14 +385,16 @@ function AddJobForm({
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const expr = isCustomSchedule ? customExpr : preset;
+  const unresolved = createUnresolved !== null;
 
   const handleSubmit = () => {
-    if (creating || !name.trim() || !expr.trim() || !prompt.trim()) return;
+    if (creating || unresolved || !name.trim() || !expr.trim() || !prompt.trim()) return;
     void onCreate({
       name: name.trim(),
       schedule: expr.trim(),
       prompt: prompt.trim(),
       agentId: agentId.trim() || 'jarvis',
+      goalId: goalId || null,
     });
   };
 
@@ -346,17 +411,27 @@ function AddJobForm({
         </p>
       )}
 
-      {createError && (
+      {createPreflightError && (
         <div role="alert" className="mb-4 text-xs font-mono text-error">
-          Could not add cron job. Your draft has been kept.
+          {createPreflightError}
+        </div>
+      )}
+
+      {createUnresolved && (
+        <div role="alert" className="mb-4 text-xs font-mono text-warning">
+          {createUnresolved}
           <button
             type="button"
-            onClick={handleSubmit}
-            disabled={creating || !name.trim() || !expr.trim() || !prompt.trim()}
+            onClick={onVerifyCreate}
+            disabled={creating}
             className="ml-2 underline disabled:opacity-50"
           >
-            Retry
+            Verify list
           </button>
+          <div className="mt-1 text-bone-dim">
+            Creation is not retried automatically. The new job may already exist; verify the
+            authoritative list before creating another.
+          </div>
         </div>
       )}
 
@@ -408,6 +483,51 @@ function AddJobForm({
             className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
           />
         </div>
+      </div>
+
+      {/* Optional Goal association (native-validated on create) */}
+      <div className="mb-4">
+        <label className="block text-xs font-mono text-bone-dim mb-1.5">
+          Goal association (optional)
+        </label>
+        {goalsState.kind === 'loading' && (
+          <p role="status" className="text-xs font-mono text-bone-faint">Loading goals…</p>
+        )}
+        {goalsState.kind === 'error' && (
+          <div role="alert" className="text-xs font-mono text-error">
+            Could not read the native Goal list. The Goal selector is unavailable; you can still
+            create an unlinked job.
+            <button type="button" onClick={loadGoals} className="ml-2 underline">Retry</button>
+          </div>
+        )}
+        {goalsState.kind === 'ready' && goalsState.goals.length === 0 && (
+          <p className="text-xs font-mono text-bone-faint">
+            No goals exist. The job will be created unlinked.
+          </p>
+        )}
+        {goalsState.kind === 'ready' && goalsState.goals.length > 0 && (
+          <>
+            <select
+              value={goalId}
+              disabled={creating}
+              onChange={(e) => { if (!creating) setGoalId(e.target.value); }}
+              className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone focus:outline-none focus:border-royal/50 transition-colors"
+            >
+              <option value="">No Goal (unlinked)</option>
+              {goalsState.goals.map((goal) => (
+                <option key={goal.id} value={goal.id} disabled={goal.project_root !== null}>
+                  {goal.objective} ({goal.status})
+                  {goal.project_root !== null ? ' — project-scoped; link from Goal detail' : ''}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[10px] font-mono text-bone-faint">
+              The native authority validates the selected Goal against this job&apos;s Agent. A
+              project-scoped Goal cannot be associated at creation because a new job has no bound
+              Session; link an existing session-bound job from the Goal detail instead.
+            </p>
+          </>
+        )}
       </div>
 
       {/* Schedule */}
@@ -498,10 +618,10 @@ function AddJobForm({
         </motion.button>
         <motion.button
           onClick={handleSubmit}
-          disabled={creating || !name.trim() || !expr.trim() || !prompt.trim()}
+          disabled={creating || unresolved || !name.trim() || !expr.trim() || !prompt.trim()}
           className={cn(
             'px-4 py-2 text-xs font-mono text-void bg-gradient-to-r from-royal to-cyan-neon rounded-lg transition-opacity',
-            (creating || !name.trim() || !expr.trim() || !prompt.trim())
+            (creating || unresolved || !name.trim() || !expr.trim() || !prompt.trim())
               ? 'opacity-50 cursor-not-allowed'
               : 'hover:opacity-90'
           )}
@@ -988,7 +1108,20 @@ export default function CronView() {
   const [refreshing, setRefreshing] = useState(false);
   const [showAddForm, setShowAddForm] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  // A creation whose exact authoritative readback could not confirm exactly one
+  // matching row is retained as a visible unresolved state and is never retried
+  // automatically.
+  const [createUnresolved, setCreateUnresolved] = useState<string | null>(null);
+  // A preflight failure is a definite non-submission (no write occurred), so the
+  // draft is kept and the user may safely retry; it is distinct from an
+  // unresolved write whose outcome is uncertain.
+  const [createPreflightError, setCreatePreflightError] = useState<string | null>(null);
+  const lastCreateRef = useRef<{
+    id: string | null;
+    draft: CronJobDraft;
+    /** Exact authoritative job IDs observed immediately before the write. */
+    baselineIds: Set<string>;
+  } | null>(null);
   const createPending = useRef(false);
   const [operations, setOperations] = useState<CronOperationMap>({});
   const operationsRef = useRef<CronOperationMap>({});
@@ -1259,39 +1392,152 @@ export default function CronView() {
     }
   }, [handleOperation, publishOperations, reconcileOperation]);
 
+  // Re-read the authoritative job list and confirm only a row whose id was
+  // ABSENT from the pre-write baseline and whose submitted fields all match
+  // exactly. When the create returned a readable id, that exact id is required.
+  // A malformed/failed read, or zero/multiple matches, is not a confirmation.
+  const findCreatedJob = async (
+    id: string | null,
+    draft: CronJobDraft,
+    baselineIds: Set<string>,
+  ): Promise<CronJob | null> => {
+    let rows: unknown;
+    try {
+      rows = await invoke<unknown>('list_cron_jobs');
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(rows)) return null;
+    const list = rows as CronJob[];
+    updateJobs(list);
+    const matches = list.filter(
+      (row) =>
+        !baselineIds.has(row.id) &&
+        (id === null || row.id === id) &&
+        row.name === draft.name &&
+        row.schedule === draft.schedule &&
+        row.prompt === draft.prompt &&
+        row.agent_id === draft.agentId &&
+        (row.goal_id ?? null) === (draft.goalId ?? null),
+    );
+    return matches.length === 1 ? matches[0] : null;
+  };
+
   const handleCreate = async (draft: CronJobDraft) => {
-    if (createPending.current) return;
+    if (createPending.current || createUnresolved !== null) return;
     createPending.current = true;
     setCreating(true);
+    setCreatePreflightError(null);
     try {
-      const job = await invoke<CronJob>('add_cron_job', {
-        name: draft.name,
-        schedule: draft.schedule,
-        prompt: draft.prompt,
-        agentId: draft.agentId,
-      });
-      updateJobs([job, ...jobsRef.current]);
-      setCreateError(false);
-      setShowAddForm(false);
-      success(`Cron job "${job.name}" created successfully.`, 'Cron Job Added');
-    } catch {
-      setCreateError(true);
+      // Fresh pre-write baseline of the authoritative job IDs. If it is
+      // unavailable or malformed, do not submit the write at all.
+      let baselineRows: unknown;
+      try {
+        baselineRows = await invoke<unknown>('list_cron_jobs');
+      } catch {
+        setCreatePreflightError(
+          'Could not read the authoritative cron job list before creating. The job was not submitted; your draft has been kept.',
+        );
+        return;
+      }
+      if (!Array.isArray(baselineRows)) {
+        setCreatePreflightError(
+          'The authoritative cron job list returned an unreadable response before creating. The job was not submitted; your draft has been kept.',
+        );
+        return;
+      }
+      const baseline = baselineRows as CronJob[];
+      updateJobs(baseline);
+      const baselineIds = new Set(baseline.map((row) => row.id));
+      // Retain the exact pre-write baseline in the unresolved create context so
+      // a later Verify list only accepts a genuinely new row.
+      lastCreateRef.current = { id: null, draft, baselineIds };
+
+      let created: CronJob | null = null;
+      try {
+        created = await invoke<CronJob>('add_cron_job', {
+          name: draft.name,
+          schedule: draft.schedule,
+          prompt: draft.prompt,
+          agentId: draft.agentId,
+          goalId: draft.goalId,
+        });
+      } catch {
+        // A rejected invoke is not proof the job was not created: the response
+        // may have been lost after the native commit. Mark it unresolved and
+        // block retry; Verify list reconciles read-only.
+        setCreateUnresolved(
+          'The cron job creation request did not return a confirmed response. The job may or may not have been created; verify the authoritative list before creating another job.',
+        );
+        return;
+      }
+      if (!created || typeof created.id !== 'string' || created.id.length === 0) {
+        // The command resolved but returned no readable identity. Keep the
+        // retained draft/baseline context so Verify list can reconcile by a new
+        // matching row; never re-create.
+        setCreateUnresolved(
+          'The native create command returned no readable job identity. The creation outcome is unresolved; verify the authoritative list before creating another job.',
+        );
+        return;
+      }
+      lastCreateRef.current = { id: created.id, draft, baselineIds };
+      const confirmed = await findCreatedJob(created.id, draft, baselineIds);
+      if (confirmed) {
+        lastCreateRef.current = null;
+        setCreateUnresolved(null);
+        setShowAddForm(false);
+        success(`Cron job "${confirmed.name}" created successfully.`, 'Cron Job Added');
+      } else {
+        // The command returned but the authoritative readback did not prove
+        // exactly one new matching row. Retain a visible unresolved state and do
+        // not retry creation automatically (a blind retry could duplicate the job).
+        setCreateUnresolved(
+          'The cron job creation was accepted, but the new job could not be confirmed from the authoritative list. Verify the list before creating another job.',
+        );
+      }
     } finally {
       createPending.current = false;
       setCreating(false);
     }
   };
 
+  // Read-only reconciliation for an unresolved creation: re-read the exact list
+  // and confirm only exactly one new matching row (id absent from the retained
+  // pre-write baseline). It never re-submits `add_cron_job`, and an unresolved
+  // outcome is never cleared by a mismatch (zero matches stays blocked).
+  const handleVerifyCreate = async () => {
+    const pending = lastCreateRef.current;
+    if (!pending || createPending.current) return;
+    createPending.current = true;
+    try {
+      const confirmed = await findCreatedJob(pending.id, pending.draft, pending.baselineIds);
+      if (confirmed) {
+        lastCreateRef.current = null;
+        setCreateUnresolved(null);
+        setShowAddForm(false);
+        success(`Cron job "${confirmed.name}" confirmed.`, 'Cron Job Added');
+      } else {
+        setCreateUnresolved(
+          'The cron job still could not be confirmed from the authoritative list. Verify the list before creating another job.',
+        );
+      }
+    } finally {
+      createPending.current = false;
+    }
+  };
+
   const handleToggleAddForm = () => {
     if (createPending.current) return;
-    setCreateError(false);
+    setCreatePreflightError(null);
     setShowAddForm((current) => !current);
   };
 
   const handleCancelAdd = () => {
     if (createPending.current) return;
-    setCreateError(false);
+    setCreatePreflightError(null);
     setShowAddForm(false);
+    // Deliberately do NOT clear `createUnresolved`/`lastCreateRef`: an uncertain
+    // create must be reconciled read-only before another create is allowed.
   };
 
   const updateFromSnapshot = useCallback((snapshot: CronSnapshot) => {
@@ -1661,7 +1907,9 @@ export default function CronView() {
               onCreate={handleCreate}
               onCancel={handleCancelAdd}
               creating={creating}
-              createError={createError}
+              createPreflightError={createPreflightError}
+              createUnresolved={createUnresolved}
+              onVerifyCreate={handleVerifyCreate}
             />
           </motion.div>
         )}

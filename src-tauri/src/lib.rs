@@ -1561,36 +1561,24 @@ pub fn run() {
     };
 
     let home = crate::get_home_dir();
-    let db_path = std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop/jarvis.db");
+    let app_data_dir =
+        std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop");
 
-    if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let db = match rusqlite::Connection::open(&db_path) {
-        Ok(conn) => {
-            conn.execute_batch(
-                "PRAGMA journal_mode = WAL; \
-                 PRAGMA foreign_keys = ON; \
-                 PRAGMA synchronous = NORMAL; \
-                 PRAGMA temp_store = MEMORY; \
-                 PRAGMA mmap_size = 30000000000; \
-                 PRAGMA cache_size = -20000;",
-            )
-            .ok();
-            // Wait up to 5s on lock contention instead of erroring instantly with
-            // "database is locked" (the manual open path skipped AppDb::new's setup).
-            let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
-            crate::db::run_migrations(&conn).ok();
-            let db = crate::db::AppDb {
-                conn: std::sync::Mutex::new(conn),
-                db_path: db_path.clone(),
-            };
+    // Both initialization paths go through `AppDb::new`, which retains the
+    // app-data root handle and binds the opened `jarvis.db` to that same
+    // directory inode before publishing AppDb. A failure to establish the
+    // binding fails closed here rather than serving a path-only database.
+    let db = match crate::db::AppDb::new(&app_data_dir) {
+        Ok(db) => {
             let _ = crate::commands::skills::seed_skills(&db);
             db
         }
         Err(e) => {
-            eprintln!("[Jarvis] Failed to open DB at {:?}: {}", db_path, e);
+            eprintln!(
+                "[Jarvis] Failed to open DB at {:?}: {}",
+                app_data_dir.join("jarvis.db"),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -1705,6 +1693,7 @@ pub fn run() {
             goal_link_remove,
             goal_prepare_run,
             goal_run_progress,
+            project_steward_workspace_snapshot,
             list_memory_files,
             read_memory_file,
             list_workspace_files,
@@ -1716,6 +1705,7 @@ pub fn run() {
             jarvis_list_memories_by_tier,
             jarvis_recall_cold_memory,
             run_learning_session,
+            get_learning_research_receipt,
             list_skills,
             get_skill,
             enable_skill,

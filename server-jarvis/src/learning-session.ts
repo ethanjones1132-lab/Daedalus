@@ -67,7 +67,7 @@ export interface LearningFinding {
   bun_instance_id: string;
 }
 
-export type LearningOutcome = "complete" | "partial" | "unavailable";
+export type LearningOutcome = "complete" | "partial" | "blocked" | "unavailable";
 
 export interface LearningEvidenceBinding {
   status: "bound" | "unavailable";
@@ -380,6 +380,12 @@ export async function executeLearningResearch(
 
   const rejected: LearningRejectedSource[] = [];
   const findings: LearningFinding[] = [];
+  // A policy stop means an existing ToolRuntime `ask`/`deny` decision prevented
+  // a tool from being invoked. It is tracked separately from an ordinary source
+  // rejection so the disposition is `blocked`, never a quiet `partial`.
+  let policyStopped = false;
+  const isPolicyStop = (code: string): boolean =>
+    code === "approval_required" || code === "policy_denied";
 
   const invalid = (reason: string): LearningResearchResponse =>
     respond("unavailable", reason, findings, rejected, { status: "unavailable", reason });
@@ -454,6 +460,7 @@ export async function executeLearningResearch(
         { query: request.topic },
       );
       if (!search.ok) {
+        if (isPolicyStop(search.error_code)) policyStopped = true;
         rejected.push({
           url: "",
           reason: `web_search ${search.error_code}: ${search.reason}`,
@@ -490,6 +497,7 @@ export async function executeLearningResearch(
         },
       );
       if (!fetched.ok) {
+        if (isPolicyStop(fetched.error_code)) policyStopped = true;
         rejected.push({
           url: source.canonicalUrl,
           reason: `web_fetch ${fetched.error_code}: ${fetched.reason}`,
@@ -529,11 +537,31 @@ export async function executeLearningResearch(
     clearTimeout(deadlineTimer);
   }
 
+  // Disposition describes execution/evidence coverage only. A policy stop is
+  // `blocked` (user action required) and is never downgraded to `partial`; a
+  // deadline/source rejection with usable findings is `partial`; missing
+  // grounded findings without a policy stop is `unavailable`; only an ordinary
+  // bounded completion with no rejected/failed source is `complete`.
   if (findings.length === 0) {
+    if (policyStopped) {
+      const reason =
+        rejected.find((entry) => entry.reason.length > 0)?.reason ??
+        "retrieval was stopped by the existing tool permission policy";
+      return respond("blocked", reason, findings, rejected, binding);
+    }
     const reason =
       rejected.find((entry) => entry.reason.length > 0)?.reason ??
       "no source-grounded findings were retrieved";
     return respond("unavailable", reason, findings, rejected, binding);
+  }
+  if (policyStopped) {
+    return respond(
+      "blocked",
+      "one or more retrieval tools were stopped by the existing permission policy; usable bound findings are preserved",
+      findings,
+      rejected,
+      binding,
+    );
   }
   if (controller.signal.aborted) {
     return respond(

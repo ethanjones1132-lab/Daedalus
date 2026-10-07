@@ -172,6 +172,74 @@ export interface SessionRunRecord {
   goal_id?: string;
 }
 
+/**
+ * One-shot Project Steward handoff from the setup flow to the existing chat
+ * path. Selector-only: it carries the persisted Session ID, the native Goal ID,
+ * and the exact user-authored task text. It never carries a workspace path,
+ * Agent identity, tool call, permission, or completion authority, and the chat
+ * surface only pre-fills from it — the user still presses Send explicitly.
+ */
+export interface ProjectStewardHandoff {
+  session_id: string;
+  goal_id: string;
+  task_draft: string;
+}
+
+/**
+ * App-retained navigation selector for an in-app `goal://notifications` event
+ * (Roadmap Priority 4.3 Task 3). It carries ONLY the exact optional IDs from the
+ * event payload. These values are navigation selectors, never authority, status,
+ * reason, or trusted evidence. The toast title/message and any schedule prompt
+ * are deliberately excluded. It lives in App memory only until consumed and is
+ * never persisted as task content or durable authority.
+ */
+export interface GoalNotificationSelector {
+  goal_id: string;
+  activation_id?: string;
+  cron_job_id?: string;
+  run_id?: string;
+}
+
+/**
+ * Cross-workflow navigation selector (Roadmap Priority 4.4, Task 1). It is a
+ * destination-addressed, selector-only contract used to move between the
+ * Project Steward, Attributable Researcher (Learning), and Recurring Operator
+ * (Goals) surfaces. It carries exact native identifiers only — never task or
+ * objective text, source content, findings/synthesis, permission, outcome,
+ * status, accepted flag, or backend configuration. Each destination re-reads
+ * its owning native rows and validates the exact identity before any selection
+ * or focus; a missing, malformed, stale, or conflicting selector is rejected
+ * with no fallback and no workflow dispatch.
+ *
+ * The run identifiers stay in distinct namespaces and are never interchangeable:
+ * `session_run_id` is a persisted Session run (Project Steward), `agent_run_id`
+ * is an Agent run (Researcher), and `cron_run_id` is a Cron run (Recurring
+ * Operator). Optional IDs are omitted when the source view has no exact native
+ * value; the source then navigates without preselection rather than coercing an
+ * ID across namespaces.
+ */
+export type WorkflowNavigationSelector =
+  | {
+      workflow: 'project-steward';
+      session_id: string;
+      goal_id: string;
+      session_run_id?: string;
+    }
+  | {
+      workflow: 'researcher';
+      session_id: string;
+      agent_run_id: string;
+    }
+  | {
+      workflow: 'recurring-operator';
+      goal_id: string;
+      cron_job_id?: string;
+      activation_id?: string;
+      cron_run_id?: string;
+    };
+
+/** Destination workflow key for cross-workflow navigation. */
+export type WorkflowDestination = WorkflowNavigationSelector['workflow'];
 
 export type JarvisTerminalOutcome = 'partial' | 'failed' | 'timed_out';
 

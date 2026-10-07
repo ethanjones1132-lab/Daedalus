@@ -27,6 +27,11 @@ pub use memory_capture::*;
 pub mod goals;
 pub use goals::*;
 
+// Project Steward read-only workspace review snapshot
+// (Roadmap Priority #4, Phase 4.1, Task 1)
+pub mod project_steward;
+pub use project_steward::*;
+
 // Skills command handlers (SQLite-backed)
 pub mod skills;
 pub use skills::*;

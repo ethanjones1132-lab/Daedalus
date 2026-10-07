@@ -48,17 +48,27 @@ async fn probe_chat_health(client: &reqwest::Client, base_url: &str) -> bool {
 
 #[derive(Serialize)]
 pub struct LearningRunResult {
+    /// Native-generated record identity and durable-receipt key. Present even
+    /// when the attempt is unavailable and no receipt was persisted.
+    pub record_id: String,
+    pub request_id: String,
     pub topic: String,
     pub subtopic: String,
     pub started_at: String,
     pub finished_at: String,
-    pub output_path: String,
     pub outcome: crate::jarvis::learning::LearningOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub findings: Vec<crate::jarvis::learning::Finding>,
     pub rejected_sources: Vec<crate::jarvis::learning::SourceEvaluation>,
     pub evidence_binding: crate::jarvis::learning::EvidenceBinding,
+    /// Canonical hash of the durable receipt. `None` means no receipt was
+    /// persisted and the result must not be treated as durably saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_hash: Option<String>,
+    /// Contained app-owned receipt path. `None` when no receipt was persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_path: Option<String>,
 }
 
 /// Native-validated learning source tuple. Every field is resolved from
@@ -164,9 +174,11 @@ fn resolve_learning_authority(
     })
 }
 
-/// Build the explicit unavailable result. Carries no findings, no output path,
-/// and never a fabricated binding.
+/// Build the explicit unavailable result for a pre-persistence failure. Carries
+/// no findings, no durable receipt, and never a fabricated binding. `record_id`
+/// is the native-generated request identity so a caller can correlate exactly.
 fn unavailable_learning_result(
+    request_id: String,
     topic: String,
     subtopic: String,
     started_at: String,
@@ -174,11 +186,12 @@ fn unavailable_learning_result(
     reason: impl Into<String>,
 ) -> LearningRunResult {
     LearningRunResult {
+        record_id: request_id.clone(),
+        request_id,
         topic,
         subtopic,
         started_at,
         finished_at: chrono::Utc::now().to_rfc3339(),
-        output_path: String::new(),
         outcome: crate::jarvis::learning::LearningOutcome::Unavailable,
         reason: Some(reason.into()),
         findings: Vec::new(),
@@ -186,6 +199,8 @@ fn unavailable_learning_result(
         evidence_binding: crate::jarvis::learning::EvidenceBinding::unavailable(
             "no authoritative learning source binding was dispatched",
         ),
+        receipt_hash: None,
+        receipt_path: None,
     }
 }
 
@@ -266,6 +281,22 @@ fn validate_learning_finding(
     if finding.reference != expected_reference {
         return Err("a finding's reference is not bound to its URL and digest".to_string());
     }
+
+    // The excerpt is the only retrieved body content native receives. Require it
+    // to be present and bounded; native cannot recompute the full-body digest
+    // because the private transport contract returns the digest and a bounded
+    // excerpt, not the raw bytes, so the digest remains a Bun-validated claim.
+    if finding.excerpt.trim().is_empty() {
+        return Err("a finding has an empty retrieved excerpt".to_string());
+    }
+    if finding.excerpt.chars().count() > learning::EXCERPT_MAX_CHARS {
+        return Err("a finding's retrieved excerpt exceeds the bounded length".to_string());
+    }
+
+    // Retrieval time must be a concrete parseable RFC3339 timestamp, distinct
+    // from any synthesis time.
+    chrono::DateTime::parse_from_rfc3339(finding.retrieved_at.trim())
+        .map_err(|_| "a finding has a non-RFC3339 retrieval timestamp".to_string())?;
     Ok(())
 }
 
@@ -304,6 +335,16 @@ fn validate_learning_response(
         return Err("Bun response run identity does not match the validated run".to_string());
     }
 
+    // The runtime bounds must be concrete RFC3339 instants in chronological
+    // order; a malformed or reversed interval is unavailable, never persisted.
+    let started = chrono::DateTime::parse_from_rfc3339(response.started_at.trim())
+        .map_err(|_| "Bun returned a non-RFC3339 research start time".to_string())?;
+    let finished = chrono::DateTime::parse_from_rfc3339(response.finished_at.trim())
+        .map_err(|_| "Bun returned a non-RFC3339 research finish time".to_string())?;
+    if finished < started {
+        return Err("Bun returned a research finish time before its start time".to_string());
+    }
+
     match &response.outcome {
         learning::LearningOutcome::Unavailable => {
             if !response.findings.is_empty() {
@@ -311,10 +352,25 @@ fn validate_learning_response(
             }
             return Ok(());
         }
-        learning::LearningOutcome::Complete | learning::LearningOutcome::Partial => {}
-    }
-    if response.findings.is_empty() {
-        return Err("Bun reported a successful outcome with no findings".to_string());
+        learning::LearningOutcome::Blocked => {
+            // A policy stop is a real, user-actionable disposition. It must
+            // carry a concrete reason, and any findings preserved alongside it
+            // must still be fully bound below.
+            if response
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err("Bun reported blocked without a policy reason".to_string());
+            }
+        }
+        learning::LearningOutcome::Complete | learning::LearningOutcome::Partial => {
+            if response.findings.is_empty() {
+                return Err("Bun reported a successful outcome with no findings".to_string());
+            }
+        }
     }
     for finding in &response.findings {
         validate_learning_finding(finding, response, authority)?;
@@ -331,14 +387,17 @@ fn validate_learning_response(
 /// native `session_runs` completed-run record (with an optional consistency
 /// check against the schema-only `agent_runs` mirror). Any absent, duplicate,
 /// stale, conflicting, or unreadable record yields explicit `unavailable` with
-/// no dispatch and no file.
+/// no dispatch and no receipt.
 ///
 /// Only after that verification is a typed request (the validated tuple plus
 /// topic/seeds) sent to the owned Bun service over the private capability
 /// transport. Bun resolves the exact stored trajectory by run+session, strictly
 /// decodes it, and runs existing `web_search`/`web_fetch` ToolRuntime tools in
 /// the validated Session/workspace context under the existing permission
-/// policy. A session file is written only when genuine findings exist.
+/// policy. A versioned native receipt is persisted only under the contained,
+/// app-owned research-history directory, and is proven by exact readback plus a
+/// fresh native re-read of the Session/run/Agent/root binding before the
+/// durable result is returned.
 #[tauri::command]
 pub async fn run_learning_session(
     db: State<'_, crate::db::AppDb>,
@@ -346,25 +405,12 @@ pub async fn run_learning_session(
     session_id: String,
     agent_run_id: String,
     seed_urls: Option<Vec<String>>,
-    out_dir: Option<String>,
 ) -> Result<LearningRunResult, String> {
     use crate::jarvis::learning;
 
     let started_at = chrono::Utc::now().to_rfc3339();
-
-    // Resolved for later use only. Nothing is created or written unless genuine
-    // findings are ready to persist; a failed authority resolution or an empty
-    // result must not leave a directory or file.
-    let out_path = match out_dir {
-        Some(d) => std::path::PathBuf::from(d),
-        None => {
-            let mut p = std::path::PathBuf::from(crate::wsl::wsl_home());
-            p.push(".jarvis");
-            p.push("learning");
-            p
-        }
-    };
-
+    // Native-generated request/record identity. The caller never supplies it.
+    let request_id = uuid::Uuid::new_v4().to_string();
     let subtopic = learning::next_subtopic(&[]).to_string();
 
     // Existing Tier 1 host gate for caller feedback only.
@@ -387,14 +433,14 @@ pub async fn run_learning_session(
             Ok(authority) => authority,
             Err(reason) => {
                 return Ok(unavailable_learning_result(
-                    topic, subtopic, started_at, rejected, reason,
+                    request_id, topic, subtopic, started_at, rejected, reason,
                 ))
             }
         }
     };
 
     let request = learning::LearningResearchRequest {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: request_id.clone(),
         agent_run_id: authority.agent_run_id.clone(),
         session_id: authority.session_id.clone(),
         agent_id: authority.agent_id.clone(),
@@ -405,7 +451,6 @@ pub async fn run_learning_session(
         max_sources: 8,
         timeout_ms: 180_000,
     };
-    let request_id = request.request_id.clone();
 
     let response = tauri::async_runtime::spawn_blocking(move || {
         let transport = crate::jarvis::memory::transport::native_memory_transport();
@@ -417,6 +462,7 @@ pub async fn run_learning_session(
         Ok(Ok(Some(response))) => response,
         Ok(Ok(None)) => {
             return Ok(unavailable_learning_result(
+                request_id,
                 topic,
                 subtopic,
                 started_at,
@@ -426,11 +472,12 @@ pub async fn run_learning_session(
         }
         Ok(Err(error)) => {
             return Ok(unavailable_learning_result(
-                topic, subtopic, started_at, rejected, error,
+                request_id, topic, subtopic, started_at, rejected, error,
             ))
         }
         Err(join_error) => {
             return Ok(unavailable_learning_result(
+                request_id,
                 topic,
                 subtopic,
                 started_at,
@@ -442,80 +489,211 @@ pub async fn run_learning_session(
 
     // Validate the Bun response identity and every finding against the exact
     // native-validated tuple before anything is persisted. An inconsistent
-    // response fails closed as unavailable with no output write.
+    // response fails closed as unavailable with no receipt.
     if let Err(reason) = validate_learning_response(&response, &request_id, &authority) {
         return Ok(unavailable_learning_result(
-            topic, subtopic, started_at, rejected, reason,
+            request_id, topic, subtopic, started_at, rejected, reason,
         ));
     }
 
-    let binding = response.evidence_binding;
+    let binding = response.evidence_binding.clone();
     let mut rejected = rejected;
-    for source in response.rejected_sources {
+    let mut receipt_rejected: Vec<learning::RejectedSource> = rejected
+        .iter()
+        .map(|ev| learning::RejectedSource {
+            url: ev.url.clone(),
+            reason: ev.credibility_note.clone(),
+        })
+        .collect();
+    for source in &response.rejected_sources {
         rejected.push(learning::SourceEvaluation {
-            url: source.url,
+            url: source.url.clone(),
             tier: learning::CredibilityTier::Rejected,
-            credibility_note: source.reason,
+            credibility_note: source.reason.clone(),
         });
+        receipt_rejected.push(source.clone());
     }
-    let findings = response.findings;
 
-    // Persist only genuine source-grounded findings. The output directory is
-    // created here, after the response was validated and real findings are in
-    // hand, so unavailable/empty results leave no directory or file behind.
-    let mut output_path = String::new();
-    if !findings.is_empty() {
-        std::fs::create_dir_all(&out_path)
-            .map_err(|e| format!("Failed to create learning output directory: {}", e))?;
-        let path = learning::output_path(&out_path, &topic);
-        let body = format!(
-            "# Learning Session — {}\n\n- Topic: `{}`\n- Subtopic: `{}`\n- Started: {}\n- Outcome: `{:?}`\n- Source run: `{}`\n- Source session: `{}`\n- Trajectory digest: `{}`\n- Sources: {}\n- Rejected/unavailable: {}\n\n## Findings\n\n{}\n",
-            topic,
+    // Native owns the final execution-coverage disposition. It must account for
+    // both Bun-reported rejections and native-rejected caller seed URLs: a run
+    // with any rejected/failed source can never be `complete`. Policy stops stay
+    // `blocked`; usable findings with any rejection become `partial`; rejected
+    // sources that leave no usable evidence fall to the conservative
+    // `unavailable`. A response outcome is never promoted.
+    let has_findings = !response.findings.is_empty();
+    let has_rejected = !rejected.is_empty();
+    let (final_outcome, final_reason) = match &response.outcome {
+        learning::LearningOutcome::Blocked => {
+            (learning::LearningOutcome::Blocked, response.reason.clone())
+        }
+        learning::LearningOutcome::Unavailable => {
+            (learning::LearningOutcome::Unavailable, response.reason.clone())
+        }
+        learning::LearningOutcome::Complete | learning::LearningOutcome::Partial => {
+            if has_rejected {
+                if has_findings {
+                    let reason = response.reason.clone().or_else(|| {
+                        Some(format!(
+                            "{} source(s) were rejected or unavailable",
+                            rejected.len()
+                        ))
+                    });
+                    (learning::LearningOutcome::Partial, reason)
+                } else {
+                    let reason = response.reason.clone().or_else(|| {
+                        Some("all retrieved sources were rejected or unavailable".to_string())
+                    });
+                    (learning::LearningOutcome::Unavailable, reason)
+                }
+            } else {
+                (response.outcome.clone(), response.reason.clone())
+            }
+        }
+    };
+
+    // Receipt I/O is anchored to the app-data root handle retained in AppDb and
+    // bound to the open SQLite database, not a path reopened from db_path. No
+    // caller-supplied output path is accepted; receipts live only under the
+    // contained research-history subdirectory of this root.
+    let root = match db.app_data_root() {
+        Some(root) => root,
+        None => {
+            return Ok(unavailable_learning_result(
+                request_id,
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                "research receipt storage is unavailable in this build".to_string(),
+            ))
+        }
+    };
+
+    let receipt = learning::LearningResearchReceipt {
+        version: learning::LEARNING_RESEARCH_RECEIPT_VERSION,
+        record_id: request_id.clone(),
+        request_id: request_id.clone(),
+        topic: topic.clone(),
+        subtopic: subtopic.clone(),
+        session_id: authority.session_id.clone(),
+        agent_run_id: authority.agent_run_id.clone(),
+        agent_id: authority.agent_id.clone(),
+        project_root: authority.project_root.clone(),
+        tool_sequence_digest: binding.tool_sequence_digest.clone().unwrap_or_default(),
+        bun_instance_id: response.bun_instance_id.clone(),
+        started_at: response.started_at.clone(),
+        finished_at: response.finished_at.clone(),
+        outcome: final_outcome.clone(),
+        reason: final_reason.clone(),
+        findings: response.findings.clone(),
+        rejected_sources: receipt_rejected,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        receipt_hash: String::new(),
+    };
+
+    let (persisted, receipt_path) = match learning::persist_research_receipt(root, receipt) {
+        Ok(value) => value,
+        Err(reason) => {
+            return Ok(unavailable_learning_result(
+                request_id,
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                format!("research receipt was not durably saved: {reason}"),
+            ))
+        }
+    };
+
+    // Read the receipt back by exact record id. A missing or malformed readback
+    // is unavailable, never a saved report.
+    let readback = match learning::read_research_receipt(root, &persisted.record_id) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return Ok(unavailable_learning_result(
+                request_id,
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                "research receipt was not readable after persistence".to_string(),
+            ))
+        }
+        Err(reason) => {
+            return Ok(unavailable_learning_result(
+                request_id, topic, subtopic, started_at, rejected, reason,
+            ))
+        }
+    };
+
+    // Re-read the full native Session/run/Agent/root binding after persistence
+    // and require it to still agree with the durable receipt. Any change or
+    // disappearance fails closed with the durable claim withheld.
+    let verified = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        resolve_learning_authority(&conn, &readback.session_id, &readback.agent_run_id)
+    };
+    let verified = match verified {
+        Ok(authority) => authority,
+        Err(reason) => {
+            return Ok(unavailable_learning_result(
+                request_id,
+                topic,
+                subtopic,
+                started_at,
+                rejected,
+                format!("durable research receipt authority is no longer valid: {reason}"),
+            ))
+        }
+    };
+    if readback != persisted
+        || verified.session_id != readback.session_id
+        || verified.agent_run_id != readback.agent_run_id
+        || verified.agent_id != readback.agent_id
+        || verified.project_root != readback.project_root
+    {
+        return Ok(unavailable_learning_result(
+            request_id,
             topic,
             subtopic,
             started_at,
-            response.outcome,
-            authority.agent_run_id,
-            authority.session_id,
-            binding.tool_sequence_digest.as_deref().unwrap_or(""),
-            findings.len(),
-            rejected.len(),
-            findings
-                .iter()
-                .map(|f| format!(
-                    "- **{}** — {} [{}]\n  {} — {}\n  digest: {} | trajectory: {} | tool: {} call: {} run: {}\n  reference: {}\n",
-                    f.subtopic,
-                    f.source_url,
-                    f.source_host,
-                    f.retrieved_at,
-                    f.excerpt,
-                    f.content_digest,
-                    f.trajectory_digest,
-                    f.tool_name,
-                    f.tool_call_id,
-                    f.run_id,
-                    f.reference,
-                ))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        std::fs::write(&path, body)
-            .map_err(|e| format!("Failed to write learning session: {}", e))?;
-        output_path = path.to_string_lossy().into_owned();
+            rejected,
+            "durable research receipt identity no longer matches the persisted Session/run binding"
+                .to_string(),
+        ));
     }
 
     Ok(LearningRunResult {
+        record_id: persisted.record_id,
+        request_id,
         topic,
         subtopic,
         started_at,
-        finished_at: chrono::Utc::now().to_rfc3339(),
-        output_path,
-        outcome: response.outcome,
-        reason: response.reason,
-        findings,
+        finished_at: response.finished_at,
+        outcome: final_outcome,
+        reason: final_reason,
+        findings: response.findings,
         rejected_sources: rejected,
         evidence_binding: binding,
+        receipt_hash: Some(persisted.receipt_hash),
+        receipt_path: Some(receipt_path.to_string_lossy().into_owned()),
     })
+}
+
+/// Read back one durable native research receipt by exact native record id.
+///
+/// `Ok(None)` is a genuine absent record; an `Err` is a read, strict-decode, or
+/// hash-verification failure and must be rendered as unavailable rather than as
+/// an empty research history.
+#[tauri::command]
+pub async fn get_learning_research_receipt(
+    db: State<'_, crate::db::AppDb>,
+    record_id: String,
+) -> Result<Option<crate::jarvis::learning::LearningResearchReceipt>, String> {
+    let root = db.app_data_root().ok_or_else(|| {
+        "research receipt storage is unavailable in this build".to_string()
+    })?;
+    crate::jarvis::learning::read_research_receipt(root, &record_id)
 }
 
 #[tauri::command]
@@ -656,18 +834,22 @@ pub async fn jarvis_send_message(
                 source_message_id,
             )
             .map_err(|error| error.message)?;
-            // Validation succeeded. If the owned child could not confirm the
-            // bounded one-shot, the turn proceeds goal-less rather than
-            // attributing the run to a Goal whose authority was not
-            // established. This is fail-closed for authority, not for the turn.
+            // Validation succeeded, but the owned child did not confirm the
+            // bounded one-shot (or returned no native binding id). A user who
+            // explicitly selected a Goal must never be downgraded to an
+            // unlinked turn: fail closed BEFORE the Bun dispatch so the run is
+            // not attributed to a Goal whose authority was not established.
+            // Ordinary Goal-less chat is preserved only when no Goal was
+            // selected (handled by the `Some("") | None` arm above).
             match preparation.binding_id {
                 Some(binding_id) if preparation.registered => Some(binding_id),
                 _ => {
-                    eprintln!(
-                        "[jarvis-chat] goal binding not registered turn={} goal={} (running goal-less)",
-                        turn_id, candidate
+                    return Err(
+                        "The selected Goal run binding could not be registered with the native \
+                         authority, so the turn was not sent. Your draft is preserved; retry, or \
+                         clear the Goal selection to send an ordinary turn."
+                            .to_string(),
                     );
-                    None
                 }
             }
         }

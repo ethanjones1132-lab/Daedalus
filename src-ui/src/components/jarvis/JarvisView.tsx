@@ -9,6 +9,7 @@ import {
   OPENROUTER_MODELS,
   type AgentOption,
   type SessionMemorySelection,
+  type ProjectStewardHandoff,
 } from './types';
 import ControlCenterView, { type ControlCenterTab } from './ControlCenterView';
 import { sessionScroll } from './session-scroll';
@@ -138,6 +139,15 @@ interface JarvisViewProps {
   initialSubView?: JarvisSubView;
   initialControlTab?: ControlCenterTab;
   onCompanionChange?: (companion: CompanionState | null) => void;
+  /**
+   * One-shot, selector-only Project Steward handoff. When present, this view
+   * re-reads the Session/Goal authorities, requires the Session Agent and
+   * canonical project root to match the Goal, then selects them and pre-fills
+   * the exact user task in the chat composer. It never sends.
+   */
+  projectStewardHandoff?: ProjectStewardHandoff | null;
+  /** Clears the one-shot handoff after it has been applied or rejected. */
+  onProjectStewardHandoffConsumed?: () => void;
 }
 
 type ToolApprovalRequest = {
@@ -167,6 +177,95 @@ function decodeBoundScope(value: unknown): { kind: string; agent_id: string; pro
   if (typeof record.kind !== 'string' || typeof record.agent_id !== 'string') return null;
   if (record.project_root !== null && typeof record.project_root !== 'string') return null;
   return { kind: record.kind, agent_id: record.agent_id, project_root: record.project_root ?? null };
+}
+
+/**
+ * Decode the `goal_get` readback into the selector/identity fields Project
+ * Steward handoff validation needs. A malformed or absent result is never
+ * treated as a match.
+ */
+interface GoalIdentity {
+  id: string;
+  objective: string;
+  status: string;
+  agent_id: string;
+  project_root: string | null;
+}
+
+function decodeGoalIdentity(value: unknown): GoalIdentity | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const goalRaw = record.goal;
+  if (typeof goalRaw !== 'object' || goalRaw === null || Array.isArray(goalRaw)) return null;
+  const goal = goalRaw as Record<string, unknown>;
+  if (typeof goal.id !== 'string' || typeof goal.objective !== 'string') return null;
+  if (typeof goal.agent_id !== 'string') return null;
+  if (goal.project_root !== null && typeof goal.project_root !== 'string') return null;
+  return {
+    id: goal.id,
+    objective: goal.objective,
+    status: typeof goal.status === 'string' ? goal.status : 'pending',
+    agent_id: goal.agent_id,
+    project_root: goal.project_root ?? null,
+  };
+}
+
+/** Best-effort workspace-root normalization for the handoff identity match only;
+ *  native revalidates the canonical root at send time. */
+function normalizeHandoffRoot(root: string | null | undefined): string | null {
+  if (typeof root !== 'string') return null;
+  let value = root.trim();
+  if (value.length === 0) return null;
+  while (value.length > 1 && (value.endsWith('/') || value.endsWith('\\'))) {
+    value = value.slice(0, -1);
+  }
+  return value;
+}
+
+/**
+ * Minimal canonical Session readback for handoff identity validation. The chat
+ * projection omits `archived`, so this reads the canonical `list_sessions`
+ * shape (which includes `archived` and the validated `project_root`).
+ */
+interface CanonicalSessionRow {
+  id: string;
+  agent_id: string;
+  archived: boolean;
+  project_root: string | null;
+}
+
+/**
+ * Result of decoding a native collection. `ok: false` means the collection was
+ * unreadable — not that it was empty — so a malformed element cannot make a
+ * requested Session look like it no longer exists.
+ */
+type CollectionRead<T> = { ok: true; rows: T[] } | { ok: false };
+
+function decodeCanonicalSessionRows(value: unknown): CollectionRead<CanonicalSessionRow> {
+  if (!Array.isArray(value)) return { ok: false };
+  const rows: CanonicalSessionRow[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return { ok: false };
+    const record = item as Record<string, unknown>;
+    if (typeof record.id !== 'string' || typeof record.agent_id !== 'string') return { ok: false };
+    // Strict decode: a row without a real boolean `archived` is unreadable
+    // rather than coerced to `false`, so a malformed/archived Session can never
+    // be accepted as a live handoff target by default. Any malformed element
+    // makes the whole read unavailable; a genuinely valid empty array stays
+    // empty.
+    if (typeof record.archived !== 'boolean') return { ok: false };
+    let projectRoot: string | null;
+    if (record.project_root === null) projectRoot = null;
+    else if (typeof record.project_root === 'string') projectRoot = record.project_root;
+    else return { ok: false };
+    rows.push({
+      id: record.id,
+      agent_id: record.agent_id,
+      archived: record.archived,
+      project_root: projectRoot,
+    });
+  }
+  return { ok: true, rows };
 }
 
 // ── Durable run record (Task 4.1) ────────────────────────────────────
@@ -271,7 +370,7 @@ class JarvisStreamError extends Error {
   }
 }
 
-export default function JarvisView({ initialSubView = 'chat', initialControlTab, onCompanionChange }: JarvisViewProps) {
+export default function JarvisView({ initialSubView = 'chat', initialControlTab, onCompanionChange, projectStewardHandoff = null, onProjectStewardHandoffConsumed }: JarvisViewProps) {
   const [subView, setSubView] = useState<JarvisSubView>(initialSubView);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
@@ -294,6 +393,15 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
   const sessionDeleteOperationsRef = useRef<Record<string, SessionDeleteOperation<JarvisSession>>>({});
   const sessionDeleteReadPending = useRef(false);
   const [activeSession, setActiveSession] = useState<string | null>(null);
+  // One-shot Project Steward handoff state. `chatHandoff` is handed down to the
+  // chat panel once the Session/Goal readback below has validated it.
+  const [chatHandoff, setChatHandoff] = useState<ProjectStewardHandoff | null>(null);
+  const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
+  const handoffSeqRef = useRef(0);
+  const handoffConsumedRef = useRef<(() => void) | undefined>(onProjectStewardHandoffConsumed);
+  useEffect(() => {
+    handoffConsumedRef.current = onProjectStewardHandoffConsumed;
+  }, [onProjectStewardHandoffConsumed]);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const [status, setStatus] = useState<JarvisStatus | null>(null);
   const [configLoading, setConfigLoading] = useState(true);
@@ -434,6 +542,80 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
     loadStatus();
   }, [loadSessions, loadConfig, loadStatus]);
 
+  const handleChatHandoffApplied = useCallback(() => {
+    setChatHandoff(null);
+    handoffConsumedRef.current?.();
+  }, []);
+
+  // Project Steward one-shot handoff. Re-read the persisted Session and the
+  // native Goal before consuming anything: require the Session to exist, be
+  // non-archived, and match the Goal's Agent and canonical project root. Only
+  // then select the Session/Goal and pre-fill the task; nothing is sent here.
+  useEffect(() => {
+    if (!projectStewardHandoff) return;
+    const seq = ++handoffSeqRef.current;
+    let cancelled = false;
+    const consume = () => {
+      if (cancelled || seq !== handoffSeqRef.current) return;
+      handoffConsumedRef.current?.();
+    };
+    const reject = (message: string) => {
+      if (cancelled || seq !== handoffSeqRef.current) return;
+      setHandoffNotice(message);
+      consume();
+    };
+    void (async () => {
+      try {
+        const [sessionRows, rawGoal] = await Promise.all([
+          invoke<unknown>('list_sessions'),
+          invoke<unknown>('goal_get', { id: projectStewardHandoff.goal_id }),
+        ]);
+        if (cancelled || seq !== handoffSeqRef.current) return;
+        const decodedSessions = decodeCanonicalSessionRows(sessionRows);
+        if (!decodedSessions.ok) {
+          reject('Project Steward: the Session list could not be read. The task was not opened in Chat.');
+          return;
+        }
+        const session = decodedSessions.rows.find(
+          (row) => row.id === projectStewardHandoff.session_id,
+        );
+        const goal = decodeGoalIdentity(rawGoal);
+        if (!session) {
+          reject('Project Steward: the selected Session no longer exists. The task was not opened in Chat.');
+          return;
+        }
+        if (session.archived) {
+          reject('Project Steward: the selected Session is archived. The task was not opened in Chat.');
+          return;
+        }
+        if (!goal || goal.id !== projectStewardHandoff.goal_id) {
+          reject('Project Steward: the native Goal could not be re-read. The task was not opened in Chat.');
+          return;
+        }
+        const sessionAgent = typeof session.agent_id === 'string' ? session.agent_id : '';
+        const sessionRoot = normalizeHandoffRoot(session.project_root);
+        const goalRoot = normalizeHandoffRoot(goal.project_root);
+        if (!sessionAgent || sessionAgent !== goal.agent_id) {
+          reject('Project Steward: the Session Agent no longer matches the Goal. The task was not opened in Chat.');
+          return;
+        }
+        if (!sessionRoot || !goalRoot || sessionRoot !== goalRoot) {
+          reject('Project Steward: the Session workspace no longer matches the Goal. The task was not opened in Chat.');
+          return;
+        }
+        setHandoffNotice(null);
+        setSubView('chat');
+        setActiveSession(projectStewardHandoff.session_id);
+        setChatHandoff(projectStewardHandoff);
+      } catch {
+        reject('Project Steward: the Session/Goal readback failed. The task was not opened in Chat.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectStewardHandoff]);
+
   const subNavItems: { id: JarvisSubView; label: string; icon: React.ReactNode }[] = [
     { id: 'chat', label: 'Chat', icon: <Sparkles size={11} /> },
     { id: 'sessions', label: 'Sessions', icon: <ChevronRight size={11} /> },
@@ -506,6 +688,12 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
         })}
       </div>
 
+      {handoffNotice && (
+        <p role="alert" className="text-[11px] font-mono text-amber-400 mb-1">
+          {handoffNotice}
+        </p>
+      )}
+
       {/* Sticky session chips (Phase 3.4) */}
       {recentSessions.length > 0 && (
         <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
@@ -567,6 +755,8 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 onRunRecordSettled={setRunRecord}
                 sessions={sessions}
                 onSessionsChanged={() => { void loadSessions(); }}
+                projectStewardHandoff={chatHandoff}
+                onProjectStewardHandoffApplied={handleChatHandoffApplied}
               />
             </motion.div>
           )}
@@ -704,6 +894,7 @@ const CURATED_SUGGESTIONS: string[] = [
 export function ChatPanel({
   activeSession, setActiveSession, config, backendLabel, modelLabel, onSessionCreated, onRunRecordSettled,
   sessions = [], onSessionsChanged = () => {},
+  projectStewardHandoff = null, onProjectStewardHandoffApplied,
 }: {
   activeSession: string | null;
   setActiveSession: (id: string | null) => void;
@@ -716,6 +907,14 @@ export function ChatPanel({
   sessions?: JarvisSession[];
   /** Refresh the persisted Session list after a native binding change. */
   onSessionsChanged?: () => void;
+  /**
+   * Selector-only Project Steward handoff already validated by JarvisView. When
+   * it targets the active Session, the exact Goal is selected and the exact
+   * user task is pre-filled. Nothing is sent.
+   */
+  projectStewardHandoff?: ProjectStewardHandoff | null;
+  /** Clears the handoff after it has been applied to the composer. */
+  onProjectStewardHandoffApplied?: () => void;
 }) {
   const [messages, setMessages] = useState<JarvisMessage[]>([]);
   const [draftStore, setDraftStore] = useState<SessionDraftStore>(() => createSessionDraftStore());
@@ -1101,6 +1300,39 @@ export function ChatPanel({
     const nextText = typeof next === 'function' ? next(currentText) : next;
     publishDraftStore(updateSessionDraft(currentStore, sessionId, nextText));
   }, [activeSession, publishDraftStore]);
+
+  // Project Steward handoff application. JarvisView has already re-read and
+  // validated the Session/Goal identity; here we select the exact Goal (ensuring
+  // its option exists) and pre-fill the exact user task for the active Session.
+  // The ordinary composer and explicit Send are unchanged — nothing is sent.
+  useEffect(() => {
+    if (!projectStewardHandoff) return;
+    if (activeSession !== projectStewardHandoff.session_id) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const raw = await invoke<unknown>('goal_get', { id: projectStewardHandoff.goal_id });
+        const goal = decodeGoalIdentity(raw);
+        if (!cancelled && goal && goal.id === projectStewardHandoff.goal_id) {
+          setGoalOptions((prev) =>
+            prev.some((option) => option.id === goal.id)
+              ? prev
+              : [...prev, { id: goal.id, objective: goal.objective, status: goal.status }],
+          );
+        }
+      } catch {
+        // The composer still receives the exact handoff task; the Goal id is
+        // selected and native re-validates it before any run is linked.
+      }
+      if (cancelled) return;
+      setSelectedGoalId(projectStewardHandoff.goal_id);
+      setInput(projectStewardHandoff.task_draft, projectStewardHandoff.session_id);
+      onProjectStewardHandoffApplied?.();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectStewardHandoff, activeSession, setInput, onProjectStewardHandoffApplied]);
 
   const presentApprovalRequest = useCallback((request: ToolApprovalRequest | null | undefined) => {
     if (!request || !request.session_id || !request.call_id || !request.name) return false;

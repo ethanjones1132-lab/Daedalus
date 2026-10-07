@@ -5,7 +5,8 @@ export type ViewId =
   | 'approvals' | 'gateway' | 'hermes' | 'doctor' | 'health' | 'plugins'
   | 'memory' | 'action-registry' | 'learning'
   | 'jarvis-hub' | 'jarvis-chat' | 'jarvis-sessions' | 'jarvis-skills'
-  | 'jarvis-tools' | 'jarvis-companion' | 'jarvis-config' | 'jarvis-status';
+  | 'jarvis-tools' | 'jarvis-companion' | 'jarvis-config' | 'jarvis-status'
+  | 'project-steward';
 
 export interface NavItem { id: ViewId; label: string; icon: string }
 export interface NavSection { title: string; items: NavItem[] }

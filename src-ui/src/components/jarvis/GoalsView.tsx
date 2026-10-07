@@ -35,6 +35,8 @@ import {
   type TrustedExecutionReceipt,
   type TrustedManifestSummary,
 } from './trusted-receipt-state';
+import type { GoalNotificationSelector, WorkflowDestination, WorkflowNavigationSelector } from './types';
+import WorkflowReadinessPanel, { type WorkflowReadinessItem } from './WorkflowReadinessPanel';
 
 interface Goal {
   id: string;
@@ -119,13 +121,38 @@ interface CronSchedule {
   goal_id: string | null;
 }
 
+/** Optional runtime receipt carried on a Cron run (never Goal acceptance). */
+interface CronExecutionEvidence {
+  run_id: string;
+  status: string;
+  acceptance_result: string | null;
+  error_code: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+/**
+ * Per-run receipt state. Distinguishes an explicit `null` evidence (native
+ * Option) from a present-but-malformed evidence object, so the UI never hides a
+ * malformed receipt behind the same "none" rendering.
+ */
+type CronRunReceipt =
+  | { kind: 'present'; evidence: CronExecutionEvidence }
+  | { kind: 'absent' }
+  | { kind: 'malformed' };
+
 interface CronActivation {
   activation_id: string;
   cron_id: string;
+  goal_id: string | null;
+  agent_id: string;
+  session_id: string | null;
+  project_root: string | null;
   schedule_occurrence: string;
   trigger_kind: string;
   claim_state: string;
   run_id: string | null;
+  bun_run_id: string | null;
   terminal_reason: string | null;
   claimed_at: string;
   dispatched_at: string | null;
@@ -136,12 +163,53 @@ interface CronRunRecord {
   id: string;
   cron_id: string;
   status: string;
+  output: string;
   error: string;
-  terminal_reason: string | null;
+  duration_ms: number;
   started_at: string;
   finished_at: string | null;
+  execution_evidence: CronRunReceipt;
   activation_id: string | null;
   schedule_occurrence: string | null;
+  goal_id: string | null;
+  terminal_reason: string | null;
+}
+
+type LinkTargetKind = 'cron_job' | 'commitment';
+
+/** Persisted Session authority used to prove a cron job's workspace scope. */
+interface SessionScopeRow {
+  id: string;
+  agent_id: string;
+  project_root: string | null;
+}
+
+/**
+ * Candidate rows for explicit Goal linking, read only from the owning native
+ * authorities and bound to the current Goal/request generation. A failed or
+ * malformed read is an unavailable candidate set, never an empty one.
+ */
+type LinkCandidatesState =
+  | { kind: 'loading' }
+  | { kind: 'error'; message: string }
+  | {
+      kind: 'ready';
+      jobs: CronSchedule[];
+      commitments: CommitmentRecord[];
+      sessions: SessionScopeRow[];
+    };
+
+/**
+ * One explicit link/unlink operation. A write whose exact Goal-side link and
+ * target-side `goal_id` readback do not agree stays unresolved and is only
+ * reconciled by a read-only Refresh; it is never repeated automatically.
+ */
+interface LinkOp {
+  kind: 'link' | 'unlink';
+  targetKind: LinkTargetKind;
+  targetId: string;
+  phase: 'writing' | 'write-failed' | 'read-failed';
+  message?: string;
 }
 
 type ScheduleOpKind = 'pause' | 'resume' | 'run' | 'cancel';
@@ -262,6 +330,259 @@ function isAtOrAfter(timestamp: string | null | undefined, reference: number): b
   return Number.isFinite(parsed) && parsed >= reference;
 }
 
+// ── Strict native activation/run decoding ────────────────────────────────────
+//
+// Native `CronActivation`/`CronRun`/`CronExecutionEvidence` DTOs are decoded
+// field-by-field. A malformed collection or row is unavailable (null), never a
+// silently-cast or empty authoritative history; a valid empty array is genuine
+// "none recorded".
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A required string field; a missing/non-string value is malformed. */
+function requiredString(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === 'string' ? value : null;
+}
+
+/**
+ * An `Option<String>` field that native serializes as an explicit `null` or a
+ * string. Returns `undefined` for a missing/malformed value (malformed), `null`
+ * for an explicit null, and the string otherwise.
+ */
+function nullableString(
+  record: Record<string, unknown>,
+  key: string,
+): string | null | undefined {
+  if (!(key in record)) return undefined;
+  const value = record[key];
+  if (value === null) return null;
+  if (typeof value === 'string') return value;
+  return undefined;
+}
+
+/**
+ * A required identity field. A missing/non-string value, or an empty or
+ * whitespace-only string, is malformed so a blank ID can never join or verify.
+ */
+function requiredIdentity(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (typeof value !== 'string' || value.trim().length === 0) return null;
+  return value;
+}
+
+/**
+ * An optional identity field: explicit `null` is a legitimate "absent", but a
+ * present empty/whitespace-only string (or any non-string/non-null value, or a
+ * missing key) is malformed.
+ */
+function nullableIdentity(
+  record: Record<string, unknown>,
+  key: string,
+): string | null | undefined {
+  if (!(key in record)) return undefined;
+  const value = record[key];
+  if (value === null) return null;
+  if (typeof value !== 'string' || value.trim().length === 0) return undefined;
+  return value;
+}
+
+function decodeCronExecutionEvidence(value: unknown): CronExecutionEvidence | null {
+  if (!isRecord(value)) return null;
+  const runId = requiredIdentity(value, 'run_id');
+  const status = requiredString(value, 'status');
+  const acceptanceResult = nullableString(value, 'acceptance_result');
+  const errorCode = nullableString(value, 'error_code');
+  const startedAt = nullableString(value, 'started_at');
+  const finishedAt = nullableString(value, 'finished_at');
+  if (runId === null || status === null) return null;
+  if (
+    acceptanceResult === undefined ||
+    errorCode === undefined ||
+    startedAt === undefined ||
+    finishedAt === undefined
+  ) {
+    return null;
+  }
+  return {
+    run_id: runId,
+    status,
+    acceptance_result: acceptanceResult,
+    error_code: errorCode,
+    started_at: startedAt,
+    finished_at: finishedAt,
+  };
+}
+
+function decodeCronActivation(value: unknown): CronActivation | null {
+  if (!isRecord(value)) return null;
+  const activationId = requiredIdentity(value, 'activation_id');
+  const cronId = requiredIdentity(value, 'cron_id');
+  const agentId = requiredIdentity(value, 'agent_id');
+  const occurrence = requiredIdentity(value, 'schedule_occurrence');
+  const triggerKind = requiredString(value, 'trigger_kind');
+  const claimState = requiredString(value, 'claim_state');
+  const claimedAt = requiredString(value, 'claimed_at');
+  const goalId = nullableIdentity(value, 'goal_id');
+  const sessionId = nullableIdentity(value, 'session_id');
+  const projectRoot = nullableIdentity(value, 'project_root');
+  const runId = nullableIdentity(value, 'run_id');
+  const bunRunId = nullableIdentity(value, 'bun_run_id');
+  const terminalReason = nullableString(value, 'terminal_reason');
+  const dispatchedAt = nullableString(value, 'dispatched_at');
+  const settledAt = nullableString(value, 'settled_at');
+  if (
+    activationId === null ||
+    cronId === null ||
+    agentId === null ||
+    occurrence === null ||
+    triggerKind === null ||
+    claimState === null ||
+    claimedAt === null
+  ) {
+    return null;
+  }
+  if (
+    goalId === undefined ||
+    sessionId === undefined ||
+    projectRoot === undefined ||
+    runId === undefined ||
+    bunRunId === undefined ||
+    terminalReason === undefined ||
+    dispatchedAt === undefined ||
+    settledAt === undefined
+  ) {
+    return null;
+  }
+  return {
+    activation_id: activationId,
+    cron_id: cronId,
+    goal_id: goalId,
+    agent_id: agentId,
+    session_id: sessionId,
+    project_root: projectRoot,
+    schedule_occurrence: occurrence,
+    trigger_kind: triggerKind,
+    claim_state: claimState,
+    run_id: runId,
+    bun_run_id: bunRunId,
+    terminal_reason: terminalReason,
+    claimed_at: claimedAt,
+    dispatched_at: dispatchedAt,
+    settled_at: settledAt,
+  };
+}
+
+function decodeCronRunRecord(value: unknown): CronRunRecord | null {
+  if (!isRecord(value)) return null;
+  const id = requiredIdentity(value, 'id');
+  const cronId = requiredIdentity(value, 'cron_id');
+  const status = requiredString(value, 'status');
+  const startedAt = requiredString(value, 'started_at');
+  const output = requiredString(value, 'output');
+  const error = requiredString(value, 'error');
+  const durationMs = value.duration_ms;
+  const finishedAt = nullableString(value, 'finished_at');
+  const activationId = nullableIdentity(value, 'activation_id');
+  const occurrence = nullableIdentity(value, 'schedule_occurrence');
+  const goalId = nullableIdentity(value, 'goal_id');
+  const terminalReason = nullableString(value, 'terminal_reason');
+  if (id === null || cronId === null || status === null || startedAt === null) return null;
+  if (output === null || error === null) return null;
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs)) return null;
+  if (
+    finishedAt === undefined ||
+    activationId === undefined ||
+    occurrence === undefined ||
+    goalId === undefined ||
+    terminalReason === undefined
+  ) {
+    return null;
+  }
+  let executionEvidence: CronRunReceipt;
+  if (value.execution_evidence === undefined) {
+    // The native contract requires this field (Option): an absent property is a
+    // malformed outer row.
+    return null;
+  } else if (value.execution_evidence === null) {
+    executionEvidence = { kind: 'absent' };
+  } else {
+    const decoded = decodeCronExecutionEvidence(value.execution_evidence);
+    executionEvidence =
+      decoded === null ? { kind: 'malformed' } : { kind: 'present', evidence: decoded };
+  }
+  return {
+    id,
+    cron_id: cronId,
+    status,
+    output,
+    error,
+    duration_ms: durationMs,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    execution_evidence: executionEvidence,
+    activation_id: activationId,
+    schedule_occurrence: occurrence,
+    goal_id: goalId,
+    terminal_reason: terminalReason,
+  };
+}
+
+function decodeCronActivationArray(value: unknown): CronActivation[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: CronActivation[] = [];
+  for (const row of value) {
+    const decoded = decodeCronActivation(row);
+    if (decoded === null) return null;
+    out.push(decoded);
+  }
+  return out;
+}
+
+function decodeCronRunArray(value: unknown): CronRunRecord[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: CronRunRecord[] = [];
+  for (const row of value) {
+    const decoded = decodeCronRunRecord(row);
+    if (decoded === null) return null;
+    out.push(decoded);
+  }
+  return out;
+}
+
+/**
+ * Exact run↔activation relation: Cron, Goal, activation, and occurrence must
+ * all agree, and when the activation records a run id it must equal the run id.
+ * Anything else is a separate/unavailable relation, never a synthesized success.
+ */
+function runMatchesActivation(run: CronRunRecord, activation: CronActivation): boolean {
+  if (run.activation_id === null) return false;
+  if (activation.activation_id !== run.activation_id) return false;
+  if (activation.cron_id !== run.cron_id) return false;
+  if (activation.goal_id !== run.goal_id) return false;
+  if (activation.schedule_occurrence !== run.schedule_occurrence) return false;
+  if (activation.run_id !== null && activation.run_id !== run.id) return false;
+  return true;
+}
+
+function joinedRunForActivation(
+  activation: CronActivation,
+  runs: CronRunRecord[],
+): CronRunRecord | null {
+  const matches = runs.filter((run) => runMatchesActivation(run, activation));
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function matchedActivationForRun(
+  run: CronRunRecord,
+  activations: CronActivation[],
+): CronActivation | null {
+  const matches = activations.filter((activation) => runMatchesActivation(run, activation));
+  return matches.length === 1 ? matches[0] : null;
+}
+
 /**
  * Whether one operation's requested effect is evidenced by an authoritative
  * readback. This is the single predicate applied both immediately after the
@@ -317,6 +638,221 @@ function scheduleOpReconciled(
   // cancel: the tracked in-flight execution must be gone after the refresh.
   return !result.inFlight.has(jobId);
 }
+
+/**
+ * Exact navigation focus resolved from a `goal://notifications` selector against
+ * fresh native reads. It is a display focus only: `cronJobId`/`activationId`/
+ * `runId` are the exact matching durable IDs, never authority.
+ */
+interface NotificationFocus {
+  goalId: string;
+  cronJobId: string | null;
+  activationId: string | null;
+  runId: string | null;
+}
+
+/**
+ * Outcome of reconciling a notification selector against the freshly-read Goal,
+ * persisted Goal↔Cron association, and exact activation/run tuple. A stale
+ * outcome never selects or focuses a different/latest record.
+ */
+type NotificationReconcile =
+  | { status: 'ok'; focus: NotificationFocus }
+  | { status: 'stale'; message: string };
+
+const NOTIFICATION_STALE_MESSAGE =
+  'This notification selector could not be reconciled with the current native Goal, schedule link, or activation/run rows. Nothing was opened or focused from it; refresh the schedule state or select the Goal manually. No fallback or latest record is substituted.';
+
+/**
+ * Reconcile a notification selector against fresh native state. Only an exact
+ * tuple (Goal id, persisted Goal↔Cron link, exact activation id with matching
+ * Cron/Goal ids, and — when supplied — exact run id with matching Cron/Goal ids
+ * and an exact run↔activation relation) resolves to a focus. Anything missing,
+ * malformed, or conflicting is stale; the caller must not substitute another
+ * record. Selector values are never status, reason, or evidence.
+ */
+function reconcileNotificationSelector(
+  selector: GoalNotificationSelector,
+  goalId: string,
+  linkedJobIds: Set<string>,
+  linkedCronIds: Set<string>,
+  activationsByJob: Record<string, CronActivation[]>,
+  runsByJob: Record<string, CronRunRecord[]>,
+): NotificationReconcile {
+  const { cron_job_id, activation_id, run_id } = selector;
+  const hasSubSelector =
+    cron_job_id !== undefined || activation_id !== undefined || run_id !== undefined;
+  if (!hasSubSelector) {
+    return { status: 'ok', focus: { goalId, cronJobId: null, activationId: null, runId: null } };
+  }
+  if (cron_job_id === undefined || !linkedCronIds.has(cron_job_id) || !linkedJobIds.has(cron_job_id)) {
+    // A sub-selector without an exact persisted Goal↔Cron association (link
+    // projection AND target-side goal_id) cannot be focused; never fall back to
+    // another linked job.
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  if (!hasOwn(activationsByJob, cron_job_id) || !hasOwn(runsByJob, cron_job_id)) {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  const activations = activationsByJob[cron_job_id];
+  const runs = runsByJob[cron_job_id];
+
+  let matchedActivation: CronActivation | null = null;
+  if (activation_id !== undefined) {
+    const matches = activations.filter(
+      (activation) =>
+        activation.activation_id === activation_id &&
+        activation.cron_id === cron_job_id &&
+        activation.goal_id === goalId,
+    );
+    if (matches.length !== 1) {
+      return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    }
+    matchedActivation = matches[0];
+  }
+
+  if (run_id !== undefined) {
+    const matches = runs.filter(
+      (run) => run.id === run_id && run.cron_id === cron_job_id && run.goal_id === goalId,
+    );
+    if (matches.length !== 1) {
+      return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    }
+    if (matchedActivation !== null && !runMatchesActivation(matches[0], matchedActivation)) {
+      return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    }
+  }
+
+  return {
+    status: 'ok',
+    focus: {
+      goalId,
+      cronJobId: cron_job_id,
+      activationId: activation_id ?? null,
+      runId: run_id ?? null,
+    },
+  };
+}
+
+/**
+ * Fresh, state-free reconciliation of a notification selector against native
+ * authority, performed BEFORE any selection/expansion/focus. It reads the exact
+ * Goal, the persisted Goal↔Cron link projection, `list_cron_jobs`, and (when a
+ * sub-selector is present) that job's activation and run histories, then applies
+ * the exact-tuple predicate. A read failure or malformed row is stale, never an
+ * empty success, and no other/latest record is substituted.
+ */
+async function readNotificationSelector(
+  selector: GoalNotificationSelector,
+): Promise<NotificationReconcile> {
+  const goalId = selector.goal_id;
+  let detailRaw: unknown;
+  try {
+    detailRaw = await invoke<unknown>('goal_get', { id: goalId });
+  } catch {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  if (!isRecord(detailRaw)) return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  const goal = detailRaw.goal;
+  if (!isRecord(goal) || requiredIdentity(goal, 'id') !== goalId) {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+
+  const hasSubSelector =
+    selector.cron_job_id !== undefined ||
+    selector.activation_id !== undefined ||
+    selector.run_id !== undefined;
+  if (!hasSubSelector) {
+    return { status: 'ok', focus: { goalId, cronJobId: null, activationId: null, runId: null } };
+  }
+  if (selector.cron_job_id === undefined) {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  const cronJobId = selector.cron_job_id;
+
+  let linksRaw: unknown;
+  try {
+    linksRaw = await invoke<unknown>('goal_links_list', { goalId });
+  } catch {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  if (!Array.isArray(linksRaw)) return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  const linkedCronIds = new Set<string>();
+  for (const row of linksRaw) {
+    if (!isRecord(row)) return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    const rowGoalId = requiredIdentity(row, 'goal_id');
+    const targetKind = requiredString(row, 'target_kind');
+    const targetId = requiredIdentity(row, 'target_id');
+    if (rowGoalId === null || targetKind === null || targetId === null) {
+      return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    }
+    if (rowGoalId === goalId && targetKind === 'cron_job') linkedCronIds.add(targetId);
+  }
+
+  let jobsRaw: unknown;
+  try {
+    jobsRaw = await invoke<unknown>('list_cron_jobs');
+  } catch {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+  if (!Array.isArray(jobsRaw)) return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  const linkedJobIds = new Set<string>();
+  for (const row of jobsRaw) {
+    if (!isRecord(row)) return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    const jobId = requiredIdentity(row, 'id');
+    const jobGoalId = nullableIdentity(row, 'goal_id');
+    if (jobId === null || jobGoalId === undefined) {
+      return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+    }
+    if (jobGoalId === goalId) linkedJobIds.add(jobId);
+  }
+
+  let activations: CronActivation[] | null;
+  try {
+    activations = decodeCronActivationArray(
+      await invoke<unknown>('get_cron_activations', { cronId: cronJobId }),
+    );
+  } catch {
+    activations = null;
+  }
+  let runs: CronRunRecord[] | null;
+  try {
+    runs = decodeCronRunArray(await invoke<unknown>('get_cron_runs', { cronId: cronJobId }));
+  } catch {
+    runs = null;
+  }
+  if (activations === null || runs === null) {
+    return { status: 'stale', message: NOTIFICATION_STALE_MESSAGE };
+  }
+
+  return reconcileNotificationSelector(
+    selector,
+    goalId,
+    linkedJobIds,
+    linkedCronIds,
+    { [cronJobId]: activations },
+    { [cronJobId]: runs },
+  );
+}
+
+/**
+ * Adapt a cross-workflow Recurring Operator navigation selector to the existing
+ * notification selector shape so the same fresh native Goal/link/schedule/
+ * activation/run reconciliation is reused. `cron_run_id` and the notification
+ * selector's `run_id` denote the same Cron run namespace; this is never a
+ * Session run or an Agent run id, and no cross-namespace value is coerced.
+ */
+function workflowSelectorToNotificationSelector(
+  selector: Extract<WorkflowNavigationSelector, { workflow: 'recurring-operator' }>,
+): GoalNotificationSelector {
+  return {
+    goal_id: selector.goal_id,
+    ...(selector.cron_job_id !== undefined ? { cron_job_id: selector.cron_job_id } : {}),
+    ...(selector.activation_id !== undefined ? { activation_id: selector.activation_id } : {}),
+    ...(selector.cron_run_id !== undefined ? { run_id: selector.cron_run_id } : {}),
+  };
+}
+
 
 interface ActionRegistryRow {
   id: string;
@@ -479,7 +1015,145 @@ function acceptanceRank(candidate: AcceptanceCandidate): number {
   return 3;
 }
 
-export default function GoalsView() {
+/**
+ * Bounded runtime receipt for one exact run, visibly scoped to that run. A run's
+ * runtime evidence and `acceptance_result` are per-run facts, never Goal
+ * acceptance; Goal completion still requires the trusted acceptance receipt.
+ *
+ * Native `evidence.run_id` is the Bun run id, which must equal the exact joined
+ * activation's `bun_run_id` for the evidence to be verified. It is never
+ * compared to the Cron run row id; absent/conflicting identity renders the
+ * evidence as unverified, not as a valid receipt.
+ */
+function RunReceipt({
+  run,
+  activationBunRunId,
+}: {
+  run: CronRunRecord;
+  activationBunRunId: string | null;
+}) {
+  const receipt = run.execution_evidence;
+  return (
+    <div className="mt-1.5 rounded border border-white/10 bg-white/[0.02] p-2 text-[11px] font-mono text-bone/70">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Pill variant={cronRunVariant(run.status)}>{run.status}</Pill>
+        <span className="text-bone/40">{run.duration_ms}ms</span>
+      </div>
+      <div className="mt-1 text-bone/50 break-all">
+        <div>run {run.id}</div>
+        <div>cron {run.cron_id} · goal {run.goal_id ?? 'unbound'}</div>
+        <div>
+          activation {run.activation_id ?? 'none'} · occurrence{' '}
+          {run.schedule_occurrence ?? '—'}
+        </div>
+        <div>
+          started {run.started_at}
+          {run.finished_at ? ` · finished ${run.finished_at}` : ''}
+        </div>
+      </div>
+      {run.terminal_reason && (
+        <div className="mt-1 text-bone/60">reason: {run.terminal_reason}</div>
+      )}
+      {run.error && <div className="mt-1 text-red-200/80 break-all">error: {run.error}</div>}
+      {run.output && <div className="mt-1 text-bone/40 break-all">output: {run.output}</div>}
+      {receipt.kind === 'absent' && (
+        <div className="mt-1.5 rounded border border-white/10 p-1.5 text-[10px] text-bone/40">
+          No runtime receipt available for this run.
+        </div>
+      )}
+      {receipt.kind === 'malformed' && (
+        <div
+          role="alert"
+          className="mt-1.5 rounded border border-warning/20 bg-warning/5 p-1.5 text-[10px] text-warning"
+        >
+          Runtime receipt unavailable: malformed native evidence.
+        </div>
+      )}
+      {receipt.kind === 'present' &&
+        (() => {
+          const evidence = receipt.evidence;
+          const evidenceVerified =
+            activationBunRunId !== null && activationBunRunId === evidence.run_id;
+          return (
+            <div
+              className={cn(
+                'mt-1.5 rounded border p-1.5',
+                evidenceVerified
+                  ? 'border-cyan-neon/20 bg-cyan-neon/5'
+                  : 'border-warning/20 bg-warning/5',
+              )}
+            >
+              <div
+                className={cn(
+                  'text-[10px] uppercase tracking-wider',
+                  evidenceVerified ? 'text-cyan-glow' : 'text-warning',
+                )}
+              >
+                {evidenceVerified
+                  ? `Runtime receipt/evidence (scoped to run ${run.id})`
+                  : 'Runtime evidence unverified'}
+              </div>
+              <div className="mt-0.5 text-bone/60 break-all">
+                <div>
+                  evidence run {evidence.run_id} · status {evidence.status}
+                </div>
+                {evidence.error_code && <div>error code: {evidence.error_code}</div>}
+                {(evidence.started_at || evidence.finished_at) && (
+                  <div>
+                    {evidence.started_at ? `started ${evidence.started_at}` : ''}
+                    {evidence.finished_at ? ` · finished ${evidence.finished_at}` : ''}
+                  </div>
+                )}
+                {evidence.acceptance_result && (
+                  <div className="text-bone/50">
+                    runtime acceptance_result: {evidence.acceptance_result}
+                  </div>
+                )}
+              </div>
+              <div className="mt-1 text-[10px] text-bone/40">
+                {evidenceVerified
+                  ? 'This is a per-run runtime receipt, not Goal acceptance. Goal completion still requires the trusted acceptance receipt/readback above.'
+                  : "This evidence's identity is unverified: the exact joined activation's bun_run_id does not match evidence.run_id, or no joined activation exists. It is not a valid runtime receipt and is not Goal acceptance."}
+              </div>
+            </div>
+          );
+        })()}
+    </div>
+  );
+}
+
+export default function GoalsView({
+  notificationSelector = null,
+  onNotificationSelectorConsumed,
+  navigationSelector = null,
+  onNavigationSelectorConsumed,
+  onNavigateWorkflow,
+}: {
+  /**
+   * App-retained `{goal_id, activation_id?, cron_job_id?, run_id?}` navigation
+   * selector from an in-app `goal://notifications` event. Selector-only: on
+   * mount the view re-reads native Goal/link/schedule/activation/run authority
+   * and opens/focuses only an exact match. No toast text or prompt is carried.
+   */
+  notificationSelector?: GoalNotificationSelector | null;
+  /** Reports the exact selector consumed, so App clears only that one. */
+  onNotificationSelectorConsumed?: (selector: GoalNotificationSelector) => void;
+  /**
+   * App-retained cross-workflow navigation selector. Destination-addressed and
+   * selector-only: this view re-reads native Goal/link/schedule/activation/run
+   * authority and opens/focuses only an exact match. A missing, malformed,
+   * stale, or conflicting selector is shown as stale with no fallback and no
+   * schedule action.
+   */
+  navigationSelector?: Extract<WorkflowNavigationSelector, { workflow: 'recurring-operator' }> | null;
+  /** Reports the exact selector consumed, so App clears only that one. */
+  onNavigationSelectorConsumed?: (selector: WorkflowNavigationSelector) => void;
+  /** Requests navigation to another workflow, optionally with an exact selector. */
+  onNavigateWorkflow?: (
+    destination: WorkflowDestination,
+    selector: WorkflowNavigationSelector | null,
+  ) => void;
+}) {
   const [goals, setGoals] = useState<Goal[]>([]);
   const [detail, setDetail] = useState<GoalDetail | null>(null);
   const [runs, setRuns] = useState<GoalRunProgress[]>([]);
@@ -506,6 +1180,20 @@ export default function GoalsView() {
   const [reconciling, setReconciling] = useState(false);
   const [scheduleOps, setScheduleOps] = useState<Record<string, ScheduleOp>>({});
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+  // App-retained notification navigation focus (selector-only). `selectorNotice`
+  // surfaces a stale/unavailable outcome when the selector cannot be reconciled;
+  // `selectorFocus` highlights only the exact matching native record.
+  const [selectorFocus, setSelectorFocus] = useState<NotificationFocus | null>(null);
+  const [selectorNotice, setSelectorNotice] = useState<string | null>(null);
+
+  // Explicit Goal link/unlink candidates and operation. Candidates are read only
+  // from the owning native authorities and bound to the current Goal generation.
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [linkTargetKind, setLinkTargetKind] = useState<LinkTargetKind>('cron_job');
+  const [linkTargetId, setLinkTargetId] = useState('');
+  const [linkCandidates, setLinkCandidates] = useState<LinkCandidatesState>({ kind: 'loading' });
+  const [linkOpState, setLinkOpState] = useState<LinkOp | null>(null);
+  const linkOpRef = useRef<LinkOp | null>(null);
 
   const [acceptanceCandidates, setAcceptanceCandidates] = useState<AcceptanceCandidate[]>([]);
   const [acceptanceDoneIds, setAcceptanceDoneIds] = useState<Set<string>>(new Set());
@@ -616,16 +1304,17 @@ export default function GoalsView() {
             cronId: job.id,
           });
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
-          if (Array.isArray(rows)) {
-            nextActivations[job.id] = rows as CronActivation[];
-            observedActivations[job.id] = rows as CronActivation[];
+          const decoded = decodeCronActivationArray(rows);
+          if (decoded !== null) {
+            nextActivations[job.id] = decoded;
+            observedActivations[job.id] = decoded;
           } else {
-            nextActivations[job.id] = [];
+            // A malformed collection/row is unavailable, never an authoritative
+            // empty history: the key stays absent.
             nextActivationErrors[job.id] = true;
           }
         } catch {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
-          nextActivations[job.id] = [];
           nextActivationErrors[job.id] = true;
         }
         try {
@@ -633,16 +1322,15 @@ export default function GoalsView() {
             cronId: job.id,
           });
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
-          if (Array.isArray(rows)) {
-            nextRuns[job.id] = rows as CronRunRecord[];
-            observedRuns[job.id] = rows as CronRunRecord[];
+          const decoded = decodeCronRunArray(rows);
+          if (decoded !== null) {
+            nextRuns[job.id] = decoded;
+            observedRuns[job.id] = decoded;
           } else {
-            nextRuns[job.id] = [];
             nextRunErrors[job.id] = true;
           }
         } catch {
           if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
-          nextRuns[job.id] = [];
           nextRunErrors[job.id] = true;
         }
       }
@@ -723,10 +1411,10 @@ export default function GoalsView() {
   // A failed or malformed (non-array) read is unavailable, never an
   // authoritative "no commitments" list.
   const loadGoalSupport = useCallback(
-    async (goalId: string, expectedRequest: number) => {
+    async (goalId: string, expectedRequest: number): Promise<ScheduleRefreshResult> => {
       try {
         const all = await invoke<unknown>('get_commitments');
-        if (expectedRequest !== detailRequestId.current) return;
+        if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
         if (!Array.isArray(all)) {
           setCommitmentsUnavailable(true);
           setCommitmentsReadError(
@@ -740,13 +1428,13 @@ export default function GoalsView() {
           );
         }
       } catch {
-        if (expectedRequest !== detailRequestId.current) return;
+        if (expectedRequest !== detailRequestId.current) return { status: 'stale' };
         setCommitmentsUnavailable(true);
         setCommitmentsReadError(
           'Could not read linked commitments from the native authority. Linked commitments are unavailable.',
         );
       }
-      await refreshScheduleState(goalId, expectedRequest);
+      return refreshScheduleState(goalId, expectedRequest);
     },
     [refreshScheduleState],
   );
@@ -1091,6 +1779,15 @@ export default function GoalsView() {
           ? history.runs[job.id].map((run) => run.id)
           : undefined;
 
+      // Run now must not submit without a usable fresh activation+run baseline:
+      // without it the new occurrence could not be reconciled, so refuse rather
+      // than dispatch an unverifiable manual run. No operation is recorded (no
+      // write was attempted); the control is disabled while history is
+      // unavailable, so this is a defensive guard.
+      if (kind === 'run' && (baselineActivationIds === undefined || baselineRunIds === undefined)) {
+        return;
+      }
+
       const op: ScheduleOp = {
         kind,
         jobId: job.id,
@@ -1207,13 +1904,401 @@ export default function GoalsView() {
     [refreshScheduleState],
   );
 
-  const loadDetail = useCallback(async (id: string) => {
+  const publishLinkOp = useCallback((next: LinkOp | null) => {
+    linkOpRef.current = next;
+    setLinkOpState(next);
+  }, []);
+
+  // Load explicit-link candidates from the owning native authorities only. A
+  // failed or malformed read (including a malformed Session authority row) is an
+  // unavailable candidate set, never an empty one.
+  const loadLinkCandidates = useCallback(async (expectedRequest: number) => {
+    if (expectedRequest !== detailRequestId.current) return;
+    setLinkCandidates({ kind: 'loading' });
+    try {
+      const [jobsRaw, commitmentsRaw, sessionsRaw] = await Promise.all([
+        invoke<unknown>('list_cron_jobs'),
+        invoke<unknown>('get_commitments'),
+        invoke<unknown>('list_sessions'),
+      ]);
+      if (expectedRequest !== detailRequestId.current) return;
+      if (
+        !Array.isArray(jobsRaw) ||
+        !Array.isArray(commitmentsRaw) ||
+        !Array.isArray(sessionsRaw)
+      ) {
+        setLinkCandidates({
+          kind: 'error',
+          message:
+            'The native candidate authorities returned an unreadable response. Link candidates are unavailable.',
+        });
+        return;
+      }
+      const sessions: SessionScopeRow[] = [];
+      for (const row of sessionsRaw) {
+        if (!row || typeof row !== 'object') {
+          setLinkCandidates({
+            kind: 'error',
+            message:
+              'The native Session authority returned a malformed row. Link candidates are unavailable.',
+          });
+          return;
+        }
+        const record = row as Record<string, unknown>;
+        if (typeof record.id !== 'string' || typeof record.agent_id !== 'string') {
+          setLinkCandidates({
+            kind: 'error',
+            message:
+              'The native Session authority returned a malformed row. Link candidates are unavailable.',
+          });
+          return;
+        }
+        sessions.push({
+          id: record.id,
+          agent_id: record.agent_id,
+          project_root: typeof record.project_root === 'string' ? record.project_root : null,
+        });
+      }
+      setLinkCandidates({
+        kind: 'ready',
+        jobs: jobsRaw as CronSchedule[],
+        commitments: commitmentsRaw as CommitmentRecord[],
+        sessions,
+      });
+    } catch {
+      if (expectedRequest !== detailRequestId.current) return;
+      setLinkCandidates({
+        kind: 'error',
+        message: 'Could not read link candidates from the native authorities.',
+      });
+    }
+  }, []);
+
+  // Freshly re-read the exact Goal row and its Agent/workspace identity.
+  const readGoalRow = useCallback(async (goalId: string): Promise<Goal | null> => {
+    try {
+      const raw = await invoke<GoalDetail>('goal_get', { id: goalId });
+      if (!raw || !raw.goal || raw.goal.id !== goalId) return null;
+      return raw.goal;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Freshly read the persisted Session scope map, or null when the authority is
+  // unavailable/malformed (so a project-scoped candidate can never be offered).
+  const readSessionScopes = useCallback(
+    async (): Promise<Map<string, SessionScopeRow> | null> => {
+      try {
+        const raw = await invoke<unknown>('list_sessions');
+        if (!Array.isArray(raw)) return null;
+        const map = new Map<string, SessionScopeRow>();
+        for (const row of raw) {
+          if (!row || typeof row !== 'object') return null;
+          const record = row as Record<string, unknown>;
+          if (typeof record.id !== 'string' || typeof record.agent_id !== 'string') return null;
+          map.set(record.id, {
+            id: record.id,
+            agent_id: record.agent_id,
+            project_root: typeof record.project_root === 'string' ? record.project_root : null,
+          });
+        }
+        return map;
+      } catch {
+        return null;
+      }
+    },
+    [],
+  );
+
+  // Exact Goal-side link + freshly re-read Goal identity + authoritative
+  // target-side `goal_id`/scope agreement.
+  const confirmLink = useCallback(
+    async (goalId: string, targetKind: LinkTargetKind, targetId: string): Promise<boolean> => {
+      const goal = await readGoalRow(goalId);
+      if (!goal) return false;
+      const linksRaw = await invoke<unknown>('goal_links_list', { goalId }).catch(() => null);
+      if (!Array.isArray(linksRaw)) return false;
+      const linkPresent = (linksRaw as GoalLink[]).some(
+        (link) =>
+          link.goal_id === goalId &&
+          link.target_kind === targetKind &&
+          link.target_id === targetId,
+      );
+      if (!linkPresent) return false;
+      if (targetKind === 'cron_job') {
+        const jobsRaw = await invoke<unknown>('list_cron_jobs').catch(() => null);
+        if (!Array.isArray(jobsRaw)) return false;
+        const job = (jobsRaw as CronSchedule[]).find((row) => row.id === targetId);
+        if (!job || job.goal_id !== goalId || job.agent_id !== goal.agent_id) return false;
+        if (goal.project_root !== null) {
+          if (job.session_id === null) return false;
+          const sessions = await readSessionScopes();
+          if (!sessions) return false;
+          const session = sessions.get(job.session_id);
+          if (
+            !session ||
+            session.agent_id !== goal.agent_id ||
+            session.project_root !== goal.project_root
+          ) {
+            return false;
+          }
+        }
+        return true;
+      }
+      const commitmentsRaw = await invoke<unknown>('get_commitments').catch(() => null);
+      if (!Array.isArray(commitmentsRaw)) return false;
+      const commitment = (commitmentsRaw as CommitmentRecord[]).find((row) => row.id === targetId);
+      if (!commitment || commitment.goal_id !== goalId) return false;
+      // A Commitment carries no workspace association and cannot be bound to a
+      // project-scoped Goal.
+      if (goal.project_root !== null) return false;
+      if (commitment.agent_id !== null && commitment.agent_id !== goal.agent_id) return false;
+      return true;
+    },
+    [readGoalRow, readSessionScopes],
+  );
+
+  // Unlink confirmation requires the link absent AND the target fully unbound
+  // (`goal_id === null`, not merely a different Goal id).
+  const confirmUnlink = useCallback(
+    async (goalId: string, targetKind: LinkTargetKind, targetId: string): Promise<boolean> => {
+      const goal = await readGoalRow(goalId);
+      if (!goal) return false;
+      const linksRaw = await invoke<unknown>('goal_links_list', { goalId }).catch(() => null);
+      if (!Array.isArray(linksRaw)) return false;
+      const linkPresent = (linksRaw as GoalLink[]).some(
+        (link) =>
+          link.goal_id === goalId &&
+          link.target_kind === targetKind &&
+          link.target_id === targetId,
+      );
+      if (linkPresent) return false;
+      if (targetKind === 'cron_job') {
+        const jobsRaw = await invoke<unknown>('list_cron_jobs').catch(() => null);
+        if (!Array.isArray(jobsRaw)) return false;
+        const job = (jobsRaw as CronSchedule[]).find((row) => row.id === targetId);
+        return job !== undefined && job.goal_id === null;
+      }
+      const commitmentsRaw = await invoke<unknown>('get_commitments').catch(() => null);
+      if (!Array.isArray(commitmentsRaw)) return false;
+      const commitment = (commitmentsRaw as CommitmentRecord[]).find((row) => row.id === targetId);
+      return commitment !== undefined && commitment.goal_id === null;
+    },
+    [readGoalRow],
+  );
+
+  const refreshLinkState = useCallback(
+    async (goalId: string, expectedRequest: number) => {
+      try {
+        const fresh = await invoke<GoalDetail>('goal_get', { id: goalId });
+        if (expectedRequest !== detailRequestId.current || selectedIdRef.current !== goalId) return;
+        if (fresh && fresh.goal && fresh.goal.id === goalId) setDetail(fresh);
+      } catch {
+        // Leave the previous detail in place; the unresolved link op surfaces
+        // the uncertainty and a later Refresh reconciles it.
+      }
+      await loadGoalSupport(goalId, expectedRequest);
+      await loadLinkCandidates(expectedRequest);
+    },
+    [loadGoalSupport, loadLinkCandidates],
+  );
+
+  const runLinkOp = useCallback(
+    async (kind: 'link' | 'unlink', targetKind: LinkTargetKind, targetId: string) => {
+      const current = detail;
+      if (!current || linkOpRef.current) return;
+      const goalId = current.goal.id;
+      const expectedRequest = detailRequestId.current;
+      const op: LinkOp = { kind, targetKind, targetId, phase: 'writing' };
+      publishLinkOp(op);
+
+      // A completion may only mutate the operation it started, and only while
+      // the exact Goal selection/generation is unchanged. A stale callback never
+      // clears or rewrites a newer operation.
+      const stillCurrent = (): boolean =>
+        linkOpRef.current === op &&
+        selectedIdRef.current === goalId &&
+        expectedRequest === detailRequestId.current;
+
+      const fail = (phase: 'write-failed' | 'read-failed', message: string) => {
+        if (!stillCurrent()) return;
+        publishLinkOp({ ...op, phase, message });
+      };
+
+      try {
+        if (kind === 'link') {
+          await invoke<GoalLink>('goal_link_add', { goalId, targetKind, targetId });
+        } else {
+          await invoke<boolean>('goal_link_remove', { goalId, targetKind, targetId });
+        }
+      } catch (err) {
+        fail(
+          'write-failed',
+          typeof err === 'string'
+            ? err
+            : `Could not ${kind} the ${targetKind === 'cron_job' ? 'cron job' : 'commitment'}.`,
+        );
+        return;
+      }
+
+      if (!stillCurrent()) return;
+
+      const confirmed =
+        kind === 'link'
+          ? await confirmLink(goalId, targetKind, targetId)
+          : await confirmUnlink(goalId, targetKind, targetId);
+      if (!stillCurrent()) return;
+      if (confirmed) {
+        publishLinkOp(null);
+        setLinkTargetId('');
+        await refreshLinkState(goalId, expectedRequest);
+      } else {
+        fail(
+          'read-failed',
+          `The ${kind} was accepted, but the authoritative Goal and target rows did not confirm it. Use Refresh to reconcile; the write is not repeated automatically.`,
+        );
+      }
+    },
+    [detail, publishLinkOp, confirmLink, confirmUnlink, refreshLinkState],
+  );
+
+  // Read-only reconciliation for an unresolved link/unlink: re-read the exact
+  // Goal-side link and target rows and clear only when they agree. It never
+  // repeats the write, and it only mutates the operation it was started for.
+  const reconcileLinks = useCallback(async () => {
+    const op = linkOpRef.current;
+    if (!op || op.phase === 'writing') return;
+    const goalId = selectedIdRef.current;
+    if (!goalId) return;
+    const expectedRequest = detailRequestId.current;
+    const confirmed =
+      op.kind === 'link'
+        ? await confirmLink(goalId, op.targetKind, op.targetId)
+        : await confirmUnlink(goalId, op.targetKind, op.targetId);
+    if (linkOpRef.current !== op) return;
+    if (selectedIdRef.current !== goalId || expectedRequest !== detailRequestId.current) return;
+    if (confirmed) {
+      publishLinkOp(null);
+      await refreshLinkState(goalId, expectedRequest);
+    } else {
+      publishLinkOp({
+        ...op,
+        phase: 'read-failed',
+        message: `The ${op.kind} is still not confirmed by the authoritative rows. Reconcile again later; the write is not repeated automatically.`,
+      });
+    }
+  }, [confirmLink, confirmUnlink, publishLinkOp, refreshLinkState]);
+
+  // Reconcile an App-retained notification selector against the freshly-read
+  // Goal/link/schedule/activation/run state. It never selects or focuses a
+  // different/latest record: an exact Goal readback plus (when supplied) the
+  // exact persisted Goal↔Cron link and exact activation/Cron/Goal/run tuple are
+  // required. Only the resolved exact IDs are used, and only as a display focus.
+  const applyNotificationSelector = useCallback(
+    async (
+      selector: GoalNotificationSelector,
+      goalId: string,
+      loaded: GoalDetail | null,
+      scheduleResult: ScheduleRefreshResult,
+      expectedRequest: number,
+    ) => {
+      if (loaded === null || loaded.goal.id !== selector.goal_id) {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+        return;
+      }
+      const hasSubSelector =
+        selector.cron_job_id !== undefined ||
+        selector.activation_id !== undefined ||
+        selector.run_id !== undefined;
+      if (!hasSubSelector) {
+        // Only an exact Goal id was supplied: open that Goal and do not invent
+        // or select a latest activation.
+        setSelectorNotice(null);
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        return;
+      }
+      if (scheduleResult.status !== 'ok') {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+        return;
+      }
+      let linksRaw: unknown;
+      try {
+        linksRaw = await invoke<unknown>('goal_links_list', { goalId });
+      } catch {
+        if (expectedRequest !== detailRequestId.current) return;
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+        return;
+      }
+      if (expectedRequest !== detailRequestId.current) return;
+      if (!Array.isArray(linksRaw)) {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+        return;
+      }
+      const linkedCronIds = new Set<string>();
+      for (const row of linksRaw) {
+        if (!isRecord(row)) {
+          setSelectorFocus(null);
+          setExpandedJob(null);
+          setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+          return;
+        }
+        const rowGoalId = requiredIdentity(row, 'goal_id');
+        const targetKind = requiredString(row, 'target_kind');
+        const targetId = requiredIdentity(row, 'target_id');
+        if (rowGoalId === null || targetKind === null || targetId === null) {
+          setSelectorFocus(null);
+          setExpandedJob(null);
+          setSelectorNotice(NOTIFICATION_STALE_MESSAGE);
+          return;
+        }
+        if (rowGoalId === goalId && targetKind === 'cron_job') linkedCronIds.add(targetId);
+      }
+      const reconciled = reconcileNotificationSelector(
+        selector,
+        goalId,
+        scheduleResult.linkedJobIds,
+        linkedCronIds,
+        scheduleResult.activationsByJob,
+        scheduleResult.runsByJob,
+      );
+      if (reconciled.status === 'ok') {
+        setSelectorNotice(null);
+        setSelectorFocus(reconciled.focus);
+        setExpandedJob(reconciled.focus.cronJobId);
+      } else {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(reconciled.message);
+      }
+    },
+    [],
+  );
+
+  const loadDetail = useCallback(async (id: string, selector: GoalNotificationSelector | null = null) => {
     // Bind this read to the selection generation. A response for an older
     // selection is discarded so it can never replace a newer selected Goal.
     const request = ++detailRequestId.current;
     selectedIdRef.current = id;
     setSelectedId(id);
     setTransitionError(null);
+    // A manual selection (no notification selector) clears any retained
+    // notification focus/notice so a stale selector can never keep highlighting
+    // a record the user has navigated away from. A selector-driven open leaves
+    // the prior notice until this generation resolves it.
+    if (selector === null) {
+      setSelectorNotice(null);
+      setSelectorFocus(null);
+    }
     // Clear any detail that belongs to a different Goal so the panel and the
     // list selection never disagree; re-selecting the shown Goal is preserved.
     setDetail((prev) => (prev && prev.goal.id === id ? prev : null));
@@ -1240,6 +2325,12 @@ export default function GoalsView() {
       runErrors: {},
     };
     setExpandedJob(null);
+    setLinkOpen(false);
+    setLinkTargetKind('cron_job');
+    setLinkTargetId('');
+    setLinkCandidates({ kind: 'loading' });
+    linkOpRef.current = null;
+    setLinkOpState(null);
     setAcceptanceCandidates([]);
     setAcceptanceDoneIds(new Set());
     setAcceptanceUnavailable(false);
@@ -1273,17 +2364,120 @@ export default function GoalsView() {
     }
     // Goal-linked Commitments and schedules are read from their own native
     // authorities. Their read failures are reported in their own panels.
-    await loadGoalSupport(id, request);
+    const scheduleResult = await loadGoalSupport(id, request);
     // Trusted acceptance receipts are read only from native authorities and
     // bound to this exact Goal generation.
     if (loaded && request === detailRequestId.current) {
       await loadAcceptanceState(loaded, request);
     }
-  }, [loadGoalSupport, loadAcceptanceState]);
+    // Reconcile an App-retained notification selector only after the fresh
+    // Goal/link/schedule/activation/run reads above. Selecting/expanding/focusing
+    // happens only for an exact match; anything missing, malformed, or
+    // conflicting is shown as stale/unavailable with no fallback.
+    if (selector !== null && request === detailRequestId.current) {
+      await applyNotificationSelector(selector, id, loaded, scheduleResult, request);
+    }
+  }, [loadGoalSupport, loadAcceptanceState, applyNotificationSelector]);
 
   useEffect(() => {
     void fetchGoals();
   }, [fetchGoals]);
+
+  // Consume an App-retained notification selector exactly once. The exact Goal,
+  // persisted Goal↔Cron link, `list_cron_jobs`, and the relevant
+  // activation/run histories are read and reconciled BEFORE any selection,
+  // expansion, or focus; a deleted/malformed/conflicting selector is never
+  // selected and no other/latest record is substituted. The selector is reported
+  // consumed only after the read settles, so it survives the route change into
+  // Goals but is not retained as durable authority. A superseded selector is not
+  // reported consumed; App clears only the exact selector it handed over.
+  useEffect(() => {
+    if (!notificationSelector) return;
+    const selector = notificationSelector;
+    let cancelled = false;
+    const selectionAtStart = selectedIdRef.current;
+    // Snapshot the selection generation too: a manual reselect of the SAME Goal
+    // leaves selectedIdRef unchanged but bumps detailRequestId, so this prevents
+    // a delayed notification preflight from overriding the manual choice.
+    const generationAtStart = detailRequestId.current;
+    void (async () => {
+      const reconciled = await readNotificationSelector(selector);
+      if (cancelled) return;
+      // A newer user selection supersedes this notification open; never
+      // override it with a delayed read.
+      if (
+        selectedIdRef.current !== selectionAtStart ||
+        detailRequestId.current !== generationAtStart
+      ) {
+        onNotificationSelectorConsumed?.(selector);
+        return;
+      }
+      if (reconciled.status !== 'ok') {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(reconciled.message);
+        onNotificationSelectorConsumed?.(selector);
+        return;
+      }
+      // Open the exact reconciled Goal; loadDetail re-reads and re-reconciles
+      // the exact tuple before applying any focus, so a change between reads is
+      // shown as stale rather than focused.
+      await loadDetail(selector.goal_id, selector);
+      if (cancelled) return;
+      onNotificationSelectorConsumed?.(selector);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [notificationSelector, loadDetail, onNotificationSelectorConsumed]);
+
+  // Consume an App-retained cross-workflow navigation selector exactly once. The
+  // exact Goal / persisted Goal↔Cron link / activation / run tuple is re-read
+  // and reconciled BEFORE any selection, expansion, or focus; a stale selector
+  // is never substituted and no schedule action is run. The selector is reported
+  // consumed only after the read settles.
+  useEffect(() => {
+    if (!navigationSelector) return;
+    const selector = navigationSelector;
+    let cancelled = false;
+    const selectionAtStart = selectedIdRef.current;
+    const generationAtStart = detailRequestId.current;
+    void (async () => {
+      const adapted = workflowSelectorToNotificationSelector(selector);
+      const reconciled = await readNotificationSelector(adapted);
+      if (cancelled) return;
+      // A newer user selection supersedes this handoff; never override it.
+      if (
+        selectedIdRef.current !== selectionAtStart ||
+        detailRequestId.current !== generationAtStart
+      ) {
+        onNavigationSelectorConsumed?.(selector);
+        return;
+      }
+      if (reconciled.status !== 'ok') {
+        setSelectorFocus(null);
+        setExpandedJob(null);
+        setSelectorNotice(reconciled.message);
+        onNavigationSelectorConsumed?.(selector);
+        return;
+      }
+      // Open the exact reconciled Goal; loadDetail re-reads and re-reconciles
+      // the exact tuple before applying any focus.
+      await loadDetail(selector.goal_id, adapted);
+      if (cancelled) return;
+      onNavigationSelectorConsumed?.(selector);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [navigationSelector, loadDetail, onNavigationSelectorConsumed]);
+
+  // Candidate lists are loaded only when the explicit link panel is opened, and
+  // are bound to the current Goal/request generation.
+  useEffect(() => {
+    if (!linkOpen || !selectedId) return;
+    void loadLinkCandidates(detailRequestId.current);
+  }, [linkOpen, selectedId, loadLinkCandidates]);
 
   const create = useCallback(async () => {
     if (createPending.current) return;
@@ -1349,12 +2543,347 @@ export default function GoalsView() {
       )
     : [];
 
+  const goalIsProjectScoped = detail ? detail.goal.project_root !== null : false;
+  const linkedJobIds = new Set(schedules.map((job) => job.id));
+  const linkedCommitmentIds = new Set(commitments.map((c) => c.id));
+  const sessionById = new Map<string, SessionScopeRow>(
+    linkCandidates.kind === 'ready'
+      ? linkCandidates.sessions.map(
+          (session) => [session.id, session] as [string, SessionScopeRow],
+        )
+      : [],
+  );
+  const jobCandidates =
+    linkCandidates.kind === 'ready' && detail
+      ? linkCandidates.jobs.filter((job) => {
+          if (job.goal_id !== null) return false;
+          if (linkedJobIds.has(job.id)) return false;
+          if (job.agent_id !== detail.goal.agent_id) return false;
+          if (goalIsProjectScoped) {
+            // A project-scoped Goal requires a persisted, session-bound job whose
+            // canonical Session workspace root matches the Goal root. An
+            // unavailable/malformed Session authority yields no candidate.
+            if (job.session_id === null) return false;
+            const session = sessionById.get(job.session_id);
+            if (!session) return false;
+            if (session.agent_id !== detail.goal.agent_id) return false;
+            if (session.project_root !== detail.goal.project_root) return false;
+          }
+          return true;
+        })
+      : [];
+  const commitmentCandidates =
+    linkCandidates.kind === 'ready' && detail
+      ? linkCandidates.commitments.filter(
+          (c) =>
+            c.goal_id === null &&
+            !linkedCommitmentIds.has(c.id) &&
+            (c.agent_id === null || c.agent_id === detail.goal.agent_id),
+        )
+      : [];
+
+  // ── Task 2: presentation-only readiness/recovery items ──────────────────────
+  //
+  // Every item mirrors state this view already decoded from native authority.
+  // The panel performs no read and never equates a run, receipt, or command
+  // return with Goal acceptance.
+  const recurringReadinessItems: WorkflowReadinessItem[] = [];
+  if (loading && !detail) {
+    recurringReadinessItems.push({
+      id: 'goals',
+      label: 'Goals',
+      state: 'waiting',
+      detail: 'Loading the native Goal list.',
+    });
+  } else if (error && !detail) {
+    recurringReadinessItems.push({
+      id: 'goals',
+      label: 'Goals',
+      state: 'unavailable',
+      detail: `${error} The Goal list read failed or was malformed; this is not an authoritative empty list.`,
+      recoveryLabel: 'Retry',
+      onRecover: () => {
+        void fetchGoals();
+      },
+      nextStep: 'Retry the Goal read.',
+    });
+  } else if (!detail) {
+    recurringReadinessItems.push({
+      id: 'goal',
+      label: 'Goal selection',
+      state: 'needs_user_input',
+      detail: 'No Goal is selected.',
+      nextStep: 'Select a Goal to review its schedule/commitment and trusted acceptance state.',
+    });
+  } else {
+    if (error) {
+      recurringReadinessItems.push({
+        id: 'goals',
+        label: 'Goals',
+        state: 'unavailable',
+        detail: `${error} The Goal list read failed or was malformed; the open Goal detail is shown, but the list read is unavailable.`,
+        recoveryLabel: 'Retry',
+        onRecover: () => {
+          void fetchGoals();
+        },
+      });
+    }
+    if (scheduleUnavailable) {
+      recurringReadinessItems.push({
+        id: 'schedules',
+        label: 'Goal-linked schedules',
+        state: 'unavailable',
+        detail: scheduleReadError ?? 'The native schedule authority is unavailable.',
+        recoveryLabel: 'Refresh',
+        onRecover: () => {
+          void reconcileSchedules();
+        },
+      });
+    } else if (schedules.length === 0) {
+      recurringReadinessItems.push({
+        id: 'schedules',
+        label: 'Goal-linked schedules',
+        state: 'needs_user_input',
+        detail:
+          'No cron schedules are linked to this Goal. Linking attributes future activations; it does not grant permissions.',
+        nextStep: 'Link a compatible existing job or create one elsewhere; this view never creates a job.',
+      });
+    } else {
+      const ops = Object.values(scheduleOps);
+      const writing = ops.some((op) => op.phase === 'writing');
+      const uncertain = ops.some((op) => op.phase !== 'writing');
+      const claimStates = Object.values(activations)
+        .flat()
+        .map((activation) => activation.claim_state);
+      const unrecognizedClaimStates = claimStates.filter(
+        (state) => !hasOwn(CLAIM_VARIANT, state),
+      );
+      const historyUnavailable =
+        Object.values(activationErrors).some(Boolean) || Object.values(runErrors).some(Boolean);
+      if (writing) {
+        recurringReadinessItems.push({
+          id: 'schedules',
+          label: 'Schedule operation',
+          state: 'waiting',
+          detail:
+            'A schedule operation is in flight; its requested effect must be read back before it is claimed.',
+        });
+      } else if (uncertain) {
+        recurringReadinessItems.push({
+          id: 'schedules',
+          label: 'Schedule operation',
+          state: 'stale',
+          detail:
+            'A schedule operation was accepted but its requested effect is not yet observed; the display is stale until Refresh reconciles it.',
+          recoveryLabel: 'Refresh',
+          onRecover: () => {
+            void reconcileSchedules();
+          },
+        });
+      } else if (historyUnavailable) {
+        recurringReadinessItems.push({
+          id: 'history',
+          label: 'Activation / run history',
+          state: 'unavailable',
+          detail:
+            'At least one activation or run history could not be read. A missing history is unavailable, never an authoritative empty list.',
+          recoveryLabel: 'Refresh',
+          onRecover: () => {
+            void reconcileSchedules();
+          },
+        });
+      } else if (claimStates.includes('blocked')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'blocked',
+          detail: 'At least one activation is blocked by the native runtime; this panel grants nothing.',
+          nextStep: 'Resolve the blocked condition through the existing activation surface.',
+        });
+      } else if (claimStates.includes('claimed') || claimStates.includes('dispatched')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'waiting',
+          detail:
+            'At least one activation is claimed or dispatched and has not reached a terminal state.',
+          nextStep:
+            'Wait for the existing activation control to advance, or reconcile it through the existing activation surface.',
+        });
+      } else if (claimStates.includes('waiting_for_user')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'waiting',
+          detail: 'At least one activation is waiting for you.',
+          nextStep: 'Respond through the existing activation control.',
+        });
+      } else if (claimStates.includes('ambiguous')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'partial',
+          detail: 'At least one activation is ambiguous and needs reconciliation.',
+          recoveryLabel: 'Refresh',
+          onRecover: () => {
+            void reconcileSchedules();
+          },
+        });
+      } else if (claimStates.includes('failed')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'partial',
+          detail: 'At least one activation failed; review its per-run receipt below.',
+        });
+      } else if (claimStates.includes('cancelled')) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'stale',
+          detail: 'At least one activation was cancelled; it is not a completed occurrence.',
+        });
+      } else if (unrecognizedClaimStates.length > 0) {
+        recurringReadinessItems.push({
+          id: 'activations',
+          label: 'Activation',
+          state: 'unavailable',
+          detail:
+            'At least one activation is in an unrecognized claim state; it is unavailable, never ready.',
+        });
+      } else {
+        recurringReadinessItems.push({
+          id: 'schedules',
+          label: 'Goal-linked schedules',
+          state: 'ready_for_explicit_action',
+          detail: `${schedules.length} linked schedule(s) with no observed blocker.`,
+          nextStep: 'Use the existing pause/resume/run/cancel controls explicitly.',
+        });
+      }
+    }
+
+    if (commitmentsUnavailable) {
+      recurringReadinessItems.push({
+        id: 'commitments',
+        label: 'Goal-linked commitments',
+        state: 'unavailable',
+        detail: commitmentsReadError ?? 'The native Commitment authority is unavailable.',
+        recoveryLabel: 'Refresh',
+        onRecover: () => {
+          void loadDetail(detail.goal.id);
+        },
+      });
+    }
+
+    if (acceptanceUnavailable) {
+      recurringReadinessItems.push({
+        id: 'acceptance',
+        label: 'Trusted acceptance',
+        state: 'unavailable',
+        detail: acceptanceReadError ?? 'Trusted acceptance receipts are unavailable.',
+        recoveryLabel: 'Refresh',
+        onRecover: () => {
+          void refreshAcceptanceState();
+        },
+        nextStep:
+          'Refresh the trusted acceptance readbacks; no completion is claimed without a full readback.',
+      });
+    } else if (Object.keys(confirmedAcceptance).length > 0) {
+      recurringReadinessItems.push({
+        id: 'acceptance',
+        label: 'Trusted acceptance (confirmed)',
+        state: 'ready_for_explicit_action',
+        detail:
+          'A trusted acceptance receipt was confirmed by native readback. This is trusted acceptance, not a plain run success or command return.',
+        nextStep: 'Review the criterion check rows below; the Goal is completed only from accepted evidence.',
+      });
+    } else if (
+      acceptanceCandidates.some(
+        (candidate) =>
+          candidate.execution.status === 'pending_acceptance' && candidate.receipt === null,
+      )
+    ) {
+      recurringReadinessItems.push({
+        id: 'acceptance',
+        label: 'Trusted acceptance',
+        state: 'ready_for_explicit_action',
+        detail:
+          'A bound pending-acceptance execution exists; running acceptance is an explicit, trusted native action.',
+        nextStep: 'Run acceptance checks for the exact execution through the existing trusted path.',
+      });
+    } else if (acceptanceCandidates.length === 0) {
+      recurringReadinessItems.push({
+        id: 'acceptance',
+        label: 'Trusted acceptance',
+        state: 'needs_user_input',
+        detail:
+          "No bound execution or acceptance candidate is available for this Goal's criteria, Agent, and workspace.",
+        nextStep:
+          'Inspect the existing trusted acceptance/manifest panel or Settings for a compatible registered manifest.',
+      });
+    } else {
+      recurringReadinessItems.push({
+        id: 'acceptance',
+        label: 'Trusted acceptance',
+        state: 'partial',
+        detail: 'Bound acceptance candidates exist but none is currently runnable or confirmed.',
+        nextStep: 'Reconcile the exact operation from the trusted manifest panel.',
+      });
+    }
+
+    if (selectorNotice) {
+      recurringReadinessItems.push({
+        id: 'selector',
+        label: 'Notification / selector reconciliation',
+        state: 'stale',
+        detail: selectorNotice,
+        recoveryLabel: 'Refresh goals',
+        onRecover: () => {
+          void fetchGoals();
+        },
+      });
+    }
+  }
+
+  const recurringReadinessBoundary =
+    'A successful Cron run, runtime receipt, or command return is not Goal acceptance. Completion is shown only after a trusted acceptance receipt and exact native readback. This panel creates, runs, pauses, or cancels nothing.';
+
   return (
     <div className="flex flex-col gap-4 h-full overflow-hidden">
       <SectionHeader
         title="Goals"
         subtitle="User-owned objectives and the acceptance criteria they must meet"
         count={goals.length}
+      />
+
+      {onNavigateWorkflow && (
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-bone/40">
+          <span className="uppercase tracking-[0.18em]">Open</span>
+          <button
+            type="button"
+            onClick={() => onNavigateWorkflow('project-steward', null)}
+            className="underline"
+          >
+            Project Steward
+          </button>
+          <button
+            type="button"
+            onClick={() => onNavigateWorkflow('researcher', null)}
+            className="underline"
+          >
+            Attributable Researcher
+          </button>
+        </div>
+      )}
+
+      <WorkflowReadinessPanel
+        workflow="recurring-operator"
+        heading="Derived from the Goal, Goal-linked schedule/commitment, activation/run, and trusted acceptance readbacks below."
+        items={recurringReadinessItems}
+        boundaryNote={recurringReadinessBoundary}
+        onNavigateWorkflow={
+          onNavigateWorkflow ? (destination) => onNavigateWorkflow(destination, null) : undefined
+        }
       />
 
       <GlassCard className="p-3">
@@ -1470,6 +2999,17 @@ export default function GoalsView() {
         </div>
 
         <div className="flex-1 overflow-y-auto min-h-0">
+          {selectorNotice && (
+            <div
+              role="alert"
+              className="mb-3 rounded-lg border border-warning/30 bg-warning/5 p-3 text-[11px] text-warning"
+            >
+              {selectorNotice}{' '}
+              <button type="button" onClick={() => void fetchGoals()} className="underline">
+                Refresh goals
+              </button>
+            </div>
+          )}
           {!detail ? (
             <EmptyState message="Select a goal to review its criteria and state." />
           ) : (
@@ -1569,9 +3109,9 @@ export default function GoalsView() {
                 )}
                 {acceptanceCandidates.length === 0 && !acceptanceUnavailable ? (
                   <div className="text-sm text-bone/40 mt-2">
-                    No registered trusted acceptance manifest is bound to this Goal&apos;s criteria,
-                    Agent, and workspace. Register a manifest in Settings and run the approved action
-                    first.
+                    No bound execution or acceptance candidate is available for this Goal&apos;s
+                    criteria, Agent, and workspace. Inspect the existing trusted acceptance/manifest
+                    panel or Settings for a compatible registered manifest.
                   </div>
                 ) : (
                   <ul className="mt-2 space-y-2">
@@ -1762,9 +3302,178 @@ export default function GoalsView() {
                             open.
                           </div>
                         )}
+                        {onNavigateWorkflow && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onNavigateWorkflow('project-steward', {
+                                workflow: 'project-steward',
+                                session_id: run.session_id,
+                                goal_id: detail.goal.id,
+                                session_run_id: run.run_id,
+                              })
+                            }
+                            className="mt-1 underline text-[11px] text-bone/50 hover:text-bone"
+                          >
+                            Open this run in Project Steward
+                          </button>
+                        )}
                       </li>
                     ))}
                   </ul>
+                )}
+              </GlassCard>
+
+              <GlassCard className="p-4">
+                <div className="flex items-start justify-between gap-2 flex-wrap">
+                  <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-bone/40">
+                    Link an existing record
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Toggle linking an existing cron job or commitment"
+                    onClick={() => {
+                      setLinkTargetId('');
+                      setLinkOpen((open) => !open);
+                    }}
+                    className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 transition-colors"
+                  >
+                    {linkOpen ? 'Close' : 'Link record…'}
+                  </button>
+                </div>
+                <div className="mt-1 text-[11px] text-bone/40">
+                  Linking records attribution only. It never creates a cron job, grants
+                  permissions, or completes the Goal.
+                </div>
+
+                {linkOpen && (
+                  <div className="mt-2 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[11px] text-bone/50" htmlFor="goal-link-kind">
+                        Kind
+                      </label>
+                      <select
+                        id="goal-link-kind"
+                        value={linkTargetKind}
+                        disabled={linkOpState?.phase === 'writing'}
+                        onChange={(e) => {
+                          setLinkTargetKind(e.target.value as LinkTargetKind);
+                          setLinkTargetId('');
+                        }}
+                        className="px-2 py-1 text-xs rounded-lg bg-white/5 border border-white/10 text-bone"
+                      >
+                        <option value="cron_job">Cron job</option>
+                        <option value="commitment">Commitment</option>
+                      </select>
+                    </div>
+
+                    {linkCandidates.kind === 'loading' && (
+                      <div role="status" className="text-[11px] text-bone/40">
+                        Loading candidates…
+                      </div>
+                    )}
+                    {linkCandidates.kind === 'error' && (
+                      <div role="alert" className="text-[11px] text-red-200">
+                        {linkCandidates.message}{' '}
+                        <button
+                          type="button"
+                          onClick={() => void loadLinkCandidates(detailRequestId.current)}
+                          className="underline"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+
+                    {linkCandidates.kind === 'ready' &&
+                      linkTargetKind === 'cron_job' &&
+                      (goalIsProjectScoped && jobCandidates.length === 0 ? (
+                        <div role="alert" className="text-[11px] text-warning">
+                          This Goal is project-scoped. A cron job may be linked only when it is
+                          already bound to a Session whose Agent and canonical workspace pass the
+                          native compatibility validator. No compatible existing session-bound job
+                          is available. A new cron job cannot be created-and-linked here; bind an
+                          existing job elsewhere first.
+                        </div>
+                      ) : jobCandidates.length === 0 ? (
+                        <div className="text-[11px] text-bone/40">
+                          No compatible unlinked cron jobs are available.
+                        </div>
+                      ) : (
+                        <select
+                          aria-label="Cron job candidate"
+                          value={linkTargetId}
+                          disabled={linkOpState?.phase === 'writing'}
+                          onChange={(e) => setLinkTargetId(e.target.value)}
+                          className="w-full px-2 py-1 text-xs rounded-lg bg-white/5 border border-white/10 text-bone"
+                        >
+                          <option value="">Select a cron job…</option>
+                          {jobCandidates.map((job) => (
+                            <option key={job.id} value={job.id}>
+                              {job.name} · {job.schedule} · agent {job.agent_id}
+                              {job.session_id ? ' · session-bound' : ''}
+                            </option>
+                          ))}
+                        </select>
+                      ))}
+
+                    {linkCandidates.kind === 'ready' &&
+                      linkTargetKind === 'commitment' &&
+                      (goalIsProjectScoped ? (
+                        <div role="alert" className="text-[11px] text-warning">
+                          Commitments have no workspace association and cannot be linked to a
+                          project-scoped Goal under the current native contract.
+                        </div>
+                      ) : commitmentCandidates.length === 0 ? (
+                        <div className="text-[11px] text-bone/40">
+                          No compatible unlinked commitments are available.
+                        </div>
+                      ) : (
+                        <select
+                          aria-label="Commitment candidate"
+                          value={linkTargetId}
+                          disabled={linkOpState?.phase === 'writing'}
+                          onChange={(e) => setLinkTargetId(e.target.value)}
+                          className="w-full px-2 py-1 text-xs rounded-lg bg-white/5 border border-white/10 text-bone"
+                        >
+                          <option value="">Select a commitment…</option>
+                          {commitmentCandidates.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.text} · {c.status}
+                              {c.agent_id ? ` · agent ${c.agent_id}` : ' · user-wide'}
+                            </option>
+                          ))}
+                        </select>
+                      ))}
+
+                    <button
+                      type="button"
+                      disabled={linkTargetId === '' || linkOpState !== null}
+                      onClick={() => void runLinkOp('link', linkTargetKind, linkTargetId)}
+                      className="px-3 py-1 rounded-md border border-accent/40 text-xs text-accent/90 hover:bg-accent/10 disabled:opacity-40 transition-colors"
+                    >
+                      {linkOpState?.kind === 'link' && linkOpState.phase === 'writing'
+                        ? 'Linking…'
+                        : 'Link selected'}
+                    </button>
+
+                    {linkOpState && linkOpState.phase !== 'writing' && (
+                      <div role="alert" className="text-[11px] text-red-200">
+                        {linkOpState.message}{' '}
+                        <button
+                          type="button"
+                          onClick={() => void reconcileLinks()}
+                          className="underline"
+                        >
+                          Refresh
+                        </button>
+                        <div className="mt-0.5 text-bone/40">
+                          The write is not repeated automatically. Refresh re-reads the
+                          authoritative Goal and target rows.
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
               </GlassCard>
 
@@ -1791,11 +3500,24 @@ export default function GoalsView() {
                   <ul className="mt-2 space-y-2">
                     {commitments.map((commitment) => (
                       <li key={commitment.id} className="text-sm text-bone/80">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <Pill variant={commitment.status === 'completed' ? 'success' : 'default'}>
                             {commitment.status}
                           </Pill>
                           <span>{commitment.text}</span>
+                          <button
+                            type="button"
+                            aria-label={`Unlink commitment ${commitment.id} from this goal`}
+                            disabled={linkOpState !== null}
+                            onClick={() => void runLinkOp('unlink', 'commitment', commitment.id)}
+                            className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/60 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                          >
+                            {linkOpState?.kind === 'unlink' &&
+                            linkOpState.targetId === commitment.id &&
+                            linkOpState.phase === 'writing'
+                              ? 'Unlinking…'
+                              : 'Unlink'}
+                          </button>
                         </div>
                         <div className="mt-1 text-[11px] text-bone/40 font-mono">
                           {commitment.agent_id ? `agent ${commitment.agent_id} · ` : ''}
@@ -1856,8 +3578,23 @@ export default function GoalsView() {
                         ACTIONABLE_CLAIM_STATES.includes(a.claim_state),
                       );
                       const expanded = expandedJob === job.id;
+                      // The mutation controls require this exact job's native
+                      // schedule and activation/run history. If the schedule
+                      // authority is unavailable, or this job's activation/run
+                      // history is malformed/unreadable, no mutation may be
+                      // submitted (per-job, so other jobs stay controllable).
+                      const historyUnavailable =
+                        activationErrors[job.id] === true || runErrors[job.id] === true;
+                      const scheduleStateUnavailable = scheduleUnavailable || historyUnavailable;
                       return (
-                        <li key={job.id} className="rounded-lg border border-white/10 p-3">
+                        <li
+                          key={job.id}
+                          className={cn(
+                            'rounded-lg border border-white/10 p-3',
+                            selectorFocus?.cronJobId === job.id &&
+                              'border-accent/50 ring-1 ring-accent/30',
+                          )}
+                        >
                           <div className="flex items-center gap-2 flex-wrap">
                             <StatusDot ok={job.enabled} warn={!job.enabled} />
                             <span className="text-sm text-bone truncate">{job.name}</span>
@@ -1876,7 +3613,7 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Pause schedule ${job.name}`}
-                                disabled={op !== undefined || scheduleUnavailable}
+                                disabled={op !== undefined || scheduleStateUnavailable}
                                 onClick={() => void runScheduleOp('pause', job)}
                                 className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
                               >
@@ -1886,7 +3623,7 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Resume schedule ${job.name}`}
-                                disabled={op !== undefined || scheduleUnavailable}
+                                disabled={op !== undefined || scheduleStateUnavailable}
                                 onClick={() => void runScheduleOp('resume', job)}
                                 className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/80 hover:bg-white/10 disabled:opacity-40 transition-colors"
                               >
@@ -1898,7 +3635,10 @@ export default function GoalsView() {
                               aria-label={`Run schedule ${job.name} now`}
                               title="Starts a new manual occurrence; this is not a replay of a prior activation."
                               disabled={
-                                op !== undefined || running || !job.enabled || scheduleUnavailable
+                                op !== undefined ||
+                                running ||
+                                !job.enabled ||
+                                scheduleStateUnavailable
                               }
                               onClick={() => void runScheduleOp('run', job)}
                               className="px-2 py-0.5 rounded-md border border-accent/40 text-xs text-accent/90 hover:bg-accent/10 disabled:opacity-40 transition-colors"
@@ -1909,19 +3649,39 @@ export default function GoalsView() {
                               <button
                                 type="button"
                                 aria-label={`Cancel schedule ${job.name}`}
-                                disabled={op !== undefined || scheduleUnavailable}
+                                disabled={op !== undefined || scheduleStateUnavailable}
                                 onClick={() => void runScheduleOp('cancel', job)}
                                 className="px-2 py-0.5 rounded-md border border-error/40 text-xs text-error/90 hover:bg-error/10 disabled:opacity-40 transition-colors"
                               >
                                 {op?.kind === 'cancel' && op.phase === 'writing' ? 'Cancelling…' : 'Cancel'}
                               </button>
                             )}
+                            <button
+                              type="button"
+                              aria-label={`Unlink cron job ${job.name} from this goal`}
+                              disabled={linkOpState !== null}
+                              onClick={() => void runLinkOp('unlink', 'cron_job', job.id)}
+                              className="px-2 py-0.5 rounded-md border border-white/15 text-xs text-bone/60 hover:bg-white/10 disabled:opacity-40 transition-colors"
+                            >
+                              {linkOpState?.kind === 'unlink' &&
+                              linkOpState.targetId === job.id &&
+                              linkOpState.phase === 'writing'
+                                ? 'Unlinking…'
+                                : 'Unlink'}
+                            </button>
                           </div>
 
                           <div className="mt-1 text-[10px] text-bone/30">
                             Pause stops future activations and requests cancellation of any in-flight
                             run. Run now starts a new manual occurrence.
                           </div>
+
+                          {historyUnavailable && (
+                            <div role="alert" className="mt-1.5 text-[11px] text-warning">
+                              This schedule&apos;s activation/run history is unavailable; its
+                              mutation controls are disabled until the state is reconciled.
+                            </div>
+                          )}
 
                           {op && op.phase === 'writing' && (
                             <div role="status" className="mt-1.5 text-[11px] text-bone/40">
@@ -1976,74 +3736,147 @@ export default function GoalsView() {
                               {expanded ? '▾' : '▸'} Activation history ({jobActivations.length})
                             </button>
                             {expanded && (
-                              <div className="mt-1.5 pl-2 border-l border-white/10 space-y-1.5">
-                                {activationErrors[job.id] && (
+                              <div className="mt-1.5 pl-2 border-l border-white/10 space-y-2">
+                                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                                  Claimed activations
+                                </div>
+                                {activationErrors[job.id] ? (
                                   <div role="alert" className="text-[11px] text-red-200">
-                                    Activation history could not be read; it may be incomplete.
+                                    Activation history could not be read; it is unavailable, not
+                                    empty.
                                   </div>
-                                )}
-                                {!activationErrors[job.id] && jobActivations.length === 0 && (
+                                ) : jobActivations.length === 0 ? (
                                   <div className="text-[11px] text-bone/40">
                                     No activations recorded yet.
                                   </div>
+                                ) : (
+                                  <ul className="space-y-2">
+                                    {jobActivations.map((activation) => {
+                                      const joined = joinedRunForActivation(activation, jobRuns);
+                                      return (
+                                        <li
+                                          key={activation.activation_id}
+                                          className={cn(
+                                            'rounded-md border border-white/10 p-2 text-[11px] font-mono text-bone/70',
+                                            selectorFocus?.cronJobId === job.id &&
+                                              selectorFocus?.activationId ===
+                                                activation.activation_id &&
+                                              'border-accent/50 bg-accent/5 ring-1 ring-accent/30',
+                                          )}
+                                        >
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            <Pill variant={claimVariant(activation.claim_state)}>
+                                              {activation.claim_state}
+                                            </Pill>
+                                            <span>{actionableLabel(activation.claim_state)}</span>
+                                            <span className="text-bone/40">
+                                              {activation.trigger_kind}
+                                            </span>
+                                          </div>
+                                          <div className="mt-1 text-bone/50 break-all">
+                                            <div>activation {activation.activation_id}</div>
+                                            <div>
+                                              cron {activation.cron_id} · goal{' '}
+                                              {activation.goal_id ?? 'unbound'}
+                                            </div>
+                                            <div>
+                                              agent {activation.agent_id}
+                                              {activation.session_id
+                                                ? ` · session ${activation.session_id}`
+                                                : ''}
+                                              {activation.project_root
+                                                ? ` · root ${activation.project_root}`
+                                                : ''}
+                                            </div>
+                                            <div>
+                                              occurrence {activation.schedule_occurrence}
+                                            </div>
+                                            <div>
+                                              claimed {activation.claimed_at}
+                                              {activation.dispatched_at
+                                                ? ` · dispatched ${activation.dispatched_at}`
+                                                : ''}
+                                              {activation.settled_at
+                                                ? ` · settled ${activation.settled_at}`
+                                                : ''}
+                                            </div>
+                                            <div>
+                                              run {activation.run_id ?? 'none'}
+                                              {activation.bun_run_id
+                                                ? ` · bun ${activation.bun_run_id}`
+                                                : ''}
+                                            </div>
+                                          </div>
+                                          {activation.terminal_reason && (
+                                            <div className="mt-1 text-bone/60">
+                                              reason: {activation.terminal_reason}
+                                            </div>
+                                          )}
+                                          {runErrors[job.id] ? (
+                                            <div className="mt-1 text-bone/40">
+                                              Run history is unavailable; no run relation is claimed
+                                              for this activation.
+                                            </div>
+                                          ) : joined ? (
+                                            <RunReceipt
+                                              run={joined}
+                                              activationBunRunId={activation.bun_run_id}
+                                            />
+                                          ) : (
+                                            <div className="mt-1 text-bone/40">
+                                              No run is joined to this activation by exact
+                                              Cron/Goal/activation/occurrence identity.
+                                            </div>
+                                          )}
+                                        </li>
+                                      );
+                                    })}
+                                  </ul>
                                 )}
-                                {jobActivations.map((activation) => (
-                                  <div
-                                    key={activation.activation_id}
-                                    className="text-[11px] text-bone/70 font-mono"
-                                  >
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <Pill variant={claimVariant(activation.claim_state)}>
-                                        {activation.claim_state}
-                                      </Pill>
-                                      <span>occ {activation.schedule_occurrence}</span>
-                                      <span className="text-bone/40">{activation.trigger_kind}</span>
-                                    </div>
-                                    <div className="text-bone/40">
-                                      claimed {activation.claimed_at}
-                                      {activation.dispatched_at
-                                        ? ` · dispatched ${activation.dispatched_at}`
-                                        : ''}
-                                      {activation.settled_at
-                                        ? ` · settled ${activation.settled_at}`
-                                        : ''}
-                                      {activation.run_id ? ` · run ${activation.run_id}` : ''}
-                                    </div>
-                                    {activation.terminal_reason && (
-                                      <div className="text-bone/60">
-                                        reason: {activation.terminal_reason}
-                                      </div>
-                                    )}
-                                  </div>
-                                ))}
-                                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40 mt-1">
-                                  Recent runs
+
+                                <div className="text-[10px] font-mono uppercase tracking-wider text-bone/40">
+                                  Runs without a matched activation
                                 </div>
-                                {runErrors[job.id] && (
+                                {runErrors[job.id] ? (
                                   <div role="alert" className="text-[11px] text-red-200">
-                                    Run history could not be read; it may be incomplete.
+                                    Run history could not be read; it is unavailable, not empty.
                                   </div>
+                                ) : (
+                                  (() => {
+                                    const unmatched = jobRuns.filter(
+                                      (run) =>
+                                        matchedActivationForRun(run, jobActivations) === null,
+                                    );
+                                    if (unmatched.length === 0) {
+                                      return (
+                                        <div className="text-[11px] text-bone/40">
+                                          Every run is joined to an activation.
+                                        </div>
+                                      );
+                                    }
+                                    return (
+                                      <ul className="space-y-2">
+                                        {unmatched.slice(0, 10).map((run) => (
+                                          <li
+                                            key={run.id}
+                                            className={cn(
+                                              'rounded-md border border-warning/20 p-2 text-[11px] font-mono text-bone/70',
+                                              selectorFocus?.cronJobId === job.id &&
+                                                selectorFocus?.runId === run.id &&
+                                                'border-accent/50 bg-accent/5 ring-1 ring-accent/30',
+                                            )}
+                                          >
+                                            <div className="text-bone/40">
+                                              Activation relation unavailable or conflicting; shown
+                                              separately.
+                                            </div>
+                                            <RunReceipt run={run} activationBunRunId={null} />
+                                          </li>
+                                        ))}
+                                      </ul>
+                                    );
+                                  })()
                                 )}
-                                {!runErrors[job.id] && jobRuns.length === 0 && (
-                                  <div className="text-[11px] text-bone/40">No runs recorded yet.</div>
-                                )}
-                                {jobRuns.slice(0, 10).map((run) => (
-                                  <div key={run.id} className="text-[11px] text-bone/70 font-mono">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <Pill variant={cronRunVariant(run.status)}>{run.status}</Pill>
-                                      <span>{run.started_at}</span>
-                                      {run.activation_id ? (
-                                        <span className="text-bone/40">act {run.activation_id}</span>
-                                      ) : null}
-                                    </div>
-                                    {run.terminal_reason && (
-                                      <div className="text-bone/60">reason: {run.terminal_reason}</div>
-                                    )}
-                                    {run.error && (
-                                      <div className="text-red-200/80 truncate">{run.error}</div>
-                                    )}
-                                  </div>
-                                ))}
                               </div>
                             )}
                           </div>

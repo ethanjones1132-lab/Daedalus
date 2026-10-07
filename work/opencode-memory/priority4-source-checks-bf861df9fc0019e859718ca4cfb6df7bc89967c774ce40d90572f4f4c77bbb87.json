@@ -1,0 +1,120 @@
+{
+  "report": "priority-4-phase-4-4-source-checks",
+  "phase": "Priority 4.4 — Cross-workflow readiness and evidence handoff",
+  "status": "PARTIAL / STOPPED ON UI BUILD FAILURE",
+  "reason": "This is the record of the first permitted-check attempt at the frozen Phase 4.4 source-worktree identity. `cargo check`, server typecheck, and server build exited 0, but the UI build failed (exit 1). Per the plan, the run stopped after the failed check and `git diff --check` was NOT RUN. This is a failed/partial attempt, not an all-five-pass result.",
+  "source_identity": {
+    "type": "source-worktree fingerprint (SHA-256 over source/build-input trees; not a commit)",
+    "commit_sha": null,
+    "worktree_fingerprint": "bf861df9fc0019e859718ca4cfb6df7bc89967c774ce40d90572f4f4c77bbb87",
+    "file_count": 795,
+    "algorithm": "SHA-256 over the UTF-8 compact JSON array of sorted [relative_path, file_SHA256, byte_length] entries from `git ls-files --cached --others --exclude-standard` under src-tauri, server-jarvis, src-ui, excluding path components node_modules, target, dist, build, .turbo, .next.",
+    "scope": "Source/build-input trees only (src-tauri, server-jarvis, src-ui). This fingerprints source/build-input trees only; it does not cover docs, generated output directories, or a commit, and it is not a commit SHA.",
+    "note": "This is the old (pre-correction) source-worktree identity at which the first check attempt was made. No commit SHA exists for this checkpoint and none is claimed.",
+    "fingerprint_same_before_and_after_attempt": true,
+    "fingerprint_stability_note": "The source fingerprint was the same before and after this attempt: running the checks did not change source."
+  },
+  "capture_time": "2026-10-07T01:13:55Z",
+  "result_recorded_at": "2026-10-07T01:13:55Z",
+  "luna_review": {
+    "task": "Phase 4.4 Task 4 documentation review",
+    "result": "clean",
+    "scope": "Phase 4.4 Task 4 documentation (the acceptance checklist, the roadmap status/handoff, and the pending five-check report) was reviewed clean by Luna. This is separate from, and earlier than, the one-line source-type restoration reviewed clean in the corrected-source report.",
+    "as_of": "2026-10-06"
+  },
+  "warnings_or_failures": {
+    "status": "STOPPED ON UI BUILD FAILURE (exit 1); git diff --check NOT RUN",
+    "text": "src-ui build failed with TS2305 and TS2304. cargo check exited 0 with eight warning categories; see cargo_check_warnings.",
+    "cargo_check_warnings": [
+      {
+        "category": "non_camel_case_types",
+        "location": "src/db/mod.rs:189"
+      },
+      {
+        "category": "non_camel_case_types",
+        "location": "src/jarvis/learning.rs:657"
+      },
+      {
+        "category": "deprecated",
+        "detail": "Atomic fetch_update",
+        "location": "src/supervisor.rs:73"
+      },
+      {
+        "category": "unused",
+        "detail": "Manager",
+        "location": "src/commands/trusted_acceptance.rs:21"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "bun_instance_id",
+        "location": "line 1024"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "status",
+        "location": "line 1051"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "reason",
+        "location": "line 1052"
+      },
+      {
+        "category": "dead_code",
+        "detail": "shlex_join",
+        "location": "src/wsl.rs:311"
+      }
+    ],
+    "note": "Warnings/failure text above is from the captured output of this attempt. The known-but-unrelated pre-existing docs/implementation/roadmap-priority-3-status.md:3 trailing whitespace produced by `git diff --check` on the shared worktree is expected to recur when the full diff-check is eventually run; it is not claimed as a Phase 4.4 result here."
+  },
+  "checks": [
+    {
+      "name": "rust_compile",
+      "command": "(cd src-tauri && /Users/charlottehughes/.cargo/bin/cargo check)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": "Eight warning categories from captured output; see warnings_or_failures.cargo_check_warnings."
+    },
+    {
+      "name": "server_typecheck",
+      "command": "(cd server-jarvis && bun run typecheck)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": null
+    },
+    {
+      "name": "server_build",
+      "command": "(cd server-jarvis && bun run build)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": null
+    },
+    {
+      "name": "ui_build",
+      "command": "(cd src-ui && bun run build)",
+      "exit_code": 1,
+      "status": "FAIL",
+      "warning_or_failure": "TS2305: src-ui/src/components/jarvis/chat-state.ts(1,30) — module './types' has no exported member 'JarvisTerminalOutcome'. TS2304: src-ui/src/components/jarvis/types.ts(263,21) — cannot find name 'JarvisTerminalOutcome'."
+    },
+    {
+      "name": "diff_check",
+      "command": "git diff --check",
+      "exit_code": null,
+      "status": "NOT RUN",
+      "warning_or_failure": null,
+      "note": "NOT RUN because the plan says stop after a failed check; the UI build failed, so the run stopped rather than proceeding to the full `git diff --check`."
+    }
+  ],
+  "failure_analysis": {
+    "cause": "Deletion of a pre-existing type by the P4.4 selector edit.",
+    "detail": "The Phase 4.4 selector edit to src-ui/src/components/jarvis/types.ts removed the pre-existing `JarvisTerminalOutcome` type. `chat-state.ts` still imports it and `JarvisMessage.terminalOutcome` still references it, so the src-ui build failed with TS2305 and TS2304.",
+    "type": "JarvisTerminalOutcome",
+    "restoration": "The deleted type was subsequently restored by an exact one-line restoration; Luna's review of that exact one-line restoration was clean. The corrected source-worktree fingerprint and the pending five-check report are recorded separately in work/opencode-memory/priority4-source-checks-88fad2a4f058c9a54c2c2357291b36cca3b3da3b8cff98cc8a1a6fed646bdcf6.json."
+  },
+  "deviations": [
+    {
+      "item": "path-scoped git diff --check during documentation inspection before final freeze",
+      "detail": "During documentation inspection before final freeze, a path-scoped `git diff --check` over the P4 docs paths ran and produced no output, but its exit code was not retained. It is not the permitted final full `git diff --check` and is not claimed as one."
+    }
+  ]
+}

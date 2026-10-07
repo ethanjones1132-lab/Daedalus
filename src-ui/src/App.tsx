@@ -31,7 +31,7 @@ import { usePolling } from './hooks/usePolling';
 import { useTheme } from './hooks/useTheme';
 import MarkdownRenderer from './components/jarvis/MarkdownRenderer';
 import type { BackendSession, NavSection, SessionMessage, ViewId } from './types';
-import type { CompanionRarity, CompanionSpecies, CompanionState } from './components/jarvis/types';
+import type { CompanionRarity, CompanionSpecies, CompanionState, GoalNotificationSelector, ProjectStewardHandoff, WorkflowDestination, WorkflowNavigationSelector } from './components/jarvis/types';
 import JarvisView from './components/jarvis/JarvisView';
 import MemoryView from './components/jarvis/MemoryView';
 import { MythosCompanionSprite } from './components/jarvis/MythosCompanionSprite';
@@ -47,6 +47,7 @@ import NodesView from './components/jarvis/NodesView';
 import HooksView from './components/jarvis/HooksView';
 import CommitmentsView from './components/jarvis/CommitmentsView';
 import GoalsView from './components/jarvis/GoalsView';
+import ProjectStewardView, { type ProjectStewardReviewSelection } from './components/jarvis/ProjectStewardView';
 import ApprovalsView from './components/jarvis/ApprovalsView';
 import PluginsView from './components/jarvis/PluginsView';
 import GatewayView from './components/jarvis/GatewayView';
@@ -72,6 +73,7 @@ const NAV_SECTIONS: NavSection[] = [
       { id: 'control', label: 'Control', icon: 'G' },
       { id: 'models', label: 'Models', icon: 'M' },
       { id: 'memory', label: 'Memory', icon: 'R' },
+      { id: 'project-steward', label: 'Project Steward', icon: 'S' },
     ],
   },
   {
@@ -626,6 +628,80 @@ function AppInner() {
   });
   const [companion, setCompanion] = useState<CompanionState | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // One-shot Project Steward handoff. It is selector-only (Session ID, Goal ID,
+  // user-authored task text); the chat surface consumes it, pre-fills, and then
+  // clears it. It never supplies workspace/Agent/permission authority.
+  const [projectStewardHandoff, setProjectStewardHandoff] = useState<ProjectStewardHandoff | null>(null);
+  // Retained Project Steward review selector: exactly the persisted Session ID
+  // and native Goal ID of the Goal handed to Chat. It survives the route change
+  // to Chat and back so Project Steward can reconstruct the Goal/run review from
+  // fresh native readback. It carries no task text, Agent, root, criteria,
+  // outcome, diff, or evidence, and is never treated as authority.
+  const [projectStewardReview, setProjectStewardReview] = useState<ProjectStewardReviewSelection | null>(null);
+  const handleProjectStewardHandoffConsumed = useCallback(() => setProjectStewardHandoff(null), []);
+  const openProjectStewardInChat = useCallback((handoff: ProjectStewardHandoff) => {
+    setProjectStewardHandoff(handoff);
+    // Retain only the selector fields; the task draft stays a one-shot prefill.
+    setProjectStewardReview({ session_id: handoff.session_id, goal_id: handoff.goal_id });
+    setCurrentView('jarvis');
+  }, []);
+  // App-retained in-app Goal notification navigation selector. It carries only
+  // the exact optional IDs from the `goal://notifications` event, survives the
+  // route change into Goals, and is cleared by GoalsView once consumed. It is
+  // never persisted and never treated as authority, status, or evidence.
+  const [goalNotificationSelector, setGoalNotificationSelector] =
+    useState<GoalNotificationSelector | null>(null);
+  const handleGoalNotificationSelectorConsumed = useCallback(
+    (selector: GoalNotificationSelector) => {
+      // Clear only the exact selector that was consumed, so a newer notification
+      // selector is never dropped by a superseded consume callback.
+      setGoalNotificationSelector((current) => (current === selector ? null : current));
+    },
+    [],
+  );
+  // Cross-workflow navigation selector (Roadmap Priority 4.4, Task 1). At most
+  // one selector is retained in App memory. It is selector-only — exact native
+  // IDs, no task/content/status — and the destination view clears it only after
+  // its own fresh exact readback resolves or explicitly rejects it. A newer
+  // navigation replaces any prior selector; a route change never carries it as
+  // durable authority.
+  const [workflowNavigationSelector, setWorkflowNavigationSelector] =
+    useState<WorkflowNavigationSelector | null>(null);
+  const handleWorkflowNavigationSelectorConsumed = useCallback(
+    (selector: WorkflowNavigationSelector) => {
+      // Clear only the exact selector that was consumed, so a newer navigation
+      // selector is never dropped by a superseded consume callback.
+      setWorkflowNavigationSelector((current) => (current === selector ? null : current));
+    },
+    [],
+  );
+  const navigateToWorkflow = useCallback(
+    (destination: WorkflowDestination, selector: WorkflowNavigationSelector | null) => {
+      // Retain only an exact, destination-matching selector; a mismatch or an
+      // absent selector is a plain route change with no preselection. The route
+      // is derived from the destination, never persisted.
+      const exact = selector !== null && selector.workflow === destination ? selector : null;
+      // An explicit cross-workflow navigation to Goals supersedes any retained
+      // in-app Goal notification selector. Clearing it in the same commit means
+      // GoalsView mounts with `notificationSelector === null`, so its notification
+      // consume effect (which would otherwise re-read and select from stale
+      // notification IDs) is canceled before the explicit workflow selector
+      // effect can reconcile. Ordinary notification "Open Goals" does not use
+      // this path, so it is unaffected.
+      if (destination === 'recurring-operator') {
+        setGoalNotificationSelector(null);
+      }
+      setWorkflowNavigationSelector(exact);
+      setCurrentView(
+        destination === 'project-steward'
+          ? 'project-steward'
+          : destination === 'researcher'
+            ? 'learning'
+            : 'goals',
+      );
+    },
+    [],
+  );
   const allNavItems = useMemo(
     () => NAV_SECTIONS.flatMap((s) => s.items),
     [],
@@ -762,10 +838,33 @@ function AppInner() {
     listen<GoalNotification>('goal://notifications', (e) => {
       const n = e.payload;
       if (!n?.message) return;
-      const openGoal = {
-        label: 'Open Goals',
-        onClick: () => setCurrentView('goals'),
-      };
+      // Retain only the exact optional IDs from the event as a navigation
+      // selector. The toast title/message and any schedule prompt are never
+      // retained, and the payload text is display-only (never re-verification).
+      const selector: GoalNotificationSelector | null =
+        typeof n.goal_id === 'string' && n.goal_id.trim().length > 0
+          ? {
+              goal_id: n.goal_id,
+              ...(typeof n.activation_id === 'string' && n.activation_id.length > 0
+                ? { activation_id: n.activation_id }
+                : {}),
+              ...(typeof n.cron_job_id === 'string' && n.cron_job_id.length > 0
+                ? { cron_job_id: n.cron_job_id }
+                : {}),
+              ...(typeof n.run_id === 'string' && n.run_id.length > 0
+                ? { run_id: n.run_id }
+                : {}),
+            }
+          : null;
+      const openGoal = selector
+        ? {
+            label: 'Open Goals',
+            onClick: () => {
+              setGoalNotificationSelector(selector);
+              setCurrentView('goals');
+            },
+          }
+        : undefined;
       if (n.kind === 'scheduled_run_blocked' || n.kind === 'scheduled_run_failed') {
         toastError(n.message, n.title, undefined, openGoal);
       } else if (n.kind === 'scheduled_run_waiting_for_user' || n.kind === 'scheduled_run_cancelled') {
@@ -792,7 +891,31 @@ function AppInner() {
       case 'jarvis-hub':
       case 'jarvis-chat':
       case 'jarvis-companion':
-        return <ErrorBoundary><JarvisView onCompanionChange={setCompanion} /></ErrorBoundary>;
+        return (
+          <ErrorBoundary>
+            <JarvisView
+              onCompanionChange={setCompanion}
+              projectStewardHandoff={projectStewardHandoff}
+              onProjectStewardHandoffConsumed={handleProjectStewardHandoffConsumed}
+            />
+          </ErrorBoundary>
+        );
+      case 'project-steward':
+        return (
+          <ErrorBoundary>
+            <ProjectStewardView
+              onOpenInChat={openProjectStewardInChat}
+              reviewSelection={projectStewardReview}
+              navigationSelector={
+                workflowNavigationSelector?.workflow === 'project-steward'
+                  ? workflowNavigationSelector
+                  : null
+              }
+              onNavigationSelectorConsumed={handleWorkflowNavigationSelectorConsumed}
+              onNavigateWorkflow={navigateToWorkflow}
+            />
+          </ErrorBoundary>
+        );
       case 'chat-feeds': return <ChatFeedsView />;
       case 'overview': return <OverviewView />;
       case 'sessions': return <SessionsView />;
@@ -806,14 +929,24 @@ function AppInner() {
       case 'cron': return <CronView />;
       case 'action-registry': return <ActionRegistryView />;
       case 'skills': return <SkillsView />;
-      case 'learning': return <LearningView />;
+      case 'learning': return (
+        <LearningView
+          navigationSelector={
+            workflowNavigationSelector?.workflow === 'researcher'
+              ? workflowNavigationSelector
+              : null
+          }
+          onNavigationSelectorConsumed={handleWorkflowNavigationSelectorConsumed}
+          onNavigateWorkflow={navigateToWorkflow}
+        />
+      );
       case 'agents': return <AgentsView />;
       case 'channels': return <ChannelsView />;
       case 'devices': return <ErrorBoundary><DevicesView /></ErrorBoundary>;
       case 'nodes': return <ErrorBoundary><NodesView /></ErrorBoundary>;
       case 'hooks': return <ErrorBoundary><HooksView /></ErrorBoundary>;
       case 'commitments': return <ErrorBoundary><CommitmentsView /></ErrorBoundary>;
-      case 'goals': return <ErrorBoundary><GoalsView /></ErrorBoundary>;
+      case 'goals': return <ErrorBoundary><GoalsView notificationSelector={goalNotificationSelector} onNotificationSelectorConsumed={handleGoalNotificationSelectorConsumed} navigationSelector={workflowNavigationSelector?.workflow === 'recurring-operator' ? workflowNavigationSelector : null} onNavigationSelectorConsumed={handleWorkflowNavigationSelectorConsumed} onNavigateWorkflow={navigateToWorkflow} /></ErrorBoundary>;
       case 'approvals': return <ErrorBoundary><ApprovalsView /></ErrorBoundary>;
       case 'plugins': return <ErrorBoundary><PluginsView /></ErrorBoundary>;
       case 'gateway': return <ErrorBoundary><GatewayView /></ErrorBoundary>;
