@@ -181,17 +181,31 @@ pub struct LlamaCppConfig {
     pub model: String,
     pub server_path: String,
     pub model_path: String,
+    /// Separate MTP draft head (`-md`). Blank uses the MTP layer embedded in
+    /// the model GGUF, which is how the Qwen3.6 keep96 slice ships.
     pub mtp_path: String,
     pub port: u16,
     pub context_window: u32,
     pub reasoning_budget: u32,
+    /// MoE expert layers kept on the CPU (`--n-cpu-moe`).
+    pub n_cpu_moe: u32,
+    /// Logical and physical batch size (`-b` / `-ub`).
+    pub batch_size: u32,
+    /// `--spec-type` value, e.g. `draft-mtp,ngram-mod`. Blank disables speculation.
+    pub spec_type: String,
+    /// `--spec-draft-n-max`.
+    pub spec_draft_n_max: u32,
 }
 
 impl Default for LlamaCppConfig {
+    /// Qwen3.6-35B-A3B UD-IQ2_M keep96 on the 8 GB RTX 4060: every layer on the
+    /// GPU, embedded MTP stacked with n-gram lookup, thinking off. Measured on
+    /// llama.cpp master 836d571 at 274 tok/s and 101/117 on tier2b (2026-10-04
+    /// speed lab; settled over swap108/add108 on 2026-10-06).
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
-            model: "gemma-4-26B-A4B-it-IQ2_M.gguf".to_string(),
+            model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf".to_string(),
             // Artifact locations are machine-specific, so source ships them
             // blank. Each install sets them in Settings (persisted as the
             // `llama_cpp` row of the app settings table) or through the
@@ -201,7 +215,11 @@ impl Default for LlamaCppConfig {
             mtp_path: String::new(),
             port: 8080,
             context_window: 16384,
-            reasoning_budget: 1536,
+            reasoning_budget: 0,
+            n_cpu_moe: 0,
+            batch_size: 1024,
+            spec_type: "draft-mtp,ngram-mod".to_string(),
+            spec_draft_n_max: 2,
         }
     }
 }
@@ -237,6 +255,59 @@ impl LlamaCppConfig {
         }
         self
     }
+
+    /// llama-server arguments after the executable. `mtp_head_exists` says
+    /// whether `mtp_path` names an existing file; a configured head that is
+    /// missing drops `draft-mtp` so the server still starts with the rest of
+    /// the speculation stack.
+    pub fn server_args(&self, mtp_head_exists: bool) -> Vec<String> {
+        let port = self.port.to_string();
+        let n_cpu_moe = self.n_cpu_moe.to_string();
+        let context = self.context_window.to_string();
+        let batch = self.batch_size.to_string();
+        let budget = self.reasoning_budget.to_string();
+        let fixed: [&str; 32] = [
+            "-m", self.model_path.trim(),
+            "--alias", self.model.as_str(),
+            "--host", "127.0.0.1",
+            "--port", port.as_str(),
+            "-ngl", "99",
+            "--n-cpu-moe", n_cpu_moe.as_str(),
+            "-c", context.as_str(),
+            "-ctk", "q8_0", "-ctv", "q8_0",
+            "--flash-attn", "on",
+            "-b", batch.as_str(), "-ub", batch.as_str(),
+            // -np > 1 is not supported with MTP
+            "-np", "1",
+            "--jinja",
+            "--reasoning-budget", budget.as_str(),
+            "--no-webui",
+            // The default 8 GiB host prompt cache starves a 16 GB machine.
+            "--cache-ram", "0",
+        ];
+        let mut args: Vec<String> = fixed.iter().map(|arg| arg.to_string()).collect();
+
+        let mtp_configured = !self.mtp_path.trim().is_empty();
+        let spec: Vec<&str> = self
+            .spec_type
+            .split(',')
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .filter(|kind| !(*kind == "draft-mtp" && mtp_configured && !mtp_head_exists))
+            .collect();
+        if !spec.is_empty() {
+            args.extend([
+                "--spec-type".to_string(),
+                spec.join(","),
+                "--spec-draft-n-max".to_string(),
+                self.spec_draft_n_max.to_string(),
+            ]);
+            if mtp_configured && mtp_head_exists && spec.contains(&"draft-mtp") {
+                args.extend(["-md".to_string(), self.mtp_path.trim().to_string()]);
+            }
+        }
+        args
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +320,69 @@ mod llama_cpp_config_tests {
         assert!(config.server_path.is_empty());
         assert!(config.model_path.is_empty());
         assert!(config.mtp_path.is_empty());
+    }
+
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn default_launches_keep96_placement_with_embedded_mtp_and_ngram() {
+        let config = LlamaCppConfig {
+            model_path: "keep96.gguf".to_string(),
+            ..LlamaCppConfig::default()
+        };
+        let args = config.server_args(false);
+        assert_eq!(flag(&args, "--n-cpu-moe"), Some("0"));
+        assert_eq!(flag(&args, "-b"), Some("1024"));
+        assert_eq!(flag(&args, "-ub"), Some("1024"));
+        assert_eq!(flag(&args, "--reasoning-budget"), Some("0"));
+        assert_eq!(flag(&args, "--cache-ram"), Some("0"));
+        assert_eq!(flag(&args, "--spec-type"), Some("draft-mtp,ngram-mod"));
+        assert_eq!(flag(&args, "--spec-draft-n-max"), Some("2"));
+        assert_eq!(flag(&args, "--alias"), Some("Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf"));
+        assert!(!args.iter().any(|arg| arg == "-md"));
+    }
+
+    #[test]
+    fn separate_mtp_head_is_passed_when_present_and_dropped_when_missing() {
+        let config = LlamaCppConfig {
+            model_path: "gemma.gguf".to_string(),
+            mtp_path: "mtp-gemma.gguf".to_string(),
+            n_cpu_moe: 16,
+            ..LlamaCppConfig::default()
+        };
+        let present = config.server_args(true);
+        assert_eq!(flag(&present, "--spec-type"), Some("draft-mtp,ngram-mod"));
+        assert_eq!(flag(&present, "-md"), Some("mtp-gemma.gguf"));
+        assert_eq!(flag(&present, "--n-cpu-moe"), Some("16"));
+
+        let missing = config.server_args(false);
+        assert_eq!(flag(&missing, "--spec-type"), Some("ngram-mod"));
+        assert!(!missing.iter().any(|arg| arg == "-md"));
+    }
+
+    #[test]
+    fn blank_spec_type_disables_speculation() {
+        let config = LlamaCppConfig {
+            spec_type: " ".to_string(),
+            ..LlamaCppConfig::default()
+        };
+        let args = config.server_args(false);
+        assert!(!args.iter().any(|arg| arg == "--spec-type" || arg == "-md"));
+    }
+
+    #[test]
+    fn stored_row_without_placement_fields_takes_defaults() {
+        let stored = r#"{"base_url":"http://127.0.0.1:8080/v1","model":"m","server_path":"s","model_path":"p","mtp_path":"","port":8080,"context_window":16384,"reasoning_budget":0}"#;
+        let config: LlamaCppConfig = serde_json::from_str(stored).unwrap();
+        assert_eq!(config.n_cpu_moe, 0);
+        assert_eq!(config.batch_size, 1024);
+        assert_eq!(config.spec_type, "draft-mtp,ngram-mod");
+        assert_eq!(config.spec_draft_n_max, 2);
     }
 
     #[test]

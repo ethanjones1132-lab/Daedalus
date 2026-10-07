@@ -265,8 +265,8 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     std::thread::spawn(move || warm_model(model));
 }
 
-/// Start the configured local llama.cpp server with the measured Gemma 4
-/// placement, MTP head, and bounded reasoning budget. The Child is owned by
+/// Start the configured local llama.cpp server with the placement, speculation
+/// and reasoning budget from `LlamaCppConfig::server_args`. The Child is owned by
 /// the shared lifecycle manager, so switching backends or exiting Daedalus
 /// only stops a server that this process actually spawned.
 pub(crate) async fn start_llama_cpp_server(
@@ -298,8 +298,15 @@ pub(crate) async fn start_llama_cpp_server(
         return Err(format!("llama-server executable not found: {}", server_path.display()));
     }
     if !model_path.is_file() {
-        return Err(format!("Gemma GGUF not found: {}", model_path.display()));
+        return Err(format!("llama.cpp model GGUF not found: {}", model_path.display()));
     }
+    let mtp_head_exists = mtp_path.is_file();
+    if mtp_path.as_os_str().is_empty() {
+        println!("[Daedalus] no separate MTP head configured; draft-mtp uses the model's embedded MTP layer");
+    } else if !mtp_head_exists {
+        eprintln!("[Daedalus] MTP head not found at {}; starting without draft-mtp", mtp_path.display());
+    }
+    let server_args = config.server_args(mtp_head_exists);
 
     let outcome = process_lifecycle::launch(
         process_lifecycle::ManagedProcess::LlamaCpp,
@@ -314,32 +321,7 @@ pub(crate) async fn start_llama_cpp_server(
 
             use std::process::{Command, Stdio};
             let mut command = Command::new(&server_path);
-            command.args([
-                "-m", model_path.to_string_lossy().as_ref(),
-                "--alias", &config.model,
-                "--host", "127.0.0.1",
-                "--port", &config.port.to_string(),
-                "-ngl", "99",
-                "--n-cpu-moe", "20",
-                "-c", &config.context_window.to_string(),
-                "-ctk", "q8_0", "-ctv", "q8_0",
-                "--flash-attn", "on",
-                "-b", "512", "-ub", "512", "-np", "1",
-                "--jinja",
-                "--reasoning-budget", &config.reasoning_budget.to_string(),
-                "--no-webui",
-            ]);
-            if mtp_path.is_file() {
-                command.args([
-                    "--spec-type", "draft-mtp",
-                    "-md", mtp_path.to_string_lossy().as_ref(),
-                    "--spec-draft-n-max", "2",
-                ]);
-            } else if mtp_path.as_os_str().is_empty() {
-                eprintln!("[Daedalus] no MTP head configured (llama_cpp.mtp_path); starting without MTP");
-            } else {
-                eprintln!("[Daedalus] MTP head not found at {}; starting without MTP", mtp_path.display());
-            }
+            command.args(&server_args);
 
             let log_dir = std::env::var_os("USERPROFILE")
                 .map(std::path::PathBuf::from)
@@ -392,7 +374,7 @@ pub fn reconcile_backend_services(
         }
         if matches!(backend, crate::jarvis::types::JarvisBackend::LlamaCpp) {
             if let Err(error) = start_llama_cpp_server(llama_cpp).await {
-                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         } else {
             process_lifecycle::stop(process_lifecycle::ManagedProcess::LlamaCpp);
@@ -1463,7 +1445,7 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         }
         crate::jarvis::types::JarvisBackend::LlamaCpp => {
             if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
-                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         }
         crate::jarvis::types::JarvisBackend::OpenRouter => {

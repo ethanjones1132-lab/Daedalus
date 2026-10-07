@@ -46,6 +46,10 @@ export interface JarvisConfig {
     port: number;
     context_window: number;
     reasoning_budget: number;
+    n_cpu_moe?: number;
+    batch_size?: number;
+    spec_type?: string;
+    spec_draft_n_max?: number;
   };
   opencode_zen: {
     base_url: string;

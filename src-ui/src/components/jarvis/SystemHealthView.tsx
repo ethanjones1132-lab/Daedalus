@@ -208,7 +208,7 @@ export default function SystemHealthView() {
 
   const subsystems = health ? [
     { name: 'Ollama', up: health.ollama.running, detail: health.ollama.url },
-    ...(health.llama_cpp ? [{ name: 'Gemma llama.cpp', up: health.llama_cpp.running, detail: health.llama_cpp.url }] : []),
+    ...(health.llama_cpp ? [{ name: 'llama.cpp', up: health.llama_cpp.running, detail: health.llama_cpp.url }] : []),
     { name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url },
     { name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}` },
     { name: 'Claude proxy', up: health.claude_proxy.running, detail: `:${health.claude_proxy.port}` },

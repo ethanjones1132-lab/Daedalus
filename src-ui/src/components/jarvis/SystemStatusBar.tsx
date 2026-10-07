@@ -52,7 +52,7 @@ function serviceLabel(label: string, state: ServiceState, stale: boolean): strin
 }
 
 function serviceAnnouncement(key: TelemetryServiceKey, state: ServiceState, stale: boolean, requirement: ServiceRequirement, backend: string): string {
-  const name = key === 'ollama' && backend === 'llama_cpp' ? 'Gemma llama.cpp server' : SERVICE_NAMES[key];
+  const name = key === 'ollama' && backend === 'llama_cpp' ? 'llama.cpp server' : SERVICE_NAMES[key];
   return `${name} ${STATE_WORDS[state]}${REQUIREMENT_WORDS[requirement]}.${stale ? ' This is a previously observed state.' : ''}`;
 }
 

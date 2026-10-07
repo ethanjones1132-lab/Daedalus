@@ -98,11 +98,22 @@ export interface LlamaCppConfig {
    */
   server_path: string;
   model_path: string;
-  /** Optional MTP draft head; blank starts llama-server without MTP. */
+  /**
+   * Separate MTP draft head (`-md`). Blank uses the MTP layer embedded in the
+   * model GGUF, which is how the Qwen3.6 keep96 slice ships.
+   */
   mtp_path: string;
   port: number;
   context_window: number;
   reasoning_budget: number;
+  /** MoE expert layers kept on the CPU (`--n-cpu-moe`). */
+  n_cpu_moe: number;
+  /** Logical and physical batch size (`-b` / `-ub`). */
+  batch_size: number;
+  /** `--spec-type` value, e.g. `draft-mtp,ngram-mod`; blank disables speculation. */
+  spec_type: string;
+  /** `--spec-draft-n-max`. */
+  spec_draft_n_max: number;
 }
 
 /**
@@ -557,16 +568,24 @@ export function defaultConfig(): JarvisConfig {
       max_retries: 3,
       timeout_ms: 60000,
     },
+    // Qwen3.6-35B-A3B UD-IQ2_M keep96 on the 8 GB RTX 4060: every layer on
+    // the GPU, embedded MTP stacked with n-gram lookup, thinking off. Measured
+    // on llama.cpp master 836d571 at 274 tok/s and 101/117 on tier2b
+    // (2026-10-04 speed lab; settled over swap108/add108 on 2026-10-06).
     llama_cpp: {
       base_url: "http://127.0.0.1:8080/v1",
-      model: "gemma-4-26B-A4B-it-IQ2_M.gguf",
+      model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
       // Machine-specific paths ship blank; see LlamaCppConfig.
       server_path: "",
       model_path: "",
       mtp_path: "",
       port: 8080,
       context_window: 16384,
-      reasoning_budget: 1536,
+      reasoning_budget: 0,
+      n_cpu_moe: 0,
+      batch_size: 1024,
+      spec_type: "draft-mtp,ngram-mod",
+      spec_draft_n_max: 2,
     },
     // Secondary OpenAI-compatible providers. Keys are intentionally blank in
     // source (no secrets committed) — they are written to the live config.json
@@ -671,13 +690,15 @@ export function defaultConfig(): JarvisConfig {
         in_turn_driver: {
           enabled: true,
         },
-        model: "gemma-4-26B-A4B-it-IQ2_M.gguf",
+        model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
         fallback_model: "",
         base_url: "http://127.0.0.1:8080/v1",
         output_mode: "tool_call",
-        temperature: 1.0,
+        // keep96's best measured sampling (2026-10-04 sweep): the model card's
+        // 0.7 / 0.8 / top-k 20 cost 6-8 tier2b points.
+        temperature: 0.2,
         top_p: 0.95,
-        top_k: 64,
+        top_k: 40,
         // 700 structurally truncated multi-stage replan decisions (2026-07-16
         // incident memory) — routing itself stays capped by per-call
         // numPredict, so the wider ceiling only helps the bigger decisions.
@@ -741,7 +762,7 @@ export function defaultConfig(): JarvisConfig {
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
     },
-    system_prompt: `You are Jarvis, a local AI coding assistant running on Gemma 4 26B-A4B via llama.cpp.
+    system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen3.6-35B-A3B (keep96) via llama.cpp.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 
 ## Tool Protocol (No native tool support. Always emit this format for file/shell/web operations):

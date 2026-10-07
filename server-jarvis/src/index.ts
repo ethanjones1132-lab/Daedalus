@@ -2,8 +2,8 @@
 // ── Jarvis Bun Server v2.0 ──
 // ═══════════════════════════════════════════════════════════════
 // WSL-side HTTP server on port 19877.
-// Uses OpenAI-compatible APIs for llama.cpp Gemma, Ollama, and OpenRouter.
-// Gemma via llama.cpp is the default local chat and persistent-conductor backend.
+// Uses OpenAI-compatible APIs for llama.cpp, Ollama, and OpenRouter.
+// Qwen3.6 keep96 via llama.cpp is the default local chat and persistent-conductor backend.
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
@@ -980,7 +980,7 @@ async function discoverModels(configOverride?: Partial<JarvisConfig>): Promise<a
         name: model.id ?? cfg.llama_cpp.model,
         context_length: cfg.llama_cpp.context_window,
         pricing: "free",
-        description: "Local Gemma model served by llama.cpp",
+        description: "Local model served by llama.cpp",
         source: "llama_cpp",
         already_installed: true,
       }));
@@ -2972,7 +2972,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (isLocalInference && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(isLlamaCpp
-                ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+                ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local llama.cpp server is running.`
                 : `Cannot connect to Ollama. Tried: ${localTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
             }
             throw fetchErr;
@@ -5350,7 +5350,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
             throw new Error(isLlamaCpp
-              ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+              ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local llama.cpp server is running.`
               : `Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
           }
           throw fetchErr;
@@ -6243,7 +6243,7 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     configWarnings.push(`Model "${cfg.ollama.model}" not found in Ollama. Run: ollama pull ${cfg.ollama.model}`);
   }
   if (cfg.active_backend === "llama_cpp" && !llamaCppRunning) {
-    configWarnings.push(`llama.cpp is not responding at ${cfg.llama_cpp.base_url}. Start the local Gemma server.`);
+    configWarnings.push(`llama.cpp is not responding at ${cfg.llama_cpp.base_url}. Start the local llama.cpp server.`);
   } else if (cfg.active_backend === "llama_cpp" && !llamaCppModelAvailable) {
     configWarnings.push(`Model "${cfg.llama_cpp.model}" is not served by llama.cpp.`);
   }

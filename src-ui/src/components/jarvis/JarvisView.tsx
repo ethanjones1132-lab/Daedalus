@@ -749,7 +749,7 @@ export default function JarvisView({ initialSubView = 'chat', initialControlTab,
                 activeSession={activeSession}
                 setActiveSession={setActiveSession}
                 config={config}
-                backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : config?.active_backend === 'llama_cpp' ? 'Gemma 4 · llama.cpp' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
+                backendLabel={config?.active_backend === 'openrouter' ? 'OpenRouter' : config?.active_backend === 'llama_cpp' ? 'llama.cpp' : (config?.active_backend === 'claude_cli' ? 'Claude CLI' : 'Ollama')}
                 modelLabel={config ? (config.active_backend === 'ollama' ? config.ollama.model : config.active_backend === 'llama_cpp' ? config.llama_cpp.model : (config.active_backend === 'claude_cli' ? (config.claude_cli.model ?? '') : config.openrouter.model)) : ''}
                 onSessionCreated={loadSessions}
                 onRunRecordSettled={setRunRecord}
@@ -6305,8 +6305,8 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
                   : 'bg-obsidian/40 border-iron/30 text-bone-dim hover:border-iron/50'
               )}
             >
-              <div className="font-semibold">Gemma 4 · llama.cpp</div>
-              <div className="text-[10px] font-mono text-bone-faint mt-0.5">Local · 26B-A4B</div>
+              <div className="font-semibold">llama.cpp</div>
+              <div className="text-[10px] font-mono text-bone-faint mt-0.5">Local · Qwen3.6 keep96</div>
             </button>
             <button
               onClick={() => updateField('active_backend', 'openrouter')}
@@ -6433,7 +6433,7 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
                 type="text"
                 value={localConfig.llama_cpp?.model ?? ''}
                 onChange={(e) => updateField('llama_cpp', { ...localConfig.llama_cpp, model: e.target.value })}
-                placeholder="Gemma llama.cpp model alias"
+                placeholder="llama.cpp model alias"
                 className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
               />
               {([
@@ -6451,7 +6451,7 @@ function ConfigPanel({ config, setConfig, loading, loadError, onRetry }: {
                   className="w-full px-3 py-2 text-xs font-mono bg-obsidian/60 border border-iron/40 rounded-lg text-bone placeholder:text-bone-faint focus:outline-none focus:border-royal/50 transition-colors"
                 />
               ))}
-              <div className="text-[10px] font-mono text-bone-faint">Server: {localConfig.llama_cpp?.base_url ?? 'http://127.0.0.1:8080/v1'} · context {localConfig.llama_cpp?.context_window ?? 16384} · reasoning budget {localConfig.llama_cpp?.reasoning_budget ?? 1536}</div>
+              <div className="text-[10px] font-mono text-bone-faint">Server: {localConfig.llama_cpp?.base_url ?? 'http://127.0.0.1:8080/v1'} · context {localConfig.llama_cpp?.context_window ?? 16384} · reasoning budget {localConfig.llama_cpp?.reasoning_budget ?? 0} · spec {localConfig.llama_cpp?.spec_type || 'off'}</div>
             </div>
           ) : (
             <input

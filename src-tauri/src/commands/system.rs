@@ -574,12 +574,12 @@ pub async fn get_doctor_report(
         name: "llama_cpp".into(),
         status: if !llama_cpp_required || llama_cpp_running { "ok".into() } else { "warn".into() },
         detail: if !llama_cpp_required {
-            "Gemma llama.cpp is not the active inference backend".into()
+            "llama.cpp is not the active inference backend".into()
         } else if llama_cpp_running {
-            format!("Gemma model {} is listening at {}", config.llama_cpp.model, config.llama_cpp.base_url)
+            format!("llama.cpp model {} is listening at {}", config.llama_cpp.model, config.llama_cpp.base_url)
         } else {
             let paths = config.llama_cpp.clone().with_env_fallbacks();
-            let mut detail = format!("Gemma llama.cpp is the active backend but is not listening on port {}", config.llama_cpp.port);
+            let mut detail = format!("llama.cpp is the active backend but is not listening on port {}", config.llama_cpp.port);
             if paths.server_path.trim().is_empty() || paths.model_path.trim().is_empty() {
                 detail.push_str("; llama_cpp.server_path / model_path are not configured (Settings or JARVIS_LLAMA_SERVER_PATH / JARVIS_LLAMA_MODEL_PATH)");
             }
