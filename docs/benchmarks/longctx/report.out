@@ -1,0 +1,8 @@
+window 65536, filler 56000: solved {'short': 100, 'late': 94, 'early': 53} of {'short': 117, 'late': 117, 'early': 117}; prompt s {'short': 0.2, 'late': 1.2, 'early': 33.2}; cached tokens {'short': 0.0, 'late': 52367.2, 'early': 0.0}
+  late vs short: samples 5 vs 11 (McNemar p 0.2101), tasks 3 vs 8 (sign p 0.2266)
+  early vs short: samples 1 vs 48 (McNemar p 0.0), tasks 0 vs 24 (sign p 0.0)
+  complete True; bar (b) PASS
+window 131072, filler 116000: solved {'short': 100, 'late': 92} of {'short': 117, 'late': 117}; prompt s {'short': 0.2, 'late': 2.8}; cached tokens {'short': 0.0, 'late': 108556.3}
+  late vs short: samples 6 vs 14 (McNemar p 0.1153), tasks 5 vs 8 (sign p 0.5811)
+  complete True; bar (b) PASS
+Short against the stored 16k candidate 0: {'65536': {'n': 117, 'same_text': 105, 'same_grade': 115, 'stored_solved': 100, 'short_solved': 100}, '131072': {'n': 117, 'same_text': 105, 'same_grade': 115, 'stored_solved': 100, 'short_solved': 100}}

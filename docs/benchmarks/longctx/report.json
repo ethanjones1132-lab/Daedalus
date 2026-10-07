@@ -1,0 +1,140 @@
+{
+ "65536/56000": {
+  "window": 65536,
+  "target": 56000,
+  "n": {
+   "short": 117,
+   "late": 117,
+   "early": 117
+  },
+  "solved": {
+   "short": 100,
+   "late": 94,
+   "early": 53
+  },
+  "by_category": {
+   "short": {
+    "A": 36,
+    "B": 6,
+    "C": 21,
+    "D": 20,
+    "E": 17
+   },
+   "late": {
+    "A": 32,
+    "B": 9,
+    "C": 19,
+    "D": 20,
+    "E": 14
+   },
+   "early": {
+    "A": 22,
+    "C": 15,
+    "D": 13,
+    "E": 3
+   }
+  },
+  "prompt_s_mean": {
+   "short": 0.2,
+   "late": 1.2,
+   "early": 33.2
+  },
+  "prompt_n_mean": {
+   "short": 125.1,
+   "late": 1503.1,
+   "early": 53912.4
+  },
+  "cache_n_mean": {
+   "short": 0.0,
+   "late": 52367.2,
+   "early": 0.0
+  },
+  "late_vs_short": {
+   "n": 117,
+   "short_only": 11,
+   "cond_only": 5,
+   "mcnemar_p": 0.2101,
+   "short_tasks": 8,
+   "cond_tasks": 3,
+   "sign_p": 0.2266
+  },
+  "early_vs_short": {
+   "n": 117,
+   "short_only": 48,
+   "cond_only": 1,
+   "mcnemar_p": 0.0,
+   "short_tasks": 24,
+   "cond_tasks": 0,
+   "sign_p": 0.0
+  },
+  "complete": true,
+  "bar_b_pass": true
+ },
+ "131072/116000": {
+  "window": 131072,
+  "target": 116000,
+  "n": {
+   "short": 117,
+   "late": 117
+  },
+  "solved": {
+   "short": 100,
+   "late": 92
+  },
+  "by_category": {
+   "short": {
+    "A": 36,
+    "B": 6,
+    "C": 21,
+    "D": 20,
+    "E": 17
+   },
+   "late": {
+    "A": 33,
+    "B": 9,
+    "C": 18,
+    "D": 18,
+    "E": 14
+   }
+  },
+  "prompt_s_mean": {
+   "short": 0.2,
+   "late": 2.8
+  },
+  "prompt_n_mean": {
+   "short": 125.1,
+   "late": 2981.8
+  },
+  "cache_n_mean": {
+   "short": 0.0,
+   "late": 108556.3
+  },
+  "late_vs_short": {
+   "n": 117,
+   "short_only": 14,
+   "cond_only": 6,
+   "mcnemar_p": 0.1153,
+   "short_tasks": 8,
+   "cond_tasks": 5,
+   "sign_p": 0.5811
+  },
+  "complete": true,
+  "bar_b_pass": true
+ },
+ "short_vs_stored": {
+  "65536": {
+   "n": 117,
+   "same_text": 105,
+   "same_grade": 115,
+   "stored_solved": 100,
+   "short_solved": 100
+  },
+  "131072": {
+   "n": 117,
+   "same_text": 105,
+   "same_grade": 115,
+   "stored_solved": 100,
+   "short_solved": 100
+  }
+ }
+}

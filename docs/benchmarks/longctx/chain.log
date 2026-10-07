@@ -1,0 +1,17 @@
+13:16:36 start; idle VRAM 739 MiB
+service stopped
+13:40:25 grid exit 0; {"ctk": {"16384": "q8_0", "32768": "q8_0", "65536": "q8_0"}, "largest_pass": 65536, "idle_vram_mib": 740}
+13:40:34 grid verdict rescored with the speed rule (owner-approved deviation); spill-rule verdict kept as grid.verdict.v1-spill-rule.json
+13:47:01 session 65536 short,late try 1 exit 0 (guard 2048 MB)
+13:47:01 report exit 0: 1 group(s) pass bar (b)
+14:00:25 recipe 65536 exit 0
+14:00:25 bar (a) 65536: pass
+14:10:32 session 131072 short,late try 1 exit 0 (guard 2048 MB)
+14:10:32 report exit 0: 2 group(s) pass bar (b)
+14:23:45 recipe 131072 exit 0
+14:23:46 bar (a) 131072: pass
+15:31:08 session 65536 early try 1 exit 0 (guard 2048 MB)
+15:31:08 report exit 0: 2 group(s) pass bar (b)
+15:31:09 chosen window: 131072
+service started
+15:31:10 Versutus gate start requested; chain done
