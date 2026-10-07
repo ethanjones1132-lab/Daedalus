@@ -146,6 +146,42 @@ class StatsTest(unittest.TestCase):
         self.assertEqual(pb.task_sign([]), (0, 0, 1.0))
 
 
+class TargetedTest(unittest.TestCase):
+    RULE = dict(form="targeted", c_hidden=0.1, t_hi=pb.NEVER, t_lo=-1.0)
+
+    def test_choose(self):
+        self.assertEqual(pb.choose(dict(card(), hidden=0.2), self.RULE), "P")
+        self.assertEqual(pb.choose(dict(card(), hidden=0.05), self.RULE), "R")
+        self.assertEqual(pb.choose(None, self.RULE), "R")
+
+    def test_decile_grid(self):
+        g = pb.decile_grid([i / 100 for i in range(60)])
+        self.assertEqual(len(g), 11)
+        self.assertEqual((g[0], g[-1]), (0.0, pb.NEVER))
+
+    def test_fit_targeted_probes_only_where_it_pays(self):
+        tests = {"r8s0": [True], "r8s1": [True], "prs0": [True]}
+        b = rec([cand("r8", i, False, tests) for i in range(8)], [cand("pr", i, True, tests) for i in range(3)],
+                task="b")
+        a = rec([cand("r8", i, True, tests) for i in range(8)], [cand("pr", i, False, tests) for i in range(3)],
+                task="a")
+        cards = {"b": dict(card(), hidden=0.3), "a": dict(card(), hidden=0.05)}
+        rule, solved, _ = pb.fit_targeted([a, b], cards, budget=1e9, use_p=False)
+        self.assertEqual((rule["form"], rule["c_hidden"], solved), ("targeted", 0.3, 2))
+
+
+class NoteTest(unittest.TestCase):
+    def test_note_for(self):
+        os.environ.setdefault("TIER2B_DIR", str(HERE.parents[1] / "scripts" / "benchmark-tier2b"))
+        import playbook_tier2b as pt
+        tgt = dict(form="targeted", c_hidden=0.1, t_hi=pb.NEVER, t_lo=-1.0)
+        c = dict(card(kind="library"), hidden=0.3)
+        self.assertEqual(pt.note_for(c, "P", tgt), pt.NOTES["unseen"] + "\n\n")
+        self.assertEqual(pt.note_for(c, "R", tgt), "")
+        self.assertEqual(pt.note_for(c, "R", RULE), pt.NOTES["library"] + "\n\n")
+        self.assertEqual(pt.note_for(None, "R", tgt), "")
+
+
 class MatchesBestofnTest(unittest.TestCase):
     def test_pick_equals_bestofn_selftest_on_a_stored_run(self):
         os.environ.setdefault("TIER2B_DIR", str(HERE.parents[1] / "scripts" / "benchmark-tier2b"))

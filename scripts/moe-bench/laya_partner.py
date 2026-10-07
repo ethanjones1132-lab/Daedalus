@@ -116,7 +116,7 @@ def worker(a):
                 rep = {}
             elif m["op"] == "classify":
                 raw = lp.classify(m["state"], calib["classify_wording"])
-                rep = {"raw": raw, "card": calibrate_card(raw, calib["platt"])}
+                rep = {"raw": raw, "card": calibrate_card(raw, calib["platt"], calib.get("hidden_signal", "noul"))}
             elif m["op"] == "verify":
                 p, ckpt = lp.verify(m["requirement"], m["entry"], m["code"], calib["verify_form"])
                 rep = {"p_raw": p, "p": platt_apply(p, calib["platt"]["verify"]), "ckpt": ckpt}

@@ -7,7 +7,7 @@ labels from laya_partner.py into one record per task-trial:
           "cands": {"r8": [cand x 8], "pr": [cand x 3]}}
   cand = {"run", "cand", "secs", "compiles", "imports", "graded_ok", "self": {suite: {test: passed}},
           "p": calibrated P(correct) or None, "verify_secs"}
-  card = {"kind", "unseen", "p_little", "p_alot", "effort_top"}   (laya_calibrate.calibrate_card)
+  card = {"kind", "unseen", "p_little", "p_alot", "effort_top", "hidden"}   (laya_calibrate.calibrate_card)
 Cost is model seconds: Qwen generation, probe execution and Laya calls.
 
 usage: playbook.py fit --trials NESTED.jsonl --labels LABELS.jsonl --calib CALIB.json --out RULE.json
@@ -34,9 +34,13 @@ T_LO = (-1.0, 0.1, 0.2, 0.3, 0.4)
 
 
 def choose(card, rule):
-    """Spec §3.2. The form is fixed; only the cutoffs in `rule` are fitted. No card (Laya failed) -> recipe."""
+    """Spec §3.2. The form is fixed; only the cutoffs in `rule` are fitted. No card (Laya failed) -> recipe.
+    form "targeted" (spec 2026-10-06-laya-v2-design.md §2): P when Laya's hidden-code signal clears c_hidden,
+    else R."""
     if card is None:
         return "R"
+    if rule.get("form") == "targeted":
+        return "P" if card["hidden"] >= rule["c_hidden"] else "R"
     if card["unseen"] >= rule["c_u"]:
         return "P" if card["effort_top"] == 0 else "PR"
     if card["p_little"] >= rule["c_easy"]:
@@ -150,13 +154,34 @@ def fit(recs, cards, budget, use_p):
     return best
 
 
+def decile_grid(values):
+    """Cutoff candidates for the targeted form: the 0th..90th percentile values (one per task) plus NEVER."""
+    v = sorted(values)
+    return tuple(sorted({v[int(len(v) * i / 10)] for i in range(10)})) + (NEVER,)
+
+
+def fit_targeted(recs, cards, budget, use_p):
+    """Spec v2 §2: (rule, solved, mean secs) over c_hidden in the decile grid of the cards' hidden signal (and,
+    with use_p, the verify thresholds); same objective as fit(). None when no rule fits the budget."""
+    memo, best = {}, None
+    thresholds = list(itertools.product(T_HI, T_LO)) if use_p else [(NEVER, -1.0)]
+    for c in decile_grid([cd["hidden"] for cd in cards.values()]):
+        for t_hi, t_lo in thresholds:
+            rule = dict(form="targeted", c_hidden=c, t_hi=t_hi, t_lo=t_lo)
+            solved, secs = system(recs, cards, rule, use_p, memo)
+            if secs <= budget and (best is None or (solved, -secs) > (best[1], -best[2])):
+                best = (rule, solved, secs)
+    return best
+
+
 def records(trial_rows, label_rows, calib):
     """Join nested-run rows (type "trial") and Laya label rows into (records, calibrated cards)."""
     w, f, pl = calib["classify_wording"], calib["verify_form"], calib["platt"]
+    hs = calib.get("hidden_signal", "noul")
     cards, csecs, vp = {}, {}, {}
     for r in label_rows:
         if r["type"] == "card" and r["wording"] == w:
-            cards[r["task"]], csecs[r["task"]] = calibrate_card(r["card"], pl), r["secs"]
+            cards[r["task"]], csecs[r["task"]] = calibrate_card(r["card"], pl, hs), r["secs"]
         elif r["type"] == "verify" and r["form"] == f:
             vp[(r["task"], r["trial"], r["run"], r["cand"])] = (platt_apply(r["p"], pl["verify"]), r["secs"])
     latest = {(t["task"], t["trial"]): t for t in trial_rows if t.get("type") == "trial"}
@@ -182,6 +207,18 @@ def mcnemar_p(b, c):
     return min(1.0, 2 * sum(math.comb(n, i) for i in range(min(b, c) + 1)) / 2 ** n)
 
 
+def task_sign(pairs):
+    """pairs: [(task, a_ok, b_ok)] per trial -> (tasks a solved more trials of, tasks b did, exact sign-test p).
+    A task's trials are correlated, so the task is the unit here (owner's bar, 2026-10-06)."""
+    per = collections.defaultdict(lambda: [0, 0])
+    for task, a_ok, b_ok in pairs:
+        per[task][0] += bool(a_ok)
+        per[task][1] += bool(b_ok)
+    wins = sum(a > b for a, b in per.values())
+    losses = sum(a < b for a, b in per.values())
+    return wins, losses, mcnemar_p(wins, losses)
+
+
 def by_category(rows_ok):
     """rows_ok: [(category, ok)] -> {category: solved}."""
     res = collections.Counter()
@@ -194,9 +231,12 @@ def fit_cmd(a):
     calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
     recs, cards = records(read_jsonl(a.trials), read_jsonl(a.labels), calib)
     budget = fixed(recs, "R")[1]
-    out = {"budget_secs": round(budget, 3), "records": len(recs)}
+    form = getattr(a, "form", None) or "targeted"
+    out = {"budget_secs": round(budget, 3), "records": len(recs), "form": form}
+    if form == "targeted":
+        out["grid"] = list(decile_grid([cd["hidden"] for cd in cards.values()]))
     for name, use_p in (("verify", True), ("noverify", False)):
-        best = fit(recs, cards, budget, use_p)
+        best = fit_targeted(recs, cards, budget, use_p) if form == "targeted" else fit(recs, cards, budget, use_p)
         if best is None:
             sys.exit(f"no {name} rule fits the recipe's {budget:.2f} s budget")
         rule, solved, secs = best
@@ -240,9 +280,12 @@ def report_cmd(a):
         b = sum(1 for k, r in rows4.items() if k in base and r["graded_ok"] and not base[k])
         c = sum(1 for k, r in rows4.items() if k in base and not r["graded_ok"] and base[k])
         p = mcnemar_p(b, c)
-        res["bar"] = {"c4_only": b, "recipe_only": c, "mcnemar_p": p, "c4_secs": res["c4"]["mean_secs"],
-                      "recipe_secs": res["c2_recipe"]["mean_secs"],
-                      "met": res["c4"]["solved"] > res["c2_recipe"]["solved"] and p < 0.10
+        # The owner's bar (2026-10-06): the per-sample McNemar AND an exact sign test over tasks, both p < 0.10.
+        tw, tl, tp = task_sign((k[0], r["graded_ok"], base[k]) for k, r in rows4.items() if k in base)
+        res["bar"] = {"c4_only": b, "recipe_only": c, "mcnemar_p": p,
+                      "tasks_c4_better": tw, "tasks_recipe_better": tl, "task_sign_p": tp,
+                      "c4_secs": res["c4"]["mean_secs"], "recipe_secs": res["c2_recipe"]["mean_secs"],
+                      "met": res["c4"]["solved"] > res["c2_recipe"]["solved"] and p < 0.10 and tp < 0.10
                       and res["c4"]["mean_secs"] <= res["c2_recipe"]["mean_secs"]}
     if a.out:
         pathlib.Path(a.out).write_text(json.dumps(res, indent=1), encoding="utf-8")
@@ -259,6 +302,7 @@ def main():
         s.add_argument("--calib", required=True)
         if name == "fit":
             s.add_argument("--out", required=True)
+            s.add_argument("--form", choices=["targeted", "v1"], default="targeted")
         else:
             s.add_argument("--rule", required=True)
             s.add_argument("--live", action="append", default=[])

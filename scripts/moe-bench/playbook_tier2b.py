@@ -54,6 +54,16 @@ NOTES = {
 }
 
 
+def note_for(card, play, rule):
+    """Spec v2 §5: under the targeted form only probed tasks get the unseen-code note; v1 rules keep per-kind
+    notes. No card (Laya failed) -> no note."""
+    if card is None:
+        return ""
+    if rule.get("form") == "targeted":
+        return NOTES["unseen"] + "\n\n" if play == "P" else ""
+    return NOTES[card["kind"]] + "\n\n"
+
+
 def probe_test_prompt(task, script, output):
     return (test_prompt(task) + f"\n\nThis script was run in the package directory:\n```python\n{script}\n```\n"
             f"Its output:\n```\n{output}\n```\nUse what it shows about how the code behaves.")
@@ -254,8 +264,8 @@ def live_trial(task, trial, rule, lc, note_on, use_p, temp_alt):
     calls.append(["laya_classify", secs, 0])
     card = reply["card"] if reply and reply.get("ok") else None
     play = playbook.choose(card, rule)
-    if note_on and card:
-        note = NOTES[card["kind"]] + "\n\n"
+    if note_on:
+        note = note_for(card, play, rule)
     early = escalated = False
     suites, names = [], ()
     if play in ("R", "R8"):
@@ -314,8 +324,8 @@ def live(a):
         lc = LayaClient(a.calib)
         free = available_mb()
         print(f"Laya worker {'down' if lc.dead else 'up'}; {free} MB available with Qwen and Laya loaded", flush=True)
-        if free < MIN_FREE_MB:
-            sys.exit(f"only {free} MB available; the spec needs {MIN_FREE_MB}")
+        if free < a.min_free_mb:
+            sys.exit(f"only {free} MB available; the guard is {a.min_free_mb} (spec default {MIN_FREE_MB})")
         with out.open("a", encoding="utf-8") as f:
             for task in TASKS:
                 for trial in range(a.trials):
@@ -364,6 +374,8 @@ def main():
     lv.add_argument("--trials", type=int, default=3)
     lv.add_argument("--temp-alt", type=float, default=0.7)
     lv.add_argument("--model", default="qwen36keep96", choices=sorted(bon.CONFIGS))
+    lv.add_argument("--min-free-mb", type=int, default=MIN_FREE_MB,
+                    help="RAM guard with Qwen and Laya loaded (spec 2048; an owner decision may set it per run)")
     s = sub.add_parser("summarize")
     s.add_argument("path")
     a = ap.parse_args()
