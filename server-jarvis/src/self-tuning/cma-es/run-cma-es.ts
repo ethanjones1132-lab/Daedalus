@@ -15,8 +15,8 @@ import {
   type TransitionResult,
 } from "../policy-staging";
 import {
-  HELD_OUT_TASKS,
-  TRAINING_TASKS,
+  loadHeldOutTasks,
+  loadTrainingTasks,
   type FixtureTask,
 } from "../rollout/fixture-tasks";
 import {
@@ -32,7 +32,7 @@ import { SepCmaEs } from "./sep-cma-es";
  * with the winner handed to policy-staging for live vetting.
  *
  * Train/held-out separation is structural, not a convention. `evaluateFitness`
- * takes no task list — it closes over TRAINING_TASKS, so there is no parameter
+ * takes no task list — it closes over loadTrainingTasks(), so there is no parameter
  * through which a held-out fixture could reach the optimizer loop.
  * `scoreHeldOut` / `compareHeldOut` are separate functions called only after
  * the loop terminates.
@@ -51,8 +51,8 @@ export interface CampaignOptions {
   onGeneration?: (info: GenerationReport) => void;
   /**
    * Optional training subset for early budget-controlled runs (`--tasks N`).
-   * Defaults to the full TRAINING_TASKS export. Held-out scoring always uses
-   * HELD_OUT_TASKS regardless of this override.
+   * Defaults to the full loadTrainingTasks() export. Held-out scoring always uses
+   * loadHeldOutTasks() regardless of this override.
    */
   trainingTasks?: readonly FixtureTask[];
   /**
@@ -240,7 +240,7 @@ export async function scoreHeldOut(
 ): Promise<ScoreHeldOutResult> {
   const seedList = seeds.length > 0 ? seeds : [0];
   const candidates = seedList.map((seed) => ({ theta, seed }));
-  const batch = await runRolloutBatch(candidates, HELD_OUT_TASKS, callModel, {
+  const batch = await runRolloutBatch(candidates, loadHeldOutTasks(), callModel, {
     concurrency,
   });
   const matrix = batch.map((outcomes) => outcomes.map((o) => o.reward));
@@ -267,7 +267,7 @@ export async function compareHeldOut(
     candidates.push({ theta: winner, seed });
     candidates.push({ theta: baseline, seed });
   }
-  const batch = await runRolloutBatch(candidates, HELD_OUT_TASKS, callModel, {
+  const batch = await runRolloutBatch(candidates, loadHeldOutTasks(), callModel, {
     concurrency,
   });
 
@@ -302,11 +302,11 @@ export async function compareHeldOut(
 
 /** Run the optimizer loop and score the result against held-out fixtures. */
 export async function runCmaEsCampaign(opts: CampaignOptions): Promise<CampaignResult> {
-  const trainingTasks = opts.trainingTasks ?? TRAINING_TASKS;
+  const trainingTasks = opts.trainingTasks ?? loadTrainingTasks();
   if (trainingTasks.length === 0) {
     throw new Error("no training fixtures — refusing to run a campaign with nothing to score");
   }
-  if (HELD_OUT_TASKS.length === 0) {
+  if (loadHeldOutTasks().length === 0) {
     throw new Error(
       "no held-out fixtures — a campaign with no held-out set cannot distinguish " +
         "a real improvement from overfitting, so its result would be meaningless",
@@ -428,7 +428,7 @@ function campaignWinnerProposal(result: CampaignResult): {
     patch: { domain: "budget", theta: diff },
     rationale:
       `Phase D sep-CMA-ES over ${result.generations} generation(s): ${evidence} ` +
-      `across ${HELD_OUT_TASKS.length} held-out fixture(s); ${Object.keys(diff).length} ` +
+      `across ${loadHeldOutTasks().length} held-out fixture(s); ${Object.keys(diff).length} ` +
       `of ${THETA_KEYS.length} dimensions changed`,
   };
 }
@@ -515,10 +515,10 @@ export function campaignFixtureSummary(): {
 } {
   const names = (tasks: readonly FixtureTask[]) => tasks.map((t) => t.name);
   return {
-    training: TRAINING_TASKS.length,
-    heldOut: HELD_OUT_TASKS.length,
-    trainingNames: names(TRAINING_TASKS),
-    heldOutNames: names(HELD_OUT_TASKS),
+    training: loadTrainingTasks().length,
+    heldOut: loadHeldOutTasks().length,
+    trainingNames: names(loadTrainingTasks()),
+    heldOutNames: names(loadHeldOutTasks()),
   };
 }
 
@@ -532,7 +532,7 @@ export interface TrainingTaskSelection {
 /**
  * Choose the training fixtures a campaign optimizes against.
  *
- * `limit` takes a *prefix* of TRAINING_TASKS, and the leading fixtures are the
+ * `limit` takes a *prefix* of loadTrainingTasks(), and the leading fixtures are the
  * easy ones. Measured 2026-08-09: two of three campaigned models scored a
  * population mean of exactly 1.0000 on that prefix — a 15-way fitness tie,
  * which leaves sep-CMA-ES ranking candidates by tie-break order rather than by
@@ -548,17 +548,17 @@ export function selectTrainingTasks(
 ): readonly FixtureTask[] {
   const { names, limit } = selection;
   if (names === undefined) {
-    return limit !== undefined ? TRAINING_TASKS.slice(0, limit) : TRAINING_TASKS;
+    return limit !== undefined ? loadTrainingTasks().slice(0, limit) : loadTrainingTasks();
   }
   if (names.length === 0) {
     throw new Error(
       "Training fixture list is empty — omit the flag to use all " +
-        `${TRAINING_TASKS.length} training fixtures.`,
+        `${loadTrainingTasks().length} training fixtures.`,
     );
   }
 
-  const byName = new Map(TRAINING_TASKS.map((t) => [t.name, t]));
-  const heldOut = new Set(HELD_OUT_TASKS.map((t) => t.name));
+  const byName = new Map(loadTrainingTasks().map((t) => [t.name, t]));
+  const heldOut = new Set(loadHeldOutTasks().map((t) => t.name));
 
   // Fail loudly on a bad name. A typo that silently selected a different (or
   // empty) set would not surface until a multi-hour campaign had already run.
@@ -572,7 +572,7 @@ export function selectTrainingTasks(
     }
     throw new Error(
       `Unknown training fixture "${name}". Use --preflight to list the ` +
-        `${TRAINING_TASKS.length} available names.`,
+        `${loadTrainingTasks().length} available names.`,
     );
   });
 }

@@ -17,7 +17,7 @@ import {
   recordEligibleOutcome,
   resetPolicyStagingForTests,
 } from "../policy-staging";
-import { HELD_OUT_TASKS, TRAINING_TASKS } from "../rollout/fixture-tasks";
+import { loadHeldOutTasks, loadTrainingTasks } from "../rollout/fixture-tasks";
 import {
   campaignFixtureSummary,
   compareHeldOut,
@@ -45,8 +45,8 @@ const inertModel: CallModelFn = async () => ({ content: "no tools." });
 describe("campaignFixtureSummary", () => {
   test("reports disjoint, non-empty splits", () => {
     const s = campaignFixtureSummary();
-    expect(s.training).toBe(TRAINING_TASKS.length);
-    expect(s.heldOut).toBe(HELD_OUT_TASKS.length);
+    expect(s.training).toBe(loadTrainingTasks().length);
+    expect(s.heldOut).toBe(loadHeldOutTasks().length);
     expect(s.training).toBeGreaterThan(0);
     expect(s.heldOut).toBeGreaterThan(0);
     for (const name of s.heldOutNames) {
@@ -176,11 +176,11 @@ describe("compareHeldOut", () => {
       2,
     );
 
-    expect(comparison.pairCount).toBe(HELD_OUT_TASKS.length * seeds.length);
+    expect(comparison.pairCount).toBe(loadHeldOutTasks().length * seeds.length);
     // Per-task derivation: candidate.seed * 1000 + taskIndex
     const expectedTaskSeeds = new Set<number>();
     for (const s of seeds) {
-      for (let t = 0; t < HELD_OUT_TASKS.length; t++) {
+      for (let t = 0; t < loadHeldOutTasks().length; t++) {
         expectedTaskSeeds.add(s * 1000 + t);
       }
     }
@@ -206,7 +206,7 @@ describe("CRN training fitness", () => {
       generations: 1,
       popSize: 4,
       concurrency: 2,
-      trainingTasks: TRAINING_TASKS.slice(0, 1),
+      trainingTasks: loadTrainingTasks().slice(0, 1),
       campaignSeedBase: 7,
       heldOutSeeds: [0], // minimize held-out work
       rng: seededRng(99),
@@ -214,8 +214,8 @@ describe("CRN training fitness", () => {
 
     // generation 0 → generationSeed 7 → taskIndex 0 → 7000
     expect(seenSeeds.has(7000)).toBe(true);
-    // Held-out with seed 0 → task seeds 0..HELD_OUT_TASKS.length-1
-    for (let t = 0; t < HELD_OUT_TASKS.length; t++) {
+    // Held-out with seed 0 → task seeds 0..loadHeldOutTasks().length-1
+    for (let t = 0; t < loadHeldOutTasks().length; t++) {
       expect(seenSeeds.has(t)).toBe(true);
     }
   }, 120_000);
@@ -429,24 +429,24 @@ describe("persistCampaignWinner", () => {
 
 describe("selectTrainingTasks", () => {
   test("no selector returns the full training set", () => {
-    expect(selectTrainingTasks()).toEqual(TRAINING_TASKS);
+    expect(selectTrainingTasks()).toEqual(loadTrainingTasks());
   });
 
   test("limit keeps the existing prefix-slice behaviour", () => {
     const picked = selectTrainingTasks({ limit: 3 });
-    expect(picked.map((t) => t.name)).toEqual(TRAINING_TASKS.slice(0, 3).map((t) => t.name));
+    expect(picked.map((t) => t.name)).toEqual(loadTrainingTasks().slice(0, 3).map((t) => t.name));
   });
 
   test("names select exactly those fixtures, in the order given", () => {
-    const a = TRAINING_TASKS[4]!.name;
-    const b = TRAINING_TASKS[1]!.name;
+    const a = loadTrainingTasks()[4]!.name;
+    const b = loadTrainingTasks()[1]!.name;
     const picked = selectTrainingTasks({ names: [a, b] });
     expect(picked.map((t) => t.name)).toEqual([a, b]);
   });
 
   test("names win over limit — an explicit list is never silently truncated", () => {
-    const a = TRAINING_TASKS[7]!.name;
-    const b = TRAINING_TASKS[9]!.name;
+    const a = loadTrainingTasks()[7]!.name;
+    const b = loadTrainingTasks()[9]!.name;
     const picked = selectTrainingTasks({ names: [a, b], limit: 1 });
     expect(picked.map((t) => t.name)).toEqual([a, b]);
   });
@@ -460,7 +460,7 @@ describe("selectTrainingTasks", () => {
   });
 
   test("a held-out fixture name is rejected — it would leak the eval set into training", () => {
-    expect(() => selectTrainingTasks({ names: [HELD_OUT_TASKS[0]!.name] })).toThrow(
+    expect(() => selectTrainingTasks({ names: [loadHeldOutTasks()[0]!.name] })).toThrow(
       /held-out/i,
     );
   });

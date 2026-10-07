@@ -39,7 +39,7 @@ import {
   type RolloutSamplerSpec,
   type RolloutSkillOverride,
 } from "./rollout-runner";
-import { HELD_OUT_TASKS, TRAINING_TASKS, type FixtureTask } from "./fixture-tasks";
+import { loadHeldOutTasks, loadTrainingTasks, type FixtureTask } from "./fixture-tasks";
 import { validateSkillCandidate } from "../../intelligence/skill-candidate-validation";
 import { distillFromTrajectorySnapshot } from "../../intelligence/skill-distiller";
 import type { SkillCandidate, SkillTrigger } from "../../intelligence/skill-types";
@@ -132,11 +132,11 @@ export function hashFixtureTask(task: FixtureTask): string {
 }
 
 export function expectedHeldOutFixtures(): LearningEvalHeldOutTask[] {
-  return HELD_OUT_TASKS.map((task) => ({ name: task.name, fixtureDigest: hashFixtureTask(task) }));
+  return loadHeldOutTasks().map((task) => ({ name: task.name, fixtureDigest: hashFixtureTask(task) }));
 }
 
 export function expectedTrainingFixtures(): LearningEvalHeldOutTask[] {
-  return TRAINING_TASKS.map((task) => ({ name: task.name, fixtureDigest: hashFixtureTask(task) }));
+  return loadTrainingTasks().map((task) => ({ name: task.name, fixtureDigest: hashFixtureTask(task) }));
 }
 
 // ── Source binding digests ──────────────────────────────────────
@@ -144,13 +144,13 @@ export function expectedTrainingFixtures(): LearningEvalHeldOutTask[] {
 /** Canonical digest of every checked-in fixture (training + held-out). */
 export function computeFixtureSourceDigest(): string {
   return computeDigest(
-    stableStringify([...TRAINING_TASKS, ...HELD_OUT_TASKS].map(canonicalFixturePayload)),
+    stableStringify([...loadTrainingTasks(), ...loadHeldOutTasks()].map(canonicalFixturePayload)),
   );
 }
 
 /** Digest of the authentic held-out graded tests — the frozen oracle/rubric. */
 export function computeRubricDigest(): string {
-  return computeDigest(stableStringify(HELD_OUT_TASKS.map((task) => task.test)));
+  return computeDigest(stableStringify(loadHeldOutTasks().map((task) => task.test)));
 }
 
 /**
@@ -197,11 +197,11 @@ export function validateSourceBindings(manifest: FrozenLearningEvalManifest): So
  * generation.
  */
 export function resolveTrainingFixture(ref: LearningEvalTrainingFixture): FixtureTask {
-  const heldOut = HELD_OUT_TASKS.find((task) => task.name === ref.name);
+  const heldOut = loadHeldOutTasks().find((task) => task.name === ref.name);
   if (heldOut) {
     throw new Error(`refusing to train on held-out fixture "${ref.name}"`);
   }
-  const task = TRAINING_TASKS.find((candidate) => candidate.name === ref.name);
+  const task = loadTrainingTasks().find((candidate) => candidate.name === ref.name);
   if (!task) throw new Error(`unknown training fixture "${ref.name}"`);
   if (hashFixtureTask(task) !== ref.fixtureDigest) {
     throw new Error(`training fixture digest mismatch for "${ref.name}"`);
@@ -1215,7 +1215,7 @@ export async function runPairedLearningCampaign(
   const candidate = manifest.candidate.candidate;
   const neutral = manifest.neutral.candidate;
 
-  const fixtureByName = new Map(HELD_OUT_TASKS.map((task) => [task.name, task]));
+  const fixtureByName = new Map(loadHeldOutTasks().map((task) => [task.name, task]));
   const storeRoot = opts.skillStoreRoot ?? makeIsolatedSkillStoreRoot();
   const rows: PairedOutcomeRow[] = [];
   // Every arm call shares these frozen sampler values and deadlines.

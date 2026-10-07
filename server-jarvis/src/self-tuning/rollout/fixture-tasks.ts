@@ -51,8 +51,10 @@ function benchmarkDir(): string {
 
 /**
  * Dump `TASKS` / `HELD_OUT_NAMES` / `K` as JSON via the Python source of truth.
- * Synchronous and done once at module load — the fixture set is static for a
+ * Synchronous and done once, on first use — the fixture set is static for a
  * whole campaign, so there is nothing to gain from re-reading it per rollout.
+ * Never at import: the Bun server reaches this module through its
+ * learning-eval imports, and a deployed bundle has no benchmark directory.
  */
 function loadDump(): RawDump {
   const script = [
@@ -86,30 +88,50 @@ function normalize(raw: RawDump["tasks"][number]): FixtureTask {
   };
 }
 
-const dump = loadDump();
-const heldOutNames = new Set(dump.held_out);
-const allTasks: readonly FixtureTask[] = dump.tasks.map(normalize);
+interface FixtureSet {
+  training: readonly FixtureTask[];
+  heldOut: readonly FixtureTask[];
+  k: number;
+}
+
+let fixtureSet: FixtureSet | undefined;
+
+function loadFixtureSet(): FixtureSet {
+  if (!fixtureSet) {
+    const dump = loadDump();
+    const heldOutNames = new Set(dump.held_out);
+    const allTasks = dump.tasks.map(normalize);
+    fixtureSet = {
+      training: allTasks.filter((t) => !heldOutNames.has(t.name)),
+      heldOut: allTasks.filter((t) => heldOutNames.has(t.name)),
+      k: dump.k,
+    };
+  }
+  return fixtureSet;
+}
 
 /**
  * Fixtures the optimizer may train on.
  *
  * The train/held-out separation is enforced structurally, not by convention:
  * these are two distinct exports, and the CMA-ES fitness function's only
- * caller passes `TRAINING_TASKS`. `HELD_OUT_TASKS` is reachable solely from
+ * caller passes `loadTrainingTasks()`. `loadHeldOutTasks()` is reachable solely from
  * the held-out scorer, which runs once after the optimizer loop terminates.
  * There is no code path by which a held-out fixture reaches `ask()`/`tell()`.
  */
-export const TRAINING_TASKS: readonly FixtureTask[] = allTasks.filter(
-  (t) => !heldOutNames.has(t.name),
-);
+export function loadTrainingTasks(): readonly FixtureTask[] {
+  return loadFixtureSet().training;
+}
 
 /** Fixtures reserved for final scoring. Never fed to the optimizer loop. */
-export const HELD_OUT_TASKS: readonly FixtureTask[] = allTasks.filter((t) =>
-  heldOutNames.has(t.name),
-);
+export function loadHeldOutTasks(): readonly FixtureTask[] {
+  return loadFixtureSet().heldOut;
+}
 
 /** Samples per task — mirrors the tier-2B convention for variance reduction. */
-export const FIXTURE_K = dump.k;
+export function loadFixtureK(): number {
+  return loadFixtureSet().k;
+}
 
 /**
  * Seed one fixture into a fresh temp workspace and return its path.

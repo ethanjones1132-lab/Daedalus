@@ -1,14 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { BASELINE_THETA } from "../../orchestration/orchestration-policy";
 import type { CallModelFn } from "../../orchestration/coordinator";
-import { TRAINING_TASKS } from "./fixture-tasks";
+import { loadTrainingTasks } from "./fixture-tasks";
 import { meanReward, runRolloutBatch } from "./rollout-pool";
 import type { RolloutOutcome } from "./rollout-runner";
 
 const inertModel: CallModelFn = async () => ({ content: "no tools." });
 
 describe("runRolloutBatch", () => {
-  const tasks = TRAINING_TASKS.slice(0, 2);
+  const tasks = loadTrainingTasks().slice(0, 2);
   const candidates = [
     { theta: BASELINE_THETA, seed: 1 },
     { theta: { ...BASELINE_THETA, max_directives_per_turn: 12 }, seed: 2 },

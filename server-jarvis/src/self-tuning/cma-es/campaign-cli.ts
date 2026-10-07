@@ -26,7 +26,7 @@ import {
   readOllamaVersion,
   resolveLocalTarget,
 } from "../rollout/ollama-local-transport";
-import { HELD_OUT_TASKS, TRAINING_TASKS } from "../rollout/fixture-tasks";
+import { loadHeldOutTasks, loadTrainingTasks } from "../rollout/fixture-tasks";
 import { runOneRollout } from "../rollout/rollout-runner";
 import { DEFAULT_ROLLOUT_CONCURRENCY } from "../rollout/rollout-pool";
 import {
@@ -200,8 +200,8 @@ async function runExplain(
   let baselineSum = 0;
 
   for (const s of heldOutSeeds) {
-    for (let t = 0; t < HELD_OUT_TASKS.length; t++) {
-      const task = HELD_OUT_TASKS[t]!;
+    for (let t = 0; t < loadHeldOutTasks().length; t++) {
+      const task = loadHeldOutTasks()[t]!;
       const taskSeed = s * 1000 + t;
 
       const baselineOutcome = await runOneRollout(
@@ -364,11 +364,11 @@ async function runPreflight(): Promise<number> {
 
 async function runSmoke(model?: string): Promise<number> {
   const cfg = loadConfig();
-  if (TRAINING_TASKS.length === 0) {
+  if (loadTrainingTasks().length === 0) {
     console.error("FAIL: no training fixtures");
     return 1;
   }
-  const task = TRAINING_TASKS[0]!;
+  const task = loadTrainingTasks()[0]!;
   console.log(`=== Phase-D campaign smoke ===`);
   console.log(`task=${task.name} category=${task.category} entry=${task.entry}`);
   console.log(`model=${model ?? "(pool default)"}`);

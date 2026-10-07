@@ -7,7 +7,7 @@ import { getToolsForMode } from "../../orchestration/modes";
 import { defaultConfig } from "../../config";
 import { makeExecutionContext } from "../../tool-runtime";
 import type { CallModelFn } from "../../orchestration/coordinator";
-import { TRAINING_TASKS } from "./fixture-tasks";
+import { loadTrainingTasks } from "./fixture-tasks";
 import {
   buildFixtureRolloutRequest,
   buildRolloutRuntime,
@@ -15,7 +15,7 @@ import {
   runOneRollout,
 } from "./rollout-runner";
 
-const hiddenFileTask = TRAINING_TASKS.find((t) => t.name === "pkg_discount")!;
+const hiddenFileTask = loadTrainingTasks().find((t) => t.name === "pkg_discount")!;
 
 /**
  * These use a scripted CallModelFn rather than a live model: the point is to
@@ -24,7 +24,7 @@ const hiddenFileTask = TRAINING_TASKS.find((t) => t.name === "pkg_discount")!;
  * model runs. A live-Ollama smoke test is a separate, slower check.
  */
 
-const task = TRAINING_TASKS.find((t) => t.name === "merge_intervals")!;
+const task = loadTrainingTasks().find((t) => t.name === "merge_intervals")!;
 
 /**
  * Phase-D fixtures are test-driven: the graded oracle lives at `_t.py`.
