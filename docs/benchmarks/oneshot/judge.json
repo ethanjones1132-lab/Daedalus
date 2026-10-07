@@ -1,0 +1,123 @@
+{
+ "_note": "Blind scores against ecosystem-lab/rubric.md, committed before the id->build map was opened. Judge: Claude (author of the spec and reference). Blinding was weak in practice: the five builds that ran were visibly polished and the five that did not were visibly broken.",
+ "227acf": {
+  "P1": {"score": 5, "reason": "States stream discipline, pick-only-if-non-empty, neighbour order, start-of-phase snapshot, breed split, newborns skip."},
+  "P2": {"score": 5, "reason": "Names every component including scheduler, announcer and shortcuts."},
+  "P3": {"score": 5, "reason": "Code mirrors the plan: occupancy grids, snapshot sort, tickOnce steps in plan order."},
+  "C1": {"score": 5, "reason": "Sectioned RNG/defaults/DOM/state/sim/render; single world state; API over the same core."},
+  "C2": {"score": 4, "reason": "Clear names and short steps; defensive Number() coercion repeated in tickOnce adds noise."},
+  "C3": {"score": 5, "reason": "Guards storage parsing and scenario input; 5 try/catch; coerces params."},
+  "D1": {"score": 5, "reason": "Two clear panels; world, controls, counters, chart, ODE, scenario, presets grouped."},
+  "D2": {"score": 5, "reason": "Polished dark theme, consistent cards, readable charts."},
+  "D3": {"score": 5, "reason": "Every slider labelled with its value; counters prominent; ODE results labelled."},
+  "D4": {"score": 5, "reason": "Single-column reflow at 390 px; everything readable and reachable."}
+ },
+ "89e287": {
+  "P1": {"score": 5, "reason": "All rules stated precisely, including reset draw order and newborn rule."},
+  "P2": {"score": 5, "reason": "Complete component list including focus styling and responsive layout."},
+  "P3": {"score": 5, "reason": "Cell-slot data model and RK4 shared by API and panel, as planned."},
+  "C1": {"score": 5, "reason": "Clean sections; one state object; renderer and panels separate from the core."},
+  "C2": {"score": 5, "reason": "Readable throughout; named constants; short functions."},
+  "C3": {"score": 5, "reason": "7 try/catch; storage and scenario guarded."},
+  "D1": {"score": 5, "reason": "Logical grouping, chart legend, compact ODE input grid."},
+  "D2": {"score": 5, "reason": "Polished light theme, consistent spacing and colour."},
+  "D3": {"score": 5, "reason": "Labelled sliders with values, legend, labelled results."},
+  "D4": {"score": 5, "reason": "Reflows well at 390 px."}
+ },
+ "d0999d": {
+  "P1": {"score": 5, "reason": "Rules and draw discipline correct."},
+  "P2": {"score": 5, "reason": "Complete, including clock design and renderer details."},
+  "P3": {"score": 5, "reason": "Code follows the plan's model and clock."},
+  "C1": {"score": 5, "reason": "Well separated sections; one source of truth."},
+  "C2": {"score": 4, "reason": "Readable; a few long functions."},
+  "C3": {"score": 5, "reason": "Guards storage and bad scenario JSON."},
+  "D1": {"score": 5, "reason": "Clear two-panel grouping with a helpful subtitle and shortcut hint."},
+  "D2": {"score": 4, "reason": "Polished dark theme; ODE panel is empty dashes and a blank chart until Run."},
+  "D3": {"score": 4, "reason": "Labelled controls, but the population chart has no legend."},
+  "D4": {"score": 5, "reason": "Reflows well; readable."}
+ },
+ "de3a3c": {
+  "P1": {"score": 5, "reason": "Rules correct and precise."},
+  "P2": {"score": 5, "reason": "Complete component list."},
+  "P3": {"score": 5, "reason": "Map-based occupancy and doTick/runTicks as planned."},
+  "C1": {"score": 5, "reason": "Clear separation; single state object S."},
+  "C2": {"score": 5, "reason": "Readable, well named."},
+  "C3": {"score": 5, "reason": "Guards storage and scenario input."},
+  "D1": {"score": 5, "reason": "Panels well grouped; parameters section titled 'applied on reset'."},
+  "D2": {"score": 5, "reason": "Polished; legend; descriptive ODE labels (prey growth etc.)."},
+  "D3": {"score": 5, "reason": "Best labelling of the set: every input explained, shortcut hint."},
+  "D4": {"score": 5, "reason": "Reflows well; drift value wraps but stays readable."}
+ },
+ "f545a8": {
+  "P1": {"score": 4, "reason": "Rules correct except rabbit breeding target stated as 'fox/rabbit-free' (spec: rabbit-free)."},
+  "P2": {"score": 5, "reason": "Complete."},
+  "P3": {"score": 4, "reason": "Code follows the spec rather than the plan on that one rule; otherwise matches."},
+  "C1": {"score": 5, "reason": "Clean sections (randomness, parameters, state, helpers, reset, ...)."},
+  "C2": {"score": 5, "reason": "Readable and compact."},
+  "C3": {"score": 5, "reason": "Guards storage and scenario input."},
+  "D1": {"score": 5, "reason": "Clear grouping, legend, example scenario placeholder."},
+  "D2": {"score": 5, "reason": "Polished navy theme, large readable charts."},
+  "D3": {"score": 4, "reason": "Terse slider labels ('Fox gain') without units."},
+  "D4": {"score": 5, "reason": "Reflows well."}
+ },
+ "65819d": {
+  "P1": {"score": 2, "reason": "Headline tick order only; no draw discipline, neighbour order or breed split."},
+  "P2": {"score": 3, "reason": "Lists most components."},
+  "P3": {"score": 2, "reason": "Code structure loosely matches; never runs."},
+  "C1": {"score": 2, "reason": "Recognisable parts but DOM lookups by id that the HTML never defines."},
+  "C2": {"score": 3, "reason": "Readable in places."},
+  "C3": {"score": 0, "reason": "Crashes on load (null element)."},
+  "D1": {"score": 0, "reason": "Blank page."},
+  "D2": {"score": 0, "reason": "Blank page."},
+  "D3": {"score": 0, "reason": "Nothing usable rendered."},
+  "D4": {"score": 0, "reason": "Blank page."}
+ },
+ "6add58": {
+  "P1": {"score": 2, "reason": "Headline tick order only."},
+  "P2": {"score": 4, "reason": "Lists most components."},
+  "P3": {"score": 1, "reason": "The extracted app is a script-less HTML skeleton."},
+  "C1": {"score": 1, "reason": "HTML and JS split into separate blocks, then repeated."},
+  "C2": {"score": 2, "reason": "Skeleton readable; no logic present in the app."},
+  "C3": {"score": 0, "reason": "Does nothing; assembled JS fails (duplicate declaration)."},
+  "D1": {"score": 1, "reason": "Unstyled controls in a row; labels sit beside the wrong sliders."},
+  "D2": {"score": 0, "reason": "Unstyled."},
+  "D3": {"score": 1, "reason": "Some labels, misplaced; counters stuck at 0."},
+  "D4": {"score": 1, "reason": "Wraps without overflow but unusable."}
+ },
+ "9834ad": {
+  "P1": {"score": 2, "reason": "Headline tick order; 'RK4 for 4-point interpolation' is muddled."},
+  "P2": {"score": 3, "reason": "Covers the main panels."},
+  "P3": {"score": 2, "reason": "Loosely matches; never runs."},
+  "C1": {"score": 2, "reason": "Some structure; selects '#world' etc. that the HTML never defines."},
+  "C2": {"score": 3, "reason": "Short and readable."},
+  "C3": {"score": 0, "reason": "Fails on load."},
+  "D1": {"score": 0, "reason": "Blank page."},
+  "D2": {"score": 0, "reason": "Blank page."},
+  "D3": {"score": 0, "reason": "Nothing usable rendered."},
+  "D4": {"score": 0, "reason": "Blank page."}
+ },
+ "898f8d": {
+  "P1": {"score": 0, "reason": "No plan."},
+  "P2": {"score": 0, "reason": "No plan."},
+  "P3": {"score": 0, "reason": "No plan."},
+  "C1": {"score": 0, "reason": "Script-less HTML skeleton; JS in separate repeated blocks."},
+  "C2": {"score": 1, "reason": "Skeleton only."},
+  "C3": {"score": 0, "reason": "Does nothing; assembled JS fails ('<' inside the JS block)."},
+  "D1": {"score": 1, "reason": "Unstyled controls; misplaced labels."},
+  "D2": {"score": 0, "reason": "Unstyled; invalid <meta> wrapping the title."},
+  "D3": {"score": 1, "reason": "Counters at 0; nothing works."},
+  "D4": {"score": 1, "reason": "Wraps without overflow but unusable."}
+ },
+ "af54a4": {
+  "P1": {"score": 0, "reason": "No plan."},
+  "P2": {"score": 0, "reason": "No plan."},
+  "P3": {"score": 0, "reason": "No plan."},
+  "C1": {"score": 0, "reason": "67 KB of a degenerate CSS loop; no script reached."},
+  "C2": {"score": 0, "reason": "Repetition loop."},
+  "C3": {"score": 0, "reason": "Nothing runs."},
+  "D1": {"score": 0, "reason": "Blank page."},
+  "D2": {"score": 0, "reason": "Blank page."},
+  "D3": {"score": 0, "reason": "Nothing rendered."},
+  "D4": {"score": 0, "reason": "Blank page."}
+ }
+}
