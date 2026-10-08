@@ -1,0 +1,182 @@
+Laya worker up; 2897 MB available with Qwen and Laya loaded
+c_rle_encode t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_rle_encode t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_rle_encode t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_moving_average t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_moving_average t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 2 s
+c_moving_average t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_flatten t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_flatten t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_flatten t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_kth_largest t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 18 s
+c_kth_largest t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_kth_largest t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_dedupe_keep_order t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_dedupe_keep_order t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_dedupe_keep_order t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 4 s
+c_top_k_words t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 8 s
+c_top_k_words t1: r8 5/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 18 s
+c_top_k_words t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 10 s
+c_rotate_right t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_rotate_right t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_rotate_right t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_is_anagram t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_is_anagram t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_is_anagram t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_matrix_transpose t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_matrix_transpose t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_matrix_transpose t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 2 s
+c_lcm_list t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_lcm_list t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 3 s
+c_lcm_list t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 3 s
+c_digital_root t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_digital_root t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_digital_root t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_pair_sum_count t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 5 s
+c_pair_sum_count t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_pair_sum_count t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+v_invoice_cents t0: r8 0/8, pr 1/3 pass grading; p3 fixes [True, False] evidence type; 22 s
+v_invoice_cents t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 22 s
+v_invoice_cents t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 27 s
+v_session_timeout t0: r8 0/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 16 s
+v_session_timeout t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 25 s
+v_session_timeout t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 17 s
+v_profile_missing_user t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+v_profile_missing_user t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+v_profile_missing_user t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+v_delivery_km t0: r8 4/8, pr 0/3 pass grading; p3 fixes [True, False] evidence type; 10 s
+v_delivery_km t1: r8 4/8, pr 2/3 pass grading; p3 fixes [False] evidence none; 6 s
+v_delivery_km t2: r8 3/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 18 s
+v_report_dates t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 6 s
+v_report_dates t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 5 s
+v_report_dates t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 4 s
+v_ship_order t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+v_ship_order t1: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence order; 7 s
+v_ship_order t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+v_sales_tax_percent t0: r8 1/8, pr 0/3 pass grading; p3 fixes [True, False] evidence type; 9 s
+v_sales_tax_percent t1: r8 0/8, pr 2/3 pass grading; p3 fixes [False, True] evidence type; 6 s
+v_sales_tax_percent t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 24 s
+v_upload_retries t0: r8 8/8, pr 2/3 pass grading; p3 fixes [True] evidence none; 5 s
+v_upload_retries t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+v_upload_retries t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 15 s
+v_heat_alert_units t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 9 s
+v_heat_alert_units t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence none; 5 s
+v_heat_alert_units t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 6 s
+v_pages_from_one t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 28 s
+v_pages_from_one t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 16 s
+v_pages_from_one t2: r8 0/8, pr 0/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+v_plugin_names t0: r8 1/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 6 s
+v_plugin_names t1: r8 0/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 5 s
+v_plugin_names t2: r8 1/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 6 s
+v_basket_currency t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 11 s
+v_basket_currency t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 9 s
+v_basket_currency t2: r8 0/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 18 s
+c_parse_int_or t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_parse_int_or t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_parse_int_or t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_mean_or_none t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_mean_or_none t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_mean_or_none t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_clean_email t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 21 s
+c_clean_email t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_clean_email t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 6 s
+c_split_tags t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_split_tags t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 8 s
+c_split_tags t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_first_or t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_first_or t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_first_or t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_clamp_checked t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_clamp_checked t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_clamp_checked t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_parse_pairs t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_parse_pairs t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_parse_pairs t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 16 s
+c_max_by t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_max_by t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 14 s
+c_max_by t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_truncate t0: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_truncate t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_truncate t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_parse_percent t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_parse_percent t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_parse_percent t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_as_list t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 11 s
+c_as_list t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 9 s
+c_as_list t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 14 s
+c_parse_version t0: r8 1/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 12 s
+c_parse_version t1: r8 3/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 13 s
+c_parse_version t2: r8 2/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 16 s
+c_read_config t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_read_config t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_read_config t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 7 s
+c_write_csv t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 8 s
+c_write_csv t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 17 s
+c_write_csv t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_count_lines t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_count_lines t1: r8 6/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 8 s
+c_count_lines t2: r8 5/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_backup_copy t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_backup_copy t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 6 s
+c_backup_copy t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 6 s
+c_tail t0: r8 0/8, pr 2/3 pass grading; p3 fixes [False, False] evidence type; 15 s
+c_tail t1: r8 0/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 12 s
+c_tail t2: r8 0/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 11 s
+c_safe_join t0: r8 1/8, pr 3/3 pass grading; p3 fixes [False, False] evidence type; 10 s
+c_safe_join t1: r8 1/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 13 s
+c_safe_join t2: r8 0/8, pr 3/3 pass grading; p3 fixes [False, False] evidence type; 11 s
+c_find_ext t0: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 6 s
+c_find_ext t1: r8 3/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 3 s
+c_find_ext t2: r8 4/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 7 s
+c_write_utf8 t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_write_utf8 t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_write_utf8 t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 10 s
+c_file_sha256 t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_file_sha256 t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 11 s
+c_file_sha256 t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_write_lines t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_write_lines t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_write_lines t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_newest_file t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 15 s
+c_newest_file t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 13 s
+c_newest_file t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 14 s
+c_merge_text_files t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 12 s
+c_merge_text_files t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 13 s
+c_merge_text_files t2: r8 7/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 14 s
+c_title_lib t0: r8 7/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 35 s
+c_title_lib t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 24 s
+c_title_lib t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 21 s
+c_date_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_date_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_date_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_mask_lib t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_mask_lib t1: r8 6/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 3 s
+c_mask_lib t2: r8 7/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 5 s
+c_wrap_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 8 s
+c_wrap_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_wrap_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 6 s
+c_temp_lib t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_temp_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_temp_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 19 s
+c_zip_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 6 s
+c_zip_lib t1: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence order; 17 s
+c_zip_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 5 s
+c_pct_lib t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_pct_lib t1: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_pct_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_words_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 6 s
+c_words_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence none; 15 s
+c_words_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 7 s
+c_median_lib t0: r8 8/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_median_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 8 s
+c_median_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 9 s
+c_initials_lib t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence sign; 3 s
+c_initials_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [False, True] evidence type; 4 s
+c_initials_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence sign; 3 s
+c_ordinal_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_ordinal_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_ordinal_lib t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 12 s
+c_plural_lib t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+c_plural_lib t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 4 s
+c_plural_lib t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 5 s
+done in 28.2 min
