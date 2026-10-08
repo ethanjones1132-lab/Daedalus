@@ -94,7 +94,9 @@ class LayaClient:
     """laya_partner.py worker in Laya's own venv, over JSON lines. It never raises: once the worker fails to start,
     crashes or misses the deadline, every later call returns (None, secs) and tasks fall back (spec §7)."""
 
-    def __init__(self, calib, timeout=5.0, start_timeout=300.0):
+    # 30 s since 2026-10-08 (v2 ran with 5 s): under memory pressure a paged-out worker missed 5 s and was dropped for
+    # the rest of the run. A slow answer still counts in model secs.
+    def __init__(self, calib, timeout=30.0, start_timeout=300.0):
         self.timeout, self.dead, self.q, self.proc = timeout, False, queue.Queue(), None
         try:
             self.proc = subprocess.Popen([LAYA_PY, str(HERE / "laya_partner.py"), "worker", "--calib", str(calib)],
