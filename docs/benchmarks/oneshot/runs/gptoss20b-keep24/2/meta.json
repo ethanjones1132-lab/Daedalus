@@ -1,0 +1,20 @@
+{
+ "model": "gptoss20b-keep24",
+ "file": "gpt-oss-20b-MXFP4-keep24-selfgen.gguf",
+ "seed": 2,
+ "ncmoe": 7,
+ "fit": [
+  {
+   "ncmoe": 7,
+   "loaded": true,
+   "vram_used_mib": 7718
+  }
+ ],
+ "wall_s": 123.9,
+ "finish_reason": "stop",
+ "prompt_n": 3764,
+ "gen_n": 4837,
+ "gen_tps": 40.2,
+ "has_reasoning": true,
+ "ram_avail_gb": 0.7
+}

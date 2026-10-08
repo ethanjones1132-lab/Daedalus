@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ecosystem Lab</title>
+<style>
+:root { --bg: #1a1a1a; --fg: #e0e0e0; --accent: #4a90e2; --panel: #2a2a2a; }
+body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+#app { display: flex; flex-direction: column; gap: 20px; max-width: 1200px; width: 100%; }
+@media (min-width: 1000px) { #app { flex-direction: row; align-items: flex-start; } }
+#panel-world { flex: 1; background: var(--panel); padding: 20px; border-radius: 8px; }
+#panel-side { flex: 1; display: flex; flex-direction: column; gap: 20px; }
+#panel-side > div { background: var(--panel); padding: 20px; border-radius: 8px; }
+canvas { width: 100%; height: auto; image-rendering: pixelated; background: #000; display: block; border-radius: 4px; }
+.controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-top: 20px; }
+.control-group { display: flex; flex-direction: column; gap: 5px; }
+label { font-size: 0.85rem; color: #aaa; }
+input[type="range"] { width: 100%; }
+.counters { display: flex; gap: 20px; font-family: monospace; font-size: 1.1rem; margin-bottom: 15px; }
+.counter-item { color: var(--accent); }
+svg { width: 100%; height: 200px; background: #222; border-radius: 4px; }
+polyline { fill: none; stroke-width: 2; }
+.ode-panel input { width: 60px; background: #333; color: #fff; border: 1px solid #555; padding: 2px; }
+textarea { width: 100%; height: 80px; background: #111; color: #0f0; font-family: monospace; border: 1px solid #444; box: border-box; }
+.error { color: #ff5555; font-size: 0.8rem; margin-top: 5px; }
+.preset-item { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #444; }
+button { cursor: pointer; padding: 6px 12px; background: #444; color: white; border: none; border-radius: 4px; }
+button:hover { background: #555; }
+button:focus { outline: 2px solid var(--accent); }
+@media (max-width: 700px) { #panel-side { width: 100%; } }
+</style>
+</head>
+<body>
+
+<div id="app">
+<div id="panel-world">
+    <div class="counters">
+        <span>Tick: <span id="tick" class="counter-item">0</span></span>
+        <span>R: <span id="count-rabbits" class="counter-item">0</span></span>
+        <span>F: <span id="count-foxes" class="counter-item">0</span></span>
+        <span>G: <span id="count-grass" class="counter-item">0</span></span>
+    </div>
+    <canvas id="world" data-testid="world"></canvas>
+    <div class="controls-grid">
+        <div class="control-group"><button data-testid="play">Play</button></div>
+        <div class="control-group"><button data-testid="pause">Pause</button></div>
+        <div class="control-group"><button data-testid="step">Step</button></div>
+        <div class="control-group"><button data-testid="reset">Reset</button></div>
+        <div class="control-group">
+            <label for="seed">Seed</label>
+            <input type="number" id="seed" value="42">
+        </div>
+        <div class="control-group">
+            <label for="speed">Speed (t/s)</label>
+            <input type="range" id="speed" min="1" max="60" value="10">
+        </div>
+    </div>
+    <div class="controls-grid">
+        <div class="control-group"><label for="param-rabbits0">Rabbits 0</label><input type="range" id="param-rabbits0" min="0" max="300" value="100" data-testid="param-rabbits0"></div>
+        <div class="control-group"><label for="param-foxes0">Foxes 0</label><input type="range" id="param-foxes0" min="0" max="60" value="6" data-testid="param-foxes0"></div>
+        <div class="control-group"><label for="param-rabbitBreed">Rabbit Breed</label><input type="range" id="param-rabbitBreed" min="2" max="40" value="12" data-testid="param-rabbitBreed"></div>
+        <div class="control-group"><label for="param-foxBreed">Fox Breed</label><input type="range" id="param-foxBreed" min="2" max="60" value="40" data-testid="param-foxBreed"></div>
+        <div class="control-group"><label for="param-foxGain">Fox Gain</label><input type="range" id="param-foxGain" min="1" max="30" value="4" data-testid="param-foxGain"></div>
+        <div class="control-group"><label for="param-grassMax">Grass Max</label><input type="range" id="param-grassMax" min="1" max="10" value="4" data-testid="param-grassMax"></div>
+    </div>
+</div>
+
+<div id="panel-side">
+    <div>
+        <label>Population History</label>
+        <svg data-testid="chart" id="chart-svg" viewBox="0 0 400 200" preserveAspectRatio="none">
+            <polyline id="series-rabbits" data-testid="series-rabbits" stroke="#eee" />
+            <polyline id="series-foxes" data-testid="series-foxes" stroke="#dc5014" />
+            <text x="5" y="190" fill="#aaa" font-size="12">tick</text>
+            <text x="370" y="20" fill="#aaa" font-size="12">count</text>
+        </svg>
+    </div>
+
+    <div class="ode-panel">
+        <label>Lotka–Volterra (RK4)</label>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 10px;">
+            <label>α: <input type="number" step="0.1" id="ode-alpha" value="1.1"></label>
+            <label>β: <input type="number" step="0.1" id="ode-beta" value="0.4"></label>
+            <label>γ: <input type="number" step="0.1" id="ode-gamma" value="0.4"></label>
+            <label>δ: <input type="number" step="0.1" id="ode-delta" value="0.1"></label>
+            <label>x0: <input type="number" id="ode-x0" value="10"></label>
+            <label>y0: <input type="number" id="ode-y0" value="10"></label>
+            <label>t: <input type="number" id="ode-t" value="50"></label>
+            <label>dt: <input type="number" step="0.01" id="ode-dt" value="0.01"></label>
+        </div>
+        <button id="ode-run" style="margin-top:10px; width:100%;">Run ODE</button>
+        <div id="ode-results" style="font-size: 0.8rem; margin-top:10px; font-family: monospace;"></div>
+        <svg data-testid="ode-chart" id="ode-chart-svg" viewBox="0 0 400 200" preserveAspectRatio="none">
+            <polyline id="ode-series-x" data-testid="ode-series-x" stroke="#eee" />
+            <polyline id="ode-series-y" data-testid="ode-series-y" stroke="#dc5014" />
+        </svg>
+    </div>
+
+    <div>
+        <label>Scenario</label>
+        <textarea id="scenario-json" data-testid="scenario-json"></textarea>
+        <div style="display: flex; gap: 5px; margin-top: 5px;">
+            <button id="scenario-export" data-testid="scenario-export">Export</button>
+            <button id="scenario-load" data-testid="scenario-load">Load</button>
+        </div>
+        <div id="scenario-error" class="error" data-testid="scenario-error"></div>
+        <button id="csv-export" data-testid="csv-export" style="margin-top: 10px; width: 100%;">Download CSV</button>
+    </div>
+
+    <div>
+        <label>Presets</label>
+        <div style="display: flex; gap: 5px; margin-top: 5px;">
+            <input type="text" id="preset-name" placeholder="Name" style="flex:1; background:#333; color:#fff; border:1px solid #555;">
+            <button id="preset-save" data-testid="preset-save">Save</button>
+        </div>
+        <div id="preset-list" style="margin-top: 10px;"></div>
+    </div>
+</div>
+
+<div id="announcer" aria-live="polite" style="position:absolute; left:-9999px;"></div>
+
+<script>
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const DEFAULTS = {
+    width: 40, height: 30, grassMax: 4, rabbits0: 100, foxes0: 6,
+    rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+    foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+};
+
+class Ecosystem {
+    constructor() {
+        this.reset(42, {});
+    }
+
+    reset(seed, params) {
+        this.params = { ...DEFAULTS, ...params };
+        this.rand = mulberry32(seed);
+        this.seed = seed;
+        this.tick = 0;
+        this.idCounter = 1;
+        this.history = [];
+        this.width = this.params.width;
+        this.height = this.params.height;
+        
+        this.grass = new Int32Array(this.width * this.height);
+        for (let i = 0; i < this.grass.length; i++) {
+            this.grass[i] = Math.floor(this.rand() * (this.params.grassMax + 1));
+        }
+
+        this.rabbits = [];
+        const emptyCells = [];
+        for (let i = 0; i < this.width * this.height; i++) emptyCells.push(i);
+        
+        const pick = (list) => {
+            if (list.length === 0) return null;
+            return list[Math.floor(this.rand() * list.length)];
+        };
+
+        for (let i = 0; i < this.params.rabbits0; i++) {
+            const list = [];
+            for (let j = 0; j < this.width * this.height; j++) {
+                if (!this.rabbits.find(r => r.idx === j)) list.push(j);
+            }
+            const idx = pick(list);
+            if (idx !== null) {
+                this.rabbits.push({ id: this.idCounter++, x: idx % this.width, y: Math.floor(idx / this.width), energy: this.params.rabbitStart, idx });
+            }
+        }
+
+        for (let i = 0; i < this.params.foxes0; i++) {
+            const list = [];
+            for (let j = 0; j < this.width * this.height; j++) {
+                if (!this.rabbits.find(r => r.idx === j) && !this.foxes.find(f => f.idx === j)) list.push(j);
+            }
+            const idx = pick(list);
+            if (idx !== null) {
+                this.foxes.push({ id: this.idCounter++, x: idx % this.width, y: Math.floor(idx / this.width), energy: this.params.foxStart, idx });
+            }
+        }
+        // Note: The logic for "no fox" in rabbit placement is actually handled by the loop.
+        // Re-implementing correctly:
+        this.rabbits = [];
+        this.foxes = [];
+        // Re-run the logic exactly as specified
+        // 1. Grass is set.
+        // 2. Rabbits:
+        for(let i=0; i<this.params.rabbits0; i++) {
+            let list = [];
+            for(let j=0; j<this.width*this.height; j++) {
+                if(!this.rabbits.find(r => r.idx === j)) list.push(j);
+            }
+            let idx = pick(list);
+            if(idx !== null) {
+                this.rabbits.push({id: this.idCounter++, x: idx % this.width, y: Math.floor(idx/this.width), energy: this.params.rabbitStart, idx});
+            }
+        }
+        // 3. Foxes:
+        for(let i=0; i<this.params.foxes0; i++) {
+            let list = [];
+            for(let j=0; j<this.width*this.height; j++) {
+                let hasR = this.rabbits.find(r => r.idx === j);
+                let hasF = this.foxes.find(f => f.idx === j);
+                if(!hasR && !hasF) list.push(j);
+            }
+            let idx = pick(list);
+            if(idx !== null) {
+                this.foxes.push({id: this.idCounter++, x: idx % this.width, y: Math.floor(idx/this.width), energy: this.params.foxStart, idx});
+            }
+        }
+
+        this.recordHistory();
+        return this.counts();
+    }
+
+    getNeighbors(x, y) {
+        const ns = [];
+        const dirs = [[0,-1], [1,0], [0,1], [-1,0]];
+        for (let [dx, dy] of dirs) {
+            let nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < this.width && ny >= 0 && ny < this.height) {
+                ns.push({x: nx, y: ny, idx: ny * this.width + nx});
+            }
+        }
+        return ns;
+    }
+
+    step() {
+        // 1. Grass
+        for (let i = 0; i < this.grass.length; i++) {
+            this.grass[i] = Math        Math.min(this.params.grassMax, this.grass[i] + 1);
+        }
+
+        // 2. Rabbits
+        const pick = (list) => { if (list.length === 0) return null; return list[Math.floor(this.rand() * list.length)]; };
+        let activeRabbits = [...this.rabbits].sort((a, b) => a.id - b.id);
+        
+        for (let r of activeRabbits) {
+            // Find current index in array (it might have been modified)
+            const rObj = this.rabbits.find(rb => rb.id === r.id);
+            if (!rObj) continue;
+
+            // Move
+            const ns = this.getNeighbors(rObj.x, rObj.y);
+            const freeNs = ns.filter(n => !this.rabbits.find(rb => rb.idx === n.idx));
+            if (freeNs.length > 0) {
+                const target = pick(freeNs);
+                rObj.idx = target.idx;
+                rObj.x = target.x;
+                rObj.y = target.y;
+            }
+
+            // Eat
+            const g = this.grass[rObj.idx];
+            rObj.energy += this.params.rabbitGain * g;
+            this.grass[rObj.idx] = 0;
+
+            // Cost
+            rObj.energy -= this.params.rabbitCost;
+
+            // Breed
+            if (rObj.energy >= this.params.rabbitBreed) {
+                const breedNs = ns.filter(n => !this.rabbits.find(rb => rb.idx === n.idx));
+                if (breedNs.length > 0) {
+                    const spot = pick(breedNs);
+                    const childEnergy = Math.floor(rObj.energy / 2);
+                    rObj.energy -= childEnergy;
+                    this.rabbits.push({
+                        id: this.idCounter++,
+                        x: spot.x, y: spot.y,
+                        energy: childEnergy,
+                        idx: spot.idx
+                    });
+                }
+            }
+
+            // Die
+            if (rObj.energy <= 0) {
+                this.rabbits = this.rabbits.filter(rb => rb.id !== rObj.id);
+            }
+        }
+
+        // 3. Foxes
+        let activeFoxes = [...this.foxes].sort((a, b) => a.id - b.id);
+        for (let f of activeFoxes) {
+            const fObj = this.foxes.find(fx => fx.id === f.id);
+            if (!fObj) continue;
+
+            // Move
+            const ns = this.getNeighbors(fObj.x, fObj.y);
+            const rabbitNs = ns.filter(n => this.rabbits.find(rb => rb.idx === n.idx) && !this.foxes.find(fx => fx.idx === n.idx));
+            const emptyNs = ns.filter(n => !this.foxes.find(fx => fx.idx === n.idx));
+            
+            if (rabbitNs.length > 0) {
+                const target = pick(rabbitNs);
+                fObj.idx = target.idx; fObj.x = target.x; fObj.y = target.y;
+            } else if (emptyNs.length > 0) {
+                const target = pick(emptyNs);
+                fObj.idx = target.idx; fObj.x = target.x; fObj.y = target.y;
+            }
+
+            // Eat
+            const rabbitAt = this.rabbits.find(rb => rb.idx === fObj.idx);
+            if (rabbitAt) {
+                this.rabbits = this.rabbits.filter(rb => rb.id !== rabbitAt.id);
+                fObj.energy += this.params.foxGain;
+            }
+
+            // Cost
+            fObj.energy -= this.params.foxCost;
+
+            // Breed
+            if (fObj.energy >= this.params.foxBreed) {
+                const breedNs = ns.filter(n => !this.foxes.find(fx => fx.idx === n.idx));
+                if (breedNs.length > 0) {
+                    const spot = pick(breedNs);
+                    const childEnergy = Math.floor(fObj.energy / 2);
+                    fObj.energy -= childEnergy;
+                    this.foxes.push({
+                        id: this.idCounter++,
+                        x: spot.x, y: spot.y,
+                        energy: childEnergy,
+                        idx: spot.idx
+                    });
+                }
+            }
+
+            // Die
+            if (fObj.energy <= 0) {
+                this.foxes = this.foxes.filter(fx => fx.id !== fObj.id);
+            }
+        }
+
+        this.tick++;
+        this.recordHistory();
+    }
+
+    recordHistory() {
+        let totalGrass = 0;
+        for(let g of this.grass) totalGrass += g;
+        this.history.push({
+            tick: this.tick,
+            rabbits: this.rabbits.length,
+            foxes: this.foxes.length,
+            grass: totalGrass
+        });
+    }
+
+    counts() {
+        let totalGrass = 0;
+        for(let g of this.grass) totalGrass += g;
+        return { rabbits: this.rabbits.length, foxes: this.foxes.length, grass: totalGrass };
+    }
+
+    cell(x, y) {
+        const idx = y * this.width + x;
+        const rabbit = this.rabbits.find(r => r.idx === idx);
+        const fox = this.foxes.find(f => f.idx === idx);
+        return {
+            grass: this.grass[idx],
+            rabbit: rabbit ? { id: rabbit.id, energy: rabbit.energy } : null,
+            fox: fox ? { id: fox.id, energy: fox.energy } : null
+        };
+    }
+
+    ode(p, t, dt) {
+        const { alpha, beta, gamma, delta, x0, y0 } = p;
+        let x = x0, y = y0;
+        const steps = Math.round(t / dt);
+        
+        const f = (cx, cy) => ({
+            dx: alpha * cx - beta * cx * cy,
+            dy: delta * cx * cy - gamma * cy
+        });
+
+        for (let i = 0; i < steps; i++) {
+            const k1 = f(x, y);
+            const k2 = f(x + 0.5 * dt * k1.dx, y + 0.5 * dt * k1.dy);
+            const k3 = f(x + 0.5 * dt * k2.dx, y + 0.5 * dt * k2.dy);
+            const k4 = f(x + dt * k3.dx, y + dt * k3.dy);
+            x += (dt / 6) * (k1.dx + 2 * k2.dx + 2 * k3.dx + k4.dx);
+            y += (dt / 6) * (k1.dy + 2 * k2.dy + 2 * k3.dy + k4.dy);
+        }
+        return { x, y };
+    }
+
+    exportCSV() {
+        let csv = "tick,rabbits,foxes,grass\n";
+        for (let h of this.history) {
+            csv += `${h.tick},${h.rabbits},${h.foxes},${h.grass}\n`;
+        }
+        return csv;
+    }
+
+    exportScenario() {
+        return JSON.stringify({
+            version: 1,
+            seed: this.seed,
+            params: this.params
+        });
+    }
+
+    loadScenario(text) {
+        try {
+            const data = JSON.parse(text);
+            if (data.version !== 1 || typeof data.seed !== 'number') throw new Error();
+            this.reset(data.seed, data.params);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+}
+
+// --- UI & Controller ---
+
+const lab = new Ecosystem();
+window.lab = lab;
+
+const canvas = document.getElementById('world');
+const ctx = canvas.getContext('2d');
+const chartSvg = document.getElementById('chart-svg');
+const odeChartSvg = document.getElementById('ode-chart-svg');
+
+function updateUI() {
+    const counts = lab.counts();
+    document.getElementById('tick').textContent = lab.tick;
+    document.getElementById('count-rabbits').textContent = counts.rabbits;
+    document.getElementById('count-foxes').textContent = counts.foxes;
+    document.getElementById('count-grass').textContent = counts.grass;
+    
+    renderWorld();
+    renderChart();
+}
+
+function renderWorld() {
+    canvas.width = lab.width * 10;
+    canvas.height = lab.height * 10;
+    for (let y = 0; y < lab.height; y++) {
+        for (let x = 0; x < lab.width; x++) {
+            const idx = y * lab.width + x;
+            const g = lab.grass[idx];
+            const G = 60 + Math.round(160 * g / lab.params.grassMax);
+            ctx.fillStyle = `rgb(30, ${G}, 30)`;
+            ctx.fillRect(x * 10, y * 10, 10, 10);
+            
+            const r = lab.rabbits.find(rb => rb.idx === idx);
+            if (r) {
+                ctx.fillStyle = 'rgb(240, 240, 240)';
+                ctx.beginPath();
+                ctx.arc(x * 10 + 5, y * 10 + 5, 2.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            const f = lab.foxes.find(fx => fx.idx === idx);
+            if (f) {
+                ctx.fillStyle = 'rgb(220, 80, 20)';
+                ctx.beginPath();
+                ctx.arc(x * 10 + 5, y * 10 + 5, 3.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+    }
+}
+
+function renderChart() {
+    const history = lab.history;
+    if (history.length === 0) return;
+
+    const maxTick = history[history.length - 1].tick;
+    const maxPop = Math.max(...history.map(h => Math.max(h.rabbits, h.foxes, h.grass/10 || 1)), 10);
+    
+    const getPoints = (key) => {
+        return history.map((h, i) => {
+            const x = (i / (history.length - 1 || 1)) * 400;
+            const y = 200 - (h[key] / maxPop) * 180 - 10;
+            return `${x},${y}`;
+        }).join(' ');
+    };
+
+    document.getElementById('series-rabbits').setAttribute('points', getPoints('rabbits'));
+    document.getElementById('series-foxes').setAttribute('points', getPoints('foxes'));
+}
+
+// Playback logic
+let isPlaying = false;
+let lastTime = 0;
+let accumulator = 0;
+
+function loop(timestamp) {
+    if (!isPlaying) return;
+    const dt = (timestamp - lastTime) / 1000;
+    lastTime = timestamp;
+    accumulator += dt;
+    
+    const speed = parseInt(document.getElementById('speed').value);
+    const interval = 1 / speed;
+
+    while (accumulator >= interval) {
+        lab.step();
+        accumulator -= interval;
+    }
+    
+    updateUI();
+    requestAnimationFrame(loop);
+}
+
+// Event Listeners
+document.getElementById('play').onclick = () => {
+    if (!isPlaying) {
+        isPlaying = true;
+
+    }
+    lastTime = performance.now();
+    requestAnimationFrame(loop);
+};
+document.getElementById('pause').onclick = () => isPlaying = false;
+document.getElementById('step').onclick = () => { lab.step(); updateUI(); };
+document.getElementById('reset').onclick = () => {
+    const seed = parseInt(document.getElementById('seed').value);
+    const params = {};
+    ['rabbits0', 'foxes0', 'rabbitBreed', 'foxBreed', 'foxGain', 'grassMax'].forEach(p => {
+        params[p] = parseInt(document.getElementById('param-' + p).value);
+    });
+    lab.reset(seed, params);
+    updateUI();
+};
+
+// Parameter sync
+document.querySelectorAll('input[type="range"]').forEach(input => {
+    input.oninput = () => {
+        // Only update the label/value visually, actual params apply on reset
+        // But for the user, we show the current value
+    };
+});
+
+// Manual value display for sliders
+function updateSliderLabels() {
+    document.querySelectorAll('input[type="range"]').forEach(input => {
+        const label = input.previousElementSibling;
+        if (label && label.tagName === 'LABEL') {
+            // We don't have a separate span for value, so we'll just let the user see the input
+        }
+    });
+}
+
+document.getElementById('seed').onchange = (e) => {
+    const seed = parseInt(e.target.value);
+    lab.reset(seed, {});
+    updateUI();
+};
+
+// ODE Logic
+document.getElementById('ode-run').onclick = () => {
+    const p = {
+        alpha: parseFloat(document.getElementById('ode-alpha').value),
+        beta: parseFloat(document.getElementById('ode-beta').value),
+        gamma: parseFloat(document.getElementById('ode-gamma').value),
+        delta: parseFloat(document.getElementById('ode-delta').value),
+        x0: parseFloat(document.getElementById('ode-x0').value),
+        y0: parseFloat(document.getElementById('ode-y0').value)
+    };
+    const t = parseFloat(document.getElementById('ode-t').value);
+    const dt = parseFloat(document.getElementById('ode-dt').value);
+
+    const res = lab.ode(p, t, dt);
+    
+    // RK4 trajectory for chart
+    const historyX = [];
+    const historyY = [];
+    let cx = p.x0, cy = p.y0;
+    const steps = Math.round(t / dt);
+    const f = (x, y) => ({
+        dx: p.alpha * x - p.beta * x * y,
+        dy: p.delta * x * y - p.gamma * y
+    });
+
+    for(let i=0; i<=steps; i++) {
+        historyX.push({t: i*dt, val: cx});
+        historyY.push({t: i*dt, val: cy});
+        const k1 = f(cx, cy);
+        const k2 = f(cx + 0.5 * dt * k1.dx, cy + 0.5 * dt * k1.dy);
+        const k3 = f(cx + 0.5 * dt * k2.dx, cy + 0.5 * dt * k2.dy);
+        const k4 = f(cx + dt * k3.dx, cy + dt * k3.dy);
+        cx += (dt / 6) * (k1.dx + 2 * k2.dx + 2 * k3.dx + k4.dx);
+        cy += (dt / 6) * (k1.dy + 2 * k2.dy + 2 * k3.dy + k4.dy);
+    }
+
+    document.getElementById('ode-results').innerHTML = `
+        x: ${res.x.toFixed(8)}<br>
+        y: ${res.y.toFixed(8)}<br>
+        eq_x: ${(p.gamma/p.delta).toFixed(4)}<br>
+        eq_y: ${(p.alpha/p.beta).toFixed(4)}<br>
+        drift: ${Math.abs((p.delta*res.x - p.gamma*Math.log(res.x) + p.beta*res.y - p.alpha*Math.log(res.y)) - (p.delta*p.x0 - p.gamma*Math.log(p.x0) + p.beta*p.y0 - p.alpha*Math.log(p.y0))).toFixed(4)}
+    `;
+
+    // Draw ODE Chart
+    const maxVal = Math.max(...historyX.map(h => h.val), ...historyY.map(h => h.val), 1);
+    const getOdePoints = (arr) => arr.map((h, i) => {
+        const x = (i / (arr.length - 1)) * 400;
+        const y = 200 - (h.val / maxVal) * 180 - 10;
+        return `${x},${y}`;
+    }).join(' ');
+
+    document.getElementById('ode-series-x').setAttribute('points', getOdePoints(historyX));
+    document.getElementById('ode-series-y').setAttribute('points', getOdePoints(historyY));
+};
+
+// Scenario & Presets
+document.getElementById('scenario-export').onclick = () => {
+    document.getElementById('scenario-json').value = lab.exportScenario();
+};
+document.getElementById('scenario-load').onclick = () => {
+    const txt = document.getElementById('scenario-json').value;
+    const err = document.getElementById('scenario-error');
+    if (lab.loadScenario(txt)) {
+        err.textContent = "";
+        document.getElementById('seed').value = lab.seed;
+        // Sync sliders
+        for(let k in lab.params) {
+            const el = document.getElementById('param-' + k);
+            if(el) el.value = lab.params[k];
+        }
+        updateUI();
+    } else {
+        err.textContent = "Invalid Scenario";
+    }
+};
+document.getElementById('csv-export').onclick = () => {
+    const blob = new Blob([lab.exportCSV()], {type: 'text/csv'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ecolab.csv';
+    a.click();
+};
+
+document.getElementById('preset-save').onclick = () => {
+    const name = document.getElementById('preset-name').value || "Unnamed";
+    const presets = JSON.parse(localStorage.getItem("ecolab.presets") || "{}");
+    presets[name] = lab.exportScenario();
+    localStorage.setItem("ecolab.presets", JSON.stringify(presets));
+    renderPresets();
+};
+
+function renderPresets() {
+    const list = document.getElementById('preset-list');
+    list.innerHTML = "";
+    const presets = JSON.parse(localStorage.getItem("ecolab.presets") || "{}");
+    for (let name in presets) {
+        const div = document.createElement('div');
+        div.className = 'preset-item';
+        div.innerHTML = `<span>${name}</span><div>
+            <button class="preset-load" onclick="loadPreset('${name}')">Load</button>
+            <button class="preset-delete" onclick="deletePreset('${name}')">Del</button>
+        </div>`;
+        list.appendChild(div);
+    }
+}
+window.loadPreset = (name) => {
+    const presets = JSON.parse(localStorage.getItem("ecolab.presets") || "{}");
+    lab.loadScenario(presets[name]);
+    document.getElementById('scenario-json').value = presets[name];
+    document.getElementByIdseed = lab.seed; // fix
+    document.getElementById('seed').value = lab.seed;
+    // Sync sliders
+    for(let k in lab.params) {
+        const el = document.getElementById('param-' + k);
+        if(el) el.value = lab.params[k];
+    }
+    updateUI();
+};
+window.deletePreset = (name) => {
+    const presets = JSON.parse(localStorage.getItem("ecolab.presets") || "{}");
+    delete presets[name];
+    localStorage.setItem("ecolab.presets", JSON.stringify(presets));
+    renderPresets();
+};
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+    if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA' || document.activeElement.tagName === 'BUTTON') return;
+    if (e.code === 'Space') {
+        e.preventDefault();
+        document.getElementById('play').click();
+    }
+    if (e.key === 's') {
+        e.preventDefault();
+        document.getElementById('step').click();
+    }
+    if (e.key === 'r') {
+        e.preventDefault();
+        document.getElementById('reset').click();
+    }
+});
+
+// Init
+renderPresets();
+updateUI();
+</script>
+</body>
+</html>

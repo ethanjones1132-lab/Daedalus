@@ -1,0 +1,824 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ecosystem Lab</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 0; background: #f5f6f8; color: #222; }
+  .wrap { display: flex; flex-wrap: wrap; gap: 16px; padding: 16px; align-items: flex-start; }
+  #panel-world { flex: 1 1 360px; min-width: 360px; background: #fff; padding: 16px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+  #panel-side { flex: 1 1 420px; min-width: 320px; background: #fff; padding: 16px; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+  @media (min-width: 1000px) { .wrap { align-items: center; } }
+  @media (max-width: 699px) { .wrap { flex-direction: column; } #panel-world, #panel-side { flex: 1 1 auto; width: auto; min-width: 0; } }
+  h2 { margin: 0 0 12px; font-size: 18px; }
+  h3 { margin: 18px 0 8px; font-size: 14px; color: #444; }
+  canvas { width: 100%; height: auto; display: block; border: 1px solid #ccc; border-radius: 6px; background: #1a1a1a; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid #999; border-radius: 6px; background: #eef; cursor: pointer; }
+  button:hover { background: #dde; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid #4a90d9; outline-offset: 2px; }
+  label { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  input[type=number], input[type=text] { font: inherit; padding: 5px 6px; border: 1px solid #999; border-radius: 5px; width: 70px; }
+  input[type=range] { width: 120px; }
+  .counter { font-size: 14px; margin: 4px 0; }
+  .counter b { font-weight: 600; }
+  .stat { display: inline-block; margin-right: 14px; font-size: 14px; }
+  .stat b { font-weight: 600; }
+  .out { font-size: 13px; margin: 3px 0; font-family: ui-monospace, monospace; }
+  .out b { font-weight: 600; }
+  textarea { width: 100%; min-height: 90px; font-family: ui-monospace, monospace; font-size: 12px; padding: 6px; border: 1px solid #999; border-radius: 5px; resize: vertical; }
+  .err { color: #c0392b; font-size: 13px; min-height: 18px; margin: 6px 0; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; flex-wrap: wrap; }
+  .preset-item { border: 1px solid #ddd; border-radius: 6px; padding: 8px; margin: 6px 0; }
+  .preset-item .nm { font-weight: 600; margin-right: 8px; }
+  .small-btn { padding: 4px 8px; font-size: 12px; }
+  svg { width: 100%; height: auto; }
+  .grid2 { display: grid; grid-template-columns: auto 1fr auto; gap: 6px 10px; align-items: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section id="panel-world">
+    <h2>Ecosystem Lab</h2>
+    <canvas data-testid="world" width="400" height="300"></canvas>
+    <div class="controls">
+      <button data-testid="play">Play</button>
+      <button data-testid="pause">Pause</button>
+      <button data-testid="step">Step</button>
+      <button data-testid="reset">Reset</button>
+      <label>Seed <input type="number" data-testid="seed" value="42"></label>
+      <label>Speed <input type="range" data-testid="speed" min="1" max="60" value="10"></label>
+    </div>
+    <h3>Parameters</h3>
+    <div class="grid2" id="sliders"></div>
+    <h3>Counters</h3>
+    <div class="counter"><b>Tick:</b> <span data-testid="tick">0</span></div>
+    <div class="counter"><b>Rabbits:</b> <span data-testid="count-rabbits">0</span></div>
+    <div class="counter"><b>Foxes:</b> <span data-testid="count-foxes">0</span></div>
+    <div class="counter"><b>Grass:</b> <span data-testid="count-grass">0</span></div>
+  </section>
+
+  <section id="panel-side">
+    <h2>Population</h2>
+    <svg data-testid="chart" viewBox="0 0 500 220" role="img" aria-label="Population over time">
+      <line x1="40" y1="200" x2="490" y2="200" stroke="#888"/>
+      <line x1="40" y1="10" x2="40" y2="200" stroke="#888"/>
+      <text x="265" y="215" font-size="12" text-anchor="middle">tick</text>
+      <text x="14" y="110" font-size="12" text-anchor="middle" transform="rotate(-90 14 110)">count</text>
+      <polyline data-testid="series-rabbits" fill="none" stroke="#c0392b" stroke-width="1.5"/>
+      <polyline data-testid="series-foxes" fill="none" stroke="#2e86c1" stroke-width="1.5"/>
+    </svg>
+
+    <h3>Lotka–Volterra</h3>
+    <div class="grid2">
+      <label for="ode-alpha">α</label><input type="number" id="ode-alpha" data-testid="ode-alpha" value="1.1">
+      <label for="ode-beta">β</label><input type="number" id="ode-beta" data-testid="ode-beta" value="0.4">
+      <label for="ode-gamma">γ</label><input type="number" id="ode-gamma" data-testid="ode-gamma" value="0.4">
+      <label for="ode-delta">δ</label><input type="number" id="ode-delta" data-testid="ode-delta" value="0.1">
+      <label for="ode-x0">x₀</label><input type="number" id="ode-x0" data-testid="ode-x0" value="10">
+      <label for="ode-y0">y₀</label><input type="number" id="ode-y0" data-testid="ode-y0" value="10">
+      <label for="ode-t">t</label><input type="number" id="ode-t" data-testid="ode-t" value="50">
+      <label for="ode-dt">dt</label><input type="number" id="ode-dt" data-testid="ode-dt" value="0.01">
+    </div>
+    <button data-testid="ode-run">Run ODE</button>
+    <div class="out">x = <b data-testid="ode-x">0</b></div>
+    <div class="out">y = <b data-testid="ode-y">0</b></div>
+    <div class="out">x_eq = <b data-testid="ode-eq-x">0</b></div>
+    <div class="out">y_eq = <b data-testid="ode-eq-y">0</b></div>
+    <div class="out">drift = <b data-testid="ode-drift">0</b></div>
+    <svg data-testid="ode-chart" viewBox="0 0 500 220" role="img" aria-label="ODE trajectory">
+      <line x1="40" y1="200" x2="490" y2="200" stroke="#888"/>
+      <line x1="40" y1="10" x2="40" y2="200" stroke="#888"/>
+      <polyline data-testid="ode-series-x" fill="none" stroke="#c0392b" stroke-width="1.5"/>
+      <polyline data-testid="ode-series-y" fill="none" stroke="#2e86c1" stroke-width="1.5"/>
+    </svg>
+
+    <h3>Scenario</h3>
+    <div class="controls">
+      <button data-testid="scenario-export">Export</button>
+      <button data-testid="scenario-load">Load</button>
+    </div>
+    <textarea data-testid="scenario-json" aria-label="Scenario JSON"></textarea>
+    <div class="err" data-testid="scenario-error"></div>
+
+    <h3>Presets</h3>
+    <div class="row">
+      <input type="text" data-testid="preset-name" placeholder="Preset name">
+      <button data-testid="preset-save">Save</button>
+    </div>
+    <div data-testid="preset-list"></div>
+
+    <h3>CSV</h3>
+    <button data-testid="csv-export">Download ecolab.csv</button>
+  </section>
+</div>
+<div aria-live="polite" data-testid="announcer"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  function mulberry32(seed) {
+    let a = seed | 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var DEFAULTS = {
+    width: 40, height: 30, grassMax: 4,
+    rabbits0: 100, foxes0: 6,
+    rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+    foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+  };
+  var PARAM_SLIDERS = [
+    { key: "rabbits0", min: 0, max: 300 },
+    { key: "foxes0", min: 0, max: 60 },
+    { key: "rabbitBreed", min: 2, max: 40 },
+    { key: "foxBreed", min: 2, max: 60 },
+    { key: "foxGain", min: 1, max: 30 },
+    { key: "grassMax", min: 1, max: 10 }
+  ];
+
+  var state = {
+    seed: 42, params: {}, speed: 10,
+    playing: false, raf: null, acc: 0, lastTime: 0
+  };
+
+  var world = { cells: null, rabbits: [], foxes: [], cellsByRabbit: null, cellsByFox: null, id: 0, rand: null, tick: 0, history: [], width: 40, height: 30, grassMax: 4 };
+
+  var els = {};
+  var canvas;
+
+  function pick(list) {
+    if (!list || list.length === 0) return null;
+    return list[Math.floor(state.rand() * list.length)];
+  }
+
+  function inBounds(x, y) {
+    return x >= 0 && x < world.width && y >= 0 && y < world.height;
+  }
+
+  function neighbours(x, y) {
+    var res = [];
+    if (inBounds(x, y - 1)) res.push([x, y - 1]);
+    if (inBounds(x + 1, y)) res.push([x + 1, y]);
+    if (inBounds(x, y + 1)) res.push([x, y + 1]);
+    if (inBounds(x - 1, y)) res.push([x - 1, y]);
+    return res;
+  }
+
+  function idx(x, y) { return y * world.width + x; }
+
+  function reset(seed, params) {
+    state.seed = seed;
+    var p = {};
+    for (var k in DEFAULTS) p[k] = DEFAULTS[k];
+    if (params) { for (var dk in DEFAULTS) if (params[dk] !== undefined) p[dk] = params[dk]; }
+    state.params = p;
+    world.rand = mulberry32(seed);
+    world.tick = 0;
+    world.id = 1;
+    world.history = [];
+    world.width = p.width;
+    world.height = p.height;
+    world.grassMax = p.grassMax;
+    world.cells = new Array(world.width * world.height);
+    world.cellsByRabbit = new Array(world.width * world.height);
+    world.cellsByFox = new Array(world.width * world.height);
+    for (var i = 0; i < world.cells.length; i++) {
+      world.cells[i] = { grass: 0, rabbit: null, fox: null };
+      world.cellsByRabbit[i] = [];
+      world.cellsByFox[i] = [];
+    }
+    world.rabbits = [];
+    world.foxes = [];
+
+    for (var y = 0; y < world.height; y++) {
+      for (var x = 0; x < world.width; x++) {
+        world.cells[idx(x, y)].grass = Math.floor(state.rand() * (world.grassMax + 1));
+      }
+    }
+
+    for (var r = 0; r < p.rabbits0; r++) {
+      var empty = [];
+      for (var yy = 0; yy < world.height; yy++) {
+        for (var xx = 0; xx < world.width; xx++) {
+          if (!world.cells[idx(xx, yy)].rabbit) empty.push([xx, yy]);
+        }
+      }
+      var spot = pick(empty);
+      if (!spot) break;
+      createRabbit(spot[0], spot[1], p.rabbitStart);
+    }
+
+    for (var f = 0; f < p.foxes0; f++) {
+      var emptyF = [];
+      for (var y2 = 0; y2 < world.height; y2++) {
+        for (var x2 = 0; x2 < world.width; x2++) {
+          if (!world.cells[idx(x2, y2)].fox) emptyF.push([x2, y2]);
+        }
+      }
+      var spotF = pick(emptyF);
+      if (!spotF) break;
+      createFox(spotF[0], spotF[1], p.foxStart);
+    }
+
+    recordHistory();
+    render();
+    updateCounters();
+    updateChart();
+    return counts();
+  }
+
+  function createRabbit(x, y, energy) {
+    var r = { id: world.id++, energy: energy, x: x, y: y };
+    var i = idx(x, y);
+    world.cells[i].rabbit = r;
+    world.cellsByRabbit[i].push(r);
+    world.rabbits.push(r);
+    return r;
+  }
+
+  function createFox(x, y, energy) {
+    var f = { id: world.id++, energy: energy, x: x, y: y };
+    var i = idx(x, y);
+    world.cells[i].fox = f;
+    world.cellsByFox[i].push(f);
+    world.foxes.push(f);
+    return f;
+  }
+
+  function removeRabbit(r) {
+    var i = idx(r.x, r.y);
+    var arr = world.cellsByRabbit[i];
+    var pos = arr.indexOf(r);
+    if (pos >= 0) arr.splice(pos, 1);
+    if (world.cells[i].rabbit === r) world.cells[i].rabbit = null;
+    var pos2 = world.rabbits.indexOf(r);
+    if (pos2 >= 0) world.rabbits.splice(pos2, 1);
+  }
+
+  function removeFox(f) {
+    var i = idx(f.x, f.y);
+    var arr = world.cellsByFox[i];
+    var pos = arr.indexOf(f);
+    if (pos >= 0) arr.splice(pos, 1);
+    if (world.cells[i].fox === f) world.cells[i].fox = null;
+    var pos2 = world.foxes.indexOf(f);
+    if (pos2 >= 0) world.foxes.splice(pos2, 1);
+  }
+
+  function doTick() {
+    for (var i = 0; i < world.cells.length; i++) {
+      var c = world.cells[i];
+      c.grass = Math.min(world.grassMax, c.grass + 1);
+    }
+
+    var rbs = world.rabbits.slice().sort(function (a, b) { return a.id - b.id; });
+    for (var ri = 0; ri < rbs.length; ri++) {
+      var rb = rbs[ri];
+      if (world.cells[idx(rb.x, rb.y)].rabbit !== rb) continue;
+      var nb = neighbours(rb.x, rb.y);
+      var free = [];
+      for (var ni = 0; ni < nb.length; ni++) {
+        if (!world.cells[idx(nb[ni][0], nb[ni][1])].rabbit) free.push(nb[ni]);
+      }
+      if (free.length > 0) {
+        var mv = pick(free);
+        moveAnimal(rb, mv[0], mv[1]);
+      }
+      var ci = idx(rb.x, rb.y);
+      rb.energy += world.rabbitGain * world.cells[ci].grass;
+      world.cells[ci].grass = 0;
+      rb.energy -= world.rabbitCost;
+      if (rb.energy >= world.rabbitBreed) {
+        var nb2 = neighbours(rb.x, rb.y);
+        var free2 = [];
+        for (var ni2 = 0; ni2 < nb2.length; ni2++) {
+          if (!world.cells[idx(nb2[ni2][0], nb2[ni2][1])].rabbit) free2.push(nb2[ni2]);
+        }
+        if (free2.length > 0) {
+          var spot = pick(free2);
+          var child = Math.floor(rb.energy / 2);
+          rb.energy -= child;
+          createRabbit(spot[0], spot[1], child);
+        }
+      }
+      if (rb.energy <= 0) removeRabbit(rb);
+    }
+
+    var fxs = world.foxes.slice().sort(function (a, b) { return a.id - b.id; });
+    for (var fi = 0; fi < fxs.length; fi++) {
+      var fx = fxs[fi];
+      if (world.cells[idx(fx.x, fx.y)].fox !== fx) continue;
+      var nb3 = neighbours(fx.x, fx.y);
+      var target = null;
+      var eatRabbit = false;
+      var cellHasRabbit = world.cells[idx(fx.x, fx.y)].rabbit !== null;
+      if (cellHasRabbit) { target = [[fx.x, fx.y]]; } else {
+        var eatFree = [];
+        for (var ni3 = 0; ni3 < nb3.length; ni3++) {
+          var cell = world.cells[idx(nb3[ni3][0], nb3[ni3][1])];
+          if (cell.rabbit !== null && cell.fox === null) eatFree.push(nb3[ni3]);
+        }
+        if (eatFree.length > 0) target = pick(eatFree);
+      }
+      if (target) {
+        if (target[0] === fx.x && target[1] === fx.y) {
+          var cr = world.cells[idx(fx.x, fx.y)].rabbit;
+          if (cr) { removeRabbit(cr); fx.energy += world.foxGain; }
+        } else {
+          moveAnimal(fx, target[0], target[1]);
+          var cr2 = world.cells[idx(fx.x, fx.y)].rabbit;
+          if (cr2) { removeRabbit(cr2); fx.energy += world.foxGain; }
+        }
+      } else {
+        var noFox = [];
+        for (var ni4 = 0; ni4 < nb3.length; ni4++) {
+          if (!world.cells[idx(nb3[ni4][0], nb3[ni4][1])].fox) noFox.push(nb3[ni4]);
+        }
+        if (noFox.length > 0) {
+          var mv2 = pick(noFox);
+          moveAnimal(fx, mv2[0], mv2[1]);
+          var cr3 = world.cells[idx(fx.x, fx.y)].rabbit;
+          if (cr3) { removeRabbit(cr3); fx.energy += world.foxGain; }
+        }
+      }
+      fx.energy -= world.foxCost;
+      if (fx.energy >= world.foxBreed) {
+        var nb4 = neighbours(fx.x, fx.y);
+        var free3 = [];
+        for (var ni5 = 0; ni5 < nb4.length; ni5++) {
+          if (!world.cells[idx(nb4[ni5][0], nb4[ni5][1])].fox) free3.push(nb4[ni5]);
+        }
+        if (free3.length > 0) {
+          var spot2 = pick(free3);
+          var child2 = Math.floor(fx.energy / 2);
+          fx.energy -= child2;
+          createFox(spot2[0], spot2[1], child2);
+        }
+      }
+      if (fx.energy <= 0) removeFox(fx);
+    }
+
+    world.tick += 1;
+    recordHistory();
+  }
+
+  function moveAnimal(a, x, y) {
+    var oldI = idx(a.x, a.y);
+    var newI = idx(x, y);
+    var arr = a === "rabbit" ? world.cellsByRabbit : world.cellsByFox;
+    var pos = arr[oldI].indexOf(a);
+    if (pos >= 0) arr[oldI].splice(pos, 1);
+    world.cells[oldI][a === "rabbit" ? "rabbit" : "fox"] = null;
+    a.x = x; a.y = y;
+    var pos2 = arr[newI].indexOf(a);
+    if (pos2 < 0) arr[newI].push(a);
+    world.cells[newI][a === "rabbit" ? "rabbit" : "fox"] = a;
+  }
+
+  function recordHistory() {
+    var grass = 0;
+    for (var i = 0; i < world.cells.length; i++) grass += world.cells[i].grass;
+    world.history.push({ tick: world.tick, rabbits: world.rabbits.length, foxes: world.foxes.length, grass: grass });
+  }
+
+  function counts() {
+    var grass = 0;
+    for (var i = 0; i < world.cells.length; i++) grass += world.cells[i].grass;
+    return { rabbits: world.rabbits.length, foxes: world.foxes.length, grass: grass };
+  }
+
+  function tickNum() { return world.tick; }
+
+  function cell(x, y) {
+    if (x < 0 || x >= world.width || y < 0 || y >= world.height) return { grass: 0, rabbit: null, fox: null };
+    var c = world.cells[idx(x, y)];
+    return { grass: c.grass, rabbit: c.rabbit, fox: c.fox };
+  }
+
+  function history() { return world.history.map(function (h) { return { tick: h.tick, rabbits: h.rabbits, foxes: h.foxes, grass: h.grass }; }); }
+
+  function derivative(x, y, p) {
+    return [p.alpha * x - p.beta * x * y, p.delta * x * y - p.gamma * y];
+  }
+
+  function ode(p, t, dt) {
+    var n = Math.round(t / dt);
+    var x = p.x0, y = p.y0;
+    for (var s = 0; s < n; s++) {
+      var k1 = derivative(x, y, p);
+      var k2 = derivative(x + 0.5 * dt * k1[0], y + 0.5 * dt * k1[1], p);
+      var k3 = derivative(x + 0.5 * dt * k2[0], y + 0.5 * dt * k2[1], p);
+      var k4 = derivative(x + dt * k3[0], y + dt * k3[1], p);
+      x += (dt / 6) * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]);
+      y += (dt / 6) * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+    }
+    return { x: x, y: y };
+  }
+
+  function exportCSV() {
+    var hist = history();
+    var lines = ["tick,rabbits,foxes,grass"];
+    for (var i = 0; i < hist.length; i++) {
+      lines.push(hist[i].tick + "," + hist[i].rabbits + "," + hist[i].foxes + "," + hist[i].grass);
+    }
+    return lines.join("\n") + "\n";
+  }
+
+  function exportScenario() {
+    return JSON.stringify({ version: 1, seed: state.seed, params: state.params });
+  }
+
+  function loadScenario(text) {
+    var parsed;
+    try { parsed = JSON.parse(text); } catch (e) { showError("Invalid JSON"); return false; }
+    if (!parsed || parsed.version !== 1) { showError("Invalid version"); return false; }
+    if (parsed.seed === undefined || parsed.seed === null || !Number.isInteger(parsed.seed)) { showError("Missing or non-integer seed"); return false; }
+    reset(parsed.seed, parsed.params || {});
+    clearError();
+    return true;
+  }
+
+  function showError(msg) { els.error.textContent = msg; }
+  function clearError() { els.error.textContent = ""; }
+
+  function render() {
+    var w = state.params.width, h = state.params.height;
+    canvas.width = w * 10;
+    canvas.height = h * 10;
+    var ctx = canvas.getContext("2d");
+    var gm = state.params.grassMax;
+    ctx.fillStyle = "#1e1e1e";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var c = world.cells[idx(x, y)];
+        var G = 60 + Math.round(160 * c.grass / gm);
+        ctx.fillStyle = "rgb(30," + G + ",30)";
+        ctx.fillRect(x * 10, y * 10, 10, 10);
+      }
+    }
+    for (var i = 0; i < world.rabbits.length; i++) {
+      var rb = world.rabbits[i];
+      drawAnimal(ctx, rb.x, rb.y, "rgb(240,240,240)");
+    }
+    for (var j = 0; j < world.foxes.length; j++) {
+      var fx = world.foxes[j];
+      drawAnimal(ctx, fx.x, fx.y, "rgb(220,80,20)");
+    }
+  }
+
+  function drawAnimal(ctx, x, y, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(x * 10 + 3, y * 10 + 3, 4, 4);
+  }
+
+  function updateCounters() {
+    var c = counts();
+    els.tick.textContent = world.tick;
+    els.countRabbits.textContent = c.rabbits;
+    els.countFoxes.textContent = c.foxes;
+    els.countGrass.textContent = c.grass;
+  }
+
+  function updateChart() {
+    var hist = history();
+    var maxT = 1, maxC = 1;
+    for (var i = 0; i < hist.length; i++) {
+      if (hist[i].tick > maxT) maxT = hist[i].tick;
+      if (hist[i].rabbits > maxC) maxC = hist[i].rabbits;
+      if (hist[i].foxes > maxC) maxC = hist[i].foxes;
+    }
+    var pad = 40, plotW = 450, plotH = 180, base = 200;
+    function pts(arr) {
+      if (hist.length === 1) return "40,100";
+      var res = [];
+      for (var i = 0; i < hist.length; i++) {
+        var px = 40 + (hist[i].tick / maxT) * plotW;
+        var ry = base - (hist[i][arr] / maxC) * plotH;
+        res.push(px.toFixed(2) + "," + ry.toFixed(2));
+      }
+      return res.join(" ");
+    }
+    els.chartRabbits.setAttribute("points", pts("rabbits"));
+    els.chartFoxes.setAttribute("points", pts("foxes"));
+  }
+
+  function runODE() {
+    var p = {
+      alpha: parseFloat(els.odeAlpha.value),
+      beta: parseFloat(els.odeBeta.value),
+      gamma: parseFloat(els.odeGamma.value),
+      delta: parseFloat(els.odeDelta.value),
+      x0: parseFloat(els.odeX0.value),
+      y0: parseFloat(els.odeY0.value)
+    };
+    var t = parseFloat(els.odeT.value);
+    var dt = parseFloat(els.odeDt.value);
+    var end = ode(p, t, dt);
+    els.odeX.textContent = end.x;
+    els.odeY.textContent = end.y;
+    els.odeEqX.textContent = p.gamma / p.delta;
+    els.odeEqY.textContent = p.alpha / p.beta;
+    function V(x, y) { return p.delta * x - p.gamma * Math.log(x) + p.beta * y - p.alpha * Math.log(y); }
+    var drift = Math.abs(V(end.x, end.y) - V(p.x0, p.y0));
+    els.odeDrift.textContent = drift;
+    drawODEChart(p, t, dt);
+  }
+
+  function drawODEChart(p, t, dt) {
+    var n = Math.round(t / dt);
+    var x = p.x0, y = p.y0;
+    var xs = [x], ys = [y];
+    for (var s = 0; s < n; s++) {
+      var k1 = derivative(x, y, p);
+      var k2 = derivative(x + 0.5 * dt * k1[0], y + 0.5 * dt * k1[1], p);
+      var k3 = derivative(x + 0.5 * dt * k2[0], y + 0.5 * dt * k2[1], p);
+      var k4 = derivative(x + dt * k3[0], y + dt * k3[1], p);
+      x += (dt / 6) * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]);
+      y += (dt / 6) * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+      xs.push(x); ys.push(y);
+    }
+    var maxX = -Infinity, minX = Infinity, maxY = -Infinity, minY = Infinity;
+    for (var i = 0; i < xs.length; i++) {
+      if (xs[i] > maxX) maxX = xs[i];
+      if (xs[i] < minX) minX = xs[i];
+      if (ys[i] > maxY) maxY = ys[i];
+      if (ys[i] < minY) minY = ys[i];
+    }
+    var pad = 40, plotW = 450, plotH = 180, base = 200;
+    var xSpan = (maxX - minX) || 1, ySpan = (maxY - minY) || 1;
+    function ptsX() {
+      var res = [];
+      for (var i = 0; i < xs.length; i++) {
+        var px = 40 + ((xs[i] - minX) / xSpan) * plotW;
+        var ry = base - ((ys[i] - minY) / ySpan) * plotH;
+        res.push(px.toFixed(2) + "," + ry.toFixed(2));
+      }
+      return res.join(" ");
+    }
+    els.odeChartX.setAttribute("points", ptsX());
+    els.odeChartY.setAttribute("points", ptsX());
+  }
+
+  var presets = {};
+
+  function loadPresets() {
+    var raw = localStorage.getItem("ecolab.presets");
+    presets = {};
+    if (raw) {
+      try { presets = JSON.parse(raw); } catch (e) { presets = {}; }
+    }
+    renderPresetList();
+  }
+
+  function savePresets() {
+    localStorage.setItem("ecolab.presets", JSON.stringify(presets));
+    renderPresetList();
+  }
+
+  function renderPresetList() {
+    els.presetList.innerHTML = "";
+    var names = Object.keys(presets);
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var item = document.createElement("div");
+      item.className = "preset-item";
+      var nm = document.createElement("span");
+      nm.className = "nm";
+      nm.textContent = name;
+      item.appendChild(nm);
+      var loadBtn = document.createElement("button");
+      loadBtn.className = "small-btn";
+      loadBtn.textContent = "Load";
+      loadBtn.addEventListener("click", function (n) {
+        return function () {
+          var txt = JSON.stringify(presets[n]);
+          els.scenarioJson.value = txt;
+          loadScenario(txt);
+        };
+      }(name));
+      item.appendChild(loadBtn);
+      var delBtn = document.createElement("button");
+      delBtn.className = "small-btn";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function (n) {
+        return function () {
+          delete presets[n];
+          savePresets();
+        };
+      }(name));
+      item.appendChild(delBtn);
+      els.presetList.appendChild(item);
+    }
+  }
+
+  function init() {
+    canvas = document.querySelector("canvas[data-testid='world']");
+    els = {
+      seed: document.querySelector("input[data-testid='seed']"),
+      speed: document.querySelector("input[data-testid='speed']"),
+      play: document.querySelector("button[data-testid='play']"),
+      pause: document.querySelector("button[data-testid='pause']"),
+      step: document.querySelector("button[data-testid='step']"),
+      reset: document.querySelector("button[data-testid='reset']"),
+      tick: document.querySelector("span[data-testid='tick']"),
+      countRabbits: document.querySelector("span[data-testid='count-rabbits']"),
+      countFoxes: document.querySelector("span[data-testid='count-foxes']"),
+      countGrass: document.querySelector("span[data-testid='count-grass']"),
+      chartRabbits: document.querySelector("polyline[data-testid='series-rabbits']"),
+      chartFoxes: document.querySelector("polyline[data-testid='series-foxes']"),
+      odeAlpha: document.querySelector("input[data-testid='ode-alpha']"),
+      odeBeta: document.querySelector("input[data-testid='ode-beta']"),
+      odeGamma: document.querySelector("input[data-testid='ode-gamma']"),
+      odeDelta: document.querySelector("input[data-testid='ode-delta']"),
+      odeX0: document.querySelector("input[data-testid='ode-x0']"),
+      odeY0: document.querySelector("input[data-testid='ode-y0']"),
+      odeT: document.querySelector("input[data-testid='ode-t']"),
+      odeDt: document.querySelector("input[data-testid='ode-dt']"),
+      odeRun: document.querySelector("button[data-testid='ode-run']"),
+      odeX: document.querySelector("span[data-testid='ode-x']"),
+      odeY: document.querySelector("span[data-testid='ode-y']"),
+      odeEqX: document.querySelector("span[data-testid='ode-eq-x']"),
+      odeEqY: document.querySelector("span[data-testid='ode-eq-y']"),
+      odeDrift: document.querySelector("span[data-testid='ode-drift']"),
+      odeChartX: document.querySelector("polyline[data-testid='ode-series-x']"),
+      odeChartY: document.querySelector("polyline[data-testid='ode-series-y']"),
+      scenarioJson: document.querySelector("textarea[data-testid='scenario-json']"),
+      scenarioExport: document.querySelector("button[data-testid='scenario-export']"),
+      scenarioLoad: document.querySelector("button[data-testid='scenario-load']"),
+      error: document.querySelector("div[data-testid='scenario-error']"),
+      csvExport: document.querySelector("button[data-testid='csv-export']"),
+      presetName: document.querySelector("input[data-testid='preset-name']"),
+      presetSave: document.querySelector("button[data-testid='preset-save']"),
+      presetList: document.querySelector("div[data-testid='preset-list']"),
+      announcer: document.querySelector("div[data-testid='announcer']")
+    };
+
+    var sliderWrap = document.getElementById("sliders");
+    for (var s = 0; s < PARAM_SLIDERS.length; s++) {
+      var info = PARAM_SLIDERS[s];
+      var row = document.createElement("div");
+      row.className = "row";
+      var label = document.createElement("label");
+      label.setAttribute("for", "slider-" + info.key);
+      label.textContent = info.key + ":";
+      var input = document.createElement("input");
+      input.type = "range";
+      input.id = "slider-" + info.key;
+      input.dataTestId = info.key;
+      input.min = info.min;
+      input.max = info.max;
+      input.value = DEFAULTS[info.key];
+      var val = document.createElement("span");
+      val.className = "val";
+      val.textContent = DEFAULTS[info.key];
+      input.addEventListener("input", function (el, vl) {
+        return function () { vl.textContent = el.value; };
+      }(input, val));
+      row.appendChild(label);
+      row.appendChild(input);
+      row.appendChild(val);
+      sliderWrap.appendChild(row);
+    }
+
+    els.play.addEventListener("click", play);
+    els.pause.addEventListener("click", pause);
+    els.step.addEventListener("click", function () { step(1); });
+    els.reset.addEventListener("click", doReset);
+    els.scenarioExport.addEventListener("click", function () { els.scenarioJson.value = exportScenario(); });
+    els.scenarioLoad.addEventListener("click", function () { loadScenario(els.scenarioJson.value); });
+    els.csvExport.addEventListener("click", downloadCSV);
+    els.odeRun.addEventListener("click", runODE);
+    els.presetSave.addEventListener("click", savePreset);
+
+    window.addEventListener("keydown", handleKeydown);
+
+    loadPresets();
+    reset(42, {});
+    els.seed.value = 42;
+  }
+
+  function doReset() {
+    var seed = parseInt(els.seed.value, 10);
+    if (isNaN(seed)) seed = 42;
+    var params = {};
+    var sliders = document.querySelectorAll("input[data-testid]");
+    for (var i = 0; i < sliders.length; i++) {
+      var td = sliders[i].dataTestId;
+      if (td && DEFAULTS[td] !== undefined) {
+        params[td] = parseFloat(sliders[i].value);
+      }
+    }
+    if (state.playing) pause();
+    reset(seed, params);
+    announce();
+  }
+
+  function play() {
+    if (state.playing) return;
+    state.playing = true;
+    state.acc = 0;
+    state.lastTime = performance.now();
+    function frame(now) {
+      if (!state.playing) return;
+      var dt = (now - state.lastTime) / 1000;
+      state.lastTime = now;
+      state.acc += dt * state.speed;
+      var interval = 1 / 60;
+      while (state.acc >= interval) {
+        doTick();
+        state.acc -= interval;
+        render();
+        updateCounters();
+      }
+      updateChart();
+      state.raf = requestAnimationFrame(frame);
+    }
+    state.raf = requestAnimationFrame(frame);
+  }
+
+  function pause() {
+    state.playing = false;
+    if (state.raf) cancelAnimationFrame(state.raf);
+    state.acc = 0;
+    announce();
+  }
+
+  function step(n) {
+    for (var i = 0; i < n; i++) doTick();
+    render();
+    updateCounters();
+    updateChart();
+    announce();
+    return counts();
+  }
+
+  function announce() {
+    var c = counts();
+    els.announcer.textContent = "Tick " + world.tick + ": " + c.rabbits + " rabbits, " + c.foxes + " foxes";
+  }
+
+  function downloadCSV() {
+    var text = exportCSV();
+    var blob = new Blob([text], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "ecolab.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function savePreset() {
+    var name = els.presetName.value.trim();
+    if (!name) return;
+    presets[name] = JSON.parse(exportScenario());
+    savePresets();
+    els.presetName.value = "";
+  }
+
+  function handleKeydown(e) {
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") return;
+    if (e.key === " ") {
+      e.preventDefault();
+      if (state.playing) pause(); else play();
+    } else if (e.key === "s") {
+      e.preventDefault();
+      step(1);
+    } else if (e.key === "r") {
+      e.preventDefault();
+      doReset();
+    }
+  }
+
+  window.lab = {
+    reset: reset,
+    step: step,
+    counts: counts,
+    tick: tickNum,
+    cell: cell,
+    history: history,
+    ode: ode,
+    exportCSV: exportCSV,
+    exportScenario: exportScenario,
+    loadScenario: loadScenario
+  };
+
+  document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>

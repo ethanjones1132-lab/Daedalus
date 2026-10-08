@@ -1,0 +1,158 @@
+## Plan
+
+**Data model**  
+- `grid`: 2‑D array of cells `{grass, rabbit, fox}`.  
+- `animals`: two maps `rabbits` and `foxes` keyed by id → `{id, x, y, energy}`.  
+- `idCounter`: next id.  
+- `rand`: mulberry32 generator.  
+- `history`: array of `{tick, rabbits, foxes, grass}`.  
+- `params`: merged defaults + user overrides.  
+- `tickCount`: current tick.  
+
+**Tick order**  
+1. Grow grass.  
+2. Rabbits (sorted by id): move → eat → cost → breed → die.  
+3. Foxes (sorted by id): move → eat → cost → breed → die.  
+4. Increment tick, record history.  
+
+**Components**  
+- `WorldCanvas`: `<canvas data-testid="world">` renders grid.  
+- `Controls`: play/pause, step, reset, speed slider, seed input, parameter sliders.  
+- `Counters`: tick, rabbits, foxes, grass.  
+- `Chart`: `<svg data-testid="chart">` with two polylines.  
+- `CSVExport`: button `csv-export`.  
+- `ScenarioPanel`: textarea, export/load buttons, error message.  
+- `ODEPanel`: inputs, run button, outputs, chart.  
+- `PresetPanel`: name input, save button, list of presets with load/delete.  
+- `Announcer`: live region.  
+
+All UI elements use `data-testid` for tests. The simulation logic is encapsulated in `window.lab` exposing the required API. Rendering is triggered after each reset or step. The play loop uses `requestAnimationFrame` to schedule ticks at the user‑selected speed, measuring elapsed time. Keyboard shortcuts are added on `keydown` when no form control is focused. Presets are stored in `localStorage["ecolab.presets"]`. The layout uses CSS flexbox with media queries to switch between side‑by‑side and stacked layouts. All styles are inline in the single HTML file.  
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ecosystem Lab</title>
+<style>
+body{font-family:Arial,sans-serif;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
+#panel-world{flex:1;display:flex;flex-direction:column;align-items:center;padding:10px}
+#panel-side{flex:1;overflow:auto;padding:10px}
+@media(min-width:700px){body{flex-direction:row}#panel-world{max-width:60%}#panel-side{max-width:40%}}
+canvas{border:1px solid #000}
+button:focus{outline:2px solid #00f}
+label{display:block;margin-top:5px}
+input[type=range]{width:100%}
+svg{border:1px solid #ccc;width:100%;height:200px}
+[data-testid]{margin-top:5px}
+</style>
+</head>
+<body>
+<div id="panel-world">
+<canvas data-testid="world"></canvas>
+<div>
+<button data-testid="play">Play</button>
+<button data-testid="pause">Pause</button>
+<button data-testid="step">Step</button>
+<button data-testid="reset">Reset</button>
+</div>
+<div>
+<label>Seed: <input type="number" data-testid="seed" value="42"></label>
+<label>Speed: <input type="range" data-testid="speed" min="1" max="60" value="10"></label>
+</div>
+<div>
+<label>Rabbits0: <input type="range" data-testid="param-rabbits0" min="0" max="300" value="100"><span data-testid="val-rabbits0">100</span></label>
+<label>Foxes0: <input type="range" data-testid="param-foxes0" min="0" max="60" value="6"><span data-testid="val-foxes0">6</span></label>
+<label>RabbitBreed: <input type="range" data-testid="param-rabbitBreed" min="2" max="40" value="12"><span data-testid="val-rabbitBreed">12</span></label>
+<label>FoxBreed: <input type="range" data-testid="param-foxBreed" min="2" max="60" value="40"><span data-testid="val-foxBreed">40</span></label>
+<label>FoxGain: <input type="range" data-testid="param-foxGain" min="1" max="30" value="4"><span data-testid="val-foxGain">4</span></label>
+<label>GrassMax: <input type="range" data-testid="param-grassMax" min="1" max="10" value="4"><span data-testid="val-grassMax">4</span></label>
+</div>
+<div>
+<span data-testid="tick">0</span> | <span data-testid="count-rabbits">0</span> | <span data-testid="count-foxes">0</span> | <span data-testid="count-grass">0</span>
+</div>
+<div>
+<button data-testid="csv-export">Export CSV</button>
+</div>
+<div>
+<textarea data-testid="scenario-json" rows="4" cols="30"></textarea>
+<button data-testid="scenario-export">Export Scenario</button>
+<button data-testid="scenario-load">Load Scenario</button>
+<message data-testid="scenario-error"></message>
+</div>
+<div>
+<label>Preset Name: <input type="text" data-testid="preset-name"></label>
+<button data-testid="preset-save">Save Preset</button>
+<ul data-testid="preset-list"></ul>
+</div>
+<div>
+<message id="announcer" aria-live="polite"></message>
+</div>
+</div>
+<div id="panel-side">
+<svg data-testid="chart"></svg>
+<div>
+<h3>Lotka–Volterra</h3>
+<label>α: <input type="number" step="0.01" data-testid="ode-alpha" value="1.1"></label>
+<label>β: <input type="number" step="0.01" data-testid="ode-beta" value="0.4"></label>
+<label>γ: <input type="number" step="0.01" data-testid="ode-gamma" value="0.4"></label>
+<label>δ: <input type="number" step="0.01" data-testid="ode-delta" value="0.1"></label>
+<label>x0: <input type="number" step="0.1" data-testid="ode-x0" value="10"></label>
+<label>y0: <input type="number" step="0.1" data-testid="ode-y0" value="10"></label>
+<label>t: <input type="number" step="1" data-testid="ode-t" value="50"></label>
+<label>dt: <input type="number" step="0.01" data-testid="ode-dt" value="0.01"></label>
+<button data-testid="ode-run">Run</button>
+<div>
+<span>Final x: <span data-testid="ode-x"></span></span>
+<span>Final y: <span data-testid="ode-y"></span></span>
+</div>
+<div>
+<span>Equilibrium x: <span data-testid="ode-eq-x"></span></span>
+<span>Equilibrium y: <span data-testid="ode-eq-y"></span></span>
+</div>
+<div>
+<span>Drift: <span data-testid="ode-drift"></span></span>
+</div>
+<svg data-testid="ode-chart"></svg>
+</div>
+</div>
+<script>
+(() => {
+const defaults={width:40,height:30,grassMax:4,rabbits0:100,foxes0:6,rabbitStart:6,rabbitGain:1,rabbitCost:1,rabbitBreed:12,foxStart:12,foxGain:4,foxCost:2,foxBreed:40};
+let params={...defaults};
+let grid=[],rabbits={},foxes={},idCounter=1,rand=null,tickCount=0,history=[],playing=false,playStart=0,playElapsed=0,playSpeed=10,canvas,ctx,worldSize,chart,odeChart;
+function mulberry32(seed){let a=seed|0;return()=>{a=(a+0x6D2B79F5)|0;let t=a;t= Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;}}
+function reset(seed,override={}){params={...defaults,...override};rand=mulberry32(seed);tickCount=0;idCounter=1;history=[];grid=Array.from({length:params.height},()=>Array.from({length:params.width},()=>({grass:0,rabbit:null,fox:null})));for(let y=0;y<params.height;y++)for(let x=0;x<params.width;x++)grid[y][x].grass=Math.floor(rand()*(params.grassMax+1));rabbits={};foxes={};for(let i=0;i<params.rabbits0;i++){let cells=[];for(let y=0;y<params.height;y++)for(let x=0;x<params.width;x++)if(!grid[y][x].rabbit)cells.push({x,y});if(cells.length){let {x,y}=pick(cells);let id=idCounter++;rabbits[id]={id,x,y,energy:params.rabbitStart};grid[y][x].rabbit=id;}}for(let i=0;i<params.foxes0;i++){let cells=[];for(let y=0;y<params.height;y++)for(let x=0;x<params.width;x++)if(!grid[y][x].fox)cells.push({x,y});if(cells.length){let {x,y}=pick(cells);let id=idCounter++;foxes[id]={id,x,y,energy:params.foxStart};grid[y][x].fox=id;}}record();draw();updateCounters();}
+function pick(list){return list[Math.floor(rand()*list.length)];}
+function neighbors(x,y){let res=[];if(y>0)res.push({x,y-1});if(x<params.width-1)res.push({x+1,y});if(y<params.height-1)res.push({x,y+1});if(x>0)res.push({x-1,y});return res;}
+function step(n=1){for(let i=0;i<n;i++)tick();draw();updateCounters();return counts();}
+function tick(){for(let y=0;y<params.height;y++)for(let x=0;x<params.width;x++){let c=grid[y][x];c.grass=Math.min(params.grassMax,c.grass+1);}let rIds=Object.keys(rabbits).map(Number).sort((a,b)=>a-b);for(let id of rIds){let a=rabbits[id];if(!a)continue;let nb=neighbors(a.x,a.y).filter(n=>!grid[n.y][n.x].rabbit);if(nb.length)a={...a, ...pick(nb)};grid[a.y][a.x].rabbit=id;let cell=grid[a.y][a.x];a.energy+=params.rabbitGain*cell.grass;cell.grass=0;a.energy-=params.rabbitCost;if(a.energy>=params.rabbitBreed){let nb2=neighbors(a.x,a.y).filter(n=>!grid[n.y][n.x].rabbit);if(nb2.length){let spot=pick(nb2);let child=Math.floor(a.energy/2);a.energy-=child;let cid=idCounter++;rabbits[cid]={id:cid,x:spot.x,y:spot.y,energy:child};grid[spot.y][spot.x].rabbit=cid;}}if(a.energy<=0){delete rabbits[id];grid[a.y][a.x].rabbit=null;continue;}rabbits[id]=a;}
+let fIds=Object.keys(foxes).map(Number).sort((a,b)=>a-b);for(let id of fIds){let a=foxes[id];if(!a)continue;let nb=neighbors(a.x,a.y).filter(n=>grid[n.y][n.x].rabbit && !grid[n.y][n.x].fox);if(nb.length)a={...a,...pick(nb)};else{nb=neighbors(a.x,a.y).filter(n=>!grid[n.y][n.x].fox);if(nb.length)a={...a,...pick(nb)}}grid[a.y][a.x].fox=id;let cell=grid[a.y][a.x];if(cell.rabbit){delete rabbits[cell.rabbit];cell.rabbit=null;}a.energy+=params.foxGain;a.energy-=params.foxCost;if(a.energy>=params.foxBreed){let nb2=neighbors(a.x,a.y).filter(n=>!grid[n.y][n.x].fox);if(nb2.length){let spot=pick(nb2);let child=Math.floor(a.energy/2);a.energy-=child;let cid=idCounter++;foxes[cid]={id:cid,x:spot.x,y:spot.y,energy:child};grid[spot.y][spot.x].fox=cid;}}if(a.energy<=0){delete foxes[id];grid[a.y][a.x].fox=null;continue;}foxes[id]=a;}
+tickCount++;record();}
+function record(){let grass=grid.reduce((s,row)=>s+row.reduce((s2,c)=>s2+c.grass,0),0);history.push({tick:tickCount,rabbits:Object.keys(rabbits).length,foxes:Object.keys(foxes).length,grass});}
+function counts(){let grass=grid.reduce((s,row)=>s+row.reduce((s2,c)=>s2+c.grass,0),0);return{rabbits:Object.keys(rabbits).length,foxes:Object.keys(foxes).length,grass};}
+function updateCounters(){document.querySelector('[data-testid="tick"]').textContent=tickCount;document.querySelector('[data-testid="count-rabbits"]').textContent=Object.keys(rabbits).length;document.querySelector('[data-testid="count-foxes"]').textContent=Object.keys(foxes).length;document.querySelector('[data-testid="count-grass"]').textContent=grid.reduce((s,row)=>s+row.reduce((s2,c)=>s2+c.grass,0),0);}
+function draw(){ctx.clearRect(0,0,worldSize,worldSize);for(let y=0;y<params.height;y++)for(let x=0;x<params.width;x++){let c=grid[y][x];let G=60+Math.round(160*c.grass/params.grassMax);ctx.fillStyle=`rgb(30,${G},30)`;ctx.fillRect(x*10,y*10,10,10);if(c.rabbit){ctx.fillStyle='rgb(240,240,240)';ctx.fillRect(x*10+3,y*10+3,4,4);}if(c.fox){ctx.fillStyle='rgb(220,80,20)';ctx.fillRect(x*10+3,y*10+3,4,4);}}}
+function init(){canvas=document.querySelector('[data-testid="world"]');ctx=canvas.getContext('2d');worldSize=params.width*10;canvas.width=worldSize;canvas.height=worldSize;chart=document.querySelector('[data-testid="chart"]');odeChart=document.querySelector('[data-testid="ode-chart"]');reset(42,{});setupControls();loadPresets();announce();document.body.addEventListener('keydown',keyHandler);}
+function setupControls(){document.querySelector('[data-testid="play"]').onclick=()=>{playing=true;playStart=performance.now();loop();};document.querySelector('[data-testid="pause"]').onclick=()=>{playing=false;};document.querySelector('[data-testid="step"]').onclick=()=>{step();};document.querySelector('[data-testid="reset"]').onclick=()=>{let seed=parseInt(document.querySelector('[data-testid="seed"]').value)||42;let p={rabbits0:parseInt(document.querySelector('[data-testid="param-rabbits0"]').value)||100,foxes0:parseInt(document.querySelector('[data-testid="param-foxes0"]').value)||6,rabbitBreed:parseInt(document.querySelector('[data-testid="param-rabbitBreed"]').value)||12,foxBreed:parseInt(document.querySelector('[data-testid="param-foxBreed"]').value)||40,foxGain:parseInt(document.querySelector('[data-testid="param-foxGain"]').value)||4,grassMax:parseInt(document.querySelector('[data-testid="param-grassMax"]').value)||4};reset(seed,p);};document.querySelector('[data-testid="speed"]').oninput=e=>{playSpeed=parseInt(e.target.value)||10;};['param-rabbits0','param-foxes0','param-rabbitBreed','param-foxBreed','param-foxGain','param-grassMax'].forEach(id=>{let inp=document.querySelector(`[data-testid="${id}"]`);let val=document.querySelector(`[data-testid="val-${id}"]`);inp.oninput=e=>{val.textContent=e.target.value;};});document.querySelector('[data-testid="csv-export"]').onclick=()=>{let csv=exportCSV();let a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='ecolab.csv';a.click();};document.querySelector('[data-testid="scenario-export"]').onclick=()=>{document.querySelector('[data-testid="scenario-json"]').value=exportScenario();};document.querySelector('[data-testid="scenario-load"]').onclick=()=>{loadScenario(document.querySelector('[data-testid="scenario-json"]').value);};document.querySelector('[data-testid="preset-save"]').onclick=()=>{let name=document.querySelector('[data-testid="preset-name"]').value.trim();if(name){savePreset(name);loadPresets();}};}
+function loop(){if(!playing)return;let now=performance.now();let elapsed=now-playStart;playElapsed+=elapsed;playStart=now;let ticks=Math.floor(playElapsed*playSpeed/1000);if(ticks>0){step(ticks);playElapsed-=ticks*1000/playSpeed;}draw();announce();requestAnimationFrame(loop);}
+function announce(){document.getElementById('announcer').textContent=`Tick ${tickCount}: ${Object.keys(rabbits).length} rabbits, ${Object.keys(foxes).length} foxes`;}
+// CSV
+function exportCSV(){let lines=['tick,rabbits,foxes,grass'];history.forEach(h=>lines.push(`${h.tick},${h.rabbits},${h.foxes},${h.grass}`));return lines.join('\n')+'\n';}
+// Scenario
+function exportScenario(){return JSON.stringify({version:1,seed:parseInt(document.querySelector('[data-testid="seed"]').value)||42,params});}
+function loadScenario(text){try{let o=JSON.parse(text);if(o.version!==1||!Number.isInteger(o.seed))throw'bad';reset(o.seed,o.params||{});document.querySelector('[data-testid="scenario-error"]').textContent='';return true;}catch(e){document.querySelector('[data-testid="scenario-error"]').textContent='Invalid scenario';return false;}}
+function odeRun(){let a=parseFloat(document.querySelector('[data-testid="ode-alpha"]').value)||1.1;let b=parseFloat(document.querySelector('[data-testid="ode-beta"]').value)||0.4;let g=parseFloat(document.querySelector('[data-testid="ode-gamma"]').value)||0.4;let d=parseFloat(document.querySelector('[data-testid="ode-delta"]').value)||0.1;let x0=parseFloat(document.querySelector('[data-testid="ode-x0"]').value)||10;let y0=parseFloat(document.querySelector('[data-testid="ode-y0"]').value)||10;let t=parseFloat(document.querySelector('[data-testid="ode-t"]').value)||50;let dt=parseFloat(document.querySelector('[data-testid="ode-dt"]').value)||0.01;let n=Math.round(t/dt);let x=x0,y=y0;for(let i=0;i<n;i++){let k1x=a*x-b*x*y,k1y=d*x*y-g*y;let k2x=a*(x+dt*k1x/2)-b*(x+dt*k1x/2)*(y+dt*k1y/2),k2y=d*(x+dt*k1x/2)*(y+dt*k1y/2)-g*(y+dt*k1y/2);let k3x=a*(x+dt*k2x/2)-b*(x+dt*k2x/2)*(y+dt*k2y/2),k3y=d*(x+dt*k2x/2)*(y+dt*k2y/2)-g*(y+dt*k2y/2);let k4x=a*(x+dt*k3x)-b*(x+dt*k3x)*(y+dt*k3y),k4y=d*(x+dt*k3x)*(y+dt*k3y)-g*(y+dt*k3y);x+=dt*(k1x+2*k2x+2*k3x+k4x)/6;y+=dt*(k1y+2*k2y+2*k3y+k4y)/6;}document.querySelector('[data-testid="ode-x"]').textContent=x.toPrecision(8);document.querySelector('[data-testid="ode-y"]').textContent=y.toPrecision(8);document.querySelector('[data-testid="ode-eq-x"]').textContent=(g/d).toPrecision(8);document.querySelector('[data-testid="ode-eq-y"]').textContent=(a/b).toPrecision(8);let V0=d*x0-g*Math.log(x0)+b*y0-a*Math.log(y0);let V1=d*x-b*Math.log(x)+b*y-a*Math.log(y);document.querySelector('[data-testid="ode-drift"]').textContent=Math.abs(V1-V0).toPrecision(8);drawOdeChart(x0,y0,x,y);}
+// ODE chart
+function drawOdeChart(x0,y0,x1,y1){let pts=[];let n=200;let dx=(x1-x0)/n;let dy=(y1-y0)/n;for(let i=0;i<=n;i++)pts.push([x0+dx*i,y0+dy*i]);let maxX=Math.max(...pts.map(p=>p[0]));let maxY=Math.max(...pts.map(p=>p[1]));let minX=Math.min(...pts.map(p=>p[0]));let minY=Math.min(...pts.map(p=>p[1]));let w=odeChart.clientWidth,h=odeChart.clientHeight;let poly='';pts.forEach((p,i)=>{let px=(p[0]-minX)/(maxX-minX)*w;let py=h-(p[1]-minY)/(maxY-minY)*h;poly+=i?' '+px+','+py:px+','+py;});odeChart.innerHTML=`<polyline data-testid="ode-series-x" points="${poly}" fill="none" stroke="blue"/>`;}
+// Chart
+function updateChart(){let w=chart.clientWidth,h=chart.clientHeight;let maxR=Math.max(...history.map(h=>h.rabbits));let maxF=Math.max(...history.map(h=>h.foxes));let max=Math.max(maxR,maxF);let polyR='',polyF='';history.forEach((h,i)=>{let x=i*w/history.length;let yR=h.rabbits?h.rabbits/max*h:0;let yF=h.foxes?h.foxes/max*h:0;polyR+=i?' '+x+','+yR:x+','+yR;polyF+=i?' '+x+','+yF:x+','+yF;});chart.innerHTML=`<polyline data-testid="series-rabbits" points="${polyR}" fill="none" stroke="green"/><polyline data-testid="series-foxes" points="${polyF}" fill="none" stroke="red"/>`;}
+// Presets
+function loadPresets(){let list=document.querySelector('[data-testid="preset-list"]');list.innerHTML='';let data=localStorage.getItem('ecolab.presets');let obj={};try{obj=JSON.parse(data)||{}}catch(e){}Object.entries(obj).forEach(([name,sc])=>{let li=document.createElement('li');li.textContent=name+' ';let loadBtn=document.createElement('button');loadBtn.textContent='Load';loadBtn.onclick=()=>{reset(sc.seed,sc.params||{});};let delBtn=document.createElement('button');delBtn.textContent='Delete';delBtn.onclick=()=>{delete obj[name];localStorage.setItem('ecolab.presets',JSON.stringify(obj));loadPresets();};li.append(loadBtn,delBtn);list.append(li);});}
+function savePreset(name){let data=localStorage.getItem('ecolab.presets');let obj={};try{obj=JSON.parse(data)||{}}catch(e){}obj[name]={seed:parseInt(document.querySelector('[data-testid="seed"]').value)||42,params};localStorage.setItem('ecolab.presets',JSON.stringify(obj));}
+document.querySelector('[data-testid="ode-run"]').onclick=odeRun;
+init();
+})();
+</script>
+</body>
+</html>

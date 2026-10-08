@@ -1,0 +1,20 @@
+{
+ "model": "tiel",
+ "file": "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf",
+ "seed": 3,
+ "ncmoe": 24,
+ "fit": [
+  {
+   "ncmoe": 24,
+   "loaded": true,
+   "vram_used_mib": 7830
+  }
+ ],
+ "wall_s": 227.0,
+ "finish_reason": "stop",
+ "prompt_n": 4119,
+ "gen_n": 9501,
+ "gen_tps": 43.6,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.15
+}

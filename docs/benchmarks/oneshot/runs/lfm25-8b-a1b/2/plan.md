@@ -1,0 +1,4 @@
+## Plan
+The app uses a single-page layout with two main panels: a world grid rendered on a `<canvas>` and a side panel containing charts, controls, and panels. The data model stores the grid as a 2‑D array of cells, each with grass, rabbit, and fox data. The tick order follows the specified neighbour order, and the generator `mulberry32` provides deterministic randomness. Components include a `CanvasRenderer`, `Controls`, `ChartRenderer`, `LotkaVolterraPanel`, and `PresetManager`. The reset function merges user parameters with defaults, initializing the generator, grass, rabbits, and foxes. Each tick updates grass, moves animals, eats, breeds, and records history. The UI updates via a requestAnimationFrame loop, driven by speed sliders and play/pause controls. The CSV export formats history data, and the scenario system handles JSON storage/loading. All interactions are keyboard accessible, with an ARIA live announcer for screen readers.
+
+## Code

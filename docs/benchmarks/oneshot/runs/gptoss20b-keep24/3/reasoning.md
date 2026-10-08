@@ -1,0 +1,1 @@
+Need plan and full HTML. Hard to implement fully but produce skeleton.
