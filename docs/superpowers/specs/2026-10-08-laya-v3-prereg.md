@@ -1,6 +1,6 @@
 # Laya v3: pre-registration (before any judge run)
 
-- **Committed:** 2026-10-08, about 12:50, before the first run of anything on `docs/benchmarks/laya-judge3/`. Nothing has run on the new judge set: it was sealed in a404c4b (DeepSeek-written, validated with `validate_tasks.py`, 120/120 well-formed) and has not been opened by a model since.
+- **Committed:** 2026-10-08 12:40 (5548446), before the first run of anything on `docs/benchmarks/laya-judge3/`. Nothing has run on the new judge set: it was sealed in a404c4b (DeepSeek-written, validated with `validate_tasks.py`, 120/120 well-formed) and has not been opened by a model since.
 - **Design:** `2026-10-07-laya-v3-design.md`, with the owner's amendment of 2026-10-08 (the v1 probe as a third route; below). **Plan:** `plans/2026-10-08-laya-v3.md` (deviations below).
 - **Coder:** Qwen3.6-35B-A3B keep96 (`bestofn_tier2b.CONFIGS["qwen36keep96"]`), MTP + n-gram speculation, llama-server 836d571.
 - **Laya:** 0.3.27 on the CPU, as in v2.
