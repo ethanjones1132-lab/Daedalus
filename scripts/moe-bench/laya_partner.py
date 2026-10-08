@@ -23,6 +23,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from laya_calibrate import IDENTITY, calibrate_card, platt_apply  # noqa: E402
+from laya_v3_text import EVIDENCE_OPTIONS, valid_state  # noqa: E402
 
 REPO_ID = "convaiinnovations/laya"
 CLASSIFY = {
@@ -52,6 +53,11 @@ VERIFY = {
                       "criteria": {"meets": "yes, it does what the requirement asks",
                                    "misses": "no, it still misses the requirement"}}},
 }
+
+# Laya v3 (spec 2026-10-07-laya-v3-design.md §3): A reads the probe output, B gates the repair
+EVIDENCE = {"shows": {"type": "choice", "instructions": "What does the probe output show about the helper?",
+                      "criteria": dict(EVIDENCE_OPTIONS)}}
+VALID = {"ok": {"type": "noul", "instructions": "The check tests exactly what the requirement states."}}
 
 
 def verify_state(requirement, entry, code):
@@ -95,6 +101,16 @@ class Laya:
         a = ans["ok"]
         return (a["noul"] if form == "noul" else a["probabilities"]["meets"]), ckpt
 
+    def evidence(self, state):
+        ans, ckpt = self.ask(state, EVIDENCE)
+        if ans is None:
+            return None
+        return {"choice": ans["shows"]["choice"], "probabilities": ans["shows"]["probabilities"], "ckpt": ckpt}
+
+    def valid(self, state):
+        ans, ckpt = self.ask(state, VALID)
+        return (None, None) if ans is None else (ans["ok"]["noul"], ckpt)
+
 
 def worker(a):
     out = sys.stdout
@@ -120,6 +136,13 @@ def worker(a):
             elif m["op"] == "verify":
                 p, ckpt = lp.verify(m["requirement"], m["entry"], m["code"], calib["verify_form"])
                 rep = {"p_raw": p, "p": platt_apply(p, calib["platt"]["verify"]), "ckpt": ckpt}
+            elif m["op"] == "evidence":
+                rep = lp.evidence(m["state"])
+                if rep is None:
+                    raise ValueError("evidence state too long for Laya")
+            elif m["op"] == "valid":
+                p, ckpt = lp.valid(m["state"])
+                rep = {"p_raw": p, "p": platt_apply(p, calib["platt"].get("valid", [1.0, 0.0])), "ckpt": ckpt}
             else:
                 raise ValueError(f"unknown op {m['op']!r}")
             rep["ok"] = True
@@ -151,6 +174,7 @@ def label(a):
     if out.exists():
         for r in map(json.loads, out.read_text(encoding="utf-8").splitlines()):
             done.add(("card", r["task"], r["wording"]) if r["type"] == "card"
+                     else ("valid", r["task"], r["trial"], r["assert"]) if r["type"] == "valid"
                      else ("verify", r["task"], r["trial"], r["run"], r["cand"], r["form"]))
     lp = Laya()
     t0, n = time.time(), 0
@@ -176,6 +200,19 @@ def label(a):
                 if n % 100 == 0:
                     f.flush()
                     print(f"{n} verify answers, {time.time() - t0:.0f} s", flush=True)
+        if getattr(a, "v3", False):  # Laya v3: P(valid) for every example assert (the repair gate's labels)
+            for r in map(json.loads, open(a.runs, encoding="utf-8")):
+                p3 = r.get("p3") if r.get("type") == "trial" else None
+                if not p3:
+                    continue
+                task = tasks[r["task"]]
+                for i, src in enumerate(p3["examples"]["asserts"]):
+                    if ("valid", r["task"], r["trial"], i) in done:
+                        continue
+                    t = time.time()
+                    p, ckpt = lp.valid(valid_state(task["spec"], p3["examples"]["imports"], src))
+                    f.write(json.dumps({"type": "valid", "task": r["task"], "trial": r["trial"], "assert": i, "p": p,
+                                        "ckpt": ckpt, "secs": round(time.time() - t, 3)}) + "\n")
     print(f"labelled in {time.time() - t0:.0f} s -> {out}", flush=True)
 
 
@@ -187,6 +224,7 @@ def main():
     lab = sub.add_parser("label")
     lab.add_argument("--runs", required=True)
     lab.add_argument("--out", required=True)
+    lab.add_argument("--v3", action="store_true")
     a = ap.parse_args()
     worker(a) if a.cmd == "worker" else label(a)
 

@@ -63,6 +63,16 @@ class CalibrateTest(unittest.TestCase):
         self.assertLess(aucs[("v1", "noul")], 0.5)
         self.assertEqual(max(aucs, key=aucs.get), ("v1", "kind_p"))
 
+    def test_card_has_library(self):
+        raw = {"kind": "library", "kind_p": {"unseen": 0.1, "library": 0.8}, "unseen": 0.5, "effort_p": [0.4, 0.3, 0.3]}
+        self.assertEqual(lc.calibrate_card(raw, lc.IDENTITY["platt"], "kind_p")["library"], 0.8)
+
+    def test_valid_pairs(self):
+        trials = [{"type": "trial", "task": "t", "trial": 0, "p3": {"asserts_valid": [True, False]}}]
+        labels = [{"type": "valid", "task": "t", "trial": 0, "assert": 0, "p": 0.9, "secs": 0.3},
+                  {"type": "valid", "task": "t", "trial": 0, "assert": 1, "p": 0.2, "secs": 0.3}]
+        self.assertEqual(lc.valid_pairs(trials, labels), [(0.9, True), (0.2, False)])
+
 
 if __name__ == "__main__":
     unittest.main()

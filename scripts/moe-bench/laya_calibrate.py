@@ -23,7 +23,7 @@ import pathlib
 EPS = 1e-4
 WORDINGS = ("v1", "v2")
 FORMS = ("noul", "rubric")
-QUANTITIES = ("unseen", "effort_little", "effort_alot", "verify")
+QUANTITIES = ("unseen", "effort_little", "effort_alot", "verify", "valid")
 KIND_OF = {"A": "algorithm", "B": "unseen", "C": "input", "D": "files", "E": "library"}
 HIDDEN_SIGNALS = ("noul", "kind_p")  # the v2 rule's task signal (spec 2026-10-06-laya-v2-design.md §3)
 IDENTITY = {"classify_wording": "v1", "verify_form": "noul", "hidden_signal": "noul",
@@ -116,7 +116,15 @@ def calibrate_card(raw, platt, hidden_signal="noul"):
             "p_little": platt_apply(ep[0], platt["effort_little"]),
             "p_alot": platt_apply(ep[2], platt["effort_alot"]),
             "effort_top": max(range(3), key=lambda i: ep[i]),
-            "hidden": hidden_of(raw, hidden_signal)}
+            "hidden": hidden_of(raw, hidden_signal), "library": raw.get("kind_p", {}).get("library", 0.0)}
+
+
+def valid_pairs(trial_rows, label_rows):
+    """[(Laya's raw P(valid), the reference passes the assert)] for every labelled example assert (spec v3 §4)."""
+    truth = {(t["task"], t["trial"], i): ok for t in trial_rows if t.get("p3")
+             for i, ok in enumerate(t["p3"]["asserts_valid"])}
+    return [(r["p"], truth[k]) for r in label_rows if r["type"] == "valid" and r["p"] is not None
+            and (k := (r["task"], r["trial"], r["assert"])) in truth]
 
 
 def hidden_of(raw, signal):
@@ -205,11 +213,17 @@ def fit_cmd(a):
     vauc = {f: pairs_auc(vp[f]) for f in FORMS}
     form = max(FORMS, key=lambda f: _num(vauc[f]))
     data = dict(wq[wording], verify=vp[form])
+    vpairs = valid_pairs(trials, labels)  # v3: the repair gate's labels
+    if vpairs:
+        data["valid"] = vpairs
     platt = {q: list(platt_fit([p for p, _ in v], [int(y) for _, y in v])) for q, v in data.items()}
     calib = {"classify_wording": wording, "verify_form": form, "hidden_signal": signal, "platt": platt,
              "report": {"hidden_auc": {f"{w}/{s}": v for (w, s), v in hauc.items()},
                         "wording_auc": wauc, "verify_auc": vauc,
                         "kind_accuracy": {w: kind_accuracy(cards_of(labels, w), cats) for w in WORDINGS},
+                        "library_auc": {w: pairs_auc([(c["kind_p"].get("library", 0.0), cats[t] == "E")
+                                                      for t, c in cards_of(labels, w).items() if t in cats])
+                                        for w in WORDINGS},
                         "chosen": diagnose(data, platt)}}
     pathlib.Path(a.out).write_text(json.dumps(calib, indent=1), encoding="utf-8")
     print(json.dumps(calib, indent=1))
@@ -222,6 +236,9 @@ def report_cmd(a):
     cats, s_ok, r_ok, cand_ok = outcomes(trials, labels)
     cards = cards_of(labels, calib["classify_wording"])
     data = dict(quantities(cards, cats, s_ok, r_ok), verify=verify_pairs(labels, cand_ok, calib["verify_form"]))
+    vpairs = valid_pairs(trials, labels)
+    if vpairs and "valid" in calib["platt"]:
+        data["valid"] = vpairs
     rep = {"hidden": hidden_report(cards, cats, calib.get("hidden_signal", "noul")),
            "diagnostics": diagnose(data, calib["platt"]), "kind_accuracy": kind_accuracy(cards, cats)}
     if a.out:
