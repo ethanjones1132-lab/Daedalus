@@ -451,6 +451,56 @@ def records_v3(trial_rows, label_rows, calib):
     return recs, cards
 
 
+def report_v3_cmd(a):
+    """Spec v3 §6: configurations 1, 2 and 6, v2 and v3 simulated, the ablations, live v3, and the bar."""
+    calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
+    rule = json.loads(pathlib.Path(a.rule).read_text(encoding="utf-8"))["rule"]
+    trials, labels = read_jsonl(a.trials), read_jsonl(a.labels)
+    recs, cards = records_v3(trials, labels, calib)
+    res = {"n": len(recs)}
+    for label, play in (("c1_single", "S"), ("c2_recipe", "R")):
+        solved, secs = fixed(recs, play)
+        res[label] = {"solved": solved, "mean_secs": round(secs, 3),
+                      "by_category": by_category((r["category"], outcome(r, play)[0]) for r in recs)}
+    res["c6_oracle"] = {"solved": oracle(recs)}
+    v2c = json.loads(pathlib.Path(a.v2_calib).read_text(encoding="utf-8"))
+    v2r = json.loads(pathlib.Path(a.v2_rule).read_text(encoding="utf-8"))
+    r2, k2 = records(trials, labels, v2c)
+    res["v2_simulated"] = dict(zip(("solved", "mean_secs"), system(r2, k2, v2r["verify"], True)))
+    res["v3_simulated"] = dict(zip(("solved", "mean_secs"), system_v3(recs, cards, rule)))
+    res["ablations"] = {n: dict(zip(("solved", "mean_secs"), system_v3(recs, cards, rule, dict(FULL, **ch))))
+                        for n, ch in ABLATIONS.items()}
+    rows = {(r["task"], r["trial"]): r for r in read_jsonl(a.live) if r.get("type") == "live"}
+    res["v3_live"] = {"solved": sum(r["graded_ok"] for r in rows.values()), "n": len(rows),
+                      "mean_secs": round(sum(r["model_secs"] for r in rows.values()) / max(len(rows), 1), 3),
+                      "by_category": by_category((r["category"], r["graded_ok"]) for r in rows.values()),
+                      **{k: sum(bool(r.get(f)) for r in rows.values()) for k, f in
+                         (("notes", "note"), ("repairs", "repaired"), ("escalations", "escalated"),
+                          ("early_stops", "early_stop"))},
+                      "probe_routes": sum(r["playbook"] == "P3" for r in rows.values()),
+                      "laya_fallbacks": sum(not r["laya_ok"] for r in rows.values())}
+    # the bar (owner, 2026-10-07): solves more, McNemar and task sign test both p < 0.10, no more model secs,
+    # and the tier2b guard
+    base = {(r["task"], r["trial"]): bool(outcome(r, "R")[0]) for r in recs}
+    b = sum(1 for k, r in rows.items() if k in base and r["graded_ok"] and not base[k])
+    c = sum(1 for k, r in rows.items() if k in base and not r["graded_ok"] and base[k])
+    tw, tl, tp = task_sign((k[0], r["graded_ok"], base[k]) for k, r in rows.items() if k in base)
+    import pair_bestofn
+    t2 = pair_bestofn.outcomes(a.tier2b_recipe)
+    t2_rec = {(k[0], k[2]): v["recipe"] for k, v in t2.items()}
+    t2_rows = {(r["task"], r["trial"]): r for r in read_jsonl(a.tier2b_live) if r.get("type") == "live"}
+    guard = tier2b_guard((k[0], r["graded_ok"], t2_rec[k]) for k, r in t2_rows.items() if k in t2_rec)
+    live_secs = sum(r["model_secs"] for r in rows.values()) / max(len(rows), 1)
+    met = (sum(r["graded_ok"] for r in rows.values()) > sum(base.values()) and mcnemar_p(b, c) < 0.10 and tp < 0.10
+           and live_secs <= res["c2_recipe"]["mean_secs"] and not guard["fails"])
+    res["bar"] = {"v3_only": b, "recipe_only": c, "mcnemar_p": mcnemar_p(b, c), "tasks_v3_better": tw,
+                  "tasks_recipe_better": tl, "task_sign_p": tp, "v3_secs": live_secs,
+                  "recipe_secs": res["c2_recipe"]["mean_secs"], "tier2b_guard": guard, "met": met}
+    if a.out:
+        pathlib.Path(a.out).write_text(json.dumps(res, indent=1), encoding="utf-8")
+    print(json.dumps(res, indent=1))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -466,8 +516,16 @@ def main():
             s.add_argument("--rule", required=True)
             s.add_argument("--live", action="append", default=[])
             s.add_argument("--out")
+    r3 = sub.add_parser("report-v3")
+    for arg in ("--trials", "--labels", "--calib", "--rule", "--live", "--tier2b-live", "--tier2b-recipe", "--v2-calib",
+                "--v2-rule"):
+        r3.add_argument(arg, required=True)
+    r3.add_argument("--out")
     a = ap.parse_args()
-    fit_cmd(a) if a.cmd == "fit" else report_cmd(a)
+    if a.cmd == "report-v3":
+        report_v3_cmd(a)
+    else:
+        fit_cmd(a) if a.cmd == "fit" else report_cmd(a)
 
 
 if __name__ == "__main__":
