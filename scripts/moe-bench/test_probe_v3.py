@@ -25,5 +25,41 @@ class TextTest(unittest.TestCase):
                          "Requirement: req\n\nCheck:\nfrom m import f\nassert f(1) == 2")
 
 
+import probe_v3 as pv  # noqa: E402
+
+TASK = dict(name="t_demo", category="B", entry="calc.py", hidden_file="units.py",
+            files={"units.py": "def grams(x):\n    return x * 1000\n",
+                   "calc.py": "from units import grams\n\n\ndef kg(x):\n    return grams(x)\n"},
+            spec="kg(2) returns 2000, but 2 kilograms is 2.", test="from calc import kg\nassert kg(2) == 2\n",
+            reference="from units import grams\n\n\ndef kg(x):\n    return grams(x) / 1000\n")
+
+
+class ProbeV3Test(unittest.TestCase):
+    def test_probe_prompt_names_the_helper(self):
+        p = pv.probe_prompt_v3(TASK)
+        self.assertIn("units", p)
+        self.assertIn("type(result).__name__", p)
+        self.assertIn("Do not call calc.py's own functions", p)
+
+    def test_fix_prompt_note_first(self):
+        p = pv.fix_prompt_v3(TASK, "print(1)", "1", "Note: X.")
+        self.assertTrue(p.startswith("Note: X.\n\n"))
+        self.assertNotIn("Note:", pv.fix_prompt_v3(TASK, "print(1)", "1", None))
+
+    def test_split_asserts(self):
+        imports, asserts = pv.split_asserts("from calc import kg\nimport math\nassert kg(2) == 2\nx = 1\n"
+                                            "assert kg(0) == 0, 'zero'\n")
+        self.assertEqual(imports, "from calc import kg\nimport math")
+        self.assertEqual(asserts, ["assert kg(2) == 2", "assert kg(0) == 0, 'zero'"])
+        self.assertEqual(pv.split_asserts("not python ("), ("", []))
+
+    def test_run_asserts_on_reference_and_buggy(self):
+        imports, asserts = "from calc import kg", ["assert kg(2) == 2", "assert kg(0) == 0"]
+        self.assertEqual([ok for ok, _ in pv.run_asserts(TASK, TASK["reference"], imports, asserts)], [True, True])
+        res = pv.run_asserts(TASK, TASK["files"]["calc.py"], imports, asserts)
+        self.assertEqual([ok for ok, _ in res], [False, True])
+        self.assertIn("AssertionError", res[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
