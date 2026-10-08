@@ -228,6 +228,24 @@ def by_category(rows_ok):
 
 
 def fit_cmd(a):
+    if getattr(a, "form", None) == "v3":
+        calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
+        recs, cards = records_v3(read_jsonl(a.trials), read_jsonl(a.labels), calib)
+        budget = fixed(recs, "R")[1]
+        best = fit_v3(recs, cards, budget)
+        if best is None:
+            sys.exit(f"no v3 rule fits the recipe's {budget:.2f} s budget")
+        rule, solved, secs = best
+        out = {"budget_secs": round(budget, 3), "records": len(recs), "form": "v3",
+               "grid": {"hidden": list(decile_grid([c["hidden"] for c in cards.values()])),
+                        "library": list(decile_grid([c.get("library", 0.0) for c in cards.values()]))},
+               "rule": rule, "fit": {"solved": solved, "mean_secs": round(secs, 3)},
+               "ablations": {n: dict(zip(("solved", "mean_secs"), system_v3(recs, cards, rule, dict(FULL, **ch))))
+                             for n, ch in ABLATIONS.items()},
+               "calib_pool": {pb: fixed(recs, pb)[0] for pb in PLAYBOOKS}}
+        pathlib.Path(a.out).write_text(json.dumps(out, indent=1), encoding="utf-8")
+        print(json.dumps(out, indent=1))
+        return
     calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8"))
     recs, cards = records(read_jsonl(a.trials), read_jsonl(a.labels), calib)
     budget = fixed(recs, "R")[1]
@@ -292,6 +310,147 @@ def report_cmd(a):
     print(json.dumps(res, indent=1))
 
 
+# ---- Laya v3 (spec 2026-10-07-laya-v3-design.md) ----
+EVIDENCE_NONE = "none"
+V3_NOTE = (0.3, 0.5, 0.7, NEVER)
+V3_VALID = (0.3, 0.5, 0.7, NEVER)
+V3_T_HI = (0.5, 0.6, 0.7, 0.8, 0.9, NEVER)
+V3_T_LO = (-1.0, 0.2, 0.4, 0.6)
+FULL = dict(use_a=True, repair="gate", use_c=True, lib_gate=True, old_probe=False)
+ABLATIONS = {"no_A": {"use_a": False}, "no_B": {"repair": "always"}, "no_check": {"repair": "never"},
+             "no_C": {"use_c": False}, "no_lib_gate": {"lib_gate": False}, "old_probe": {"old_probe": True}}
+
+
+def route_v3(card, rule):
+    """§3: the probe path when the hidden-code signal clears c_hidden and the library signal is below c_lib."""
+    if card is None:
+        return "R"
+    return "P3" if card["hidden"] >= rule["c_hidden"] and card.get("library", 0.0) < rule["c_lib"] else "R"
+
+
+def probe_outcome_v3(rec, rule, use_a=True, repair="gate"):
+    """(graded_ok, model secs) of the probe path. repair: "gate" (B), "always" (no gate) or "never" (no check)."""
+    p3 = rec["p3"]
+    ev, fixes = p3.get("evidence"), p3["fixes"]
+    secs = p3["probe_secs"] + (p3.get("evidence_secs") or 0.0)
+    noted = (use_a and ev is not None and ev["choice"] != EVIDENCE_NONE and len(fixes) > 1
+             and ev["probabilities"].get(ev["choice"], 0.0) >= rule["c_note"])
+    f = fixes[1] if noted else fixes[0]
+    secs += f["secs"]
+    if repair == "never":
+        return f["graded_ok"], secs
+    secs += p3["examples_secs"]
+    failing = [i for i, ok in enumerate(f["asserts_ok"]) if not ok]
+    if not failing or f.get("repair") is None:
+        return f["graded_ok"], secs
+    if repair == "gate":
+        secs += sum(p3["valid_secs"][i] for i in failing)
+        if not any(p3["valid_p"][i] is not None and p3["valid_p"][i] >= rule["c_valid"] for i in failing):
+            return f["graded_ok"], secs
+    return f["repair"]["graded_ok"], secs + f["repair"]["secs"]
+
+
+def recipe_outcome_v3(rec, rule, use_p=True, use_c=True):
+    """(graded_ok, model secs) of the recipe path: v2's early stop, then C (escalate to all 8 candidates and the
+    second suite when the pick's P(correct) < t_lo or, with e_fail, when it fails any of its own self-tests)."""
+    r8, su = rec["cands"]["r8"], rec["suites"]
+    asked = {}
+
+    def p(c):
+        asked[(c["run"], c["cand"])] = c.get("verify_secs", 0.0)
+        return -1.0 if c.get("p") is None else c["p"]
+
+    c0 = r8[0]
+    if use_p and rule["t_hi"] <= 1.0 and allpass(c0, "r8s0") and p(c0) >= rule["t_hi"]:
+        return c0["graded_ok"], su["r8s0"]["secs"] + c0["secs"] + sum(asked.values())
+    cands, secs = r8[:3], su["r8s0"]["secs"] + sum(c["secs"] for c in r8[:3])
+    best = pick(cands, ("r8s0",), p if use_p else None)
+    low = use_p and rule["t_lo"] > -1.0 and best.get("p") is not None and p(best) < rule["t_lo"]
+    failing = rule.get("e_fail", True) and not allpass(best, "r8s0")
+    if use_c and (low or failing):
+        secs += su["r8s1"]["secs"] + sum(c["secs"] for c in r8[3:])
+        best = pick(r8, ("r8s0", "r8s1"), p if use_p else None)
+    return best["graded_ok"], secs + sum(asked.values())
+
+
+def outcome_v3(rec, card, rule, flags=FULL):
+    r = dict(rule, c_lib=NEVER) if not flags["lib_gate"] else rule
+    if route_v3(card, r) == "P3":
+        if flags["old_probe"]:
+            return outcome(rec, "P")
+        return probe_outcome_v3(rec, rule, flags["use_a"], flags["repair"])
+    return recipe_outcome_v3(rec, rule, True, flags["use_c"])
+
+
+def system_v3(recs, cards, rule, flags=FULL):
+    solved = secs = 0.0
+    for rec in recs:
+        card = cards.get(rec["task"])
+        ok, s = outcome_v3(rec, card, rule, flags)
+        solved += ok
+        secs += s + (rec["classify_secs"] if card is not None else 0.0)
+    return solved, secs / len(recs)
+
+
+def fit_v3(recs, cards, budget):
+    """§4: the most solved within budget (ties: fewer secs), using that the probe outcome depends only on
+    (c_note, c_valid), the recipe outcome only on (t_hi, t_lo, e_fail), and the route only on (c_hidden, c_lib)."""
+    base = dict(form="v3", c_hidden=0.0, c_lib=NEVER)
+    cls = [rec["classify_secs"] if cards.get(rec["task"]) is not None else 0.0 for rec in recs]
+    probe = {(n, v): [probe_outcome_v3(r, dict(base, c_note=n, c_valid=v)) if r.get("p3") else (False, 0.0)
+                      for r in recs]
+             for n in V3_NOTE for v in V3_VALID}
+    recipe = {(h, l, e): [recipe_outcome_v3(r, dict(base, t_hi=h, t_lo=l, e_fail=e)) for r in recs]
+              for h in V3_T_HI for l in V3_T_LO for e in (True, False)}
+    hid = decile_grid([c["hidden"] for c in cards.values()])
+    lib = decile_grid([c.get("library", 0.0) for c in cards.values()])
+    best = None
+    for ch in hid:
+        for cl in lib:
+            mask = [r.get("p3") is not None and route_v3(cards.get(r["task"]), dict(c_hidden=ch, c_lib=cl)) == "P3"
+                    for r in recs]
+            for pk, pv_ in probe.items():
+                for rk, rv in recipe.items():
+                    res = [pv_[i] if m else rv[i] for i, m in enumerate(mask)]
+                    solved = sum(x[0] for x in res)
+                    secs = (sum(x[1] for x in res) + sum(cls)) / len(recs)
+                    if secs <= budget and (best is None or (solved, -secs) > (best[1], -best[2])):
+                        best = (dict(form="v3", c_hidden=ch, c_lib=cl, c_note=pk[0], c_valid=pk[1],
+                                     t_hi=rk[0], t_lo=rk[1], e_fail=rk[2]), solved, secs)
+    return best
+
+
+def tier2b_guard(pairs):
+    """§6 guard: pairs [(task, v3_ok, recipe_ok)] per trial; fails when the recipe wins on tasks at p < 0.10."""
+    w, l, p = task_sign(pairs)
+    return {"tasks_v3_better": w, "tasks_recipe_better": l, "task_sign_p": p, "fails": l > w and p < 0.10}
+
+
+def records_v3(trial_rows, label_rows, calib):
+    """records() plus each row's p3 block, with Laya's calibrated P(valid) per example assert."""
+    recs, cards = records(trial_rows, label_rows, calib)
+    pv_ = {(r["task"], r["trial"], r["assert"]): (platt_apply(r["p"], calib["platt"].get("valid", [1.0, 0.0])),
+                                                  r["secs"])
+           for r in label_rows if r["type"] == "valid"}
+    rows = {(t["task"], t["trial"]): t for t in trial_rows if t.get("type") == "trial"}
+    for rec in recs:
+        p3 = rows[(rec["task"], rec["trial"])].get("p3")
+        if not p3:
+            continue
+        pr = p3["probe"]
+        n = len(p3["examples"]["asserts"])
+        rec["p3"] = {
+            "probe_secs": pr["secs_gen"] + pr["secs_exec"] + pr.get("secs_retry_gen", 0.0) + pr.get("secs_retry_exec", 0.0),
+            "evidence": p3.get("evidence"), "evidence_secs": p3.get("evidence_secs") or 0.0,
+            "examples_secs": p3["examples"]["secs"], "asserts": p3["examples"]["asserts"],
+            "valid_p": [pv_.get((rec["task"], rec["trial"], i), (None, 0.0))[0] for i in range(n)],
+            "valid_secs": [pv_.get((rec["task"], rec["trial"], i), (None, 0.0))[1] for i in range(n)],
+            "fixes": [{"graded_ok": f["graded_ok"], "secs": f["secs"], "asserts_ok": f["asserts_ok"],
+                       "repair": ({"graded_ok": f["repair"]["graded_ok"], "secs": f["repair"]["secs"]}
+                                  if f.get("repair") else None)} for f in p3["fixes"]]}
+    return recs, cards
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -302,7 +461,7 @@ def main():
         s.add_argument("--calib", required=True)
         if name == "fit":
             s.add_argument("--out", required=True)
-            s.add_argument("--form", choices=["targeted", "v1"], default="targeted")
+            s.add_argument("--form", choices=["targeted", "v1", "v3"], default="targeted")
         else:
             s.add_argument("--rule", required=True)
             s.add_argument("--live", action="append", default=[])

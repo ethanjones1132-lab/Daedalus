@@ -242,5 +242,47 @@ class CommandsTest(unittest.TestCase):
         self.assertGreaterEqual(rule["verify_fit"]["solved"], rule["calib_pool"]["R"])
         self.assertLessEqual(rule["verify_fit"]["mean_secs"], rule["budget_secs"])
 
+
+def p3(fixes, asserts=("assert f(1) == 2",), valid_p=(0.9,), ev=None, probe_secs=2.0):
+    return {"probe_secs": probe_secs, "evidence": ev, "evidence_secs": 0.3, "examples_secs": 0.5,
+            "asserts": list(asserts), "valid_p": list(valid_p), "valid_secs": [0.3] * len(valid_p), "fixes": fixes}
+
+
+def fix(ok, asserts_ok=(True,), repair=None, secs=1.0):
+    return {"graded_ok": ok, "secs": secs, "asserts_ok": list(asserts_ok), "repair": repair}
+
+
+class V3Test(unittest.TestCase):
+    RULE = dict(form="v3", c_hidden=0.1, c_lib=0.5, c_note=0.5, c_valid=0.5, t_hi=pb.NEVER, t_lo=-1.0, e_fail=True)
+
+    def test_route_library_gate(self):
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.2, library=0.1), self.RULE), "P3")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.2, library=0.9), self.RULE), "R")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.05, library=0.1), self.RULE), "R")
+        self.assertEqual(pb.route_v3(None, self.RULE), "R")
+
+    def test_probe_note_and_gate(self):
+        ev = {"choice": "scale", "probabilities": {"scale": 0.8, "none": 0.2}}
+        r = {"p3": p3([fix(False, (False,), repair={"graded_ok": False, "secs": 1.0}),
+                       fix(False, (False,), repair={"graded_ok": True, "secs": 1.0})], ev=ev)}
+        self.assertEqual(pb.probe_outcome_v3(r, self.RULE)[0], True)            # note -> fix 1, gate passes -> repair
+        self.assertEqual(pb.probe_outcome_v3(r, self.RULE, use_a=False)[0], False)
+        self.assertEqual(pb.probe_outcome_v3(r, dict(self.RULE, c_valid=pb.NEVER))[0], False)
+        self.assertEqual(pb.probe_outcome_v3(r, self.RULE, repair="never")[0], False)
+
+    def test_recipe_escalates_on_failing_selftest(self):
+        tests_bad, tests_good = {"r8s0": [False], "r8s1": [True]}, {"r8s0": [True], "r8s1": [True]}
+        r8 = [cand("r8", i, False, tests_bad) for i in range(3)] + [cand("r8", 3, True, tests_good)] + \
+             [cand("r8", i, False, tests_bad) for i in range(4, 8)]
+        r = rec(r8, [cand("pr", i, False) for i in range(3)])
+        self.assertEqual(pb.recipe_outcome_v3(r, self.RULE)[0], True)
+        self.assertEqual(pb.recipe_outcome_v3(r, self.RULE, use_c=False)[0], False)
+
+    def test_tier2b_guard(self):
+        pairs = [(f"t{i}", False, True) for i in range(6)]
+        self.assertTrue(pb.tier2b_guard(pairs)["fails"])
+        self.assertFalse(pb.tier2b_guard([(f"t{i}", True, True) for i in range(6)])["fails"])
+
+
 if __name__ == "__main__":
     unittest.main()
