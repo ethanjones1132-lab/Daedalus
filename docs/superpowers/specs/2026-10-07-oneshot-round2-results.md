@@ -83,3 +83,26 @@
 ## Files
 
 `docs/benchmarks/oneshot/runs/<model>/<seed>/`, for the models `qwen36full`, `qwen36full-iq3xxs`, `gemma26b`, `tiel`, `gptoss20b`, `gptoss20b-keep24`, `lfm25-8b-a1b` and `xing4`. Each holds `response.md`, `plan.md`, `app.html`, `app-assembled.html`, `meta.json` (with the fit record), `static.json`, `checks-dev.json`, `checks-dev-assembled.json` and `shots/`, plus `reasoning.md` for gpt-oss. Also in `docs/benchmarks/oneshot/`: `round2.log`, `keep24-report.json` and `gallery.md`.
+
+## Next (owner, 2026-10-07 23:35)
+
+**Owner's view:** Qwen3.6 full IQ3_XXS is the most capable local model. It should become the standard for local testing **if it leaves enough headroom**, so a headroom test comes first. keep96 stays the default for fast loops (Laya, tier2b) and Jarvis until then.
+
+**Measured tonight:**
+- 35–38 tok/s generation;
+- prompt reading about 445 tok/s warm, and about 32 tok/s on the first prompt while its experts page in from E:;
+- 7,596 MiB of VRAM in use at a 40k window with the desktop's 1.4 GB, about 0.6 GB spare;
+- **0.4–1.0 GB of RAM free while serving**, below the Laya worker's 2 GB guard.
+
+**The headroom test,** after the Laya v3 run (about 1.5 GPU hours), with the owner's usual apps open:
+1. **tier2b recipe** on IQ3_XXS (3 candidates + 1 suite, the 2026-10-06 seeds) against keep96's 107/117.
+2. **Speed and memory** at 16k, 40k and 64k windows, each with the fitted placement:
+   - generation and prompt speed (warm and cold);
+   - VRAM margin;
+   - RAM free.
+3. **The Laya worker loaded alongside it:** does RAM stay at or above the 1,024 MB fallback guard?
+4. **K2-Horizon's two one-shot builds,** with heavy apps closed.
+
+**The real fixes, if headroom fails:**
+- **More RAM:** a second 16 GB stick.
+- **A lighter-pruned 3-bit slice** (for example keep192 from IQ3_XXS). This belongs to the expert-patching work sequenced after Laya.
