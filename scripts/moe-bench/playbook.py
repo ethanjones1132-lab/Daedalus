@@ -239,7 +239,8 @@ def fit_cmd(a):
         out = {"budget_secs": round(budget, 3), "records": len(recs), "form": "v3",
                "grid": {"hidden": list(decile_grid([c["hidden"] for c in cards.values()])),
                         "library": list(decile_grid([c.get("library", 0.0) for c in cards.values()]))},
-               "rule": rule, "fit": {"solved": solved, "mean_secs": round(secs, 3)},
+               "rule": rule, "fit": {"solved": solved, "mean_secs": round(secs, 3), "routes": dict(
+                   collections.Counter(route_v3(cards.get(r["task"]), rule) for r in recs))},
                "ablations": {n: dict(zip(("solved", "mean_secs"), system_v3(recs, cards, rule, dict(FULL, **ch))))
                              for n, ch in ABLATIONS.items()},
                "calib_pool": {pb: fixed(recs, pb)[0] for pb in PLAYBOOKS}}
@@ -316,16 +317,21 @@ V3_NOTE = (0.3, 0.5, 0.7, NEVER)
 V3_VALID = (0.3, 0.5, 0.7, NEVER)
 V3_T_HI = (0.5, 0.6, 0.7, 0.8, 0.9, NEVER)
 V3_T_LO = (-1.0, 0.2, 0.4, 0.6)
-FULL = dict(use_a=True, repair="gate", use_c=True, lib_gate=True, old_probe=False)
+FULL = dict(use_a=True, repair="gate", use_c=True, lib_gate=True, old_probe=False, v1_route=True)
 ABLATIONS = {"no_A": {"use_a": False}, "no_B": {"repair": "always"}, "no_check": {"repair": "never"},
-             "no_C": {"use_c": False}, "no_lib_gate": {"lib_gate": False}, "old_probe": {"old_probe": True}}
+             "no_C": {"use_c": False}, "no_lib_gate": {"lib_gate": False}, "old_probe": {"old_probe": True},
+             "no_v1_route": {"v1_route": False}}
 
 
 def route_v3(card, rule):
-    """§3: the probe path when the hidden-code signal clears c_hidden and the library signal is below c_lib."""
+    """§3: the probe path P3 when the hidden-code signal clears c_hidden and the library signal is below c_lib.
+    Amendment 2026-10-08 (prereg): otherwise v1's probe P when the signal clears c_probe, else the recipe. No v3
+    rule without it fit the recipe's seconds on the pool; a rule without c_probe routes as first specified."""
     if card is None:
         return "R"
-    return "P3" if card["hidden"] >= rule["c_hidden"] and card.get("library", 0.0) < rule["c_lib"] else "R"
+    if card["hidden"] >= rule["c_hidden"] and card.get("library", 0.0) < rule["c_lib"]:
+        return "P3"
+    return "P" if card["hidden"] >= rule.get("c_probe", NEVER) else "R"
 
 
 def probe_outcome_v3(rec, rule, use_a=True, repair="gate"):
@@ -374,11 +380,18 @@ def recipe_outcome_v3(rec, rule, use_p=True, use_c=True):
 
 
 def outcome_v3(rec, card, rule, flags=FULL):
-    r = dict(rule, c_lib=NEVER) if not flags["lib_gate"] else rule
-    if route_v3(card, r) == "P3":
+    r = dict(rule)
+    if not flags["lib_gate"]:
+        r["c_lib"] = NEVER
+    if not flags.get("v1_route", True):
+        r["c_probe"] = NEVER
+    play = route_v3(card, r)
+    if play == "P3":
         if flags["old_probe"]:
             return outcome(rec, "P")
         return probe_outcome_v3(rec, rule, flags["use_a"], flags["repair"])
+    if play == "P":
+        return outcome(rec, "P")
     return recipe_outcome_v3(rec, rule, True, flags["use_c"])
 
 
@@ -394,7 +407,10 @@ def system_v3(recs, cards, rule, flags=FULL):
 
 def fit_v3(recs, cards, budget):
     """§4: the most solved within budget (ties: fewer secs), using that the probe outcome depends only on
-    (c_note, c_valid), the recipe outcome only on (t_hi, t_lo, e_fail), and the route only on (c_hidden, c_lib)."""
+    (c_note, c_valid), the recipe outcome only on (t_hi, t_lo, e_fail), and the route only on (c_hidden, c_lib,
+    c_probe). c_probe (amendment 2026-10-08) shares c_hidden's grid; v1's probe outcome has no parameters.
+    Exact ties (a setting that no routed record uses) go to the probe and recipe settings that score best on their
+    own over the whole pool (most solved, then fewer secs), not to the loop order."""
     base = dict(form="v3", c_hidden=0.0, c_lib=NEVER)
     cls = [rec["classify_secs"] if cards.get(rec["task"]) is not None else 0.0 for rec in recs]
     probe = {(n, v): [probe_outcome_v3(r, dict(base, c_note=n, c_valid=v)) if r.get("p3") else (False, 0.0)
@@ -402,22 +418,28 @@ def fit_v3(recs, cards, budget):
              for n in V3_NOTE for v in V3_VALID}
     recipe = {(h, l, e): [recipe_outcome_v3(r, dict(base, t_hi=h, t_lo=l, e_fail=e)) for r in recs]
               for h in V3_T_HI for l in V3_T_LO for e in (True, False)}
+    own = lambda res: (sum(x[0] for x in res), -sum(x[1] for x in res))  # noqa: E731
+    pscore = {k: own(v) for k, v in probe.items()}
+    rscore = {k: own(v) for k, v in recipe.items()}
+    oldp = [outcome(r, "P") for r in recs]
     hid = decile_grid([c["hidden"] for c in cards.values()])
     lib = decile_grid([c.get("library", 0.0) for c in cards.values()])
     best = None
     for ch in hid:
         for cl in lib:
-            mask = [r.get("p3") is not None and route_v3(cards.get(r["task"]), dict(c_hidden=ch, c_lib=cl)) == "P3"
-                    for r in recs]
-            for pk, pv_ in probe.items():
-                for rk, rv in recipe.items():
-                    res = [pv_[i] if m else rv[i] for i, m in enumerate(mask)]
-                    solved = sum(x[0] for x in res)
-                    secs = (sum(x[1] for x in res) + sum(cls)) / len(recs)
-                    if secs <= budget and (best is None or (solved, -secs) > (best[1], -best[2])):
-                        best = (dict(form="v3", c_hidden=ch, c_lib=cl, c_note=pk[0], c_valid=pk[1],
-                                     t_hi=rk[0], t_lo=rk[1], e_fail=rk[2]), solved, secs)
-    return best
+            for cp in hid:
+                route = [route_v3(cards.get(r["task"]), dict(c_hidden=ch, c_lib=cl, c_probe=cp)) for r in recs]
+                route = ["R" if x == "P3" and r.get("p3") is None else x for x, r in zip(route, recs)]
+                for pk, pv_ in probe.items():
+                    for rk, rv in recipe.items():
+                        res = [pv_[i] if x == "P3" else oldp[i] if x == "P" else rv[i] for i, x in enumerate(route)]
+                        solved = sum(x[0] for x in res)
+                        secs = (sum(x[1] for x in res) + sum(cls)) / len(recs)
+                        key = (solved, -round(secs, 9), pscore[pk], rscore[rk])
+                        if secs <= budget and (best is None or key > best[3]):
+                            best = (dict(form="v3", c_hidden=ch, c_lib=cl, c_probe=cp, c_note=pk[0], c_valid=pk[1],
+                                         t_hi=rk[0], t_lo=rk[1], e_fail=rk[2]), solved, secs, key)
+    return best and best[:3]
 
 
 def tier2b_guard(pairs):
@@ -478,6 +500,7 @@ def report_v3_cmd(a):
                          (("notes", "note"), ("repairs", "repaired"), ("escalations", "escalated"),
                           ("early_stops", "early_stop"))},
                       "probe_routes": sum(r["playbook"] == "P3" for r in rows.values()),
+                      "v1_probe_routes": sum(r["playbook"] == "P" for r in rows.values()),
                       "laya_fallbacks": sum(not r["laya_ok"] for r in rows.values())}
     # the bar (owner, 2026-10-07): solves more, McNemar and task sign test both p < 0.10, no more model secs,
     # and the tier2b guard

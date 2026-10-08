@@ -426,6 +426,11 @@ def live_trial_v3(task, trial, rule, lc, temp_alt):
                                         63000 + 100 * trial + (1 if note else 0)))
                 flags["repaired"] = True
         ok = pv.grade(task, code)[0]
+    elif play == "P":  # v1's probe and one fix (amendment 2026-10-08), as nested_trial's pr candidate 0: no note
+        script = extract_code(gen("probe", probe_prompt(task), 30000 + trial))
+        output = probe_run(script)
+        code = extract_code(gen("pr0", fix_prompt(task, script, output), trial))
+        ok = bon.check(task, code, [])["graded_ok"]
     else:
         pvals = {}
 

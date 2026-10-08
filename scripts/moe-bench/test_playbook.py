@@ -278,6 +278,38 @@ class V3Test(unittest.TestCase):
         self.assertEqual(pb.recipe_outcome_v3(r, self.RULE)[0], True)
         self.assertEqual(pb.recipe_outcome_v3(r, self.RULE, use_c=False)[0], False)
 
+    def test_route_v1_probe_band(self):
+        # amendment 2026-10-08: no v3 rule fit the recipe's seconds on the pool, so v1's probe P is a third route,
+        # taken when the hidden-code signal clears c_probe but P3's conditions fail
+        rule = dict(self.RULE, c_probe=0.02)
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.2, library=0.1), rule), "P3")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.05, library=0.1), rule), "P")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.2, library=0.9), rule), "P")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.01, library=0.1), rule), "R")
+        self.assertEqual(pb.route_v3(dict(card(), hidden=0.05, library=0.1), self.RULE), "R")  # no c_probe: as specified
+
+    def test_v1_route_outcome_and_ablation(self):
+        tests = {"r8s0": [False], "r8s1": [False]}
+        r = dict(rec([cand("r8", i, False, tests) for i in range(8)],
+                     [cand("pr", 0, True)] + [cand("pr", i, False) for i in (1, 2)]), p3=p3([fix(False)]))
+        c, rule = dict(card(), hidden=0.05, library=0.1), dict(self.RULE, c_probe=0.02)
+        self.assertEqual(pb.outcome_v3(r, c, rule), pb.outcome(r, "P"))
+        self.assertTrue(pb.outcome_v3(r, c, rule)[0])
+        self.assertFalse(pb.outcome_v3(r, c, rule, dict(pb.FULL, v1_route=False))[0])
+
+    def test_fit_takes_the_v1_route_when_only_it_fits(self):
+        tests = {"r8s0": [False], "r8s1": [False]}
+        recs = [dict(rec([cand("r8", i, False, tests) for i in range(8)],
+                         [cand("pr", 0, True, secs=0.5)] + [cand("pr", i, False) for i in (1, 2)],
+                         probe_secs=0.5, task=t), p3=p3([fix(False, secs=5.0)])) for t in ("a", "b")]
+        cards = {t: dict(card(), hidden=0.05, library=0.1) for t in ("a", "b")}
+        rule, solved, secs = pb.fit_v3(recs, cards, pb.fixed(recs, "R")[1])
+        self.assertEqual((rule["c_probe"], solved), (0.05, 2))
+        self.assertEqual({pb.route_v3(c, rule) for c in cards.values()}, {"P"})
+        # the recipe settings do not change this score; the tie goes to the recipe's own best on the whole pool,
+        # where escalating on failed self-tests (e_fail) only adds seconds
+        self.assertFalse(rule["e_fail"])
+
     def test_tier2b_guard(self):
         pairs = [(f"t{i}", False, True) for i in range(6)]
         self.assertTrue(pb.tier2b_guard(pairs)["fails"])
