@@ -38,7 +38,12 @@ def fix_prompt_v3(task, script, output, note):
 
 
 def example_prompt(task):
+    # The current file is shown so the checks call its real function names (2026-10-08 smoke run: from the text
+    # alone, Qwen guessed names and every check failed with ImportError, even on the reference). Expected values
+    # still come only from the text, never from the (buggy) code.
     return (f"Here is a bug report or requirement for {task['entry']}:\n\n{task['spec']}\n\n"
+            f"The current {task['entry']} (it has the bug; use it only for the names to call):\n```python\n"
+            f"{task['files'][task['entry']]}```\n\n"
             f"Write checks taken only from concrete examples the text states: for each example (an input and the "
             f"output the text says it should give) write one line `assert <call> == <expected>`, importing what you "
             f"call from `{module_of(task['entry'])}`. Do not invent examples the text does not state. If it states "

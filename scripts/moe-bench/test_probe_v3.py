@@ -46,6 +46,13 @@ class ProbeV3Test(unittest.TestCase):
         self.assertTrue(p.startswith("Note: X.\n\n"))
         self.assertNotIn("Note:", pv.fix_prompt_v3(TASK, "print(1)", "1", None))
 
+    def test_example_prompt_shows_the_names_to_call(self):
+        # 2026-10-08 smoke run: without the file, Qwen guessed function names (run_length_encode for rle_encode),
+        # so every example assert failed with ImportError, even on the reference
+        p = pv.example_prompt(TASK)
+        self.assertIn("def kg(x)", p)
+        self.assertIn("only from concrete examples the text states", p)
+
     def test_split_asserts(self):
         imports, asserts = pv.split_asserts("from calc import kg\nimport math\nassert kg(2) == 2\nx = 1\n"
                                             "assert kg(0) == 0, 'zero'\n")

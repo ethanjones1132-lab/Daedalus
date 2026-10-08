@@ -40,6 +40,8 @@ import bestofn_tier2b as bon  # noqa: E402
 import playbook  # noqa: E402
 from bestofn_tier2b import TASKS, baseline_prompt, extract_code, test_names, test_prompt  # noqa: E402
 from probe_tier2b import fix_prompt, probe_prompt, run_probe  # noqa: E402
+import laya_v3_text as lt  # noqa: E402
+import probe_v3 as pv  # noqa: E402
 
 LAYA_PY = r"C:\qwen3-forge-stage\venv-laya\Scripts\python.exe"
 MIN_FREE_MB = 2048
@@ -203,6 +205,50 @@ def nested_trial(task, trial, temp_alt, ex):
             "suites": suites, "probe": probe, "cands": cands}
 
 
+def p3_block(task, trial, lc):
+    """Laya v3 §5: probe v3 (+ one retry), Laya's evidence answer, fix without and with Laya's note, example asserts,
+    their results on both fixes and the reference, and one repair per fix that fails any assert. Seeds: probe
+    60000+t, retry 61000+t, fixes the trial's seed, examples 62000+100t, repairs 63000+100t+fix."""
+    text, n, s_gen = timed_chat(pv.probe_prompt_v3(task), 60000 + trial)
+    script = extract_code(text)
+    t = time.time()
+    output = pv.run_probe(task, script)
+    probe = {"script": script, "output": output, "gen_n": n, "secs_gen": s_gen,
+             "secs_exec": round(time.time() - t, 3), "retried": False}
+    if "Traceback" in output:
+        text, n2, s2 = timed_chat(pv.retry_prompt_v3(task, script, output), 61000 + trial)
+        script = extract_code(text)
+        t = time.time()
+        output = pv.run_probe(task, script)
+        probe.update(retried=True, retry_script=script, retry_output=output, secs_retry_gen=s2,
+                     secs_retry_exec=round(time.time() - t, 3))
+    rep, ev_secs = lc.call({"op": "evidence", "state": lt.evidence_state(task["spec"], script, output)})
+    evidence = {"choice": rep["choice"], "probabilities": rep["probabilities"]} if rep and rep.get("ok") else None
+    fixes = []
+    notes = [None] + ([lt.note_text(evidence["choice"])] if evidence and evidence["choice"] != "none" else [])
+    for note in notes:
+        text, n, s = timed_chat(pv.fix_prompt_v3(task, script, output, note), trial)
+        fixes.append({"note": note, "code": extract_code(text), "secs": s, "gen_n": n})
+    text, n, s_ex = timed_chat(pv.example_prompt(task), 62000 + 100 * trial)
+    n_ex = n
+    imports, asserts = pv.split_asserts(extract_code(text))
+    valid = [ok for ok, _ in pv.run_asserts(task, task["reference"], imports, asserts)] if asserts else []
+    for i, f in enumerate(fixes):
+        res = pv.run_asserts(task, f["code"], imports, asserts) if asserts else []
+        f["asserts_ok"], f["assert_errors"] = [ok for ok, _ in res], [e for _, e in res]
+        f["graded_ok"], f["graded_detail"] = pv.grade(task, f["code"])
+        f["repair"] = None
+        failing = [(asserts[j], f["assert_errors"][j]) for j, ok in enumerate(f["asserts_ok"]) if not ok]
+        if failing:
+            text, n, s = timed_chat(pv.repair_prompt(task, f["code"], imports, failing), 63000 + 100 * trial + i)
+            code = extract_code(text)
+            ok, detail = pv.grade(task, code)
+            f["repair"] = {"code": code, "secs": s, "gen_n": n, "graded_ok": ok, "graded_detail": detail}
+    return {"probe": probe, "evidence": evidence, "evidence_secs": ev_secs,
+            "examples": {"imports": imports, "asserts": asserts, "secs": s_ex, "gen_n": n_ex},
+            "asserts_valid": valid, "fixes": fixes}
+
+
 def nested(a):
     out = pathlib.Path(a.out)
     done = done_keys(out)
@@ -210,20 +256,41 @@ def nested(a):
     log = open(out.with_suffix(".server.log"), "a", encoding="utf-8", errors="replace")
     proc = bon.start_server(log)
     t_start = time.time()
+    lc = None
+    base = {}
+    if getattr(a, "v3", False) and a.base:  # Laya v3: extend stored rows with the p3 block instead of re-running them
+        base = {(r["task"], r["trial"]): r for r in map(json.loads, open(a.base, encoding="utf-8")) if r.get("type") == "trial"}
     try:
+        if getattr(a, "v3", False):
+            lc = LayaClient(a.calib)
+            free = available_mb()
+            print(f"Laya worker {'down' if lc.dead else 'up'}; {free} MB available with Qwen and Laya loaded", flush=True)
+            if free < a.min_free_mb:
+                sys.exit(f"only {free} MB available; the guard is {a.min_free_mb} (spec default {MIN_FREE_MB})")
         with out.open("a", encoding="utf-8") as f, ThreadPoolExecutor(8) as ex:
             for task in TASKS:
                 for trial in range(a.trials):
                     if (task["name"], trial) in done:
                         continue
                     t = time.time()
-                    row = dict(nested_trial(task, trial, a.temp_alt, ex), model=gguf)
+                    if lc is not None and (task["name"], trial) in base:
+                        row = dict(base[(task["name"], trial)])
+                    else:
+                        row = dict(nested_trial(task, trial, a.temp_alt, ex), model=gguf)
+                    if lc is not None:
+                        row["p3"] = p3_block(task, trial, lc)
                     f.write(json.dumps(row) + "\n")
                     f.flush()
                     ok = collections.Counter(c["run"] for c in row["cands"] if c["graded_ok"])
-                    print(f"{task['name']} t{trial}: r8 {ok['r8']}/8, pr {ok['pr']}/3 pass grading; "
+                    extra = ""
+                    if "p3" in row:
+                        extra = (f"; p3 fixes {[fx['graded_ok'] for fx in row['p3']['fixes']]} "
+                                 f"evidence {(row['p3']['evidence'] or {}).get('choice')}")
+                    print(f"{task['name']} t{trial}: r8 {ok['r8']}/8, pr {ok['pr']}/3 pass grading{extra}; "
                           f"{time.time() - t:.0f} s", flush=True)
     finally:
+        if lc:
+            lc.close()
         stop(proc, log)
     print(f"done in {(time.time() - t_start) / 60:.1f} min", flush=True)
 
@@ -309,10 +376,101 @@ def live_trial(task, trial, rule, lc, note_on, use_p, temp_alt):
             "wall_secs": round(time.time() - t0, 3)}
 
 
+def live_trial_v3(task, trial, rule, lc, temp_alt):
+    """One task-trial of the full v3 system (spec §3); mirrors playbook.outcome_v3 with FULL, step for step, with the
+    seeds and prompts of nested_trial and p3_block, so the live run matches the simulation."""
+    t0, calls = time.time(), []
+    flags = dict(note=False, repaired=False, escalated=False, early=False)
+
+    def gen(what, prompt, sd, temp=None):
+        text, n, secs = timed_chat(prompt, sd, temp)
+        calls.append([what, secs, n])
+        return text
+
+    def laya(what, msg):
+        r, s = lc.call(msg)
+        calls.append([what, s, 0])
+        return r if r and r.get("ok") else None
+
+    def probe_run(script):
+        t = time.time()
+        out = pv.run_probe(task, script)
+        calls.append(["probe_exec", round(time.time() - t, 3), 0])
+        return out
+
+    reply = laya("laya_classify", {"op": "classify", "state": baseline_prompt(task)})
+    card = reply["card"] if reply else None
+    play = playbook.route_v3(card, rule)
+    if play == "P3":
+        script = extract_code(gen("probe", pv.probe_prompt_v3(task), 60000 + trial))
+        output = probe_run(script)
+        if "Traceback" in output:
+            script = extract_code(gen("probe_retry", pv.retry_prompt_v3(task, script, output), 61000 + trial))
+            output = probe_run(script)
+        ev = laya("laya_evidence", {"op": "evidence", "state": lt.evidence_state(task["spec"], script, output)})
+        note = None
+        if ev and ev["choice"] != "none" and ev["probabilities"].get(ev["choice"], 0.0) >= rule["c_note"]:
+            note, flags["note"] = lt.note_text(ev["choice"]), True
+        code = extract_code(gen("fix", pv.fix_prompt_v3(task, script, output, note), trial))
+        imports, asserts = pv.split_asserts(extract_code(gen("examples", pv.example_prompt(task),
+                                                             62000 + 100 * trial)))
+        if asserts:
+            failing = [(asserts[j], e) for j, (ok, e) in enumerate(pv.run_asserts(task, code, imports, asserts))
+                       if not ok]
+            ps = []
+            for a_src, _ in failing:
+                r = laya("laya_valid", {"op": "valid", "state": lt.valid_state(task["spec"], imports, a_src)})
+                ps.append(r["p"] if r else None)
+            if any(p is not None and p >= rule["c_valid"] for p in ps):
+                code = extract_code(gen("repair", pv.repair_prompt(task, code, imports, failing),
+                                        63000 + 100 * trial + (1 if note else 0)))
+                flags["repaired"] = True
+        ok = pv.grade(task, code)[0]
+    else:
+        pvals = {}
+
+        def p_of(c):
+            k = (c["run"], c["cand"])
+            if k not in pvals:
+                r = laya("laya_verify", {"op": "verify", "requirement": task["spec"], "entry": task["entry"],
+                                         "code": c["code"]})
+                pvals[k] = r["p"] if r else None
+            return -1.0 if pvals[k] is None else pvals[k]
+
+        def new(i, sd, temp, suites):
+            c = {"run": "r8", "cand": i, "code": extract_code(gen(f"r8{i}", baseline_prompt(task), sd, temp))}
+            chk = bon.check(task, c["code"], suites)
+            c.update(compiles=chk["compiles"], imports=chk["imports"], graded_ok=chk["graded_ok"], self=chk["self"])
+            return c
+
+        s0 = extract_code(gen("suite0", test_prompt(task), 20000 + 100 * trial))
+        suites = [(s0, test_names(s0))]
+        c0 = new(0, trial, None, suites)
+        if rule["t_hi"] <= 1.0 and playbook.allpass(c0, "s0") and p_of(c0) >= rule["t_hi"]:
+            best, flags["early"] = c0, True
+        else:
+            pool = [c0] + [new(c, 1000 + 100 * trial + c, temp_alt, suites) for c in (1, 2)]
+            best = playbook.pick(pool, ("s0",), p_of)
+            low = rule["t_lo"] > -1.0 and 0 <= p_of(best) < rule["t_lo"]
+            if low or (rule.get("e_fail", True) and not playbook.allpass(best, "s0")):
+                s1 = extract_code(gen("suite1", test_prompt(task), 20000 + 100 * trial + 1, temp_alt))
+                suites = suites + [(s1, test_names(s1))]
+                pool = [dict(c, self=bon.check(task, c["code"], suites)["self"]) for c in pool]
+                pool += [new(c, 1000 + 100 * trial + c, temp_alt, suites) for c in range(3, 8)]
+                best, flags["escalated"] = playbook.pick(pool, ("s0", "s1"), p_of), True
+        ok = best["graded_ok"]
+    return {"type": "live", "task": task["name"], "category": task["category"], "trial": trial, "card": card,
+            "laya_ok": card is not None, "laya_dead": lc.dead, "playbook": play, "note": flags["note"],
+            "repaired": flags["repaired"], "escalated": flags["escalated"], "early_stop": flags["early"],
+            "graded_ok": bool(ok), "calls": calls, "model_secs": round(sum(c[1] for c in calls), 3),
+            "gen_tokens": sum(c[2] or 0 for c in calls), "wall_secs": round(time.time() - t0, 3)}
+
+
 def live(a):
     rules = json.loads(pathlib.Path(a.rule).read_text(encoding="utf-8"))
     use_p = a.verify == "on"
-    rule = rules["verify" if use_p else "noverify"]
+    v3 = getattr(a, "v3", False)
+    rule = rules["rule"] if v3 else rules["verify" if use_p else "noverify"]
     out = pathlib.Path(a.out)
     done = done_keys(out)
     gguf = start(a.model)
@@ -331,7 +489,8 @@ def live(a):
                 for trial in range(a.trials):
                     if (task["name"], trial) in done:
                         continue
-                    row = dict(live_trial(task, trial, rule, lc, a.note == "on", use_p, a.temp_alt), model=gguf)
+                    row = dict(live_trial_v3(task, trial, rule, lc, a.temp_alt) if v3 else
+                               live_trial(task, trial, rule, lc, a.note == "on", use_p, a.temp_alt), model=gguf)
                     f.write(json.dumps(row) + "\n")
                     f.flush()
                     print(f"{task['name']} t{trial}: {row['playbook']}{' early' if row['early_stop'] else ''}"
@@ -365,6 +524,10 @@ def main():
     n.add_argument("--trials", type=int, default=3)
     n.add_argument("--temp-alt", type=float, default=0.7)
     n.add_argument("--model", default="qwen36keep96", choices=sorted(bon.CONFIGS))
+    n.add_argument("--v3", action="store_true", help="Laya v3: add the p3 block (needs --calib for the Laya worker)")
+    n.add_argument("--base", help="v3: extend these stored trial rows instead of re-running nested_trial")
+    n.add_argument("--calib")
+    n.add_argument("--min-free-mb", type=int, default=MIN_FREE_MB)
     lv = sub.add_parser("live")
     lv.add_argument("--out", required=True)
     lv.add_argument("--rule", required=True)
@@ -374,6 +537,7 @@ def main():
     lv.add_argument("--trials", type=int, default=3)
     lv.add_argument("--temp-alt", type=float, default=0.7)
     lv.add_argument("--model", default="qwen36keep96", choices=sorted(bon.CONFIGS))
+    lv.add_argument("--v3", action="store_true", help="Laya v3: the full system (rule.json's 'rule')")
     lv.add_argument("--min-free-mb", type=int, default=MIN_FREE_MB,
                     help="RAM guard with Qwen and Laya loaded (spec 2048; an owner decision may set it per run)")
     s = sub.add_parser("summarize")
