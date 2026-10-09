@@ -15,7 +15,7 @@ import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-p
 import { getToolsForMode } from "../orchestration/modes";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { ToolDefinition } from "../tool-types";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { saveSkillCandidate } from "../intelligence/skill-store";
@@ -338,38 +338,84 @@ export function diffBaseline(report: EvalReport, baseline: Baseline): string[] {
   return diffs;
 }
 
+// ── CLI gate ─────────────────────────────────────────────────────
+/**
+ * Decide the CLI regression gate's exit code and output lines from a report
+ * and a baseline path. Kept separate from the `import.meta.main` entrypoint so
+ * it can be exercised with isolated fixtures (temp baselines) without touching
+ * the repo's `baseline.json`.
+ *
+ * Fail-closed rule: a missing or malformed baseline is a gate FAILURE, not a
+ * warning. Without a readable snapshot we cannot prove the suite has not
+ * regressed, so the only way to (re)create a baseline is an explicit
+ * `--write-baseline`.
+ */
+export function runCliGate(opts: {
+  report: EvalReport;
+  baselinePath: string;
+  writeBaseline: boolean;
+}): { exitCode: number; output: string[] } {
+  const { report, baselinePath, writeBaseline } = opts;
+  const output: string[] = [];
+
+  if (writeBaseline) {
+    writeFileSync(baselinePath, JSON.stringify(toBaseline(report), null, 2) + "\n");
+    output.push(`Wrote baseline (${report.passed}/${report.total} passing) to ${baselinePath}`);
+    return { exitCode: 0, output };
+  }
+
+  for (const r of report.results) {
+    output.push(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
+  }
+  output.push(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
+
+  // Read + validate the baseline. A missing file, invalid JSON, or a
+  // structurally wrong object all mean the gate cannot be evaluated honestly.
+  let baseline: Baseline | null = null;
+  let readError: string | null = null;
+  try {
+    const parsed = JSON.parse(readFileSync(baselinePath, "utf8")) as unknown;
+    const rec = parsed as Partial<Baseline> | null;
+    if (
+      rec === null ||
+      typeof rec !== "object" ||
+      typeof rec.total !== "number" ||
+      rec.outcomes === null ||
+      typeof rec.outcomes !== "object"
+    ) {
+      readError = "baseline is not a valid Baseline object";
+    } else {
+      baseline = rec as Baseline;
+    }
+  } catch (e) {
+    readError = String(e);
+  }
+
+  if (readError !== null || baseline === null) {
+    output.push(`\nBaseline unreadable at ${baselinePath}: ${readError}`);
+    output.push("Failing closed — no readable baseline to regress against.");
+    output.push("Re-run with --write-baseline to create one explicitly.");
+    return { exitCode: 1, output };
+  }
+
+  // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
+  // complete regression gate matching harness.test.ts.
+  const drift = diffBaseline(report, baseline);
+  if (drift.length) {
+    output.push("\nBaseline drift detected:");
+    for (const d of drift) output.push(`  - ${d}`);
+    output.push("If intended, re-run with --write-baseline to update the snapshot.");
+  }
+
+  return { exitCode: report.failed > 0 || drift.length > 0 ? 1 : 0, output };
+}
+
 // ── CLI ──────────────────────────────────────────────────────────
 if (import.meta.main) {
-  const { writeFileSync } = await import("fs");
-  const { join } = await import("path");
   const report = await runEval();
   const baselinePath = join(import.meta.dir, "baseline.json");
-
-  if (process.argv.includes("--write-baseline")) {
-    writeFileSync(baselinePath, JSON.stringify(toBaseline(report), null, 2) + "\n");
-    console.log(`Wrote baseline (${report.passed}/${report.total} passing) to ${baselinePath}`);
-  } else {
-    for (const r of report.results) {
-      console.log(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
-    }
-    console.log(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
-
-    // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
-    // complete regression gate matching harness.test.ts.
-    const { readFileSync } = await import("fs");
-    let drift: string[] = [];
-    try {
-      const baseline = JSON.parse(readFileSync(baselinePath, "utf8")) as Baseline;
-      drift = diffBaseline(report, baseline);
-      if (drift.length) {
-        console.log("\nBaseline drift detected:");
-        for (const d of drift) console.log(`  - ${d}`);
-        console.log("If intended, re-run with --write-baseline to update the snapshot.");
-      }
-    } catch (e) {
-      console.log(`\n(could not read baseline: ${e})`);
-    }
-
-    if (report.failed > 0 || drift.length > 0) process.exit(1);
-  }
+  const writeBaseline = process.argv.includes("--write-baseline");
+  const { exitCode, output } = runCliGate({ report, baselinePath, writeBaseline });
+  for (const line of output) console.log(line);
+  process.exit(exitCode);
 }
