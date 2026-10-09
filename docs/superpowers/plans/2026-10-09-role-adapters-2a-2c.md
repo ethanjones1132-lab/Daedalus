@@ -812,7 +812,7 @@ Expected: lines like `seeds python ... kept 3; 100 s`; the row count grows towar
 Run: `$PY scripts/roles/prepare_seeds.py --dir E:/AI/teacher-data/gen-v0`
 Expected: `{"rows": N, "usable": {"train": ..., "dev": ..., "test": ...}}`.
 
-- [ ] **Step 3: start `gen` in the background on the cleaned seeds (all splits)**
+- [ ] **Step 3: start `gen` in the background on the cleaned seeds (two processes by split, 12 concurrent calls in all; one process alone made about 110 seeds an hour)**
 
 ```bash
 cd /c/Projects/home-base-recovered/.claude/worktrees/micro-agent-swarm-design-929d42
@@ -843,6 +843,152 @@ mkdir -p docs/benchmarks/roles
 cp /e/AI/role-adapters/data/manifest.json docs/benchmarks/roles/data-manifest.json
 git add docs/benchmarks/roles/data-manifest.json
 git commit -m "data(roles): frozen dataset manifest for arm S"
+```
+
+---
+
+### Task 6b: a second seed round (added during Task 6)
+
+**Why:** all 280 (language, kind, field) cells are used by the first round, which gave 651 usable seeds (465 train). At the observed teacher pass rate (about 70% on the first build, 5% more after one fix) that is about 330 verified build samples, short of the spec's 600 per role. A second round with another random seed asks DeepSeek for 3 more tasks per cell; near-duplicates of existing requests are dropped on merge.
+
+**Files:** Create `scripts/roles/merge_seeds.py`; Test `scripts/roles/test_merge_seeds.py`.
+
+- [ ] **Step 1: start the second round in its own folder (resumable, API only)**
+
+```bash
+mkdir -p /e/AI/teacher-data/gen-v0b
+nohup $PY scripts/teacher/teacher_gen.py seeds --out E:/AI/teacher-data/gen-v0b --backend deepseek --workers 4 \
+  --cells 280 --k 3 --seed 12 > /e/AI/teacher-data/gen-v0b/seeds.out 2>&1 &
+```
+Expected: `seeds ... kept 3; ~100 s` lines; about 280 cells.
+
+- [ ] **Step 2: extract the merge test and watch it fail**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/test_merge_seeds.py && cd scripts/roles && $PY -m unittest test_merge_seeds`
+Expected: FAIL, `ModuleNotFoundError: No module named 'merge_seeds'`.
+
+```python file=scripts/roles/test_merge_seeds.py
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import merge_seeds  # noqa: E402
+
+
+def row(i, request, **kw):
+    return dict({"lang": "python", "kind": "k", "field": "data analysis", "i": i, "title": "t", "request": request,
+                 "entry": "a.py", "tests": "x"}, **kw)
+
+
+class MergeTest(unittest.TestCase):
+    def test_offsets_dedupes_and_flags_the_round(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        base, extra = d / "seeds.jsonl", d / "extra.jsonl"
+        base.write_text(json.dumps(row(0, "Parse log files and report the slowest endpoints per day with percentiles.")) + "\n",
+                        encoding="utf-8")
+        rows = [row(0, "Parse log files and report the slowest endpoints per day with percentiles."),  # a duplicate
+                row(1, "Convert temperatures between Celsius and Fahrenheit from a command line with rounding rules."),
+                row(2, "Anything", excluded=True),
+                {"lang": "python", "kind": "k", "field": "data analysis", "empty": True}]
+        extra.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        counts = merge_seeds.merge(base, extra, offset=3)
+        out = [json.loads(line) for line in base.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(counts, {"added": 1, "duplicates": 1, "skipped": 2})
+        self.assertEqual([r["i"] for r in out], [0, 4])
+        self.assertEqual(out[1].get("round"), 2)
+
+    def test_running_it_twice_does_not_add_twice(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        base, extra = d / "seeds.jsonl", d / "extra.jsonl"
+        base.write_text("", encoding="utf-8")
+        extra.write_text(json.dumps(row(0, "Summarize a CSV of expenses by category with totals and a monthly trend line.")),
+                         encoding="utf-8")
+        merge_seeds.merge(base, extra, offset=3)
+        again = merge_seeds.merge(base, extra, offset=3)
+        self.assertEqual(again["added"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 3: write the implementation**
+
+```python file=scripts/roles/merge_seeds.py
+"""Appends a second seed round to the first: task index shifted by --offset, near-duplicates (Jaccard >= 0.6 on the
+request words) of anything already present dropped, rows tagged round 2. Idempotent.
+usage: merge_seeds.py --base E:/AI/teacher-data/gen-v0/seeds.jsonl --extra E:/AI/teacher-data/gen-v0b/seeds.jsonl"""
+import argparse
+import json
+import pathlib
+import sys
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "moe-bench" / "train_tasks"))
+import make  # noqa: E402
+
+LIMIT = 0.6
+
+
+def read(path):
+    p = pathlib.Path(path)
+    return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()] if p.exists() else []
+
+
+def merge(base, extra, offset=3):
+    have = [make.words(r["request"]) for r in read(base) if r.get("request")]
+    added = duplicates = skipped = 0
+    with open(base, "a", encoding="utf-8") as out:
+        for r in read(extra):
+            if r.get("empty") or r.get("excluded") or not r.get("request"):
+                skipped += 1
+                continue
+            w = make.words(r["request"])
+            if any(make.jaccard(w, h) >= LIMIT for h in have):
+                duplicates += 1
+                continue
+            r["i"] = r["i"] + offset
+            r["round"] = 2
+            out.write(json.dumps(r) + "\n")
+            have.append(w)
+            added += 1
+    return {"added": added, "duplicates": duplicates, "skipped": skipped}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", required=True)
+    ap.add_argument("--extra", required=True)
+    ap.add_argument("--offset", type=int, default=3)
+    a = ap.parse_args()
+    print(json.dumps(merge(a.base, a.extra, a.offset)))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 4: run the tests**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/merge_seeds.py && cd scripts/roles && $PY -m unittest test_merge_seeds -v`
+Expected: `OK` (2 tests).
+
+- [ ] **Step 5: when round 2 has finished, merge it, clean, and generate its seeds**
+
+```bash
+$PY scripts/roles/merge_seeds.py --base E:/AI/teacher-data/gen-v0/seeds.jsonl --extra E:/AI/teacher-data/gen-v0b/seeds.jsonl
+$PY scripts/roles/prepare_seeds.py --dir E:/AI/teacher-data/gen-v0
+```
+Then restart the two `gen` processes of Task 6 Step 3 (train, and dev plus test); they skip every finished seed.
+
+- [ ] **Step 6: commit**
+
+```bash
+git add scripts/roles/merge_seeds.py scripts/roles/test_merge_seeds.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md
+git commit -m "feat(roles): second seed round and idempotent merge"
 ```
 
 ---
