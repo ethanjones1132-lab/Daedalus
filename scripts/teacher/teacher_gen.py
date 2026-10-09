@@ -337,14 +337,17 @@ def seeds(a):
 
 def gen(a):
     out = pathlib.Path(a.out)
-    seeds_ = [r for r in map(json.loads, open(out / "seeds.jsonl", encoding="utf-8"))
-              if not r.get("empty") and not r.get("excluded")]
+    keep_splits = set(a.splits.split(",")) if a.splits else None
+    seeds_ = [r for r in map(json.loads, open(out / a.seeds_file, encoding="utf-8"))
+              if not r.get("empty") and not r.get("excluded") and not r.get("lab_excluded")
+              and (keep_splits is None or r.get("split") in keep_splits)]
     path = out / "runs.jsonl"
     done = {(r["lang"], r["kind"], r["field"], r["i"]) for r in map(json.loads, open(path, encoding="utf-8"))} if path.exists() else set()
 
     def run(s):
         key = (s["lang"], s["kind"], s["field"], s["i"])
         rec = {"lang": s["lang"], "kind": s["kind"], "field": s["field"], "i": s["i"], "backend": a.backend,
+               "split": s.get("split"),
                "request": s["request"], "entry": s["entry"], "tests": s["tests"]}
         rec["plan"], rec["plan_secs"], e1 = call(a.backend, PLAN_GEN_PROMPT.format(request=s["request"]))
         rec["build"], rec["build_secs"], e2 = call(a.backend, BUILD_FROM_PLAN_PROMPT.format(request=s["request"],
@@ -379,6 +382,9 @@ def main():
         s.add_argument("--out", required=True)
         s.add_argument("--backend", choices=list(BACKENDS), required=True)
         s.add_argument("--workers", type=int, default=6)
+        if name == "gen":
+            s.add_argument("--seeds-file", default="seeds.jsonl", help="seeds.jsonl or seeds-clean.jsonl")
+            s.add_argument("--splits", default="", help="comma-separated splits to generate (default all)")
         if name == "seeds":
             s.add_argument("--cells", type=int, default=60)
             s.add_argument("--k", type=int, default=4)
