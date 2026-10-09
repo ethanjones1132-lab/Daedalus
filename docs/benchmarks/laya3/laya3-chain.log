@@ -1,0 +1,40 @@
+08:13:27 pool session start
+08:42:13 pool nested try 1 exit 0 (guard 2048 MB); rows 180
+08:45:24 pool labels exit 0; valid rows 606
+08:45:24 pool session done
+service started
+08:45:24 Versutus gate start requested
+12:41:14 judge session start
+14:45:11 run_v3_judge.sh stopped (kill -9, no gate restore) after Laya timed out under memory pressure; its nested runner continues; run_v3_judge_rest.sh takes over
+14:45:19 judge session (rest) start
+17:48:29 judge nested runner finished; rows 360
+split: 212 rows without an evidence answer of 360
+17:48:30 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+17:58:37 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:08:44 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:18:51 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:28:57 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:39:04 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:49:11 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+18:59:18 waiting: a game is running (RobloxPlayerBeta); Laya misses its deadline under that memory pressure
+19:11:16 p3 redo pass 1 try 1 exit 127 (guard 2048 MB); rows 156
+20:14:35 p3 redo pass 1 try 2 exit 0 (guard 2048 MB); rows 360
+merge: 360 rows; 8 still without an evidence answer
+split: 8 rows without an evidence answer of 360
+20:17:30 p3 redo pass 2 try 1 exit 0 (guard 2048 MB); rows 360
+merge: 360 rows; 0 still without an evidence answer
+split: 0 rows without an evidence answer of 360
+20:18:19 p3 redo pass 3 try 1 exit 0 (guard 2048 MB); rows 360
+merge: 360 rows; 0 still without an evidence answer
+21:05:44 judge live try 1 exit 0 (guard 2048 MB); rows 360
+drop-dead: 0 live rows run after Laya died, removed for a rerun
+21:06:36 tier2b live try 1 exit 1 (guard 2048 MB); rows 0
+21:24:17 tier2b live try 2 exit 0 (guard 1024 MB); rows 117
+drop-dead: 0 live rows run after Laya died, removed for a rerun
+21:37:05 Versutus gate start requested early: GPU work done, only CPU labelling left
+23:21:07 judge labels exit 0
+23:21:07 report exit 0
+23:21:08 diagnostics exit 0
+23:21:08 judge session done
+service started
+23:21:08 Versutus gate start requested
