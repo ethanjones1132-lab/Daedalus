@@ -97,7 +97,7 @@ class LayaClient:
     # 30 s since 2026-10-08 (v2 ran with 5 s): under memory pressure a paged-out worker missed 5 s and was dropped for
     # the rest of the run. A slow answer still counts in model secs.
     def __init__(self, calib, timeout=30.0, start_timeout=300.0):
-        self.timeout, self.dead, self.q, self.proc = timeout, False, queue.Queue(), None
+        self.timeout, self.dead, self.q, self.proc, self.ready = timeout, False, queue.Queue(), None, None
         try:
             self.proc = subprocess.Popen([LAYA_PY, str(HERE / "laya_partner.py"), "worker", "--calib", str(calib)],
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -107,6 +107,7 @@ class LayaClient:
             return
         threading.Thread(target=self._read, daemon=True).start()
         r = self._get(start_timeout)
+        self.ready = r  # the worker's first line: wording, form, int8 flag and its memory at load
         if not (r and r.get("ready")):
             self.close()
             self.dead = True

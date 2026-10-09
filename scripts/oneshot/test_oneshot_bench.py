@@ -121,3 +121,34 @@ class BlindTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DenseTest(unittest.TestCase):
+    def test_dense_uses_ngl_not_cpu_moe(self):
+        a = ob.llama_args("qwen38-9b", 91)
+        self.assertEqual(a[a.index("-ngl") + 1], "91")
+        self.assertNotIn("--n-cpu-moe", a)
+        self.assertEqual(a[a.index("--spec-type") + 1], "draft-mtp,ngram-mod")
+
+    def test_dense_spec_override(self):
+        self.assertEqual(ob.llama_args("gemma4-12b", 99)[ob.llama_args("gemma4-12b", 99).index("--spec-type") + 1],
+                         "ngram-mod")
+        self.assertNotIn("--spec-type", ob.llama_args("gemma4-12b", 99, "none"))
+
+    def test_moe_unchanged(self):
+        a = ob.llama_args("qwen36full-iq3xxs", 26)
+        self.assertEqual(a[a.index("-ngl") + 1], "99")
+        self.assertEqual(a[a.index("--n-cpu-moe") + 1], "26")
+
+    def test_ngl_fit_steps(self):
+        self.assertIsNone(ob.next_ngl(99, ob.VRAM_CAP_MIB, True))
+        self.assertEqual(ob.next_ngl(99, ob.VRAM_CAP_MIB + 50, True, 110), 95)  # at least 4 lower
+        self.assertEqual(ob.next_ngl(99, ob.VRAM_CAP_MIB + 1000, True, 110), 99 - 11)  # the excess in layers, +1
+        self.assertEqual(ob.next_ngl(99, None, False), 91)  # out of memory at load
+        self.assertEqual(ob.next_ngl(40, None, False, oom=False), 40)  # not memory: the caller changes the spec
+
+    def test_every_roster_file_is_registered(self):
+        for key in ("qwen38-27b", "gemma4-12b", "qwen38-9b", "dsv4pro-qwen35-9b", "qwen35-9b", "qwen35-9b-coder",
+                    "qwythos-9b", "ornith-9b", "nemotron-nano-9b", "gemma4-12b-coding", "llama31-8b", "nanbeige-3b",
+                    "bonsai-27b"):
+            self.assertTrue(ob.MODELS[key]["dense"])

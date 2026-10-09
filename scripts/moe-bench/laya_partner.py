@@ -11,10 +11,15 @@ never on tier2b or the judge set. Inputs longer than the English checkpoint's 51
   label   every wording and form in batch: a card per task in TIER2B_DIR and P(correct) per stored candidate
           (rows of type "trial" from playbook_tier2b.py nested, or "cand" from bestofn_tier2b.py). Resumable.
 
+LAYA_INT8=1 (lean Laya, 2026-10-09): each checkpoint is streamed into dynamic int8 on the encoder's nn.Linear layers,
+one tensor at a time, so the fp32 encoder is never held; the worker also answers {"op": "mem"}. Nothing else changes.
+
 usage: laya_partner.py worker [--calib CALIB.json]
        laya_partner.py label --runs RUNS.jsonl --out LABELS.jsonl      (TIER2B_DIR = the runs' task set)
 """
 import argparse
+import ctypes
+import gc
 import json
 import os
 import pathlib
@@ -26,6 +31,7 @@ from laya_calibrate import IDENTITY, calibrate_card, platt_apply  # noqa: E402
 from laya_v3_text import EVIDENCE_OPTIONS, valid_state  # noqa: E402
 
 REPO_ID = "convaiinnovations/laya"
+INT8 = os.environ.get("LAYA_INT8") == "1"
 CLASSIFY = {
     "v1": {
         "kind": {"type": "choice", "instructions": "What kind of fix is this?",
@@ -64,10 +70,131 @@ def verify_state(requirement, entry, code):
     return f"Requirement: {requirement}\n\nCorrected {entry}:\n```python\n{code}\n```"
 
 
+def mem_stats():
+    """This process's working set and private (commit) bytes in MiB, with their peaks. Windows only."""
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_ulong), ("faults", ctypes.c_ulong), ("peak_ws", ctypes.c_size_t),
+                    ("ws", ctypes.c_size_t), ("q1", ctypes.c_size_t), ("q2", ctypes.c_size_t),
+                    ("q3", ctypes.c_size_t), ("q4", ctypes.c_size_t), ("pagefile", ctypes.c_size_t),
+                    ("peak_pagefile", ctypes.c_size_t), ("private", ctypes.c_size_t)]
+    c = Counters()
+    c.cb = ctypes.sizeof(c)
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    ctypes.windll.psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+    ctypes.windll.psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+    mib = 2 ** 20
+    return {"ws_mib": c.ws // mib, "peak_ws_mib": c.peak_ws // mib, "private_mib": c.private // mib,
+            "peak_private_mib": c.peak_pagefile // mib}
+
+
+def trim_memory():
+    """Give freed pages back: collect garbage, shrink the heap and empty the working set."""
+    gc.collect()
+    try:
+        ctypes.cdll.msvcrt._heapmin()
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+        k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), ctypes.c_size_t(-1).value, ctypes.c_size_t(-1).value)
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        pass
+
+
+class LazyWeights:
+    """A safetensors file read one tensor at a time: keys, shapes and tensors on demand, nothing held."""
+
+    def __init__(self, path):
+        from safetensors import safe_open
+        self.f = safe_open(path, framework="pt", device="cpu")
+        self._keys = list(self.f.keys())
+        self._set = set(self._keys)
+
+    def keys(self):
+        return self._keys
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __contains__(self, k):
+        return k in self._set
+
+    def __getitem__(self, k):
+        return self.f.get_tensor(k)
+
+    def get(self, k, default=None):
+        return self.f.get_tensor(k) if k in self._set else default
+
+    def shape(self, k):
+        return tuple(self.f.get_slice(k).get_shape())
+
+
+def _lean_verify(model, cfg, weights, model_id):
+    """laya.agent._verify_compatibility for LazyWeights: the same checks, from shapes only."""
+    for key in ("encoder", "head_layers"):
+        if key not in cfg:
+            raise ValueError(f"Incompatible model config for {model_id!r}: missing {key!r}")
+    for prefix in ("encoder.", "type_emb.", "scorer.", "act_head."):
+        if not any(k.startswith(prefix) for k in weights.keys()):
+            raise ValueError(f"Incompatible model weights for {model_id!r}: no {prefix!r} parameters")
+    bad = [n for n, p in model.named_parameters() if n not in weights or weights.shape(n) != tuple(p.shape)]
+    if bad:
+        raise ValueError(f"Model weights do not match the architecture for {model_id!r}: {bad[:3]}")
+
+
+def _stream_load(model, weights):
+    """DecisionModel.load_state_dict(strict=True) that never holds the fp32 encoder: every encoder nn.Linear is
+    read, quantized to dynamic int8 and swapped in one at a time; everything else is copied as usual. The two-layer
+    decision head stays fp32 (torch's TransformerEncoderLayer reads linear1.weight as a tensor; it is ~25M of the
+    421M parameters)."""
+    import torch
+    nn = torch.nn
+    linears = {f"encoder.{n}": m for n, m in model.encoder.named_modules() if isinstance(m, nn.Linear)}
+    handled = {f"{n}.{t}" for n in linears for t in ("weight", "bias")}
+    state = model.state_dict()
+    unexpected = set(weights.keys()) - set(state)
+    missing = set(state) - set(weights.keys())
+    if unexpected or missing:
+        raise RuntimeError(f"strict load failed: unexpected {sorted(unexpected)[:3]}, missing {sorted(missing)[:3]}")
+    for k, v in state.items():
+        if k not in handled:
+            v.copy_(weights[k])
+    for full, mod in linears.items():
+        name = full[len("encoder."):]
+        mod.weight = nn.Parameter(weights[f"{full}.weight"], requires_grad=False)
+        if mod.bias is not None:
+            mod.bias = nn.Parameter(weights[f"{full}.bias"], requires_grad=False)
+        holder = torch.ao.quantization.quantize_dynamic(nn.Sequential(mod), {nn.Linear}, dtype=torch.qint8)
+        parent, _, leaf = name.rpartition(".")
+        setattr(model.encoder.get_submodule(parent) if parent else model.encoder, leaf, holder[0])
+        del mod, holder
+    del state
+    trim_memory()
+    return torch.nn.modules.module._IncompatibleKeys([], [])
+
+
+def install_lean_loader():
+    """LAYA_INT8=1: make laya.load build each checkpoint straight into int8 (see _stream_load)."""
+    import laya.agent as la
+    import safetensors.torch as st
+    build = la.build_model
+
+    def lean_build(*args, **kw):
+        model = build(*args, **kw)
+        model.load_state_dict = lambda weights, strict=True: _stream_load(model, weights)
+        return model
+    la.build_model, la._verify_compatibility, st.load_file = lean_build, _lean_verify, LazyWeights
+
+
 class Laya:
     def __init__(self):
         os.environ.setdefault("USE_TF", "0")
         import laya
+        if INT8:
+            install_lean_loader()
         self.laya, self.agents = laya, {}
         self.agent("root")
 
@@ -120,36 +247,47 @@ def worker(a):
         out.write(json.dumps(obj) + "\n")
         out.flush()
 
+    import torch
     calib = json.loads(pathlib.Path(a.calib).read_text(encoding="utf-8")) if a.calib else IDENTITY
     lp = Laya()
     lp.classify("Fix solution.py.\n\nRequirement: warm-up.", calib["classify_wording"])  # first call is slow
-    say({"ok": True, "ready": True, "wording": calib["classify_wording"], "form": calib["verify_form"]})
+    say({"ok": True, "ready": True, "wording": calib["classify_wording"], "form": calib["verify_form"],
+         "int8": INT8, **mem_stats()})
     for line in sys.stdin:
         t = time.time()
         try:
             m = json.loads(line)
-            if m["op"] == "ping":
-                rep = {}
-            elif m["op"] == "classify":
-                raw = lp.classify(m["state"], calib["classify_wording"])
-                rep = {"raw": raw, "card": calibrate_card(raw, calib["platt"], calib.get("hidden_signal", "noul"))}
-            elif m["op"] == "verify":
-                p, ckpt = lp.verify(m["requirement"], m["entry"], m["code"], calib["verify_form"])
-                rep = {"p_raw": p, "p": platt_apply(p, calib["platt"]["verify"]), "ckpt": ckpt}
-            elif m["op"] == "evidence":
-                rep = lp.evidence(m["state"])
-                if rep is None:
-                    raise ValueError("evidence state too long for Laya")
-            elif m["op"] == "valid":
-                p, ckpt = lp.valid(m["state"])
-                rep = {"p_raw": p, "p": platt_apply(p, calib["platt"].get("valid", [1.0, 0.0])), "ckpt": ckpt}
-            else:
-                raise ValueError(f"unknown op {m['op']!r}")
+            with torch.inference_mode():
+                rep = answer(lp, calib, m)
             rep["ok"] = True
         except Exception as e:  # any failure is a fallback for the caller, never a crash of the worker
             rep = {"ok": False, "error": repr(e)[:300]}
         rep["secs"] = round(time.time() - t, 3)
         say(rep)
+
+
+def answer(lp, calib, m):
+    """One worker request -> the reply (without ok and secs)."""
+    op = m["op"]
+    if op == "ping":
+        return {}
+    if op == "mem":
+        return mem_stats()
+    if op == "classify":
+        raw = lp.classify(m["state"], calib["classify_wording"])
+        return {"raw": raw, "card": calibrate_card(raw, calib["platt"], calib.get("hidden_signal", "noul"))}
+    if op == "verify":
+        p, ckpt = lp.verify(m["requirement"], m["entry"], m["code"], calib["verify_form"])
+        return {"p_raw": p, "p": platt_apply(p, calib["platt"]["verify"]), "ckpt": ckpt}
+    if op == "evidence":
+        rep = lp.evidence(m["state"])
+        if rep is None:
+            raise ValueError("evidence state too long for Laya")
+        return rep
+    if op == "valid":
+        p, ckpt = lp.valid(m["state"])
+        return {"p_raw": p, "p": platt_apply(p, calib["platt"].get("valid", [1.0, 0.0])), "ckpt": ckpt}
+    raise ValueError(f"unknown op {op!r}")
 
 
 def run_candidates(path, extract_code):
@@ -189,7 +327,7 @@ def label(a):
         f.flush()
         for name, trial, run, c, code in run_candidates(a.runs, extract_code):
             task = tasks[name]
-            for form in VERIFY:
+            for form in (a.forms.split(",") if getattr(a, "forms", "") else VERIFY):
                 if ("verify", name, trial, run, c, form) in done:
                     continue
                 t = time.time()
@@ -225,6 +363,7 @@ def main():
     lab.add_argument("--runs", required=True)
     lab.add_argument("--out", required=True)
     lab.add_argument("--v3", action="store_true")
+    lab.add_argument("--forms", default="", help="verify forms to label, comma-separated (default: all)")
     a = ap.parse_args()
     worker(a) if a.cmd == "worker" else label(a)
 

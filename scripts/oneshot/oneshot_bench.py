@@ -170,22 +170,51 @@ MODELS = {
     "k2h": dict(path=EM / "K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf", ncmoe=30, spec="none", build="k2h",
                 extra=["-ot", "attn_v_exps=CPU"]),
 }
+# Step 1 item 4 (2026-10-09, owner): the dense models on disk, one pick each. The fit lowers -ngl (start 99) instead of
+# raising --n-cpu-moe. spec: mtp where the GGUF carries an MTP head, else ngram; a failed load that is not out of memory
+# is retried with the next spec down (mtp, ngram, none) before the placement changes.
+def dense(path, spec="ngram", **kw):
+    return dict(path=pathlib.Path(path), ncmoe=99, spec=spec, dense=True, **kw)
+
+
+EG = pathlib.Path(r"E:\models\gguf")
+MODELS.update({
+    "qwen38-27b": dense(EM / "Qwen3.8-27B-UD-IQ2_XXS.gguf", gen_timeout=9000),
+    "gemma4-12b": dense(EM / "gemma-4-12b-it-qat-q4_0.gguf"),
+    "qwen38-9b": dense(EM / "published-Q4_K_M.gguf", "mtp"),
+    "dsv4pro-qwen35-9b": dense(EG / "DeepSeek-V4-Pro-Qwen3.5-9B-MTP-Q5_K_M.gguf", "mtp"),
+    "qwen35-9b": dense(EG / "unsloth-Qwen3.5-9B-Q5_K_M.gguf"),
+    "qwen35-9b-coder": dense(EM / "Qwen3.5-9B-Coder.Q4_K_M.gguf"),
+    "qwythos-9b": dense(EG / "Qwythos-9B-Claude-Mythos-5-1M-MTP-Q4_K_M.gguf", "mtp"),
+    "ornith-9b": dense(EG / "ornith-1.0-9b-Q4_K_M.gguf"),
+    "nemotron-nano-9b": dense(EG / "nvidia_NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf"),
+    "gemma4-12b-coding": dense(EM / "gemma4-coding-Q3_K_M.gguf"),
+    "llama31-8b": dense(EG / "Meta-Llama-3.1-8B-Instruct-Q5_K_S.gguf"),
+    "nanbeige-3b": dense(EG / "nanbeige4.2-3b-Q6_K.gguf"),
+    "bonsai-27b": dense(EG / "Ternary-Bonsai-27B-Q2_0.gguf", gen_timeout=9000),
+})
 CTX = 40960  # prompt (~5k tokens) + the 32k output budget
 PORT = 8095
 VRAM_CAP_MIB = 8188 - 250  # absolute use, desktop included: above this, Windows spills VRAM into system RAM
 
 
-def llama_args(name, ncmoe):
+SPECS_DOWN = {"mtp": "ngram", "ngram": "none"}
+
+
+def llama_args(name, place, spec=None):
+    """place: --n-cpu-moe for an MoE, -ngl for a dense model (entries with dense=True). spec overrides the entry's."""
     m = MODELS[name]
-    args = [str(BUILDS[m.get("build", "master")]), "-m", str(m["path"]), "--host", "127.0.0.1", "--port", str(PORT),
-            "-ngl", "99", "--n-cpu-moe", str(ncmoe), "-c", str(CTX), "-ctk", "q8_0", "-ctv", "q8_0",
-            "--flash-attn", "on", "-b", "512", "-ub", "512", "-np", "1", "--jinja",
-            "--reasoning-budget", str(m.get("budget", 0)), "--no-webui", "--cache-ram", "0"]
-    if m["spec"] == "mtp":
+    spec = spec or m["spec"]
+    gpu = ["-ngl", str(place)] if m.get("dense") else ["-ngl", "99", "--n-cpu-moe", str(place)]
+    args = [str(BUILDS[m.get("build", "master")]), "-m", str(m["path"]), "--host", "127.0.0.1", "--port", str(PORT)]
+    args += gpu + ["-c", str(CTX), "-ctk", "q8_0", "-ctv", "q8_0",
+                   "--flash-attn", "on", "-b", "512", "-ub", "512", "-np", "1", "--jinja",
+                   "--reasoning-budget", str(m.get("budget", 0)), "--no-webui", "--cache-ram", "0"]
+    if spec == "mtp":
         args += ["--spec-type", "draft-mtp,ngram-mod", "--spec-draft-n-max", "2"]
         if m.get("draft"):
             args += ["-md", str(m["draft"])]
-    elif m["spec"] == "ngram":
+    elif spec == "ngram":
         args += ["--spec-type", "ngram-mod"]
     return args + list(m.get("extra", []))
 
@@ -195,6 +224,25 @@ def next_placement(ncmoe, used_mib, loaded):
     if not loaded:
         return ncmoe + 4
     return None if used_mib <= VRAM_CAP_MIB else ncmoe + 2
+
+
+def next_ngl(ngl, used_mib, loaded, layer_mib=110, oom=True):
+    """Dense fit: None if the placement fits; else the next -ngl, at least 4 lower. A model that is loaded but over the
+    cap drops by the excess in layers (+1); one that failed to load out of memory drops by 8."""
+    if not loaded:
+        return max(ngl - 8, 0) if oom else ngl
+    if used_mib <= VRAM_CAP_MIB:
+        return None
+    return max(ngl - max(4, -(-(used_mib - VRAM_CAP_MIB) // layer_mib) + 1), 0)
+
+
+def _oom(log_path):
+    try:
+        tail = pathlib.Path(log_path).read_text(encoding="utf-8", errors="replace")[-6000:].lower()
+    except OSError:
+        return True
+    return any(k in tail for k in ("out of memory", "cudamalloc", "failed to allocate", "unable to allocate",
+                                   "outofdevicememory", "cuda error"))
 
 
 def _post(path, payload, timeout):
@@ -240,24 +288,44 @@ def run_llama(name, seeds, runs, prompt, max_tokens=32768, stop_file=None):
     if not m["path"].exists():
         raise SystemExit(f"{name}: model file missing: {m['path']}")
     log = open(runs / f"{name}-server.log", "a", encoding="utf-8", errors="replace")
-    ncmoe, proc, fit = m["ncmoe"], None, []
+    ncmoe, proc, fit, spec = m["ncmoe"], None, [], m["spec"]
+    log_path = runs / f"{name}-server.log"
+    layer_mib = 110
+    if m.get("dense"):
+        sys.path.insert(0, str(MB))
+        import gguf_arch
+        head = gguf_arch.head(str(m["path"]))
+        blocks = next((v for k, v in head.items() if k.endswith(".block_count")), 64)
+        layer_mib = max(int(m["path"].stat().st_size / 2**20 / blocks), 40)
     try:
-        for _ in range(6):
-            proc = _start(llama_args(name, ncmoe), log)
+        for _ in range(20 if m.get("dense") else 6):
+            proc = _start(llama_args(name, ncmoe, spec), log)
             used = None
             if proc:
                 _post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Say hi."}], "max_tokens": 16,
                                                "temperature": 0, "chat_template_kwargs": m.get("chat_kwargs") or
                                                {"enable_thinking": False}}, 600)
                 used = moe_sweep.vram_used_mib()
-            fit.append({"ncmoe": ncmoe, "loaded": bool(proc), "vram_used_mib": used})
-            nxt = next_placement(ncmoe, used, bool(proc))
-            print(f"{time.strftime('%H:%M:%S')} {name}: ncmoe {ncmoe} loaded {bool(proc)} VRAM {used} MiB", flush=True)
+            fit.append({"ncmoe": ncmoe, "loaded": bool(proc), "vram_used_mib": used, "spec": spec})
+            if m.get("dense"):
+                oom = _oom(log_path) if not proc else True
+                if not proc and not oom and spec in SPECS_DOWN:
+                    nxt, spec = ncmoe, SPECS_DOWN[spec]  # same placement, simpler speculation
+                elif not proc and not oom:
+                    nxt = -1  # fails to load with no speculation and not for memory: unsupported here
+                else:
+                    nxt = next_ngl(ncmoe, used, bool(proc), layer_mib, oom)
+            else:
+                nxt = next_placement(ncmoe, used, bool(proc))
+            print(f"{time.strftime('%H:%M:%S')} {name}: place {ncmoe} spec {fit[-1]['spec']} loaded {bool(proc)} "
+                  f"VRAM {used} MiB", flush=True)
             if nxt is None:
                 break
             if proc:
                 _stop(proc)
                 proc = None
+            if nxt < 0 or (nxt == 0 and ncmoe == 0):
+                break
             ncmoe = nxt
         if proc is None:
             raise SystemExit(f"{name}: no placement fits ({fit})")
@@ -269,10 +337,10 @@ def run_llama(name, seeds, runs, prompt, max_tokens=32768, stop_file=None):
             r = _post("/v1/chat/completions", {
                 "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.2,
                 "top_p": 0.95, "seed": s, "cache_prompt": False,
-                "chat_template_kwargs": m.get("chat_kwargs") or {"enable_thinking": False}}, 4000)
+                "chat_template_kwargs": m.get("chat_kwargs") or {"enable_thinking": False}}, m.get("gen_timeout", 4000))
             choice, tm = r["choices"][0], r.get("timings", {})
             msg = choice.get("message") or {}
-            meta = {"model": name, "file": m["path"].name, "seed": s, "ncmoe": ncmoe, "fit": fit,
+            meta = {"model": name, "file": m["path"].name, "seed": s, "ncmoe": ncmoe, "spec": spec, "fit": fit,
                     "wall_s": round(time.time() - t, 1), "finish_reason": choice.get("finish_reason"),
                     "prompt_n": tm.get("prompt_n"), "gen_n": tm.get("predicted_n"),
                     "gen_tps": round(tm.get("predicted_per_second", 0), 1),
