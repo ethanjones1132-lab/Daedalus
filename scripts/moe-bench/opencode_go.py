@@ -76,10 +76,13 @@ class Client:
     def models(self):
         return [m["id"] for m in self._req("/models")["data"]]
 
-    def chat(self, prompt, temperature=0.8, max_tokens=16384, tries=5):
-        """Reply text. Retries 429/5xx and timeouts with backoff; asks for a JSON object, without it on a 400."""
-        payload = {"model": self.model, "messages": [{"role": "user", "content": prompt}],
-                   "temperature": temperature, "max_tokens": max_tokens, "response_format": {"type": "json_object"}}
+    def chat(self, prompt, temperature=0.8, max_tokens=16384, tries=5, json_mode=True, system=None):
+        """Reply text. Retries 429/5xx and timeouts with backoff. json_mode asks for a JSON object (dropped on a 400);
+        teacher data (scripts/teacher) turns it off for free text and passes the shared system message."""
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        payload = {"model": self.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         for k in range(tries):
             try:
                 r = self._req("/chat/completions", payload)
