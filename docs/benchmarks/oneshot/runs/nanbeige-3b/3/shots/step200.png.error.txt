@@ -1,0 +1,6 @@
+Error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')
+    at oneTick (http://127.0.0.1:57790/app.html:257:17)
+    at Object.step (http://127.0.0.1:57790/app.html:247:5)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

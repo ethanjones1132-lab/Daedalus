@@ -1,0 +1,24 @@
+0.00.037.617 I srv  llama_server: initializing ...
+0.00.037.631 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.037.716 I srv  init_listene: The UI is disabled
+0.00.037.716 I srv  init_listene: Use --ui/--no-ui (or deprecated --webui/--no-webui) to enable/disable
+0.00.037.805 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.040.721 I srv    load_model: loading model 'E:\qwen3-forge\models\K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf'
+0.00.695.414 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort
+0.01.065.942 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.01.113.850 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+3.47.455.201 I cmn          init: llama threadpool init, n_threads = 10
+4.38.225.127 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 40960, kv_unified = 'false'
+4.38.227.580 W srv          init: --cache-idle-slots requires --cache-ram, disabling
+4.38.261.571 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+4.38.262.994 I srv  llama_server: model loaded
+4.38.263.002 I srv  llama_server: listening on http://127.0.0.1:8095
+4.39.343.688 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = -1
+4.39.345.478 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+19.39.764.280 W srv          stop: cancel task, id_task = 0
+19.45.408.673 I slot      release: id  0 | task 0 | stop processing: n_tokens = 152, truncated = 0
+19.45.408.952 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 1185376048
+19.45.412.509 I slot launch_slot_: id  0 | task 85 | processing task, is_child = 0
+22.52.968.061 I slot print_timing: id  0 | task 85 | prompt processing, n_tokens =    512, progress = 0.06, t = 187.55 s / 2.73 tokens per second
+26.03.359.986 I slot print_timing: id  0 | task 85 | prompt processing, n_tokens =   1024, progress = 0.13, t = 377.94 s / 2.71 tokens per second
+29.14.203.266 I slot print_timing: id  0 | task 85 | prompt processing, n_tokens =   1536, progress = 0.19, t = 568.79 s / 2.70 tokens per second

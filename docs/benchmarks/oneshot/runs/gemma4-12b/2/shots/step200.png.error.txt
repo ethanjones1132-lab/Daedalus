@@ -1,0 +1,6 @@
+Error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')
+    at step (http://127.0.0.1:63262/app.html:243:30)
+    at Object.step (http://127.0.0.1:63262/app.html:636:18)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

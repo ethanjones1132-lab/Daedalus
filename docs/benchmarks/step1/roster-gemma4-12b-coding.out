@@ -1,0 +1,34 @@
+07:22:59 gemma4-12b-coding: place 99 spec ngram loaded True VRAM 7141 MiB
+07:27:03 gemma4-12b-coding/1: 32768 tokens in 243.9 s, finish length
+07:30:12 gemma4-12b-coding/2: 32768 tokens in 189.2 s, finish length
+07:35:11 gemma4-12b-coding/3: 32768 tokens in 299.2 s, finish length
+gemma4-12b-coding/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+gemma4-12b-coding/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+gemma4-12b-coding/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+gemma4-12b-coding/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+gemma4-12b-coding/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+gemma4-12b-coding/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0

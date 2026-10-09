@@ -1,0 +1,9 @@
+03:13:38   laya int8: {"ram_before_mb": 1011, "ram_after_load_mb": 707, "ram_after_10s_mb": 791, "ok": 20, "p50_s": 0.905, "p95_s": 1.171, "gen_tps_during": 21.84, "skipped": null}
+03:17:08   laya fp32: {"ram_before_mb": 574, "ram_after_load_mb": 1202, "ram_after_10s_mb": 1783, "ok": 20, "p50_s": 0.867, "p95_s": 1.111, "gen_tps_during": 33.59, "skipped": null}
+03:17:23 window 16384 ncmoe 26: loaded True VRAM used 7197 peak 7237 short [34.92, 76.07, 37.48, 78.73] deep {'prompt_n': 13739, 'prompt_tps': 332.8, 'gen_tps': 33.79, 'gen_n': 300, 'wall_s': 50.92} verdict {"none": true, "int8": false, "fp32": true} error None
+03:34:15   laya int8: {"ram_before_mb": 333, "ram_after_load_mb": 511, "ram_after_10s_mb": 985, "ok": 20, "p50_s": 0.901, "p95_s": 1.302, "gen_tps_during": 25.5, "skipped": null}
+03:37:26   laya fp32: {"ram_before_mb": 365, "ram_after_load_mb": 572, "ram_after_10s_mb": 1177, "ok": 20, "p50_s": 0.923, "p95_s": 1.193, "gen_tps_during": 19.41, "skipped": null}
+03:37:45 window 65536 ncmoe 26: loaded True VRAM used 7711 peak 7751 short [28.65, 31.68, 36.56, 63.17] deep {'prompt_n': 58133, 'prompt_tps': 168.9, 'gen_tps': 24.73, 'gen_n': 300, 'wall_s': 356.98} verdict {"none": false, "int8": false, "fp32": false} error None
+04:12:33   laya int8: {"ram_before_mb": 1108, "ram_after_load_mb": 1819, "ram_after_10s_mb": 1250, "ok": 20, "p50_s": 0.943, "p95_s": 1.22, "gen_tps_during": 2.9, "skipped": null}
+04:21:29   laya fp32: {"ram_before_mb": 809, "ram_after_load_mb": 1010, "ram_after_10s_mb": 965, "ok": 20, "p50_s": 0.81, "p95_s": 1.026, "gen_tps_during": 3.08, "skipped": null}
+04:21:44 window 16384 ncmoe 26: loaded True VRAM used 7197 peak 7239 short [13.4, 6.9, 7.12, 12.31] deep {'prompt_n': 13739, 'prompt_tps': 33.6, 'gen_tps': 11.63, 'gen_n': 300, 'wall_s': 435.46} verdict {"none": false, "int8": false, "fp32": false} error None

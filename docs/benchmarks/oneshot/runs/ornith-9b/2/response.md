@@ -1,0 +1,1005 @@
+## Plan
+
+**Data Model:**
+- **Grid:** 2D array of cells. Each cell has `grass` (0..grassMax), and optional `rabbit`/`fox` objects `{id, energy}`.
+- **Animals:** Array of objects `{id, x, y, energy, type}`. IDs are unique, shared counter.
+- **State:** `tick`, `seed`, `params` (merged defaults), `history` array, `counts` object.
+- **Randomness:** Single `mulberry32` generator instance, created on reset.
+
+**Tick Order:**
+1. **Grass:** All cells grow.
+2. **Rabbits:** Sort by ID. For each: Move (pick empty neighbor), Eat (gain energy, clear grass), Cost (lose energy), Breed (if energy >= threshold, pick empty neighbor, spawn child), Die (if energy <= 0).
+3. **Foxes:** Sort by ID. For each: Move (prefer rabbit-containing cells, then empty), Eat (if rabbit present, remove, gain energy), Cost, Breed, Die.
+4. **Record:** Increment tick, push history point.
+
+**Components:**
+- **World Canvas:** Renders grid, rabbits, foxes.
+- **Controls:** Play/Pause/Step/Reset buttons, speed slider, parameter sliders.
+- **Counters:** Live tick, rabbit, fox, grass counts.
+- **Chart:** SVG polyline for rabbit/fox populations over time.
+- **Lotka-Volterra Panel:** RK4 integration, equations, drift calculation, mini chart.
+- **Scenario Tools:** Export/Load JSON, error display.
+- **Presets:** Save/Load/Delete from localStorage.
+- **Announcer:** ARIA live region for keyboard users.
+
+---
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Ecosystem Lab</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --panel: #16213e;
+    --accent: #0f3460;
+    --text: #e0e0e0;
+    --border: #533483;
+    --btn: #e94560;
+    --btn-hover: #c23152;
+    --input-bg: #0f3460;
+    --input-border: #533483;
+    --success: #4cc9f0;
+    --error: #f72585;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-width: 360px;
+    overflow-x: hidden;
+    line-height: 1.5;
+  }
+  h1 {
+    text-align: center;
+    padding: 10px;
+    font-size: 1.4em;
+    color: var(--success);
+    border-bottom: 2px solid var(--border);
+  }
+  .layout {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0;
+    padding: 10px;
+  }
+  .panel-world {
+    flex: 1 1 500px;
+    min-width: 300px;
+    background: var(--panel);
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .panel-side {
+    flex: 1 1 300px;
+    min-width: 280px;
+    background: var(--panel);
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  canvas {
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: #0a0a1a;
+    image-rendering: pixelated;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin: 10px 0;
+  }
+  button {
+    background: var(--btn);
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 0.9em;
+    transition: background 0.2s;
+  }
+  button:hover { background: var(--btn-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .counters {
+    display: flex;
+    gap: 16px;
+    font-size: 1.1em;
+    margin: 8px 0;
+    font-family: monospace;
+  }
+  .counter-item span { color: var(--success); font-weight: bold; }
+  .param-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+    font-size: 0.85em;
+  }
+  .param-row label { min-width: 80px; }
+  input[type=range] { flex: 1; }
+  .param-value { min-width: 30px; text-align: right; color: var(--success); }
+  .seed-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 0;
+  }
+  input[type=number] {
+    background: var(--input-bg);
+    color: white;
+    border: 1px solid var(--input-border);
+    padding: 4px 8px;
+    border-radius: 4px;
+    width: 60px;
+  }
+  .chart-container {
+    background: #0a0a1a;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 5px;
+  }
+  .section-title {
+    font-size: 1em;
+    color: var(--success);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 5px;
+  }
+  textarea {
+    width: 100%;
+    height: 80px;
+    background: var(--input-bg);
+    color: var(--text);
+    border: 1px solid var(--input-border);
+    border-radius: 4px;
+    padding: 5px;
+    font-family: monospace;
+    font-size: 0.8em;
+    resize: vertical;
+  }
+  .error-msg {
+    color: var(--error);
+    font-size: 0.85em;
+    min-height: 1.2em;
+  }
+  .preset-list {
+    max-height: 150px;
+    overflow-y: auto;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 5px;
+  }
+  .preset-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--accent);
+    font-size: 0.9em;
+  }
+  .preset-item:last-child { border-bottom: none; }
+  .preset-item button {
+    padding: 2px 8px;
+    font-size: 0.8em;
+    margin-left: 4px;
+  }
+  .ode-panel {
+    background: #0a0a1a;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 8px;
+  }
+  .ode-result {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 8px 0;
+    font-family: monospace;
+    font-size: 0.9em;
+  }
+  .ode-result div { min-width: 100px; }
+  .announce {
+    position: fixed;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--accent);
+    color: white;
+    padding: 6px 12px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    opacity: 0;
+    transition: opacity 0.3s;
+    pointer-events: none;
+  }
+  .announce.visible { opacity: 1; }
+  @media (max-width: 700px) {
+    .layout { flex-direction: column; }
+    .panel-side { order: 2; }
+  }
+</style>
+</head>
+<body>
+<h1>Ecosystem Lab</h1>
+<div class="layout">
+  <div class="panel-world" id="panel-world">
+    <canvas data-testid="world" width="400" height="300"></canvas>
+    <div class="controls">
+      <button data-testid="play" id="btn-play">Play</button>
+      <button data-testid="pause" id="btn-pause" disabled>Pause</button>
+      <button data-testid="step" id="btn-step">Step</button>
+      <button data-testid="reset" id="btn-reset">Reset</button>
+    </div>
+    <div class="seed-row">
+      <label for="seed">Seed:</label>
+      <input type="number" id="seed" value="42" min="0" max="999999">
+    </div>
+    <div class="counters">
+      <div class="counter-item">Tick: <span id="count-tick">0</span></div>
+      <div class="counter-item">Rabbits: <span id="count-rabbits">0</span></div>
+      <div class="counter-item">Foxes: <span id="count-foxes">0</span></div>
+      <div class="counter-item">Grass: <span id="count-grass">0</span></div>
+    </div>
+    <div class="param-row">
+      <label for="speed">Speed:</label>
+      <input type="range" id="speed" min="1" max="60" value="10">
+      <span class="param-value" id="speed-val">10</span>
+    </div>
+    <div class="param-row">
+      <label for="param-rabbits0">Rabbits:</label>
+      <input type="range" id="param-rabbits0" min="0" max="300" value="100">
+      <span class="param-value" id="val-rabbits0">100</span>
+    </div>
+    <div class="param-row">
+      <label for="param-foxes0">Foxes:</label>
+      <input type="range" id="param-foxes0" min="0" max="60" value="6">
+      <span class="param-value" id="val-foxes0">6</span>
+    </div>
+    <div class="param-row">
+      <label for="param-rabbitBreed">Rabbit Breed:</label>
+      <input type="range" id="param-rabbitBreed" min="2" max="40" value="12">
+      <span class="param-value" id="val-rabbitBreed">12</span>
+    </div>
+    <div class="param-row">
+      <label for="param-foxBreed">Fox Breed:</label>
+      <input type="range" id="param-foxBreed" min="2" max="60" value="40">
+      <span class="param-value" id="val-foxBreed">40</span>
+    </div>
+    <div class="param-row">
+      <label for="param-foxGain">Fox Gain:</label>
+      <input type="range" id="param-foxGain" min="1" max="30" value="4">
+      <span class="param-value" id="val-foxGain">4</span>
+    </div>
+    <div class="param-row">
+      <label for="param-grassMax">Grass Max:</label>
+      <input type="range" id="param-grassMax" min="1" max="10" value="4">
+      <span class="param-value" id="val-grassMax">4</span>
+    </div>
+  </div>
+  <div class="panel-side" id="panel-side">
+    <div class="chart-container">
+      <div class="section-title">Population</div>
+      <svg data-testid="chart" width="100%" height="200" viewBox="0 0 400 200" preserveAspectRatio="xMidYMid meet">
+        <text x="10" y="15" font-size="12" fill="#aaa">tick</text>
+        <text x="10" y="180" font-size="12" fill="#aaa" transform="rotate(-90, 10, 180)">count</text>
+        <polyline data-testid="series-rabbits" points="" fill="none" stroke="#4cc9f0" stroke-width="2"/>
+        <polyline data-testid="series-foxes" points="" fill="none" stroke="#f72585" stroke-width="2"/>
+      </svg>
+    </div>
+    <div class="section-title">Lotka-Volterra</div>
+    <div class="ode-panel">
+      <div class="param-row">
+        <label for="ode-alpha">α:</label>
+        <input type="number" id="ode-alpha" value="1.1" step="0.1">
+      </div>
+      <div class="param-row">
+        <label for="ode-beta">β:</label>
+        <input type="number" id="ode-beta" value="0.4" step="0.1">
+      </div>
+      <div class="param-row">
+        <label for="ode-gamma">γ:</label>
+        <input type="number" id="ode-gamma" value="0.4" step="0.1">
+      </div>
+      <div class="param-row">
+        <label for="ode-delta">δ:</label>
+        <input type="number" id="ode-delta" value="0.1" step="0.1">
+      </div>
+      <div class="param-row">
+        <label for="ode-x0">x₀:</label>
+        <input type="number" id="ode-x0" value="10" step="1">
+      </div>
+      <div class="param-row">
+        <label for="ode-y0">y₀:</label>
+        <input type="number" id="ode-y0" value="10" step="1">
+      </div>
+      <div class="param-row">
+        <label for="ode-t">t:</label>
+        <input type="number" id="ode-t" value="50" step="1">
+      </div>
+      <div class="param-row">
+        <label for="ode-dt">dt:</label>
+        <input type="number" id="ode-dt" value="0.01" step="0.001">
+      </div>
+      <button data-testid="ode-run" id="btn-ode-run">Run ODE</button>
+      <div class="ode-result" id="ode-result"></div>
+      <svg data-testid="ode-chart" width="100%" height="100" viewBox="0 0 400 100" preserveAspectRatio="xMidYMid meet">
+        <polyline data-testid="ode-series-x" points="" fill="none" stroke="#4cc9f0" stroke-width="1.5"/>
+        <polyline data-testid="ode-series-y" points="" fill="none" stroke="#f72585" stroke-width="1.5"/>
+      </svg>
+    </div>
+    <div class="section-title">Scenario</div>
+    <div class="param-row">
+      <button data-testid="scenario-export" id="btn-scenario-export">Export</button>
+      <button data-testid="scenario-load" id="btn-scenario-load">Load</button>
+    </div>
+    <textarea data-testid="scenario-json" id="scenario-json"></textarea>
+    <div class="error-msg" data-testid="scenario-error" id="scenario-error"></div>
+    <div class="section-title">Presets</div>
+    <div class="param-row">
+      <input type="text" id="preset-name" placeholder="Preset name" style="flex:1;background:var(--input-bg);color:white;border:1px solid var(--input-border);padding:4px;border-radius:4px;">
+      <button data-testid="preset-save" id="btn-preset-save">Save</button>
+    </div>
+    <div class="preset-list" id="preset-list"></div>
+  </div>
+</div>
+<div class="announce" id="announcer" aria-live="polite"></div>
+
+<script>
+// --- Defaults ---
+const defaults = {
+  width: 40, height: 30, grassMax: 4, rabbits0: 100, foxes0: 6,
+  rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+  foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+};
+
+// --- State ---
+let state = {
+  params: {},
+  seed: 42,
+  tick: 0,
+  history: [],
+  rabbits: [],
+  foxes: [],
+  grid: [],
+  playing: false,
+  speed: 10,
+  lastFrame: 0,
+  animId: null
+};
+
+// --- Mulberry32 ---
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function pick(list) {
+  if (list.length === 0) return null;
+  return list[Math.floor(rand() * list.length)];
+}
+
+// --- World Logic ---
+function reset(seed, params) {
+  state.params = { ...defaults, ...params };
+  state.seed = seed;
+  state.tick = 0;
+  state.history = [];
+  state.rabbits = [];
+  state.foxes = [];
+  state.grid = [];
+  state.playing = false;
+  state.lastFrame = 0;
+  if (state.animId) cancelAnimationFrame(state.animId);
+
+  const w = state.params.width;
+  const h = state.params.height;
+  const grassMax = state.params.grassMax;
+  const rand = mulberry32(seed);
+
+  // Init grid
+  for (let y = 0; y < h; y++) {
+    state.grid[y] = [];
+    for (let x = 0; x < w; x++) {
+      state.grid[y][x] = { grass: Math.floor(rand() * (grassMax + 1)), rabbit: null, fox: null };
+    }
+  }
+
+  // Place rabbits
+  let placed = 0;
+  const rabbitList = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (state.grid[y][x].rabbit === null) rabbitList.push({ x, y });
+      if (placed >= state.params.rabbits0) break;
+    }
+    if (placed >= state.params.rabbits0) break;
+  }
+  for (let i = 0; i < rabbitList.length && placed < state.params.rabbits0; i++) {
+    const pos = rabbitList[i];
+    state.rabbits.push({ id: state.nextId(), x: pos.x, y: pos.y, energy: state.params.rabbitStart });
+    state.grid[pos.y][pos.x].rabbit = state.rabbits[state.rabbits.length - 1];
+    placed++;
+  }
+
+  // Place foxes
+  let placedF = 0;
+  const foxList = [];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (state.grid[y][x].fox === null) foxList.push({ x, y });
+      if (placedF >= state.params.foxes0) break;
+    }
+    if (placedF >= state.params.foxes0) break;
+  }
+  for (let i = 0; i < foxList.length && placedF < state.params.foxes0; i++) {
+    const pos = foxList[i];
+    state.foxes.push({ id: state.nextId(), x: pos.x, y: pos.y, energy: state.params.foxStart });
+    state.grid[pos.y][pos.x].fox = state.foxes[state.foxes.length - 1];
+    placedF++;
+  }
+
+  // Record tick 0
+  state.tick = 0;
+  state.history.push({ tick: 0, rabbits: state.rabbits.length, foxes: state.foxes.length, grass: sumGrass() });
+
+  updateUI();
+  drawWorld();
+  updateChart();
+  return counts();
+}
+
+function nextId() {
+  return ++state._idCounter;
+}
+
+function sumGrass() {
+  let s = 0;
+  for (let y = 0; y < state.params.height; y++)
+    for (let x = 0; x < state.params.width; x++)
+      s += state.grid[y][x].grass;
+  return s;
+}
+
+function getNeighbors(x, y) {
+  const w = state.params.width, h = state.params.height;
+  const n = [];
+  if (y > 0) n.push({ x, y: y - 1 });
+  if (x + 1 < w) n.push({ x: x + 1, y });
+  if (y + 1 < h) n.push({ x, y: y + 1 });
+  if (x > 0) n.push({ x: x - 1, y });
+  return n;
+}
+
+function getEmptyNeighbors(x, y, type) {
+  const w = state.params.width, h = state.params.height;
+  const n = [];
+  for (const nb of getNeighbors(x, y)) {
+    if (type === 'rabbit' && state.grid[nb.y][nb.x].rabbit === null) n.push(nb);
+    else if (type === 'fox' && state.grid[nb.y][nb.x].fox === null) n.push(nb);
+  }
+  return n;
+}
+
+function getRabbitNeighbors(x, y) {
+  const w = state.params.width, h = state.params.height;
+  const n = [];
+  for (const nb of getNeighbors(x, y)) {
+    if (state.grid[nb.y][nb.x].rabbit !== null) n.push(nb);
+  }
+  return n;
+}
+
+function tick() {
+  const w = state.params.width, h = state.params.height;
+  const grassMax = state.params.grassMax;
+
+  // 1. Grass
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++)
+      state.grid[y][x].grass = Math.min(grassMax, state.grid[y][x].grass + 1);
+
+  // 2. Rabbits
+  const rabbitIds = state.rabbits.map(r => r.id).sort((a, b) => a - b);
+  for (const rid of rabbitIds) {
+    const rabbit = state.rabbits.find(r => r.id === rid);
+    if (!rabbit) continue;
+
+    // Move
+    const emptyN = getEmptyNeighbors(rabbit.x, rabbit.y, 'rabbit');
+    if (emptyN.length > 0) {
+      const target = pick(emptyN);
+      rabbit.x = target.x;
+      rabbit.y = target.y;
+      state.grid[target.y][target.x].rabbit = rabbit;
+      state.grid[rabbit.y][rabbit.x].rabbit = null;
+    }
+
+    // Eat
+    const cell = state.grid[rabbit.y][rabbit.x];
+    rabbit.energy += state.params.rabbitGain * cell.grass;
+    cell.grass = 0;
+
+    // Cost
+    rabbit.energy -= state.params.rabbitCost;
+
+    // Breed
+    if (rabbit.energy >= state.params.rabbitBreed) {
+      const breedN = getEmptyNeighbors(rabbit.x, rabbit.y, 'rabbit');
+      if (breedN.length > 0) {
+        const spot = pick(breedN);
+        const child = Math.floor(rabbit.energy / 2);
+        rabbit.energy -= child;
+        const childRabbit = { id: nextId(), x: spot.x, y: spot.y, energy: child };
+        state.rabbits.push(childRabbit);
+        state.grid[spot.y][spot.x].rabbit = childRabbit;
+      }
+    }
+
+    // Die
+    if (rabbit.energy <= 0) {
+      state.grid[rabbit.y][rabbit.x].rabbit = null;
+      const idx = state.rabbits.indexOf(rabbit);
+      if (idx > -1) state.rabbits.splice(idx, 1);
+    }
+  }
+
+  // 3. Foxes
+  const foxIds = state.foxes.map(f => f.id).sort((a, b) => a - b);
+  for (const fid of foxIds) {
+    const fox = state.foxes.find(f => f.id === fid);
+    if (!fox) continue;
+
+    // Move
+    const rabbitN = getRabbitNeighbors(fox.x, fox.y);
+    let target = null;
+    if (rabbitN.length > 0) {
+      target = pick(rabbitN);
+    } else {
+      const emptyN = getEmptyNeighbors(fox.x, fox.y, 'fox');
+      if (emptyN.length > 0) target = pick(emptyN);
+    }
+    if (target) {
+      fox.x = target.x;
+      fox.y = target.y;
+      state.grid[target.y][target.x].fox = fox;
+      state.grid[fox.y][fox.x].fox = null;
+    }
+
+    // Eat
+    if (state.grid[fox.y][fox.x].rabbit !== null) {
+      const rabbit = state.grid[fox.y][fox.x].rabbit;
+      state.grid[fox.y][fox.x].rabbit = null;
+      fox.energy += state.params.foxGain;
+      const idx = state.rabbits.indexOf(rabbit);
+      if (idx > -1) state.rabbits.splice(idx, 1);
+    }
+
+    // Cost
+    fox.energy -= state.params.foxCost;
+
+    // Breed
+    if (fox.energy >= state.params.foxBreed) {
+      const breedN = getEmptyNeighbors(fox.x, fox.y, 'fox');
+      if (breedN.length > 0) {
+        const spot = pick(breedN);
+        const child = Math.floor(fox.energy / 2);
+        fox.energy -= child;
+        const childFox = { id: nextId(), x: spot.x, y: spot.y, energy: child };
+        state.foxes.push(childFox);
+        state.grid[spot.y][spot.x].fox = childFox;
+      }
+    }
+
+    // Die
+    if (fox.energy <= 0) {
+      state.grid[fox.y][fox.x].fox = null;
+      const idx = state.foxes.indexOf(fox);
+      if (idx > -1) state.foxes.splice(idx, 1);
+    }
+  }
+
+  // 4. Record
+  state.tick++;
+  state.history.push({ tick: state.tick, rabbits: state.rabbits.length, foxes: state.foxes.length, grass: sumGrass() });
+
+  updateUI();
+  drawWorld();
+  updateChart();
+}
+
+// --- UI ---
+function counts() {
+  return {
+    rabbits: state.rabbits.length,
+    foxes: state.foxes.length,
+    grass: sumGrass()
+  };
+}
+
+function updateUI() {
+  document.getElementById('count-tick').textContent = state.tick;
+  document.getElementById('count-rabbits').textContent = state.rabbits.length;
+  document.getElementById('count-foxes').textContent = state.foxes.length;
+  document.getElementById('count-grass').textContent = sumGrass();
+  document.getElementById('seed').value = state.seed;
+  document.getElementById('speed-val').textContent = state.speed;
+  document.getElementById('val-rabbits0').textContent = state.params.rabbits0;
+  document.getElementById('val-foxes0').textContent = state.params.foxes0;
+  document.getElementById('val-rabbitBreed').textContent = state.params.rabbitBreed;
+  document.getElementById('val-foxBreed').textContent = state.params.foxBreed;
+  document.getElementById('val-foxGain').textContent = state.params.foxGain;
+  document.getElementById('val-grassMax').textContent = state.params.grassMax;
+
+  const btnPlay = document.getElementById('btn-play');
+  const btnPause = document.getElementById('btn-pause');
+  btnPlay.disabled = state.playing;
+  btnPause.disabled = !state.playing;
+}
+
+function drawWorld() {
+  const canvas = document.getElementById('world');
+  const ctx = canvas.getContext('2d');
+  const w = state.params.width;
+  const h = state.params.height;
+  const cellSize = 10;
+  canvas.width = w * cellSize;
+  canvas.height = h * cellSize;
+
+  // Clear
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Draw grass
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const cell = state.grid[y][x];
+      const G = 60 + Math.round(160 * cell.grass / state.params.grassMax);
+      ctx.fillStyle = `rgb(30, ${G}, 30)`;
+      ctx.fillRect(x * cellSize, y * cellSize, cellSize, cellSize);
+    }
+  }
+
+  // Draw rabbits
+  for (const rabbit of state.rabbits) {
+    const cx = rabbit.x * cellSize + cellSize / 2;
+    const cy = rabbit.y * cellSize + cellSize / 2;
+    ctx.fillStyle = 'rgb(240, 240, 240)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Draw foxes (over rabbits)
+  for (const fox of state.foxes) {
+    const cx = fox.x * cellSize + cellSize / 2;
+    const cy = fox.y * cellSize + cellSize / 2;
+    ctx.fillStyle = 'rgb(220, 80, 20)';
+    ctx.beginPath();
+    ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function updateChart() {
+  const svg = document.getElementById('chart');
+  const rabbitsPoly = svg.querySelector('[data-testid="series-rabbits"]');
+  const foxesPoly = svg.querySelector('[data-testid="series-foxes"]');
+  let points = '';
+  const maxCount = Math.max(1, ...state.history.map(h => Math.max(h.rabbits, h.foxes)));
+  const padding = 30;
+  const chartW = 400 - padding * 2;
+  const chartH = 200 - padding * 2;
+
+  state.history.forEach((h, i) => {
+    const x = padding + (i / Math.max(1, state.history.length - 1)) * chartW;
+    const yRabbit = padding + (1 - h.rabbits / maxCount) * chartH;
+    const yFox = padding + (1 - h.foxes / maxCount) * chartH;
+    if (i === 0) {
+      points += `${x},${yRabbit} `;
+      points += `${x},${yFox} `;
+    } else {
+      points += `${x},${yRabbit} `;
+      points += `${x},${yFox} `;
+    }
+  });
+
+  rabbitsPoly.setAttribute('points', points.trim());
+  foxesPoly.setAttribute('points', points.trim());
+}
+
+// --- ODE ---
+function odeRun() {
+  const alpha = parseFloat(document.getElementById('ode-alpha').value);
+  const beta = parseFloat(document.getElementById('ode-beta').value);
+  const gamma = parseFloat(document.getElementById('ode-gamma').value);
+  const delta = parseFloat(document.getElementById('ode-delta').value);
+  const x0 = parseFloat(document.getElementById('ode-x0').value);
+  const y0 = parseFloat(document.getElementById('ode-y0').value);
+  const t = parseFloat(document.getElementById('ode-t').value);
+  const dt = parseFloat(document.getElementById('ode-dt').value);
+
+  const n = Math.round(t / dt);
+  let x = x0, y = y0;
+
+  for (let i = 0; i < n; i++) {
+    const k1x = alpha * x - beta * x * y;
+    const k1y = delta * x * y - gamma * y;
+    const x2 = x + 0.5 * k1x * dt;
+    const y2 = y + 0.5 * k1y * dt;
+    const k2x = alpha * x2 - beta * x2 * y2;
+    const k2y = delta * x2 * y2 - gamma * y2;
+    const x3 = x + 0.5 * k2x * dt;
+    const y3 = y + 0.5 * k2y * dt;
+    const k3x = alpha * x3 - beta * x3 * y3;
+    const k3y = delta * x3 * y3 - gamma * y3;
+    const x4 = x + k3x * dt;
+    const y4 = y + k3y * dt;
+    const k4x = alpha * x4 - beta * x4 * y4;
+    const k4y = delta * x4 * y4 - gamma * y4;
+    x = x + (k1x + 2 * k2x + 2 * k3x + k4x) / 6 * dt;
+    y = y + (k1y + 2 * k2y + 2 * k3y + k4y) / 6 * dt;
+  }
+
+  const eqX = gamma / delta;
+  const eqY = alpha / beta;
+  const V = (px, py) => delta * px - gamma * Math.log(px) + beta * py - alpha * Math.log(py);
+  const drift = Math.abs(V(x, y) - V(x0, y0));
+
+  // Display
+  const resultDiv = document.getElementById('ode-result');
+  resultDiv.innerHTML = `
+    <div>Final x: ${x.toFixed(8)}</div>
+    <div>Final y: ${y.toFixed(8)}</div>
+    <div>Eq x: ${eqX.toFixed(8)}</div>
+    <div>Eq y: ${eqY.toFixed(8)}</div>
+    <div>Drift: ${parseFloat(drift).toFixed(8)}</div>
+  `;
+
+  // Draw ODE chart
+  const odeSvg = document.getElementById('ode-chart');
+  const odeXPoly = odeSvg.querySelector('[data-testid="ode-series-x"]');
+  const odeYPoly = odeSvg.querySelector('[data-testid="ode-series-y"]');
+  let odePoints = '';
+  const odeStep = Math.max(1, Math.floor(n / 100));
+  let ox = x0, oy = y0;
+  for (let i = 0; i <= n; i += odeStep) {
+    const px = padding + (i / n) * chartW;
+    const pyX = padding + (1 - ox / Math.max(1, ...state.history.map(h => Math.max(h.rabbits, h.foxes)))) * chartH;
+    const pyY = padding + (1 - oy / Math.max(1, ...state.history.map(h => Math.max(h.rabbits, h.foxes)))) * chartH;
+    odePoints += `${px},${pyX} `;
+    odePoints += `${px},${pyY} `;
+    if (i < n) {
+      // Re-integrate to next step for plotting
+      const k1x = alpha * ox - beta * ox * oy;
+      const k1y = delta * ox * oy - gamma * oy;
+      const ox2 = ox + 0.5 * k1x * dt;
+      const oy2 = oy + 0.5 * k1y * dt;
+      const k2x = alpha * ox2 - beta * ox2 * oy2;
+      const k2y = delta * ox2 * oy2 - gamma * oy2;
+      const ox3 = ox + 0.5 * k2x * dt;
+      const oy3 = oy + 0.5 * k2y * dt;
+      const k3x = alpha * ox3 - beta * ox3 * oy3;
+      const k3y = delta * ox3 * oy3 - gamma * oy3;
+      const ox4 = ox + k3x * dt;
+      const oy4 = oy + k3y * dt;
+      const k4x = alpha * ox4 - beta * ox4 * oy4;
+      const k4y = delta * ox4 * oy4 - gamma * oy4;
+      ox = ox + (k1x + 2 * k2x + 2 * k3x + k4x) / 6 * dt;
+      oy = oy + (k1y + 2 * k2y + 2 * k3y + k4y) / 6 * dt;
+    }
+  }
+
+  odeXPoly.setAttribute('points', odePoints.trim());
+  odeYPoly.setAttribute('points', odePoints.trim());
+}
+
+// --- Scenario ---
+function exportScenario() {
+  const scenario = {
+    version: 1,
+    seed: state.seed,
+    params: state.params
+  };
+  document.getElementById('scenario-json').value = JSON.stringify(scenario, null, 2);
+}
+
+function loadScenario(text) {
+  const errorEl = document.getElementById('scenario-error');
+  errorEl.textContent = '';
+  try {
+    const data = JSON.parse(text);
+    if (data.version !== 1) throw new Error('Wrong version');
+    if (!Number.isInteger(data.seed)) throw new Error('Seed must be integer');
+    reset(data.seed, data.params);
+    return true;
+  } catch (e) {
+    errorEl.textContent = e.message;
+    return false;
+  }
+}
+
+// --- Presets ---
+function savePreset(name) {
+  const scenario = {
+    version: 1,
+    seed: state.seed,
+    params: state.params
+  };
+  let presets = JSON.parse(localStorage.getItem('ecolab.presets') || '{}');
+  presets[name] = scenario;
+  localStorage.setItem('ecolab.presets', JSON.stringify(presets));
+  renderPresets();
+}
+
+function loadPreset(name) {
+  const presets = JSON.parse(localStorage.getItem('ecolab.presets') || '{}');
+  if (presets[name]) {
+    reset(presets[name].seed, presets[name].params);
+  }
+}
+
+function deletePreset(name) {
+  let presets = JSON.parse(localStorage.getItem('ecolab.presets') || '{}');
+  delete presets[name];
+  localStorage.setItem('ecolab.presets', JSON.stringify(presets));
+  renderPresets();
+}
+
+function renderPresets() {
+  const presets = JSON.parse(localStorage.getItem('ecolab.presets') || '{}');
+  const list = document.getElementById('preset-list');
+  list.innerHTML = '';
+  for (const [name, scenario] of Object.entries(presets)) {
+    const item = document.createElement('div');
+    item.className = 'preset-item';
+    item.innerHTML = `
+      <span>${name}</span>
+      <button data-testid="preset-load" data-name="${name}">Load</button>
+      <button data-testid="preset-delete" data-name="${name}">Delete</button>
+    `;
+    list.appendChild(item);
+  }
+}
+
+// --- Play/Pause ---
+function startPlaying() {
+  state.playing = true;
+  state.lastFrame = performance.now();
+  loop();
+}
+
+function stopPlaying() {
+  state.playing = false;
+  if (state.animId) cancelAnimationFrame(state.animId);
+  state.animId = null;
+}
+
+function loop() {
+  if (!state.playing) return;
+  const now = performance.now();
+  const dt = (now - state.lastFrame) / 1000;
+  state.lastFrame = now;
+
+  const ticksToRun = Math.floor(dt * state.speed);
+  for (let i = 0; i < ticksToRun; i++) {
+    tick();
+  }
+
+  updateUI();
+  drawWorld();
+  updateChart();
+
+  // Announce
+  const a = document.getElementById('announcer');
+  a.textContent = `Tick ${state.tick}: ${state.rabbits.length} rabbits, ${state.foxes.length} foxes`;
+  a.classList.add('visible');
+  setTimeout(() => a.classList.remove('visible'), 2000);
+
+  state.animId = requestAnimationFrame(loop);
+}
+
+// --- Event Listeners ---
+document.getElementById('btn-play').addEventListener('click', startPlaying);
+document.getElementById('btn-pause').addEventListener('click', stopPlaying);
+document.getElementById('btn-step').addEventListener('click', () => {
+  if (state.playing) stopPlaying();
+  tick();
+  updateUI();
+  drawWorld();
+  updateChart();
+});
+document.getElementById('btn-reset').addEventListener('click', () => {
+  reset(parseInt(document.getElementById('seed').value) || 42, {});
+});
+document.getElementById('speed').addEventListener('input', (e) => {
+  state.speed = parseInt(e.target.value);
+  document.getElementById('speed-val').textContent = state.speed;
+});
+document.getElementById('btn-scenario-export').addEventListener('click', exportScenario);
+document.getElementById('btn-scenario-load').addEventListener('click', () => {
+  loadScenario(document.getElementById('scenario-json').value);
+});
+document.getElementById('btn-ode-run').addEventListener('click', odeRun);
+
+// Parameter sliders
+const paramSliders = [
+  { id: 'param-rabbits0', val: 'val-rabbits0' },
+  { id: 'param-foxes0', val: 'val-foxes0' },
+  { id: 'param-rabbitBreed', val: 'val-rabbitBreed' },
+  { id: 'param-foxBreed', val: 'val-foxBreed' },
+  { id: 'param-foxGain', val: 'val-foxGain' },
+  { id: 'param-grassMax', val: 'val-grassMax' }
+];
+paramSliders.forEach(s => {
+  document.getElementById(s.id).addEventListener('input', (e) => {
+    document.getElementById(s.val).textContent = e.target.value;
+  });
+});
+
+// Preset buttons
+document.getElementById('btn-preset-save').addEventListener('click', () => {
+  const name = document.getElementById('preset-name').value.trim();
+  if (name) savePreset(name);
+});
+document.getElementById('preset-list').addEventListener('click', (e) => {
+  const name = e.target.dataset.name;
+  if (e.target.dataset.testid === 'preset-load') loadPreset(name);
+  if (e.target.dataset.testid === 'preset-delete') deletePreset(name);
+});
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  const focused = document.activeElement;
+  const isInteractive = focused && (
+    focused.tagName === 'INPUT' ||
+    focused.tagName === 'TEXTAREA' ||
+    focused.tagName === 'BUTTON' ||
+    focused.tagName === 'SELECT'
+  );
+
+  if (isInteractive) return;
+
+  if (e.key === ' ') {
+    e.preventDefault();
+    if (state.playing) stopPlaying();
+    else startPlaying();
+  } else if (e.key === 's') {
+    e.preventDefault();
+    if (state.playing) stopPlaying();
+    tick();
+    updateUI();
+    drawWorld();
+    updateChart();
+  } else if (e.key === 'r') {
+    e.preventDefault();
+    reset(parseInt(document.getElementById('seed').value) || 42, {});
+  }
+});
+
+// --- Init ---
+reset(42, {});
+renderPresets();
+</script>
+</body>
+</html>
+```

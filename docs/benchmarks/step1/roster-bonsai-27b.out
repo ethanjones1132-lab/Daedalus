@@ -1,0 +1,3 @@
+11:12:30 bonsai-27b: place 99 spec ngram loaded False VRAM None MiB
+11:12:34 bonsai-27b: place 99 spec none loaded False VRAM None MiB
+bonsai-27b: no placement fits ([{'ncmoe': 99, 'loaded': False, 'vram_used_mib': None, 'spec': 'ngram'}, {'ncmoe': 99, 'loaded': False, 'vram_used_mib': None, 'spec': 'none'}])

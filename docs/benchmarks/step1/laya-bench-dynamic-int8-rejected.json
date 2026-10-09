@@ -1,0 +1,430 @@
+{
+ "fp32": {
+  "variant": "fp32",
+  "load_s": 11.2,
+  "ram_avail_mb_before": 4221,
+  "ram_avail_mb_after_load": 2242,
+  "ready": {
+   "ok": true,
+   "ready": true,
+   "wording": "v1",
+   "form": "rubric",
+   "int8": false,
+   "ws_mib": 1970,
+   "peak_ws_mib": 2748,
+   "private_mib": 3054,
+   "peak_private_mib": 4611
+  },
+  "dead": false,
+  "calls": 20,
+  "ok": 20,
+  "p50_s": 0.831,
+  "p95_s": 1.054,
+  "mean_s": 0.649,
+  "mem_after_calls": {
+   "ws_mib": 1985,
+   "peak_ws_mib": 2748,
+   "private_mib": 3141,
+   "peak_private_mib": 4611,
+   "ok": true,
+   "secs": 0.0
+  },
+  "ram_avail_mb_after_calls": 2254,
+  "answers": [
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.18047343560899262,
+     "p_little": 0.8436134966710391,
+     "p_alot": 0.16060132249011622,
+     "effort_top": 2,
+     "hidden": 0.0516,
+     "library": 0.5018
+    }
+   },
+   {
+    "p": 0.9161268100052852,
+    "p_raw": 0.9351,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.1906374632536979,
+     "p_little": 0.8107287531934341,
+     "p_alot": 0.18489210977410367,
+     "effort_top": 1,
+     "hidden": 0.2699,
+     "library": 0.3529
+    }
+   },
+   {
+    "p": 0.6907214568749004,
+    "p_raw": 0.7433,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.18382509375289527,
+     "p_little": 0.8185343318836398,
+     "p_alot": 0.16211666393256174,
+     "effort_top": 2,
+     "hidden": 0.0735,
+     "library": 0.6813
+    }
+   },
+   {
+    "p": 0.20571537649238347,
+    "p_raw": 0.247,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.23299548049492944,
+     "p_little": 0.8405435678671918,
+     "p_alot": 0.160086012190819,
+     "effort_top": 2,
+     "hidden": 0.0896,
+     "library": 0.3486
+    }
+   },
+   {
+    "p": 0.970060108640497,
+    "p_raw": 0.9774,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.15583112839261454,
+     "p_little": 0.8142476184822862,
+     "p_alot": 0.178199172918913,
+     "effort_top": 1,
+     "hidden": 0.04,
+     "library": 0.8446
+    }
+   },
+   {
+    "p": 0.8311018361558448,
+    "p_raw": 0.8655,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "algorithm",
+     "unseen": 0.1842240520809015,
+     "p_little": 0.8347292815369228,
+     "p_alot": 0.1618914923434481,
+     "effort_top": 2,
+     "hidden": 0.0646,
+     "library": 0.3058
+    }
+   },
+   {
+    "p": 0.9051417347872447,
+    "p_raw": 0.9263,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.24685510571077868,
+     "p_little": 0.8363582487155189,
+     "p_alot": 0.16575887179396329,
+     "effort_top": 2,
+     "hidden": 0.0531,
+     "library": 0.6968
+    }
+   },
+   {
+    "p": 0.8854747492096753,
+    "p_raw": 0.9104,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.2822026434251703,
+     "p_little": 0.8170188670067616,
+     "p_alot": 0.17958428628966905,
+     "effort_top": 1,
+     "hidden": 0.059,
+     "library": 0.7277
+    }
+   },
+   {
+    "p": 0.853546465766383,
+    "p_raw": 0.8842,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.16274162174795584,
+     "p_little": 0.8192305889834387,
+     "p_alot": 0.17184417990470024,
+     "effort_top": 2,
+     "hidden": 0.0912,
+     "library": 0.7326
+    }
+   },
+   {
+    "p": 0.8949705548295162,
+    "p_raw": 0.9181,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "algorithm",
+     "unseen": 0.14603424615334776,
+     "p_little": 0.8257549335730845,
+     "p_alot": 0.17387241515468663,
+     "effort_top": 1,
+     "hidden": 0.0751,
+     "library": 0.2858
+    }
+   },
+   {
+    "p": 0.7107610821766432,
+    "p_raw": 0.7613,
+    "card": null
+   }
+  ]
+ },
+ "int8": {
+  "variant": "int8",
+  "load_s": 13.3,
+  "ram_avail_mb_before": 4250,
+  "ram_avail_mb_after_load": 2144,
+  "ready": {
+   "ok": true,
+   "ready": true,
+   "wording": "v1",
+   "form": "rubric",
+   "int8": true,
+   "ws_mib": 489,
+   "peak_ws_mib": 2751,
+   "private_mib": 3163,
+   "peak_private_mib": 4615
+  },
+  "dead": false,
+  "calls": 20,
+  "ok": 20,
+  "p50_s": 0.373,
+  "p95_s": 0.493,
+  "mean_s": 0.303,
+  "mem_after_calls": {
+   "ws_mib": 565,
+   "peak_ws_mib": 2751,
+   "private_mib": 2660,
+   "peak_private_mib": 4615,
+   "ok": true,
+   "secs": 0.0
+  },
+  "ram_avail_mb_after_calls": 2715,
+  "answers": [
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "files",
+     "unseen": 0.2186532471474424,
+     "p_little": 0.8081359760816182,
+     "p_alot": 0.17304342183460877,
+     "effort_top": 2,
+     "hidden": 0.1759,
+     "library": 0.1967
+    }
+   },
+   {
+    "p": 0.851735778322618,
+    "p_raw": 0.8827,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.23192467668139274,
+     "p_little": 0.8070472433323661,
+     "p_alot": 0.1713272056511643,
+     "effort_top": 2,
+     "hidden": 0.1865,
+     "library": 0.3478
+    }
+   },
+   {
+    "p": 0.7553689759559993,
+    "p_raw": 0.8007,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.2056763513751426,
+     "p_little": 0.8374121962229127,
+     "p_alot": 0.1630838136090855,
+     "effort_top": 2,
+     "hidden": 0.1897,
+     "library": 0.3916
+    }
+   },
+   {
+    "p": 0.7755220074851946,
+    "p_raw": 0.8182,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "files",
+     "unseen": 0.21615318389430235,
+     "p_little": 0.8317970488960034,
+     "p_alot": 0.16668360843128333,
+     "effort_top": 2,
+     "hidden": 0.118,
+     "library": 0.2062
+    }
+   },
+   {
+    "p": 0.8043385268583981,
+    "p_raw": 0.8429,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.2660202290817077,
+     "p_little": 0.8152081125236469,
+     "p_alot": 0.18197261657460753,
+     "effort_top": 1,
+     "hidden": 0.262,
+     "library": 0.3589
+    }
+   },
+   {
+    "p": 0.5454235736544822,
+    "p_raw": 0.6071,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "input",
+     "unseen": 0.21162695355508748,
+     "p_little": 0.8035419884391832,
+     "p_alot": 0.1734355831625726,
+     "effort_top": 2,
+     "hidden": 0.1995,
+     "library": 0.2355
+    }
+   },
+   {
+    "p": 0.9307223197763547,
+    "p_raw": 0.9467,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.18196893442490603,
+     "p_little": 0.8141599073836274,
+     "p_alot": 0.17114640473298645,
+     "effort_top": 2,
+     "hidden": 0.1575,
+     "library": 0.2839
+    }
+   },
+   {
+    "p": 0.6874016364846177,
+    "p_raw": 0.7403,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "input",
+     "unseen": 0.16211892757882318,
+     "p_little": 0.8224193328011494,
+     "p_alot": 0.16956125456203702,
+     "effort_top": 2,
+     "hidden": 0.1336,
+     "library": 0.1443
+    }
+   },
+   {
+    "p": 0.5060255579839734,
+    "p_raw": 0.5684,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.15031680738892358,
+     "p_little": 0.8248223844366291,
+     "p_alot": 0.16230303636205706,
+     "effort_top": 2,
+     "hidden": 0.1587,
+     "library": 0.5412
+    }
+   },
+   {
+    "p": 0.853063437238519,
+    "p_raw": 0.8838,
+    "card": null
+   },
+   {
+    "p": null,
+    "p_raw": null,
+    "card": {
+     "kind": "library",
+     "unseen": 0.18492610836254988,
+     "p_little": 0.8101168403889127,
+     "p_alot": 0.17268319031763169,
+     "effort_top": 2,
+     "hidden": 0.1683,
+     "library": 0.2416
+    }
+   },
+   {
+    "p": 0.789699904419717,
+    "p_raw": 0.8304,
+    "card": null
+   }
+  ]
+ }
+}

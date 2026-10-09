@@ -1,0 +1,73 @@
+<div id="app">
+  <div class="layout">
+    <div class="panel panel-world">
+      <canvas data-testid="world"></canvas>
+      <div class="controls">
+        <input type="number" data-testid="seed" value="42" />
+        <input type="range" data-testid="speed" min="1" max="60" value="10" />
+        <div class="param-group">
+          <label for="param-rabbits0">Rabbits</label>
+          <input type="range" data-testid="param-rabbits0" min="0" max="300" value="100" />
+        </div>
+        <div class="param-group">
+          <label for="param-foxes0">Foxes</label>
+          <input type="range" data-testid="param-foxes0" min="0" max="60" value="6" />
+        </div>
+        <div class="param-group">
+          <label for="param-rabbitBreed">Rabbit Breed</label>
+          <input type="range" data-testid="param-rabbitBreed" min="2" max="40" value="6" />
+        </div>
+        <div class="param-group">
+          <label for="param-foxBreed">Fox Breed</label>
+          <input type="range" data-testid="param-foxBreed" min="2" max="60" value="12" />
+        </div>
+        <div class="param-group">
+          <label for="param-foxGain">Fox Gain</label>
+          <input type="range" data-testid="param-foxGain" min="1" max="30" value="4" />
+        </div>
+        <div class="param-group">
+          <label for="param-grassMax">Grass Max</label>
+          <input type="range" data-testid="param-grassMax" min="1" max="10" value="4" />
+        </div>
+        <div class="counters">
+          <span data-testid="count-tick">0</span>
+          <span data-testid="count-rabbits">0</span>
+          <span data-testid="count-foxes">0</span>
+          <span data-testid="count-grass">0</span>
+        </div>
+        <button data-testid="play" />
+        <button data-testid="pause" />
+        <button data-testid="step" />
+        <button data-testid="reset" />
+      </div>
+    </div>
+    <div class="panel panel-side">
+      <svg data-testid="chart"></svg>
+      <div class="ode-panel">
+        <input type="number" data-testid="ode-alpha" value="1.1" />
+        <input type="number" data-testid="ode-beta" value="0.4" />
+        <input type="number" data-testid="ode-gamma" value="0.4" />
+        <input type="number" data-testid="ode-delta" value="0.1" />
+        <input type="number" data-testid="ode-x0" value="10" />
+        <input type="number" data-testid="ode-y0" value="10" />
+        <input type="number" data-testid="ode-t" value="50" />
+        <input type="number" data-testid="ode-dt" value="0.01" />
+        <button data-testid="ode-run" />
+        <div id="ode-results"></div>
+        <svg data-testid="ode-chart"></svg>
+      </div>
+      <div class="scenario-tools">
+        <textarea data-testid="scenario-json"></textarea>
+        <button data-testid="scenario-export" />
+        <button data-testid="scenario-load" />
+        <p id="scenario-error"></p>
+      </div>
+      <div class="presets">
+        <input type-text data-testid="preset-name" />
+        <button data-testid="preset-save" />
+        <div data-testid="preset-list"></div>
+      </div>
+    </div>
+  </div>
+  <div data-testid="announcer" aria-live="polite"></div>
+</div>

@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ecosystem Lab</title>
+    <style>
+        /* Global styles */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        
+        /* Panel styles */
+        .panel {
+            width: 100%;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* World panel styles */
+        .panel-world {
+            width: 50%;
+            height: 50vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* Side panel styles */
+        .panel-side {
+            width: 50%;
+            height: 50vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        /* Chart styles */
+        .chart {
+            width: 100%;
+            height: 100%;
+        }
+        
+        /* Lotka-Volterra panel styles */
+        .lotka-volterra {
+            width: 100%;
+            height: 100%;
+        }
+        
+        /* Scenario tools styles */
+        .scenario-tools {
+            width: 100%;
+            height: 100%;
+        }
+        
+        /* Preset list styles */
+        .preset-list {
+            width: 100%;
+            height: 100%;
+        }
+        
+        /* Announcer styles */
+        .announcer {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <div class="panel-world">
+            <canvas id="world" width="400" height="300"></canvas>
+            <div>
+                <label for="seed">Seed:</label>
+                <input id="seed" type="number" value="42">
+            </div>
+            <div>
+                <label for="speed">Speed:</label>
+                <input id="speed" type="range" min="1" max="60" value="10">
+            </div>
+            <div>
+                <button id="play" data-testid="play">Play</button>
+                <button id="pause" data-testid="pause">Pause</button>
+                <button id="step" data-testid="step">Step</button>
+                <button id="reset" data-testid="reset">Reset</button>
+            </div>
+            <div>
+                <label for="rabbits0">Rabbits 0:</label>
+                <input id="rabbits0" type="range" min="0" max="300" value="100">
+                <label for="foxes0">Foxes 0:</label>
+                <input id="foxes0" type="range" min="0" max="60" value="6">
+                <label for="rabbitBreed">Rabbit Breed:</label>
+                <input id="rabbitBreed" type="range" min="2" max="40" value="12">
+                <label for="foxBreed">Fox Breed:</label>
+                <input id="foxBreed" type="range" min="2" max="60" value="40">
+                <label for="foxGain">Fox Gain:</label>
+                <input id="foxGain" type="range" min="1" max="30" value="4">
+                <label for="grassMax">Grass Max:</label>
+                <input id="grassMax" type="range" min="1" max="10" value="4">
+            </div>
+            <div>
+                <label for="tick">Tick:</label>
+                <span id="tick">0</span>
+                <label for="rabbits">Rabbits:</label>
+                <span id="rabbits">0</span>
+                <label for="foxes">Foxes:</label>
+                <span id="foxes">0</span>
+                <label for="grass">Grass:</label>
+                <span id="grass">0</span>
+            </div>
+        </div>
+        <div class="panel-side">
+            <div class="chart">
+                <svg id="chart" width="400" height="300"></svg>
+            </div>
+            <div class="lotka-volterra">
+                <label for="alpha">Alpha:</label>
+                <input id="alpha" type="number" value="1.1">
+                <label for="beta">Beta:</label>
+                <input id="beta" type="number" value="0.4">
+                <label for="gamma">Gamma:</label>
+                <input id="gamma" type="number" value="0.4">
+                <label for="delta">Delta:</label>
+                <input id="delta" type="number" value="0.1">
+                <label for="x0">X0:</label>
+                <input id="x0" type="number" value="10">
+                <label for="y0">Y0:</label>
+                <input id="y0" type="number" value="10">
+                <label for="t">T:</label>
+                <input id="t" type="number" value="50">
+                <label for="dt">DT:</label>
+                <input id="dt" type="number" value="0.01">
+                <button id="ode-run">Run</button>
+            </div>
+            <div class="scenario-tools">
+                <textarea id="scenario-json"></textarea>
+                <button id="scenario-export">Export Scenario</button>
+                <button id="scenario-load">Load Scenario</button>
+                <div id="scenario-error"></div>
+            </div>
+            <div class="preset-list">
+                <input id="preset-name" type="text">
+                <button id="preset-save">Save Preset</button>
+                <ul id="preset-list"></ul>
+            </div>
+            <div class="announcer">
+                <span id="announcer"></span>
+            </div>
+        </div>
+    </div>
+    <script>
+        // Global variables
+        let world;
+        let chart;
+        let lotkaVolterra;
+        let scenarioTools;
+        let presetList;
+        let announcer;
+        
+        // Initialize the app
+        function init() {
+            // Get the elements
+            world = document.getElementById('world');
+            chart = document.getElementById('chart');
+            lotkaVolterra = document.getElementById('lotka-volterra');
+            scenarioTools = document.getElementById('scenario-tools');
+            presetList = document.getElementById('preset-list');
+            announcer = document.getElementById('announcer');
+            
+            // Set up the canvas
+            world.width = 400;
+            world.height = 300;
+            
+            // Set up the chart
+            chart.width = 400;
+            chart.height = 300;
+            
+            // Set up the Lotka-Volterra panel
+            lotkaVolterra.width = 400;
+            lotkaVolterra.height = 300;
+            
+            // Set up the scenario tools
+            scenarioTools.width = 400;
+            scenarioTools.height = 300;
+            
+            // Set up the preset list
+            presetList.width = 400;
+            presetList.height = 300;
+            
+            // Set up the announcer
+            announcer.width = 400;
+            announcer.height = 300;
+            
+            // Initialize the simulation
+            reset(42, {});
+        }
+        
+        // Reset the simulation
+        function reset(seed, params) {
+            // Merge the params over the defaults
+            params = Object.assign({}, {
+                rabbits0: 100,
+                foxes0: 6,
+                rabbitBreed: 12,
+                foxBreed: 40,
+                foxGain: 4,
+                grassMax: 4
+            }, params);
+            
+            // Set the seed
+            let rand = mulberry32(seed);
+            
+            // Set the tick
+            let tick = 0;
+            
+            // Set the history
+            let history = [];
+            
+            // Set the grass
+            let grass = [];
+            for (let y = 0; y < 30; y++) {
+                grass[y] = [];
+                for (let x = 0; x < 40; x++) {
+                    grass[y][x] = Math.floor(rand() * (params.grassMax + 1));
+                }
+            }
+            
+            // Set the rabbits
+            let rabbits = [];
+            for (let i = 0; i < params.rabbits0; i++) {
+                let x = Math.floor(rand() * 40);
+                let y = Math.floor(rand() * 30);
+                while (grass[y][x] === 0) {
+                    x = Math.floor(rand() * 40);
+                    y = Math.floor(rand() * 30);
+                }
+                rabbits.push({ id: 1 + i, x: x, y: y, energy: params.rabbitStart });
+            }
+            
+            // Set the foxes
+            let foxes = [];
+            for (let i = 0; i < params.foxes0; i++) {
+                let x = Math.floor(rand() * 40);
+                let y = Math.floor(rand() * 30);
+                while (grass[y][x] === 0 || rabbits.some(r => r.x === x && r.y === y)) {
+                    x = Math.floor(rand() * 40);
+                    y = Math.floor(rand() * 30);
+                }
+                foxes.push({ id: 1 + i, x: x, y: y, energy: params.foxStart });
+            }
+            
+            // Record the history
+            history.push({ tick: tick, rabbits: rabbits.length, foxes: foxes.length, grass: grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0) });
+            
+            // Draw the world
+            drawWorld();
+            
+            // Draw the chart
+            drawChart();
+            
+            // Draw the Lotka-Volterra panel
+            drawLotkaVolterra();
+            
+            // Draw the scenario tools
+            drawScenarioTools();
+            
+            // Draw the preset list
+            drawPresetList();
+            
+            // Draw the announcer
+            drawAnnouncer();
+            
+            // Return the counts
+            return { rabbits: rabbits.length, foxes: foxes.length, grass: grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0) };
+        }
+        
+        // Draw the world
+        function drawWorld() {
+            // Clear the canvas
+            world.getContext('2d').clearRect(0, 0, world.width, world.height);
+            
+            // Draw the grass
+            for (let y = 0; y < 30; y++) {
+                for (let x = 0; x < 40; x++) {
+                    let grassLevel = grass[y][x];
+                    let color = `rgb(30, ${60 + Math.round(160 * grassLevel / params.grassMax)}, 30)`;
+                    world.getContext('2d').fillRect(x * 10, y * 10, 10, 10);
+                    world.getContext('2d').strokeRect(x * 10, y * 10, 10, 10);
+                    world.getContext('2d').fillStyle = color;
+                    world.getContext('2d').fillRect(x * 10 + 1, y * 10 + 1, 8, 8);
+                }
+            }
+            
+            // Draw the rabbits
+            for (let rabbit of rabbits) {
+                let x = rabbit.x * 10;
+                let y = rabbit.y * 10;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+            }
+            
+            // Draw the foxes
+            for (let fox of foxes) {
+                let x = fox.x * 10;
+                let y = fox.y * 10;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+                world.getContext('2d').fillStyle = `rgb(220, 80, 20)`;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+            }
+        }
+        
+        // Draw the chart
+        function drawChart() {
+            // Clear the chart
+            chart.getContext('2d').clearRect(0, 0, chart.width, chart.height);
+            
+            // Draw the series
+            for (let i = 0; i < history.length; i++) {
+                let x = i * chart.width / history.length;
+                let y = chart.height - (history[i].rabbits / Math.max(...history.map(h => h.rabbits)) * chart.height);
+                chart.getContext('2d').moveTo(x, y);
+                chart.getContext('2d').lineTo(x, chart.height);
+            }
+            
+            // Draw the axis
+            chart.getContext('2d').strokeRect(0, chart.height - 10, chart.width, 10);
+            chart.getContext('2d').strokeRect(0, 0, 10, chart.height);
+        }
+        
+        // Draw the Lotka-Volterra panel
+        function drawLotkaVolterra() {
+            // Clear the Lotka-Volterra panel
+            lotkaVolterra.getContext('2d').clearRect(0, 0, lotkaVolterra.width, lotkaVolterra.height);
+            
+            // Draw the equations
+            lotkaVolterra.getContext('2d').fillText('dx/dt = αx - βxy', 10, 10);
+            lotkaVolterra.getContext('2d').fillText('dy/dt = δxy - γy', 10, 30);
+        }
+        
+        // Draw the scenario tools
+        function drawScenarioTools() {
+            // Clear the scenario tools
+            scenarioTools.getContext('2d').clearRect(0, 0, scenarioTools.width, scenarioTools.height);
+            
+            // Draw the scenario JSON
+            scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10);
+            scenarioTools.getContext('2d').fillText(scenarioTools.getContext('2d').createTextMetrics().measureText(scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10)).width, 30);
+        }
+        
+        // Draw the preset list
+        function drawPresetList() {
+            // Clear the preset list
+            presetList.getContext('2d').clearRect(0, 0, presetList.width, presetList.height);
+            
+            // Draw the preset list items
+            for (let i = 0; i < presetList.children.length; i++) {
+                presetList.children[i].getContext('2d').fillText(presetList.children[i].children[0].children[0].children[0].value, 10, 10 + i * 20);
+            }
+        }
+        
+        // Draw the announcer
+        function drawAnnouncer() {
+            // Clear the announcer
+            announcer.getContext('2d').clearRect(0, 0, announcer.width, announcer.height);
+            
+            // Draw the announcer text
+            announcer.getContext('2d').fillText('Tick 0: 0 rabbits, 0 foxes', 10, 10);
+        }
+        
+        // Main loop
+        function loop() {
+            // Update the simulation
+            let counts = reset(42, {});
+            
+            // Update the world
+            drawWorld();
+            
+            // Update the chart
+            drawChart();
+            
+            // Update the Lotka-Volterra panel
+            drawLotkaVolterra();
+            
+            // Update the scenario tools
+            drawScenarioTools();
+            
+            // Update the preset list
+            drawPresetList();
+            
+            // Update the announcer
+            drawAnnouncer();
+            
+            // Update the counters
+            document.getElementById('tick').textContent = counts.tick;
+            document.getElementById('rabbits').textContent = counts.rabbits;
+            document.getElementById('foxes').textContent = counts.foxes;
+            document.getElementById('grass').textContent = counts.grass;
+            
+            // Request the next frame
+            requestAnimationFrame(loop);
+        }
+        
+        // Initialize the app
+        init();
+        
+        // Start the main loop
+        loop();
+    </script>
+    <script>
+        // Function to generate a random number
+        function mulberry32(a) {
+            let x = a | 0;
+            return function() {
+                x = (x + 0x6D2B79F5) | 0;
+                let t = x;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+        }
+        
+        // Function to pick a random element from a list
+        function pick(list) {
+            if (list.length === 0) {
+                return null;
+            }
+            return list[Math.floor(mulberry32(42)() * list.length)];
+        }
+        
+        // Function to draw the world
+        function drawWorld() {
+            // Clear the canvas
+            world.getContext('2d').clearRect(0, 0, world.width, world.height);
+            
+            // Draw the grass
+            for (let y = 0; y < 30; y++) {
+                for (let x = 0; x < 40; x++) {
+                    let grassLevel = grass[y][x];
+                    let color = `rgb(30, ${60 + Math.round(160 * grassLevel / params.grassMax)}, 30)`;
+                    world.getContext('2d').fillRect(x * 10, y * 10, 10, 10);
+                    world.getContext('2d').strokeRect(x * 10, y * 10, 10, 10);
+                    world.getContext('2d').fillStyle = color;
+                    world.getContext('2d').fillRect(x * 10 + 1, y * 10 + 1, 8, 8);
+                }
+            }
+            
+            // Draw the rabbits
+            for (let rabbit of rabbits) {
+                let x = rabbit.x * 10;
+                let y = rabbit.y * 10;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+            }
+            
+            // Draw the foxes
+            for (let fox of foxes) {
+                let x = fox.x * 10;
+                let y = fox.y * 10;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+                world.getContext('2d').fillStyle = `rgb(220, 80, 20)`;
+                world.getContext('2d').fillRect(x + 1, y + 1, 8, 8);
+            }
+        }
+        
+        // Function to draw the chart
+        function drawChart() {
+            // Clear the chart
+            chart.getContext('2d').clearRect(0, 0, chart.width, chart.height);
+            
+            // Draw the series
+            for (let i = 0; i < history.length; i++) {
+                let x = i * chart.width / history.length;
+                let y = chart.height - (history[i].rabbits / Math.max(...history.map(h => h.rabbits)) * chart.height);
+                chart.getContext('2d').moveTo(x, y);
+                chart.getContext('2d').lineTo(x, chart.height);
+            }
+            
+            // Draw the axis
+            chart.getContext('2d').strokeRect(0, chart.height - 10, chart.width, 10);
+            chart.getContext('2d').strokeRect(0, 0, 10, chart.height);
+        }
+        
+        // Function to draw the Lotka-Volterra panel
+        function drawLotkaVolterra() {
+            // Clear the Lotka-Volterra panel
+            lotkaVolterra.getContext('2d').clearRect(0, 0, lotkaVolterra.width, lotkaVolterra.height);
+            
+            // Draw the equations
+            lotkaVolterra.getContext('2d').fillText('dx/dt = αx - βxy', 10, 10);
+            lotkaVolterra.getContext('2d').fillText('dy/dt = δxy - γy', 10, 30);
+        }
+        
+        // Function to draw the scenario tools
+        function drawScenarioTools() {
+            // Clear the scenario tools
+            scenarioTools.getContext('2d').clearRect(0, 0, scenarioTools.width, scenarioTools.height);
+            
+            // Draw the scenario JSON
+            scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10);
+            scenarioTools.getContext('2d').fillText(scenarioTools.getContext('2d').createTextMetrics().measureText(scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10)).width, 30);
+        }
+        
+        // Function to draw the preset list
+        function drawPresetList() {
+            // Clear the preset list
+            presetList.getContext('2d').clearRect(0, 0, presetList.width, presetList.height);
+            
+            // Draw the preset list items
+            for (let i = 0; i < presetList.children.length; i++) {
+                presetList.children[i].getContext('2d').fillText(presetList.children[i].children[0].children[0].children[0].value, 10, 10 + i * 20);
+            }
+        }
+        
+        // Function to draw the announcer
+        function drawAnnouncer() {
+            // Clear the announcer
+            announcer.getContext('2d').clearRect(0, 0, announcer.width, announcer.height);
+            
+            // Draw the announcer text
+            announcer.getContext('2d').fillText('Tick 0: 0 rabbits, 0 foxes', 10, 10);
+        }
+        
+        // Function to update the counters
+        function updateCounters() {
+            // Update the tick counter
+            document.getElementById('tick').textContent = tick;
+            
+            // Update the rabbits counter
+            document.getElementById('rabbits').textContent = rabbits.length;
+            
+            // Update the foxes counter
+            document.getElementById('foxes').textContent = foxes.length;
+            
+            // Update the grass counter
+            document.getElementById('grass').textContent = grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0);
+        }
+        
+        // Function to update the world
+        function updateWorld() {
+            // Update the grass
+            for (let y = 0; y < 30; y++) {
+                for (let x = 0; x < 40; x++) {
+                    grass[y][x]++;
+                }
+            }
+            
+            // Update the rabbits
+            for (let rabbit of rabbits) {
+                // Move the rabbit
+                let neighbours = [];
+                if (rabbit.x > 0) {
+                    neighbours.push({ x: rabbit.x - 1, y: rabbit.y });
+                }
+                if (rabbit.x < 39) {
+                    neighbours.push({ x: rabbit.x + 1, y: rabbit.y });
+                }
+                if (rabbit.y > 0) {
+                    neighbours.push({ x: rabbit.x, y: rabbit.y - 1 });
+                }
+                if (rabbit.y < 29) {
+                    neighbours.push({ x: rabbit.x, y: rabbit.y + 1 });
+                }
+                rabbit.x = pick(neighbours).x;
+                rabbit.y = pick(neighbours).y;
+                
+                // Eat the grass
+                grass[rabbit.y][rabbit.x] = 0;
+                
+                // Breed the rabbit
+                if (rabbit.energy >= params.rabbitBreed) {
+                    let neighbours = [];
+                    if (rabbit.x > 0) {
+                        neighbours.push({ x: rabbit.x - 1, y: rabbit.y });
+                    }
+                    if (rabbit.x < 39) {
+                        neighbours.push({ x: rabbit.x + 1, y: rabbit.y });
+                    }
+                    if (rabbit.y > 0) {
+                        neighbours.push({ x: rabbit.x, y: rabbit.y - 1 });
+                    }
+                    if (rabbit.y < 29) {
+                        neighbours.push({ x: rabbit.x, y: rabbit.y + 1 });
+                    }
+                    let spot = pick(neighbours);
+                    let child = Math.floor(rabbit.energy / 2);
+                    rabbit.energy -= child;
+                    rabbits.push({ id: 1 + rabbits.length, x: spot.x, y: spot.y, energy: child });
+                }
+                
+                // Die the rabbit
+                if (rabbit.energy <= 0) {
+                    rabbits.splice(rabbits.indexOf(rabbit), 1);
+                }
+            }
+            
+            // Update the foxes
+            for (let fox of foxes) {
+                // Move the fox
+                let neighbours = [];
+                if (fox.x > 0) {
+                    neighbours.push({ x: fox.x - 1, y: fox.y });
+                }
+                if (fox.x < 39) {
+                    neighbours.push({ x: fox.x + 1, y: fox.y });
+                }
+                if (fox.y > 0) {
+                    neighbours.push({ x: fox.x, y: fox.y - 1 });
+                }
+                if (fox.y < 29) {
+                    neighbours.push({ x: fox.x, y: fox.y + 1 });
+                }
+                neighbours = neighbours.filter(n => grass[n.y][n.x] > 0 && rabbits.some(r => r.x === n.x && r.y === n.y));
+                fox.x = pick(neighbours).x;
+                fox.y = pick(neighbours).y;
+                
+                // Eat the rabbit
+                for (let rabbit of rabbits) {
+                    if (rabbit.x === fox.x && rabbit.y === fox.y) {
+                        rabbits.splice(rabbits.indexOf(rabbit), 1);
+                        fox.energy += params.foxGain;
+                        break;
+                    }
+                }
+                
+                // Breed the fox
+                if (fox.energy >= params.foxBreed) {
+                    let neighbours = [];
+                    if (fox.x > 0) {
+                        neighbours.push({ x: fox.x - 1, y: fox.y });
+                    }
+                    if (fox.x < 39) {
+                        neighbours.push({ x: fox.x + 1, y: fox.y });
+                    }
+                    if (fox.y > 0) {
+                        neighbours.push({ x: fox.x, y: fox.y - 1 });
+                    }
+                    if (fox.y < 29) {
+                        neighbours.push({ x: fox.x, y: fox.y + 1 });
+                    }
+                    let spot = pick(neighbours);
+                    let child = Math.floor(fox.energy / 2);
+                    fox.energy -= child;
+                    foxes.push({ id: 1 + foxes.length, x: spot.x, y: spot.y, energy: child });
+                }
+                
+                // Die the fox
+                if (fox.energy <= 0) {
+                    foxes.splice(foxes.indexOf(fox), 1);
+                }
+            }
+        }
+        
+        // Function to update the chart
+        function updateChart() {
+            // Update the series
+            for (let i = 0; i < history.length; i++) {
+                let x = i * chart.width / history.length;
+                let y = chart.height - (history[i].rabbits / Math.max(...history.map(h => h.rabbits)) * chart.height);
+                chart.getContext('2d').moveTo(x, y);
+                chart.getContext('2d').lineTo(x, chart.height);
+            }
+        }
+        
+        // Function to update the Lotka-Volterra panel
+        function updateLotkaVolterra() {
+            // Update the equations
+            lotkaVolterra.getContext('2d').fillText('dx/dt = αx - βxy', 10, 10);
+            lotkaVolterra.getContext('2d').fillText('dy/dt = δxy - γy', 10, 30);
+        }
+        
+        // Function to update the scenario tools
+        function updateScenarioTools() {
+            // Update the scenario JSON
+            scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10);
+            scenarioTools.getContext('2d').fillText(scenarioTools.getContext('2d').createTextMetrics().measureText(scenarioTools.getContext('2d').fillText('Scenario JSON:', 10, 10)).width, 30);
+        }
+        
+        // Function to update the preset list
+        function updatePresetList() {
+            // Update the preset list items
+            for (let i = 0; i < presetList.children.length; i++) {
+                presetList.children[i].getContext('2d').fillText(presetList.children[i].children[0].children[0].children[0].value, 10, 10 + i * 20);
+            }
+        }
+        
+        // Function to update the announcer
+        function updateAnnouncer() {
+            // Update the announcer text
+            announcer.getContext('2d').fillText('Tick 0: 0 rabbits, 0 foxes', 10, 10);
+        }
+        
+        // Function to update the counters
+        function updateCounters() {
+            // Update the tick counter
+            document.getElementById('tick').textContent = tick;
+            
+            // Update the rabbits counter
+            document.getElementById('rabbits').textContent = rabbits.length;
+            
+            // Update the foxes counter
+            document.getElementById('foxes').textContent = foxes.length;
+            
+            // Update the grass counter
+            document.getElementById('grass').textContent = grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0);
+        }
+        
+        // Main loop
+        function loop() {
+            // Update the simulation
+            updateWorld();
+            
+            // Update the world
+            drawWorld();
+            
+            // Update the chart
+            updateChart();
+            
+            // Update the Lotka-Volterra panel
+            updateLotkaVolterra();
+            
+            // Update the scenario tools
+            updateScenarioTools();
+            
+            // Update the preset list
+            updatePresetList();
+            
+            // Update the announcer
+            updateAnnouncer();
+            
+            // Update the counters
+            updateCounters();
+            
+            // Request the next frame
+            requestAnimationFrame(loop);
+        }
+        
+        // Initialize the app
+        init();
+        
+        // Start the main loop
+        loop();
+    </script>
+</body>
+</html>

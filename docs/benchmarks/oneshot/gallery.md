@@ -196,3 +196,210 @@ Builds are grouped by model and seed, round one (keep96, DeepSeek v4.1 Flash) an
 
 <img src="runs/xing4/2/shots/phone.png" alt="xing4/2 phone" width="160">
 <img src="runs/xing4/2/shots/load.png" alt="xing4/2 load" width="420">
+
+## Step 1 (2026-10-09): the dense model roster
+
+Twelve dense models, 3 builds each, same settings as round two (40k window, q8_0 cache, temperature 0.2, seeds 1 to 3). Ternary-Bonsai-27B could not be loaded by any llama build on disk. K2-Horizon produced no builds (see `docs/superpowers/specs/2026-10-09-step1-results.md`).
+
+## qwen35-9b/1
+
+<img src="runs/qwen35-9b/1/shots/step200.png" alt="qwen35-9b/1 step200" width="420">
+<img src="runs/qwen35-9b/1/shots/phone.png" alt="qwen35-9b/1 phone" width="160">
+<img src="runs/qwen35-9b/1/shots/load.png" alt="qwen35-9b/1 load" width="420">
+
+## qwen35-9b/2
+
+<img src="runs/qwen35-9b/2/shots/phone.png" alt="qwen35-9b/2 phone" width="160">
+<img src="runs/qwen35-9b/2/shots/ode.png" alt="qwen35-9b/2 ode" width="420">
+<img src="runs/qwen35-9b/2/shots/load.png" alt="qwen35-9b/2 load" width="420">
+
+## qwen35-9b/3
+
+<img src="runs/qwen35-9b/3/shots/phone.png" alt="qwen35-9b/3 phone" width="160">
+<img src="runs/qwen35-9b/3/shots/load.png" alt="qwen35-9b/3 load" width="420">
+
+## gemma4-12b/1
+
+<img src="runs/gemma4-12b/1/shots/phone.png" alt="gemma4-12b/1 phone" width="160">
+<img src="runs/gemma4-12b/1/shots/ode.png" alt="gemma4-12b/1 ode" width="420">
+<img src="runs/gemma4-12b/1/shots/load.png" alt="gemma4-12b/1 load" width="420">
+
+## gemma4-12b/2
+
+<img src="runs/gemma4-12b/2/shots/phone.png" alt="gemma4-12b/2 phone" width="160">
+<img src="runs/gemma4-12b/2/shots/load.png" alt="gemma4-12b/2 load" width="420">
+
+## gemma4-12b/3
+
+<img src="runs/gemma4-12b/3/shots/phone.png" alt="gemma4-12b/3 phone" width="160">
+<img src="runs/gemma4-12b/3/shots/load.png" alt="gemma4-12b/3 load" width="420">
+
+## nanbeige-3b/1
+
+<img src="runs/nanbeige-3b/1/shots/phone.png" alt="nanbeige-3b/1 phone" width="160">
+<img src="runs/nanbeige-3b/1/shots/ode.png" alt="nanbeige-3b/1 ode" width="420">
+<img src="runs/nanbeige-3b/1/shots/load.png" alt="nanbeige-3b/1 load" width="420">
+
+## nanbeige-3b/2
+
+<img src="runs/nanbeige-3b/2/shots/phone.png" alt="nanbeige-3b/2 phone" width="160">
+<img src="runs/nanbeige-3b/2/shots/ode.png" alt="nanbeige-3b/2 ode" width="420">
+<img src="runs/nanbeige-3b/2/shots/load.png" alt="nanbeige-3b/2 load" width="420">
+
+## nanbeige-3b/3
+
+<img src="runs/nanbeige-3b/3/shots/phone.png" alt="nanbeige-3b/3 phone" width="160">
+<img src="runs/nanbeige-3b/3/shots/ode.png" alt="nanbeige-3b/3 ode" width="420">
+<img src="runs/nanbeige-3b/3/shots/load.png" alt="nanbeige-3b/3 load" width="420">
+
+## ornith-9b/1
+
+<img src="runs/ornith-9b/1/shots/phone.png" alt="ornith-9b/1 phone" width="160">
+<img src="runs/ornith-9b/1/shots/ode.png" alt="ornith-9b/1 ode" width="420">
+<img src="runs/ornith-9b/1/shots/load.png" alt="ornith-9b/1 load" width="420">
+
+## ornith-9b/2
+
+<img src="runs/ornith-9b/2/shots/phone.png" alt="ornith-9b/2 phone" width="160">
+<img src="runs/ornith-9b/2/shots/ode.png" alt="ornith-9b/2 ode" width="420">
+<img src="runs/ornith-9b/2/shots/load.png" alt="ornith-9b/2 load" width="420">
+
+## ornith-9b/3
+
+<img src="runs/ornith-9b/3/shots/phone.png" alt="ornith-9b/3 phone" width="160">
+<img src="runs/ornith-9b/3/shots/ode.png" alt="ornith-9b/3 ode" width="420">
+<img src="runs/ornith-9b/3/shots/load.png" alt="ornith-9b/3 load" width="420">
+
+## qwen38-9b/1
+
+<img src="runs/qwen38-9b/1/shots/phone.png" alt="qwen38-9b/1 phone" width="160">
+<img src="runs/qwen38-9b/1/shots/ode.png" alt="qwen38-9b/1 ode" width="420">
+<img src="runs/qwen38-9b/1/shots/load.png" alt="qwen38-9b/1 load" width="420">
+
+## qwen38-9b/2
+
+<img src="runs/qwen38-9b/2/shots/phone.png" alt="qwen38-9b/2 phone" width="160">
+<img src="runs/qwen38-9b/2/shots/ode.png" alt="qwen38-9b/2 ode" width="420">
+<img src="runs/qwen38-9b/2/shots/load.png" alt="qwen38-9b/2 load" width="420">
+
+## qwen38-9b/3
+
+<img src="runs/qwen38-9b/3/shots/phone.png" alt="qwen38-9b/3 phone" width="160">
+<img src="runs/qwen38-9b/3/shots/ode.png" alt="qwen38-9b/3 ode" width="420">
+<img src="runs/qwen38-9b/3/shots/load.png" alt="qwen38-9b/3 load" width="420">
+
+## nemotron-nano-9b/1
+
+<img src="runs/nemotron-nano-9b/1/shots/phone.png" alt="nemotron-nano-9b/1 phone" width="160">
+<img src="runs/nemotron-nano-9b/1/shots/load.png" alt="nemotron-nano-9b/1 load" width="420">
+
+## nemotron-nano-9b/2
+
+<img src="runs/nemotron-nano-9b/2/shots/phone.png" alt="nemotron-nano-9b/2 phone" width="160">
+<img src="runs/nemotron-nano-9b/2/shots/ode.png" alt="nemotron-nano-9b/2 ode" width="420">
+<img src="runs/nemotron-nano-9b/2/shots/load.png" alt="nemotron-nano-9b/2 load" width="420">
+
+## nemotron-nano-9b/3
+
+<img src="runs/nemotron-nano-9b/3/shots/phone.png" alt="nemotron-nano-9b/3 phone" width="160">
+<img src="runs/nemotron-nano-9b/3/shots/ode.png" alt="nemotron-nano-9b/3 ode" width="420">
+<img src="runs/nemotron-nano-9b/3/shots/load.png" alt="nemotron-nano-9b/3 load" width="420">
+
+## qwythos-9b/1
+
+<img src="runs/qwythos-9b/1/shots/phone.png" alt="qwythos-9b/1 phone" width="160">
+<img src="runs/qwythos-9b/1/shots/ode.png" alt="qwythos-9b/1 ode" width="420">
+<img src="runs/qwythos-9b/1/shots/load.png" alt="qwythos-9b/1 load" width="420">
+
+## qwythos-9b/2
+
+<img src="runs/qwythos-9b/2/shots/phone.png" alt="qwythos-9b/2 phone" width="160">
+<img src="runs/qwythos-9b/2/shots/ode.png" alt="qwythos-9b/2 ode" width="420">
+<img src="runs/qwythos-9b/2/shots/load.png" alt="qwythos-9b/2 load" width="420">
+
+## qwythos-9b/3
+
+<img src="runs/qwythos-9b/3/shots/phone.png" alt="qwythos-9b/3 phone" width="160">
+<img src="runs/qwythos-9b/3/shots/ode.png" alt="qwythos-9b/3 ode" width="420">
+<img src="runs/qwythos-9b/3/shots/load.png" alt="qwythos-9b/3 load" width="420">
+
+## gemma4-12b-coding/1
+
+<img src="runs/gemma4-12b-coding/1/shots/phone.png" alt="gemma4-12b-coding/1 phone" width="160">
+<img src="runs/gemma4-12b-coding/1/shots/load.png" alt="gemma4-12b-coding/1 load" width="420">
+
+## gemma4-12b-coding/2
+
+<img src="runs/gemma4-12b-coding/2/shots/phone.png" alt="gemma4-12b-coding/2 phone" width="160">
+<img src="runs/gemma4-12b-coding/2/shots/ode.png" alt="gemma4-12b-coding/2 ode" width="420">
+<img src="runs/gemma4-12b-coding/2/shots/load.png" alt="gemma4-12b-coding/2 load" width="420">
+
+## gemma4-12b-coding/3
+
+<img src="runs/gemma4-12b-coding/3/shots/phone.png" alt="gemma4-12b-coding/3 phone" width="160">
+<img src="runs/gemma4-12b-coding/3/shots/ode.png" alt="gemma4-12b-coding/3 ode" width="420">
+<img src="runs/gemma4-12b-coding/3/shots/load.png" alt="gemma4-12b-coding/3 load" width="420">
+
+## llama31-8b/1
+
+<img src="runs/llama31-8b/1/shots/phone.png" alt="llama31-8b/1 phone" width="160">
+<img src="runs/llama31-8b/1/shots/ode.png" alt="llama31-8b/1 ode" width="420">
+<img src="runs/llama31-8b/1/shots/load.png" alt="llama31-8b/1 load" width="420">
+
+## llama31-8b/2
+
+<img src="runs/llama31-8b/2/shots/phone.png" alt="llama31-8b/2 phone" width="160">
+<img src="runs/llama31-8b/2/shots/load.png" alt="llama31-8b/2 load" width="420">
+
+## llama31-8b/3
+
+<img src="runs/llama31-8b/3/shots/phone.png" alt="llama31-8b/3 phone" width="160">
+<img src="runs/llama31-8b/3/shots/ode.png" alt="llama31-8b/3 ode" width="420">
+<img src="runs/llama31-8b/3/shots/load.png" alt="llama31-8b/3 load" width="420">
+
+## qwen38-27b/1
+
+<img src="runs/qwen38-27b/1/shots/phone.png" alt="qwen38-27b/1 phone" width="160">
+<img src="runs/qwen38-27b/1/shots/load.png" alt="qwen38-27b/1 load" width="420">
+
+## qwen38-27b/2
+
+<img src="runs/qwen38-27b/2/shots/phone.png" alt="qwen38-27b/2 phone" width="160">
+<img src="runs/qwen38-27b/2/shots/load.png" alt="qwen38-27b/2 load" width="420">
+
+## qwen38-27b/3
+
+<img src="runs/qwen38-27b/3/shots/phone.png" alt="qwen38-27b/3 phone" width="160">
+<img src="runs/qwen38-27b/3/shots/ode.png" alt="qwen38-27b/3 ode" width="420">
+<img src="runs/qwen38-27b/3/shots/load.png" alt="qwen38-27b/3 load" width="420">
+
+## dsv4pro-qwen35-9b/1
+
+<img src="runs/dsv4pro-qwen35-9b/1/shots/phone.png" alt="dsv4pro-qwen35-9b/1 phone" width="160">
+<img src="runs/dsv4pro-qwen35-9b/1/shots/ode.png" alt="dsv4pro-qwen35-9b/1 ode" width="420">
+<img src="runs/dsv4pro-qwen35-9b/1/shots/load.png" alt="dsv4pro-qwen35-9b/1 load" width="420">
+
+## dsv4pro-qwen35-9b/2
+
+<img src="runs/dsv4pro-qwen35-9b/2/shots/phone.png" alt="dsv4pro-qwen35-9b/2 phone" width="160">
+<img src="runs/dsv4pro-qwen35-9b/2/shots/load.png" alt="dsv4pro-qwen35-9b/2 load" width="420">
+
+## dsv4pro-qwen35-9b/3
+
+<img src="runs/dsv4pro-qwen35-9b/3/shots/phone.png" alt="dsv4pro-qwen35-9b/3 phone" width="160">
+<img src="runs/dsv4pro-qwen35-9b/3/shots/load.png" alt="dsv4pro-qwen35-9b/3 load" width="420">
+
+## qwen35-9b-coder/1
+
+<img src="runs/qwen35-9b-coder/1/shots/phone.png" alt="qwen35-9b-coder/1 phone" width="160">
+<img src="runs/qwen35-9b-coder/1/shots/load.png" alt="qwen35-9b-coder/1 load" width="420">
+
+## qwen35-9b-coder/2
+
+<img src="runs/qwen35-9b-coder/2/shots/phone.png" alt="qwen35-9b-coder/2 phone" width="160">
+<img src="runs/qwen35-9b-coder/2/shots/load.png" alt="qwen35-9b-coder/2 load" width="420">
+
+## qwen35-9b-coder/3
+
+<img src="runs/qwen35-9b-coder/3/shots/phone.png" alt="qwen35-9b-coder/3 phone" width="160">
+<img src="runs/qwen35-9b-coder/3/shots/load.png" alt="qwen35-9b-coder/3 load" width="420">

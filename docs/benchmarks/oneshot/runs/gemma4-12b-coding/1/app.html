@@ -1,0 +1,2026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scaling=1.0">
+  <title>Ecosystem Lab</title>
+  <style>
+    :root {
+      --bg: #f8f9fa;
+      --panel: #ffffff;
+      --border: #dee2e6;
+      --primary: #1a73e8;
+      --text: #212529;
+    }
+    body {
+      font-family: system-ui,sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2rem;
+      max-width: 1200px;
+      width: 100%;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    canvas {
+      border: 1px solid var(--border);
+      image-rendering: pixelated;
+      max-width: 100%;
+      height: auto;
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 0.5rem;
+    }
+    .counter { font-weight: bold; font-size: 1.2em; }
+    .ode-panel h3 { margin-top: 0; }
+    .preset-list { list-style: none; padding: 0; margin: 1rem 0; }
+    .preset-item { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
+    .error { color: #dc3516; font-size: 0.9em; }
+    @media (min-width: 1000px) {
+      .container { flex-direction: row; }
+    }
+    @media (max-width: 699px) {
+      .container { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div id="announcer" aria-live="polite"></div>
+  <div class="container">
+    <div class="panel panel-world">
+      <canvas id="world" data-testid="world"></canvas>
+      <div class="counters">
+        <span id="tick-display">Tick: 0</span> |
+        <span id="rabbit-display">Rabbits: 0</span> |
+        <span id="fox-display">Foxes: 0</span> |
+        <span id="grass-display">Grass: 0</span>
+      </div>
+      <div class="controls">
+        <input type="number" id="seed" value="42" min="0" max="1000000">
+        <input type="range" id="speed" min="1" max="60" value="10">
+        <button id="play" data-testid="play">Play</button>
+        <button id="pause" data-testid="pause">Pause</button>
+        <button id="step" data-testid="step">Step</button>
+        <button id="reset" data-testid="reset">Reset</button>
+      </div>
+      <div class="params">
+        <label>Rabbits: <input type="range" id="param-rabbits0" min="0" max="300" value="100"></label>
+        <label>Foxes: <input type="range" id="param-foxes0" min="0" max="60" value="6"></label>
+        <label>Rabbit Breed: <input type="range" id="param-rabbitBreed" min="2" max="40" value="6"></label>
+        <label>Fox Breed: <input type="range" id="param-foxBreed" min="2" max="60" value="12"></label>
+        <label>Fox Gain: <input type="range" id="param-foxGain" min="1" max="30" value="4"></label>
+        <label>Grass Max: <input type="range" id="param-grassMax" min="1" max="10" value="4"></label>
+      </div>
+    </div>
+    <div class="panel panel-side">
+      <svg id="chart" data-testid="chart" width="300" height="200"></svg>
+      <div class="ode-panel">
+        <input type="number" id="ode-alpha" value="1.1" step="0.1">
+        <input type="number" id="ode-beta" value="0.4" step="0.1">
+        <input type="number" id="ode-gamma" value="0.4" step="0.1">
+        <input type="number" id="ode-delta" value="0.1" step="0.1">
+        <input type="number" id="ode-x0" value="10">
+        <input type="number" id="ode-y0" value="10">
+        <input type="number" id="ode-t" value="50">
+        <input type="number" id="ode-dt" value="0.01">
+        <button id="ode-run">Run ODE</button>
+        <div id="ode-results"></div>
+        <svg id="ode-chart" data-testid="ode-chart" width="300" height="200"></svg>
+      </div>
+      <div class="scenario-tools">
+        <input type="text" id="preset-name" placeholder="Preset name">
+        <button id="preset-save">Save</button>
+        <button id="scenario-export">Export JSON</button>
+        <textarea id="scenario-json" style="width:100%;height:60px;"></textarea>
+        <button id="scenario-load">Load</button>
+        <span id="scenario-error" class="error"></span>
+        <ul id="preset-list" data-testid="preset-list"></ul>
+      </div>
+      <button id="csv-export">Download CSV</button>
+    </div>
+  </div>
+  <script>
+    const WIDTH = 40, HEIGHT = 30, GRASSMAX = 4;
+    function mulberry32(seed) {
+      let a = seed | 0;
+      return function () {
+        a = (a + 0x6D2B79F5) | 0;
+        let t = a;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    function pick(list) { return list.length > 0 ? list[Math.floor(Math.random() * list.length)] : undefined; }
+    function getNeighbors(x, y) {
+      const list = [];
+      const dirs = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+      for (const [dx, dy] of dirs) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && nx < WIDTH && ny >= 0 && ny < HEIGHT) list.push([nx, ny]);
+      }
+      return list;
+    }
+    let state = { seed, rand, tick, idCounter: 1, history: [], params: {} };
+    function reset(seed, params = {}) {
+      state.seed = seed;
+      state.rand = mulberry32(seed);
+      state.tick = 0;
+      state.idCounter = 1;
+      state.history = [];
+      state.params = { rabbits0: 100, foxes0: 6, rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12, foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 12, width: WIDTH, height: HEIGHT, grassMax: GRASSMAX };
+      const grid = [];
+      for (let y = 0; y < HEIGHT; y++) {
+        grid[y] = [];
+        for (let x = 0; x < WIDTH; x++) grid[y][x] = { grass: 0, rabbit: null, fox: null };
+      }
+      const rabbits = [];
+      for (let i = 0; i < state.params.rabbits0; i++) {
+        const cells = [];
+        for (let y = 0; y < HEIGHT; y++) for (let x = 0; x < WIDTH; x++) if (!grid[y][x].rabbit) cells.push([x, y]);
+        const [x, y] = pick(cells);
+        grid[y][x].rabbit = { id: state.idCounter++, energy: state.params.rabbitStart };
+      }
+      const foxes = [];
+      for (let i = 0; i < state.params.foxes0; i++) {
+        const cells = [];
+        for (let y = 0; y < HEIGHT; y++) for (let x = 0; x < WIDTH; x++) if (!grid[y][x].fox) cells.push([x, y]);
+        const [x, y] = pick(cells);
+        grid[y][x].fox = { id: state.idCounter++, energy: state.params.foxStart };
+      }
+      state.grid = grid;
+      state.rabbits = rabbits;
+      state.foxes = foxes;
+      state.history = [{ tick: 0, rabbits: rabbits.length, foxes: foxes.length, grass: grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0) }];
+      render();
+      return counts();
+    }
+    function counts() {
+      const grass = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      return { rabbits: state.rabbits.length, foxes: state.foxes.length, grass };
+    }
+    function step() {
+      const rabbits = state.rabbits.map(r => ({ ...r }));
+      const foxes = state.foxes.map(f => ({ ...f }));
+      rabbits.sort((a, b) => a.id - b.id);
+      foxes.sort((a, b) => a.id - b.id);
+      rabbits.forEach(r => {
+        const neighbors = getNeighbors(r.x, r.y).filter(n => !grid[n[1]][n[0]].rabbit);
+        const target = neighbors.length > 0 ? neighbors[pick(neighbors)] : [r.x, r.y];
+        r.x = target[0]; r.y = target[1];
+        r.energy += state.params.rabbitGain * grid[r.y][r.x].grass;
+        grid[r.y][r.x].grass = 0;
+        r.energy -= state.params.rabbitCost;
+        if (r.energy >= state.params.rabbitBreed) {
+          const n = getNeighbors(r.x, r.y).filter(n => !grid[n[1]][n[0]].rabbit);
+          if (n.length > 0) {
+            const spot = n[pick(n)];
+            const childEnergy = Math.floor(r.energy / 2);
+            r.energy -= childEnergy;
+            grid[spot[1]][spot[0]].rabbit = { id: state.idCounter++, energy: childEnergy };
+          }
+        }
+        if (r.energy <= 0) grid[r.y][r.x].rabbit = null;
+      });
+      foxes.forEach(f => {
+        const rabbitTarget = getNeighbors(f.x, f.y).filter(n => grid[n[1]][n[0]].rabbit && !grid[n[1]][n[0]].fox);
+        const target = rabbitTarget.length > 0 ? rabbitTarget[pick(rabbitTarget)] : getNeighbors(f.x, f.y).filter(n => !grid[n[1]][n[0]].fox);
+        if (target) { f.x = target[0]; f.y = target[1]; }
+        if (grid[f.y][f.x].rabbit) { grid[f.y][f.x].rabbit = null; f.energy += state.params.foxGain; }
+        f.energy -= state.params.foxCost;
+        if (f.energy >= state.params.foxBreed) {
+          const n = getNeighbors(f.x, f.y).filter(n => !grid[n[1]][n[0]].fox);
+          if (n.length > 1) {
+            const spot = n[pick(n)];
+            const childEnergy = Math.floor(f.energy / 2);
+            f.energy -= childEnergy;
+            grid[spot[1]][spot[0]].fox = { id: state.idCounter++, energy: childEnergy };
+          }
+        }
+        if (f.energy <= 0) grid[f.y][f.x].fox = null;
+      });
+      state.rabbits = state.grid.map(r => r.rabbit).filter(r => r !== null);
+      state.foxes = state.grid.map(r => r.fox).filter(r => r !== null);
+      state.tick++;
+      state.history.push({ tick: state.tick, rabbits: state.rabbits.length, foxes: state.foxes.length, grass: state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0) });
+      return counts();
+    }
+    function render() {
+      const canvas = document.getElementById('world');
+      const ctx = canvas.getContext('2d');
+      canvas.width = WIDTH * 10;
+      canvas.height = HEIGHT * 10;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('tick-display').innerText = `Tick: ${state.tick}`;
+      document.getElementById('rabbit-display').innerText = `Rabbits: ${state.rabbits.length}`;
+      document.getElementById('fox-display').innerText = `Foxes: ${state.foxes.length}`;
+      document.getElementById('grass-display').innerText = `Grass: ${state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0)}`;
+    }
+    function ode(p, t, dt) {
+      let {alpha, beta, gamma, delta, x0, y0} = p;
+      let k1x = alpha * x0 - beta * x0 * y0;
+      let k1y = delta * x0 * y0 - gamma * y0;
+      let k2x = alpha * (x0 + k1x * dt / 2) - beta * (x0 + k1x * dt / 2) * (y0 + k1y * dt / 2);
+      let k2y = delta * (x0 + k1x * dt / 2) * (y0 + k1y * dt / 2) - gamma * (y0 + k1y * dt / 2);
+      let k3x = alpha * (x0 + k2x * dt / 2) - beta * (x0 + k2x * dt / 2) * (y0 + k2y * dt / 2);
+      let k3y = delta * (x0 + k2x * dt / 2) * (y0 + k2y * dt / 2) - gamma * (y0 + k2y * dt / 2);
+      let k4x = alpha * (x0 + k3x * dt) - beta * (x0 + k3x * dt) * (y0 + k3y * dt);
+      let k4y = delta * (x0 + k3x * dt) * (y0 + k3y * dt) - gamma * (y0 + k3y * dt);
+      let x = x0 + (k1x + k2x + k3x + k4x) * dt / 4;
+      let y = y0 + (k1y + k2y + k3y + k4y) * dt / 4;
+      return {x, y};
+    }
+    const canvas = document.getElementById('world');
+     let playInterval = null;
+     function togglePlay(state) {
+      if (playInterval) clearInterval(playInterval);
+      if (state.playing) {
+        playInterval = setInterval(() => step(), 1000 / parseInt(document.getElementById('speed').value));
+        document.getElementById('announcer').innerText = `Tick ${state.tick}: ${state.rabbits.length} rabbits, ${state.foxes.length} foxes`;
+      } else {
+        document.getElementById('announcer').innerText = `Tick ${state.tick}: ${state.rabbits.length} rabbits, ${state.foxes.length} foxes`;
+      }
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('tick-display').innerText = `Tick: ${state.tick}`;
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('tick-display').innerText = `Tick: ${state.tick}`;
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let y = 0; y < HEIGHT; y++) {
+        for (let x = 0; x < WIDTH; x++) {
+          const g = grid[y][x].grass;
+          ctx.fillStyle = `rgb(30, ${60 + Math.round(160 * g / GRASSMAX)}, 30)`;
+          ctx.fillRect(x * 10, y * 10, 10, 10);
+          if (grid[y][x].rabbit) ctx.fillStyle = `rgb(240, 240, 240)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+          if (grid[y][x].fox) ctx.fillStyle = `rgb(220, 80, 20)`;
+          ctx.fillRect(x * 10 + 2, y * 10 + 2, 6, 6);
+        }
+      }
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function update() {
+      const r = state.rabbits.length;
+      const f = state.foxes.length;
+      const g = state.grid.flatMap(r => r.map(c => c.grass)).reduce((a, b) => a + b, 0);
+      document.getElementById('rabbit-display').innerText = r;
+      document.getElementById('fox-display').innerText = f;
+      document.getElementById('grass-display').innerText = g;
+    }
+    function render() {
+      const c = canvas;
+      c.width = WIDTH * 10;
+      c.height = HEIGHT * 10;
+      const ctx = c.getContext('2d');
+      ctx.clearRect(0, 0

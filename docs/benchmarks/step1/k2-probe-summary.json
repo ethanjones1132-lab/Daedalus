@@ -1,0 +1,12 @@
+{
+ "note": "written by hand: the probe script was killed by its 30-minute timeout before it wrote its own file",
+ "mode": "mmap (the original k2h registry config, without --load-mode none), apps (Discord, OneDrive) closed",
+ "ncmoe": 30,
+ "extra": [
+  "-ot",
+  "attn_v_exps=CPU"
+ ],
+ "gen_prompt_200_tokens": "no answer within the 900 s request timeout (TimeoutError)",
+ "long_prompt_9k_tokens": "connection reset when the probe was stopped; prompt processing ran at 2.73 tok/s at 512 tokens in",
+ "no_mmap_attempt": "ncmoe 30 fit at the first load (VRAM 7654 MiB); generation 1.1 tok/s average (0.2-2.3 tok/s instantaneous) after 326-375 tokens; llama-server private memory 19.4 GB, working set 1.6 GB, memory compression 2.7 GB, 52k pages/s read from the pagefile; stopped by hand under the handoff's rule (RAM below ~1 GB)"
+}

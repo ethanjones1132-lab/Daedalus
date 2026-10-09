@@ -1,0 +1,22 @@
+{
+ "model": "dsv4pro-qwen35-9b",
+ "file": "DeepSeek-V4-Pro-Qwen3.5-9B-MTP-Q5_K_M.gguf",
+ "seed": 2,
+ "ncmoe": 99,
+ "spec": "mtp",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7555,
+   "spec": "mtp"
+  }
+ ],
+ "wall_s": 163.1,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 11023,
+ "gen_tps": 68.6,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.68
+}

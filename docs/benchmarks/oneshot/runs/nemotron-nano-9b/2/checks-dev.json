@@ -1,0 +1,443 @@
+{
+ "score": 0.05523809523809524,
+ "areas": {
+  "logic": 0.1,
+  "time": 0.16666666666666666,
+  "canvas": 0,
+  "chart": 0,
+  "data": 0,
+  "algo": 0,
+  "layout": 0,
+  "a11y": 0.2857142857142857,
+  "persist": 0,
+  "domain": 0
+ },
+ "passed": 4,
+ "total": 70,
+ "console_errors": [
+  "TypeError: Cannot read properties of null (reading 'getContext')"
+ ],
+ "blocked_requests": 0,
+ "checks": [
+  {
+   "id": "api-present",
+   "area": "logic",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "reset-counts-0",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "reset-counts-1",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "reset-counts-2",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "params-apply",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "grass-bounds",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "one-per-cell",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "energy-positive",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "ids-initial",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "ui-step",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: locator.textContent: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "play-rate",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "pause-stops",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "step-one",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "speed-change",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "speed-slider-dom",
+   "area": "time",
+   "pass": true,
+   "detail": "[\"range\",\"1\",\"60\",\"10\"]"
+  },
+  {
+   "id": "space-toggles",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "canvas-size",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "pixels-reset",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "pixels-after-step",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "pixels-after-reset-ui",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "fox-over-rabbit",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "points-equal-history",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "monotone-y",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "monotone-x",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "axes-labelled",
+   "area": "chart",
+   "pass": false,
+   "detail": ""
+  },
+  {
+   "id": "chart-resets",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "csv-exact",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "csv-download",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "scenario-roundtrip",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "scenario-defaults",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "scenario-bad-json",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "scenario-bad-version",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "scenario-ui-load",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "state-50-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-100-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-500-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "state-50-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-100-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-500-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "state-50-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-100-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "counts-500-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "breed-ids",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "extinction-foxes",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "extinction-all",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "side-by-side-1280",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "stacked-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "no-hscroll-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "[600,600,false]"
+  },
+  {
+   "id": "no-hscroll-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "[412,390,false]"
+  },
+  {
+   "id": "canvas-fits-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "{\"x\":10,\"y\":10,\"width\":402,\"height\":302}"
+  },
+  {
+   "id": "tab-reaches-controls",
+   "area": "a11y",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "buttons-keyboard",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "sliders-labelled",
+   "area": "a11y",
+   "pass": false,
+   "detail": "unlabelled: speed"
+  },
+  {
+   "id": "announce-on-pause",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "shortcut-s",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "shortcut-r",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "focus-visible",
+   "area": "a11y",
+   "pass": true,
+   "detail": "[\"play\",\"auto\",\"1px\",\"none\"]"
+  },
+  {
+   "id": "preset-save-reload",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "preset-list",
+   "area": "persist",
+   "pass": false,
+   "detail": "[]"
+  },
+  {
+   "id": "preset-delete",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: locator.click: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "preset-load-applies",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')"
+  },
+  {
+   "id": "corrupt-storage",
+   "area": "persist",
+   "pass": false,
+   "detail": "[0,true,[\"TypeError: Cannot read properties of null (reading 'getContext')\"]]"
+  },
+  {
+   "id": "ode-values-0",
+   "area": "domain",
+   "pass": false,
+   "detail": "app {\"x\":0,\"y\":0} ref {\"x\":0.07484073069377406,\"y\":0.8694301634142199}"
+  },
+  {
+   "id": "ode-values-1",
+   "area": "domain",
+   "pass": false,
+   "detail": "app {\"x\":0,\"y\":0} ref {\"x\":4.940988081110374,\"y\":5.237792727027955}"
+  },
+  {
+   "id": "ode-values-2",
+   "area": "domain",
+   "pass": false,
+   "detail": "app {\"x\":0,\"y\":0} ref {\"x\":3.2034918618075943,\"y\":2.4101818527587198}"
+  },
+  {
+   "id": "ode-steps-rounding",
+   "area": "domain",
+   "pass": false,
+   "detail": "app {\"x\":0,\"y\":0} ref {\"x\":7.179825061745335,\"y\":10.510710244677728}"
+  },
+  {
+   "id": "eq-dom",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: locator.textContent: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "drift-small",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: locator.textContent: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "ode-ui-run",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: locator.textContent: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "ode-chart",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: locator.getAttribute: Timeout 4000ms exceeded."
+  }
+ ]
+}

@@ -1,0 +1,443 @@
+{
+ "score": 0.08,
+ "areas": {
+  "logic": 0.1,
+  "time": 0,
+  "canvas": 0,
+  "chart": 0.2,
+  "data": 0,
+  "algo": 0,
+  "layout": 0,
+  "a11y": 0,
+  "persist": 0,
+  "domain": 0.5
+ },
+ "passed": 6,
+ "total": 70,
+ "console_errors": [
+  "ReferenceError: Cannot access 'counts' before initialization"
+ ],
+ "blocked_requests": 0,
+ "checks": [
+  {
+   "id": "api-present",
+   "area": "logic",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "reset-counts-0",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "reset-counts-1",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "reset-counts-2",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "params-apply",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "grass-bounds",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "one-per-cell",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "energy-positive",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "ids-initial",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "ui-step",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: locator.click: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "play-rate",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "pause-stops",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "step-one",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "speed-change",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "speed-slider-dom",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of null (reading 'type')"
+  },
+  {
+   "id": "space-toggles",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "canvas-size",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "pixels-reset",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "pixels-after-step",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "pixels-after-reset-ui",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "fox-over-rabbit",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "points-equal-history",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "monotone-y",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "monotone-x",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "axes-labelled",
+   "area": "chart",
+   "pass": true,
+   "detail": "\n                    \n                    \n                    count\n           "
+  },
+  {
+   "id": "chart-resets",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "csv-exact",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "csv-download",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "scenario-roundtrip",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "scenario-defaults",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "scenario-bad-json",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "scenario-bad-version",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "scenario-ui-load",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "state-50-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-100-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-500-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "state-50-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-100-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-500-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "state-50-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-100-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "counts-500-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "breed-ids",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "extinction-foxes",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "extinction-all",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "side-by-side-1280",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "stacked-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "no-hscroll-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "[600,600,false]"
+  },
+  {
+   "id": "no-hscroll-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "[454,390,false]"
+  },
+  {
+   "id": "canvas-fits-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "{\"x\":31,\"y\":69,\"width\":402.40625,\"height\":301.796875}"
+  },
+  {
+   "id": "tab-reaches-controls",
+   "area": "a11y",
+   "pass": false,
+   "detail": "not reached: play,pause,step,reset,speed,seed,param-rabbits0,param-foxes0,param-rabbitBreed,param-foxBreed,param-foxGain,param-grassMax"
+  },
+  {
+   "id": "buttons-keyboard",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "sliders-labelled",
+   "area": "a11y",
+   "pass": false,
+   "detail": "unlabelled: speed,param-rabbits0,param-foxes0,param-rabbitBreed,param-foxBreed,param-foxGain,param-grassMax"
+  },
+  {
+   "id": "announce-on-pause",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "shortcut-s",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "shortcut-r",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "focus-visible",
+   "area": "a11y",
+   "pass": false,
+   "detail": "[null,\"auto\",\"1px\",\"none\"]"
+  },
+  {
+   "id": "preset-save-reload",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "preset-list",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  },
+  {
+   "id": "preset-delete",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  },
+  {
+   "id": "preset-load-applies",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization"
+  },
+  {
+   "id": "corrupt-storage",
+   "area": "persist",
+   "pass": false,
+   "detail": "[0,true,[\"ReferenceError: Cannot access 'counts' before initialization\"]]"
+  },
+  {
+   "id": "ode-values-0",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":0.07484073069377406,\"y\":0.8694301634142199} ref {\"x\":0.07484073069377406,\"y\":0.8694301634142199}"
+  },
+  {
+   "id": "ode-values-1",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":4.940988081110374,\"y\":5.237792727027955} ref {\"x\":4.940988081110374,\"y\":5.237792727027955}"
+  },
+  {
+   "id": "ode-values-2",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":3.2034918618075943,\"y\":2.4101818527587198} ref {\"x\":3.2034918618075943,\"y\":2.4101818527587198}"
+  },
+  {
+   "id": "ode-steps-rounding",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":7.179825061745335,\"y\":10.510710244677728} ref {\"x\":7.179825061745335,\"y\":10.510710244677728}"
+  },
+  {
+   "id": "eq-dom",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  },
+  {
+   "id": "drift-small",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  },
+  {
+   "id": "ode-ui-run",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  },
+  {
+   "id": "ode-chart",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot set properties of null (setting 'value')"
+  }
+ ]
+}

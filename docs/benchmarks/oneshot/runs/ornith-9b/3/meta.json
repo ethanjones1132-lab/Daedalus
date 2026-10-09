@@ -1,0 +1,22 @@
+{
+ "model": "ornith-9b",
+ "file": "ornith-1.0-9b-Q4_K_M.gguf",
+ "seed": 3,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 6390,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 242.9,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 10300,
+ "gen_tps": 42.8,
+ "has_reasoning": false,
+ "ram_avail_gb": 2.32
+}

@@ -78,3 +78,7 @@ Path 1's answer is path 2's starting point.
 - From jev-swarm: it tuned stations that weren't the bottleneck, so measure the bottleneck before building for it.
 - From Laya v3: test each Laya question for real signal first. A near-constant answer, like "type" for 82% of rows, can't help.
 - From long context: 128k fits with GPU apps closed. The rollout (128k or 64k) waits for the owner's choice.
+
+## Status (2026-10-09)
+
+Step 1 ran overnight: results in `2026-10-09-step1-results.md`, the two-pick proposal in `2026-10-09-base-selection.md` (A: Qwen3.6-35B-A3B IQ3_XXS at 64k with a lean Laya; B: Qwen3.5-9B with Qwen3.5-4B as the second size). Step 2 starts after the owner confirms the picks.

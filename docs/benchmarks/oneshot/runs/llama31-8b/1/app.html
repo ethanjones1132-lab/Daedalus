@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ecosystem Lab</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        #panel-world {
+            float: left;
+            width: 50%;
+            height: 100vh;
+            padding: 20px;
+            border: 1px solid #ccc;
+        }
+        #panel-side {
+            float: right;
+            width: 50%;
+            height: 100vh;
+            padding: 20px;
+            border: 1px solid #ccc;
+        }
+        #panel-world canvas {
+            width: 100%;
+            height: 100%;
+        }
+        #panel-side svg {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div id="panel-world">
+        <canvas id="world" width="400" height="300"></canvas>
+        <div>
+            <button id="play" data-testid="play">Play</button>
+            <button id="pause" data-testid="pause">Pause</button>
+            <button id="step" data-testid="step">Step</button>
+            <button id="reset" data-testid="reset">Reset</button>
+            <input id="speed" type="range" min="1" max="60" value="10" data-testid="speed">
+            <span>Speed: <span id="speed-value">10</span></span>
+            <div>
+                <label for="seed">Seed:</label>
+                <input id="seed" type="number" value="42" data-testid="seed">
+            </div>
+            <div>
+                <label for="rabbits0">Rabbits:</label>
+                <input id="rabbits0" type="number" value="100" data-testid="param-rabbits0">
+            </div>
+            <div>
+                <label for="foxes0">Foxes:</label>
+                <input id="foxes0" type="number" value="6" data-testid="param-foxes0">
+            </div>
+            <div>
+                <label for="rabbitBreed">Rabbit Breed:</label>
+                <input id="rabbitBreed" type="number" value="12" data-testid="param-rabbitBreed">
+            </div>
+            <div>
+                <label for="foxBreed">Fox Breed:</label>
+                <input id="foxBreed" type="number" value="40" data-testid="param-foxBreed">
+            </div>
+            <div>
+                <label for="foxGain">Fox Gain:</label>
+                <input id="foxGain" type="number" value="4" data-testid="param-foxGain">
+            </div>
+            <div>
+                <label for="grassMax">Grass Max:</label>
+                <input id="grassMax" type="number" value="4" data-testid="param-grassMax">
+            </div>
+            <div>
+                <label for="tick">Tick:</label>
+                <span id="tick">0</span>
+            </div>
+            <div>
+                <label for="rabbits">Rabbits:</label>
+                <span id="rabbits">0</span>
+            </div>
+            <div>
+                <label for="foxes">Foxes:</label>
+                <span id="foxes">0</span>
+            </div>
+            <div>
+                <label for="grass">Grass:</label>
+                <span id="grass">0</span>
+            </div>
+        </div>
+    </div>
+    <div id="panel-side">
+        <svg id="chart" width="400" height="300">
+            <polyline id="series-rabbits" data-testid="series-rabbits"></polyline>
+            <polyline id="series-foxes" data-testid="series-foxes"></polyline>
+        </svg>
+        <div>
+            <label for="ode-alpha">Lotka-Volterra Alpha:</label>
+            <input id="ode-alpha" type="number" value="1.1" data-testid="ode-alpha">
+        </div>
+        <div>
+            <label for="ode-beta">Lotka-Volterra Beta:</label>
+            <input id="ode-beta" type="number" value="0.4" data-testid="ode-beta">
+        </div>
+        <div>
+            <label for="ode-gamma">Lotka-Volterra Gamma:</label>
+            <input id="ode-gamma" type="number" value="0.4" data-testid="ode-gamma">
+        </div>
+        <div>
+            <label for="ode-delta">Lotka-Volterra Delta:</label>
+            <input id="ode-delta" type="number" value="0.1" data-testid="ode-delta">
+        </div>
+        <div>
+            <label for="ode-x0">Lotka-Volterra X0:</label>
+            <input id="ode-x0" type="number" value="10" data-testid="ode-x0">
+        </div>
+        <div>
+            <label for="ode-y0">Lotka-Volterra Y0:</label>
+            <input id="ode-y0" type="number" value="10" data-testid="ode-y0">
+        </div>
+        <div>
+            <label for="ode-t">Lotka-Volterra T:</label>
+            <input id="ode-t" type="number" value="50" data-testid="ode-t">
+        </div>
+        <div>
+            <label for="ode-dt">Lotka-Volterra DT:</label>
+            <input id="ode-dt" type="number" value="0.01" data-testid="ode-dt">
+        </div>
+        <button id="ode-run" data-testid="ode-run">Run</button>
+        <div>
+            <label for="ode-x">Lotka-Volterra X:</label>
+            <span id="ode-x"></span>
+        </div>
+        <div>
+            <label for="ode-y">Lotka-Volterra Y:</label>
+            <span id="ode-y"></span>
+        </div>
+        <div>
+            <label for="ode-eq-x">Lotka-Volterra EQ X:</label>
+            <span id="ode-eq-x"></span>
+        </div>
+        <div>
+            <label for="ode-eq-y">Lotka-Volterra EQ Y:</label>
+            <span id="ode-eq-y"></span>
+        </div>
+        <div>
+            <label for="ode-drift">Lotka-Volterra Drift:</label>
+            <span id="ode-drift"></span>
+        </div>
+        <svg id="ode-chart" width="400" height="300">
+            <polyline id="ode-series-x" data-testid="ode-series-x"></polyline>
+            <polyline id="ode-series-y" data-testid="ode-series-y"></polyline>
+        </svg>
+        <div>
+            <label for="preset-name">Preset Name:</label>
+            <input id="preset-name" type="text">
+        </div>
+        <button id="preset-save" data-testid="preset-save">Save</button>
+        <div id="preset-list">
+            <!-- preset items will be inserted here -->
+        </div>
+    </div>
+    <script>
+        const world = document.getElementById('world');
+        const chart = document.getElementById('chart');
+        const odeChart = document.getElementById('ode-chart');
+        const playButton = document.getElementById('play');
+        const pauseButton = document.getElementById('pause');
+        const stepButton = document.getElementById('step');
+        const resetButton = document.getElementById('reset');
+        const speedInput = document.getElementById('speed');
+        const speedValue = document.getElementById('speed-value');
+        const seedInput = document.getElementById('seed');
+        const rabbits0Input = document.getElementById('rabbits0');
+        const foxes0Input = document.getElementById('foxes0');
+        const rabbitBreedInput = document.getElementById('rabbitBreed');
+        const foxBreedInput = document.getElementById('foxBreed');
+        const foxGainInput = document.getElementById('foxGain');
+        const grassMaxInput = document.getElementById('grassMax');
+        const tickSpan = document.getElementById('tick');
+        const rabbitsSpan = document.getElementById('rabbits');
+        const foxesSpan = document.getElementById('foxes');
+        const grassSpan = document.getElementById('grass');
+        const seriesRabbits = document.getElementById('series-rabbits');
+        const seriesFoxes = document.getElementById('series-foxes');
+        const odeAlphaInput = document.getElementById('ode-alpha');
+        const odeBetaInput = document.getElementById('ode-beta');
+        const odeGammaInput = document.getElementById('ode-gamma');
+        const odeDeltaInput = document.getElementById('ode-delta');
+        const odeX0Input = document.getElementById('ode-x0');
+        const odeY0Input = document.getElementById('ode-y0');
+        const odeTInput = document.getElementById('ode-t');
+        const odeDtInput = document.getElementById('ode-dt');
+        const odeRunButton = document.getElementById('ode-run');
+        const odeXSpan = document.getElementById('ode-x');
+        const odeYSpan = document.getElementById('ode-y');
+        const odeEqXSpan = document.getElementById('ode-eq-x');
+        const odeEqYSpan = document.getElementById('ode-eq-y');
+        const odeDriftSpan = document.getElementById('ode-drift');
+        const presetNameInput = document.getElementById('preset-name');
+        const presetSaveButton = document.getElementById('preset-save');
+        const presetList = document.getElementById('preset-list');
+
+        let seed = 42;
+        let speed = 10;
+        let rabbits0 = 100;
+        let foxes0 = 6;
+        let rabbitBreed = 12;
+        let foxBreed = 40;
+        let foxGain = 4;
+        let grassMax = 4;
+        let tick = 0;
+        let rabbits = 0;
+        let foxes = 0;
+        let grass = 0;
+        let history = [];
+        let odeAlpha = 1.1;
+        let odeBeta = 0.4;
+        let odeGamma = 0.4;
+        let odeDelta = 0.1;
+        let odeX0 = 10;
+        let odeY0 = 10;
+        let odeT = 50;
+        let odeDt = 0.01;
+        let odeX = 0;
+        let odeY = 0;
+        let odeEqX = 0;
+        let odeEqY = 0;
+        let odeDrift = 0;
+
+        function mulberry32(seed) {
+            let a = seed | 0;
+            return function() {
+                a = (a + 0x6D2B79F5) | 0;
+                let t = a;
+                t = Math.imul(t ^ (t >>> 15), t | 1);
+                t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+                return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+            };
+        }
+
+        function pick(list) {
+            if (list.length === 0) return null;
+            return list[Math.floor(mulberry32(seed)() * list.length)];
+        }
+
+        function reset() {
+            seed = parseInt(seedInput.value);
+            speed = parseInt(speedInput.value);
+            rabbits0 = parseInt(rabbits0Input.value);
+            foxes0 = parseInt(foxes0Input.value);
+            rabbitBreed = parseInt(rabbitBreedInput.value);
+            foxBreed = parseInt(foxBreedInput.value);
+            foxGain = parseInt(foxGainInput.value);
+            grassMax = parseInt(grassMaxInput.value);
+            tick = 0;
+            rabbits = 0;
+            foxes = 0;
+            grass = 0;
+            history = [];
+            const worldWidth = 40;
+            const worldHeight = 30;
+            const grassMaxValue = grassMax + 1;
+            const grass = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(0));
+            const rabbits = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(null));
+            const foxes = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(null));
+            const idCounter = 1;
+            for (let i = 0; i < rabbits0; i++) {
+                const x = Math.floor(mulberry32(seed)() * worldWidth);
+                const y = Math.floor(mulberry32(seed)() * worldHeight);
+                if (rabbits[x][y] === null) {
+                    rabbits[x][y] = { id: idCounter, energy: 6 };
+                    idCounter++;
+                }
+            }
+            for (let i = 0; i < foxes0; i++) {
+                const x = Math.floor(mulberry32(seed)() * worldWidth);
+                const y = Math.floor(mulberry32(seed)() * worldHeight);
+                if (foxes[x][y] === null) {
+                    foxes[x][y] = { id: idCounter, energy: 12 };
+                    idCounter++;
+                }
+            }
+            for (let x = 0; x < worldWidth; x++) {
+                for (let y = 0; y < worldHeight; y++) {
+                    grass[x][y] = Math.floor(mulberry32(seed)() * grassMaxValue);
+                }
+            }
+            history.push({ tick, rabbits, foxes, grass: grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0) });
+            drawWorld();
+            drawChart();
+            drawOdeChart();
+            updateCounters();
+        }
+
+        function step() {
+            const worldWidth = 40;
+            const worldHeight = 30;
+            const grassMaxValue = grassMax + 1;
+            const grass = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(0));
+            const rabbits = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(null));
+            const foxes = Array(worldWidth).fill(0).map(() => Array(worldHeight).fill(null));
+            for (let x = 0; x < worldWidth; x++) {
+                for (let y = 0; y < worldHeight; y++) {
+                    grass[x][y] = Math.min(grassMax, grass[x][y] + 1);
+                }
+            }
+            const rabbitsAlive = Array.from(rabbits).filter(rabbit => rabbit !== null).map(rabbit => rabbit.id);
+            rabbitsAlive.sort((a, b) => a - b);
+            for (const rabbitId of rabbitsAlive) {
+                const rabbit = rabbits.flat().find(rabbit => rabbit.id === rabbitId);
+                const x = rabbit.x;
+                const y = rabbit.y;
+                const neighbours = getNeighbours(x, y);
+                const emptyNeighbours = neighbours.filter(neighbour => rabbits[neighbour.x][neighbour.y] === null);
+                const rabbitNeighbour = pick(emptyNeighbours);
+                if (rabbitNeighbour) {
+                    rabbit.x = rabbitNeighbour.x;
+                    rabbit.y = rabbitNeighbour.y;
+                }
+                const grassLevel = grass[x][y];
+                rabbit.energy += grassLevel * foxGain;
+                grass[x][y] = 0;
+                rabbit.energy -= rabbitCost;
+                if (rabbit.energy >= rabbitBreed) {
+                    const breedNeighbours = neighbours.filter(neighbour => rabbits[neighbour.x][neighbour.y] === null);
+                    const breedSpot = pick(breedNeighbours);
+                    if (breedSpot) {
+                        const child = Math.floor(rabbit.energy / 2);
+                        rabbit.energy -= child;
+                        const newRabbit = { id: idCounter, energy: child };
+                        rabbits[breedSpot.x][breedSpot.y] = newRabbit;
+                        idCounter++;
+                    }
+                }
+                if (rabbit.energy <= 0) {
+                    rabbits[x][y] = null;
+                }
+            }
+            const foxesAlive = Array.from(foxes).filter(fox => fox !== null).map(fox => fox.id);
+            foxesAlive.sort((a, b) => a - b);
+            for (const foxId of foxesAlive) {
+                const fox = foxes.flat().find(fox => fox.id === foxId);
+                const x = fox.x;
+                const y = fox.y;
+                const neighbours = getNeighbours(x, y);
+                const rabbitNeighbours = neighbours.filter(neighbour => rabbits[neighbour.x][neighbour.y] !== null);
+                const emptyNeighbours = neighbours.filter(neighbour => rabbits[neighbour.x][neighbour.y] === null);
+                const foxNeighbour = pick(rabbitNeighbours.concat(emptyNeighbours));
+                if (foxNeighbour) {
+                    fox.x = foxNeighbour.x;
+                    fox.y = foxNeighbour.y;
+                }
+                if (rabbits[fox.x][fox.y] !== null) {
+                    const rabbit = rabbits[fox.x][fox.y];
+                    fox.energy += foxGain;
+                    rabbits[fox.x][fox.y] = null;
+                }
+                fox.energy -= foxCost;
+                if (fox.energy >= foxBreed) {
+                    const breedNeighbours = neighbours.filter(neighbour => foxes[neighbour.x][neighbour.y] === null);
+                    const breedSpot = pick(breedNeighbours);
+                    if (breedSpot) {
+                        const child = Math.floor(fox.energy / 2);
+                        fox.energy -= child;
+                        const newFox = { id: idCounter, energy: child };
+                        foxes[breedSpot.x][breedSpot.y] = newFox;
+                        idCounter++;
+                    }
+                }
+                if (fox.energy <= 0) {
+                    foxes[x][y] = null;
+                }
+            }
+            tick++;
+            history.push({ tick, rabbits, foxes, grass: grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0) });
+            drawWorld();
+            drawChart();
+            drawOdeChart();
+            updateCounters();
+        }
+
+        function getNeighbours(x, y) {
+            const neighbours = [];
+            if (x > 0) neighbours.push({ x: x - 1, y });
+            if (x < 39) neighbours.push({ x: x + 1, y });
+            if (y > 0) neighbours.push({ x, y: y - 1 });
+            if (y < 29) neighbours.push({ x, y: y + 1 });
+            return neighbours;
+        }
+
+        function drawWorld() {
+            const ctx = world.getContext('2d');
+            ctx.clearRect(0, 0, world.width, world.height);
+            for (let x = 0; x < 40; x++) {
+                for (let y = 0; y < 30; y++) {
+                    const grassLevel = grass[x][y];
+                    const grassColor = `rgb(30, ${60 + Math.round(160 * grassLevel / grassMax)}, 30)`;
+                    ctx.fillStyle = grassColor;
+                    ctx.fillRect(x * 10, y * 10, 10, 10);
+                    if (rabbits[x][y] !== null) {
+                        const rabbitColor = `rgb(240, 240, 240)`;
+                        ctx.fillStyle = rabbitColor;
+                        ctx.beginPath();
+                        ctx.arc(x * 10 + 5, y * 10 + 5, 4, 0, 2 * Math.PI);
+                        ctx.fill();
+                    }
+                    if (foxes[x][y] !== null) {
+                        const foxColor = `rgb(220, 80, 20)`;
+                        ctx.fillStyle = foxColor;
+                        ctx.beginPath();
+                        ctx.arc(x * 10 + 5, y * 10 + 5, 4, 0, 2 * Math.PI);
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+
+        function drawChart() {
+            const ctx = chart.getContext('2d');
+            ctx.clearRect(0, 0, chart.width, chart.height);
+            const seriesRabbits = history.map((historyPoint, index) => ({ x: index, y: historyPoint.rabbits }));
+            const seriesFoxes = history.map((historyPoint, index) => ({ x: index, y: historyPoint.foxes }));
+            ctx.beginPath();
+            ctx.moveTo(0, chart.height - seriesRabbits[0].y);
+            for (const point of seriesRabbits) {
+                ctx.lineTo(point.x * 10, chart.height - point.y);
+            }
+            ctx.strokeStyle = 'blue';
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, chart.height - seriesFoxes[0].y);
+            for (const point of seriesFoxes) {
+                ctx.lineTo(point.x * 10, chart.height - point.y);
+            }
+            ctx.strokeStyle = 'red';
+            ctx.stroke();
+        }
+
+        function drawOdeChart() {
+            const ctx = odeChart.getContext('2d');
+            ctx.clearRect(0, 0, odeChart.width, odeChart.height);
+            const seriesX = Array.from({ length: Math.round(odeT / odeDt) + 1 }, (_, index) => ({ x: index * odeDt, y: odeX }));
+            const seriesY = Array.from({ length: Math.round(odeT / odeDt) + 1 }, (_, index) => ({ x: index * odeDt, y: odeY }));
+            ctx.beginPath();
+            ctx.moveTo(0, odeChart.height - seriesX[0].y);
+            for (const point of seriesX) {
+                ctx.lineTo(point.x * 10, odeChart.height - point.y);
+            }
+            ctx.strokeStyle = 'blue';
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(0, odeChart.height - seriesY[0].y);
+            for (const point of seriesY) {
+                ctx.lineTo(point.x * 10, odeChart.height - point.y);
+            }
+            ctx.strokeStyle = 'red';
+            ctx.stroke();
+        }
+
+        function updateCounters() {
+            tickSpan.textContent = tick;
+            rabbitsSpan.textContent = rabbits;
+            foxesSpan.textContent = foxes;
+            grassSpan.textContent = grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0);
+        }
+
+        function animate() {
+            if (playButton.classList.contains('playing')) {
+                step();
+                requestAnimationFrame(animate);
+            }
+        }
+
+        playButton.addEventListener('click', () => {
+            if (playButton.classList.contains('playing')) {
+                playButton.classList.remove('playing');
+                pauseButton.classList.remove('hidden');
+            } else {
+                playButton.classList.add('playing');
+                pauseButton.classList.add('hidden');
+                animate();
+            }
+        });
+
+        pauseButton.addEventListener('click', () => {
+            playButton.classList.remove('playing');
+            pauseButton.classList.remove('hidden');
+        });
+
+        stepButton.addEventListener('click', step);
+
+        resetButton.addEventListener('click', reset);
+
+        speedInput.addEventListener('input', () => {
+            speed = parseInt(speedInput.value);
+        });
+
+        seedInput.addEventListener('input', () => {
+            seed = parseInt(seedInput.value);
+        });
+
+        rabbits0Input.addEventListener('input', () => {
+            rabbits0 = parseInt(rabbits0Input.value);
+        });
+
+        foxes0Input.addEventListener('input', () => {
+            foxes0 = parseInt(foxes0Input.value);
+        });
+
+        rabbitBreedInput.addEventListener('input', () => {
+            rabbitBreed = parseInt(rabbitBreedInput.value);
+        });
+
+        foxBreedInput.addEventListener('input', () => {
+            foxBreed = parseInt(foxBreedInput.value);
+        });
+
+        foxGainInput.addEventListener('input', () => {
+            foxGain = parseInt(foxGainInput.value);
+        });
+
+        grassMaxInput.addEventListener('input', () => {
+            grassMax = parseInt(grassMaxInput.value);
+        });
+
+        odeAlphaInput.addEventListener('input', () => {
+            odeAlpha = parseFloat(odeAlphaInput.value);
+        });
+
+        odeBetaInput.addEventListener('input', () => {
+            odeBeta = parseFloat(odeBetaInput.value);
+        });
+
+        odeGammaInput.addEventListener('input', () => {
+            odeGamma = parseFloat(odeGammaInput.value);
+        });
+
+        odeDeltaInput.addEventListener('input', () => {
+            odeDelta = parseFloat(odeDeltaInput.value);
+        });
+
+        odeX0Input.addEventListener('input', () => {
+            odeX0 = parseFloat(odeX0Input.value);
+        });
+
+        odeY0Input.addEventListener('input', () => {
+            odeY0 = parseFloat(odeY0Input.value);
+        });
+
+        odeTInput.addEventListener('input', () => {
+            odeT = parseFloat(odeTInput.value);
+        });
+
+        odeDtInput.addEventListener('input', () => {
+            odeDt = parseFloat(odeDtInput.value);
+        });
+
+        odeRunButton.addEventListener('click', () => {
+            odeX = odeX0;
+            odeY = odeY0;
+            const odeSeriesX = Array.from({ length: Math.round(odeT / odeDt) + 1 }, (_, index) => ({ x: index * odeDt, y: odeX }));
+            const odeSeriesY = Array.from({ length: Math.round(odeT / odeDt) + 1 }, (_, index) => ({ x: index * odeDt, y: odeY }));
+            drawOdeChart();
+            odeXSpan.textContent = odeX.toFixed(8);
+            odeYSpan.textContent = odeY.toFixed(8);
+            odeEqXSpan.textContent = (odeGamma / odeDelta).toFixed(8);
+            odeEqYSpan.textContent = (odeAlpha / odeBeta).toFixed(8);
+            odeDriftSpan.textContent = Math.abs(odeX - odeX0).toFixed(8);
+        });
+
+        presetSaveButton.addEventListener('click', () => {
+            const presetName = presetNameInput.value;
+            const preset = {
+                seed,
+                speed,
+                rabbits0,
+                foxes0,
+                rabbitBreed,
+                foxBreed,
+                foxGain,
+                grassMax,
+                tick,
+                rabbits,
+                foxes,
+                grass: grass.reduce((sum, row) => sum + row.reduce((sum, cell) => sum + cell, 0), 0),
+                history,
+                odeAlpha,
+                odeBeta,
+                odeGamma,
+                odeDelta,
+                odeX0,
+                odeY0,
+                odeT,
+                odeDt,
+                odeX,
+                odeY,
+                odeEqX: odeGamma / odeDelta,
+                odeEqY: odeAlpha / odeBeta,
+                odeDrift: Math.abs(odeX - odeX0),
+            };
+            localStorage.setItem('ecolab.presets', JSON.stringify({ [presetName]: preset }));
+            const presetItem = document.createElement('div');
+            presetItem.textContent = presetName;
+            const presetLoadButton = document.createElement('button');
+            presetLoadButton.textContent = 'Load';
+            presetLoadButton.addEventListener('click', () => {
+                const presetName = presetItem.textContent;
+                const preset = JSON.parse(localStorage.getItem('ecolab.presets'))[presetName];
+                if (preset) {
+                    reset();
+                    seed = preset.seed;
+                    speed = preset.speed;
+                    rabbits0 = preset.rabbits0;
+                    foxes0 = preset.foxes0;
+                    rabbitBreed = preset.rabbitBreed;
+                    foxBreed = preset.foxBreed;
+                    foxGain = preset.foxGain;
+                    grassMax = preset.grassMax;
+                    tick = preset.tick;
+                    rabbits = preset.rabbits;
+                    foxes = preset.foxes;
+                    grass = preset.grass;
+                    history = preset.history;
+                    odeAlpha = preset.odeAlpha;
+                    odeBeta = preset.odeBeta;
+                    odeGamma = preset.odeGamma;
+                    odeDelta = preset.odeDelta;
+                    odeX0 = preset.odeX0;
+                    odeY0 = preset.odeY0;
+                    odeT = preset.odeT;
+                    odeDt = preset.odeDt;
+                    odeX = preset.odeX;
+                    odeY = preset.odeY;
+                    odeEqX = preset.odeEqX;
+                    odeEqY = preset.odeEqY;
+                    odeDrift = preset.odeDrift;
+                    drawWorld();
+                    drawChart();
+                    drawOdeChart();
+                    updateCounters();
+                }
+            });
+            presetItem.appendChild(presetLoadButton);
+            presetList.appendChild(presetItem);
+        });
+
+        reset();
+    </script>
+</body>
+</html>
