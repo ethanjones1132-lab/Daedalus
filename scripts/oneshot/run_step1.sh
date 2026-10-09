@@ -29,11 +29,19 @@ cd "$WT" || exit 1
 mkdir -p "$L" "$RUNS"
 
 if [ "$PHASE" = all ] || [ "$PHASE" = headroom ]; then
-  gpu_free
-  log "headroom start"
-  "$PY" scripts/moe-bench/headroom_iq3.py --out "$L/headroom.jsonl" --windows 16384,40960,65536,98304,131072 \
-    --variants int8,fp32 --stop-file "$L/stop" >> "$L/headroom.out" 2>&1
-  log "headroom exit $?"
+  H="$PY scripts/moe-bench/headroom_iq3.py --stop-file $L/stop"
+  # pass A (no-mmap, the handoff's mode, apps as found): speed and memory per window. 16k-65k ran first with the first
+  # Laya worker; 98k and 131k skip Laya (pass B does it with the final lean worker) and the follow-up probe.
+  gpu_free; log "headroom pass A start"
+  $H --out "$L/headroom.jsonl" --windows 16384,40960,65536,98304,131072 --variants "" --no-followup-above 65536     --tag "no-mmap, apps as found" >> "$L/headroom.out" 2>&1
+  log "headroom pass A exit $?"
+  # pass B: the final lean worker (and fp32) beside the server, no deep prompt: no-mmap at 64k and 128k, mmap at 16k-128k
+  gpu_free; log "headroom pass B1 start"
+  $H --out "$L/headroom-b1.jsonl" --windows 65536,131072 --variants int8,fp32 --laya-only --ncmoe-from "$L/headroom.jsonl"     --tag "no-mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
+  log "headroom pass B1 exit $?"
+  gpu_free; log "headroom pass B2 start"
+  $H --out "$L/headroom-b2.jsonl" --windows 16384,65536,131072 --variants int8,fp32 --laya-only --load-mode mmap     --ncmoe-from "$L/headroom.jsonl" --tag "mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
+  log "headroom pass B2 exit $?"
   touch "$L/headroom.done"
 fi
 
@@ -57,9 +65,15 @@ if [ "$PHASE" = all ] || [ "$PHASE" = roster ]; then
     if [ -e "$L/roster-$m.done" ]; then continue; fi
     gpu_free
     log "roster $m start"
-    "$PY" $S/oneshot_bench.py run --model "$m" --seeds 1-3 --runs "$RUNS" --stop-file "$L/stop" >> "$L/roster-$m.out" 2>&1
-    log "roster $m run exit $?"
-    taskkill //F //IM llama-server.exe > /dev/null 2>&1
+    for attempt in 1 2; do
+      "$PY" $S/oneshot_bench.py run --model "$m" --seeds 1-3 --runs "$RUNS" --stop-file "$L/stop" >> "$L/roster-$m.out" 2>&1
+      log "roster $m run exit $? (attempt $attempt)"
+      taskkill //F //IM llama-server.exe > /dev/null 2>&1
+      n=$(ls "$RUNS/$m"/*/response.md 2>/dev/null | wc -l)
+      [ "$n" -ge 3 ] && break
+      grep -q "no placement fits\|model file missing" "$L/roster-$m.out" && break
+      [ -e "$L/stop" ] && break
+    done
     ( "$PY" $S/oneshot_bench.py check --runs "$RUNS" --params $P --set dev --shots --only "$m" >> "$L/roster-$m.out" 2>&1
       "$PY" $S/oneshot_bench.py check --runs "$RUNS" --params $P --set dev --assembled --only "$m" >> "$L/roster-$m.out" 2>&1
       touch "$L/roster-$m.done"; echo "$(date +%H:%M:%S) roster $m checks done" >> "$L/step1-chain.log" ) &

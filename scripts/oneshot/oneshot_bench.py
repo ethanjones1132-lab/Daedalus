@@ -168,7 +168,7 @@ MODELS = {
     "lfm25-8b-a1b": dict(path=pathlib.Path(r"E:\models\gguf\LFM2.5-8B-A1B-Q4_K_M.gguf"), ncmoe=0, spec="ngram"),
     "xing4": dict(path=EM / "Xing4.0-29B-A4B-IQ3_XXS.gguf", ncmoe=22, spec="none", build="xing4"),
     "k2h": dict(path=EM / "K2-Horizon-MoVA-36B-A4B-IQ3_XXS.gguf", ncmoe=30, spec="none", build="k2h",
-                extra=["-ot", "attn_v_exps=CPU"]),
+                extra=["-ot", "attn_v_exps=CPU", "--load-mode", "none"]),  # none: no mmap (output-neutral, less RAM)
 }
 # Step 1 item 4 (2026-10-09, owner): the dense models on disk, one pick each. The fit lowers -ngl (start 99) instead of
 # raising --n-cpu-moe. spec: mtp where the GGUF carries an MTP head, else ngram; a failed load that is not out of memory

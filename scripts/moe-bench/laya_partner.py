@@ -11,8 +11,10 @@ never on tier2b or the judge set. Inputs longer than the English checkpoint's 51
   label   every wording and form in batch: a card per task in TIER2B_DIR and P(correct) per stored candidate
           (rows of type "trial" from playbook_tier2b.py nested, or "cand" from bestofn_tier2b.py). Resumable.
 
-LAYA_INT8=1 (lean Laya, 2026-10-09): each checkpoint is streamed into dynamic int8 on the encoder's nn.Linear layers,
-one tensor at a time, so the fp32 encoder is never held; the worker also answers {"op": "mem"}. Nothing else changes.
+LAYA_INT8=1 (lean Laya, 2026-10-09): each checkpoint is streamed into weight-only int8 (per output channel) on the
+encoder's nn.Linear layers, one tensor at a time, so the fp32 encoder is never held; activations and the matmul stay
+fp32. (Dynamic int8, which also quantizes activations, moved the answers too far: hidden-code AUC 1.00 -> 0.72.)
+The worker also answers {"op": "mem"}. Nothing else changes.
 
 usage: laya_partner.py worker [--calib CALIB.json]
        laya_partner.py label --runs RUNS.jsonl --out LABELS.jsonl      (TIER2B_DIR = the runs' task set)
@@ -145,13 +147,41 @@ def _lean_verify(model, cfg, weights, model_id):
         raise ValueError(f"Model weights do not match the architecture for {model_id!r}: {bad[:3]}")
 
 
+def _w8_class():
+    """nn.Linear with the weight kept as per-output-channel int8 (built lazily: torch is only in Laya's venv)."""
+    import torch
+    nn, F = torch.nn, torch.nn.functional
+
+    class W8Linear(nn.Module):
+        buf = None  # one fp32 scratch for the dequantized weight, shared by every layer (the worker is single-threaded)
+
+        def __init__(self, weight, bias=None):
+            super().__init__()
+            scale = weight.abs().amax(dim=1).clamp_min(1e-8) / 127.0
+            self.register_buffer("q", torch.round(weight / scale[:, None]).clamp_(-127, 127).to(torch.int8))
+            self.register_buffer("scale", scale.float())
+            self.bias = None if bias is None else nn.Parameter(bias.clone(), requires_grad=False)
+            self.in_features, self.out_features = weight.shape[1], weight.shape[0]
+
+        def forward(self, x):
+            n = self.q.numel()
+            if W8Linear.buf is None or W8Linear.buf.numel() < n:
+                W8Linear.buf = torch.empty(n)
+            w = W8Linear.buf[:n].view_as(self.q)
+            w.copy_(self.q)
+            y = F.linear(x, w).mul_(self.scale)  # scale after the matmul: the same result, one less pass over w
+            return y if self.bias is None else y.add_(self.bias)
+
+    return W8Linear
+
+
 def _stream_load(model, weights):
-    """DecisionModel.load_state_dict(strict=True) that never holds the fp32 encoder: every encoder nn.Linear is
-    read, quantized to dynamic int8 and swapped in one at a time; everything else is copied as usual. The two-layer
-    decision head stays fp32 (torch's TransformerEncoderLayer reads linear1.weight as a tensor; it is ~25M of the
-    421M parameters)."""
+    """DecisionModel.load_state_dict(strict=True) that never holds the fp32 encoder: the skeleton is on the meta device,
+    every encoder nn.Linear is read and replaced by a W8Linear one at a time, and every other tensor (embeddings,
+    norms, the fp32 two-layer decision head, ~25M of the 421M parameters) is assigned from the checkpoint."""
     import torch
     nn = torch.nn
+    W8Linear = _w8_class()
     linears = {f"encoder.{n}": m for n, m in model.encoder.named_modules() if isinstance(m, nn.Linear)}
     handled = {f"{n}.{t}" for n in linears for t in ("weight", "bias")}
     state = model.state_dict()
@@ -159,21 +189,36 @@ def _stream_load(model, weights):
     missing = set(state) - set(weights.keys())
     if unexpected or missing:
         raise RuntimeError(f"strict load failed: unexpected {sorted(unexpected)[:3]}, missing {sorted(missing)[:3]}")
-    for k, v in state.items():
-        if k not in handled:
-            v.copy_(weights[k])
+    for k in state:
+        if k in handled:
+            continue
+        owner, _, leaf = k.rpartition(".")
+        mod = model.get_submodule(owner) if owner else model
+        t = weights[k]
+        t = t.float() if t.is_floating_point() else t  # the checkpoint stores some tensors as fp16; copy_ used to cast
+        if leaf in mod._parameters:
+            mod._parameters[leaf] = nn.Parameter(t, requires_grad=False)
+        else:
+            mod._buffers[leaf] = t
     for full, mod in linears.items():
         name = full[len("encoder."):]
-        mod.weight = nn.Parameter(weights[f"{full}.weight"], requires_grad=False)
-        if mod.bias is not None:
-            mod.bias = nn.Parameter(weights[f"{full}.bias"], requires_grad=False)
-        holder = torch.ao.quantization.quantize_dynamic(nn.Sequential(mod), {nn.Linear}, dtype=torch.qint8)
+        bias = weights[f"{full}.bias"].float() if mod.bias is not None else None
         parent, _, leaf = name.rpartition(".")
-        setattr(model.encoder.get_submodule(parent) if parent else model.encoder, leaf, holder[0])
-        del mod, holder
+        setattr(model.encoder.get_submodule(parent) if parent else model.encoder, leaf,
+                W8Linear(weights[f"{full}.weight"].float(), bias))
     del state
     trim_memory()
     return torch.nn.modules.module._IncompatibleKeys([], [])
+
+
+def _rebuild_meta_buffers(model):
+    """Modules of the encoder that hold non-persistent buffers (ModernBERT's RoPE tables) were built on the meta
+    device and are in no checkpoint: build them again on the CPU from their own config."""
+    for name, mod in list(model.encoder.named_modules()):
+        if name and any(b is not None and b.is_meta for b in mod._buffers.values()):
+            real = type(mod)(mod.config)
+            parent, _, leaf = name.rpartition(".")
+            setattr(model.encoder.get_submodule(parent) if parent else model.encoder, leaf, real)
 
 
 def install_lean_loader():
@@ -183,7 +228,10 @@ def install_lean_loader():
     build = la.build_model
 
     def lean_build(*args, **kw):
-        model = build(*args, **kw)
+        import torch
+        with torch.device("meta"):  # no fp32 skeleton: it would be ~1.7 GB of commit, and commit is what ran out
+            model = build(*args, **kw)
+        _rebuild_meta_buffers(model)
         model.load_state_dict = lambda weights, strict=True: _stream_load(model, weights)
         return model
     la.build_model, la._verify_compatibility, st.load_file = lean_build, _lean_verify, LazyWeights

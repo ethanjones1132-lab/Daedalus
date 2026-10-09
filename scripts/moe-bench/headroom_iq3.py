@@ -18,7 +18,8 @@ Pass rule (stated in the results doc, the owner may adjust). A window passes, fo
 The 'none' variant is the first three lines only.
 
 usage (from the repo root): headroom_iq3.py --out OUT.jsonl [--windows 16384,40960,65536,98304,131072]
-                                            [--variants int8,fp32] [--stop-file F]
+                                            [--variants int8,fp32] [--stop-file F] [--load-mode none|mmap] [--tag T]
+                                            [--no-followup-above N] [--laya-only] [--ncmoe-from HEADROOM.jsonl]
 """
 import argparse
 import json
@@ -29,6 +30,7 @@ import sys
 import threading
 import time
 
+os.environ.setdefault("TIER2B_DIR", "docs/benchmarks/laya-calib")  # before bestofn_tier2b loads its task set
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "oneshot"))
@@ -41,7 +43,8 @@ MODEL = "qwen36full-iq3xxs"
 VRAM_TOTAL = 8188
 MAX_DEEP = 108000  # the stdlib text in speed_pair runs out near here
 MIN_GEN_TPS, MIN_RAM_MB, FALLBACK_RAM_MB, MAX_P95_S, N_LAYA = 25.0, 2048, 1024, 5.0, 20
-HARD_RAM_FLOOR_MB = 600  # below this a Laya launch could page the server: skip it and record why
+HARD_RAM_FLOOR_MB = 250  # below this a launch is skipped and recorded; above it Laya is launched even when the
+# pass rule will fail, because what happens then (paging, timeouts, server speed) is the measurement (2026-10-09)
 
 
 def deep_tokens(window):
@@ -57,11 +60,12 @@ def window_verdict(row):
     if not short or statistics.mean(short) < MIN_GEN_TPS:
         base_ok.append(f"short generation {statistics.mean(short) if short else None} tok/s < {MIN_GEN_TPS}")
     deep = row.get("deep") or {}
-    if not deep.get("gen_tps") or deep["gen_tps"] < MIN_GEN_TPS:
-        base_ok.append(f"deep generation {deep.get('gen_tps')} tok/s < {MIN_GEN_TPS}")
     fu = row.get("followup") or {}
-    if "error" in fu or not fu or "error" in deep:
-        base_ok.append("deep prompt or follow-up did not complete")
+    if "skipped" not in deep:
+        if not deep.get("gen_tps") or deep["gen_tps"] < MIN_GEN_TPS:
+            base_ok.append(f"deep generation {deep.get('gen_tps')} tok/s < {MIN_GEN_TPS}")
+        if "error" in fu or not fu or "error" in deep:
+            base_ok.append("deep prompt or follow-up did not complete")
     out = {"none": {"pass": not base_ok, "tier": "base", "reasons": list(base_ok)}}
     for variant, lay in (row.get("laya") or {}).items():
         reasons = list(base_ok)
@@ -103,6 +107,12 @@ def laya_phase(variant, client_cls, msgs, server_prompt, avail_mb):
         return rec
     time.sleep(10)
     rec["ram_after_10s_mb"] = avail_mb()
+    # a state longer than 512 tokens makes the worker load the second checkpoint (typed-decisions): its worst-case size
+    first_verify = next(m for m in msgs if m["op"] == "verify")
+    primer_rep, rec["primer_s"] = client.call(dict(first_verify, code=(first_verify["code"] + "\n\n") * 3))
+    rec["primer_ckpt"] = (primer_rep or {}).get("ckpt")
+    rec["worker_mem_both_checkpoints"] = client.call({"op": "mem"})[0] if not client.dead else None
+    rec["ram_with_both_mb"] = avail_mb()
     gen = {}
 
     def generate():
@@ -136,10 +146,10 @@ def measure(window, ncmoe, a, laya_msgs):
     """One server load at `ncmoe`: returns (row, proc-less). row['refit'] asks for a larger ncmoe."""
     import playbook_tier2b as pt
     ob.CTX = window
-    args = ob.llama_args(MODEL, ncmoe) + ["--load-mode", "none"]
+    args = ob.llama_args(MODEL, ncmoe) + (["--load-mode", "none"] if a.load_mode == "none" else [])
     log = open(pathlib.Path(a.out).parent / f"headroom-{window}-ncmoe{ncmoe}.log", "w",
                encoding="utf-8", errors="replace")
-    row = {"window": window, "ncmoe": ncmoe, "t_start": time.strftime("%H:%M:%S"), "args": [
+    row = {"window": window, "ncmoe": ncmoe, "load_mode": a.load_mode, "tag": a.tag, "t_start": time.strftime("%H:%M:%S"), "args": [
         x for x in args[args.index("--host") + 2:] if not str(x).endswith(".gguf")],
         "vram_base_mib": moe_sweep.vram_used_mib(), "ram_before_launch_mb": pt.available_mb()}
     base_shared = moe_sweep.gpu_shared_mib()
@@ -173,14 +183,22 @@ def measure(window, ncmoe, a, laya_msgs):
         peak = max(peak, moe_sweep.vram_used_mib())
         name, content, _ = speed_pair.deep_prompt(deep_tokens(window))
         row["deep_name"] = name
-        try:
-            fu = moe_sweep.followup_probe(content)
-            row["followup"] = fu
-            first = fu["first"]
-            row["deep"] = {"prompt_n": first["prompt_n"], "prompt_tps": first["prompt_tps"],
-                           "gen_tps": first["gen_tps"], "gen_n": first["gen_n"], "wall_s": first["wall_s"]}
-        except Exception as e:
-            row["deep"] = {"error": f"{type(e).__name__}: {e}"[:300]}
+        if a.laya_only:  # the mmap pass: RAM state after a cold and a warm read is what Laya meets; no deep prompt
+            row["deep"], row["followup"] = {"skipped": "laya-only"}, {"skipped": "laya-only"}
+        else:
+            try:
+                if window > a.no_followup_above:  # reading 83-108k tokens takes 14-25 min: once, no follow-up
+                    first = moe_sweep.chat_once([{"role": "user", "content": content}], 300, False)
+                    first.pop("text")
+                    row["followup"] = {"skipped": f"window above {a.no_followup_above}", "first": first}
+                else:
+                    fu = moe_sweep.followup_probe(content)
+                    row["followup"] = fu
+                    first = fu["first"]
+                row["deep"] = {"prompt_n": first["prompt_n"], "prompt_tps": first["prompt_tps"],
+                               "gen_tps": first["gen_tps"], "gen_n": first["gen_n"], "wall_s": first["wall_s"]}
+            except Exception as e:
+                row["deep"] = {"error": f"{type(e).__name__}: {e}"[:300]}
         peak = max(peak, moe_sweep.vram_used_mib())
         row.update(vram_peak_mib=peak, vram_margin_mib=VRAM_TOTAL - peak,
                    shared_spill_mib=moe_sweep.gpu_shared_mib() - base_shared if base_shared >= 0 else None,
@@ -210,11 +228,15 @@ def main():
     ap.add_argument("--variants", default="int8,fp32")
     ap.add_argument("--ncmoe", type=int, default=26)
     ap.add_argument("--stop-file", default="")
+    ap.add_argument("--ncmoe-from", default="", help="a headroom.jsonl: start each window at its fitted ncmoe there")
+    ap.add_argument("--no-followup-above", type=int, default=10 ** 9, help="no follow-up probe for larger windows")
+    ap.add_argument("--laya-only", action="store_true", help="cold + warm read and short generations, no deep prompt")
+    ap.add_argument("--load-mode", default="none", choices=["none", "mmap"], help="mmap = llama-server's default")
+    ap.add_argument("--tag", default="", help="free text recorded in every row, e.g. the apps that were closed")
     a = ap.parse_args()
     a.variants = [v for v in a.variants.split(",") if v]
     out = pathlib.Path(a.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("TIER2B_DIR", "docs/benchmarks/laya-calib")
     import laya_lean_eval
     laya_msgs = laya_lean_eval.make_msgs("docs/benchmarks/laya3/laya3-calib-nested.jsonl", N_LAYA)
     done = {}
@@ -224,7 +246,14 @@ def main():
             if r.get("final"):
                 done[r["window"]] = r
     ncmoe = a.ncmoe
+    fitted = {}
+    if a.ncmoe_from and pathlib.Path(a.ncmoe_from).exists():
+        for line in pathlib.Path(a.ncmoe_from).read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if r.get("final") and r.get("fit_ok"):
+                fitted[r["window"]] = r["ncmoe"]
     for window in (int(w) for w in a.windows.split(",")):
+        ncmoe = max(ncmoe, fitted.get(window, 0))
         if a.stop_file and pathlib.Path(a.stop_file).exists():
             print("stop file found", flush=True)
             return

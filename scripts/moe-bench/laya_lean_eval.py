@@ -55,6 +55,8 @@ def bench(a):
     msgs = make_msgs(a.nested, a.calls)
     out = {}
     for variant, env in (("fp32", "0"), ("int8", "1")):
+        if variant not in a.variants.split(","):
+            continue
         os.environ["LAYA_INT8"] = env
         ram0 = pt.available_mb()
         t0 = time.time()
@@ -148,6 +150,7 @@ def main():
     b.add_argument("--calib", default="docs/benchmarks/laya3/calib.json")
     b.add_argument("--nested", default="docs/benchmarks/laya3/laya3-calib-nested.jsonl")
     b.add_argument("--calls", type=int, default=30)
+    b.add_argument("--variants", default="fp32,int8")
     b.add_argument("--out", required=True)
     c = sub.add_parser("accept")
     for n in ("fp32", "lean", "trials", "calib", "rule", "out"):

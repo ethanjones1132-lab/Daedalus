@@ -1,8 +1,10 @@
+import os
 import pathlib
 import sys
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
+os.environ.setdefault("TIER2B_DIR", str(HERE.parents[1] / "docs" / "benchmarks" / "laya-calib"))
 sys.path.insert(0, str(HERE))
 import headroom_iq3 as h  # noqa: E402
 
