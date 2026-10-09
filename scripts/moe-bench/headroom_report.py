@@ -25,13 +25,22 @@ def depth_gen(r):
     return round(statistics.mean(v), 1) if v else None
 
 
+def gen_pair(r):
+    """Short prompts run as [gen, edit, gen, edit]: fresh code (the speed that matters) and an edit that re-emits
+    code from the prompt (n-gram speculation makes it 2x faster)."""
+    v = r.get("short_gen_tps") or []
+    if len(v) < 4:
+        return "—"
+    return f"{statistics.mean(v[0::2]):.0f} / {statistics.mean(v[1::2]):.0f}"
+
+
 def fmt(x, nd=1):
     return "—" if x is None else (f"{x:.{nd}f}" if isinstance(x, float) else str(x))
 
 
 def tables(rows):
     out = ["| Window | ncmoe | Load s | VRAM loaded / peak / margin (MiB) | Spill (MiB) | Cold / warm read (tok/s) | "
-           "Short gen (tok/s) | Deep read (tok/s) | Deep gen (tok/s) | Follow-up turn re-read (tokens) | "
+           "Gen: fresh code / copy-heavy edit (tok/s) | Deep read (tok/s) | Deep gen (tok/s) | Follow-up turn re-read (tokens) | "
            "RAM free before launch / after warm / after deep (MB) |", "|" + "---|" * 11]
     for r in rows:
         fu = r.get("followup") or {}
@@ -40,7 +49,7 @@ def tables(rows):
                        w=r["window"], nc=r["ncmoe"], ls=fmt(r.get("load_s")), vl=r.get("vram_used_loaded_mib"),
                        vp=r.get("vram_peak_mib"), vm=r.get("vram_margin_mib"), sp=r.get("shared_spill_mib"),
                        cold=fmt((r.get("cold") or {}).get("prompt_tps")), warm=fmt((r.get("warm") or {}).get("prompt_tps")),
-                       sg=fmt(statistics.mean(r["short_gen_tps"]) if r.get("short_gen_tps") else None),
+                       sg=gen_pair(r),
                        dr=fmt((r.get("deep") or {}).get("prompt_tps")), dg=fmt(depth_gen(r)),
                        nt=(fu.get("next_turn") or {}).get("prompt_n"), r0=r.get("ram_before_launch_mb"),
                        r1=r.get("ram_after_warm_mb"), r2=r.get("ram_after_deep_mb")))

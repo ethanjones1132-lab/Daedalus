@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Step 1 chain (2026-10-09): headroom test, K2-Horizon's two builds, then the dense roster on the Ecosystem Lab.
 # Phases are resumable and skip finished work. Triggers are marker files, never log text. The Versutus gate is restored
-# on exit, however the chain ends. usage: run_step1.sh [headroom|k2|roster|all]   (default all)
+# on exit, however the chain ends. usage: [SKIP_HEADROOM=1] [SKIP_K2=1] run_step1.sh [headroom|k2|roster|all]   (default all)
 set -u
 PY=/c/qwen3-forge-stage/venv/Scripts/python.exe
 WT=/c/Projects/home-base-recovered/.claude/worktrees/micro-agent-swarm-design-929d42
@@ -28,24 +28,27 @@ if [ "$PHASE" = all ]; then trap 'restore_gate' EXIT; fi
 cd "$WT" || exit 1
 mkdir -p "$L" "$RUNS"
 
-if [ "$PHASE" = all ] || [ "$PHASE" = headroom ]; then
+if { [ "$PHASE" = all ] || [ "$PHASE" = headroom ]; } && [ -z "${SKIP_HEADROOM:-}" ]; then
   H="$PY scripts/moe-bench/headroom_iq3.py --stop-file $L/stop"
+  headroom_running() { powershell -NoProfile -Command "(Get-CimInstance Win32_Process | Where-Object { \$_.Name -match 'python' -and \$_.CommandLine -match 'headroom_iq3' } | Measure-Object).Count" | tr -d ''; }
+  while [ "$(headroom_running)" != "0" ]; do sleep 30; done
   # pass A (no-mmap, the handoff's mode, apps as found): speed and memory per window. 16k-65k ran first with the first
-  # Laya worker; 98k and 131k skip Laya (pass B does it with the final lean worker) and the follow-up probe.
+  # Laya worker; 98k and 131k skip Laya and the follow-up probe.
   gpu_free; log "headroom pass A start"
   $H --out "$L/headroom.jsonl" --windows 16384,40960,65536,98304,131072 --variants "" --no-followup-above 65536     --tag "no-mmap, apps as found" >> "$L/headroom.out" 2>&1
   log "headroom pass A exit $?"
-  # pass B: the final lean worker (and fp32) beside the server, no deep prompt: no-mmap at 64k and 128k, mmap at 16k-128k
+  # pass B: the final lean worker (and fp32) beside the server after a deep prompt, no follow-up: 16k and 64k, in no-mmap
+  # and in mmap mode (the file-backed CPU experts can be dropped under pressure)
   gpu_free; log "headroom pass B1 start"
-  $H --out "$L/headroom-b1.jsonl" --windows 65536,131072 --variants int8,fp32 --laya-only --ncmoe-from "$L/headroom.jsonl"     --tag "no-mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
+  $H --out "$L/headroom-b1.jsonl" --windows 16384,65536 --variants int8,fp32 --no-followup-above 0 --ncmoe-from "$L/headroom.jsonl"     --tag "no-mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
   log "headroom pass B1 exit $?"
   gpu_free; log "headroom pass B2 start"
-  $H --out "$L/headroom-b2.jsonl" --windows 16384,65536,131072 --variants int8,fp32 --laya-only --load-mode mmap     --ncmoe-from "$L/headroom.jsonl" --tag "mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
+  $H --out "$L/headroom-b2.jsonl" --windows 16384,65536 --variants int8,fp32 --no-followup-above 0 --load-mode mmap     --ncmoe-from "$L/headroom.jsonl" --tag "mmap, lean loader v2" >> "$L/headroom-b.out" 2>&1
   log "headroom pass B2 exit $?"
   touch "$L/headroom.done"
 fi
 
-if [ "$PHASE" = all ] || [ "$PHASE" = k2 ]; then
+if { [ "$PHASE" = all ] || [ "$PHASE" = k2 ]; } && [ -z "${SKIP_K2:-}" ]; then
   gpu_free
   log "k2h start (RAM available $("$PY" -c "import sys; sys.path.insert(0, 'scripts/moe-bench'); import moe_sweep; print(moe_sweep.ram_avail_gb())") GB)"
   "$PY" $S/oneshot_bench.py run --model k2h --seeds 1-2 --runs "$RUNS" --stop-file "$L/stop" >> "$L/k2h.out" 2>&1
