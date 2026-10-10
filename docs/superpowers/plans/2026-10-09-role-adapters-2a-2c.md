@@ -441,6 +441,7 @@ import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import edits  # noqa: E402
 import samples  # noqa: E402
 
 FENCE = "`" * 3
@@ -471,7 +472,10 @@ class SamplesTest(unittest.TestCase):
         user = s["messages"][1]["content"]
         self.assertIn("return a - b", user)
         self.assertIn("AssertionError", user)
-        self.assertEqual(s["messages"][2]["content"], GOOD)
+        self.assertIn("Reply with edit blocks only", user)
+        fixed, err = edits.apply_edits({"calc.py": "def add(a, b):\n    return a - b\n"}, s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, {"calc.py": "def add(a, b):\n    return a + b\n"})
 
     def test_fault_sample_target_is_the_original_rendered(self):
         fault = {"sid": "python|k|data analysis|5", "split": "train", "lang": "python", "request": "R", "entry": "calc.py",
@@ -480,8 +484,9 @@ class SamplesTest(unittest.TestCase):
         s = samples.fault_sample(fault)
         self.assertEqual(s["role"], "fix")
         self.assertEqual(s["source"], "fault")
-        self.assertIn("# file: calc.py", s["messages"][2]["content"])
-        self.assertIn("return a + b", s["messages"][2]["content"])
+        fixed, err = edits.apply_edits(fault["files_bad"], s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, fault["files_ok"])
         self.assertIn("return a - b", s["messages"][1]["content"])
 
     def test_render_files_markers(self):
@@ -518,6 +523,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 for p in (HERE, HERE.parent / "teacher", HERE.parent / "moe-bench"):
     sys.path.insert(0, str(p))
 import compare_tasks as ct  # noqa: E402
+import edits  # noqa: E402
 import splits  # noqa: E402
 import teacher_gen as tg  # noqa: E402
 
@@ -525,6 +531,29 @@ FENCE = "`" * 3
 MARK = {"python": "# file: {}", "node": "// file: {}", "web": "<!-- file: {} -->"}
 FENCE_LANG = {"python": "python", "node": "javascript", "web": "html"}
 FAILED = "The acceptance tests failed:\n"
+FIX_EDIT_PROMPT = """You implemented this request:
+
+{request}
+
+Your files:
+
+{files}
+
+Running acceptance checks against them gave these failures:
+
+{failures}
+
+Fix the implementation with the smallest edits that work. Reply with edit blocks only, no prose. Each block names a file
+and replaces text that occurs exactly once in that file:
+
+FILE: <path>
+<<<<<<< SEARCH
+<lines copied exactly from the file, with enough surrounding lines to be unique>
+=======
+<the replacement lines>
+>>>>>>> REPLACE
+
+Use as many blocks as needed. Do not rewrite whole files."""
 
 
 def sid_of(rec):
@@ -573,16 +602,22 @@ def from_runs(runs):
                             r["build"], sid, split, lang, "teacher"))
         elif r.get("fix_ok") and r.get("fix"):
             files = tg.extract_files(r["build"], r["entry"])
-            if files:
-                user = ct.FIX_PROMPT.format(request=r["request"], files=show_files(files),
-                                            failures=FAILED + r.get("build_out", ""))
-                out.append(make("fix", user, r["fix"], sid, split, lang, "teacher-fix"))
+            fixed = tg.extract_files(r["fix"], r["entry"])
+            reply = edits.make_edits(files, fixed) if files and fixed else None
+            if reply:
+                user = FIX_EDIT_PROMPT.format(request=r["request"], files=show_files(files),
+                                              failures=FAILED + r.get("build_out", ""))
+                out.append(make("fix", user, reply, sid, split, lang, "teacher-fix"))
     return out
 
 
 def fault_sample(f):
-    user = ct.FIX_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
-    return make("fix", user, render_files(f["files_ok"], f["lang"]), f["sid"], f["split"], f["lang"], "fault")
+    """The fix sample of a teacher-authored fault, or None when no unambiguous edit turns the faulty files into the original."""
+    reply = edits.make_edits(f["files_bad"], f["files_ok"])
+    if not reply:
+        return None
+    user = FIX_EDIT_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
+    return make("fix", user, reply, f["sid"], f["split"], f["lang"], "fault")
 
 
 def read_jsonl(path):
@@ -592,7 +627,7 @@ def read_jsonl(path):
 def build_datasets(runs_path, faults_path, out_dir):
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    rows = from_runs(read_jsonl(runs_path)) + [fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")]
+    rows = from_runs(read_jsonl(runs_path)) + [x for x in (fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")) if x]
     by = collections.defaultdict(list)
     for s in rows:
         by[(s["role"], s["split"])].append(s)
@@ -632,6 +667,375 @@ Expected: `OK` (5 tests).
 ```bash
 git add scripts/roles/samples.py scripts/roles/test_samples.py
 git commit -m "feat(roles): role samples and dataset files"
+```
+
+---
+
+### Task 4b: the fix role speaks in edits (added after the sequence-length measurements)
+
+**Why:** a QLoRA step on the 4B holds up to 6,144 tokens (504 tok/s, 6.4 GB) and falls off a cliff at 7,168 (116 tok/s) and 8,192 (60 tok/s), because activation memory grows about 0.5 MB per token and the card has 8 GB. The teacher's builds are 4k to 6k tokens (median 5.4k) and fit (72% at 6,144). The teacher's fixes do not: the failing files appear in the prompt and again in the reply (median 8.8k tokens, 2 of 14 under 6,144). So the fix role replies with **SEARCH/REPLACE edit blocks**, converted deterministically from (failing files, fixed files) with no API call, which also matches the project's line-edit direction. The full-file fix prompt stays as the baseline prompt: the base model is scored on both formats and the adapter must beat the better one.
+
+**Files:** Create `scripts/roles/edits.py`; Test `scripts/roles/test_edits.py`; Modify `scripts/roles/samples.py`, `scripts/roles/test_samples.py`, `scripts/roles/eval_roles.py` (blocks below).
+
+- [ ] **Step 1: extract the test and watch it fail**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/test_edits.py && cd scripts/roles && $PY -m unittest test_edits`
+Expected: FAIL, `ModuleNotFoundError: No module named 'edits'`.
+
+```python file=scripts/roles/test_edits.py
+import pathlib
+import random
+import sys
+import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import edits  # noqa: E402
+
+OLD = {"calc.py": "def add(a, b):\n    return a - b\n\n\ndef mul(a, b):\n    return a * b\n"}
+NEW = {"calc.py": "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"}
+
+
+class EditsTest(unittest.TestCase):
+    def test_one_changed_line_round_trips(self):
+        text = edits.make_edits(OLD, NEW)
+        self.assertIn("FILE: calc.py", text)
+        self.assertIn("return a - b", text)
+        out, err = edits.apply_edits(OLD, text)
+        self.assertIsNone(err)
+        self.assertEqual(out, NEW)
+
+    def test_new_file_and_untouched_file(self):
+        old = {"a.py": "x = 1\n", "b.py": "y = 2\n"}
+        new = {"a.py": "x = 1\n", "b.py": "y = 3\n", "c.py": "z = 4\n"}
+        out, err = edits.apply_edits(old, edits.make_edits(old, new))
+        self.assertIsNone(err)
+        self.assertEqual(out, new)
+
+    def test_repeated_lines_get_enough_context(self):
+        old = {"f.py": "a = 1\nb = 2\n" * 5 + "c = 3\n" + "a = 1\nb = 2\n" * 5}
+        new = {"f.py": "a = 1\nb = 2\n" * 5 + "c = 4\n" + "a = 1\nb = 2\n" * 5}
+        out, err = edits.apply_edits(old, edits.make_edits(old, new))
+        self.assertIsNone(err)
+        self.assertEqual(out, new)
+
+    def test_random_edits_round_trip(self):
+        rng = random.Random(7)
+        vocab = ["    x = 0\n", "    x += 1\n", "    return x\n", "\n", "    if x:\n", "        pass\n", "    y = [x]\n"]
+        made = 0
+        for _ in range(200):
+            old = [rng.choice(vocab) for _ in range(rng.randint(8, 60))]
+            new = list(old)
+            for _ in range(rng.randint(1, 4)):
+                k, op = rng.randrange(len(new)), rng.choice(["replace", "insert", "delete"])
+                if op == "replace":
+                    new[k] = rng.choice(vocab) + "#\n"
+                elif op == "insert":
+                    new.insert(k, rng.choice(vocab))
+                elif len(new) > 3:
+                    del new[k]
+            o, n = {"m.py": "".join(old)}, {"m.py": "".join(new)}
+            if o == n:
+                continue
+            text = edits.make_edits(o, n)
+            if text is None:
+                continue
+            made += 1
+            out, err = edits.apply_edits(o, text)
+            self.assertIsNone(err)
+            self.assertEqual(out, n)
+        self.assertGreater(made, 150)
+
+    def test_apply_refuses_a_missing_or_ambiguous_search(self):
+        files = {"f.py": "a = 1\na = 1\nb = 2\n"}
+        block = "FILE: f.py\n<<<<<<< SEARCH\n{}=======\n{}>>>>>>> REPLACE\n"
+        out, err = edits.apply_edits(files, block.format("a = 1\n", "a = 9\n"))
+        self.assertIn("2 times", err)
+        out, err = edits.apply_edits(files, block.format("zzz\n", "a = 9\n"))
+        self.assertIn("0 times", err)
+        self.assertEqual(out, files)
+        self.assertIsNotNone(edits.apply_edits(files, "no blocks here")[1])
+
+    def test_a_marker_line_in_the_code_makes_the_conversion_decline(self):
+        old = {"f.py": "x = 1\n"}
+        new = {"f.py": "x = 1\n=======\n"}
+        self.assertIsNone(edits.make_edits(old, new))
+
+    def test_unchanged_files_give_no_edits(self):
+        self.assertIsNone(edits.make_edits(OLD, dict(OLD)))
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: write the module**
+
+```python file=scripts/roles/edits.py
+"""SEARCH/REPLACE edit blocks for the fix role (design change 2026-10-09: the teacher's full-file fixes are 8.8k tokens
+at the median and do not fit a QLoRA step on 8 GB). make_edits turns (failing files, fixed files) into blocks, verified by
+applying them; apply_edits applies a reply's blocks and refuses any SEARCH that does not match exactly once.
+
+Block format (payload lines keep their newlines; a new file has an empty SEARCH):
+FILE: <path>
+<<<<<<< SEARCH
+<lines copied from the file>
+=======
+<replacement lines>
+>>>>>>> REPLACE"""
+import difflib
+import re
+
+OPEN, MID, CLOSE = "<<<<<<< SEARCH", "=======", ">>>>>>> REPLACE"
+BLOCK = re.compile(r"^FILE: (\S+)\n<<<<<<< SEARCH\n(.*?)^=======\n(.*?)^>>>>>>> REPLACE$", re.S | re.M)
+MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
+
+
+def _nl(text):
+    return text if not text or text.endswith("\n") else text + "\n"
+
+
+def _block(path, search, replace):
+    return f"FILE: {path}\n{OPEN}\n{search}{MID}\n{replace}{CLOSE}\n"
+
+
+def _hunks(old, new, ctx):
+    a, b = old.splitlines(keepends=True), new.splitlines(keepends=True)
+    ops = [op for op in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if op[0] != "equal"]
+    groups = []
+    for op in ops:
+        if groups and op[1] - groups[-1][-1][2] <= 2 * ctx:
+            groups[-1].append(op)
+        else:
+            groups.append([op])
+    out = []
+    for g in groups:
+        i1, i2, j1, j2 = g[0][1], g[-1][2], g[0][3], g[-1][4]
+        lo, hi = max(0, i1 - ctx), min(len(a), i2 + ctx)
+        out.append(("".join(a[lo:hi]), "".join(b[j1 - (i1 - lo):j2 + (hi - i2)])))
+    return out
+
+
+def apply_edits(files, reply):
+    """(new files, None) or (the unchanged files, a reason). Every SEARCH must match exactly once in its file."""
+    blocks = BLOCK.findall(reply)
+    if not blocks:
+        return files, "no edit blocks"
+    out = dict(files)
+    for path, search, replace in blocks:
+        text = out.get(path)
+        if text is None:
+            if search:
+                return files, f"{path}: unknown file"
+            out[path] = replace
+            continue
+        if not search:
+            return files, f"{path}: empty SEARCH for an existing file"
+        n = text.count(search)
+        if n != 1:
+            return files, f"{path}: SEARCH matches {n} times"
+        out[path] = text.replace(search, replace, 1)
+    return out, None
+
+
+def make_edits(old, new, max_ctx=16):
+    """Edit blocks that turn `old` into `new` (dicts path -> text), or None if the files are unchanged, a file was removed,
+    an old file is empty, a payload line looks like a marker, or no amount of context makes the blocks unambiguous."""
+    if any(p not in new for p in old) or any(not t for t in old.values()):
+        return None
+    want = {p: _nl(t) for p, t in new.items()}
+    base = {p: _nl(t) for p, t in old.items()}
+    ctx = 2
+    while ctx <= max_ctx:
+        pairs = []
+        for path, text in want.items():
+            if path not in base:
+                pairs.append((path, "", text))
+            elif base[path] != text:
+                pairs += [(path, s, r) for s, r in _hunks(base[path], text, ctx)]
+        if not pairs:
+            return None
+        if any(ln.startswith(MARKERS) for _, s, r in pairs for ln in (s + r).splitlines()):
+            return None
+        out = "".join(_block(*x) for x in pairs)
+        done, err = apply_edits(base, out)
+        if err is None and done == want:
+            return out
+        ctx *= 2
+    return None
+```
+
+- [ ] **Step 3: run the tests**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/edits.py && cd scripts/roles && $PY -m unittest test_edits -v`
+Expected: `OK` (7 tests).
+
+- [ ] **Step 4: switch the fix samples to edits (patch `samples.py`, its test, and `eval_roles.py` in the plan, then re-extract)**
+
+Save the block below as `patch_edits.py` in the scratchpad, run it from the repo root (it edits this plan's file blocks), then re-extract the three files and run the three test files.
+
+```python
+# run once from the repo root
+import pathlib
+
+import re
+
+p = pathlib.Path("docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md")
+s = p.read_text(encoding="utf-8")
+FILE_BLOCK = re.compile(r"(```python file=\S+\n)(.*?)(\n```)", re.S)
+
+
+def swap(old, new):
+    """Replace `old` in the one file block of the plan that contains it (not in this patch's own text)."""
+    global s
+    hits = [m for m in FILE_BLOCK.finditer(s) if old in m.group(2)]
+    assert len(hits) == 1 and hits[0].group(2).count(old) == 1, (len(hits), old[:70])
+    m = hits[0]
+    s = s[:m.start(2)] + m.group(2).replace(old, new, 1) + s[m.end(2):]
+
+
+# --- samples.py: the fix prompt in edit form, edit-form fix samples
+swap('''import compare_tasks as ct  # noqa: E402
+import splits  # noqa: E402
+import teacher_gen as tg  # noqa: E402
+
+FENCE = "`" * 3''', '''import compare_tasks as ct  # noqa: E402
+import edits  # noqa: E402
+import splits  # noqa: E402
+import teacher_gen as tg  # noqa: E402
+
+FENCE = "`" * 3''')
+swap('''FAILED = "The acceptance tests failed:\\n"
+''', '''FAILED = "The acceptance tests failed:\\n"
+FIX_EDIT_PROMPT = """You implemented this request:
+
+{request}
+
+Your files:
+
+{files}
+
+Running acceptance checks against them gave these failures:
+
+{failures}
+
+Fix the implementation with the smallest edits that work. Reply with edit blocks only, no prose. Each block names a file
+and replaces text that occurs exactly once in that file:
+
+FILE: <path>
+<<<<<<< SEARCH
+<lines copied exactly from the file, with enough surrounding lines to be unique>
+=======
+<the replacement lines>
+>>>>>>> REPLACE
+
+Use as many blocks as needed. Do not rewrite whole files."""
+''')
+swap('''            files = tg.extract_files(r["build"], r["entry"])
+            if files:
+                user = ct.FIX_PROMPT.format(request=r["request"], files=show_files(files),
+                                            failures=FAILED + r.get("build_out", ""))
+                out.append(make("fix", user, r["fix"], sid, split, lang, "teacher-fix"))''',
+     '''            files = tg.extract_files(r["build"], r["entry"])
+            fixed = tg.extract_files(r["fix"], r["entry"])
+            reply = edits.make_edits(files, fixed) if files and fixed else None
+            if reply:
+                user = FIX_EDIT_PROMPT.format(request=r["request"], files=show_files(files),
+                                              failures=FAILED + r.get("build_out", ""))
+                out.append(make("fix", user, reply, sid, split, lang, "teacher-fix"))''')
+swap('''def fault_sample(f):
+    user = ct.FIX_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
+    return make("fix", user, render_files(f["files_ok"], f["lang"]), f["sid"], f["split"], f["lang"], "fault")''',
+     '''def fault_sample(f):
+    """The fix sample of a teacher-authored fault, or None when no unambiguous edit turns the faulty files into the original."""
+    reply = edits.make_edits(f["files_bad"], f["files_ok"])
+    if not reply:
+        return None
+    user = FIX_EDIT_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
+    return make("fix", user, reply, f["sid"], f["split"], f["lang"], "fault")''')
+swap('''[fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")]''',
+     '''[x for x in (fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")) if x]''')
+
+# --- test_samples.py: the fix target is edit blocks that rebuild the fixed files
+swap('''        self.assertIn("return a - b", user)
+        self.assertIn("AssertionError", user)
+        self.assertEqual(s["messages"][2]["content"], GOOD)''',
+     '''        self.assertIn("return a - b", user)
+        self.assertIn("AssertionError", user)
+        self.assertIn("Reply with edit blocks only", user)
+        fixed, err = edits.apply_edits({"calc.py": "def add(a, b):\\n    return a - b\\n"}, s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, {"calc.py": "def add(a, b):\\n    return a + b\\n"})''')
+swap('''        self.assertEqual(s["source"], "fault")
+        self.assertIn("# file: calc.py", s["messages"][2]["content"])
+        self.assertIn("return a + b", s["messages"][2]["content"])
+        self.assertIn("return a - b", s["messages"][1]["content"])''',
+     '''        self.assertEqual(s["source"], "fault")
+        fixed, err = edits.apply_edits(fault["files_bad"], s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, fault["files_ok"])
+        self.assertIn("return a - b", s["messages"][1]["content"])''')
+swap('''import samples  # noqa: E402
+
+FENCE = "`" * 3
+GOOD =''', '''import edits  # noqa: E402
+import samples  # noqa: E402
+
+FENCE = "`" * 3
+GOOD =''')
+
+# --- eval_roles.py: fixes are scored in both formats for the base model; adapters answer in edits
+swap('''def fix_fn(server, failing):
+    def fn(t):
+        row = failing[t["sid"]]
+        files = tg.extract_files(row["text"], t["entry"])
+        shown = samples.show_files(files) if files else "(no files were produced)"
+        user = ct.FIX_PROMPT.format(request=t["request"], files=shown, failures=samples.FAILED + row["out"])
+        r = server.chat(samples.chat_messages(user), MAX_TOKENS["fix"])
+        fixed = tg.extract_files(r["text"], t["entry"]) or files
+        ok, out = tg.run_tests(t["lang"], fixed, t["tests"]) if fixed else (False, "no files")
+        return {"sid": t["sid"], "ok": ok, "out": out, "finish": r["finish"]}
+    return fn''', '''def fix_fn(server, failing, edit=True):
+    """One fix round. edit=True: the edit-block prompt and reply (the role adapters' format); edit=False: the full-file
+    prompt and reply (the base model's natural format, the other baseline)."""
+    def fn(t):
+        row = failing[t["sid"]]
+        files = tg.extract_files(row["text"], t["entry"])
+        shown = samples.show_files(files) if files else "(no files were produced)"
+        template = samples.FIX_EDIT_PROMPT if edit else ct.FIX_PROMPT
+        user = template.format(request=t["request"], files=shown, failures=samples.FAILED + row["out"])
+        r = server.chat(samples.chat_messages(user), MAX_TOKENS["fix"] if not edit else 2048)
+        if edit:
+            fixed, err = edits.apply_edits(files, r["text"]) if files else (files, "no files")
+        else:
+            fixed, err = tg.extract_files(r["text"], t["entry"]) or files, None
+        ok, out = tg.run_tests(t["lang"], fixed, t["tests"]) if fixed and err is None else (False, err or "no files")
+        return {"sid": t["sid"], "ok": ok, "out": out, "finish": r["finish"]}
+    return fn''')
+swap('''import compare_tasks as ct  # noqa: E402
+import llama_server  # noqa: E402''', '''import compare_tasks as ct  # noqa: E402
+import edits  # noqa: E402
+import llama_server  # noqa: E402''')
+swap('''        run_phase(P("fixes-base"), [t for t in tasks if t["sid"] in failing], fix_fn(s, failing), s.parallel)''',
+     '''        todo = [t for t in tasks if t["sid"] in failing]
+        run_phase(P("fixes-base"), todo, fix_fn(s, failing, edit=False), s.parallel)
+        run_phase(P("fixes-base-edit"), todo, fix_fn(s, failing, edit=True), s.parallel)''')
+swap('''           "fix": gate(ok(f"fixes-{a.fix}"), ok("fixes-base"))}''',
+     '''           "fix": gate(ok(f"fixes-{a.fix}"), ok("fixes-base")),
+           "fix_vs_base_edit_format": gate(ok(f"fixes-{a.fix}"), ok("fixes-base-edit"))}''')
+p.write_text(s, encoding="utf-8", newline="\n")
+print("plan updated")
+```
+
+- [ ] **Step 5: run the affected tests**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/samples.py scripts/roles/test_samples.py scripts/roles/eval_roles.py && cd scripts/roles && $PY -m unittest test_edits test_samples test_eval_roles -v`
+Expected: `OK`. (The `fix` pass rule is judged against the better of the two baselines: `fix` and `fix_vs_base_edit_format` must both pass.)
+
+- [ ] **Step 6: commit**
+
+```bash
+git add scripts/roles/edits.py scripts/roles/test_edits.py scripts/roles/samples.py scripts/roles/test_samples.py scripts/roles/eval_roles.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md
+git commit -m "feat(roles): fix role as SEARCH/REPLACE edits, deterministic conversion, two baselines"
 ```
 
 ---
@@ -2026,6 +2430,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 for p in (HERE, HERE.parent / "teacher", HERE.parent / "moe-bench"):
     sys.path.insert(0, str(p))
 import compare_tasks as ct  # noqa: E402
+import edits  # noqa: E402
 import llama_server  # noqa: E402
 import samples  # noqa: E402
 import teacher_gen as tg  # noqa: E402
@@ -2102,15 +2507,21 @@ def build_fn(server, plans):
     return fn
 
 
-def fix_fn(server, failing):
+def fix_fn(server, failing, edit=True):
+    """One fix round. edit=True: the edit-block prompt and reply (the role adapters' format); edit=False: the full-file
+    prompt and reply (the base model's natural format, the other baseline)."""
     def fn(t):
         row = failing[t["sid"]]
         files = tg.extract_files(row["text"], t["entry"])
         shown = samples.show_files(files) if files else "(no files were produced)"
-        user = ct.FIX_PROMPT.format(request=t["request"], files=shown, failures=samples.FAILED + row["out"])
-        r = server.chat(samples.chat_messages(user), MAX_TOKENS["fix"])
-        fixed = tg.extract_files(r["text"], t["entry"]) or files
-        ok, out = tg.run_tests(t["lang"], fixed, t["tests"]) if fixed else (False, "no files")
+        template = samples.FIX_EDIT_PROMPT if edit else ct.FIX_PROMPT
+        user = template.format(request=t["request"], files=shown, failures=samples.FAILED + row["out"])
+        r = server.chat(samples.chat_messages(user), MAX_TOKENS["fix"] if not edit else 2048)
+        if edit:
+            fixed, err = edits.apply_edits(files, r["text"]) if files else (files, "no files")
+        else:
+            fixed, err = tg.extract_files(r["text"], t["entry"]) or files, None
+        ok, out = tg.run_tests(t["lang"], fixed, t["tests"]) if fixed and err is None else (False, err or "no files")
         return {"sid": t["sid"], "ok": ok, "out": out, "finish": r["finish"]}
     return fn
 
@@ -2136,7 +2547,9 @@ def cmd_baseline(a):
         run_phase(P("builds-base-from-teacher"), tasks, build_fn(s, teacher_plans(tasks)), s.parallel)
         run_phase(P("builds-base-from-base"), tasks, build_fn(s, {k: v["plan"] for k, v in plans.items()}), s.parallel)
         failing = {sid: r for sid, r in samples_map(P("builds-base-from-teacher")).items() if not r["ok"]}
-        run_phase(P("fixes-base"), [t for t in tasks if t["sid"] in failing], fix_fn(s, failing), s.parallel)
+        todo = [t for t in tasks if t["sid"] in failing]
+        run_phase(P("fixes-base"), todo, fix_fn(s, failing, edit=False), s.parallel)
+        run_phase(P("fixes-base-edit"), todo, fix_fn(s, failing, edit=True), s.parallel)
 
 
 def samples_map(path):
@@ -2170,7 +2583,8 @@ def cmd_report(a):
     res = {"size": a.size, "split": a.split,
            "build": gate(ok(f"builds-{a.build}-from-teacher"), ok("builds-base-from-teacher")),
            "plan": gate(ok(f"builds-base-from-{a.plan}"), ok("builds-base-from-base")),
-           "fix": gate(ok(f"fixes-{a.fix}"), ok("fixes-base"))}
+           "fix": gate(ok(f"fixes-{a.fix}"), ok("fixes-base")),
+           "fix_vs_base_edit_format": gate(ok(f"fixes-{a.fix}"), ok("fixes-base-edit"))}
     (pathlib.Path(a.work) / a.size / f"gates-{a.split}-{a.plan}-{a.build}-{a.fix}.json").write_text(
         json.dumps(res, indent=1), encoding="utf-8")
     print(json.dumps(res, indent=1))

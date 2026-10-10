@@ -6,6 +6,7 @@ import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import edits  # noqa: E402
 import samples  # noqa: E402
 
 FENCE = "`" * 3
@@ -36,7 +37,10 @@ class SamplesTest(unittest.TestCase):
         user = s["messages"][1]["content"]
         self.assertIn("return a - b", user)
         self.assertIn("AssertionError", user)
-        self.assertEqual(s["messages"][2]["content"], GOOD)
+        self.assertIn("Reply with edit blocks only", user)
+        fixed, err = edits.apply_edits({"calc.py": "def add(a, b):\n    return a - b\n"}, s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, {"calc.py": "def add(a, b):\n    return a + b\n"})
 
     def test_fault_sample_target_is_the_original_rendered(self):
         fault = {"sid": "python|k|data analysis|5", "split": "train", "lang": "python", "request": "R", "entry": "calc.py",
@@ -45,8 +49,9 @@ class SamplesTest(unittest.TestCase):
         s = samples.fault_sample(fault)
         self.assertEqual(s["role"], "fix")
         self.assertEqual(s["source"], "fault")
-        self.assertIn("# file: calc.py", s["messages"][2]["content"])
-        self.assertIn("return a + b", s["messages"][2]["content"])
+        fixed, err = edits.apply_edits(fault["files_bad"], s["messages"][2]["content"])
+        self.assertIsNone(err)
+        self.assertEqual(fixed, fault["files_ok"])
         self.assertIn("return a - b", s["messages"][1]["content"])
 
     def test_render_files_markers(self):

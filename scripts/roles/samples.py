@@ -11,6 +11,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 for p in (HERE, HERE.parent / "teacher", HERE.parent / "moe-bench"):
     sys.path.insert(0, str(p))
 import compare_tasks as ct  # noqa: E402
+import edits  # noqa: E402
 import splits  # noqa: E402
 import teacher_gen as tg  # noqa: E402
 
@@ -18,6 +19,29 @@ FENCE = "`" * 3
 MARK = {"python": "# file: {}", "node": "// file: {}", "web": "<!-- file: {} -->"}
 FENCE_LANG = {"python": "python", "node": "javascript", "web": "html"}
 FAILED = "The acceptance tests failed:\n"
+FIX_EDIT_PROMPT = """You implemented this request:
+
+{request}
+
+Your files:
+
+{files}
+
+Running acceptance checks against them gave these failures:
+
+{failures}
+
+Fix the implementation with the smallest edits that work. Reply with edit blocks only, no prose. Each block names a file
+and replaces text that occurs exactly once in that file:
+
+FILE: <path>
+<<<<<<< SEARCH
+<lines copied exactly from the file, with enough surrounding lines to be unique>
+=======
+<the replacement lines>
+>>>>>>> REPLACE
+
+Use as many blocks as needed. Do not rewrite whole files."""
 
 
 def sid_of(rec):
@@ -66,16 +90,22 @@ def from_runs(runs):
                             r["build"], sid, split, lang, "teacher"))
         elif r.get("fix_ok") and r.get("fix"):
             files = tg.extract_files(r["build"], r["entry"])
-            if files:
-                user = ct.FIX_PROMPT.format(request=r["request"], files=show_files(files),
-                                            failures=FAILED + r.get("build_out", ""))
-                out.append(make("fix", user, r["fix"], sid, split, lang, "teacher-fix"))
+            fixed = tg.extract_files(r["fix"], r["entry"])
+            reply = edits.make_edits(files, fixed) if files and fixed else None
+            if reply:
+                user = FIX_EDIT_PROMPT.format(request=r["request"], files=show_files(files),
+                                              failures=FAILED + r.get("build_out", ""))
+                out.append(make("fix", user, reply, sid, split, lang, "teacher-fix"))
     return out
 
 
 def fault_sample(f):
-    user = ct.FIX_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
-    return make("fix", user, render_files(f["files_ok"], f["lang"]), f["sid"], f["split"], f["lang"], "fault")
+    """The fix sample of a teacher-authored fault, or None when no unambiguous edit turns the faulty files into the original."""
+    reply = edits.make_edits(f["files_bad"], f["files_ok"])
+    if not reply:
+        return None
+    user = FIX_EDIT_PROMPT.format(request=f["request"], files=show_files(f["files_bad"]), failures=FAILED + f["fail_out"])
+    return make("fix", user, reply, f["sid"], f["split"], f["lang"], "fault")
 
 
 def read_jsonl(path):
@@ -85,7 +115,7 @@ def read_jsonl(path):
 def build_datasets(runs_path, faults_path, out_dir):
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    rows = from_runs(read_jsonl(runs_path)) + [fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")]
+    rows = from_runs(read_jsonl(runs_path)) + [x for x in (fault_sample(f) for f in read_jsonl(faults_path) if f.get("ok")) if x]
     by = collections.defaultdict(list)
     for s in rows:
         by[(s["role"], s["split"])].append(s)
