@@ -9,7 +9,7 @@
 set -u
 MODE=${1:-full}
 PY=/c/qwen3-forge-stage/venv/Scripts/python.exe
-UPY=/c/Users/ethan/.unsloth/studio/unsloth_studio/Scripts/python.exe
+UPY=$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 DIR=E:/AI/teacher-data/gen-v0
 D=E:/AI/role-adapters/data
