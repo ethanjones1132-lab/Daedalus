@@ -86,6 +86,7 @@ class Client:
         for k in range(tries):
             try:
                 r = self._req("/chat/completions", payload)
+                self.last_usage = r.get("usage")  # token counts of the last reply (teacher_gen logs them)
                 return r["choices"][0]["message"].get("content") or ""
             except urllib.error.HTTPError as e:
                 if e.code == 400 and "response_format" in payload:

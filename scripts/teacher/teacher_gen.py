@@ -34,11 +34,27 @@ GROK_MODEL = "grok-4.7"
 _local = threading.local()
 
 
+USAGE_LOG = pathlib.Path("E:/AI/teacher-data/usage.jsonl")
+_usage_lock = threading.Lock()
+
+
+def log_usage(usage, backend, secs):
+    """One JSON line per reply: token counts as the API reports them, so spend can be metered (monthly quota, 2026-10-09)."""
+    usage = usage or {}
+    with _usage_lock, open(USAGE_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": round(time.time()), "backend": backend, "secs": secs,
+                            "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+                            "total_tokens": usage.get("total_tokens")}) + "\n")
+
+
 def deepseek(prompt, max_tokens=32768):
     if not hasattr(_local, "ds"):
         _local.ds = opencode_go.Client()
         assert _local.ds.model == "deepseek-v4.1-flash", _local.ds.model
-    return _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM)
+    t = time.time()
+    text = _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM)
+    log_usage(getattr(_local.ds, "last_usage", None), "deepseek", round(time.time() - t, 1))
+    return text
 
 
 def grok(prompt, timeout=1500):
@@ -102,14 +118,30 @@ def extract_files(text, entry):
     return files
 
 
-def call(backend, prompt, **kw):
+TRANSIENT = ("429", "RemoteDisconnected", "timed out", "Connection", "502", "503", "504")
+
+
+def call(backend, prompt, retries=4, **kw):
+    """(text, seconds, error). Transient failures (rate limits, dropped connections) are retried with backoff while the
+    concurrency slot is held, which also slows the other workers down."""
     with LIMITS[backend]:
         t = time.time()
-        try:
-            text, err = BACKENDS[backend](prompt, **kw), None
-        except Exception as e:  # recorded, never fatal for the comparison
-            text, err = "", repr(e)[:300]
-        return text, round(time.time() - t, 1), err
+        err = None
+        for attempt in range(retries):
+            try:
+                return BACKENDS[backend](prompt, **kw), round(time.time() - t, 1), None
+            except Exception as e:  # recorded, never fatal for the comparison
+                err = repr(e)[:300]
+                if attempt + 1 < retries and any(k in err for k in TRANSIENT):
+                    time.sleep(20 * 2 ** attempt)
+                    continue
+                break
+        return "", round(time.time() - t, 1), err
+
+
+def valid_path(p):
+    """A relative file name that is safe to create on Windows (a model once answered with a whole HTML page as the name)."""
+    return (bool(p) and len(p) < 200 and not re.search(r'[\n\r<>:"|?*]', p) and ".." not in p and not p.startswith("/"))
 
 
 def run_build(task, files):
@@ -278,7 +310,7 @@ def run_tests(lang, files, tests):
     d = pathlib.Path(tempfile.mkdtemp(prefix=f"tg-{lang}-"))
     try:
         for p, c in files.items():
-            if ".." not in p and not p.startswith("/"):
+            if valid_path(p):
                 (d / p).parent.mkdir(parents=True, exist_ok=True)
                 (d / p).write_text(c, encoding="utf-8")
         name = {"python": "test_acceptance.py", "node": "test_acceptance.js", "web": "test_acceptance.mjs"}[lang]
@@ -345,6 +377,12 @@ def gen(a):
     done = {(r["lang"], r["kind"], r["field"], r["i"]) for r in map(json.loads, open(path, encoding="utf-8"))} if path.exists() else set()
 
     def run(s):
+        try:
+            run_one(s)
+        except Exception as e:  # one bad seed must not stop the pool; it is not recorded, so a rerun retries it
+            print(f"gen ERROR {s['lang']} {s['field']} #{s['i']}: {e!r}"[:300], flush=True)
+
+    def run_one(s):
         key = (s["lang"], s["kind"], s["field"], s["i"])
         rec = {"lang": s["lang"], "kind": s["kind"], "field": s["field"], "i": s["i"], "backend": a.backend,
                "split": s.get("split"),

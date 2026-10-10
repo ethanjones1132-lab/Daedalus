@@ -993,6 +993,318 @@ git commit -m "feat(roles): second seed round and idempotent merge"
 
 ---
 
+### Task 6c: harden `teacher_gen` (added during Task 6)
+
+**Why:** the first long `gen` run died on a reply whose "file path" was a whole HTML document (`mkdir` on Windows raised `OSError`, which killed the thread pool), and 55 of the first 394 runs failed on HTTP 429 and `RemoteDisconnected` (two `gen` processes plus the second seed round exceeded the endpoint's tolerance) yet were recorded as finished, with empty plans, so a rerun skipped them. Fixes: a path guard in `run_tests`, retry with backoff in `call`, one bad seed cannot stop the pool, and a cleaner that drops infrastructure failures from `runs.jsonl` so they are retried.
+
+**Files:** Modify `scripts/teacher/teacher_gen.py`; Create `scripts/roles/clean_runs.py`; Test `scripts/roles/test_hardening.py`.
+
+- [ ] **Step 1: extract the test and watch it fail**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/test_hardening.py && cd scripts/roles && $PY -m unittest test_hardening`
+Expected: FAIL (`AttributeError: module 'teacher_gen' has no attribute 'valid_path'` and a missing `clean_runs`).
+
+```python file=scripts/roles/test_hardening.py
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+
+HERE = pathlib.Path(__file__).resolve().parent
+for p in (HERE, HERE.parent / "teacher", HERE.parent / "moe-bench"):
+    sys.path.insert(0, str(p))
+import clean_runs  # noqa: E402
+import teacher_gen as tg  # noqa: E402
+
+
+class PathGuardTest(unittest.TestCase):
+    def test_valid_and_invalid_paths(self):
+        for ok in ("tool.py", "src/lib.js", "index.html"):
+            self.assertTrue(tg.valid_path(ok), ok)
+        for bad in ("", "../x.py", "/etc/x", "<!DOCTYPE html>\n<html>", "a\nb.py", "x" * 300, "a:b.py", "a|b"):
+            self.assertFalse(tg.valid_path(bad), repr(bad))
+
+    def test_run_tests_survives_a_garbage_path(self):
+        ok, out = tg.run_tests("python", {"<!DOCTYPE html>\n<html>": "x"}, "import unittest\n")
+        self.assertFalse(ok)
+
+
+class RetryTest(unittest.TestCase):
+    def test_retries_a_429_then_succeeds(self):
+        calls = []
+
+        def flaky(prompt, **kw):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("<HTTPError 429: 'Too Many Requests'>")
+            return "answer"
+        tg.BACKENDS["flaky"] = flaky
+        tg.LIMITS["flaky"] = tg.threading.Semaphore(1)
+        orig = tg.time.sleep
+        tg.time.sleep = lambda s: None
+        try:
+            text, secs, err = tg.call("flaky", "p")
+        finally:
+            tg.time.sleep = orig
+        self.assertEqual((text, err, len(calls)), ("answer", None, 3))
+
+    def test_gives_up_on_a_non_transient_error(self):
+        tg.BACKENDS["broken"] = lambda prompt, **kw: (_ for _ in ()).throw(ValueError("bad request"))
+        tg.LIMITS["broken"] = tg.threading.Semaphore(1)
+        text, secs, err = tg.call("broken", "p")
+        self.assertEqual(text, "")
+        self.assertIn("bad request", err)
+
+
+class CleanRunsTest(unittest.TestCase):
+    def test_drops_infrastructure_failures_only(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        rows = [{"sid": 1, "plan": "p", "build": "b", "build_ok": True},
+                {"sid": 2, "plan": "p", "build": "b", "build_ok": False, "fix_ok": False},   # a real failure: kept
+                {"sid": 3, "plan": "", "build": "", "errors": ["429"]},
+                {"sid": 4, "plan": "p", "build": ""}]
+        (d / "runs.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        kept, dropped = clean_runs.clean(d / "runs.jsonl")
+        self.assertEqual((kept, dropped), (2, 2))
+        self.assertTrue((d / "runs.jsonl.bak").exists())
+        left = [json.loads(line)["sid"] for line in (d / "runs.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(left, [1, 2])
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: write the cleaner**
+
+```python file=scripts/roles/clean_runs.py
+"""Drops infrastructure failures (an empty plan or build, or API errors) from runs.jsonl so `gen` retries them; real
+test failures stay. The original is kept as runs.jsonl.bak. usage: clean_runs.py --dir E:/AI/teacher-data/gen-v0"""
+import argparse
+import json
+import pathlib
+import shutil
+
+
+def clean(path):
+    path = pathlib.Path(path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    keep = [r for r in rows if r.get("plan") and r.get("build") and not r.get("errors")]
+    shutil.copy(path, str(path) + ".bak")
+    path.write_text("".join(json.dumps(r) + "\n" for r in keep), encoding="utf-8")
+    return len(keep), len(rows) - len(keep)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", required=True)
+    a = ap.parse_args()
+    print(clean(pathlib.Path(a.dir) / "runs.jsonl"))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+- [ ] **Step 3: patch `teacher_gen.py` (path guard, retry with backoff, a bad seed cannot kill the pool)**
+
+```python
+# run once from the repo root
+import pathlib
+
+p = pathlib.Path("scripts/teacher/teacher_gen.py")
+s = p.read_text(encoding="utf-8")
+
+
+def swap(old, new):
+    global s
+    assert s.count(old) == 1, old[:60]
+    s = s.replace(old, new, 1)
+
+
+swap('''def call(backend, prompt, **kw):
+    with LIMITS[backend]:
+        t = time.time()
+        try:
+            text, err = BACKENDS[backend](prompt, **kw), None
+        except Exception as e:  # recorded, never fatal for the comparison
+            text, err = "", repr(e)[:300]
+        return text, round(time.time() - t, 1), err''',
+     '''TRANSIENT = ("429", "RemoteDisconnected", "timed out", "Connection", "502", "503", "504")
+
+
+def call(backend, prompt, retries=4, **kw):
+    """(text, seconds, error). Transient failures (rate limits, dropped connections) are retried with backoff while the
+    concurrency slot is held, which also slows the other workers down."""
+    with LIMITS[backend]:
+        t = time.time()
+        err = None
+        for attempt in range(retries):
+            try:
+                return BACKENDS[backend](prompt, **kw), round(time.time() - t, 1), None
+            except Exception as e:  # recorded, never fatal for the comparison
+                err = repr(e)[:300]
+                if attempt + 1 < retries and any(k in err for k in TRANSIENT):
+                    time.sleep(20 * 2 ** attempt)
+                    continue
+                break
+        return "", round(time.time() - t, 1), err''')
+swap('''def run_build(task, files):''',
+     '''def valid_path(p):
+    """A relative file name that is safe to create on Windows (a model once answered with a whole HTML page as the name)."""
+    return (bool(p) and len(p) < 200 and not re.search(r'[\\n\\r<>:"|?*]', p) and ".." not in p and not p.startswith("/"))
+
+
+def run_build(task, files):''')
+swap('''        for p, c in files.items():
+            if ".." not in p and not p.startswith("/"):
+                (d / p).parent.mkdir(parents=True, exist_ok=True)
+                (d / p).write_text(c, encoding="utf-8")
+        name =''',
+     '''        for p, c in files.items():
+            if valid_path(p):
+                (d / p).parent.mkdir(parents=True, exist_ok=True)
+                (d / p).write_text(c, encoding="utf-8")
+        name =''')
+swap('''    def run(s):
+        key = (s["lang"], s["kind"], s["field"], s["i"])''',
+     '''    def run(s):
+        try:
+            run_one(s)
+        except Exception as e:  # one bad seed must not stop the pool; it is not recorded, so a rerun retries it
+            print(f"gen ERROR {s['lang']} {s['field']} #{s['i']}: {e!r}"[:300], flush=True)
+
+    def run_one(s):
+        key = (s["lang"], s["kind"], s["field"], s["i"])''')
+p.write_text(s, encoding="utf-8")
+print("patched")
+```
+
+- [ ] **Step 4: apply the patch, run the tests**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/clean_runs.py` then save the patch block above as `patch_hardening.py` in the scratchpad and run it from the repo root, then `cd scripts/roles && $PY -m unittest test_hardening -v`
+Expected: `OK` (5 tests).
+
+- [ ] **Step 5: clean the existing runs, restart `gen` with fewer workers, commit**
+
+```bash
+$PY scripts/roles/clean_runs.py --dir E:/AI/teacher-data/gen-v0
+D=E:/AI/teacher-data/gen-v0
+nohup $PY scripts/teacher/teacher_gen.py gen --out $D --backend deepseek --workers 5 --seeds-file seeds-clean.jsonl \
+  --splits train > $D/gen-train.out 2>&1 &
+nohup $PY scripts/teacher/teacher_gen.py gen --out $D --backend deepseek --workers 3 --seeds-file seeds-clean.jsonl \
+  --splits dev,test > $D/gen-eval.out 2>&1 &
+git add scripts/teacher/teacher_gen.py scripts/roles/clean_runs.py scripts/roles/test_hardening.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md
+git commit -m "fix(roles): teacher_gen path guard, retry with backoff, and a cleaner for infrastructure failures"
+```
+(8 gen workers plus the 4-worker seed round is about the 12 concurrent calls that ran without 429s earlier.)
+
+---
+
+### Task 6d: the OpenCode Go quota, and a usage log (added during Task 6)
+
+**What happened (2026-10-09, about 20:40 EDT):** every DeepSeek call began returning HTTP 429 with `GoUsageLimitError: Go usage limit exceeded`, `limitName: monthly`, `Retry-After: 24637` (about 6.8 hours, a reset near 03:30 EDT on 2026-10-10). The first seed round (280 calls), the second (about 300), roughly 1,200 `gen` calls and the Step 1 calls used up the account's monthly allowance, which the owner's other OpenCode Go uses share. All DeepSeek generation is stopped until the reset. After it, spend is metered: every call logs its token usage, and the remaining data is generated in priority order (dev and test first, then the train seeds), stopping when the data reaches the targets or the Go usage limit returns.
+
+**Files:** Modify `scripts/moe-bench/opencode_go.py`, `scripts/teacher/teacher_gen.py`; Test `scripts/roles/test_usage.py`.
+
+- [ ] **Step 1: extract the test and watch it fail**
+
+Run: `$PY scripts/roles/plan_extract.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md scripts/roles/test_usage.py && cd scripts/roles && $PY -m unittest test_usage`
+Expected: FAIL (`AttributeError: module 'teacher_gen' has no attribute 'log_usage'`).
+
+```python file=scripts/roles/test_usage.py
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+
+HERE = pathlib.Path(__file__).resolve().parent
+for p in (HERE, HERE.parent / "teacher", HERE.parent / "moe-bench"):
+    sys.path.insert(0, str(p))
+import teacher_gen as tg  # noqa: E402
+
+
+class UsageTest(unittest.TestCase):
+    def test_log_usage_appends_a_json_line(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        tg.USAGE_LOG = d / "usage.jsonl"
+        tg.log_usage({"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}, "deepseek", 12.5)
+        tg.log_usage(None, "deepseek", 1.0)
+        rows = [json.loads(line) for line in tg.USAGE_LOG.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["completion_tokens"], 20)
+        self.assertEqual(rows[0]["backend"], "deepseek")
+        self.assertEqual(rows[1]["completion_tokens"], None)
+
+
+if __name__ == "__main__":
+    unittest.main()
+```
+
+- [ ] **Step 2: patch the client and `teacher_gen`**
+
+```python
+# run once from the repo root
+import pathlib
+
+p = pathlib.Path("scripts/moe-bench/opencode_go.py")
+s = p.read_text(encoding="utf-8")
+old = '''                r = self._req("/chat/completions", payload)
+                return r["choices"][0]["message"].get("content") or ""'''
+assert s.count(old) == 1
+s = s.replace(old, '''                r = self._req("/chat/completions", payload)
+                self.last_usage = r.get("usage")  # token counts of the last reply (teacher_gen logs them)
+                return r["choices"][0]["message"].get("content") or ""''', 1)
+p.write_text(s, encoding="utf-8")
+
+p = pathlib.Path("scripts/teacher/teacher_gen.py")
+s = p.read_text(encoding="utf-8")
+old = '''def deepseek(prompt, max_tokens=32768):
+    if not hasattr(_local, "ds"):
+        _local.ds = opencode_go.Client()
+        assert _local.ds.model == "deepseek-v4.1-flash", _local.ds.model
+    return _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM)'''
+assert s.count(old) == 1
+s = s.replace(old, '''USAGE_LOG = pathlib.Path("E:/AI/teacher-data/usage.jsonl")
+_usage_lock = threading.Lock()
+
+
+def log_usage(usage, backend, secs):
+    """One JSON line per reply: token counts as the API reports them, so spend can be metered (monthly quota, 2026-10-09)."""
+    usage = usage or {}
+    with _usage_lock, open(USAGE_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": round(time.time()), "backend": backend, "secs": secs,
+                            "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
+                            "total_tokens": usage.get("total_tokens")}) + "\\n")
+
+
+def deepseek(prompt, max_tokens=32768):
+    if not hasattr(_local, "ds"):
+        _local.ds = opencode_go.Client()
+        assert _local.ds.model == "deepseek-v4.1-flash", _local.ds.model
+    t = time.time()
+    text = _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM)
+    log_usage(getattr(_local.ds, "last_usage", None), "deepseek", round(time.time() - t, 1))
+    return text''', 1)
+p.write_text(s, encoding="utf-8")
+print("patched")
+```
+
+- [ ] **Step 3: apply the patch and run the test**
+
+Save the block above as `patch_usage.py` in the scratchpad and run it from the repo root, then `cd scripts/roles && $PY -m unittest test_usage -v`
+Expected: `OK` (1 test).
+
+- [ ] **Step 4: commit**
+
+```bash
+git add scripts/moe-bench/opencode_go.py scripts/teacher/teacher_gen.py scripts/roles/test_usage.py docs/superpowers/plans/2026-10-09-role-adapters-2a-2c.md
+git commit -m "feat(roles): meter DeepSeek token usage after the monthly quota ran out"
+```
+
+---
+
 ### Task 7: the llama-server wrapper
 
 **Files:** Create `scripts/roles/llama_server.py`.
@@ -1239,12 +1551,21 @@ ATTN_MLP = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "dow
 EXCLUDE = r".*(visual|vision|merger).*"
 
 
+def prefer_efficient_sdpa():
+    """Qwen3.5 attention has 256-wide heads: PyTorch's flash kernel does not support them on this GPU, and HF's grouped-query
+    shortcut (enable_gqa) then falls back to the math kernel, which materializes 16 x 4096 x 4096 scores (4.3 GB per layer).
+    Expanding the keys and values instead lets the memory-efficient kernel run (250 MiB). Measured 2026-10-09."""
+    import transformers.integrations.sdpa_attention as sa
+    sa.use_gqa_in_sdpa = lambda *a, **k: False
+
+
 def load_qlora(path, targets="all-linear", rank=16):
     """4-bit NF4 base with gradient checkpointing (no fp32 upcast of the embeddings) and a LoRA on top."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
+    prefer_efficient_sdpa()
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                              bnb_4bit_compute_dtype=torch.bfloat16)
     model = AutoModelForCausalLM.from_pretrained(path, quantization_config=bnb, dtype=torch.bfloat16, device_map={"": 0})
@@ -1491,6 +1812,7 @@ def main():
     model = qlora_common.load_qlora(a.model, a.targets, 16)
     load_s = time.time() - t0
     head = qlora_common.swap_head(model)
+    model.train()  # gradient checkpointing is only active in train mode
     names = sorted({n.split(".")[-1] for n, m in model.named_modules() if hasattr(m, "lora_A") and "lora_A" not in n})
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
     ids = torch.randint(1000, 20000, (1, a.seq), device="cuda")
