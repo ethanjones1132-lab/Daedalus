@@ -2436,7 +2436,8 @@ import samples  # noqa: E402
 import teacher_gen as tg  # noqa: E402
 
 BASES = {"9B": "E:/models/gguf/unsloth-Qwen3.5-9B-Q5_K_M.gguf", "4B": "E:/AI/role-adapters/gguf/Qwen3.5-4B-Q5_K_M.gguf",
-         "2B": "E:/AI/role-adapters/gguf/Qwen3.5-2B-Q5_K_M.gguf"}
+         "2B": "E:/AI/role-adapters/gguf/Qwen3.5-2B-Q5_K_M.gguf",
+         "0.8B": "E:/AI/role-adapters/gguf/Qwen3.5-0.8B-Q5_K_M.gguf"}
 MAX_TOKENS = {"plan": 2048, "build": 6144, "fix": 6144}
 MIN_GAIN, MAX_P = 0.05, 0.10
 
