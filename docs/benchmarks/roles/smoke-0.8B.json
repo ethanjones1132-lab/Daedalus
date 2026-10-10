@@ -1,0 +1,45 @@
+{"seq": 4096, "step_secs": [3.17, 1.94, 1.96, 1.95], "tok_s": 2099, "peak_vram_gb": 2.45, "pass": true}
+{"seq": 6144, "step_secs": [3.11, 3.08, 3.07, 3.09], "tok_s": 1997, "peak_vram_gb": 2.55, "pass": true}
+{
+ "model": "E:/AI/role-adapters/models/Qwen3.5-0.8B",
+ "transformers": "5.5.0",
+ "torch": "2.10.0+cu130",
+ "fla": true,
+ "causal_conv1d": false,
+ "load_s": 47.4,
+ "lora_target_modules": [
+  "down_proj",
+  "gate_proj",
+  "k_proj",
+  "o_proj",
+  "q_proj",
+  "up_proj",
+  "v_proj"
+ ],
+ "runs": [
+  {
+   "seq": 4096,
+   "step_secs": [
+    3.17,
+    1.94,
+    1.96,
+    1.95
+   ],
+   "tok_s": 2099,
+   "peak_vram_gb": 2.45,
+   "pass": true
+  },
+  {
+   "seq": 6144,
+   "step_secs": [
+    3.11,
+    3.08,
+    3.07,
+    3.09
+   ],
+   "tok_s": 1997,
+   "peak_vram_gb": 2.55,
+   "pass": true
+  }
+ ]
+}
