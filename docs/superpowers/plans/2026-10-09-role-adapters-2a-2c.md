@@ -1778,8 +1778,8 @@ git commit -m "feat(roles): memory-safe QLoRA trainer (reply-only chunked loss, 
 - [ ] **Step 1: extract the script**
 
 ```python file=scripts/roles/smoke_qlora.py
-"""Smoke test (spec section 3): can a QLoRA step run at sequence length 4,096 within about 7.5 GB and 400 tokens/s?
-Runs in Unsloth Studio's Python. usage: smoke_qlora.py --model DIR [--seq 4096] [--steps 4] [--targets all-linear|attn-mlp]"""
+"""Smoke test (spec section 3): can a QLoRA step run at the given sequence lengths within about 7.5 GB and 400 tokens/s?
+Runs in Unsloth Studio's Python. usage: smoke_qlora.py --model DIR [--seqs 4096,8192,12288] [--steps 3] [--targets all-linear|attn-mlp]"""
 import argparse
 import json
 import pathlib
@@ -1800,8 +1800,8 @@ def has(mod):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--seq", type=int, default=4096)
-    ap.add_argument("--steps", type=int, default=4)
+    ap.add_argument("--seqs", default="4096")
+    ap.add_argument("--steps", type=int, default=3)
     ap.add_argument("--targets", default="all-linear")
     a = ap.parse_args()
     import torch
@@ -1815,27 +1815,35 @@ def main():
     model.train()  # gradient checkpointing is only active in train mode
     names = sorted({n.split(".")[-1] for n, m in model.named_modules() if hasattr(m, "lora_A") and "lora_A" not in n})
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4)
-    ids = torch.randint(1000, 20000, (1, a.seq), device="cuda")
-    labels = ids.clone()
-    labels[0, : int(a.seq * 0.4)] = -100  # a realistic split: the reply is the last 60%
-    torch.cuda.reset_peak_memory_stats()
-    secs = []
-    for _ in range(a.steps):
-        torch.cuda.synchronize()
-        t = time.time()
-        loss, _ = qlora_common.reply_loss(model, head, ids, labels)
-        loss.backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
-        torch.cuda.synchronize()
-        secs.append(time.time() - t)
-    steady = secs[1:] or secs
-    tok_s = a.seq / (sum(steady) / len(steady))
-    peak = torch.cuda.max_memory_allocated() / 2**30
     report = {"model": a.model, "transformers": transformers.__version__, "torch": torch.__version__,
               "fla": has("fla"), "causal_conv1d": has("causal_conv1d"), "load_s": round(load_s, 1),
-              "lora_target_modules": names, "step_secs": [round(s, 2) for s in secs], "tok_s": round(tok_s),
-              "peak_vram_gb": round(peak, 2), "seq": a.seq, "pass": peak <= 7.5 and tok_s >= 400}
+              "lora_target_modules": names, "runs": []}
+    for seq in (int(x) for x in a.seqs.split(",")):
+        ids = torch.randint(1000, 20000, (1, seq), device="cuda")
+        labels = ids.clone()
+        labels[0, : int(seq * 0.4)] = -100  # a realistic split: the reply is the last 60%
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        secs = []
+        try:
+            for _ in range(a.steps):
+                torch.cuda.synchronize()
+                t = time.time()
+                loss, _ = qlora_common.reply_loss(model, head, ids, labels)
+                loss.backward()
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+                torch.cuda.synchronize()
+                secs.append(time.time() - t)
+            steady = secs[1:] or secs
+            tok_s = seq / (sum(steady) / len(steady))
+            peak = torch.cuda.max_memory_allocated() / 2**30
+            report["runs"].append({"seq": seq, "step_secs": [round(s, 2) for s in secs], "tok_s": round(tok_s),
+                                   "peak_vram_gb": round(peak, 2), "pass": peak <= 7.5 and tok_s >= 400})
+        except torch.OutOfMemoryError as e:
+            report["runs"].append({"seq": seq, "error": "out of memory", "pass": False})
+            opt.zero_grad(set_to_none=True)
+        print(json.dumps(report["runs"][-1]), flush=True)
     print(json.dumps(report, indent=1))
 
 
@@ -2478,7 +2486,7 @@ Contents: the data manifest counts; the smoke-test verdict and the final ladder;
 mkdir -p docs/benchmarks/roles/eval
 cp -r /e/AI/role-adapters/eval/4B/test /e/AI/role-adapters/eval/9B/test docs/benchmarks/roles/eval/ 2>/dev/null
 find docs/benchmarks/roles -type f \( -name "*.json" -o -name "*.jsonl" \) | xargs $PY scripts/moe-bench/scrub_paths.py | awk '$1>0'
-grep -rIil "ethan" docs/benchmarks/roles docs/superpowers/specs/2026-10-09-role-adapters-2c-results.md scripts/roles || echo "no account name"
+grep -rIil "$(whoami)" docs/benchmarks/roles docs/superpowers/specs/2026-10-09-role-adapters-2c-results.md scripts/roles || echo "no account name"
 git add docs/benchmarks/roles docs/superpowers/specs/2026-10-09-role-adapters-2c-results.md
 git commit -m "docs(roles): 2c results - arm S role gates and retention at 4B and 9B"
 git push origin claude/micro-agent-swarm-design-929d42
