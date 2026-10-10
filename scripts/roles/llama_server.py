@@ -1,5 +1,6 @@
 """llama-server (build 836d571) for the role-adapter evaluation: one base GGUF, optionally one LoRA GGUF."""
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -10,7 +11,8 @@ PORT = 8096
 
 
 class Server:
-    def __init__(self, gguf, lora=None, slot_ctx=16384, parallel=4, port=PORT, log_path=None, extra=()):
+    def __init__(self, gguf, lora=None, slot_ctx=16384, parallel=None, port=PORT, log_path=None, extra=()):
+        parallel = parallel or int(os.environ.get("ROLES_PARALLEL", "4"))  # 8 streams roughly double the aggregate speed
         self.port, self.parallel = port, parallel
         self.args = [SERVER, "-m", str(gguf), "--host", "127.0.0.1", "--port", str(port), "-ngl", "99",
                      "-c", str(slot_ctx * parallel), "-np", str(parallel), "-ctk", "q8_0", "-ctv", "q8_0",
