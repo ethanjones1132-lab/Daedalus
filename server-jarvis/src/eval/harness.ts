@@ -306,7 +306,7 @@ export interface Baseline {
   version: number;
   total: number;
   passed: number;
-  /** id -> "pass" | "fail" */
+  /** id -> outcome, preserving the existing on-disk string schema. */
   outcomes: Record<string, "pass" | "fail">;
 }
 
@@ -323,17 +323,19 @@ export function toBaseline(report: EvalReport): Baseline {
 export function diffBaseline(report: EvalReport, baseline: Baseline): string[] {
   const diffs: string[] = [];
   const live = toBaseline(report);
+  const liveOutcomes = live.outcomes as Record<string, unknown>;
+  const baseOutcomes = baseline.outcomes as Record<string, unknown>;
 
   if (live.total !== baseline.total) {
     diffs.push(`case count changed: ${baseline.total} -> ${live.total} (update baseline.json)`);
   }
-  for (const [id, outcome] of Object.entries(baseline.outcomes)) {
-    const now = live.outcomes[id];
+  for (const [id, outcome] of Object.entries(baseOutcomes)) {
+    const now = liveOutcomes[id];
     if (now === undefined) diffs.push(`case removed: ${id}`);
     else if (now !== outcome) diffs.push(`case ${id}: ${outcome} -> ${now}`);
   }
-  for (const id of Object.keys(live.outcomes)) {
-    if (!(id in baseline.outcomes)) diffs.push(`case added: ${id} (update baseline.json)`);
+  for (const id of Object.keys(liveOutcomes)) {
+    if (!(id in baseOutcomes)) diffs.push(`case added: ${id} (update baseline.json)`);
   }
   return diffs;
 }
@@ -350,6 +352,53 @@ export function diffBaseline(report: EvalReport, baseline: Baseline): string[] {
  * regressed, so the only way to (re)create a baseline is an explicit
  * `--write-baseline`.
  */
+/**
+ * Decide whether a parsed value is a structurally trustworthy Baseline.
+ *
+ * Fail-closed rule, tightened: a baseline only counts as readable when
+ *   - `total` is a non-negative integer,
+ *   - `outcomes` is a plain (non-array, non-null) object whose every value is
+ *     "pass" or "fail",
+ *   - `total` equals the number of entries in `outcomes`.
+ *
+ * Without all three we cannot prove the suite has not regressed, so the only
+ * way to (re)create a baseline is an explicit `--write-baseline`.
+ */
+export function validateBaseline(parsed: unknown): { ok: true; baseline: Baseline } | { ok: false; reason: string } {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "baseline is not a valid Baseline object" };
+  }
+  const rec = parsed as Partial<Baseline>;
+  if (rec.version !== 1) return { ok: false, reason: "baseline.version must be 1" };
+  if (typeof rec.passed !== "number" || !Number.isInteger(rec.passed) || rec.passed < 0) {
+    return { ok: false, reason: "baseline.passed is not a non-negative integer" };
+  }
+
+  if (typeof rec.total !== "number" || !Number.isInteger(rec.total) || rec.total < 0) {
+    return { ok: false, reason: "baseline.total is not a non-negative integer" };
+  }
+  if (rec.outcomes === null || typeof rec.outcomes !== "object" || Array.isArray(rec.outcomes)) {
+    return { ok: false, reason: "baseline.outcomes is not an object" };
+  }
+
+  const entries = Object.entries(rec.outcomes as Record<string, unknown>);
+  if (entries.length !== rec.total) {
+    return {
+      ok: false,
+      reason: `baseline.total=${rec.total} does not match ${entries.length} outcomes entries`,
+    };
+  }
+  for (const [id, value] of entries) {
+    if (value === "pass" || value === "fail") continue;
+    return { ok: false, reason: `baseline.outcomes["${id}"] is ${JSON.stringify(value)}, not a pass/fail outcome` };
+  }
+
+  if (rec.passed !== entries.filter(([, value]) => value === "pass").length) {
+    return { ok: false, reason: "baseline.passed does not match passing outcomes" };
+  }
+  return { ok: true, baseline: rec as Baseline };
+}
+
 export function runCliGate(opts: {
   report: EvalReport;
   baselinePath: string;
@@ -370,23 +419,15 @@ export function runCliGate(opts: {
   output.push(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
 
   // Read + validate the baseline. A missing file, invalid JSON, or a
-  // structurally wrong object all mean the gate cannot be evaluated honestly.
+  // structurally untrustworthy object all mean the gate cannot be evaluated
+  // honestly.
   let baseline: Baseline | null = null;
   let readError: string | null = null;
   try {
     const parsed = JSON.parse(readFileSync(baselinePath, "utf8")) as unknown;
-    const rec = parsed as Partial<Baseline> | null;
-    if (
-      rec === null ||
-      typeof rec !== "object" ||
-      typeof rec.total !== "number" ||
-      rec.outcomes === null ||
-      typeof rec.outcomes !== "object"
-    ) {
-      readError = "baseline is not a valid Baseline object";
-    } else {
-      baseline = rec as Baseline;
-    }
+    const verdict = validateBaseline(parsed);
+    if (verdict.ok) baseline = verdict.baseline;
+    else readError = verdict.reason;
   } catch (e) {
     readError = String(e);
   }

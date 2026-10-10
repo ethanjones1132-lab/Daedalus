@@ -2,7 +2,7 @@ import { describe, test, expect } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { runEval, diffBaseline, runCliGate, toBaseline, type Baseline, type EvalReport } from "./harness";
+import { runEval, diffBaseline, runCliGate, toBaseline, validateBaseline, type Baseline, type EvalReport } from "./harness";
 
 describe("Orchestration eval / regression harness", () => {
   test("every eval case passes", async () => {
@@ -132,4 +132,123 @@ describe("regression CLI gate (fail-closed)", () => {
       expect(gated.exitCode).toBe(0);
     });
   });
+});
+
+// ── Baseline schema validation (fail-closed, tightened) ─────────────
+// A baseline is only trustworthy when total is a non-negative integer,
+// outcomes is a plain object of pass/fail strings, and total matches the entry count.
+describe("baseline schema validation", () => {
+  const goodReport = fakeReport([{ id: "a", pass: true }, { id: "b", pass: false }]);
+  const goodBaseline = () => JSON.parse(JSON.stringify(toBaseline(goodReport)));
+
+  test("validateBaseline accepts a well-formed baseline", () => {
+    const verdict = validateBaseline(goodBaseline());
+    expect(verdict.ok).toBe(true);
+    if (verdict.ok) expect(verdict.baseline.total).toBe(2);
+  });
+
+  test("outcomes as an ARRAY is rejected (typeof [] === 'object' must not pass)", async () => {
+    await withTempBaseline((baselinePath) => {
+      const bad = goodBaseline();
+      bad.outcomes = [true, false];
+      writeFileSync(baselinePath, JSON.stringify(bad));
+      const { exitCode, output } = runCliGate({ report: goodReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("Baseline unreadable");
+      expect(output.join("\n")).toContain("outcomes");
+    });
+  });
+
+  test("outcomes with null / invalid entries is rejected", async () => {
+    await withTempBaseline((baselinePath) => {
+      const bad = goodBaseline();
+      bad.outcomes = { a: null, b: 1 };
+      writeFileSync(baselinePath, JSON.stringify(bad));
+      const { exitCode, output } = runCliGate({ report: goodReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("Baseline unreadable");
+    });
+  });
+
+  test("total not matching entry count is rejected", async () => {
+    await withTempBaseline((baselinePath) => {
+      const bad = goodBaseline();
+      bad.total = 7;
+      writeFileSync(baselinePath, JSON.stringify(bad));
+      const { exitCode, output } = runCliGate({ report: goodReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("does not match");
+    });
+  });
+
+  test("negative total is rejected", async () => {
+    await withTempBaseline((baselinePath) => {
+      const bad = goodBaseline();
+      bad.total = -1;
+      writeFileSync(baselinePath, JSON.stringify(bad));
+      const { exitCode, output } = runCliGate({ report: goodReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("non-negative integer");
+    });
+  });
+
+  test("fractional total is rejected", async () => {
+    await withTempBaseline((baselinePath) => {
+      const bad = goodBaseline();
+      bad.total = 2.5;
+      writeFileSync(baselinePath, JSON.stringify(bad));
+      const { exitCode, output } = runCliGate({ report: goodReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("non-negative integer");
+    });
+  });
+
+  // Matching existing string snapshots remain valid without a migration.
+  test("existing string outcomes validate and are honoured verbatim", async () => {
+    await withTempBaseline((baselinePath) => {
+      const legacy = {
+        version: 1,
+        total: 1,
+        passed: 1,
+        outcomes: { a: "pass" },
+      };
+      writeFileSync(baselinePath, JSON.stringify(legacy));
+      expect(validateBaseline(legacy).ok).toBe(true);
+      const cleanReport = fakeReport([{ id: "a", pass: true }]);
+      const { exitCode, output } = runCliGate({ report: cleanReport, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(0);
+      expect(output.join("\n")).not.toContain("Baseline drift");
+    });
+  });
+
+  test("semantic mismatch against a existing string baseline still fails", async () => {
+    await withTempBaseline((baselinePath) => {
+      const legacy = { version: 1, total: 1, passed: 1, outcomes: { a: "pass" } };
+      writeFileSync(baselinePath, JSON.stringify(legacy));
+      const regressed = fakeReport([{ id: "a", pass: false }]);
+      const { exitCode, output } = runCliGate({ report: regressed, baselinePath, writeBaseline: false });
+      expect(exitCode).toBe(1);
+      expect(output.join("\n")).toContain("Baseline drift detected");
+    });
+  });
+
+  test("the repo's own baseline.json passes validation", () => {
+    const onDisk = JSON.parse(
+      readFileSync(join(import.meta.dir, "baseline.json"), "utf-8"),
+    ) as unknown;
+    const verdict = validateBaseline(onDisk);
+    expect(verdict.ok).toBe(true);
+  });
+});
+
+// Preserve the existing on-disk contract; alternate representations are malformed.
+test("boolean outcome values cannot silently extend the baseline schema", () => {
+  expect(validateBaseline({ version: 1, total: 1, passed: 1, outcomes: { a: true } }).ok).toBe(false);
+});
+
+test("baseline metadata is complete and consistent", () => {
+  const good = { version: 1, total: 2, passed: 1, outcomes: { a: "pass", b: "fail" } };
+  for (const patch of [{version: undefined}, {version: 999}, {passed: undefined}, {passed: -1}, {passed: 0.5}, {passed: 3}, {passed: 2}]) {
+    expect(validateBaseline({ ...good, ...patch }).ok).toBe(false);
+  }
 });
