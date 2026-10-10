@@ -67,6 +67,19 @@ def one(rec, k, path):
     print(f"fault {row['sid'][:60]:60} k{k}: {'kept' if row['ok'] else 'dropped'}{'; ' + err if err else ''}", flush=True)
 
 
+_told = threading.Event()
+
+
+def safe_one(rec, k, path):
+    """One job; a spent usage window or token cap (teacher_gen.Stop) ends the jobs quietly and records nothing for them."""
+    try:
+        one(rec, k, path)
+    except tg.Stop as e:
+        if not _told.is_set():
+            _told.set()
+            print(f"fault STOP: {e}", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
@@ -85,9 +98,12 @@ def main():
         for k in range(a.per_seed if split == "train" else 1):
             if (samples.sid_of(rec), k) not in done:
                 jobs.append((rec, k))
+    # shortest programs first: a fix prompt shows every file, and the trainer drops samples over its token cap, so
+    # the short ones are the ones that become training data
+    jobs.sort(key=lambda j: (j[1], sum(len(c) for c in passing_files(j[0]).values())))
     print(f"{len(jobs)} fault jobs", flush=True)
     with concurrent.futures.ThreadPoolExecutor(a.workers) as ex:
-        list(ex.map(lambda j: one(j[0], j[1], path), jobs))
+        list(ex.map(lambda j: safe_one(j[0], j[1], path), jobs))
 
 
 if __name__ == "__main__":

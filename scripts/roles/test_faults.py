@@ -30,6 +30,23 @@ class FaultTest(unittest.TestCase):
         self.assertEqual(faults.passing_files(rec), {"calc.py": "x = 1\n"})
         self.assertIsNone(faults.passing_files({"entry": "calc.py", "build": good, "build_ok": False}))
 
+    def test_a_spent_budget_ends_a_job_quietly_and_records_nothing(self):
+        import tempfile
+        path = pathlib.Path(tempfile.mkdtemp()) / "faults.jsonl"
+        fence = "`" * 3
+        rec = {"entry": "calc.py", "build": f"{fence}python\n# file: calc.py\nx = 1\n{fence}", "build_ok": True,
+               "request": "r", "tests": "t", "lang": "python", "field": "f", "kind": "k", "i": 0}
+        old = faults.tg.call
+
+        def stopped(*a, **kw):
+            raise faults.tg.Stop("cap")
+        faults.tg.call = stopped
+        try:
+            faults.safe_one(rec, 0, path)
+        finally:
+            faults.tg.call = old
+        self.assertFalse(path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
