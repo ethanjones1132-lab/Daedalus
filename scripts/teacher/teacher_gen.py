@@ -13,6 +13,7 @@ usage: teacher_gen.py compare --out E:/AI/teacher-data/compare-2026-10-08
 import argparse
 import concurrent.futures
 import json
+import os
 import pathlib
 import random
 import re
@@ -45,6 +46,43 @@ def log_usage(usage, backend, secs):
         f.write(json.dumps({"t": round(time.time()), "backend": backend, "secs": secs,
                             "prompt_tokens": usage.get("prompt_tokens"), "completion_tokens": usage.get("completion_tokens"),
                             "total_tokens": usage.get("total_tokens")}) + "\n")
+
+
+class Stop(Exception):
+    """The plan's usage window is spent or the self-imposed token cap is reached: every worker stops, nothing partial is
+    recorded, and a rerun resumes from the unrecorded seeds."""
+
+
+_stop = threading.Event()
+START = time.time()
+
+
+def spent_tokens(since):
+    """DeepSeek tokens (prompt + completion, as the API reports them) logged since `since`, across every process."""
+    if not USAGE_LOG.exists():
+        return 0
+    n = 0
+    with open(USAGE_LOG, encoding="utf-8") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("backend") == "deepseek" and r.get("t", 0) >= since:
+                n += r.get("total_tokens") or 0
+    return n
+
+
+def check_budget():
+    """TEACHER_TOKEN_CAP (tokens, unset = no cap) counted from TEACHER_BUDGET_SINCE (epoch seconds, default: this start)."""
+    if _stop.is_set():
+        raise Stop("stopped")
+    cap = int(os.environ.get("TEACHER_TOKEN_CAP") or 0)
+    if cap:
+        used = spent_tokens(float(os.environ.get("TEACHER_BUDGET_SINCE") or START))
+        if used >= cap:
+            _stop.set()
+            raise Stop(f"token cap reached: {used} >= {cap}")
 
 
 def deepseek(prompt, max_tokens=32768):
@@ -128,8 +166,12 @@ def call(backend, prompt, retries=4, **kw):
         t = time.time()
         err = None
         for attempt in range(retries):
+            check_budget()
             try:
                 return BACKENDS[backend](prompt, **kw), round(time.time() - t, 1), None
+            except opencode_go.GoUsageLimitError as e:
+                _stop.set()
+                raise Stop(repr(e)[:200]) from e
             except Exception as e:  # recorded, never fatal for the comparison
                 err = repr(e)[:300]
                 if attempt + 1 < retries and any(k in err for k in TRANSIENT):
@@ -367,6 +409,9 @@ def seeds(a):
         list(ex.map(cell, [c for c in cells if c not in done]))
 
 
+_stop_told = threading.Event()
+
+
 def gen(a):
     out = pathlib.Path(a.out)
     keep_splits = set(a.splits.split(",")) if a.splits else None
@@ -379,6 +424,10 @@ def gen(a):
     def run(s):
         try:
             run_one(s)
+        except Stop as e:
+            if not _stop_told.is_set():
+                _stop_told.set()
+                print(f"gen STOP: {e}", flush=True)
         except Exception as e:  # one bad seed must not stop the pool; it is not recorded, so a rerun retries it
             print(f"gen ERROR {s['lang']} {s['field']} #{s['i']}: {e!r}"[:300], flush=True)
 

@@ -55,6 +55,10 @@ def extract_json(text):
     return None
 
 
+class GoUsageLimitError(Exception):
+    """The plan's usage window is spent (HTTP 429 with a long Retry-After): waiting a few seconds cannot help."""
+
+
 class Client:
     def __init__(self, key=None, model=None, base=BASE):
         self._key, self.base = key or read_key(), base
@@ -92,6 +96,14 @@ class Client:
                 if e.code == 400 and "response_format" in payload:
                     payload.pop("response_format")
                     continue
+                if e.code == 429:
+                    body = e.read().decode("utf-8", "replace")[:300]
+                    try:
+                        wait = float(e.headers.get("Retry-After") or 0)
+                    except ValueError:
+                        wait = 0.0
+                    if wait >= 900 or "UsageLimit" in body:  # a spent window, not a burst limit
+                        raise GoUsageLimitError(f"HTTP 429, Retry-After {wait:.0f} s: {body}") from e
                 if e.code not in (429, 500, 502, 503, 504) or k == tries - 1:
                     raise
             except (urllib.error.URLError, TimeoutError):
