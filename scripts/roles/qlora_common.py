@@ -3,12 +3,21 @@ ATTN_MLP = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "dow
 EXCLUDE = r".*(visual|vision|merger).*"
 
 
+def prefer_efficient_sdpa():
+    """Qwen3.5 attention has 256-wide heads: PyTorch's flash kernel does not support them on this GPU, and HF's grouped-query
+    shortcut (enable_gqa) then falls back to the math kernel, which materializes 16 x 4096 x 4096 scores (4.3 GB per layer).
+    Expanding the keys and values instead lets the memory-efficient kernel run (250 MiB). Measured 2026-10-09."""
+    import transformers.integrations.sdpa_attention as sa
+    sa.use_gqa_in_sdpa = lambda *a, **k: False
+
+
 def load_qlora(path, targets="all-linear", rank=16):
     """4-bit NF4 base with gradient checkpointing (no fp32 upcast of the embeddings) and a LoRA on top."""
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
+    prefer_efficient_sdpa()
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                              bnb_4bit_compute_dtype=torch.bfloat16)
     model = AutoModelForCausalLM.from_pretrained(path, quantization_config=bnb, dtype=torch.bfloat16, device_map={"": 0})
