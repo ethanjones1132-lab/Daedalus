@@ -6,7 +6,7 @@
 # Priority: dev and test seeds first, then faults (one per passing build, shortest programs first: the trainer drops long
 # samples), then the remaining train seeds. One process at a time, <= 6 concurrent calls. The cap is cumulative: 30% for the
 # first phase, 63% by the end of faults, 100% by the end of train, so a phase that ends early hands its leftover on.
-# usage: run_gen_after_reset.sh [token-cap]      markers: $LOG, $DONE
+# usage: run_gen_after_reset.sh [token-cap] [start]      markers: $LOG, $DONE
 set -u
 PY=/c/qwen3-forge-stage/venv/Scripts/python.exe
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
@@ -18,8 +18,13 @@ export TEACHER_TOKEN_CAP=${1:-3000000}
 say() { echo "$(date +%H:%M:%S) $*" | tee -a "$LOG"; }
 rm -f "$DONE"
 
-START=$(date -d "03:35 tomorrow" +%s)
-[ "$(date +%H)" -lt 12 ] && START=$(date -d "03:35" +%s)  # run after midnight: today's 03:35
+# $2 = when to start, any `date -d` string (the monthly limit's Retry-After on 2026-10-10 03:50 was 171,705 s: use
+# "2026-10-12 03:40"); default: the next 03:35
+if [ -n "${2:-}" ]; then START=$(date -d "$2" +%s)
+else
+  START=$(date -d "03:35 tomorrow" +%s)
+  [ "$(date +%H)" -lt 12 ] && START=$(date -d "03:35" +%s)  # run after midnight: today's 03:35
+fi
 now=$(date +%s)
 [ "$now" -lt "$START" ] && { say "waiting $((START - now)) s until 03:35"; sleep $((START - now)); }
 

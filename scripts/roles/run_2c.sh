@@ -50,10 +50,15 @@ if [ "$MODE" = pre ]; then
   exit 0
 fi
 
-# ---- wait for the capped DeepSeek restart (network only) -------------------------------------------------------------
-DEADLINE=$(( $(date +%s) + 12 * 3600 ))
-while [ ! -f /e/AI/teacher-data/gen-restart.done ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do sleep 60; done
-say "generation marker: $([ -f /e/AI/teacher-data/gen-restart.done ] && echo present || echo ABSENT, going on with the data so far)"
+# ---- the DeepSeek restart (network only) -----------------------------------------------------------------------------
+# The monthly OpenCode Go limit did not reset on 2026-10-10 (Retry-After 171,705 s at 03:50), so this round trains on the
+# data already collected (WAIT_GEN=1 waits for gen-restart.done instead). MIN_TRAIN: a role with fewer train samples is
+# not trained (the fix role has 13 until teacher-authored faults can be made).
+if [ "${WAIT_GEN:-0}" = 1 ]; then
+  DEADLINE=$(( $(date +%s) + 12 * 3600 ))
+  while [ ! -f /e/AI/teacher-data/gen-restart.done ] && [ "$(date +%s)" -lt "$DEADLINE" ]; do sleep 60; done
+fi
+MIN_TRAIN=${MIN_TRAIN:-40}
 
 # ---- freeze the data ---------------------------------------------------------------------------------------------------
 $PY scripts/roles/prepare_seeds.py --dir "$DIR" >> "$LOGS/2c-prepare.out" 2>&1
@@ -81,7 +86,7 @@ for s in $SIZES; do
     R=$RUNS/$s-S-$role
     [ -f "$R/summary.json" ] && continue
     tn=$(wc -l < "$D/$role-train.jsonl" 2>/dev/null || echo 0); dn=$(wc -l < "$D/$role-dev.jsonl" 2>/dev/null || echo 0)
-    if [ "$tn" -lt 8 ] || [ "$dn" -lt 3 ]; then say "SKIP training $s $role: train $tn, dev $dn"; continue; fi
+    if [ "$tn" -lt "$MIN_TRAIN" ] || [ "$dn" -lt 3 ]; then say "SKIP training $s $role: train $tn, dev $dn"; continue; fi
     no_server
     say "train $s $role (train $tn, dev $dn)"
     upy scripts/roles/train_lora.py --model "E:/AI/role-adapters/models/Qwen3.5-$s" --train "$D/$role-train.jsonl" \
