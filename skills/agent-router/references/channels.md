@@ -40,17 +40,19 @@ This is the only channel for these models.
   - For reviews, add a read-only sandbox if one is offered (e.g. `--sandbox read-only`).
   - For a parallel implementer, run it inside its own git worktree with a sandbox that allows writes there.
   - Prefer a flag that writes the final message to a file, if one exists; otherwise redirect stdout.
-- Effort: **Luna at xhigh** for most work; **Sol at high** for final reviews and second attempts.
+- Roles and effort:
+  - **Luna at xhigh** is a worker-pool implementer. It takes larger or more involved implementation than Haiku, a parallel implementer in its own worktree, or the main implementer when GPT-6 drives.
+  - **Sol at high** is a frontier specialist, for heavy reasoning, final reviews and second attempts. It isn't a routine implementer.
 
 ## Grok CLI: Grok 4.7
 
 - Discover with `grok --help`, plus its model-list command if it has one.
 - Template (unverified): `grok -m <grok-4.7 slug> -p "<brief>"`. Use headless or prompt mode, not interactive.
-- Use for heavy reasoning, planning, second opinions, reviews and parallel implementation (own worktree).
+- A frontier specialist for heavy reasoning, planning, second opinions and reviews. It isn't a routine implementer.
 
 ## Claude models (Claude-driver sessions only)
 
-- Prefer the **Agent tool** over the CLI: `model: sonnet` / `model: haiku`, with `effort` set per invocation where supported. Use the `fork` subagent type when the task needs this conversation's context.
+- Prefer the **Agent tool** over the CLI. Workers run as `model: haiku` with `effort: xhigh` for edits (low for checks), set per invocation or in agent frontmatter. A sub-lead runs as `model: sonnet`, effort high. Use the `fork` subagent type when the task needs this conversation's context.
 - Other drivers don't route to Claude (the user's rule).
 
 ## Reading results back

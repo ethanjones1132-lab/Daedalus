@@ -12,22 +12,23 @@
         "Driver does not read every plan doc inline in its own context",
         "Driver verifies the cheap tier's output (spot-checks some docs or cross-checks claims) before reporting",
         "Plans to end with a routing log listing the delegation(s)",
-        "Does not use a Sonnet executor or cross-vendor frontier review for this read-only summarization"
+        "Does not use Sonnet, a cross-vendor frontier model, or Opus subagents for this read-only summarization"
       ]
     },
     {
       "id": 2,
       "name": "long-horizon-test-fix",
       "prompt": "the server-jarvis test suite has a bunch of failures after the llama.cpp backend merge (cb91055). get it all green again without skipping tests, and make sure nothing regresses in the provider routing",
-      "expected_output": "Opus plans with milestones and acceptance checks, Sonnet executes milestone by milestone with Opus review between, cheap tier or Haiku used for test-output triage, cross-vendor final review (GPT-6.1 Sol or Grok 4.7), routing log.",
+      "expected_output": "Opus diagnoses and writes briefs; fixes go to Haiku 5.5 at xhigh (in parallel if clusters are independent), or a Sonnet sub-lead only if coordinating them would flood the driver; pool model triages logs; Opus checks each result; cross-vendor final review (GPT-6.1 Sol or Grok 4.7); routing log.",
       "files": [],
       "assertions": [
-        "Driver (Opus) writes a plan with ordered milestones and a verifiable acceptance check per milestone",
-        "Delegates milestone execution to a Sonnet 5.5 subagent rather than doing all the fixing inline or giving it to Haiku/cheap tier",
-        "Driver reviews each milestone's diff/evidence before the next milestone starts",
-        "Uses the cheap OpenCode tier or Haiku for grunt work such as triaging/summarizing failing test output",
+        "Driver (Opus) diagnoses root causes and writes per-fix briefs, each with a verifiable acceptance check",
+        "Routes the well-specified fixes to Haiku 5.5 at xhigh (or GPT-6 Luna), not to a Sonnet executor by default",
+        "Uses Sonnet only as a sub-lead coordinating parallel Haiku workers, and only with a stated reason, or not at all",
+        "Driver checks each fix's diff/evidence before building on it",
+        "Uses a worker-pool model (Zen free / DeepSeek / Mimo / Haiku) for grunt work such as triaging failing test output",
         "Gets a cross-vendor final review from GPT-6.1 Sol (high) or Grok 4.7 for the provider-routing changes",
-        "Keeps the main session on one model (no mid-session model switch) and does not use Fable",
+        "Keeps the main session on one model and does not use Fable",
         "Plans to end with a routing log"
       ]
     },
@@ -42,6 +43,21 @@
         "Does not request a cross-vendor (GPT-6 / Grok) review for this change",
         "Runs the server-jarvis tests (or typecheck) to confirm nothing broke",
         "Does not switch the main session model or raise effort above high"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "parallel-split-refactor",
+      "prompt": "server-jarvis/src/index.ts is 5.7k lines. split the http route handlers out into per-area modules under src/routes/ (chat, models, memory, cron, etc) with zero behavior change. tests + typecheck must stay green",
+      "expected_output": "Opus maps the areas and writes the module plan and briefs; parallel Haiku 5.5 xhigh workers (directly, or under a Sonnet sub-lead with a stated reason) each extract one area on disjoint files/worktrees; Opus checks each; cross-vendor review by Sol or Grok; routing log.",
+      "files": [],
+      "assertions": [
+        "Driver (Opus) maps the route areas and writes the target module layout and per-area briefs itself",
+        "Area extractions are done by parallel workers (Haiku 5.5 xhigh, or Luna/DeepSeek), not all inline by the driver",
+        "If Sonnet is used, it is as a sub-lead coordinating parallel Haiku workers with a stated reason; Sonnet is not the sole implementer",
+        "Workers get disjoint files or separate worktrees and there is an integration step with tests + typecheck",
+        "Gets a cross-vendor review (GPT-6.1 Sol or Grok 4.7) of the refactor before calling it done",
+        "Plans to end with a routing log"
       ]
     }
   ]

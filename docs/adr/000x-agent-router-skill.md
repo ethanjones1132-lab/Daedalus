@@ -10,11 +10,9 @@ A single skill, `agent-router`, tells whichever model is driving a session (Clau
 |---|---|
 | Where it lives | A claude.ai skill, with no SessionStart hook or CLAUDE.md pointer. It stays optional until it proves itself. |
 | Claude driver | Opus 5.5, effort pinned at **high**. Fable 5.1 only on request (it can bill usage credits). |
-| Sonnet 5.5 | The "bigger subagent": it carries out long-horizon plans that Opus wrote and may run Haiku 5.5 workers. It never drives and never gives the final review. Opus checks each milestone. |
-| Haiku 5.5 | Leaf tasks with a mechanical check, context under ~100K tokens (its price rises 5× above that). |
-| GPT-6 (Codex CLI) | Luna at xhigh for most work; 6.1 Sol at high for final reviews and second attempts. Roles: cross-vendor reviewer, parallel implementer, second attempt on hard bugs. GPT-6 also runs this skill as a driver. |
-| Grok 4.7 (Grok CLI) | The same roles as GPT-6, weighted toward heavy reasoning, planning and second opinions. |
-| Cheap tier | DeepSeek v4.1 Flash, Mimo 2.6 Flash (OpenCode Go, paid) and OpenCode Zen free models, **through OpenCode CLI only**. They get grunt work first, every time: bulk reading, data generation, mechanical code, first drafts. |
+| Worker pool (default doers) | OpenCode Zen free models, DeepSeek v4.1 Flash and Mimo 2.6 Flash (OpenCode Go, paid) **through OpenCode CLI only**; Haiku 5.5 at **xhigh** for well-specified fixes and edits (context under ~100K tokens); GPT-6 Luna at xhigh (Codex CLI) for larger implementation. |
+| Sonnet 5.5 | Sub-lead only: brought in when a chunk of work needs its own coordinator running parallel Haiku 5.5 workers. It never drives, never gives the final review, and isn't a default worker. (Revised 2026-10-11, superseding "Sonnet as long-horizon executor".) |
+| Frontier specialists | GPT-6.1 Sol at high (Codex CLI) and Grok 4.7 (Grok CLI): heavy reasoning, second opinions, second attempts on stuck problems, and cross-vendor final review. They aren't routine implementers. GPT-6 also runs this skill as a driver. |
 | Data rule | Anything that isn't a secret may go to any roster model. Secrets, keys, `.env*`, `auth.json` and personal data never leave. |
 | DeepSeek quota | No skill-level restriction. |
 | Non-Claude drivers | Don't route to Claude. They use their own vendor plus the OpenCode tier. |
