@@ -21,7 +21,7 @@ Long-running Bun process (`server-jarvis/`) that the Tauri shell spawns at boot.
 _Avoid_: "the gateway", "the API"
 
 **Chat path (today)**:
-UI → `ChatPanel` → `jarvis_send_message` Tauri command → Bun server → active inference backend. The Bun server uses the OpenAI-compatible endpoint for Ollama, llama.cpp, and OpenRouter, and invokes Claude CLI directly for that backend. All native, no external agent runtime.
+UI (Sessions page, `useSessionTurn`) → `POST /chat/stream` on the Bun server (SSE, see `docs/sse-stream-contract.md`) → active inference backend; the Native surface persists the Session turn (`append_message`, `record_terminal_run`). The `jarvis_send_message` Tauri command and its `jarvis://*` events remain wired as a fallback but are not invoked by the UI. The Bun server uses the OpenAI-compatible endpoint for Ollama, llama.cpp, and OpenRouter, and invokes Claude CLI directly for that backend. All native, no external agent runtime.
 
 **Native surface**:
 The Tauri commands in `src-tauri/src/commands/` that are backed by SQLite (via `db/`) rather than by the Bun server. Sessions, agents, skills, models, channels, cron, agents, system health — all native Rust.
