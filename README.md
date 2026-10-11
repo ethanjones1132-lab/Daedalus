@@ -246,3 +246,13 @@ MIT — see [LICENSE](LICENSE). Copyright © 2026 Ethan Jones.
 [GitHub](https://github.com/ethanjones1132-lab/Daedalus) · [Issues](https://github.com/ethanjones1132-lab/Daedalus/issues)
 
 </div>
+
+## Plugins
+
+This repo is also a Claude Code plugin marketplace (`daedalus-tools`):
+
+```
+/plugin install agent-router --marketplace ethanjones1132-lab/Daedalus
+```
+
+See `plugins/agent-router/README.md`.

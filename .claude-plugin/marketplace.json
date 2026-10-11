@@ -1,0 +1,14 @@
+{
+  "name": "daedalus-tools",
+  "owner": {
+    "name": "ethanjones1132-lab"
+  },
+  "description": "Claude Code plugins from the Daedalus / Jarvis project.",
+  "plugins": [
+    {
+      "name": "agent-router",
+      "source": "./plugins/agent-router",
+      "description": "Model, subagent and CLI-agent routing for Claude Code, Codex and Grok drivers."
+    }
+  ]
+}

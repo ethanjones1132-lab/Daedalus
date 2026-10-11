@@ -4,15 +4,16 @@ Source: `skills/agent-router/`. Decided with the owner on 2026-10-11, in an inte
 
 ## Decision
 
-A single skill, `agent-router`, tells whichever model is driving a session (Claude Opus 5.5, GPT-6 or Grok 4.7) who should do each piece of work.
+A Claude Code plugin, `agent-router` (`plugins/agent-router/`), tells whichever model is driving a session (Claude Sonnet 5.5, GPT-6 or Grok 4.7) who should do each piece of work. It bundles the routing skill with four fixed agent definitions (approver, worker, runner, lead).
 
 | Question | Decision |
 |---|---|
-| Where it lives | A claude.ai skill, with no SessionStart hook or CLAUDE.md pointer. It stays optional until it proves itself. |
-| Claude driver | Opus 5.5, effort pinned at **high**. Fable 5.1 only on request (it can bill usage credits). |
+| Where it lives | A plugin in this repo's `daedalus-tools` marketplace, plus the same skill as a claude.ai skill for cloud sessions. There is no SessionStart hook or CLAUDE.md pointer; it stays optional until it proves itself. (Revised 2026-10-11: it was a claude.ai skill only.) |
+| Claude driver | **Sonnet 5.5 at xhigh**. Opus 5.5 (high) is consulted as a subagent: it approves large plans (gate 1) and handles heavy reasoning (gate 2). Fable 5.1 only on request. (Revised 2026-10-11: Opus at high was the driver.) |
+| Sonnet safeguards | The plan goes in a file and is re-read at each milestone; the request is checked line by line before calling the task done; anything surprising means stop and re-plan. |
 | Worker pool (default doers) | OpenCode Zen free models, DeepSeek v4.1 Flash and Mimo 2.6 Flash (OpenCode Go, paid) **through OpenCode CLI only**; Haiku 5.5 at **xhigh** for well-specified fixes and edits (context under ~100K tokens); GPT-6 Luna at xhigh (Codex CLI) for larger implementation. |
-| Sonnet 5.5 | Sub-lead only: brought in when a chunk of work needs its own coordinator running parallel Haiku 5.5 workers. It never drives, never gives the final review, and isn't a default worker. (Revised 2026-10-11, superseding "Sonnet as long-horizon executor".) |
-| Frontier specialists | GPT-6.1 Sol at high (Codex CLI) and Grok 4.7 (Grok CLI): heavy reasoning, second opinions, second attempts on stuck problems, and cross-vendor final review. They aren't routine implementers. GPT-6 also runs this skill as a driver. |
+| Sonnet 5.5 sub-lead | `agent-router:lead`, used only when a large chunk needs its own coordinator over parallel Haiku workers. |
+| Frontier specialists | GPT-6.1 Sol at high (Codex CLI) and Grok 4.7 (Grok CLI): heavy reasoning, second opinions, second attempts on stuck problems, and cross-vendor final review (Grok by default; Sol for core or hard-to-undo changes). They aren't routine implementers. GPT-6 also runs this skill as a driver. |
 | Data rule | Anything that isn't a secret may go to any roster model. Secrets, keys, `.env*`, `auth.json` and personal data never leave. |
 | DeepSeek quota | No skill-level restriction. |
 | Non-Claude drivers | Don't route to Claude. They use their own vendor plus the OpenCode tier. |

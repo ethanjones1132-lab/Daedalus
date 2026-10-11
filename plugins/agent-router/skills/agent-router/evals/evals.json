@@ -19,10 +19,11 @@
       "id": 2,
       "name": "long-horizon-test-fix",
       "prompt": "the server-jarvis test suite has a bunch of failures after the llama.cpp backend merge (cb91055). get it all green again without skipping tests, and make sure nothing regresses in the provider routing",
-      "expected_output": "Opus diagnoses and writes briefs; fixes go to Haiku 5.5 at xhigh (in parallel if clusters are independent), or a Sonnet sub-lead only if coordinating them would flood the driver; pool model triages logs; Opus checks each result; cross-vendor final review (GPT-6.1 Sol or Grok 4.7); routing log.",
+      "expected_output": "Sonnet driver diagnoses (Opus gate for heavy reasoning) and writes briefs; fixes go to Haiku 5.5 at xhigh (in parallel if clusters are independent), or a Sonnet sub-lead only if coordinating them would flood the driver; pool model triages logs; driver checks each result; cross-vendor final review (GPT-6.1 Sol or Grok 4.7); routing log.",
       "files": [],
       "assertions": [
-        "Driver (Opus) diagnoses root causes and writes per-fix briefs, each with a verifiable acceptance check",
+        "Driver (Sonnet) diagnoses root causes and writes per-fix briefs, each with a verifiable acceptance check",
+        "Sends the fix plan to Opus (agent-router:approver) for approval before dispatching workers, since it touches core provider routing",
         "Routes the well-specified fixes to Haiku 5.5 at xhigh (or GPT-6 Luna), not to a Sonnet executor by default",
         "Uses Sonnet only as a sub-lead coordinating parallel Haiku workers, and only with a stated reason, or not at all",
         "Driver checks each fix's diff/evidence before building on it",
@@ -42,17 +43,19 @@
         "Does the rename inline, or at most hands it to a single cheap/mechanical worker, without a Sonnet executor or multi-milestone plan",
         "Does not request a cross-vendor (GPT-6 / Grok) review for this change",
         "Runs the server-jarvis tests (or typecheck) to confirm nothing broke",
-        "Does not switch the main session model or raise effort above high"
+        "Does not switch the main session model or raise effort above high",
+        "Does not consult Opus for this small change"
       ]
     },
     {
       "id": 4,
       "name": "parallel-split-refactor",
       "prompt": "server-jarvis/src/index.ts is 5.7k lines. split the http route handlers out into per-area modules under src/routes/ (chat, models, memory, cron, etc) with zero behavior change. tests + typecheck must stay green",
-      "expected_output": "Opus maps the areas and writes the module plan and briefs; parallel Haiku 5.5 xhigh workers (directly, or under a Sonnet sub-lead with a stated reason) each extract one area on disjoint files/worktrees; Opus checks each; cross-vendor review by Sol or Grok; routing log.",
+      "expected_output": "Sonnet driver maps the areas and writes the module plan and briefs; parallel Haiku 5.5 xhigh workers (directly, or under a Sonnet sub-lead with a stated reason) each extract one area on disjoint files/worktrees; driver checks each; cross-vendor review by Sol or Grok; routing log.",
       "files": [],
       "assertions": [
-        "Driver (Opus) maps the route areas and writes the target module layout and per-area briefs itself",
+        "Driver (Sonnet) maps the route areas and writes the target module layout and per-area briefs itself",
+        "Sends the refactor plan to Opus (agent-router:approver) for approval before dispatching workers",
         "Area extractions are done by parallel workers (Haiku 5.5 xhigh, or Luna/DeepSeek), not all inline by the driver",
         "If Sonnet is used, it is as a sub-lead coordinating parallel Haiku workers with a stated reason; Sonnet is not the sole implementer",
         "Workers get disjoint files or separate worktrees and there is an integration step with tests + typecheck",
