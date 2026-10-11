@@ -249,11 +249,23 @@ export function useCronJobs() {
     void handleOperation('run', job);
   }, [handleOperation]);
 
+  // Deletion asks first through the design-system ConfirmModal (rendered by
+  // the page from `deleteCandidate`); the write only starts on confirm.
+  const [deleteCandidate, setDeleteCandidate] = useState<CronJob | null>(null);
+
   const handleDelete = useCallback((job: CronJob) => {
     if (operationsRef.current[job.id] || missedOperationRef.current) return;
-    if (!confirm(`Delete cron job "${job.name}"?`)) return;
+    setDeleteCandidate(job);
+  }, []);
+
+  const confirmDelete = useCallback(() => {
+    const job = deleteCandidate;
+    setDeleteCandidate(null);
+    if (!job || operationsRef.current[job.id] || missedOperationRef.current) return;
     void handleOperation('delete', job);
-  }, [handleOperation]);
+  }, [deleteCandidate, handleOperation]);
+
+  const cancelDelete = useCallback(() => setDeleteCandidate(null), []);
 
   const handleRetry = useCallback((job: CronJob) => {
     const operation = operationsRef.current[job.id];
@@ -422,6 +434,9 @@ export function useCronJobs() {
     handleToggle,
     handleRun,
     handleDelete,
+    deleteCandidate,
+    confirmDelete,
+    cancelDelete,
     handleRetry,
     handleCreate,
     handleToggleAddForm,

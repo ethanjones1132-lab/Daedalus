@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BarChart3, Plus, RotateCw } from 'lucide-react';
 import {
+  ConfirmModal,
   AlertLine,
   Button,
   EmptyState,
@@ -259,6 +260,15 @@ export default function CronPage() {
           }}
         />
       )}
+      <ConfirmModal
+        open={cron.deleteCandidate !== null}
+        message={`Delete cron job "${cron.deleteCandidate?.name ?? ''}"?`}
+        detail="Its run history stays in the ledger; the schedule stops firing."
+        confirmLabel="Delete"
+        danger
+        onConfirm={cron.confirmDelete}
+        onCancel={cron.cancelDelete}
+      />
     </Page>
   );
 }

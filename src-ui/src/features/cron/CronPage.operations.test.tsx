@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { within, act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../../design';
 import CronPage from './CronPage';
@@ -134,6 +134,12 @@ async function mount(): Promise<void> {
   await waitFor(() => expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0));
 }
 
+/** Deletion now asks through the design-system ConfirmModal instead of window.confirm. */
+function confirmDeletion(name: string) {
+  const dialog = screen.getByRole('dialog', { name: `Delete cron job "${name}"?` });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }));
+}
+
 describe('Cron operational mutation coordination', () => {
   it('serializes controls for one job while leaving an independent job usable', async () => {
     await mount();
@@ -199,6 +205,7 @@ describe('Cron operational mutation coordination', () => {
     const result = deferred<boolean>();
     setWrite(command, result.promise, 'alpha');
     fireEvent.click(screen.getByRole('button', { name: button }));
+    if (command === 'delete_cron_job') confirmDeletion('Alpha');
     await act(async () => result.resolve(false));
 
     await waitFor(() => expect(screen.getByRole('alert', { name: 'Cron job operation' })).toHaveTextContent(message));
@@ -234,11 +241,22 @@ describe('Cron operational mutation coordination', () => {
     await waitFor(() => expect(screen.getByText('Cron job "Alpha" disabled.')).toBeInTheDocument());
   });
 
+  it('asks before deleting and writes nothing when the confirmation is cancelled', async () => {
+    await mount();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Alpha' }));
+    const dialog = screen.getByRole('dialog', { name: 'Delete cron job "Alpha"?' });
+    expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog', { name: 'Delete cron job "Alpha"?' })).not.toBeInTheDocument();
+    expect(mutationCalls()).toEqual([]);
+  });
+
   it('keeps a confirmed deletion out of the UI until a newer list omits it', async () => {
     await mount();
     const write = deferred<boolean>();
     setWrite('delete_cron_job', write.promise, 'alpha');
     fireEvent.click(screen.getByRole('button', { name: 'Delete Alpha' }));
+    confirmDeletion('Alpha');
     await act(async () => write.resolve(true));
 
     await waitFor(() => expect(listReads.length).toBe(2));
