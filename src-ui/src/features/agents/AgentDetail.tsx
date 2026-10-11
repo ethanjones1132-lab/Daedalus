@@ -33,7 +33,7 @@ export function AgentDetail({
   onRefreshChannels: () => void;
   onOpenChannels: () => void;
 }) {
-  const prompt = agent.system_prompt.trim();
+  const prompt = (agent.system_prompt ?? '').trim();
   return (
     <div className="space-y-4">
       <Panel ticks aria-label={`${agent.name} detail`} className="d-rise">

@@ -92,7 +92,8 @@ let config: Record<string, unknown> = {
 
 // ── Raw settings table ──────────────────────────────────────────
 const settings = new Map<string, string>([
-  ['theme', 'dark'],
+  // Mirrors the browser's choice so ?mock never fights the theme picked in this tab.
+  ['theme', (() => { try { return localStorage.getItem('jarvis-theme') === 'light' ? 'light' : 'dark'; } catch { return 'dark'; } })()],
   ['active_backend', 'llama_cpp'],
   ['bridge_port', '19876'],
   ['bridge_enabled', 'false'],

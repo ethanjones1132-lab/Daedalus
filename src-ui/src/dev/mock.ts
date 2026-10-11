@@ -11,8 +11,16 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { commands, http, json, sleep } from './registry';
 
 export async function installDevMocks() {
-  const modules = import.meta.glob('./fixtures/*.ts', { eager: true });
-  void modules;
+  // Several slices register the same command (e.g. Overview also needs
+  // `list_agents`). The last registration wins, so load consumers first and
+  // each command's owning slice after them; unknown files load last.
+  const LOAD_ORDER = ['overview', 'shell', 'sessions', 'cron', 'agents', 'actions', 'connect', 'settings', 'skills', 'system'];
+  const modules = import.meta.glob('./fixtures/*.ts');
+  const rank = (path: string) => {
+    const i = LOAD_ORDER.indexOf(path.replace(/^.*\/(.*)\.ts$/, '$1'));
+    return i === -1 ? LOAD_ORDER.length : i;
+  };
+  for (const path of Object.keys(modules).sort((a, b) => rank(a) - rank(b))) await modules[path]();
 
   mockIPC(
     async (cmd, args) => {
