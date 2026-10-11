@@ -80,13 +80,20 @@ class Client:
     def models(self):
         return [m["id"] for m in self._req("/models")["data"]]
 
-    def chat(self, prompt, temperature=0.8, max_tokens=16384, tries=5, json_mode=True, system=None):
+    def chat(self, prompt, temperature=0.8, max_tokens=16384, tries=5, json_mode=True, system=None, reasoning=None):
         """Reply text. Retries 429/5xx and timeouts with backoff. json_mode asks for a JSON object (dropped on a 400);
-        teacher data (scripts/teacher) turns it off for free text and passes the shared system message."""
+        teacher data (scripts/teacher) turns it off for free text and passes the shared system message.
+        reasoning: None keeps the model's default (about 11.6k reasoning tokens for one plan); "low" and the other
+        reasoning_effort words go out as `reasoning_effort`; "off" sends thinking disabled (measured 2026-10-11 on
+        deepseek-v4.1-flash: default ~11.6k, low ~5.5k, off ~1.1k completion tokens for the same plan)."""
         messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
         payload = {"model": self.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if reasoning == "off":
+            payload["thinking"] = {"type": "disabled"}
+        elif reasoning:
+            payload["reasoning_effort"] = reasoning
         for k in range(tries):
             try:
                 r = self._req("/chat/completions", payload)

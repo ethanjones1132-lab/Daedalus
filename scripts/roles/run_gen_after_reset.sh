@@ -47,11 +47,11 @@ EOF
   [ "$k" = 24 ] && { say "quota never came back; giving up"; touch "$DONE"; exit 0; }
 done
 
-export TEACHER_BUDGET_SINCE=$(date +%s)
+export TEACHER_BUDGET_SINCE=${TEACHER_BUDGET_SINCE:-$(date +%s)}   # preset it to keep counting an earlier start
 CAP=$TEACHER_TOKEN_CAP
 say "generation starts; cap $CAP tokens since $TEACHER_BUDGET_SINCE"
 cd "$REPO/scripts/teacher" || exit 1
-"$PY" -c "import sys; sys.path.insert(0, '$REPO/scripts/roles'); import clean_runs; print(clean_runs.clean('$DIR/runs.jsonl'))" >> "$LOG" 2>&1
+"$PY" "$REPO/scripts/roles/clean_runs.py" --dir "$DIR" >> "$LOG" 2>&1
 export TEACHER_TOKEN_CAP=$((CAP * 30 / 100))
 "$PY" teacher_gen.py gen --out "$DIR" --backend deepseek --seeds-file seeds-clean.jsonl --splits dev,test --workers 6 >> "$DIR/gen-eval.out" 2>&1
 say "dev,test phase ended (rc $?)"

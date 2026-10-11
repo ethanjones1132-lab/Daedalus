@@ -65,5 +65,41 @@ class BudgetTest(unittest.TestCase):
         tg.check_budget()
 
 
+class ReasoningTest(unittest.TestCase):
+    def sent(self, reasoning):
+        client = tg.opencode_go.Client.__new__(tg.opencode_go.Client)
+        client._key, client.base, client.model, client.session = "k", "http://x", "m", "s"
+        seen = {}
+
+        def fake(path, payload=None, timeout=600):
+            seen.update(payload)
+            return {"choices": [{"message": {"content": "ok"}}], "usage": {"total_tokens": 1}}
+        client._req = fake
+        client.chat("hi", json_mode=False, reasoning=reasoning)
+        return seen
+
+    def test_default_sends_no_reasoning_field(self):
+        p = self.sent(None)
+        self.assertNotIn("reasoning_effort", p)
+        self.assertNotIn("thinking", p)
+
+    def test_low_goes_out_as_reasoning_effort_and_off_disables_thinking(self):
+        self.assertEqual(self.sent("low")["reasoning_effort"], "low")
+        p = self.sent("off")
+        self.assertEqual(p["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", p)
+
+    def test_teacher_setting_defaults_to_low_and_reads_the_environment(self):
+        os.environ.pop("TEACHER_REASONING", None)
+        self.assertEqual(tg.reasoning_setting(), "low")
+        os.environ["TEACHER_REASONING"] = "default"
+        try:
+            self.assertIsNone(tg.reasoning_setting())
+            os.environ["TEACHER_REASONING"] = "OFF"
+            self.assertEqual(tg.reasoning_setting(), "off")
+        finally:
+            os.environ.pop("TEACHER_REASONING", None)
+
+
 if __name__ == "__main__":
     unittest.main()

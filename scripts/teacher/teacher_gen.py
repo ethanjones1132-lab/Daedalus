@@ -85,12 +85,20 @@ def check_budget():
             raise Stop(f"token cap reached: {used} >= {cap}")
 
 
+def reasoning_setting():
+    """TEACHER_REASONING: low (default since 2026-10-11, about half the tokens of the model's default), medium, high,
+    off (thinking disabled, about a tenth), or default (the model's own setting, which the first rounds used)."""
+    v = os.environ.get("TEACHER_REASONING", "low").strip().lower()
+    return None if v in ("", "default") else v
+
+
 def deepseek(prompt, max_tokens=32768):
     if not hasattr(_local, "ds"):
         _local.ds = opencode_go.Client()
         assert _local.ds.model == "deepseek-v4.1-flash", _local.ds.model
     t = time.time()
-    text = _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM)
+    text = _local.ds.chat(prompt, temperature=0.7, max_tokens=max_tokens, json_mode=False, system=SYSTEM,
+                          reasoning=reasoning_setting())
     log_usage(getattr(_local.ds, "last_usage", None), "deepseek", round(time.time() - t, 1))
     return text
 
