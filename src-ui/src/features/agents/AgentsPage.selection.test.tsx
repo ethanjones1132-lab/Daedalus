@@ -60,7 +60,7 @@ describe('Agents master-detail', () => {
   it('keeps Save disabled until both a name and a model are given', async () => {
     render(<AgentsPage />);
     await screen.findByRole('heading', { name: 'Atlas' });
-    fireEvent.click(screen.getByRole('button', { name: '+ New agent' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New agent' }));
     const dialog = screen.getByRole('dialog', { name: 'New Agent' });
     const save = within(dialog).getByRole('button', { name: 'Save' });
     expect(save).toBeDisabled();

@@ -1,4 +1,4 @@
-import { RotateCw } from 'lucide-react';
+import { Plus, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { agentOperationLocked } from '../../domain/agent-operation-state';
 import {
@@ -88,7 +88,7 @@ export default function AgentsPage() {
         actions={
           <>
             <Button variant="ghost" icon={<RotateCw aria-hidden="true" />} onClick={refreshAll}>Refresh all</Button>
-            <Button variant="primary" onClick={records.openCreate} disabled={records.createLocked}>+ New agent</Button>
+            <Button variant="primary" icon={<Plus aria-hidden="true" />} onClick={records.openCreate} disabled={records.createLocked}>New agent</Button>
           </>
         }
       />

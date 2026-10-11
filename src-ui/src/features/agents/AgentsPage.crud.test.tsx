@@ -56,7 +56,7 @@ function renderView() {
 }
 
 async function openEditor() {
-  fireEvent.click(screen.getByRole('button', { name: '+ New agent' }));
+  fireEvent.click(screen.getByRole('button', { name: 'New agent' }));
 }
 
 beforeEach(() => {
