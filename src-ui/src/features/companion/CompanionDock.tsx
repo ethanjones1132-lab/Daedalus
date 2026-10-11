@@ -59,7 +59,7 @@ export default function CompanionDock({ collapsed }: { collapsed: boolean }) {
         role="status"
         aria-live="polite"
         aria-label="Cron awareness"
-        className={cn(collapsed ? 'sr-only' : 'line-clamp-2 px-1 text-[11px] leading-snug text-ink-3')}
+        className="sr-only"
       >
         {signals.awareness}
       </div>

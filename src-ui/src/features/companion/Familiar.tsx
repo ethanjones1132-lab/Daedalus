@@ -164,7 +164,16 @@ export function Familiar({ species = 'cat', rarity = 'rare', mood = 'idle', size
       <path d={bodyPath} fill="var(--d-raised)" stroke={stroke} strokeWidth="1.5" strokeLinejoin="round" />
       {/* engraved seam */}
       <path d="M21 38 Q32 42 43 38" stroke="var(--d-line-strong)" strokeWidth="1" fill="none" />
-      {part === 'beak' && <path d="M29 33 L35 33 L32 36.5 Z" fill={stroke} />}
+      {part === 'owl' && (
+        <g fill="none" stroke="var(--d-line-strong)" strokeWidth="1.2">
+          <circle cx="26" cy="29" r="5.2" />
+          <circle cx="38" cy="29" r="5.2" />
+          <path d="M20 40 q3 2 6 0 q3 2 6 0 q3 2 6 0 q3 2 6 0" />
+        </g>
+      )}
+      {(part === 'beak' || part === 'owl') && (
+        <path d={part === 'owl' ? 'M30.5 33 L33.5 33 L32 37.5 Z' : 'M29 33 L35 33 L32 36.5 Z'} fill={stroke} />
+      )}
       {/* eyes */}
       {sleeping ? (
         <g stroke="var(--d-ink-2)" strokeWidth="1.5" strokeLinecap="round" fill="none">
