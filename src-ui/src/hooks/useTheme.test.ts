@@ -72,3 +72,15 @@ describe('useTheme', () => {
     expect(invokeMock).toHaveBeenCalledWith('set_setting', { key: 'theme', value: 'light' });
   });
 });
+
+describe('useTheme across instances', () => {
+  it('keeps every mounted instance in sync when one changes the theme', () => {
+    const a = renderHook(() => useTheme());
+    const b = renderHook(() => useTheme());
+    act(() => a.result.current.setTheme('light'));
+    expect(b.result.current.theme).toBe('light');
+    act(() => b.result.current.toggle());
+    expect(a.result.current.theme).toBe('dark');
+    expect(document.documentElement.getAttribute('data-theme')).toBeNull();
+  });
+});
