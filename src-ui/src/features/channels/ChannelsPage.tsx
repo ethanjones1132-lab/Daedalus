@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { ArrowUpRight, Hash, Plug, RefreshCw, Trash2, Unplug } from 'lucide-react';
+import { ArrowUpRight, Hash, Plug, Plus, RefreshCw, Trash2, Unplug, X } from 'lucide-react';
 import {
   AlertLine,
   Badge,
@@ -439,8 +439,13 @@ export default function ChannelsPage() {
             <Button variant="ghost" icon={<RefreshCw />} onClick={retryRead} disabled={loading} aria-label="Refresh channels">
               Refresh
             </Button>
-            <Button variant="primary" onClick={() => changeAdding(!adding)} disabled={saving}>
-              {adding ? 'Close' : '+ New channel'}
+            <Button
+              variant={adding ? 'secondary' : 'primary'}
+              icon={adding ? <X aria-hidden="true" /> : <Plus aria-hidden="true" />}
+              onClick={() => changeAdding(!adding)}
+              disabled={saving}
+            >
+              {adding ? 'Close' : 'New channel'}
             </Button>
           </>
         }

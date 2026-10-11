@@ -51,7 +51,7 @@ function channelRow(name = 'Newsroom') {
 async function renderForm() {
   render(<ToastProvider><ChannelsPage /></ToastProvider>);
   await screen.findByText('No channels yet. Add one to get started.');
-  fireEvent.click(screen.getByRole('button', { name: '+ New channel' }));
+  fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
   fireEvent.change(screen.getByPlaceholderText('Channel name *'), { target: { value: 'Newsroom' } });
   fireEvent.change(screen.getByPlaceholderText('Discord channel ID *'), { target: { value: '123' } });
 }

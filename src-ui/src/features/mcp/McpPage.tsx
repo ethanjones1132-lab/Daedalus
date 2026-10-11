@@ -376,7 +376,7 @@ export default function McpPage() {
                 </div>
 
                 <aside className="space-y-3 rounded-lg border border-line bg-sunken p-4">
-                  <span className="d-label block pb-1">Readout</span>
+                  <span className="d-label block border-b border-line pb-2">Readout</span>
                   <KeyValue
                     items={[
                       ['transport', <Chip key="t">{transportOf(active)}</Chip>],

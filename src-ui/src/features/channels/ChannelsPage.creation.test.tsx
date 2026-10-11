@@ -36,7 +36,7 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 async function openDraft() {
   render(<ToastProvider><ChannelsPage /></ToastProvider>);
   await screen.findByText('No channels yet. Add one to get started.');
-  fireEvent.click(screen.getByRole('button', { name: '+ New channel' }));
+  fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
   fireEvent.change(nameInput(), { target: { value: '  Newsroom  ' } });
   fireEvent.change(destinationInput(), { target: { value: '  123  ' } });
 }
@@ -64,7 +64,7 @@ describe('Channel creation lifetime', () => {
     await act(async () => { request.resolve(channel); });
     expect(await screen.findByText('Added channel Newsroom')).toBeInTheDocument();
     expect(screen.queryByPlaceholderText('Channel name *')).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '+ New channel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
     expect(nameInput()).toHaveValue('');
     expect(destinationInput()).toHaveValue('');
     expect(screen.getByRole('combobox')).toHaveValue('discord');
@@ -103,7 +103,7 @@ describe('Channel creation lifetime', () => {
     await act(async () => { request.resolve(channel); });
     expect(await screen.findByText('Added channel Newsroom')).toBeInTheDocument();
     expect(screen.queryByPlaceholderText('Channel name *')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '+ New channel' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'New channel' })).toBeDisabled();
     await act(async () => { readback.reject(new Error('synthetic private readback detail')); });
     expect(screen.getByText('Channel was added, but the channel list could not be refreshed. Retry reloads the list only.')).toBeInTheDocument();
     expect(screen.queryByText(/synthetic private readback detail/)).not.toBeInTheDocument();
@@ -118,7 +118,7 @@ describe('Channel creation lifetime', () => {
   it('requires a destination and persists only the executable Discord choice', async () => {
     await openDraft();
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
-    fireEvent.click(screen.getByRole('button', { name: '+ New channel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
     expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Discord']);
     expect(screen.getByRole('button', { name: 'Add channel' })).toBeDisabled();
     fireEvent.change(nameInput(), { target: { value: '  Other  ' } });

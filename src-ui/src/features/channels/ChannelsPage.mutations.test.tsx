@@ -150,7 +150,7 @@ describe('Channel row mutation coordination', () => {
     invokeMock.mockReturnValueOnce(write.promise);
     fireEvent.click(connectButton());
     await act(async () => {});
-    fireEvent.click(screen.getByRole('button', { name: '+ New channel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
     fireEvent.change(screen.getByPlaceholderText('Channel name *'), { target: { value: 'Gamma' } });
     fireEvent.change(screen.getByPlaceholderText('Discord channel ID *'), { target: { value: '456' } });
     const gamma = { ...alpha, id: 'g', name: 'Gamma', config: { channel_id: '456' } };
