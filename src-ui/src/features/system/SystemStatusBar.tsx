@@ -274,8 +274,11 @@ export default function SystemStatusBar() {
       )}
 
       {view.health.error && (
-        <span role="alert" aria-label="System health observation" className="inline-flex h-full min-w-0 max-w-[30%] shrink items-center gap-2 px-2.5 text-warn">
-          <span className="min-w-0 truncate" title={healthStale ? 'Showing previously observed system health; it may be stale.' : 'System health is unavailable.'}>{healthStale ? 'Showing previously observed system health; it may be stale.' : 'System health is unavailable.'}</span>
+        <span role="alert" aria-label="System health observation" className="inline-flex h-full shrink-0 items-center gap-2 px-2.5 text-warn">
+          <span className="sr-only">{healthStale ? 'Showing previously observed system health; it may be stale.' : 'System health is unavailable.'}</span>
+          <span aria-hidden="true" title={healthStale ? 'Showing previously observed system health; it may be stale.' : 'System health is unavailable.'}>
+            {healthStale ? 'health read stale' : 'health unread'}
+          </span>
           <button
             type="button"
             aria-label="Retry system health"
@@ -288,8 +291,11 @@ export default function SystemStatusBar() {
         </span>
       )}
       {view.inference.error && (
-        <span role="alert" aria-label="Inference telemetry observation" className="inline-flex h-full min-w-0 max-w-[30%] shrink items-center gap-2 px-2.5 text-warn">
-          <span className="min-w-0 truncate" title={inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}>{inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}</span>
+        <span role="alert" aria-label="Inference telemetry observation" className="inline-flex h-full shrink-0 items-center gap-2 px-2.5 text-warn">
+          <span className="sr-only">{inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}</span>
+          <span aria-hidden="true" title={inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}>
+            {inferenceStale ? 'inference read stale' : 'inference unread'}
+          </span>
           <button
             type="button"
             aria-label="Retry inference telemetry"
