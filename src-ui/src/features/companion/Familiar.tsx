@@ -18,7 +18,7 @@ const RARITY_HALO: Record<CompanionRarity, string> = {
   common: 'var(--d-ink-4)',
   uncommon: 'var(--d-ok)',
   rare: 'var(--d-info)',
-  epic: '#c08ae8',
+  epic: 'var(--d-warn)',
   legendary: 'var(--d-accent-hot)',
 };
 
