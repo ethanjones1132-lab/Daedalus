@@ -1,3 +1,4 @@
+/// <reference types="vite/client" />
 // Module declarations for non-TS imports.
 declare module '*.css' {
   const content: string;

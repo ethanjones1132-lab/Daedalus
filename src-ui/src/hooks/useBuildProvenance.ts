@@ -5,8 +5,8 @@ import {
   sharedBuildProvenanceStore,
   type BuildProvenanceSnapshot,
   type BuildProvenanceStore,
-} from '../components/jarvis/build-provenance';
-import type { BuildInfo } from '../components/jarvis/types';
+} from '../domain/build-provenance';
+import type { BuildInfo } from '../domain/types';
 
 // One native read, one shared store: `BuildBadge` is mounted twice (sidebar
 // footer and header) and both mounts must observe the same provenance, so the

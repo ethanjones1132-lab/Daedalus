@@ -1,0 +1,595 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DAEDALUS — the design system for Jarvis
+   ───────────────────────────────────────────────────────────────────────
+   A craftsman's drafting table, not a sci-fi HUD.
+     · Ink:    warm near-black canvas, layered by value (not by glass blur)
+     · Bone:   parchment text in four strengths
+     · Brass:  THE accent — live work, focus, the thing that is happening now
+     · Verdigris / Flame / Ember / Sky: semantic tones, always paired with words
+     · Hairlines: 1px rules and a faint drafting grid carry the structure
+   Type: Instrument Serif (display) · Geist (UI) · Geist Mono (data, labels)
+   Spec: docs/design/daedalus-ui.md
+   ═══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Ink — surfaces by elevation */
+  --d-canvas: #0d0c0b;
+  --d-sunken: #090807;
+  --d-surface: #141210;
+  --d-raised: #1b1916;
+  --d-overlay: #221f1b;
+  --d-hover: rgba(236, 226, 206, 0.045);
+  --d-press: rgba(236, 226, 206, 0.07);
+
+  /* Hairlines */
+  --d-line: rgba(236, 226, 206, 0.075);
+  --d-line-strong: rgba(236, 226, 206, 0.14);
+  --d-grid: rgba(236, 226, 206, 0.028);
+
+  /* Bone — text */
+  --d-ink: #ede7db;
+  --d-ink-2: #b9b0a0;
+  --d-ink-3: #847b6d;
+  --d-ink-4: #5a534a;
+
+  /* Brass — the signature accent */
+  --d-accent: #d8a24a;
+  --d-accent-hot: #f1c272;
+  --d-accent-ink: #1b1308;
+  --d-accent-wash: rgba(216, 162, 74, 0.11);
+  --d-accent-line: rgba(216, 162, 74, 0.38);
+
+  /* Semantic tones (always paired with text — never colour alone) */
+  --d-ok: #6fc4a3;
+  --d-ok-wash: rgba(111, 196, 163, 0.1);
+  --d-warn: #ec9a4a;
+  --d-warn-wash: rgba(236, 154, 74, 0.11);
+  --d-err: #e35d52;
+  --d-err-wash: rgba(227, 93, 82, 0.11);
+  --d-info: #86b4e3;
+  --d-info-wash: rgba(134, 180, 227, 0.1);
+
+  --d-shadow-pop: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 18px 50px -12px rgba(0, 0, 0, 0.7),
+    0 2px 6px rgba(0, 0, 0, 0.35);
+  --d-shadow-card: 0 1px 0 rgba(255, 255, 255, 0.025) inset, 0 1px 2px rgba(0, 0, 0, 0.3);
+
+  color-scheme: dark;
+}
+
+/* Vellum — the daylight drafting table */
+:root[data-theme='light'] {
+  --d-canvas: #f3eee4;
+  --d-sunken: #ebe5d8;
+  --d-surface: #faf7f1;
+  --d-raised: #ffffff;
+  --d-overlay: #ffffff;
+  --d-hover: rgba(40, 30, 15, 0.045);
+  --d-press: rgba(40, 30, 15, 0.08);
+
+  --d-line: rgba(40, 30, 15, 0.1);
+  --d-line-strong: rgba(40, 30, 15, 0.18);
+  --d-grid: rgba(40, 30, 15, 0.035);
+
+  --d-ink: #1f1b15;
+  --d-ink-2: #4f473b;
+  --d-ink-3: #7a705f;
+  --d-ink-4: #a79c89;
+
+  --d-accent: #a56c12;
+  --d-accent-hot: #c4851d;
+  --d-accent-ink: #fffaf0;
+  --d-accent-wash: rgba(165, 108, 18, 0.1);
+  --d-accent-line: rgba(165, 108, 18, 0.4);
+
+  --d-ok: #2d8a66;
+  --d-ok-wash: rgba(45, 138, 102, 0.1);
+  --d-warn: #b8641a;
+  --d-warn-wash: rgba(184, 100, 26, 0.1);
+  --d-err: #b93a30;
+  --d-err-wash: rgba(185, 58, 48, 0.09);
+  --d-info: #3a6ea5;
+  --d-info-wash: rgba(58, 110, 165, 0.09);
+
+  --d-shadow-pop: 0 18px 50px -14px rgba(60, 40, 10, 0.28), 0 2px 6px rgba(60, 40, 10, 0.08);
+  --d-shadow-card: 0 1px 2px rgba(60, 40, 10, 0.06);
+
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-canvas: var(--d-canvas);
+  --color-sunken: var(--d-sunken);
+  --color-surface: var(--d-surface);
+  --color-raised: var(--d-raised);
+  --color-overlay: var(--d-overlay);
+  --color-hover: var(--d-hover);
+  --color-press: var(--d-press);
+  --color-line: var(--d-line);
+  --color-line-strong: var(--d-line-strong);
+  --color-ink: var(--d-ink);
+  --color-ink-2: var(--d-ink-2);
+  --color-ink-3: var(--d-ink-3);
+  --color-ink-4: var(--d-ink-4);
+  --color-accent: var(--d-accent);
+  --color-accent-hot: var(--d-accent-hot);
+  --color-accent-ink: var(--d-accent-ink);
+  --color-accent-wash: var(--d-accent-wash);
+  --color-accent-line: var(--d-accent-line);
+  --color-ok: var(--d-ok);
+  --color-ok-wash: var(--d-ok-wash);
+  --color-warn: var(--d-warn);
+  --color-warn-wash: var(--d-warn-wash);
+  --color-err: var(--d-err);
+  --color-err-wash: var(--d-err-wash);
+  --color-info: var(--d-info);
+  --color-info-wash: var(--d-info-wash);
+
+  --font-sans: 'Geist Variable', 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono Variable', 'Geist Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+  --font-display: 'Instrument Serif', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+
+  --shadow-pop: var(--d-shadow-pop);
+  --shadow-card: var(--d-shadow-card);
+
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out-quart: cubic-bezier(0.76, 0, 0.24, 1);
+}
+
+@layer base {
+/* ─── Base ─────────────────────────────────────────────────────────────── */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--d-canvas);
+  color: var(--d-ink);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  font-feature-settings: 'ss01', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--d-accent-wash);
+  color: var(--d-ink);
+}
+
+:focus-visible {
+  outline: 2px solid var(--d-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--d-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--d-line-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+}
+
+@layer components {
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Small-caps mono label — the "drafting annotation" voice. */
+.d-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--d-ink-3);
+}
+
+.d-display {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+}
+
+/* ─── Drafting table texture ───────────────────────────────────────────── */
+
+.d-drafting {
+  background-image:
+    linear-gradient(var(--d-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--d-grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: -1px -1px;
+}
+
+/* Registration marks: tiny brass corner ticks on hero panels. */
+.d-ticks {
+  position: relative;
+}
+.d-ticks::before,
+.d-ticks::after {
+  content: '';
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+  border-color: var(--d-accent-line);
+  border-style: solid;
+}
+.d-ticks::before {
+  top: -1px;
+  left: -1px;
+  border-width: 1px 0 0 1px;
+  border-top-left-radius: 3px;
+}
+.d-ticks::after {
+  bottom: -1px;
+  right: -1px;
+  border-width: 0 1px 1px 0;
+  border-bottom-right-radius: 3px;
+}
+
+/* ─── Motion ───────────────────────────────────────────────────────────── */
+
+@keyframes d-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+@keyframes d-ping {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  80%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+@keyframes d-shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+@keyframes d-caret {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  50%,
+  95% {
+    opacity: 0;
+  }
+}
+@keyframes d-draw {
+  from {
+    stroke-dashoffset: var(--d-draw-length, 400);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes d-wire {
+  from {
+    background-position: 0% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+@keyframes d-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes d-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.d-pulse {
+  animation: d-pulse 1.8s ease-in-out infinite;
+}
+.d-spin {
+  animation: d-spin 0.9s linear infinite;
+}
+.d-rise {
+  animation: d-rise 0.42s var(--ease-out-quint) both;
+}
+.d-caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--d-accent);
+  border-radius: 1px;
+  animation: d-caret 1.05s step-end infinite;
+}
+
+/* Skeleton shimmer bar */
+.d-skeleton {
+  background: linear-gradient(90deg, var(--d-hover) 0%, var(--d-press) 40%, var(--d-hover) 80%);
+  background-size: 200% 100%;
+  animation: d-shimmer 1.6s linear infinite;
+  border-radius: 4px;
+}
+
+/* The live wire: a thin brass filament that flows while a turn is running. */
+.d-wire {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--d-accent-line) 20%,
+    var(--d-accent-hot) 50%,
+    var(--d-accent-line) 80%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: d-wire 2.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* ─── Prose (assistant answers, markdown) ──────────────────────────────── */
+
+.d-prose {
+  color: var(--d-ink);
+  font-size: 14px;
+  line-height: 1.68;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.d-prose > :first-child {
+  margin-top: 0;
+}
+.d-prose > :last-child {
+  margin-bottom: 0;
+}
+.d-prose p {
+  margin: 0 0 0.8em;
+}
+.d-prose h1,
+.d-prose h2,
+.d-prose h3,
+.d-prose h4 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  color: var(--d-ink);
+  line-height: 1.15;
+  margin: 1.3em 0 0.45em;
+}
+.d-prose h1 {
+  font-size: 1.85em;
+}
+.d-prose h2 {
+  font-size: 1.55em;
+}
+.d-prose h3 {
+  font-size: 1.3em;
+}
+.d-prose h4 {
+  font-size: 1.12em;
+}
+.d-prose a {
+  color: var(--d-accent-hot);
+  text-decoration: underline;
+  text-decoration-color: var(--d-accent-line);
+  text-underline-offset: 3px;
+}
+.d-prose a:hover {
+  text-decoration-color: var(--d-accent-hot);
+}
+.d-prose strong {
+  color: var(--d-ink);
+  font-weight: 600;
+}
+.d-prose em {
+  color: var(--d-ink-2);
+}
+.d-prose ul,
+.d-prose ol {
+  margin: 0 0 0.85em;
+  padding-left: 1.35em;
+}
+.d-prose ul {
+  list-style: none;
+}
+.d-prose ul > li {
+  position: relative;
+}
+.d-prose ul > li::before {
+  content: '';
+  position: absolute;
+  left: -0.95em;
+  top: 0.72em;
+  width: 5px;
+  height: 1px;
+  background: var(--d-accent);
+}
+.d-prose ol {
+  list-style: decimal;
+}
+.d-prose ol > li::marker {
+  color: var(--d-ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+.d-prose li {
+  margin: 0.22em 0;
+}
+.d-prose blockquote {
+  margin: 0 0 0.85em;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 2px solid var(--d-accent-line);
+  color: var(--d-ink-2);
+  font-style: italic;
+}
+.d-prose hr {
+  border: 0;
+  height: 1px;
+  background: var(--d-line-strong);
+  margin: 1.6em 0;
+}
+.d-prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.12em 0.38em;
+  border-radius: 4px;
+  background: var(--d-raised);
+  border: 1px solid var(--d-line);
+  color: var(--d-accent-hot);
+}
+.d-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.d-prose th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--d-ink-3);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--d-line-strong);
+}
+.d-prose td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--d-line);
+  vertical-align: top;
+}
+.d-prose tr:last-child td {
+  border-bottom: 0;
+}
+
+}
+
+/* ─── Syntax highlighting (highlight.js) — warm, low-chroma ────────────── */
+
+.hljs {
+  color: var(--d-ink);
+  background: transparent;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-name {
+  color: #d8a24a;
+}
+.hljs-string,
+.hljs-addition,
+.hljs-attr-value {
+  color: #9fc98a;
+}
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-bullet {
+  color: #e39a6b;
+}
+.hljs-comment,
+.hljs-quote {
+  color: #6f675a;
+  font-style: italic;
+}
+.hljs-title,
+.hljs-section,
+.hljs-title.function_ {
+  color: #e8d2a6;
+}
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-title.class_ {
+  color: #86b4e3;
+}
+.hljs-variable,
+.hljs-template-variable,
+.hljs-deletion,
+.hljs-regexp {
+  color: #e3796f;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-property {
+  color: #c7b48c;
+}
+.hljs-meta {
+  color: #8f8676;
+}
+.hljs-link {
+  color: #f1c272;
+  text-decoration: underline;
+}
+:root[data-theme='light'] .hljs-keyword,
+:root[data-theme='light'] .hljs-selector-tag,
+:root[data-theme='light'] .hljs-built_in,
+:root[data-theme='light'] .hljs-name {
+  color: #94600f;
+}
+:root[data-theme='light'] .hljs-string,
+:root[data-theme='light'] .hljs-addition {
+  color: #3c7a32;
+}
+:root[data-theme='light'] .hljs-number,
+:root[data-theme='light'] .hljs-literal {
+  color: #b0552a;
+}
+:root[data-theme='light'] .hljs-title,
+:root[data-theme='light'] .hljs-section {
+  color: #6b4a12;
+}
+:root[data-theme='light'] .hljs-type,
+:root[data-theme='light'] .hljs-title.class_ {
+  color: #2f5f92;
+}
+:root[data-theme='light'] .hljs-attr,
+:root[data-theme='light'] .hljs-property {
+  color: #7a5c22;
+}
