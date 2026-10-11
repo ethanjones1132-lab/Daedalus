@@ -1,0 +1,48 @@
+{
+  "skill_name": "agent-router",
+  "evals": [
+    {
+      "id": 1,
+      "name": "bulk-read-plan-docs",
+      "prompt": "go through all the plan docs in docs/superpowers/plans/ and tell me which ones still have unfinished tasks. one line each with what's left",
+      "expected_output": "Bulk reading routed to the cheap OpenCode tier first (DeepSeek v4.1 Flash / Zen free), with the driver spot-checking results instead of reading every doc inline; a routing log at the end.",
+      "files": [],
+      "assertions": [
+        "Routes the bulk reading of the plan docs to the cheap OpenCode tier (DeepSeek v4.1 Flash, Mimo, or a Zen free model) as the first choice",
+        "Driver does not read every plan doc inline in its own context",
+        "Driver verifies the cheap tier's output (spot-checks some docs or cross-checks claims) before reporting",
+        "Plans to end with a routing log listing the delegation(s)",
+        "Does not use a Sonnet executor or cross-vendor frontier review for this read-only summarization"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "long-horizon-test-fix",
+      "prompt": "the server-jarvis test suite has a bunch of failures after the llama.cpp backend merge (cb91055). get it all green again without skipping tests, and make sure nothing regresses in the provider routing",
+      "expected_output": "Opus plans with milestones and acceptance checks, Sonnet executes milestone by milestone with Opus review between, cheap tier or Haiku used for test-output triage, cross-vendor final review (GPT-6.1 Sol or Grok 4.7), routing log.",
+      "files": [],
+      "assertions": [
+        "Driver (Opus) writes a plan with ordered milestones and a verifiable acceptance check per milestone",
+        "Delegates milestone execution to a Sonnet 5.5 subagent rather than doing all the fixing inline or giving it to Haiku/cheap tier",
+        "Driver reviews each milestone's diff/evidence before the next milestone starts",
+        "Uses the cheap OpenCode tier or Haiku for grunt work such as triaging/summarizing failing test output",
+        "Gets a cross-vendor final review from GPT-6.1 Sol (high) or Grok 4.7 for the provider-routing changes",
+        "Keeps the main session on one model (no mid-session model switch) and does not use Fable",
+        "Plans to end with a routing log"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "small-rename-no-overroute",
+      "prompt": "rename openCodeGoCostRank to goCostRank everywhere in server-jarvis, keep tests passing",
+      "expected_output": "Handled inline (or with one cheap mechanical helper at most) without a Sonnet executor, cross-vendor review, or multi-agent fan-out; tests run to confirm.",
+      "files": [],
+      "assertions": [
+        "Does the rename inline, or at most hands it to a single cheap/mechanical worker, without a Sonnet executor or multi-milestone plan",
+        "Does not request a cross-vendor (GPT-6 / Grok) review for this change",
+        "Runs the server-jarvis tests (or typecheck) to confirm nothing broke",
+        "Does not switch the main session model or raise effort above high"
+      ]
+    }
+  ]
+}
