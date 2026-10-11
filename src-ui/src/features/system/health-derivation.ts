@@ -1,0 +1,77 @@
+// ═══════════════════════════════════════════════════════════════
+// ── health-derivation — the one verdict the banner and Health page share
+// ═══════════════════════════════════════════════════════════════
+//
+// Pure: no React, no Tauri, no clock. `HealthBanner` (global strip) and
+// `HealthPage` (the masthead verdict sentence) both read `jarvis_check_status`
+// and must never disagree about whether the active Inference backend is up,
+// so both go through `deriveHealthPresentation`.
+
+import type { JarvisStatus } from '../../domain/types';
+
+export type HealthLevel = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
+
+/** How long a missing Bun server reads as "starting" rather than "degraded". */
+export const STARTUP_GRACE_MS = 20_000;
+
+/**
+ * Whether the active Inference backend can serve a Session turn.
+ *
+ * `llama_cpp` is the DEFAULT backend (CONTEXT.md): it is a local backend whose
+ * server must be running. It used to fall through to `false`, so a healthy
+ * llama.cpp install read "Offline". Native reports `model_available` as a
+ * constant for every non-Ollama backend (`!is_ollama`), so it is only ever
+ * consulted for Ollama; llama.cpp is judged by its own server flag.
+ */
+export function backendOk(s: JarvisStatus): boolean {
+  const backend = (s.active_backend ?? '').toLowerCase();
+  if (backend === 'ollama') return !!s.ollama_running && !!s.model_available;
+  if (backend === 'llama_cpp') return !!s.llama_cpp_running;
+  if (backend === 'openrouter') return !!s.openrouter_key_set;
+  if (backend === 'claude_cli') return !!s.claude_proxy_running;
+  return false;
+}
+
+function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): HealthLevel {
+  if (fetchError) return 'unavailable';
+  if (!backendOk(s)) return 'down';
+  if (!(s.bun_server_running ?? false)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
+  return 'ok';
+}
+
+function summaryFor(s: JarvisStatus, level: HealthLevel, fetchError: string | null): string {
+  if (fetchError) return 'Health observation is unavailable.';
+  if (level === 'down') {
+    if (!backendOk(s)) return `Backend "${s.active_backend ?? ''}" is unreachable`;
+    return 'Status check failed';
+  }
+  if (level === 'starting') return 'Starting Bun server — tools and skills are warming up';
+  if (!(s.bun_server_running ?? false)) return 'Bun server is not running — tools and skills unavailable';
+  return 'Inference is responding slowly';
+}
+
+const LABELS: Record<Exclude<HealthLevel, 'ok'>, string> = {
+  unavailable: 'Unavailable',
+  starting: 'Starting',
+  warn: 'Degraded',
+  down: 'Offline',
+};
+
+export interface HealthPresentation {
+  level: HealthLevel;
+  label: string;
+  summary: string;
+}
+
+export function deriveHealthPresentation(
+  status: JarvisStatus,
+  fetchError: string | null,
+  mountedForMs: number,
+): HealthPresentation {
+  const level = overallLevel(status, fetchError, mountedForMs);
+  return {
+    level,
+    label: level === 'ok' ? 'Ready' : LABELS[level],
+    summary: level === 'ok' ? 'All systems ready' : summaryFor(status, level, fetchError),
+  };
+}
