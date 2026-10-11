@@ -20,7 +20,7 @@ import {
   recoverAnnouncement,
   type HealthSubsystemState,
 } from '../../domain/health-banner-subsystems';
-import { deriveHealthPresentation, type HealthLevel } from './health-derivation';
+import { deriveHealthPresentation, recordFirstHealthObservation, type HealthLevel } from './health-derivation';
 
 export { deriveHealthPresentation, STARTUP_GRACE_MS } from './health-derivation';
 
@@ -61,6 +61,7 @@ const STATE_TEXT: Record<HealthSubsystemState, string> = {
 
 export default function HealthBanner() {
   const mountedAtRef = useRef(Date.now());
+  recordFirstHealthObservation(mountedAtRef.current);
   const [observation, dispatch] = useReducer(reduceRegistryState<JarvisStatus>, initialRegistryState<JarvisStatus>());
   const requestIdRef = useRef(0);
   const { snapshot: status, loading, error } = observation;

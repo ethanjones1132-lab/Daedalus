@@ -39,7 +39,7 @@ import {
   type ServiceRestartState,
 } from '../../domain/service-restart-state';
 import type { JarvisStatus } from '../../domain/types';
-import { deriveHealthPresentation, type HealthLevel } from '../system/health-derivation';
+import { deriveHealthPresentation, healthGraceAnchor, type HealthLevel } from '../system/health-derivation';
 import { defaultCopy, Observation, type ObservationCopy } from './Observation';
 import { buildSubsystemRows, RestartFeedback, SubsystemGauges, type SubsystemRow } from './SubsystemGauges';
 import { ResourceHero } from './ResourceHero';
@@ -120,7 +120,7 @@ function GaugeSkeleton() {
 }
 
 export default function HealthPage() {
-  const mountedAt = useRef(Date.now()).current;
+  const mountedAt = healthGraceAnchor(useRef(Date.now()).current);
   const statusRes = useNativeResource<JarvisStatus>('jarvis_check_status', parseJarvisStatus);
   const healthRes = useNativeResource<HealthData>('get_system_health', parseHealthData);
   const doctorRes = useNativeResource<DoctorReport>('get_doctor_report', parseDoctorReport);

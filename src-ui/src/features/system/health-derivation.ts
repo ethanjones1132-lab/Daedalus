@@ -14,6 +14,23 @@ export type HealthLevel = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
 /** How long a missing Bun server reads as "starting" rather than "degraded". */
 export const STARTUP_GRACE_MS = 20_000;
 
+/*
+ * The startup grace is measured from when the app first observed health — the
+ * HealthBanner mounts with the shell, so it records that moment. Other
+ * surfaces (the Health page) reuse it, so the banner and the page never
+ * disagree about whether the Bun server is still "starting".
+ */
+let firstObservedAt: number | null = null;
+
+export function recordFirstHealthObservation(at: number): void {
+  if (firstObservedAt === null) firstObservedAt = at;
+}
+
+/** The shared grace anchor, or `fallback` when no banner has mounted (isolated views). */
+export function healthGraceAnchor(fallback: number): number {
+  return firstObservedAt ?? fallback;
+}
+
 /**
  * Whether the active Inference backend can serve a Session turn.
  *
