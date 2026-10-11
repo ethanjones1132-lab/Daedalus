@@ -1,6 +1,7 @@
 ---
 name: agent-router
-description: Routing playbook for which model, effort level, subagent, CLI agent, skill or plugin should do each piece of work — Sonnet 5.5 (driver) / Opus 5.5 (plan approver, heavy reasoning) / Haiku 5.5, GPT-6 Luna and GPT-6.1 Sol (Codex CLI), Grok 4.7 (Grok CLI), and the OpenCode tier (DeepSeek v4.1 Flash, Mimo 2.6 Flash, OpenCode Zen free models). Use it at the start of any task bigger than a quick edit, before spawning a subagent or fork, before shelling out to another model's CLI, whenever work could be split, delegated, reviewed or run in parallel, and whenever usage limits, cost, prompt caching, effort or "which model should do this" come up — even if the user doesn't ask about routing. Written for any driver (Claude, GPT-6 or Grok).
+description: >-
+  Use this skill before starting any substantial engineering job, to decide who does each piece: which model, effort level, subagent, worker or external CLI (Sonnet, Opus, Haiku, Codex/GPT-6, Grok, OpenCode/DeepSeek/Mimo/Zen). Trigger on multi-file or multi-step work. That includes executing a written plan or its phases, refactoring or splitting a large file, a repo-wide audit with fixes everywhere, getting a big batch of failing tests green, generating bulk data or fixtures, long investigations, and anything that can be split up, run in parallel, or needs review or a second opinion. Also trigger when usage limits, cost, prompt caching, effort or "which model should do this" come up, even if routing isn't mentioned. Skip it for quick lookups, one-line or single-file edits, factual questions about code, format conversions, commit messages, and how-to questions about a tool's configuration.
 ---
 
 # Agent Router

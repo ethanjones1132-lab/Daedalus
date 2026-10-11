@@ -28,6 +28,12 @@ A Claude Code plugin, `agent-router` (`plugins/agent-router/`), tells whichever 
 - **Subagents nest** three layers deep by default. Their requests count against the same plan limits as the main session.
 - **Effort defaults:** Opus 5.5, Sonnet 5.5 and Haiku 5.5 default to `medium` in Claude Code. The `high` driver setting is a deliberate override.
 
+## Trigger evidence (2026-10-11, Sonnet 5.5 at xhigh, `claude -p`, 20 queries × 2 runs)
+
+- **Description only:** routing and usage questions trigger the skill, but concrete coding tasks (fix these tests, split this file, audit and fix) never do. Sonnet's first move on those is `Bash`. Three rounds of description tuning reached at best 6/8 on the held-out set and 0/6 on the training set's coding tasks.
+- **Tuned description plus one line in CLAUDE.md** ("Before your first tool call on any task bigger than a quick edit or a factual question, load the agent-router skill and route the work with it."): 10/10 positives triggered on both runs, and 0/10 near-miss negatives.
+- **Recommendation:** adding that line to `~/.claude/CLAUDE.md` is what makes the skill reliable. It is the owner's call, given the "optional until proven" rule.
+
 ## Consequences
 
 - Inline work versus delegation is decided by **how much context each piece carries**, not by chasing cache hits.

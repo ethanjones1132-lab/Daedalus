@@ -15,6 +15,14 @@ Routes each piece of work to the right model:
 
 Then set the driver: `/model sonnet` and `/effort xhigh`. To make that the default, put `"model": "sonnet"` and `"effortLevel": "xhigh"` in `~/.claude/settings.json`.
 
+## Make it trigger reliably
+
+On its own, the skill only loads for routing and usage questions. Sonnet starts concrete coding tasks with `Bash` and never consults it. One line in `~/.claude/CLAUDE.md` fixes that: in testing it triggered 10/10 on real tasks, with 0/10 false triggers.
+
+```
+Before your first tool call on any task bigger than a quick edit or a factual question, load the agent-router skill and route the work with it.
+```
+
 ## What's inside
 
 | Component | Model / effort | Role |

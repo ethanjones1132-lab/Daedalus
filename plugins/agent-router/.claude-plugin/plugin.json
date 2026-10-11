@@ -1,10 +1,17 @@
 {
   "name": "agent-router",
   "displayName": "Agent Router",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Model, subagent and CLI-agent routing: Sonnet 5.5 driver, Opus 5.5 plan approver, Haiku 5.5 workers, OpenCode cheap tier, GPT-6 / Grok frontier specialists.",
-  "author": { "name": "ethanjones1132-lab" },
+  "author": {
+    "name": "ethanjones1132-lab"
+  },
   "repository": "https://github.com/ethanjones1132-lab/Daedalus",
   "license": "MIT",
-  "keywords": ["routing", "subagents", "usage", "models"]
+  "keywords": [
+    "routing",
+    "subagents",
+    "usage",
+    "models"
+  ]
 }
