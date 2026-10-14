@@ -149,10 +149,12 @@ cd src-tauri && cargo tauri build   # → target/release/bundle/nsis/Jarvis_*_x6
 # Linux / WSL
 bash build-wsl.sh
 
-# macOS (unsigned; not notarized) — installed Tauri CLI; external target dir per the Mac gate
-CARGO_TARGET_DIR=/Users/charlottehughes/Documents/Codex/2026-10-14/h/work/daedalus-native-target \\
-  /Users/charlottehughes/Documents/Codex/2026-10-14/h/work/sprint-tools/node_modules/.bin/tauri build --bundles app
-# → .../release/bundle/macos/Jarvis.app (Contents/MacOS/home-base, unsigned)
+# macOS (unsigned; not notarized) — requires the Tauri CLI to be installed on this machine.
+# Use the Mac gate's separate target directory by exporting CARGO_TARGET_DIR,
+# or leave it unset to build into src-tauri/target.
+cd src-tauri && CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/../.daedalus-native-target}" \
+  cargo tauri build --bundles app
+# → $CARGO_TARGET_DIR/release/bundle/macos/Jarvis.app (Contents/MacOS/home-base, unsigned)
 ```
 
 ---
@@ -165,9 +167,9 @@ bash scripts/verify.sh --test       # + cargo test + bun test
 bash scripts/verify.sh --build      # + server dist + UI dist
 ```
 
-**Last full recorded run — 2026-10-14 (macOS): 3,553/3,553 Bun tests in `server-jarvis` (215 test files) and 1,788/1,788 UI tests (176 of 188 `*.test.{ts,tsx}` files), plus 134/134 Cargo tests green; both `tsc` jobs and both builds clean (all platform-skip predicates run on this OS).**
+**Last full recorded run — 2026-10-14 (macOS): 3,556/3,556 Bun tests in `server-jarvis` (215 test files) and 1,788/1,788 UI tests (176 Vitest files under `src/`), plus 134/134 Cargo tests green; both `tsc` jobs and both builds clean (all platform-skip predicates run on this OS).** Repository counts are source-derived: `bun test` reports tests across 215 files, and `vitest.config.ts` includes only `src/**/*.test.{ts,tsx}`, so copied test files under `node_modules/` are excluded.
 
-On macOS, run the full gate rather than the Windows-oriented subset: `python3 /Users/charlottehughes/code/mac-sprints-20261014/control/verify.py Daedalus` (or `bash scripts/verify.sh --test` for the local subset). The number in a README is a claim, and the command is the evidence.
+`bash scripts/verify.sh --test` is the repository-local full check (Bun tests, Rust tests, both `tsc` jobs); add `--build` for the server/UI artifact builds. The sprint harness command `python3 /Users/charlottehughes/code/mac-sprints-20261014/control/verify.py Daedalus` is sprint-tooling located outside this repository and is not available in a fresh clone. The number in a README is a claim, and the command is the evidence.
 
 Suite growth is itself the artifact of how this repo is maintained: **240 Bun tests on 2026-06-24 → 2,469 on 2026-08-01**, added by a cron-driven maintenance loop that ships small, test-first, commit-attributed changes on a daily cadence. `PRIORITIES.md` records each pass with its commit SHAs and the test delta it produced.
 
