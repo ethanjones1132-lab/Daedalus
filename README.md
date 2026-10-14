@@ -158,7 +158,7 @@ bash scripts/verify.sh --test       # + cargo test + bun test
 bash scripts/verify.sh --build      # + server dist + UI dist
 ```
 
-**Last full recorded run — 2026-08-01: 2,469/2,469 Bun tests and 115/115 Cargo tests green, both `tsc` jobs clean.**
+**Last full recorded run — 2026-10-14: 3,412/3,412 Bun tests and the full Cargo suite green, both `tsc` jobs clean (Windows environment; platform-specific tests skipped where the OS cannot reproduce them).**
 
 The tree has grown since that run: **185 test files under `server-jarvis/src`**, 215 across the repo including the UI. Reproduce with `bash scripts/verify.sh --test` rather than trusting this paragraph — the number in a README is a claim, and the command is the evidence.
 
