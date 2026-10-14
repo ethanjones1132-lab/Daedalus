@@ -1,3 +1,4 @@
+import { useFeatureMode } from '../workflows/FeatureModes';
 import { Button } from '../../design';
 import type { SkillCandidateAction } from '../../domain/skill-candidate-operation-state';
 import {
@@ -26,11 +27,13 @@ export function CandidateActions({
   onAction: (action: SkillCandidateAction) => void;
   mode: 'compact' | 'full';
 }) {
+  const modeNavigation = useFeatureMode();
   const passing = candidate.eval_score !== undefined && candidate.eval_score >= PROMOTE_EVAL_GATE;
   const frozen = locked || !current;
-  const promoteDisabled = frozen || !passing;
+  const promoteDisabled = frozen || (!modeNavigation && !passing);
   const act = (action: SkillCandidateAction) => (event: { stopPropagation: () => void }) => {
     event.stopPropagation();
+    if (action === 'promote' && modeNavigation) { modeNavigation.openControls(candidate.id); return; }
     onAction(action);
   };
   return (
@@ -40,20 +43,20 @@ export function CandidateActions({
           Run eval
         </Button>
       )}
-      {candidate.status === 'candidate' && (
+      {(candidate.status === 'candidate' || candidate.status === 'staged') && (
         <>
           <Button
             size="xs"
             variant="primary"
             disabled={promoteDisabled}
             onClick={act('promote')}
-            title={passing ? PROMOTE_READY_HINT : PROMOTE_BLOCKED_HINT}
+            title={modeNavigation ? 'Review and explicitly select accepted evaluation proof before promotion.' : passing ? PROMOTE_READY_HINT : PROMOTE_BLOCKED_HINT}
           >
             Promote
           </Button>
-          <Button size="xs" variant="danger" disabled={frozen} onClick={act('reject')}>
+          {candidate.status === 'candidate' && <Button size="xs" variant="danger" disabled={frozen} onClick={act('reject')}>
             Reject
-          </Button>
+          </Button>}
         </>
       )}
       {mode === 'full' && candidate.status === 'promoted' && (

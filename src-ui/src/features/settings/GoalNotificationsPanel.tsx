@@ -10,7 +10,11 @@ export default function GoalNotificationsPanel() {
   useEffect(() => {
     let current = true;
     void invoke<Record<string, string>>('get_all_settings').then(settings => {
-      if (current) { setEnabled((settings.goal_notifications_enabled ?? 'true') === 'true'); setFailed(false); }
+      if (!current) return;
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) { setFailed(true); return; }
+      const value = settings.goal_notifications_enabled;
+      if (value !== undefined && value !== 'true' && value !== 'false') { setFailed(true); return; }
+      setEnabled((value ?? 'true') === 'true'); setFailed(false);
     }, () => { if (current) setFailed(true); });
     return () => { current = false; };
   }, [retry]);

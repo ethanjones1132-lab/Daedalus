@@ -86,4 +86,3 @@ export function decodeCanonicalSessionRows(value: unknown): CollectionRead<Canon
   }
   return { ok: true, rows };
 }
-

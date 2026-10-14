@@ -49,6 +49,7 @@ import {
 // it gains tool support must be a one-line edit.
 describe("delegate tool-call capability filter", () => {
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __reseedDelegateWriteScoreboardForTests();
   });
@@ -109,6 +110,7 @@ describe("delegate tool-call capability filter", () => {
 
 describe("selectDelegateModel (W1.1 scoreboard ranking)", () => {
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __reseedDelegateWriteScoreboardForTests();
   });
@@ -265,6 +267,7 @@ describe("selectDelegateModel (W1.1 scoreboard ranking)", () => {
 
 describe("selectDelegateModel (W1.2 Anthropic Go while proxy up)", () => {
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __reseedDelegateWriteScoreboardForTests();
   });
@@ -317,6 +320,7 @@ describe("selectDelegateModel (W1.2 Anthropic Go while proxy up)", () => {
 
 describe("selectDelegateModel (W1.3 earned free lane)", () => {
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __resetDelegateWriteScoreboardForTests();
   });
@@ -470,6 +474,7 @@ describe("delegate thrash accounting", () => {
 
 describe("delegate verified-write scoreboard", () => {
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __resetDelegateWriteScoreboardForTests();
     __resetModelHealthForTests();
@@ -663,6 +668,7 @@ describe("delegate only selects models the claude_cli proxy can resolve", () => 
   const goOpenaiModels = ["deepseek-v4-flash", "mimo-v2.5"];
 
   beforeEach(() => {
+    __resetModelHealthForTests();
     __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     __resetDelegateWriteScoreboardForTests();
   });

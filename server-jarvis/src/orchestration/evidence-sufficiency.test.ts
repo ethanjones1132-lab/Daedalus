@@ -512,11 +512,9 @@ describe("extractSourceReadCandidates (F8)", () => {
 
   test("already-read keys are excluded", () => {
     const planText = "Read src/a.ts and src/b.ts";
-    const already = alreadyReadSourceKeys(
-      [read("C:\\repo\\src\\a.ts")],
-      "C:\\repo",
-    );
-    const candidates = extractSourceReadCandidates(planText, [], "C:\\repo", already);
+    const root = process.cwd();
+    const already = alreadyReadSourceKeys([read(join(root, "src", "a.ts"))], root);
+    const candidates = extractSourceReadCandidates(planText, [], root, already);
     expect(candidates.some((c) => c.toLowerCase().includes("a.ts"))).toBe(false);
     expect(candidates.some((c) => c.toLowerCase().includes("b.ts"))).toBe(true);
   });

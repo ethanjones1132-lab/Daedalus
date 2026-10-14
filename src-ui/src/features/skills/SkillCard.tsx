@@ -135,7 +135,7 @@ export function SkillCard({
           )}
         </div>
         {distilled && candidateId ? (
-          candidate?.status === 'candidate' && (
+          (candidate?.status === 'candidate' || candidate?.status === 'staged') && (
             <CandidateActions
               candidate={candidate}
               current={candidateCurrent}

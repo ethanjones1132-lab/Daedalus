@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readdir, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
 import { defaultConfig, type JarvisConfig } from "../config";
 import { readFileSync } from "fs";
 import {
@@ -32,6 +32,11 @@ import {
   DELEGATE_MCP_SESSION_GRANTS_ENV,
   DELEGATE_MCP_WORKSPACE_ENV,
 } from "../mcp-adapter";
+
+function fixturePathKey(root: string, path: string): string {
+  const absolute = resolve(root, path);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+}
 
 /** Default delegate model is Anthropic-native (minimax-m3); give tests a Go key. */
 function testConfig(): JarvisConfig {
@@ -811,7 +816,7 @@ describe("Claude executor delegate", () => {
       status: " M other.ts",
       diffStat: " other.ts | 1 +",
       fingerprint: "same",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     };
     const after = { ...before };
     let captures = 0;
@@ -883,14 +888,14 @@ describe("Claude executor delegate", () => {
       status: "",
       diffStat: "",
       fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     }], [{
       root: "C:\\repo",
       kind: "git",
       status: " M claimed.ts",
       diffStat: " claimed.ts | 2 ++",
       fingerprint: "after",
-      files: { "c:\\repo\\claimed.ts": "200:12" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "200:12" },
     }]];
     const health = new DelegateHealth();
     const streamedText: string[] = [];
@@ -1013,14 +1018,14 @@ describe("Claude executor delegate", () => {
       status: "",
       diffStat: "",
       fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     }], [{
       root: "C:\\repo",
       kind: "git",
       status: " M claimed.ts",
       diffStat: " claimed.ts | 2 ++",
       fingerprint: "after",
-      files: { "c:\\repo\\claimed.ts": "200:12" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "200:12" },
     }]];
     const health = new DelegateHealth();
     const output = await runClaudeDelegate({
@@ -1156,14 +1161,14 @@ describe("Claude executor delegate", () => {
       status: "",
       diffStat: "",
       fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     };
     const after: DelegateRootSnapshot = {
       ...before,
       status: " M claimed.ts",
       diffStat: " claimed.ts | 2 ++",
       fingerprint: "after",
-      files: { "c:\\repo\\claimed.ts": "200:12" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "200:12" },
     };
     let captures = 0;
     let finish!: (exit: { code: number | null; signal: string | null }) => void;
@@ -1225,11 +1230,11 @@ describe("Claude executor delegate", () => {
     const controller = new AbortController();
     const before: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     };
     const after: DelegateRootSnapshot = {
       ...before, fingerprint: "after", status: " M claimed.ts", diffStat: " claimed.ts | 1 +",
-      files: { "c:\\repo\\claimed.ts": "200:11" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "200:11" },
     };
     let captures = 0;
     let eventIteratorReturns = 0;
@@ -1293,7 +1298,7 @@ describe("Claude executor delegate", () => {
     const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
       root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     };
     const health = new DelegateHealth();
     let captures = 0;
@@ -1860,7 +1865,7 @@ describe("Claude executor delegate", () => {
       status: "",
       diffStat: "",
       fingerprint: "before",
-      files: { "c:\\repo\\claimed.ts": "100:10" },
+      files: { [fixturePathKey("C:\\repo", "claimed.ts")]: "100:10" },
     };
     let captures = 0;
     const output = await runClaudeDelegate({

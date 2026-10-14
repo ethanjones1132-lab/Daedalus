@@ -2023,7 +2023,7 @@ mod startup_thread_tests {
         assert!(verify.contains("$manifest.claude_proxy_sha256"));
         assert!(verify.contains("'resources\\opencode_go_openai_models.json'"));
 
-        let build_helper = include_str!("../build.rs");
+        let build_helper = include_str!("../build.rs").replace("\r\n", "\n");
         assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
         assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
         assert!(build_helper.contains(
@@ -2033,7 +2033,7 @@ mod startup_thread_tests {
             "release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"
         ));
         assert!(build_helper.contains(
-            "let proxy_models_dest = release_dir\r\n        .join(\"resources\")\r\n        .join(\"opencode_go_openai_models.json\");"
+            "let proxy_models_dest = release_dir\n        .join(\"resources\")\n        .join(\"opencode_go_openai_models.json\");"
         ));
     }
 

@@ -192,16 +192,11 @@ describe('promoted-skill performance read', () => {
   });
 
   it('ignores a read whose candidate is no longer promoted, and shows no performance at all', async () => {
-    snapshot = { ...promoted, status: 'candidate', lifecycle_version: 0, promoted_at: undefined };
+    const late = deferred<Response>();
+    performanceRead = () => late.promise;
     render(<SkillsPage />);
     fireEvent.click(await screen.findByRole('button', { name: 'Inspect skill: distilled-debug' }));
     const panel = within(screen.getByRole('region', { name: 'Skill details: distilled-debug' }));
-    expect(performanceCalls()).toHaveLength(0);
-    expect(screen.queryByRole('group', { name: PERFORMANCE_REGION })).not.toBeInTheDocument();
-
-    const late = deferred<Response>();
-    performanceRead = () => late.promise;
-    fireEvent.click(panel.getByRole('button', { name: 'Promote' }));
     await waitFor(() => expect(performanceCalls()).toHaveLength(1));
     expect(screen.getByRole('group', { name: PERFORMANCE_REGION })).toBeInTheDocument();
     await waitFor(() => expect(panel.getByRole('button', { name: 'Demote' })).toBeEnabled());

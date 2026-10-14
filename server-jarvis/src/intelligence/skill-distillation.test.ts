@@ -4,7 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { distillSkillCandidate, distillFromTrajectorySnapshot } from "./skill-distiller";
 import { redistillSnapshots } from "./redistill";
-import { listSkillCandidates, loadSkillCandidate, pruneSkillCandidates, saveSkillCandidate, skillCandidatePath, updateSkillCandidateEval } from "./skill-store";
+import { listSkillCandidates, loadSkillCandidate, pruneSkillCandidates, saveSkillCandidateForEvaluationFixture, skillCandidatePath, updateSkillCandidateStatus, updateSkillCandidateEval } from "./skill-store";
 import { resolveSkillsForTurn, resolveSkillsForConductor } from "./skill-resolver";
 import {
   evaluateSkillPromotion,
@@ -15,6 +15,7 @@ import {
   computeCandidatePerformance,
   runGroundingJudge,
 } from "./skill-promotion";
+import { stagePromotionFixture } from "../test-utils/skill-promotion-fixture";
 import type { SkillCandidate } from "./skill-types";
 import type { TrajectorySnapshot } from "../self-tuning/store";
 import { countTokens } from "../tokens";
@@ -134,7 +135,7 @@ describe("skill distillation (Track C)", () => {
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
-    saveSkillCandidate(candidate);
+    saveSkillCandidateForEvaluationFixture(candidate);
 
     const resolved = resolveSkillsForTurn("refactor the login handler and fix tests", "debug");
     expect(resolved.matched.length).toBeGreaterThan(0);
@@ -159,7 +160,7 @@ describe("skill distillation (Track C)", () => {
       created_at: updatedAt,
       updated_at: updatedAt,
     }));
-    for (const row of rows.slice().reverse()) saveSkillCandidate(row);
+    for (const row of rows.slice().reverse()) saveSkillCandidateForEvaluationFixture(row);
 
     const resolved = resolveSkillsForTurn(
       "fix the failing import in src/auth.ts",
@@ -176,7 +177,7 @@ describe("skill distillation (Track C)", () => {
   test("bounds omission samples while retaining the total omission count", () => {
     for (let index = 0; index < 8; index++) {
       const timestamp = `2026-09-24T00:00:${String(index).padStart(2, "0")}.000Z`;
-      saveSkillCandidate({
+      saveSkillCandidateForEvaluationFixture({
         id: `skill-diagnostic-${index}`,
         name: `diagnostic-${index}`,
         description: "diagnostic",
@@ -217,7 +218,7 @@ describe("skill distillation (Track C)", () => {
       created_at: "2026-09-24T00:00:00.000Z",
       updated_at: "2026-09-24T00:00:00.000Z",
     };
-    saveSkillCandidate(row);
+    saveSkillCandidateForEvaluationFixture(row);
 
     const resolved = resolveSkillsForTurn(
       "fix the failing import in src/auth.ts",
@@ -258,7 +259,7 @@ describe("skill distillation (Track C)", () => {
         updated_at: "2026-09-24T00:00:00.000Z",
       },
     ];
-    for (const row of rows) saveSkillCandidate(row);
+    for (const row of rows) saveSkillCandidateForEvaluationFixture(row);
 
     const resolved = resolveSkillsForTurn(
       "fix the failing import in src/auth.ts",
@@ -287,8 +288,8 @@ describe("skill distillation (Track C)", () => {
     expect(resolved.omitted.count).toBe(0);
   });
 
-  test("promotion pass promotes high-confidence candidates", () => {
-    saveSkillCandidate({
+  test("promotion pass rejects heuristic failures and requires evidence for passing candidates", () => {
+    saveSkillCandidateForEvaluationFixture({
       id: "skill_promote_1",
       name: "distilled-refactor-x",
       description: "refactor pattern",
@@ -316,7 +317,7 @@ describe("skill distillation (Track C)", () => {
     expect(result.rejected[0].rejection_reason).toBe("missing_signals");
     expect(result.rejected[0].status).toBe("rejected");
     // A truly-promotable candidate (signals present, in-range body) should pass.
-    saveSkillCandidate({
+    saveSkillCandidateForEvaluationFixture({
       id: "skill_promote_2",
       name: "distilled-refactor-promote",
       description: "promotable refactor",
@@ -334,9 +335,9 @@ describe("skill distillation (Track C)", () => {
       promotion_eval_delta: 0.02,
       max_candidates: 50,
     });
-    expect(second.promoted.length).toBe(1);
-    expect(second.promoted[0].id).toBe("skill_promote_2");
-    expect(listSkillCandidates("promoted").length).toBeGreaterThan(0);
+    expect(second.promoted).toEqual([]);
+    expect(second.evidence_required.map(row => row.candidate.id)).toEqual(["skill_promote_2"]);
+    expect(loadSkillCandidate("skill_promote_2")?.status).toBe("candidate");
   });
 
   test("rejection reasons are structured and machine-typed", () => {
@@ -400,7 +401,7 @@ describe("skill distillation (Track C)", () => {
       },
     ];
     for (const c of cases) {
-      saveSkillCandidate(c.candidate);
+      saveSkillCandidateForEvaluationFixture(c.candidate);
       const v = evaluateSkillPromotion(c.candidate, {
         enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
       });
@@ -411,7 +412,7 @@ describe("skill distillation (Track C)", () => {
   });
 
   test("rejection reason is persisted and survives reload", () => {
-    saveSkillCandidate({
+    saveSkillCandidateForEvaluationFixture({
       id: "rc_persist", name: "rc-persist", description: "x",
       trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: [] },
       body: "x".repeat(600),
@@ -433,7 +434,7 @@ describe("skill distillation (Track C)", () => {
     // A rejected candidate has status="rejected", not "candidate", so the
     // pass's `listSkillCandidates("candidate")` filter skips it. This is
     // the loop-termination guarantee: no infinite re-eval churn.
-    saveSkillCandidate({
+    saveSkillCandidateForEvaluationFixture({
       id: "rc_noreeval", name: "rc-noreeval", description: "x",
       trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: [] },
       body: "x".repeat(600),
@@ -455,7 +456,7 @@ describe("skill distillation (Track C)", () => {
   });
 
   test("re-enabling a rejected candidate clears its stale reason", () => {
-    saveSkillCandidate({
+    saveSkillCandidateForEvaluationFixture({
       id: "rc_rearm", name: "rc-rearm", description: "x",
       trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: [] },
       body: "x".repeat(600),
@@ -473,18 +474,18 @@ describe("skill distillation (Track C)", () => {
     // body length still in range) — manually restore to "candidate" so
     // the next pass can re-evaluate. The store should clear the stale
     // reason on the transition out of "rejected".
-    rejected.status = "candidate";
-    rejected.trigger.signals = ["mutation_verb", "function_name"];
-    saveSkillCandidate(rejected);
+    const rearmedCandidate = updateSkillCandidateStatus(rejected.id, "candidate")!;
+    rearmedCandidate.trigger.signals = ["mutation_verb", "function_name"];
+    saveSkillCandidateForEvaluationFixture(rearmedCandidate);
 
     const rearmed = runSkillPromotionPass({
       enabled: true, min_confidence: 0.5, promotion_eval_delta: 0.02, max_candidates: 50,
     });
-    const promotedRow = rearmed.promoted.find((p) => p.id === "rc_rearm");
-    expect(promotedRow).toBeDefined();
-    expect(promotedRow!.status).toBe("promoted");
-    expect(promotedRow!.rejection_reason).toBeUndefined();
-    expect(promotedRow!.rejection_detail).toBeUndefined();
+    expect(rearmed.promoted).toEqual([]);
+    const awaitingEvidence = rearmed.evidence_required.find(row => row.candidate.id === "rc_rearm")?.candidate;
+    expect(awaitingEvidence?.status).toBe("candidate");
+    expect(awaitingEvidence?.rejection_reason).toBeUndefined();
+    expect(awaitingEvidence?.rejection_detail).toBeUndefined();
   });
 
   // ---- C-01 hardening: distill_on policy + audit/replay from trajectory snapshots ----
@@ -594,7 +595,7 @@ describe("skill distillation (Track C)", () => {
       promoted_at: "2026-09-23T00:00:00.000Z",
       eval_score: 1,
     };
-    saveSkillCandidate(promoted);
+    saveSkillCandidateForEvaluationFixture(promoted);
     const originalPath = skillCandidatePath(original!.id);
     const originalBytes = readFileSync(originalPath, "utf-8");
 
@@ -663,7 +664,7 @@ describe("skill distillation (Track C)", () => {
         updated_at: "2026-09-21T00:00:00.000Z",
       },
     ];
-    for (const row of rows) saveSkillCandidate(row);
+    for (const row of rows) saveSkillCandidateForEvaluationFixture(row);
 
     expect(pruneSkillCandidates(1)).toBe(1);
     const remaining = new Set(listSkillCandidates().map((row) => row.id));
@@ -944,7 +945,7 @@ describe("skill distillation (Track C)", () => {
         called = true;
         return passingCallModel()(m, o);
       };
-      const result = await promoteSkillCandidate("does_not_exist", spyCallModel, promotionCfg, () => null);
+      const result = await promoteSkillCandidate("does_not_exist", spyCallModel, promotionCfg, { reportHash: "a".repeat(64), decisionRecordHash: "b".repeat(64), expectedLifecycleVersion: 0 }, () => null, { root: tempRoot });
       expect(result.ok).toBe(false);
       expect(result.error).toBe("candidate_not_found");
       expect(called).toBe(false);
@@ -953,19 +954,19 @@ describe("skill distillation (Track C)", () => {
     test("wrong status (already promoted) is rejected without calling the judge", async () => {
       const c = groundableCandidate("rc_already_promoted");
       c.status = "promoted";
-      saveSkillCandidate(c);
+      saveSkillCandidateForEvaluationFixture(c);
       let called = false;
       const spyCallModel: CallModelFn = async (m, o) => {
         called = true;
         return passingCallModel()(m, o);
       };
-      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, () => null);
+      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, { reportHash: "a".repeat(64), decisionRecordHash: "b".repeat(64), expectedLifecycleVersion: 0 }, () => null, { root: tempRoot });
       expect(result.ok).toBe(false);
       expect(result.error).toBe("wrong_status");
       expect(called).toBe(false);
     });
 
-    test("heuristic gate failure rejects without calling the judge", async () => {
+    test("heuristic gate failure leaves the proven staged candidate untouched without calling the judge", async () => {
       const c: SkillCandidate = {
         id: "rc_heuristic_fail", name: "rc-heuristic-fail", description: "x",
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: [] }, // no signals -> missing_signals gate
@@ -973,61 +974,63 @@ describe("skill distillation (Track C)", () => {
         source_run_ids: ["run_heuristic_fail"], confidence: 0.9, status: "candidate",
         created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
       };
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       let called = false;
       const spyCallModel: CallModelFn = async (m, o) => {
         called = true;
         return passingCallModel()(m, o);
       };
-      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, () => null);
+      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, proof, () => null, { root: tempRoot });
       expect(called).toBe(false);
-      expect(result.candidate?.status).toBe("rejected");
-      expect(result.candidate?.rejection_reason).toBe("missing_signals");
+      expect(result.error).toBe("heuristic_rejected");
+      expect(result.candidate?.status).toBe("staged");
+      expect(loadSkillCandidate(c.id)?.status).toBe("staged");
     });
 
-    test("no grounding snapshot available rejects as eval_failed without calling the judge", async () => {
+    test("no grounding snapshot leaves the proven staged candidate untouched without calling the judge", async () => {
       const c = groundableCandidate("rc_no_snapshot");
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       let called = false;
       const spyCallModel: CallModelFn = async (m, o) => {
         called = true;
         return passingCallModel()(m, o);
       };
-      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, () => null);
+      const result = await promoteSkillCandidate(c.id, spyCallModel, promotionCfg, proof, () => null, { root: tempRoot });
       expect(called).toBe(false);
-      expect(result.candidate?.status).toBe("rejected");
-      expect(result.candidate?.rejection_reason).toBe("eval_failed");
-      expect(result.candidate?.rejection_detail).toContain("no grounding source");
+      expect(result.error).toBe("no_grounding_source");
+      expect(result.candidate?.status).toBe("staged");
+      expect(loadSkillCandidate(c.id)?.status).toBe("staged");
     });
 
     test("judge pass (score >= min_judge_score) promotes and sets promoted_at + eval_score", async () => {
       const c = groundableCandidate("rc_judge_pass");
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       const fetcher = snapshotFetcherFor(`run_for_${c.id}`, { worker_instructions: { executor: "Read first." } });
-      const result = await promoteSkillCandidate(c.id, passingCallModel(), promotionCfg, fetcher);
+      const result = await promoteSkillCandidate(c.id, passingCallModel(), promotionCfg, proof, fetcher, { root: tempRoot });
       expect(result.ok).toBe(true);
       expect(result.candidate?.status).toBe("promoted");
       expect(result.candidate?.promoted_at).toBeTruthy();
-      expect(result.candidate?.eval_score).toBe(1);
+      expect(result.verdict?.score).toBe(1);
       const reloaded = loadSkillCandidate(c.id);
       expect(reloaded?.status).toBe("promoted");
       expect(reloaded?.promoted_at).toBeTruthy();
     });
 
-    test("judge fail (score < min_judge_score) rejects with eval_failed and records eval_missed", async () => {
+    test("judge failure blocks promotion and preserves the staged candidate", async () => {
       const c = groundableCandidate("rc_judge_fail");
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       const fetcher = snapshotFetcherFor(`run_for_${c.id}`, { worker_instructions: { executor: "Read first." } });
-      const result = await promoteSkillCandidate(c.id, failingCallModel(), promotionCfg, fetcher);
-      expect(result.ok).toBe(true);
-      expect(result.candidate?.status).toBe("rejected");
-      expect(result.candidate?.rejection_reason).toBe("eval_failed");
-      expect(result.candidate?.eval_missed?.length).toBeGreaterThan(0);
+      const result = await promoteSkillCandidate(c.id, failingCallModel(), promotionCfg, proof, fetcher, { root: tempRoot });
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("below_judge_threshold");
+      expect(result.candidate?.status).toBe("staged");
+      expect(result.verdict?.missed.length).toBeGreaterThan(0);
+      expect(loadSkillCandidate(c.id)?.status).toBe("staged");
     });
 
     test("contradictory judge verdict leaves the candidate untouched and reports evaluator invalidity", async () => {
       const c = groundableCandidate("rc_judge_contradictory");
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       const fetcher = snapshotFetcherFor(`run_for_${c.id}`, { worker_instructions: { executor: "Read first." } });
       const contradictoryCallModel: CallModelFn = async (messages, options) => {
         const response = await passingCallModel()(messages, options);
@@ -1040,32 +1043,32 @@ describe("skill distillation (Track C)", () => {
         };
       };
 
-      const result = await promoteSkillCandidate(c.id, contradictoryCallModel, promotionCfg, fetcher);
+      const result = await promoteSkillCandidate(c.id, contradictoryCallModel, promotionCfg, proof, fetcher, { root: tempRoot });
       expect(result.ok).toBe(false);
       expect(result.error).toBe("judge_invalid");
       expect(result.detail).toContain("invalid");
       const reloaded = loadSkillCandidate(c.id);
-      expect(reloaded?.status).toBe("candidate");
+      expect(reloaded?.status).toBe("staged");
       expect(reloaded?.eval_score).toBeUndefined();
       expect(reloaded?.rejection_reason).toBeUndefined();
     });
 
-    test("judge call failure leaves the candidate as 'candidate' (not rejected, not promoted)", async () => {
+    test("judge call failure leaves the candidate staged", async () => {
       const c = groundableCandidate("rc_judge_unavailable");
-      saveSkillCandidate(c);
+      const proof = stagePromotionFixture(c, tempRoot);
       const fetcher = snapshotFetcherFor(`run_for_${c.id}`, { worker_instructions: { executor: "Read first." } });
-      const result = await promoteSkillCandidate(c.id, throwingCallModel(), promotionCfg, fetcher);
+      const result = await promoteSkillCandidate(c.id, throwingCallModel(), promotionCfg, proof, fetcher, { root: tempRoot });
       expect(result.ok).toBe(false);
       expect(result.error).toBe("judge_unavailable");
       const reloaded = loadSkillCandidate(c.id);
-      expect(reloaded?.status).toBe("candidate");
+      expect(reloaded?.status).toBe("staged");
     });
 
     test("demoting a promoted candidate clears promoted_at", () => {
       const c = groundableCandidate("rc_demote");
       c.status = "promoted";
       c.promoted_at = new Date().toISOString();
-      saveSkillCandidate(c);
+      saveSkillCandidateForEvaluationFixture(c);
       const { updateSkillCandidateStatus } = require("./skill-store");
       const demoted = updateSkillCandidateStatus(c.id, "candidate");
       expect(demoted?.status).toBe("candidate");
@@ -1075,7 +1078,7 @@ describe("skill distillation (Track C)", () => {
 
   describe("updateSkillCandidateEval (eval-only, no status transition)", () => {
     test("persists eval_score and eval_missed without changing status", () => {
-      saveSkillCandidate({
+      saveSkillCandidateForEvaluationFixture({
         id: "rc_eval_only", name: "rc-eval-only", description: "x",
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: ["mutation_verb"] },
         body: "x".repeat(600),
@@ -1150,7 +1153,7 @@ describe("skill distillation (Track C)", () => {
     }
 
     test("bulk promotion refuses a candidate without a passing judge decision", async () => {
-      saveSkillCandidate({
+      const proof = stagePromotionFixture({
         id: "candidate-1",
         name: "candidate-1",
         description: "x",
@@ -1161,13 +1164,14 @@ describe("skill distillation (Track C)", () => {
         status: "candidate",
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      });
-      await expect(promoteCandidates(["candidate-1"], passingCallModel(), bulkCfg, () => null))
-        .rejects.toThrow("judge_required");
+      }, tempRoot);
+      await expect(promoteCandidates([{ candidateId: "candidate-1", ...proof }], passingCallModel(), bulkCfg, () => null, { root: tempRoot }))
+        .resolves.toMatchObject([{ decision: "blocked", reason: "judge_required" }]);
+      expect(loadSkillCandidate("candidate-1")?.status).toBe("staged");
     });
 
     test("bulk promotion promotes a candidate with a passing prior judge decision", async () => {
-      saveSkillCandidate({
+      const proof = stagePromotionFixture({
         id: "candidate-2",
         name: "candidate-2",
         description: "x",
@@ -1181,10 +1185,10 @@ describe("skill distillation (Track C)", () => {
         eval_score: 1.0,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      });
+      }, tempRoot);
       const fetcher = (runId: string) =>
         runId === "run_for_candidate_2" ? groundingSnapshot(runId) : null;
-      const decisions = await promoteCandidates(["candidate-2"], passingCallModel(), bulkCfg, fetcher);
+      const decisions = await promoteCandidates([{ candidateId: "candidate-2", ...proof }], passingCallModel(), bulkCfg, fetcher, { root: tempRoot });
       expect(decisions).toHaveLength(1);
       expect(decisions[0].candidate_id).toBe("candidate-2");
       expect(decisions[0].decision).toBe("promote");
@@ -1195,7 +1199,7 @@ describe("skill distillation (Track C)", () => {
     });
 
     test("bulk promotion rejects a candidate whose prior judge score is below threshold", async () => {
-      saveSkillCandidate({
+      const proof = stagePromotionFixture({
         id: "candidate-3",
         name: "candidate-3",
         description: "x",
@@ -1207,9 +1211,10 @@ describe("skill distillation (Track C)", () => {
         eval_score: 0.5,
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-      });
-      await expect(promoteCandidates(["candidate-3"], passingCallModel(), bulkCfg, () => null))
-        .rejects.toThrow("judge_required");
+      }, tempRoot);
+      await expect(promoteCandidates([{ candidateId: "candidate-3", ...proof }], passingCallModel(), bulkCfg, () => null, { root: tempRoot }))
+        .resolves.toMatchObject([{ decision: "blocked", reason: "judge_required" }]);
+      expect(loadSkillCandidate("candidate-3")?.status).toBe("staged");
     });
   });
 
@@ -1341,13 +1346,13 @@ describe("skill distillation (Track C)", () => {
     test("matches on requirement + signals without needing task_type (task_type is unknown pre-routing)", () => {
       // trigger.task_types is "debug", but the message is about "refactor" work —
       // conductor-time matching must not require task_type, only requirement/signals.
-      saveSkillCandidate(promotedCandidate("conductor_1"));
+      saveSkillCandidateForEvaluationFixture(promotedCandidate("conductor_1"));
       const hint = resolveSkillsForConductor("please look at src/foo.ts and summarize it");
       expect(hint).toContain("distilled-conductor_1");
     });
 
     test("excludes candidates whose trigger.requirements does not include the current requirement", () => {
-      saveSkillCandidate(promotedCandidate("conductor_2", {
+      saveSkillCandidateForEvaluationFixture(promotedCandidate("conductor_2", {
         trigger: { task_types: ["debug"], requirements: ["full_execution"], signals: [] },
       }));
       const hint = resolveSkillsForConductor("please look at src/foo.ts and summarize it"); // workspace_read
@@ -1355,8 +1360,8 @@ describe("skill distillation (Track C)", () => {
     });
 
     test("only considers status='promoted' candidates, not candidate/rejected", () => {
-      saveSkillCandidate(promotedCandidate("conductor_3", { status: "candidate" }));
-      saveSkillCandidate(promotedCandidate("conductor_4", { status: "rejected" }));
+      saveSkillCandidateForEvaluationFixture(promotedCandidate("conductor_3", { status: "candidate" }));
+      saveSkillCandidateForEvaluationFixture(promotedCandidate("conductor_4", { status: "rejected" }));
       const hint = resolveSkillsForConductor("please look at src/foo.ts and summarize it");
       expect(hint).not.toContain("distilled-conductor_3");
       expect(hint).not.toContain("distilled-conductor_4");
@@ -1364,7 +1369,7 @@ describe("skill distillation (Track C)", () => {
 
     test("caps at 3 skills even when more match", () => {
       for (const n of [1, 2, 3, 4, 5]) {
-        saveSkillCandidate(promotedCandidate(`conductor_cap_${n}`));
+        saveSkillCandidateForEvaluationFixture(promotedCandidate(`conductor_cap_${n}`));
       }
       const hint = resolveSkillsForConductor("please look at src/foo.ts and summarize it");
       const lines = hint.split("\n").filter(Boolean);
@@ -1372,7 +1377,7 @@ describe("skill distillation (Track C)", () => {
     });
 
     test("hint format includes name, description, and task types", () => {
-      saveSkillCandidate(promotedCandidate("conductor_format", {
+      saveSkillCandidateForEvaluationFixture(promotedCandidate("conductor_format", {
         description: "Read before editing",
         trigger: { task_types: ["debug", "refactor"], requirements: ["workspace_read"], signals: [] },
       }));

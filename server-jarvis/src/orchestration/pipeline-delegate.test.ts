@@ -1,3 +1,4 @@
+import { resolve } from "path";
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
@@ -168,7 +169,7 @@ describe("executor delegate pipeline integration", () => {
   test.skipIf(process.platform === "win32")("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
-    const claimedPath = `${root}\\claimed.ts`.toLowerCase();
+    const claimedPath = process.platform === "win32" ? resolve(root, "claimed.ts").toLowerCase() : resolve(root, "claimed.ts");
     config.jarvis_path = root;
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {
@@ -267,7 +268,7 @@ describe("executor delegate pipeline integration", () => {
   test.skipIf(process.platform === "win32")("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
-    const claimedPath = `${root}\\claimed.ts`.toLowerCase();
+    const claimedPath = process.platform === "win32" ? resolve(root, "claimed.ts").toLowerCase() : resolve(root, "claimed.ts");
     config.jarvis_path = root;
     config.claude_cli.delegate.policy = "delegate_first";
     const ctx = makeExecutionContext("agent", config, {

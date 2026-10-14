@@ -179,7 +179,7 @@ describe("persisted skill candidate validation", () => {
       return { content: "{}" };
     };
 
-    const result = await promoteSkillCandidate("bad-promotion", model, config, () => null);
+    const result = await promoteSkillCandidate("bad-promotion", model, config, { reportHash: `sha256:${"a".repeat(64)}`, decisionRecordHash: `sha256:${"b".repeat(64)}`, expectedLifecycleVersion: 0 }, () => null);
 
     expect(result).toEqual({ ok: false, error: "invalid_candidate_record" });
     expect(modelCalled).toBe(false);

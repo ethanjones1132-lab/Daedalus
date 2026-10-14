@@ -1,3 +1,4 @@
+import { tmpdir } from "os";
 import { createHash } from "crypto";
 import { join, resolve } from "path";
 import { describe, expect, test } from "bun:test";
@@ -8,8 +9,8 @@ import {
   type VerificationExecResult,
 } from "./verification-workspace";
 
-const ROOT = "C:\\work\\Perihelion";
-const STATE_ROOT = "C:\\Users\\test\\.openclaw\\jarvis";
+const ROOT = resolve(tmpdir(), "Perihelion");
+const STATE_ROOT = resolve(tmpdir(), "jarvis-verification-state");
 
 function hashRoot(root: string): string {
   return createHash("sha256").update(resolve(root)).digest("hex");

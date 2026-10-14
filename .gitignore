@@ -95,3 +95,6 @@ server-jarvis/scratchpad-*.ts
 # local sprint secrets
 .sprint/.env*
 .env.typesafe
+
+# Cloud-sync download placeholders are not source assets.
+*.icloud

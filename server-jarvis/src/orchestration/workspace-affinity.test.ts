@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { WorkspaceAffinityStore, findExistingWorkspacePath } from "./workspace-affinity";
@@ -7,7 +7,7 @@ import { WorkspaceAffinityStore, findExistingWorkspacePath } from "./workspace-a
 const created: string[] = [];
 
 function tempWorkspace(): string {
-  const root = mkdtempSync(join(tmpdir(), "jarvis-workspace-affinity-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "jarvis-workspace-affinity-")));
   created.push(root);
   return root;
 }

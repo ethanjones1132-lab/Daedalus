@@ -1,9 +1,10 @@
+import { resolve } from "path";
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "./config";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import { registerGitLogBundle } from "./git-log-bundle";
 
-const repoRoot = "C:\\Projects\\home-base-recovered";
+const repoRoot = resolve(import.meta.dir, "../..");
 
 describe("git log bundle", () => {
   test("returns recent commits for the active workspace", async () => {

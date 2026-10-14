@@ -154,6 +154,6 @@ mod tests {
     #[test]
     fn nonempty_path_joins_directly() {
         let path = mcp_config_path("C:\\Users\\ethan\\myproject");
-        assert_eq!(path, PathBuf::from("C:\\Users\\ethan\\myproject\\.mcp.json"));
+        assert_eq!(path, PathBuf::from("C:\\Users\\ethan\\myproject").join(".mcp.json"));
     }
 }

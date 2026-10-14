@@ -546,13 +546,11 @@ mod tests {
             .expect("seed session memory");
             let result = crate::jarvis::memory::engine::review_session(&conn, sid).unwrap();
             assert_eq!(result.get("reviewed").and_then(|v| v.as_bool()), Some(true));
-            assert!(
-                result
-                    .get("memories_created")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    > 0
-            );
+            // Review reports durable capture receipts; a legacy summary alone
+            // must not fabricate a new scoped memory.
+            assert_eq!(result.get("memories_created").and_then(|v| v.as_i64()), Some(0));
+            assert_eq!(result.get("capture_receipts").and_then(|v| v.as_i64()), Some(0));
+            assert_eq!(result.get("accepted_operations").and_then(|v| v.as_i64()), Some(0));
         }
     }
 }

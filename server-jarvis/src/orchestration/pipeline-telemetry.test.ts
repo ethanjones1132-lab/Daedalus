@@ -150,11 +150,11 @@ describe("pipeline stage telemetry", () => {
   });
 
   test("mid-loop signal canonicalizes equivalent carried read paths against the active workspace", async () => {
-    const workspaceRoot = "C:\\Projects\\Jarvis";
+    const workspaceRoot = resolve(tmpdir(), "Jarvis");
     const priorToolCalls = [
       "IMPLEMENTATION_PLAN.md",
-      "C:\\Projects\\Jarvis\\IMPLEMENTATION_PLAN.md",
-      "c:/projects/jarvis/implementation_plan.md",
+      join(workspaceRoot, "IMPLEMENTATION_PLAN.md"),
+      join(workspaceRoot, "src", "..", "IMPLEMENTATION_PLAN.md"),
       "README.md",
       "README.md",
       "README.md",

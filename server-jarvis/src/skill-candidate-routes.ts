@@ -19,12 +19,14 @@ import {
   candidateContentDigestV1,
   listLearningEvalDecisionsForCandidate,
   type LearningEvalDecisionRecordV1,
+  type LearningEvalDecisionStoreOptions,
 } from "./self-tuning/rollout/learning-eval-decision-store";
 
 export interface SkillCandidateRouteDependencies {
   loadDistillationConfig: () => SkillDistillationConfig;
   makeCallModel: (config: SkillDistillationConfig) => CallModelFn;
   fetchSnapshot?: SnapshotFetcher;
+  evidenceStoreOptions?: LearningEvalDecisionStoreOptions;
 }
 
 type CandidateAction = "eval" | "promote" | "reject" | "demote" | "evaluation" | "rollback";
@@ -177,7 +179,7 @@ export async function handleSkillCandidateRequest(
   const candidate = read.candidate;
 
   if (action === "evaluation") {
-    const listed = listLearningEvalDecisionsForCandidate(id);
+    const listed = listLearningEvalDecisionsForCandidate(id, dependencies.evidenceStoreOptions);
     if (!listed.ok) return evaluationReadErrorResponse(listed);
     const currentVersion = skillCandidateLifecycleVersion(candidate);
     const currentContentDigest = candidateContentDigestV1(candidate);
@@ -198,14 +200,14 @@ export async function handleSkillCandidateRequest(
     if (
       !Object.hasOwn(body, "report_hash") ||
       typeof body.report_hash !== "string" ||
-      !/^[0-9a-fA-F]{64}$/.test(body.report_hash)
+      !/^sha256:[0-9a-f]{64}$/.test(body.report_hash)
     ) {
       return Response.json({ error: "invalid_report_hash" }, { status: 400 });
     }
     if (
       !Object.hasOwn(body, "record_hash") ||
       typeof body.record_hash !== "string" ||
-      !/^[0-9a-fA-F]{64}$/.test(body.record_hash)
+      !/^sha256:[0-9a-f]{64}$/.test(body.record_hash)
     ) {
       return Response.json({ error: "invalid_record_hash" }, { status: 400 });
     }
@@ -222,14 +224,14 @@ export async function handleSkillCandidateRequest(
     if (
       !Object.hasOwn(body, "report_hash") ||
       typeof body.report_hash !== "string" ||
-      !/^[0-9a-fA-F]{64}$/.test(body.report_hash)
+      !/^sha256:[0-9a-f]{64}$/.test(body.report_hash)
     ) {
       return Response.json({ error: "invalid_report_hash" }, { status: 400 });
     }
     if (
       !Object.hasOwn(body, "record_hash") ||
       typeof body.record_hash !== "string" ||
-      !/^[0-9a-fA-F]{64}$/.test(body.record_hash)
+      !/^sha256:[0-9a-f]{64}$/.test(body.record_hash)
     ) {
       return Response.json({ error: "invalid_record_hash" }, { status: 400 });
     }
@@ -260,7 +262,7 @@ export async function handleSkillCandidateRequest(
       decisionRecordHash: body.record_hash as string,
       reasonCode: body.reason_code as RollbackReasonCode,
       eventTimestamp: body.event_timestamp as string,
-    });
+    }, dependencies.evidenceStoreOptions);
     if (!result.ok) return rollbackErrorResponse(result);
     return Response.json({ candidate: result.candidate, event: result.event });
   }
@@ -287,6 +289,7 @@ export async function handleSkillCandidateRequest(
       config,
       proof,
       dependencies.fetchSnapshot,
+      dependencies.evidenceStoreOptions,
     );
     if (!result.ok) return promotionErrorResponse(result);
     return Response.json(result.candidate);

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join, resolve } from "path";
 import { describe, test, expect, spyOn } from "bun:test";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./orchestration/modes";
 import { PredictiveRouter } from "./orchestration/router";
@@ -317,7 +320,7 @@ describe("Orchestration & Routing Tests", () => {
     expect(modelStages).toEqual(["synthesizer"]);
     expect(executed).toEqual([
       { name: "list_directory", path: root },
-      { name: "read_file", path: `${root}\\README.md` },
+      { name: "read_file", path: join(root, "README.md") },
     ]);
     expect(result.toolCalls?.map((call) => call.name)).toEqual(["list_directory", "read_file"]);
     expect(result.answer).toContain("Perihelion");
@@ -421,7 +424,7 @@ describe("Orchestration & Routing Tests", () => {
     const runtime = createToolRuntime();
     registerGitMetadataBundle(runtime);
     const ctx = makeExecutionContext("agent", defaultConfig(), {
-      workspace_path: "C:\\Projects\\home-base-recovered",
+      workspace_path: resolve(import.meta.dir, "../.."),
       skip_approval_gate: true,
     });
     let synthesisContext = "";
@@ -434,7 +437,7 @@ describe("Orchestration & Routing Tests", () => {
     const executor = new PipelineExecutor(callModel as any, runtime, ctx, testCollector);
 
     const result = await executor.execute(
-      "Inspect C:\\Projects\\home-base-recovered and report the Git SHA.",
+      `Inspect ${resolve(import.meta.dir, "../..")} and report the Git SHA.`,
       ["executor", "synthesizer"],
       "run-git-preflight",
       () => {},
@@ -1217,7 +1220,9 @@ describe("Orchestration & Routing Tests", () => {
     );
     const config = defaultConfig();
     config.tools.require_approval = [];
-    const ctx = makeExecutionContext("agent", config, { workspace_path: process.cwd() });
+    // Snapshot only this isolated workspace; the real repo may include large research artifacts.
+    const workspace = mkdtempSync(join(tmpdir(), "jarvis-m3-plan-authority-"));
+    const ctx = makeExecutionContext("agent", config, { workspace_path: workspace });
     const { ConductorBus } = await import("./orchestration/conductor-bus");
     const { LiveConductor } = await import("./orchestration/conductor");
     const { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } = await import("./orchestration/agent-pool");
@@ -1325,6 +1330,7 @@ describe("Orchestration & Routing Tests", () => {
       segment = await runPromise;
     } finally {
       bus.clear();
+      rmSync(workspace, { recursive: true, force: true });
     }
 
     expect(reviewerPlanItemIds).toEqual(["pi_1"]);

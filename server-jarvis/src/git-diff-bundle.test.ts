@@ -1,9 +1,10 @@
+import { resolve } from "path";
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "./config";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import { registerGitDiffBundle } from "./git-diff-bundle";
 
-const repoRoot = "C:\\Projects\\home-base-recovered";
+const repoRoot = resolve(import.meta.dir, "../..");
 
 describe("git diff bundle", () => {
   test("returns changed-file information for the active workspace", async () => {

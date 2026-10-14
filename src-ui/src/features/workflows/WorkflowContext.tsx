@@ -27,8 +27,17 @@ export function WorkflowProvider({ children }: { children: ReactNode }) {
   return <WorkflowContext.Provider value={value}>{children}</WorkflowContext.Provider>;
 }
 const fallback = { selector: null, notification: null, handoff: null, review: null, navigateWorkflow: () => {}, consumeSelector: () => {}, consumeNotification: () => {}, openGoalNotification: () => {}, openInChat: () => {}, consumeHandoff: () => {} };
-const WorkflowContext = createContext<ReturnType<typeof useWorkflowValue> | null>(null);
-function useWorkflowValue() {
-  return null as unknown as { selector: WorkflowNavigationSelector | null; notification: GoalNotificationSelector | null; handoff: ProjectStewardHandoff | null; review: ProjectStewardReviewSelection | null; navigateWorkflow: (destination: WorkflowDestination, selector: WorkflowNavigationSelector | null) => void; consumeSelector: (selector: WorkflowNavigationSelector) => void; consumeNotification: (selector: GoalNotificationSelector) => void; openGoalNotification: (selector: GoalNotificationSelector) => void; openInChat: (handoff: ProjectStewardHandoff) => void; consumeHandoff: () => void };
+interface WorkflowValue {
+  selector: WorkflowNavigationSelector | null;
+  notification: GoalNotificationSelector | null;
+  handoff: ProjectStewardHandoff | null;
+  review: ProjectStewardReviewSelection | null;
+  navigateWorkflow: (destination: WorkflowDestination, selector: WorkflowNavigationSelector | null) => void;
+  consumeSelector: (selector: WorkflowNavigationSelector) => void;
+  consumeNotification: (selector: GoalNotificationSelector) => void;
+  openGoalNotification: (selector: GoalNotificationSelector) => void;
+  openInChat: (handoff: ProjectStewardHandoff) => void;
+  consumeHandoff: () => void;
 }
+const WorkflowContext = createContext<WorkflowValue | null>(null);
 export function useWorkflow() { return useContext(WorkflowContext) ?? fallback; }

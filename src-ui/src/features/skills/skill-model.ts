@@ -51,7 +51,7 @@ export interface SkillCandidateDetail {
   source_run_ids: string[];
   source_session_id?: string;
   confidence: number;
-  status: 'candidate' | 'promoted' | 'rejected';
+  status: 'candidate' | 'staged' | 'promoted' | 'rejected' | 'rolled_back';
   lifecycle_version?: number;
   eval_score?: number;
   eval_missed?: string[];

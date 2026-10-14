@@ -15,6 +15,7 @@ import {
   verifySkillCandidatePromotionEvidence,
   type SkillCandidatePromotionError,
 } from "./skill-store";
+import type { LearningEvalDecisionStoreOptions } from "../self-tuning/rollout/learning-eval-decision-store";
 import { judgeAnswer, type JudgeVerdict } from "../eval/judge";
 import type { CallModelFn } from "../orchestration/coordinator";
 import { SelfTuningStore, type TrajectorySnapshot } from "../self-tuning/store";
@@ -293,6 +294,7 @@ export async function promoteCandidates(
   callModel: CallModelFn,
   config: SkillDistillationConfig,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
+  evidenceStoreOptions?: LearningEvalDecisionStoreOptions,
 ): Promise<SkillPromotionDecision[]> {
   if (!Array.isArray(requests) || requests.length === 0) {
     throw new Error("promotion_request_invalid: at least one promotion request is required");
@@ -375,7 +377,7 @@ export async function promoteCandidates(
       reportHash: request.reportHash,
       decisionRecordHash: request.decisionRecordHash,
       expectedLifecycleVersion: request.expectedLifecycleVersion,
-    });
+    }, evidenceStoreOptions);
     if (!verification.ok) {
       block(
         candidateId,
@@ -402,6 +404,7 @@ export async function promoteCandidates(
         expectedLifecycleVersion: request.expectedLifecycleVersion,
       },
       fetchSnapshot,
+      evidenceStoreOptions,
     );
 
     if (result.ok && result.candidate?.status === "promoted") {
@@ -756,7 +759,11 @@ export async function promoteSkillCandidate(
   config: SkillDistillationConfig,
   proof: SkillPromotionProof,
   fetchSnapshot: SnapshotFetcher = defaultSnapshotFetcher,
+  evidenceStoreOptions?: LearningEvalDecisionStoreOptions,
 ): Promise<PromoteSkillCandidateResult> {
+  if (!isSkillPromotionRequest({ ...(proof && typeof proof === "object" ? proof : {}), candidateId: id })) {
+    return { ok: false, error: "evidence_required" };
+  }
   const proofTuple = {
     reportHash: proof.reportHash,
     decisionRecordHash: proof.decisionRecordHash,
@@ -780,7 +787,7 @@ export async function promoteSkillCandidate(
     return { ok: false, error: "wrong_status", detail: `status is ${candidate.status}` };
   }
 
-  const verification = verifySkillCandidatePromotionEvidence({ candidateId: id, ...proofTuple });
+  const verification = verifySkillCandidatePromotionEvidence({ candidateId: id, ...proofTuple }, evidenceStoreOptions);
   if (!verification.ok) {
     return { ok: false, error: verification.error, detail: verification.detail };
   }
@@ -827,13 +834,13 @@ export async function promoteSkillCandidate(
     };
   }
 
-  const writer = promoteSkillCandidateFromAcceptedDecision({ candidateId: id, ...proofTuple });
+  const writer = promoteSkillCandidateFromAcceptedDecision({ candidateId: id, ...proofTuple }, evidenceStoreOptions);
   if (!writer.ok) {
     return {
       ok: false,
-      error: "promotion_write_failed",
+      error: writer.error === "stale_version" || writer.error === "wrong_status" ? writer.error : "promotion_write_failed",
       detail: writer.detail ?? (typeof writer.error === "string" ? writer.error : "promotion write failed"),
-      candidate,
+      candidate: writer.current ?? candidate,
       verdict,
     };
   }

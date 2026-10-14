@@ -8,8 +8,8 @@ import { PerformanceReadout } from './PerformanceReadout';
 import { useCandidatePerformance } from './skill-hooks';
 import { formatDate, PROMOTE_EVAL_GATE, type Skill, type SkillCandidateDetail } from './skill-model';
 
-const STATUS_ORDER: Record<SkillCandidateDetail['status'], number> = { candidate: 0, promoted: 1, rejected: 2 };
-const STATUS_TONE = { candidate: 'accent', promoted: 'ok', rejected: 'error' } as const;
+const STATUS_ORDER: Record<SkillCandidateDetail['status'], number> = { candidate: 0, staged: 1, promoted: 2, rejected: 3, rolled_back: 4 };
+const STATUS_TONE = { candidate: 'accent', staged: 'info', promoted: 'ok', rejected: 'error', rolled_back: 'warn' } as const;
 
 function Numeral({ label, value }: { label: string; value: string }) {
   return (

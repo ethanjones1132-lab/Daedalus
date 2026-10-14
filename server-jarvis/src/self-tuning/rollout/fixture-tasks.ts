@@ -68,7 +68,7 @@ function loadDump(): RawDump {
     "  'k': K,",
     "}))",
   ].join("\n");
-  const stdout = execFileSync("python", ["-c", script], {
+  const stdout = execFileSync(process.platform === "win32" ? "python" : "python3", ["-c", script], {
     cwd: benchmarkDir(),
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024,

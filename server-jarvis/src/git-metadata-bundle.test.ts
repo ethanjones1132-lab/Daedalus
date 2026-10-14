@@ -1,10 +1,11 @@
+import { resolve } from "path";
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "./config";
 import { getToolsForMode } from "./orchestration/modes";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
 
-const repoRoot = "C:\\Projects\\home-base-recovered";
+const repoRoot = resolve(import.meta.dir, "../..");
 
 describe("git metadata bundle", () => {
   test("reports the checked-out SHA without accepting a command string", async () => {

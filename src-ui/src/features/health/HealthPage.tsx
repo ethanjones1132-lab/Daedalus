@@ -44,6 +44,7 @@ import { defaultCopy, Observation, type ObservationCopy } from './Observation';
 import { buildSubsystemRows, RestartFeedback, SubsystemGauges, type SubsystemRow } from './SubsystemGauges';
 import { ResourceHero } from './ResourceHero';
 import { BackendPanel, BridgeActionsPanel, ProvenancePanel } from './OverviewPanels';
+import ServerLogPanel from './ServerLogPanel';
 import { DoctorPanel, ResourceDetailPanel } from './DiagnosticsPanels';
 import { RuntimeView } from './RuntimePanels';
 import { parseDoctorReport, parseJarvisStatus, type DoctorReport } from './health-format';
@@ -299,7 +300,7 @@ export default function HealthPage() {
         {tab === 'diagnostics' && (
           <div className="space-y-4">
             <DoctorPanel doctor={doctor} pending={doctorRes.loading} />
-            <ResourceDetailPanel health={health} />
+            <ResourceDetailPanel health={health} /><ServerLogPanel />
           </div>
         )}
         {tab === 'runtime' && <RuntimeView telemetry={telemetry} onRetry={() => void loadTelemetry()} />}

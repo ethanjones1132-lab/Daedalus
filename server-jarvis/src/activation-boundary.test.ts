@@ -222,13 +222,14 @@ describe("saveBoundary + restoreBoundary round-trip", () => {
     // cross-contaminate tests. Pin that this is NOT the case.
     const dirA = tempBaseDir();
     const dirB = tempBaseDir();
-    saveBoundary({ slug: "isolated", active: true }, dirA);
+    saveBoundary({ slug: "isolated", active: true, custom: "only-in-A" } as ProjectionSnapshot, dirA);
     const fromA = restoreBoundary("isolated", dirA);
     const fromB = restoreBoundary("isolated", dirB);
     expect(fromA.snapshot.updated_at).toBeDefined();
-    // B has no file → falls through to default-snapshot, which is a freshly
-    // stamped timestamp, NOT the one written by A.
-    expect(fromB.snapshot.updated_at).not.toBe(fromA.snapshot.updated_at);
+    // Two restores may share a millisecond. Assert on persisted data rather
+    // than timestamps to prove the separate base directory cannot read A.
+    expect((fromA.snapshot as Record<string, unknown>).custom).toBe("only-in-A");
+    expect((fromB.snapshot as Record<string, unknown>).custom).toBeUndefined();
   });
 });
 

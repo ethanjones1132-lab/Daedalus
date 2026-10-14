@@ -76,6 +76,9 @@ describe("runCmaEsCampaign", () => {
   test("runs the requested generations and reports history", async () => {
     const result = await runCmaEsCampaign({
       callModel: inertModel,
+      // Optimizer mechanics need one finite fixture; full split coverage is
+      // tested by the loader, and graded timeout behavior by rollout-runner.
+      trainingTasks: loadTrainingTasks().slice(0, 1),
       generations: 2,
       popSize: 4,
       concurrency: 2,
@@ -93,6 +96,9 @@ describe("runCmaEsCampaign", () => {
   test("winner is always a valid in-bounds theta", async () => {
     const result = await runCmaEsCampaign({
       callModel: inertModel,
+      // Optimizer mechanics need one finite fixture; full split coverage is
+      // tested by the loader, and graded timeout behavior by rollout-runner.
+      trainingTasks: loadTrainingTasks().slice(0, 1),
       generations: 1,
       popSize: 4,
       concurrency: 2,
@@ -113,6 +119,9 @@ describe("runCmaEsCampaign", () => {
     // optimizer can never even begin to explore it.
     const result = await runCmaEsCampaign({
       callModel: inertModel,
+      // Optimizer mechanics need one finite fixture; full split coverage is
+      // tested by the loader, and graded timeout behavior by rollout-runner.
+      trainingTasks: loadTrainingTasks().slice(0, 1),
       generations: 1,
       popSize: 8,
       concurrency: 2,
@@ -125,6 +134,9 @@ describe("runCmaEsCampaign", () => {
     const seen: number[] = [];
     await runCmaEsCampaign({
       callModel: inertModel,
+      // Optimizer mechanics need one finite fixture; full split coverage is
+      // tested by the loader, and graded timeout behavior by rollout-runner.
+      trainingTasks: loadTrainingTasks().slice(0, 1),
       generations: 2,
       popSize: 4,
       concurrency: 2,

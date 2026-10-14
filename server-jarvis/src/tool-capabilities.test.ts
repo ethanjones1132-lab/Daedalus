@@ -46,7 +46,7 @@ const LEGACY = {
    *  `run_background_command`, but those names are not registered as tools in
    *  the live runtime — the keystone pins the LIVE registry, not the alias
    *  table). */
-  executionEvidence: ["bash", "powershell"],
+  executionEvidence: process.platform === "win32" ? ["bash", "powershell"] : ["bash"],
 } as const;
 
 function standardRuntimeIndex() {

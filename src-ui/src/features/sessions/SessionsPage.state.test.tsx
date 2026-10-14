@@ -297,7 +297,7 @@ describe('ChatPanel state machine', () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
       outcome: 'failed',
     })));
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
   });
 
   it('renders a stage-timeout result as timed out instead of success', async () => {

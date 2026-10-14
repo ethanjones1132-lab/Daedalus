@@ -99,12 +99,12 @@ describe("run_background_command timeout (live)", () => {
     // loop through run_background_command must not outlive timeout_ms.
     const runtime = makeRuntime();
     const context = ctx();
-    // PowerShell path so Windows hosts do not depend on bash being on PATH.
+    // Use the host shell so the child actually starts and reaches the timeout.
     const hang = `node -e "setInterval(()=>{}, 1000)"`;
     const started = await runtime.execute(
       call("run_background_command", {
         command: hang,
-        powershell: true,
+        powershell: process.platform === "win32",
         timeout_ms: 1_500,
         description: "hang-for-timeout-test",
       }),

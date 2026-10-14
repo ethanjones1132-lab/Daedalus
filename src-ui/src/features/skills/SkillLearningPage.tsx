@@ -1,3 +1,4 @@
+import { useFeatureMode } from '../workflows/FeatureModes';
 // ═══════════════════════════════════════════════════════════════
 // ── SkillsView — Browse, toggle, inspect, and revision-restore skills
 // ═══════════════════════════════════════════════════════════════
@@ -352,7 +353,7 @@ const SKILL_CANDIDATE_DECISIONS: readonly SkillCandidateEvaluationDecision[] = [
   'inconclusive',
 ];
 
-const HEX_64 = /^[0-9a-fA-F]{64}$/;
+const EVALUATION_DIGEST = /^(?:sha256:)?[0-9a-fA-F]{64}$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -362,8 +363,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
-function isHex64(value: unknown): value is string {
-  return typeof value === 'string' && HEX_64.test(value);
+function isEvaluationDigest(value: unknown): value is string {
+  return typeof value === 'string' && EVALUATION_DIGEST.test(value);
 }
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
@@ -387,7 +388,7 @@ function decodeEvaluationCandidate(value: unknown): SkillCandidateEvaluationCand
   const id = value.id;
   const contentDigest = value.content_digest;
   const artifactDigest = value.artifact_digest;
-  if (!isNonEmptyString(id) || !isHex64(contentDigest) || !isHex64(artifactDigest)) return null;
+  if (!isNonEmptyString(id) || !isEvaluationDigest(contentDigest) || !isEvaluationDigest(artifactDigest)) return null;
   return { id, content_digest: contentDigest, artifact_digest: artifactDigest };
 }
 
@@ -449,7 +450,7 @@ function decodeEvaluation(value: unknown): SkillCandidateEvaluation | null {
   const manifestHash = value.manifest_hash;
   const decision = value.decision;
   const generatedAt = value.generated_at;
-  if (!isHex64(reportHash) || !isHex64(recordHash) || !isHex64(manifestHash)) return null;
+  if (!isEvaluationDigest(reportHash) || !isEvaluationDigest(recordHash) || !isEvaluationDigest(manifestHash)) return null;
   if (!isSkillCandidateDecision(decision)) return null;
   if (!isNonEmptyString(generatedAt)) return null;
   const candidate = decodeEvaluationCandidate(value.candidate);
@@ -1291,6 +1292,7 @@ function ObservationFeedback<S>({ label, state, onRetry }: {
 // ── Main view ──────────────────────────────────────────────────
 
 export function SkillsView() {
+  const featureMode = useFeatureMode();
   const [skills, setSkills] = useState<Skill[]>([]);
   const pendingToggles = useRef(new Set<string>());
   const [togglePending, setTogglePending] = useState<Record<string, boolean>>({});
@@ -1311,6 +1313,11 @@ export function SkillsView() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  useEffect(() => {
+    if (!featureMode?.candidateId || !candidates) return;
+    const skill = skills.find(row => candidateIdOf(row) === featureMode.candidateId);
+    if (skill) setSelectedId(skill.id);
+  }, [featureMode?.candidateId, candidates, skills]);
   const detailId = useId();
   const inspectionButtons = useRef(new Map<string, HTMLButtonElement>());
   const searchInput = useRef<HTMLInputElement>(null);

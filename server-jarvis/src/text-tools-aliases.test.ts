@@ -21,9 +21,13 @@ describe("text-protocol tool aliases", () => {
   test("every alias target is a registered tool", () => {
     const registered = registeredNames();
     const dangling = Object.entries(TOOL_ALIASES)
-      .filter(([, target]) => !registered.has(target))
+      .filter(([, target]) => !(target === "powershell" && process.platform !== "win32") && !registered.has(target))
       .map(([alias, target]) => `${alias} -> ${target}`);
     expect(dangling).toEqual([]);
+  });
+
+  test("PowerShell is registered only on its supported Windows host", () => {
+    expect(registeredNames().has("powershell")).toBe(process.platform === "win32");
   });
 
   test("browse aliases reach web_fetch, not a phantom browse tool", () => {

@@ -135,7 +135,7 @@ describe('SkillsPage — distilled candidate actions (D5)', () => {
     expect(within(card).getByRole('button', { name: /reject/i })).toBeInTheDocument();
   });
 
-  it('clicking Promote posts to the Bun promote endpoint and refreshes the list', async () => {
+  it('clicking Promote opens proof review for the exact candidate without writing', async () => {
     const onPromote = vi.fn();
     setupFetchMock({ onPromote });
     renderSkillsPage();
@@ -144,7 +144,9 @@ describe('SkillsPage — distilled candidate actions (D5)', () => {
     const card = row.closest('li')!;
     fireEvent.click(within(card).getByRole('button', { name: /promote/i }));
 
-    await waitFor(() => expect(onPromote).toHaveBeenCalledTimes(1));
+    await screen.findByRole('region', { name: 'Skill details: distilled-debug-abcdef' });
+    expect(screen.getByRole('tab', { name: 'Learning evaluation' })).toHaveAttribute('aria-selected', 'true');
+    expect(onPromote).not.toHaveBeenCalled();
     // Refresh re-invokes list_skills after the action.
     await waitFor(() => {
       expect(invokeMock.mock.calls.filter((c) => c[0] === 'list_skills').length).toBeGreaterThanOrEqual(2);

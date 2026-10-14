@@ -7,7 +7,7 @@
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
-import { installSelfLog } from "./self-log";
+import { installSelfLog, selfLogPath } from "./self-log";
 installSelfLog();
 // Native memory bootstrap must capture and strip the owned capability from
 // `process.env` before any tool runtime or child subprocess can clone it.
@@ -65,6 +65,7 @@ import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
+import { logReadResponse, readLogTail } from "./log-read";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import {
   buildClaudeCliChatArgs,
@@ -6410,6 +6411,10 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json(runtimePerformanceMonitor
         ? { enabled: true, snapshot: runtimePerformanceMonitor.snapshot({ reset: false }) }
         : { enabled: false });
+    }
+    if (path === "/diagnostics/log" && req.method === "GET") {
+      // Read the bounded tail of the log this process owns; failures remain non-2xx.
+      return logReadResponse(readLogTail(selfLogPath(), new URL(req.url).searchParams.get("limit")));
     }
     if (path === "/health/conductor-cache") {
       return Response.json(conductorCacheSnapshot());

@@ -37,12 +37,12 @@ describe("skill candidate operation state", () => {
     expect(skillCandidateMutationConfirmed(mutation, { id: "candidate-2", status: "candidate", lifecycle_version: 3 })).toBe(false);
   });
 
-  it("accepts a promote request that authoritatively resolves to rejection", () => {
+  it("refuses to confirm a promotion when authoritative state is rejected", () => {
     const mutation = transitionSkillCandidateMutation(
       startSkillCandidateMutation("candidate-1", "promote", 0, 1),
       "write-succeeded",
     )!;
-    expect(skillCandidateMutationConfirmed(mutation, { id: "candidate-1", status: "rejected", lifecycle_version: 1 })).toBe(true);
+    expect(skillCandidateMutationConfirmed(mutation, { id: "candidate-1", status: "rejected", lifecycle_version: 1 })).toBe(false);
   });
 
   it("rejects invalid phase transitions instead of reviving settled work", () => {

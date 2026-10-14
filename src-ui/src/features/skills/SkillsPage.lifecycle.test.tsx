@@ -140,18 +140,18 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
     const alphaRow = row('distilled-alpha');
     const detail = inspect('distilled-alpha');
 
-    fireEvent.click(alphaRow.getByRole('button', { name: 'Promote' }));
+    fireEvent.click(alphaRow.getByRole('button', { name: 'Reject' }));
     fireEvent.click(detail.getByRole('button', { name: 'Reject' }));
-    expect(posts(alpha.id, 'promote')).toHaveLength(1);
-    expect(posts(alpha.id, 'reject')).toHaveLength(0);
-    for (const button of [alphaRow.getByRole('button', { name: 'Promote' }), alphaRow.getByRole('button', { name: 'Reject' }), detail.getByRole('button', { name: 'Promote' }), detail.getByRole('button', { name: 'Reject' })]) {
+    expect(posts(alpha.id, 'reject')).toHaveLength(1);
+    expect(posts(alpha.id, 'reject')).toHaveLength(1);
+    for (const button of [alphaRow.getByRole('button', { name: 'Reject' }), alphaRow.getByRole('button', { name: 'Reject' }), detail.getByRole('button', { name: 'Reject' }), detail.getByRole('button', { name: 'Reject' })]) {
       expect(button).toBeDisabled();
     }
 
     candidates[alpha.id] = { ...candidates[alpha.id], status: 'rejected', lifecycle_version: 1 };
     await act(async () => write.resolve(response({ id: alpha.id, status: 'rejected', lifecycle_version: 1 })));
     await waitFor(() => expect(screen.getByText('Rejected distilled-alpha')).toBeInTheDocument());
-    expect(posts(alpha.id, 'promote')).toHaveLength(1);
+    expect(posts(alpha.id, 'reject')).toHaveLength(1);
     expect(screen.queryByText('Promoted distilled-alpha')).not.toBeInTheDocument();
   });
 
@@ -182,17 +182,17 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
     await mount();
     readQueue.push(firstRead.promise, retryRead.promise);
     const alphaRow = row('distilled-alpha');
-    fireEvent.click(alphaRow.getByRole('button', { name: 'Promote' }));
-    candidates[alpha.id] = { ...candidates[alpha.id], status: 'promoted', lifecycle_version: 1 };
-    await act(async () => write.resolve(response({ id: alpha.id, status: 'promoted', lifecycle_version: 1 })));
+    fireEvent.click(alphaRow.getByRole('button', { name: 'Reject' }));
+    candidates[alpha.id] = { ...candidates[alpha.id], status: 'rejected', lifecycle_version: 1 };
+    await act(async () => write.resolve(response({ id: alpha.id, status: 'rejected', lifecycle_version: 1 })));
     await act(async () => firstRead.reject(new Error('private read detail')));
     await waitFor(() => expect(screen.getByRole('alert', { name: 'Candidate lifecycle: distilled-alpha' })).toHaveTextContent('lifecycle write completed'));
-    expect(alphaRow.getByRole('button', { name: 'Promote' })).toBeDisabled();
+    expect(alphaRow.getByRole('button', { name: 'Reject' })).toBeDisabled();
 
     fireEvent.click(alphaRow.getByRole('button', { name: 'Retry' }));
-    expect(posts(alpha.id, 'promote')).toHaveLength(1);
+    expect(posts(alpha.id, 'reject')).toHaveLength(1);
     await act(async () => retryRead.resolve(response({ candidates: Object.values(candidates) })));
-    await waitFor(() => expect(screen.getByText('Promoted distilled-alpha')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Rejected distilled-alpha')).toBeInTheDocument());
   });
 
   it('keeps independent candidate writes usable and reconciles their reads independently', async () => {
@@ -204,19 +204,19 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
     const alphaRow = row('distilled-alpha');
     const betaRow = row('distilled-beta');
 
-    fireEvent.click(alphaRow.getByRole('button', { name: 'Promote' }));
+    fireEvent.click(alphaRow.getByRole('button', { name: 'Reject' }));
     fireEvent.click(betaRow.getByRole('button', { name: 'Reject' }));
-    expect(posts(alpha.id, 'promote')).toHaveLength(1);
+    expect(posts(alpha.id, 'reject')).toHaveLength(1);
     expect(posts(beta.id, 'reject')).toHaveLength(1);
-    expect(alphaRow.getByRole('button', { name: 'Promote' })).toBeDisabled();
+    expect(alphaRow.getByRole('button', { name: 'Reject' })).toBeDisabled();
     expect(betaRow.getByRole('button', { name: 'Reject' })).toBeDisabled();
 
     candidates[beta.id] = { ...candidates[beta.id], status: 'rejected', lifecycle_version: 1 };
     await act(async () => betaWrite.resolve(response({ id: beta.id, status: 'rejected', lifecycle_version: 1 })));
-    candidates[alpha.id] = { ...candidates[alpha.id], status: 'promoted', lifecycle_version: 1 };
-    await act(async () => alphaWrite.resolve(response({ id: alpha.id, status: 'promoted', lifecycle_version: 1 })));
+    candidates[alpha.id] = { ...candidates[alpha.id], status: 'rejected', lifecycle_version: 1 };
+    await act(async () => alphaWrite.resolve(response({ id: alpha.id, status: 'rejected', lifecycle_version: 1 })));
     await waitFor(() => {
-      expect(screen.getByText('Promoted distilled-alpha')).toBeInTheDocument();
+      expect(screen.getByText('Rejected distilled-alpha')).toBeInTheDocument();
       expect(screen.getByText('Rejected distilled-beta')).toBeInTheDocument();
     });
   });

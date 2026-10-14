@@ -10,7 +10,7 @@ import { conductorCacheSnapshot, __resetConductorCacheMetricsForTests } from "./
 import type { JarvisConfig } from "../config";
 import { defaultConfig } from "../config";
 import { __resetOllamaHealthCacheForTests } from "../ollama";
-import { saveSkillCandidate } from "../intelligence/skill-store";
+import { saveSkillCandidateForEvaluationFixture } from "../intelligence/skill-store";
 import type { SkillCandidate } from "../intelligence/skill-types";
 import { SelfTuningStore } from "../self-tuning/store";
 
@@ -1488,7 +1488,7 @@ describe("PersistentConductor", () => {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      saveSkillCandidate(candidate);
+      saveSkillCandidateForEvaluationFixture(candidate);
 
       const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
       mockOllamaCapture(chatBodies);
@@ -1521,7 +1521,7 @@ describe("PersistentConductor", () => {
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       };
-      saveSkillCandidate(candidate);
+      saveSkillCandidateForEvaluationFixture(candidate);
 
       const chatBodies: Array<{ messages: Array<{ role: string; content: string }> }> = [];
       mockOllamaCapture(chatBodies);

@@ -891,15 +891,24 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
 
   // Scroll-position watcher. We declare "pinned" as: at most 80px above the
   // bottom. Anything further up means the user is reading — pause autoscroll.
+  // Only an UPWARD scroll means the operator is reading: our own smooth
+  // scroll toward the bottom emits scroll events while still >80px away
+  // (tokens keep landing), and those must not unpin the transcript.
+  const lastScrollTopRef = useRef(0);
   const handleScroll = useCallback(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    setUserPinnedToBottom(distanceFromBottom < 80);
+    const movedUp = el.scrollTop < lastScrollTopRef.current;
+    lastScrollTopRef.current = el.scrollTop;
+    if (distanceFromBottom < 80) setUserPinnedToBottom(true);
+    else if (movedUp) setUserPinnedToBottom(false);
   }, []);
 
   const scrollToBottom = useCallback((behavior: 'smooth' | 'auto' = 'smooth') => {
-    messagesEndRef.current?.scrollIntoView({ behavior });
+    // jsdom (and very old engines) have no scrollIntoView; never let a missing
+    // layout engine break the Session surface.
+    messagesEndRef.current?.scrollIntoView?.({ behavior });
   }, []);
 
   // Throttled scroll during streaming: tokens arrive at 20-50 Hz, but
@@ -1504,7 +1513,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   // Autofocus + focus-after-send + focus-after-session-switch.
   useEffect(() => {
     const t = setTimeout(() => {
-      if (!pendingApprovalRef.current) inputRef.current?.focus();
+      if (!pendingApprovalRef.current && (document.activeElement === document.body || document.activeElement === inputRef.current)) inputRef.current?.focus();
     }, 50);
     return () => clearTimeout(t);
   }, [activeSession]);

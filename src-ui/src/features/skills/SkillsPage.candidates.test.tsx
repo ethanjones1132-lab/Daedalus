@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -93,7 +93,7 @@ describe('Skills eligibility', () => {
 });
 
 describe('Skills Candidates tab', () => {
-  it('lists every observed candidate with gates, and promotes through the same lifecycle flow', async () => {
+  it('lists every observed candidate and guides promotion into proof review', async () => {
     const user = userEvent.setup();
     mount();
     await screen.findByRole('button', { name: 'Inspect skill: docker-ops' });
@@ -107,9 +107,10 @@ describe('Skills Candidates tab', () => {
     expect(orphanRow.queryByRole('button', { name: 'Open skill' })).not.toBeInTheDocument();
 
     fireEvent.click(row.getByRole('button', { name: 'Promote' }));
-    await waitFor(() => expect(screen.getByText('Promoted distilled-trace')).toBeInTheDocument());
-    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith('/cand-1/promote') && init?.method === 'POST')).toHaveLength(1);
-    await waitFor(() => expect(row.getByRole('button', { name: 'Demote' })).toBeEnabled());
+    await screen.findByRole('region', { name: 'Skill details: distilled-trace' });
+    expect(screen.getByRole('tab', { name: 'Learning evaluation' })).toHaveAttribute('aria-selected', 'true');
+    expect(fetchMock.mock.calls.filter(([url, init]) => String(url).endsWith('/cand-1/promote') && init?.method === 'POST')).toHaveLength(0);
+
   });
 
   it('opens the linked skill in the Installed inspector', async () => {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../config";
 import { resolveSkillsForTurn } from "../intelligence/skill-resolver";
-import { saveSkillCandidate } from "../intelligence/skill-store";
+import { saveSkillCandidateForEvaluationFixture } from "../intelligence/skill-store";
 import type { SkillCandidate } from "../intelligence/skill-types";
 import { createToolRuntime, makeExecutionContext } from "../tool-runtime";
 import type { StageRun } from "../self-tuning/store";
@@ -155,7 +155,7 @@ describe("orchestrator transcript context", () => {
         created_at: updatedAt,
         updated_at: updatedAt,
       }));
-      for (const row of rows.slice().reverse()) saveSkillCandidate(row);
+      for (const row of rows.slice().reverse()) saveSkillCandidateForEvaluationFixture(row);
 
       const resolved = resolveSkillsForTurn(
         "fix the failing import in src/auth.ts",

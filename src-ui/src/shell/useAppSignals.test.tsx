@@ -93,12 +93,12 @@ describe('useAppSignals', () => {
     expect(await screen.findByText('You have 1 missed cron job pending review in the Cron tab.')).toBeInTheDocument();
   });
 
-  it('releases both listeners on unmount, including one that resolved after teardown', async () => {
+  it('releases all listeners on unmount, including one that resolved after teardown', async () => {
     const view = mount();
-    await waitFor(() => expect(listenMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(listenMock).toHaveBeenCalledTimes(3));
     await act(async () => {});
     view.unmount();
-    expect(unlisten).toHaveBeenCalledTimes(2);
+    expect(unlisten).toHaveBeenCalledTimes(3);
 
     // Race: unmount before the async listen() resolves.
     unlisten.mockClear();

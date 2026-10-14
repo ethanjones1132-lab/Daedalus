@@ -4,7 +4,8 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { distillSkillCandidate, distillFromTrajectorySnapshot } from "./skill-distiller";
 import { runGroundingJudge, promoteSkillCandidate } from "./skill-promotion";
-import { loadSkillCandidate, saveSkillCandidate } from "./skill-store";
+import { stagePromotionFixture } from "../test-utils/skill-promotion-fixture";
+import { loadSkillCandidate } from "./skill-store";
 import {
   computeSkillToolSequenceDigest,
   decodeSkillStageRuns,
@@ -195,24 +196,25 @@ describe("skill source evidence", () => {
     expect(!result.ok && result.error).toBe("no_grounding_source");
   });
 
-  test("promotion records a grounding rejection for an unobserved claim", async () => {
+  test("proven staged promotion refuses an unobserved claim and preserves the candidate", async () => {
     const root = mkdtempSync(join(tmpdir(), "jarvis-grounding-"));
     (globalThis as any).__skillCandidatesDirOverride = root;
     const c = candidate({
       id: "skill-grounding-rejected",
       body: "## Conductor worker guidance\nUse unobserved_tool on src/auth.ts. ".repeat(20),
     });
-    saveSkillCandidate(c);
+    const proof = stagePromotionFixture(c, root);
     let called = false;
     try {
       const result = await promoteSkillCandidate(c.id, async () => {
         called = true;
         return { content: "{\"covered\":[],\"missed\":[]}" };
-      }, config, () => payload());
+      }, config, proof, () => payload(), { root });
       expect(called).toBe(false);
-      expect(result.ok).toBe(true);
-      expect(result.candidate?.status).toBe("rejected");
-      expect(loadSkillCandidate(c.id)?.rejection_reason).toBe("eval_failed");
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("no_grounding_source");
+      expect(result.candidate?.status).toBe("staged");
+      expect(loadSkillCandidate(c.id)?.status).toBe("staged");
     } finally {
       delete (globalThis as any).__skillCandidatesDirOverride;
       rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });

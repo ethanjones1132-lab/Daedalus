@@ -262,8 +262,8 @@ describe('HealthBanner llama_cpp backend', () => {
     expect(screen.getByText('Offline')).toBeInTheDocument();
     expect(announcement()).toHaveTextContent('Backend "llama_cpp" is unreachable');
     details();
-    expect(screen.getByRole('listitem', { name: 'Gemma llama.cpp server is not running and required by the active inference backend.' })).toBeInTheDocument();
+    expect(screen.getByRole('listitem', { name: 'llama.cpp server is not running and required by the active inference backend.' })).toBeInTheDocument();
     expect(screen.getByRole('listitem', { name: 'Ollama is not running and not required by the active inference backend.' })).toBeInTheDocument();
-    expect(screen.getByRole('listitem', { name: /Gemma llama\.cpp server/ })).toHaveTextContent('(:8080)');
+    expect(screen.getByRole('listitem', { name: /llama\.cpp server/ })).toHaveTextContent('(:8080)');
   });
 });

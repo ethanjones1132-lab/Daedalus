@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { stagePromotionFixture } from "./test-utils/skill-promotion-fixture";
 import { handleSkillCandidateRequest } from "./skill-candidate-routes";
-import { loadSkillCandidate, saveSkillCandidate } from "./intelligence/skill-store";
+import { loadSkillCandidate, saveSkillCandidate, updateSkillCandidateStatus } from "./intelligence/skill-store";
 import type { SkillCandidate } from "./intelligence/skill-types";
 import type { CallModelFn } from "./orchestration/coordinator";
 import { computeSkillToolSequenceDigest, decodeSkillStageRuns } from "./intelligence/skill-source-evidence";
@@ -95,6 +96,7 @@ function dependencies(model: CallModelFn = passingModel()) {
     loadDistillationConfig: () => config,
     makeCallModel: () => model,
     fetchSnapshot: (runId: string) => groundingSnapshot(runId),
+    evidenceStoreOptions: { root },
   };
 }
 
@@ -133,9 +135,24 @@ describe("skill candidate lifecycle routes", () => {
     expect(loadSkillCandidate("candidate-1")).toMatchObject({ status: "rejected", lifecycle_version: 1 });
   });
 
+  test("promotes and rolls back using the canonical durable proof digests", async () => {
+    const proof = stagePromotionFixture(candidate(), root);
+    const promotion = await handleSkillCandidateRequest(request("candidate-1", "promote", {
+      expected_version: proof.expectedLifecycleVersion, report_hash: proof.reportHash, record_hash: proof.decisionRecordHash,
+    }), dependencies());
+    expect(promotion?.status).toBe(200);
+    expect(await promotion?.json()).toMatchObject({ status: "promoted", lifecycle_version: 2 });
+    const rollback = await handleSkillCandidateRequest(request("candidate-1", "rollback", {
+      expected_version: 2, report_hash: proof.reportHash, record_hash: proof.decisionRecordHash,
+      reason_code: "manual_rollback", event_timestamp: "2026-10-14T01:00:00.000Z",
+    }), dependencies());
+    expect(rollback?.status).toBe(200);
+    expect(await rollback?.json()).toMatchObject({ candidate: { status: "rolled_back", lifecycle_version: 3 } });
+  });
+
   test("fences a delayed promotion against a competing reject", async () => {
     const row = candidate();
-    saveSkillCandidate(row);
+    const proof = stagePromotionFixture(row, root);
     let releaseJudge!: () => void;
     let markStarted!: () => void;
     const gate = new Promise<void>((resolve) => { releaseJudge = resolve; });
@@ -147,21 +164,18 @@ describe("skill candidate lifecycle routes", () => {
     };
 
     const promotion = handleSkillCandidateRequest(
-      request("candidate-1", "promote", { expected_version: 0 }),
+      request("candidate-1", "promote", { expected_version: proof.expectedLifecycleVersion, report_hash: proof.reportHash, record_hash: proof.decisionRecordHash }),
       dependencies(delayedModel),
     );
-    await started;
-    const rejection = await handleSkillCandidateRequest(
-      request("candidate-1", "reject", { expected_version: 0 }),
-      dependencies(),
-    );
-    expect(rejection?.status).toBe(200);
+    await Promise.race([started, promotion.then(response => { throw new Error(`Promotion ended before judge: ${response?.status}`); })]);
+    const rejection = updateSkillCandidateStatus("candidate-1", "rejected", undefined, "manual", undefined, undefined, proof.expectedLifecycleVersion);
+    expect(rejection?.status).toBe("rejected");
     releaseJudge();
     const result = await promotion;
 
     expect(result?.status).toBe(409);
-    expect(await result?.json()).toMatchObject({ error: "stale_version", current_status: "rejected" });
-    expect(loadSkillCandidate("candidate-1")).toMatchObject({ status: "rejected", lifecycle_version: 1 });
+    expect(await result?.json()).toMatchObject({ error: "wrong_status", current_status: "rejected", current_version: 2 });
+    expect(loadSkillCandidate("candidate-1")).toMatchObject({ status: "rejected", lifecycle_version: 2 });
   });
 
   test("rejects malformed expected versions before invoking a judge", async () => {
@@ -173,7 +187,7 @@ describe("skill candidate lifecycle routes", () => {
     };
 
     const response = await handleSkillCandidateRequest(
-      request("candidate-1", "promote", { expected_version: 1.5 }),
+      request("candidate-1", "promote", { expected_version: 1.5, report_hash: `sha256:${"a".repeat(64)}`, record_hash: `sha256:${"b".repeat(64)}` }),
       dependencies(model),
     );
     expect(response?.status).toBe(400);
