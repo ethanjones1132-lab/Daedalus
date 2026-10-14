@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ecosystem Lab</title>
+<style>
+  :root { --bg:#0f1419; --panel:#1b232c; --panel2:#232e3a; --ink:#e6edf3; --muted:#94a3b8; --line:#33414f; --accent:#38bdf8; --grass:#22c55e; --rabbit:#e2e8f0; --fox:#f97316; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--ink); }
+  h1 { font-size: 18px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .layout { display: flex; flex-wrap: wrap; padding: 16px; gap: 16px; }
+  #panel-world { flex: 1 1 460px; min-width: 320px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  #panel-side { flex: 1 1 460px; min-width: 320px; display: flex; flex-direction: column; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  canvas { width: 100%; height: auto; display: block; border-radius: 6px; background: #000; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+  .counters { display: flex; gap: 16px; margin-top: 12px; flex-wrap: wrap; }
+  .counter { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; }
+  .counter .k { color: var(--muted); font-size: 12px; }
+  .counter .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+  button { font: inherit; cursor: pointer; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  input[type=number], input[type=text], input[type=range], textarea { font: inherit; color: var(--ink); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  input[type=number] { width: 80px; }
+  input[type=text] { width: 140px; }
+  input[type=range] { width: 160px; }
+  .field { margin: 8px 0; }
+  .field .lbl { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+  .field .val { color: var(--accent); font-weight: 600; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; }
+  .ode-out { margin-top: 10px; font-variant-numeric: tabular-nums; }
+  .ode-out div { margin: 3px 0; }
+  .ode-out .k { color: var(--muted); display: inline-block; min-width: 96px; }
+  .err { color: #f87171; min-height: 18px; margin-top: 8px; }
+  .preset-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+  .preset-item:first-child { border-top: none; }
+  .preset-item .name { flex: 1; }
+  .msg { color: var(--muted); font-size: 12px; }
+  svg { width: 100%; height: auto; }
+  @media (max-width: 699px) { .layout { flex-direction: column; } }
+</style>
+</head>
+<body>
+  <h1>Ecosystem Lab</h1>
+  <div class="layout">
+    <section id="panel-world">
+      <canvas data-testid="world" width="400" height="300"></canvas>
+      <div class="controls">
+        <button data-testid="play">Play</button>
+        <button data-testid="pause">Pause</button>
+        <button data-testid="step">Step</button>
+        <button data-testid="reset">Reset</button>
+        <label>Seed <input type="number" data-testid="seed" value="42"></label>
+        <label>Speed <input type="range" data-testid="speed" min="1" max="60" value="10"></label>
+      </div>
+      <div class="counters">
+        <div class="counter"><span class="k">tick </span><span class="v" data-testid="tick">0</span></div>
+        <div class="counter"><span class="k">rabbits </span><span class="v" data-testid="count-rabbits">0</span></div>
+        <div class="counter"><span class="k">foxes </span><span class="v" data-testid="count-foxes">0</span></div>
+        <div class="counter"><span class="k">grass </span><span class="v" data-testid="count-grass">0</span></div>
+      </div>
+      <div class="field"><label class="lbl">Rabbits0 <input type="range" data-testid="param-rabbits0" min="0" max="300" value="100"><span class="val" data-testid="val-rabbits0">100</span></label></div>
+      <div class="field"><label class="lbl">Foxes0 <input type="range" data-testid="param-foxes0" min="0" max="60" value="6"><span class="val" data-testid="val-foxes0">6</span></label></div>
+      <div class="field"><label class="lbl">RabbitBreed <input type="range" data-testid="param-rabbitBreed" min="2" max="40" value="12"><span class="val" data-testid="val-rabbitBreed">12</span></label></div>
+      <div class="field"><label class="lbl">FoxBreed <input type="range" data-testid="param-foxBreed" min="2" max="60" value="40"><span class="val" data-testid="val-foxBreed">40</span></label></div>
+      <div class="field"><label class="lbl">FoxGain <input type="range" data-testid="param-foxGain" min="1" max="30" value="4"><span class="val" data-testid="val-foxGain">4</span></label></div>
+      <div class="field"><label class="lbl">GrassMax <input type="range" data-testid="param-grassMax" min="1" max="10" value="4"><span class="val" data-testid="val-grassMax">4</span></label></div>
+    </section>
+    <div id="panel-side">
+      <div class="card">
+        <h2>Populations</h2>
+        <svg data-testid="chart" viewBox="0 0 500 220" role="img" aria-label="Population over time">
+          <line x1="40" y1="200" x2="490" y2="200" stroke="#4b5563"/>
+          <line x1="40" y1="10" x2="40" y2="200" stroke="#4b5563"/>
+          <text x="265" y="216" fill="#94a3b8" font-size="12">tick</text>
+          <text x="12" y="60" fill="#94a3b8" font-size="12" transform="rotate(-90 12 60)">count</text>
+          <polyline data-testid="series-rabbits" fill="none" stroke="#e2e8f0" stroke-width="1.5"/>
+          <polyline data-testid="series-foxes" fill="none" stroke="#f97316" stroke-width="1.5"/>
+        </svg>
+      </div>
+      <div class="card">
+        <h2>Lotka–Volterra</h2>
+        <div class="grid2">
+          <label>α <input type="number" data-testid="ode-alpha" value="1.1" step="0.1"></label>
+          <label>β <input type="number" data-testid="ode-beta" value="0.4" step="0.1"></label>
+          <label>γ <input type="number" data-testid="ode-gamma" value="0.4" step="0.1"></label>
+          <label>δ <input type="number" data-testid="ode-delta" value="0.1" step="0.1"></label>
+          <label>x0 <input type="number" data-testid="ode-x0" value="10"></label>
+          <label>y0 <input type="number" data-testid="ode-y0" value="10"></label>
+          <label>t <input type="number" data-testid="ode-t" value="50"></label>
+          <label>dt <input type="number" data-testid="ode-dt" value="0.01" step="0.001"></label>
+        </div>
+        <button data-testid="ode-run">Run</button>
+        <div class="ode-out" data-testid="ode-out"></div>
+        <svg data-testid="ode-chart" viewBox="0 0 500 220" role="img" aria-label="ODE trajectory"></svg>
+      </div>
+      <div class="card">
+        <h2>Scenario</h2>
+        <textarea data-testid="scenario-json" rows="6" placeholder="Paste or export scenario JSON here"></textarea>
+        <div class="controls">
+          <button data-testid="scenario-export">Export</button>
+          <button data-testid="scenario-load">Load</button>
+        </div>
+        <div class="err" data-testid="scenario-error"></div>
+      </div>
+      <div class="card">
+        <h2>Presets</h2>
+        <div class="controls">
+          <input type="text" data-testid="preset-name" placeholder="Preset name">
+          <button data-testid="preset-save">Save</button>
+        </div>
+        <div data-testid="preset-list"></div>
+      </div>
+    </div>
+  </div>
+  <div aria-live="polite" data-testid="announcer"></div>
+<script>
+(function () {
+  "use strict";
+
+  function mulberry32(seed) {
+    let a = seed | 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const DEFAULTS = {
+    width: 40, height: 30, grassMax: 4,
+    rabbits0: 100, foxes0: 6,
+    rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+    foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+  };
+  const PARAM_KEYS = ["width","height","grassMax","rabbits0","foxes0","rabbitStart","rabbitGain","rabbitCost","rabbitBreed","foxStart","foxGain","foxCost","foxBreed"];
+
+  function Simulation() {
+    this.params = {};
+    this.rand = null;
+    this.cells = [];
+    this.rabbits = [];
+    this.foxes = [];
+    this.id = 1;
+    this.tick = 0;
+    this.history = [];
+    this.seed = 42;
+    this.canvas = null;
+    this.ctx = null;
+  }
+
+  Simulation.prototype.merge = function (p) {
+    var out = {};
+    for (var k in DEFAULTS) out[k] = DEFAULTS[k];
+    if (p && typeof p === "object") {
+      for (var i = 0; i < PARAM_KEYS.length; i++) {
+        var key = PARAM_KEYS[i];
+        if (p[key] !== undefined && p[key] !== null) out[key] = p[key];
+      }
+    }
+    return out;
+  };
+
+  Simulation.prototype.reset = function (seed, params) {
+    this.params = this.merge(params || {});
+    this.seed = seed;
+    this.rand = mulberry32(seed);
+    this.tick = 0;
+    this.id = 1;
+    this.rabbits = [];
+    this.foxes = [];
+    this.history = [];
+    var w = this.params.width, h = this.params.height;
+    var n = w * h;
+    this.cells = new Array(n);
+    for (var i = 0; i < n; i++) this.cells[i] = { grass: 0, rabbit: null, fox: null };
+    // grass
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var idx = y * w + x;
+        this.cells[idx].grass = Math.floor(this.rand() * (this.params.grassMax + 1));
+      }
+    }
+    // rabbits
+    for (var r = 0; r < this.params.rabbits0; r++) {
+      var free = [];
+      for (var j = 0; j < n; j++) if (!this.cells[j].rabbit) free.push(j);
+      if (free.length === 0) break;
+      var cell = free[Math.floor(this.rand() * free.length)];
+      var rabbit = { id: this.id++, x: cell % w, y: Math.floor(cell / w), energy: this.params.rabbitStart };
+      this.rabbits.push(rabbit);
+      this.cells[cell].rabbit = rabbit;
+    }
+    // foxes
+    for (var f = 0; f < this.params.foxes0; f++) {
+      var free2 = [];
+      for (var k = 0; k < n; k++) if (!this.cells[k].fox) free2.push(k);
+      if (free2.length === 0) break;
+      var cell2 = free2[Math.floor(this.rand() * free2.length)];
+      var fox = { id: this.id++, x: cell2 % w, y: Math.floor(cell2 / w), energy: this.params.foxStart };
+      this.foxes.push(fox);
+      this.cells[cell2].fox = fox;
+    }
+    this.record();
+    this.draw();
+    return this.counts();
+  };
+
+  Simulation.prototype.neighbours = function (x, y, w, h) {
+    return [
+      [x, y - 1], [x + 1, y], [x, y + 1], [x - 1, y]
+    ];
+  };
+
+  Simulation.prototype.pick = function (list) {
+    return list[Math.floor(this.rand() * list.length)];
+  };
+
+  Simulation.prototype.tickFn = function () {
+    var w = this.params.width, h = this.params.height, n = w * h;
+    var self = this;
+    function cellAt(x, y) { if (x < 0 || y < 0 || x >= w || y >= h) return null; return self.cells[y * w + x]; }
+
+    // grass
+    for (var i = 0; i < n; i++) {
+      var c = self.cells[i];
+      c.grass = Math.min(self.params.grassMax, c.grass + 1);
+    }
+    // rabbits
+    var rStart = self.rabbits.slice();
+    rStart.sort(function (a, b) { return a.id - b.id; });
+    var toRemoveR = [];
+    for (var ri = 0; ri < rStart.length; ri++) {
+      var rb = rStart[ri];
+      if (self.rabbits.indexOf(rb) === -1) continue;
+      var nb = self.neighbours(rb.x, rb.y, w, h).filter(function (p) { return cellAt(p[0], p[1]) && !cellAt(p[0], p[1]).rabbit; });
+      if (nb.length > 0) {
+        var mv = self.pick(nb);
+        var oldCell = self.cells[rb.y * w + rb.x];
+        oldCell.rabbit = null;
+        rb.x = mv[0]; rb.y = mv[1];
+        self.cells[rb.y * w + rb.x].rabbit = rb;
+      }
+      var cur = self.cells[rb.y * w + rb.x];
+      rb.energy += self.params.rabbitGain * cur.grass;
+      cur.grass = 0;
+      rb.energy -= self.params.rabbitCost;
+      if (rb.energy >= self.params.rabbitBreed) {
+        var bnb = self.neighbours(rb.x, rb.y, w, h).filter(function (p) { return cellAt(p[0], p[1]) && !cellAt(p[0], p[1]).rabbit; });
+        if (bnb.length > 0) {
+          var spot = self.pick(bnb);
+          var child = Math.floor(rb.energy / 2);
+          rb.energy -= child;
+          var newRab = { id: self.id++, x: spot[0], y: spot[1], energy: child };
+          self.rabbits.push(newRab);
+          self.cells[spot[1] * w + spot[0]].rabbit = newRab;
+        }
+      }
+      if (rb.energy <= 0) toRemoveR.push(rb);
+    }
+    for (var rr = 0; rr < toRemoveR.length; rr++) {
+      var rem = toRemoveR[rr];
+      self.rabbits.splice(self.rabbits.indexOf(rem), 1);
+      var rc = self.cells[rem.y * w + rem.x];
+      if (rc && rc.rabbit === rem) rc.rabbit = null;
+    }
+    // foxes
+    var fStart = self.foxes.slice();
+    fStart.sort(function (a, b) { return a.id - b.id; });
+    var toRemoveF = [];
+    for (var fi = 0; fi < fStart.length; fi++) {
+      var fx = fStart[fi];
+      if (self.foxes.indexOf(fx) === -1) continue;
+      var tnb = self.neighbours(fx.x, fx.y, w, h).filter(function (p) { var cc = cellAt(p[0], p[1]); return cc && cc.rabbit && !cc.fox; });
+      var mnb = self.neighbours(fx.x, fx.y, w, h).filter(function (p) { var cc = cellAt(p[0], p[1]); return cc && !cc.fox; });
+      if (tnb.length > 0) {
+        var tmv = self.pick(tnb);
+        var of = self.cells[fx.y * w + fx.x];
+        of.fox = null;
+        fx.x = tmv[0]; fx.y = tmv[1];
+        self.cells[fx.y * w + fx.x].fox = fx;
+      } else if (mnb.length > 0) {
+        var mmv = self.pick(mnb);
+        var of2 = self.cells[fx.y * w + fx.x];
+        of2.fox = null;
+        fx.x = mmv[0]; fx.y = mmv[1];
+        self.cells[fx.y * w + fx.x].fox = fx;
+      }
+      var curf = self.cells[fx.y * w + fx.x];
+      if (curf.rabbit) {
+        self.rabbits.splice(self.rabbits.indexOf(curf.rabbit), 1);
+        curf.rabbit = null;
+        fx.energy += self.params.foxGain;
+      }
+      fx.energy -= self.params.foxCost;
+      if (fx.energy >= self.params.foxBreed) {
+        var bnf = self.neighbours(fx.x, fx.y, w, h).filter(function (p) { var cc = cellAt(p[0], p[1]); return cc && !cc.fox; });
+        if (bnf.length > 0) {
+          var sf = self.pick(bnf);
+          var ch = Math.floor(fx.energy / 2);
+          fx.energy -= ch;
+          var newFox = { id: self.id++, x: sf[0], y: sf[1], energy: ch };
+          self.foxes.push(newFox);
+          self.cells[sf[1] * w + sf[0]].fox = newFox;
+        }
+      }
+      if (fx.energy <= 0) toRemoveF.push(fx);
+    }
+    for (var fr = 0; fr < toRemoveF.length; fr++) {
+      var rfx = toRemoveF[fr];
+      self.foxes.splice(self.foxes.indexOf(rfx), 1);
+      var fc = self.cells[rfx.y * w + rfx.x];
+      if (fc && fc.fox === rfx) fc.fox = null;
+    }
+    this.tick++;
+    this.record();
+  };
+
+  Simulation.prototype.record = function () {
+    var grass = 0;
+    for (var i = 0; i < this.cells.length; i++) grass += this.cells[i].grass;
+    this.history.push({ tick: this.tick, rabbits: this.rabbits.length, foxes: this.foxes.length, grass: grass });
+  };
+
+  Simulation.prototype.counts = function () {
+    var grass = 0;
+    for (var i = 0; i < this.cells.length; i++) grass += this.cells[i].grass;
+    return { rabbits: this.rabbits.length, foxes: this.foxes.length, grass: grass };
+  };
+
+  Simulation.prototype.cell = function (x, y) {
+    if (x < 0 || y < 0 || x >= this.params.width || y >= this.params.height) return { grass: 0, rabbit: null, fox: null };
+    var c = this.cells[y * this.params.width + x];
+    return { grass: c.grass, rabbit: c.rabbit, fox: c.fox };
+  };
+
+  Simulation.prototype.historyFn = function () { return this.history.slice(); };
+
+  Simulation.prototype.ode = function (p, t, dt) {
+    var alpha = p.alpha, beta = p.beta, gamma = p.gamma, delta = p.delta;
+    var x = p.x0, y = p.y0;
+    var n = Math.round(t / dt);
+    function dx(a, b) { return alpha * a - beta * a * b; }
+    function dy(a, b) { return delta * a * b - gamma * b; }
+    for (var s = 0; s < n; s++) {
+      var k1x = dx(x, y), k1y = dy(x, y);
+      var k2x = dx(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y), k2y = dy(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y);
+      var k3x = dx(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y), k3y = dy(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y);
+      var k4x = dx(x + dt * k3x, y + dt * k3y), k4y = dy(x + dt * k3x, y + dt * k3y);
+      x += (dt / 6) * (k1x + 2 * k2x + 2 * k3x + k4x);
+      y += (dt / 6) * (k1y + 2 * k2y + 2 * k3y + k4y);
+    }
+    return { x: x, y: y };
+  };
+
+  Simulation.prototype.exportCSV = function () {
+    var lines = ["tick,rabbits,foxes,grass"];
+    for (var i = 0; i < this.history.length; i++) {
+      var e = this.history[i];
+      lines.push(e.tick + "," + e.rabbits + "," + e.foxes + "," + e.grass);
+    }
+    return lines.join("\n") + "\n";
+  };
+
+  Simulation.prototype.exportScenario = function () {
+    var params = {};
+    for (var i = 0; i < PARAM_KEYS.length; i++) params[PARAM_KEYS[i]] = this.params[PARAM_KEYS[i]];
+    return JSON.stringify({ version: 1, seed: this.seed, params: params });
+  };
+
+  Simulation.prototype.loadScenario = function (text) {
+    try {
+      var obj = JSON.parse(text);
+      if (obj.version !== 1) { this.onError("Invalid version"); return false; }
+      if (!Number.isInteger(obj.seed)) { this.onError("Seed must be an integer"); return false; }
+      this.reset(obj.seed, obj.params || {});
+      this.onError("");
+      return true;
+    } catch (e) {
+      this.onError("Invalid JSON");
+      return false;
+    }
+  };
+
+  Simulation.prototype.onError = function (msg) {
+    if (this.onErrorCb) this.onErrorCb(msg);
+  };
+
+  var sim = new Simulation();
+
+  // UI wiring
+  function el(sel) { return document.querySelector(sel); }
+  function setCount(id, v) { el("[data-testid='" + id + "']").textContent = v; }
+
+  function draw() {
+    var w = sim.params.width, h = sim.params.height, gm = sim.params.grassMax;
+    var cv = el("[data-testid='world']");
+    var ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var c = sim.cells[y * w + x];
+        var G = 60 + Math.round(160 * c.grass / gm);
+        ctx.fillStyle = "rgb(30," + G + ",30)";
+        ctx.fillRect(x * 10, y * 10, 10, 10);
+      }
+    }
+    function drawAnimal(a, color) {
+      var cx = a.x * 10 + 5, cy = a.y * 10 + 5;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (var i = 0; i < sim.rabbits.length; i++) drawAnimal(sim.rabbits[i], "rgb(240,240,240)");
+    for (var j = 0; j < sim.foxes.length; j++) drawAnimal(sim.foxes[j], "rgb(220,80,20)");
+  }
+
+  function updateChart() {
+    var hist = sim.historyFn();
+    var svgR = el("[data-testid='series-rabbits']");
+    var svgF = el("[data-testid='series-foxes']");
+    if (hist.length === 0) return;
+    var maxT = hist[hist.length - 1].tick;
+    var maxC = 1;
+    for (var i = 0; i < hist.length; i++) {
+      if (hist[i].rabbits > maxC) maxC = hist[i].rabbits;
+      if (hist[i].foxes > maxC) maxC = hist[i].foxes;
+    }
+    if (maxC < 1) maxC = 1;
+    var W = 500, H = 220, pad = 40;
+    function pts(arr, key) {
+      var out = [];
+      for (var k = 0; k < arr.length; k++) {
+        var px = 40 + (arr[k].tick / (maxT || 1)) * (W - pad - 20);
+        var py = 200 - (arr[k][key] / maxC) * (200 - pad - 20);
+        out.push(px.toFixed(2) + "," + py.toFixed(2));
+      }
+      return out.join(" ");
+    }
+    svgR.setAttribute("points", pts(hist, "rabbits"));
+    svgF.setAttribute("points", pts(hist, "foxes"));
+  }
+
+  function updateCounters() {
+    var c = sim.counts();
+    setCount("tick", sim.tick);
+    setCount("count-rabbits", c.rabbits);
+    setCount("count-foxes", c.foxes);
+    setCount("count-grass", c.grass);
+  }
+
+  function updateAll() {
+    draw();
+    updateChart();
+    updateCounters();
+  }
+
+  sim.onErrorCb = function (msg) { el("[data-testid='scenario-error']").textContent = msg || ""; };
+
+  // play loop
+  var playing = false;
+  var lastTime = 0, acc = 0, speed = 10;
+
+  function loop(ts) {
+    if (!playing) return;
+    if (lastTime === 0) lastTime = ts;
+    var dt = (ts - lastTime) / 1000;
+    lastTime = ts;
+    acc += dt * speed;
+    var maxTicks = Math.max(0, Math.floor(acc));
+    acc -= maxTicks / speed;
+    for (var i = 0; i < maxTicks; i++) sim.tickFn();
+    updateAll();
+    announce();
+    requestAnimationFrame(loop);
+  }
+
+  function announce() {
+    var c = sim.counts();
+    el("[data-testid='announcer']").textContent = "Tick " + sim.tick + ": " + c.rabbits + " rabbits, " + c.foxes + " foxes";
+  }
+
+  function play() {
+    if (playing) return;
+    playing = true;
+    lastTime = 0;
+    acc = 0;
+    requestAnimationFrame(loop);
+  }
+
+  function pause() {
+    playing = false;
+    acc = 0;
+    lastTime = 0;
+    announce();
+  }
+
+  function doReset() {
+    var seed = parseInt(el("[data-testid='seed']").value, 10);
+    var params = {
+      rabbits0: parseInt(el("[data-testid='param-rabbits0']").value, 10),
+      foxes0: parseInt(el("[data-testid='param-foxes0']").value, 10),
+      rabbitBreed: parseInt(el("[data-testid='param-rabbitBreed']").value, 10),
+      foxBreed: parseInt(el("[data-testid='param-foxBreed']").value, 10),
+      foxGain: parseInt(el("[data-testid='param-foxGain']").value, 10),
+      grassMax: parseInt(el("[data-testid='param-grassMax']").value, 10)
+    };
+    pause();
+    sim.reset(seed, params);
+    updateAll();
+    announce();
+  }
+
+  // canvas backing size
+  function setupCanvas() {
+    var cv = el("[data-testid='world']");
+    cv.width = sim.params.width * 10;
+    cv.height = sim.params.height * 10;
+  }
+
+  // ODE
+  function runODE() {
+    function num(sel, d) { var v = parseFloat(el(sel).value); return isNaN(v) ? d : v; }
+    var p = {
+      alpha: num("[data-testid='ode-alpha']", 1.1),
+      beta: num("[data-testid='ode-beta']", 0.4),
+      gamma: num("[data-testid='ode-gamma']", 0.4),
+      delta: num("[data-testid='ode-delta']", 0.1),
+      x0: num("[data-testid='ode-x0']", 10),
+      y0: num("[data-testid='ode-y0']", 10),
+      t: num("[data-testid='ode-t']", 50),
+      dt: num("[data-testid='ode-dt']", 0.01)
+    };
+    var steps = Math.round(p.t / p.dt);
+    var x = p.x0, y = p.y0;
+    function dx(a, b) { return p.alpha * a - p.beta * a * b; }
+    function dy(a, b) { return p.delta * a * b - p.gamma * b; }
+    var xs = [x], ys = [y];
+    for (var s = 0; s < steps; s++) {
+      var k1x = dx(x, y), k1y = dy(x, y);
+      var k2x = dx(x + 0.5 * p.dt * k1x, y + 0.5 * p.dt * k1y), k2y = dy(x + 0.5 * p.dt * k1x, y + 0.5 * p.dt * k1y);
+      var k3x = dx(x + 0.5 * p.dt * k2x, y + 0.5 * p.dt * k2y), k3y = dy(x + 0.5 * p.dt * k2x, y + 0.5 * p.dt * k2y);
+      var k4x = dx(x + p.dt * k3x, y + p.dt * k3y), k4y = dy(x + p.dt * k3x, y + p.dt * k3y);
+      x += (p.dt / 6) * (k1x + 2 * k2x + 2 * k3x + k4x);
+      y += (p.dt / 6) * (k1y + 2 * k2y + 2 * k3y + k4y);
+      xs.push(x); ys.push(y);
+    }
+    var V = function (a, b) { return p.delta * a - p.gamma * Math.log(a) + p.beta * b - p.alpha * Math.log(b); };
+    var drift = Math.abs(V(x, y) - V(p.x0, p.y0));
+    var eqX = p.gamma / p.delta;
+    var eqY = p.alpha / p.beta;
+    var out = el("[data-testid='ode-out']");
+    out.innerHTML =
+      '<div><span class="k">ode-x:</span> ' + fmt(x) + '</div>' +
+      '<div><span class="k">ode-y:</span> ' + fmt(y) + '</div>' +
+      '<div><span class="k">ode-eq-x:</span> ' + fmt(eqX) + '</div>' +
+      '<div><span class="k">ode-eq-y:</span> ' + fmt(eqY) + '</div>' +
+      '<div><span class="k">ode-drift:</span> ' + fmt(drift) + '</div>';
+    var svg = el("[data-testid='ode-chart']");
+    svg.innerHTML =
+      '<line x1="40" y1="200" x2="490" y2="200" stroke="#4b5563"/>' +
+      '<line x1="40" y1="10" x2="40" y2="200" stroke="#4b5563"/>' +
+      '<text x="265" y="216" fill="#94a3b8" font-size="12">t</text>' +
+      '<text x="12" y="60" fill="#94a3b8" font-size="12" transform="rotate(-90 12 60)">value</text>' +
+      '<polyline data-testid="ode-series-x" fill="none" stroke="#38bdf8" stroke-width="1.5"/>' +
+      '<polyline data-testid="ode-series-y" fill="none" stroke="#f97316" stroke-width="1.5"/>';
+    var maxV = 1, minV = 0;
+    for (var i = 0; i < xs.length; i++) { if (xs[i] > maxV) maxV = xs[i]; if (ys[i] > maxV) maxV = ys[i]; if (xs[i] < minV) minV = xs[i]; if (ys[i] < minV) minV = ys[i]; }
+    var span = maxV - minV; if (span < 1e-9) span = 1;
+    function poly(arr, color) {
+      var pts = [];
+      for (var j = 0; j < arr.length; j++) {
+        var px = 40 + (j / (arr.length - 1 || 1)) * 450;
+        var py = 200 - ((arr[j] - minV) / span) * 180;
+        pts.push(px.toFixed(2) + "," + py.toFixed(2));
+      }
+      var pl = svg.querySelector("[data-testid='ode-series-" + color + "']");
+      pl.setAttribute("points", pts.join(" "));
+    }
+    poly(xs, "x"); poly(ys, "y");
+  }
+
+  function fmt(v) {
+    var s = v.toPrecision(12);
+    if (s.indexOf(".") === -1 && s.indexOf("e") === -1) return s;
+    return parseFloat(s).toString();
+  }
+
+  // presets
+  var STORE_KEY = "ecolab.presets";
+  function loadPresets() {
+    var stored = null;
+    try { stored = localStorage.getItem(STORE_KEY); } catch (e) { stored = null; }
+    var presets = {};
+    if (stored) { try { presets = JSON.parse(stored); } catch (e) { presets = {}; } }
+    renderPresets(presets);
+  }
+
+  function renderPresets(presets) {
+    var list = el("[data-testid='preset-list']");
+    list.innerHTML = "";
+    var names = Object.keys(presets);
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      var item = document.createElement("div");
+      item.className = "preset-item";
+      var nameEl = document.createElement("span");
+      nameEl.className = "name";
+      nameEl.textContent = name;
+      var loadBtn = document.createElement("button");
+      loadBtn.textContent = "Load";
+      loadBtn.addEventListener("click", function (n) {
+        return function () {
+          var ta = el("[data-testid='scenario-json']");
+          ta.value = JSON.stringify(presets[n]);
+          loadScenario();
+        };
+      })(name);
+      var delBtn = document.createElement("button");
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function (n) {
+        return function () {
+          delete presets[n];
+          savePresets(presets);
+          renderPresets(presets);
+        };
+      })(name);
+      item.appendChild(nameEl);
+      item.appendChild(loadBtn);
+      item.appendChild(delBtn);
+      list.appendChild(item);
+    }
+  }
+
+  function savePresets(presets) {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(presets)); } catch (e) {}
+  }
+
+  function savePreset() {
+    var name = el("[data-testid='preset-name']").value.trim();
+    if (!name) return;
+    var presets = {};
+    try { presets = JSON.parse(localStorage.getItem(STORE_KEY) || "{}"); } catch (e) { presets = {}; }
+    var ta = el("[data-testid='scenario-json']");
+    var scenario = {};
+    try { scenario = JSON.parse(ta.value); } catch (e) {}
+    presets[name] = scenario;
+    savePresets(presets);
+    renderPresets(presets);
+  }
+
+  function loadScenario() {
+    var ta = el("[data-testid='scenario-json']");
+    var ok = sim.loadScenario(ta.value);
+    if (ok) {
+      renderPresets(loadPresetsObj());
+    }
+  }
+
+  function loadPresetsObj() {
+    try { return JSON.parse(localStorage.getItem(STORE_KEY) || "{}"); } catch (e) { return {}; }
+  }
+
+  // CSV export
+  function exportCSV() {
+    var text = sim.exportCSV();
+    var blob = new Blob([text], { type: "text/csv" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "ecolab.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // keyboard shortcuts
+  document.addEventListener("keydown", function (e) {
+    var tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON" || tag === "SELECT") return;
+    if (e.key === " ") { e.preventDefault(); if (playing) pause(); else play(); }
+    else if (e.key === "s") { e.preventDefault(); sim.tickFn(); updateAll(); announce(); }
+    else if (e.key === "r") { e.preventDefault(); doReset(); }
+  });
+
+  // wire buttons
+  el("[data-testid='play']").addEventListener("click", play);
+  el("[data-testid='pause']").addEventListener("click", pause);
+  el("[data-testid='step']").addEventListener("click", function () { sim.tickFn(); updateAll(); announce(); });
+  el("[data-testid='reset']").addEventListener("click", doReset);
+  el("[data-testid='speed']").addEventListener("input", function () { speed = parseInt(this.value, 10); });
+  el("[data-testid='ode-run']").addEventListener("click", runODE);
+  el("[data-testid='scenario-export']").addEventListener("click", function () { el("[data-testid='scenario-json']").value = sim.exportScenario(); });
+  el("[data-testid='scenario-load']").addEventListener("click", loadScenario);
+  el("[data-testid='preset-save']").addEventListener("click", savePreset);
+  el("[data-testid='csv-export']").addEventListener("click", exportCSV);
+
+  // slider value displays
+  var sliders = [
+    ["param-rabbits0", "val-rabbits0"],
+    ["param-foxes0", "val-foxes0"],
+    ["param-rabbitBreed", "val-rabbitBreed"],
+    ["param-foxBreed", "val-foxBreed"],
+    ["param-foxGain", "val-foxGain"],
+    ["param-grassMax", "val-grassMax"]
+  ];
+  for (var s = 0; s < sliders.length; s++) {
+    (function (r, v) {
+      var range = el("[data-testid='" + r + "']");
+      var disp = el("[data-testid='" + v + "']");
+      range.addEventListener("input", function () { disp.textContent = this.value; });
+      disp.textContent = range.value;
+    })(sliders[s][0], sliders[s][1]);
+  }
+
+  // init
+  setupCanvas();
+  sim.onErrorCb = function (msg) { el("[data-testid='scenario-error']").textContent = msg || ""; };
+  sim.reset(42, {});
+  el("[data-testid='seed']").value = "42";
+  updateAll();
+  loadPresets();
+
+  window.lab = sim;
+})();
+</script>
+</body>
+</html>

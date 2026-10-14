@@ -1,0 +1,10 @@
+01:40:35   laya int8: {"ram_before_mb": 752, "ram_after_load_mb": 1118, "ram_after_10s_mb": 1275, "ok": 20, "p50_s": 0.93, "p95_s": 1.252, "gen_tps_during": 21.22, "skipped": null}
+01:43:51   laya fp32: {"ram_before_mb": 1278, "ram_after_load_mb": 836, "ram_after_10s_mb": 1463, "ok": 20, "p50_s": 0.883, "p95_s": 1.163, "gen_tps_during": 15.05, "skipped": null}
+01:44:07 window 16384 ncmoe 26: loaded True VRAM used 7515 peak 7555 short [32.94, 69.75, 26.3, 67.49] deep {'prompt_n': 13739, 'prompt_tps': 360.5, 'gen_tps': 22.63, 'gen_n': 300, 'wall_s': 51.73} verdict {"none": false, "int8": false, "fp32": false} error None
+01:59:33   laya int8: {"ram_before_mb": 412, "ram_after_load_mb": 731, "ram_after_10s_mb": null, "ok": null, "p50_s": null, "p95_s": null, "gen_tps_during": null, "skipped": null}
+01:59:53   laya fp32: {"ram_before_mb": 729, "ram_after_load_mb": 449, "ram_after_10s_mb": null, "ok": null, "p50_s": null, "p95_s": null, "gen_tps_during": null, "skipped": null}
+02:00:10 window 40960 ncmoe 26: loaded True VRAM used 7698 peak 7747 short [28.81, 47.66, 14.53, 48.06] deep {'prompt_n': 33838, 'prompt_tps': 191.1, 'gen_tps': 27.26, 'gen_n': 300, 'wall_s': 188.58} verdict {"none": true, "int8": false, "fp32": false} error None
+02:18:20   laya int8: {"ram_before_mb": 511, "ram_after_load_mb": 1366, "ram_after_10s_mb": null, "ok": null, "p50_s": null, "p95_s": null, "gen_tps_during": null, "skipped": null}
+02:22:42   laya fp32: {"ram_before_mb": 1369, "ram_after_load_mb": 539, "ram_after_10s_mb": 1022, "ok": 20, "p50_s": 0.898, "p95_s": 1.128, "gen_tps_during": 13.22, "skipped": null}
+02:22:57 window 65536 ncmoe 26: loaded True VRAM used 7752 peak 7782 short [29.1, 63.07, 36.4, 70.74] deep {'prompt_n': 58133, 'prompt_tps': 149.9, 'gen_tps': 23.72, 'gen_n': 300, 'wall_s': 400.93} verdict {"none": false, "int8": false, "fp32": false} error None
+03:03:46 window 98304 ncmoe 26: loaded True VRAM used 7663 peak 7705 short [8.54, 11.0, 12.81, 5.42] deep {'error': 'TimeoutError: timed out'} verdict {"none": false} error None

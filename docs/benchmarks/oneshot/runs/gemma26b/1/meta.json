@@ -1,0 +1,20 @@
+{
+ "model": "gemma26b",
+ "file": "google_gemma-4-26B-A4B-it-IQ2_M.gguf",
+ "seed": 1,
+ "ncmoe": 16,
+ "fit": [
+  {
+   "ncmoe": 16,
+   "loaded": true,
+   "vram_used_mib": 7826
+  }
+ ],
+ "wall_s": 417.6,
+ "finish_reason": "stop",
+ "prompt_n": 3987,
+ "gen_n": 9543,
+ "gen_tps": 33.7,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.7
+}

@@ -1,0 +1,548 @@
+{
+ "merge_intervals": {
+  "category": "A",
+  "effort": 1.2796,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1435,
+   "logic": 0.7489,
+   "unseen": 0.1076
+  },
+  "hidden": 0.6691,
+  "files": 0.5005,
+  "library": 0.5866,
+  "robust": 0.3643
+ },
+ "lru_cache": {
+  "category": "A",
+  "effort": 1.4084,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1562,
+   "logic": 0.7293,
+   "unseen": 0.1145
+  },
+  "hidden": 0.5881,
+  "files": 0.5051,
+  "library": 0.6717,
+  "robust": 0.5741
+ },
+ "topological_sort": {
+  "category": "A",
+  "effort": 1.4576,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1513,
+   "logic": 0.6466,
+   "unseen": 0.202
+  },
+  "hidden": 0.5701,
+  "files": 0.4042,
+  "library": 0.4727,
+  "robust": 0.5381
+ },
+ "parse_csv_line": {
+  "category": "A",
+  "effort": 1.2801,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2533,
+   "logic": 0.5865,
+   "unseen": 0.1602
+  },
+  "hidden": 0.4445,
+  "files": 0.3599,
+  "library": 0.4512,
+  "robust": 0.4179
+ },
+ "pkg_discount": {
+  "category": "B",
+  "effort": 1.1184,
+  "kind": "local",
+  "kind_p": {
+   "local": 0.4139,
+   "logic": 0.3441,
+   "unseen": 0.2421
+  },
+  "hidden": 0.6489,
+  "files": 0.2766,
+  "library": 0.5061,
+  "robust": 0.4574
+ },
+ "pkg_auth": {
+  "category": "B",
+  "effort": 1.1857,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.3878,
+   "logic": 0.4265,
+   "unseen": 0.1857
+  },
+  "hidden": 0.5961,
+  "files": 0.4133,
+  "library": 0.5767,
+  "robust": 0.4758
+ },
+ "safe_divide_batch": {
+  "category": "C",
+  "effort": 1.1689,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2392,
+   "logic": 0.6154,
+   "unseen": 0.1454
+  },
+  "hidden": 0.4146,
+  "files": 0.3415,
+  "library": 0.3889,
+  "robust": 0.4221
+ },
+ "retry_with_backoff": {
+  "category": "C",
+  "effort": 1.1144,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2267,
+   "logic": 0.643,
+   "unseen": 0.1304
+  },
+  "hidden": 0.5865,
+  "files": 0.4468,
+  "library": 0.6464,
+  "robust": 0.5075
+ },
+ "load_or_create_json": {
+  "category": "D",
+  "effort": 1.3228,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1838,
+   "logic": 0.7134,
+   "unseen": 0.1029
+  },
+  "hidden": 0.7198,
+  "files": 0.7059,
+  "library": 0.746,
+  "robust": 0.6636
+ },
+ "run_checked": {
+  "category": "D",
+  "effort": 1.2955,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2423,
+   "logic": 0.5851,
+   "unseen": 0.1725
+  },
+  "hidden": 0.5029,
+  "files": 0.413,
+  "library": 0.6349,
+  "robust": 0.4875
+ },
+ "clamp_with_lib": {
+  "category": "E",
+  "effort": 1.1226,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1808,
+   "logic": 0.5153,
+   "unseen": 0.3039
+  },
+  "hidden": 0.5399,
+  "files": 0.274,
+  "library": 0.5444,
+  "robust": 0.482
+ },
+ "find_rotation_point": {
+  "category": "A",
+  "effort": 1.2969,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1717,
+   "logic": 0.5484,
+   "unseen": 0.2799
+  },
+  "hidden": 0.6155,
+  "files": 0.2821,
+  "library": 0.5545,
+  "robust": 0.4665
+ },
+ "nested_lookup": {
+  "category": "C",
+  "effort": 1.2686,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2026,
+   "logic": 0.5742,
+   "unseen": 0.2232
+  },
+  "hidden": 0.6537,
+  "files": 0.3793,
+  "library": 0.5928,
+  "robust": 0.5167
+ },
+ "slugify_with_lib": {
+  "category": "E",
+  "effort": 1.2041,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2052,
+   "logic": 0.4999,
+   "unseen": 0.2949
+  },
+  "hidden": 0.5645,
+  "files": 0.3144,
+  "library": 0.5355,
+  "robust": 0.4443
+ },
+ "binary_search_first": {
+  "category": "A",
+  "effort": 1.3224,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1366,
+   "logic": 0.6638,
+   "unseen": 0.1997
+  },
+  "hidden": 0.578,
+  "files": 0.294,
+  "library": 0.6433,
+  "robust": 0.5349
+ },
+ "group_anagrams": {
+  "category": "A",
+  "effort": 1.1567,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2376,
+   "logic": 0.5554,
+   "unseen": 0.207
+  },
+  "hidden": 0.5347,
+  "files": 0.508,
+  "library": 0.6179,
+  "robust": 0.4809
+ },
+ "drop_negatives": {
+  "category": "A",
+  "effort": 1.2701,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1739,
+   "logic": 0.6716,
+   "unseen": 0.1545
+  },
+  "hidden": 0.5604,
+  "files": 0.2044,
+  "library": 0.5314,
+  "robust": 0.4553
+ },
+ "merge_sorted": {
+  "category": "A",
+  "effort": 1.1901,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2637,
+   "logic": 0.5672,
+   "unseen": 0.1691
+  },
+  "hidden": 0.5202,
+  "files": 0.4136,
+  "library": 0.5693,
+  "robust": 0.4462
+ },
+ "roman_to_int": {
+  "category": "A",
+  "effort": 1.2874,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2752,
+   "logic": 0.4945,
+   "unseen": 0.2303
+  },
+  "hidden": 0.5195,
+  "files": 0.3727,
+  "library": 0.5686,
+  "robust": 0.5302
+ },
+ "is_balanced": {
+  "category": "A",
+  "effort": 1.1856,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1919,
+   "logic": 0.5764,
+   "unseen": 0.2317
+  },
+  "hidden": 0.523,
+  "files": 0.4054,
+  "library": 0.4999,
+  "robust": 0.5359
+ },
+ "running_sum": {
+  "category": "A",
+  "effort": 1.2125,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.256,
+   "logic": 0.4695,
+   "unseen": 0.2745
+  },
+  "hidden": 0.5336,
+  "files": 0.5163,
+  "library": 0.5188,
+  "robust": 0.4558
+ },
+ "pkg_inventory": {
+  "category": "B",
+  "effort": 1.1397,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.3568,
+   "logic": 0.3886,
+   "unseen": 0.2546
+  },
+  "hidden": 0.6078,
+  "files": 0.2465,
+  "library": 0.3483,
+  "robust": 0.2314
+ },
+ "pkg_tax": {
+  "category": "B",
+  "effort": 1.2433,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.3489,
+   "logic": 0.3997,
+   "unseen": 0.2514
+  },
+  "hidden": 0.7366,
+  "files": 0.3508,
+  "library": 0.4594,
+  "robust": 0.47
+ },
+ "pkg_rate_limit": {
+  "category": "B",
+  "effort": 1.1278,
+  "kind": "local",
+  "kind_p": {
+   "local": 0.4345,
+   "logic": 0.3495,
+   "unseen": 0.216
+  },
+  "hidden": 0.6459,
+  "files": 0.3652,
+  "library": 0.5499,
+  "robust": 0.4809
+ },
+ "pkg_shipping": {
+  "category": "B",
+  "effort": 1.0268,
+  "kind": "local",
+  "kind_p": {
+   "local": 0.5045,
+   "logic": 0.306,
+   "unseen": 0.1896
+  },
+  "hidden": 0.6521,
+  "files": 0.3691,
+  "library": 0.5969,
+  "robust": 0.4027
+ },
+ "pkg_grade": {
+  "category": "B",
+  "effort": 1.0874,
+  "kind": "local",
+  "kind_p": {
+   "local": 0.4347,
+   "logic": 0.3372,
+   "unseen": 0.2281
+  },
+  "hidden": 0.7347,
+  "files": 0.4066,
+  "library": 0.586,
+  "robust": 0.5009
+ },
+ "mutable_default_counter": {
+  "category": "C",
+  "effort": 1.327,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1302,
+   "logic": 0.7038,
+   "unseen": 0.166
+  },
+  "hidden": 0.661,
+  "files": 0.4822,
+  "library": 0.6202,
+  "robust": 0.478
+ },
+ "coalesce": {
+  "category": "C",
+  "effort": 1.2662,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.209,
+   "logic": 0.6142,
+   "unseen": 0.1768
+  },
+  "hidden": 0.5211,
+  "files": 0.4415,
+  "library": 0.563,
+  "robust": 0.5228
+ },
+ "chunk_list": {
+  "category": "C",
+  "effort": 1.2077,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1823,
+   "logic": 0.6444,
+   "unseen": 0.1733
+  },
+  "hidden": 0.585,
+  "files": 0.3897,
+  "library": 0.6483,
+  "robust": 0.5801
+ },
+ "parse_bool": {
+  "category": "C",
+  "effort": 1.2241,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1995,
+   "logic": 0.5804,
+   "unseen": 0.2201
+  },
+  "hidden": 0.5722,
+  "files": 0.4842,
+  "library": 0.5531,
+  "robust": 0.4663
+ },
+ "atomic_write": {
+  "category": "D",
+  "effort": 1.5416,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1562,
+   "logic": 0.7046,
+   "unseen": 0.1391
+  },
+  "hidden": 0.6108,
+  "files": 0.7294,
+  "library": 0.6285,
+  "robust": 0.582
+ },
+ "read_text_lines": {
+  "category": "D",
+  "effort": 1.2914,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2107,
+   "logic": 0.605,
+   "unseen": 0.1844
+  },
+  "hidden": 0.4909,
+  "files": 0.6625,
+  "library": 0.5419,
+  "robust": 0.4305
+ },
+ "ensure_parent_write": {
+  "category": "D",
+  "effort": 1.3628,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2029,
+   "logic": 0.613,
+   "unseen": 0.1841
+  },
+  "hidden": 0.5912,
+  "files": 0.6961,
+  "library": 0.6109,
+  "robust": 0.542
+ },
+ "append_log_line": {
+  "category": "D",
+  "effort": 1.2264,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2386,
+   "logic": 0.6104,
+   "unseen": 0.151
+  },
+  "hidden": 0.4613,
+  "files": 0.6864,
+  "library": 0.5747,
+  "robust": 0.4213
+ },
+ "capture_stdout": {
+  "category": "D",
+  "effort": 1.3848,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1717,
+   "logic": 0.6277,
+   "unseen": 0.2005
+  },
+  "hidden": 0.6622,
+  "files": 0.4635,
+  "library": 0.6142,
+  "robust": 0.4716
+ },
+ "quantize_with_lib": {
+  "category": "E",
+  "effort": 1.0213,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.2042,
+   "logic": 0.4985,
+   "unseen": 0.2973
+  },
+  "hidden": 0.5197,
+  "files": 0.236,
+  "library": 0.5301,
+  "robust": 0.3371
+ },
+ "hash_with_lib": {
+  "category": "E",
+  "effort": 1.1871,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1898,
+   "logic": 0.5116,
+   "unseen": 0.2986
+  },
+  "hidden": 0.5536,
+  "files": 0.2994,
+  "library": 0.4777,
+  "robust": 0.3596
+ },
+ "format_with_lib": {
+  "category": "E",
+  "effort": 1.1491,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1752,
+   "logic": 0.5331,
+   "unseen": 0.2917
+  },
+  "hidden": 0.5377,
+  "files": 0.3131,
+  "library": 0.5415,
+  "robust": 0.4339
+ },
+ "normalize_with_lib": {
+  "category": "E",
+  "effort": 1.2798,
+  "kind": "logic",
+  "kind_p": {
+   "local": 0.1833,
+   "logic": 0.5731,
+   "unseen": 0.2435
+  },
+  "hidden": 0.5321,
+  "files": 0.372,
+  "library": 0.5697,
+  "robust": 0.4614
+ }
+}

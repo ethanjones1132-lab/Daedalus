@@ -1,0 +1,22 @@
+{
+ "model": "nanbeige-3b",
+ "file": "nanbeige4.2-3b-Q6_K.gguf",
+ "seed": 3,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7422,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 313.0,
+ "finish_reason": "stop",
+ "prompt_n": 4084,
+ "gen_n": 9508,
+ "gen_tps": 30.6,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.3
+}

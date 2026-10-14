@@ -1,0 +1,13 @@
+{
+ "positions": 2046,
+ "cuda_vs_cpu_top1_agreement": 0.9589,
+ "ppl_cuda": 1.917,
+ "ppl_cpu": 1.915,
+ "disagreements": 84,
+ "cuda_gap_at_disagreements_nats": {
+  "median": 0.35,
+  "max": 2.571
+ },
+ "seconds": 174,
+ "cost_usd_est": 0.16
+}

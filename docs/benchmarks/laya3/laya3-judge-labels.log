@@ -1,0 +1,84 @@
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Fetching 5 files: 100%|##########| 5/5 [00:00<00:00, 1467.36it/s]
+C:\qwen3-forge-stage\venv-laya\Lib\site-packages\laya\agent.py:2110: RuntimeWarning: laya: this checkpoint ships invalid temperatures or values outside [0.5, 5]; using choice:11+=0.10058280825614929 -> 0.5. Treat confidence from the affected entries as uncalibrated.
+  return Agent(model_id_or_path, device=device, token=token, subfolder=subfolder, fast=fast,
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Fetching 5 files: 100%|##########| 5/5 [00:00<00:00, 1252.48it/s]
+100 verify answers, 450 s
+200 verify answers, 547 s
+300 verify answers, 613 s
+400 verify answers, 714 s
+500 verify answers, 828 s
+600 verify answers, 944 s
+700 verify answers, 996 s
+800 verify answers, 1051 s
+900 verify answers, 1139 s
+1000 verify answers, 1198 s
+1100 verify answers, 1287 s
+1200 verify answers, 1347 s
+1300 verify answers, 1484 s
+1400 verify answers, 1531 s
+1500 verify answers, 1595 s
+1600 verify answers, 1683 s
+1700 verify answers, 1738 s
+1800 verify answers, 1776 s
+1900 verify answers, 1816 s
+2000 verify answers, 1861 s
+2100 verify answers, 1933 s
+2200 verify answers, 2038 s
+2300 verify answers, 2187 s
+2400 verify answers, 2356 s
+2500 verify answers, 2487 s
+2600 verify answers, 2563 s
+2700 verify answers, 2744 s
+2800 verify answers, 2863 s
+2900 verify answers, 2923 s
+3000 verify answers, 2993 s
+3100 verify answers, 3154 s
+3200 verify answers, 3308 s
+3300 verify answers, 3367 s
+3400 verify answers, 3426 s
+3500 verify answers, 3490 s
+3600 verify answers, 3572 s
+3700 verify answers, 3628 s
+3800 verify answers, 3671 s
+3900 verify answers, 3713 s
+4000 verify answers, 3773 s
+4100 verify answers, 3865 s
+4200 verify answers, 3906 s
+4300 verify answers, 3947 s
+4400 verify answers, 3999 s
+4500 verify answers, 4079 s
+4600 verify answers, 4140 s
+4700 verify answers, 4208 s
+4800 verify answers, 4287 s
+4900 verify answers, 4377 s
+5000 verify answers, 4428 s
+5100 verify answers, 4491 s
+5200 verify answers, 4553 s
+5300 verify answers, 4613 s
+5400 verify answers, 4688 s
+5500 verify answers, 4741 s
+5600 verify answers, 4790 s
+5700 verify answers, 4842 s
+5800 verify answers, 4909 s
+5900 verify answers, 4964 s
+6000 verify answers, 5058 s
+6100 verify answers, 5128 s
+6200 verify answers, 5187 s
+6300 verify answers, 5285 s
+6400 verify answers, 5368 s
+6500 verify answers, 5459 s
+6600 verify answers, 5514 s
+6700 verify answers, 5570 s
+6800 verify answers, 5652 s
+6900 verify answers, 5712 s
+7000 verify answers, 5787 s
+7100 verify answers, 5833 s
+7200 verify answers, 5895 s
+7300 verify answers, 5982 s
+7400 verify answers, 6032 s
+7500 verify answers, 6080 s
+7600 verify answers, 6132 s
+7700 verify answers, 6187 s
+7800 verify answers, 6231 s
+7900 verify answers, 6284 s
+labelled in 6992 s -> C:\qwen3-forge-stage\logs\laya3-judge-labels.jsonl

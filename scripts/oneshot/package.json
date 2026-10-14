@@ -1,0 +1,9 @@
+{
+  "name": "oneshot-bench",
+  "private": true,
+  "type": "module",
+  "description": "Ecosystem Lab one-shot benchmark: Playwright checks (uses the installed Chrome; no browser download)",
+  "dependencies": {
+    "playwright": "1.64.0"
+  }
+}

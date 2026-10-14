@@ -1,0 +1,7 @@
+Error: page.evaluate: ReferenceError: Cannot access 'counts' before initialization
+    at render (http://127.0.0.1:51272/app.html:470:28)
+    at step (http://127.0.0.1:51272/app.html:436:13)
+    at Object.step (http://127.0.0.1:51272/app.html:526:17)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

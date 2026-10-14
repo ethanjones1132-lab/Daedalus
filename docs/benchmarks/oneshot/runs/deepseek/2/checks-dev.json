@@ -1,0 +1,441 @@
+{
+ "score": 1,
+ "areas": {
+  "logic": 1,
+  "time": 1,
+  "canvas": 1,
+  "chart": 1,
+  "data": 1,
+  "algo": 1,
+  "layout": 1,
+  "a11y": 1,
+  "persist": 1,
+  "domain": 1
+ },
+ "passed": 70,
+ "total": 70,
+ "console_errors": [],
+ "blocked_requests": 0,
+ "checks": [
+  {
+   "id": "api-present",
+   "area": "logic",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "reset-counts-0",
+   "area": "logic",
+   "pass": true,
+   "detail": "app {\"rabbits\":100,\"foxes\":6,\"grass\":2450} ref {\"rabbits\":100,\"foxes\":6,\"grass\":2450}"
+  },
+  {
+   "id": "reset-counts-1",
+   "area": "logic",
+   "pass": true,
+   "detail": "app {\"rabbits\":150,\"foxes\":10,\"grass\":2456} ref {\"rabbits\":150,\"foxes\":10,\"grass\":2456}"
+  },
+  {
+   "id": "reset-counts-2",
+   "area": "logic",
+   "pass": true,
+   "detail": "app {\"rabbits\":100,\"foxes\":6,\"grass\":1200} ref {\"rabbits\":100,\"foxes\":6,\"grass\":1200}"
+  },
+  {
+   "id": "params-apply",
+   "area": "logic",
+   "pass": true,
+   "detail": "[{\"rabbits\":10,\"foxes\":0,\"grass\":2316},0,1]"
+  },
+  {
+   "id": "grass-bounds",
+   "area": "logic",
+   "pass": true,
+   "detail": "0 cells out of [0, 3]"
+  },
+  {
+   "id": "one-per-cell",
+   "area": "logic",
+   "pass": true,
+   "detail": "[360,73,{\"rabbits\":360,\"foxes\":73,\"grass\":2446}]"
+  },
+  {
+   "id": "energy-positive",
+   "area": "logic",
+   "pass": true,
+   "detail": "0 living animals with energy <= 0"
+  },
+  {
+   "id": "ids-initial",
+   "area": "logic",
+   "pass": true,
+   "detail": "[[1,2,3,4,5],[6,7]]"
+  },
+  {
+   "id": "ui-step",
+   "area": "logic",
+   "pass": true,
+   "detail": "[[\"1\",\"97\",\"6\",\"3115\"],[1,{\"rabbits\":97,\"foxes\":6,\"grass\":3115}]]"
+  },
+  {
+   "id": "play-rate",
+   "area": "time",
+   "pass": true,
+   "detail": "tick 49 after 5 s at 10/s"
+  },
+  {
+   "id": "pause-stops",
+   "area": "time",
+   "pass": true,
+   "detail": "9 then 9"
+  },
+  {
+   "id": "step-one",
+   "area": "time",
+   "pass": true,
+   "detail": "0 -> 1"
+  },
+  {
+   "id": "speed-change",
+   "area": "time",
+   "pass": true,
+   "detail": "+40 in 2 s at 20/s"
+  },
+  {
+   "id": "speed-slider-dom",
+   "area": "time",
+   "pass": true,
+   "detail": "[\"range\",\"1\",\"60\",\"10\"]"
+  },
+  {
+   "id": "space-toggles",
+   "area": "time",
+   "pass": true,
+   "detail": "9 after 1 s playing then Space, 9 a second later"
+  },
+  {
+   "id": "canvas-size",
+   "area": "canvas",
+   "pass": true,
+   "detail": "[[400,300],[300,200]]"
+  },
+  {
+   "id": "pixels-reset",
+   "area": "canvas",
+   "pass": true,
+   "detail": "15 cells sampled"
+  },
+  {
+   "id": "pixels-after-step",
+   "area": "canvas",
+   "pass": true,
+   "detail": "15 cells sampled"
+  },
+  {
+   "id": "pixels-after-reset-ui",
+   "area": "canvas",
+   "pass": true,
+   "detail": "15 cells sampled"
+  },
+  {
+   "id": "fox-over-rabbit",
+   "area": "canvas",
+   "pass": true,
+   "detail": "2,0: 220,80,20"
+  },
+  {
+   "id": "points-equal-history",
+   "area": "chart",
+   "pass": true,
+   "detail": "[[1,1,1],[51,51,51],[121,121,121]]"
+  },
+  {
+   "id": "monotone-y",
+   "area": "chart",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "monotone-x",
+   "area": "chart",
+   "pass": true,
+   "detail": "61 points"
+  },
+  {
+   "id": "axes-labelled",
+   "area": "chart",
+   "pass": true,
+   "detail": "\n      \n      \n      \n      \n      tick\n      count\n    "
+  },
+  {
+   "id": "chart-resets",
+   "area": "chart",
+   "pass": true,
+   "detail": "1, 1"
+  },
+  {
+   "id": "csv-exact",
+   "area": "data",
+   "pass": true,
+   "detail": "tick,rabbits,foxes,grass\n0,150,10,2456\n1,145,10,2981\n2,172,1"
+  },
+  {
+   "id": "csv-download",
+   "area": "data",
+   "pass": true,
+   "detail": "ecolab.csv, 234 vs 234 chars"
+  },
+  {
+   "id": "scenario-roundtrip",
+   "area": "data",
+   "pass": true,
+   "detail": "[\"string\",1,true,true,true,true,true]"
+  },
+  {
+   "id": "scenario-defaults",
+   "area": "data",
+   "pass": true,
+   "detail": "[true,{\"rabbits\":20,\"foxes\":6,\"grass\":2316},{\"rabbits\":20,\"foxes\":6,\"grass\":2316}]"
+  },
+  {
+   "id": "scenario-bad-json",
+   "area": "data",
+   "pass": true,
+   "detail": "[[false,true],true,\"Could not parse scenario JSON.\"]"
+  },
+  {
+   "id": "scenario-bad-version",
+   "area": "data",
+   "pass": true,
+   "detail": "[[false,true],true,\"Unsupported scenario version (expected 1).\"]"
+  },
+  {
+   "id": "scenario-ui-load",
+   "area": "data",
+   "pass": true,
+   "detail": "[[[0,{\"rabbits\":44,\"foxes\":3,\"grass\":2323}],{\"rabbits\":44,\"foxes\":3,\"grass\":2323}],\"\"]"
+  },
+  {
+   "id": "state-50-0",
+   "area": "algo",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "counts-100-0",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":305,\"foxes\":64,\"grass\":2865},101] ref [{\"rabbits\":305,\"foxes\":64,\"grass\":2865},101]"
+  },
+  {
+   "id": "counts-500-0",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":407,\"foxes\":79,\"grass\":2243},501] ref [{\"rabbits\":407,\"foxes\":79,\"grass\":2243},501]"
+  },
+  {
+   "id": "state-50-1",
+   "area": "algo",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "counts-100-1",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":313,\"foxes\":69,\"grass\":2817},101] ref [{\"rabbits\":313,\"foxes\":69,\"grass\":2817},101]"
+  },
+  {
+   "id": "counts-500-1",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":140,\"foxes\":129,\"grass\":3614},501] ref [{\"rabbits\":140,\"foxes\":129,\"grass\":3614},501]"
+  },
+  {
+   "id": "state-50-2",
+   "area": "algo",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "counts-100-2",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":230,\"foxes\":58,\"grass\":992},101] ref [{\"rabbits\":230,\"foxes\":58,\"grass\":992},101]"
+  },
+  {
+   "id": "counts-500-2",
+   "area": "algo",
+   "pass": true,
+   "detail": "app [{\"rabbits\":112,\"foxes\":92,\"grass\":1394},501] ref [{\"rabbits\":112,\"foxes\":92,\"grass\":1394},501]"
+  },
+  {
+   "id": "breed-ids",
+   "area": "algo",
+   "pass": true,
+   "detail": "app 224 ids up to 227, ref up to 227"
+  },
+  {
+   "id": "extinction-foxes",
+   "area": "algo",
+   "pass": true,
+   "detail": "101 points, max 0"
+  },
+  {
+   "id": "extinction-all",
+   "area": "algo",
+   "pass": true,
+   "detail": "[{\"rabbits\":0,\"foxes\":0,\"grass\":3088},{\"rabbits\":0,\"foxes\":0,\"grass\":4800},12]"
+  },
+  {
+   "id": "side-by-side-1280",
+   "area": "layout",
+   "pass": true,
+   "detail": "[{\"x\":16,\"y\":51.984375,\"width\":812,\"height\":585.421875},{\"x\":844,\"y\":51.984375,\"width\":420,\"height\":1258.03125}]"
+  },
+  {
+   "id": "stacked-600",
+   "area": "layout",
+   "pass": true,
+   "detail": "[{\"x\":16,\"y\":51.984375,\"width\":568,\"height\":672.5},{\"x\":16,\"y\":740.484375,\"width\":568,\"height\":1388.03125}]"
+  },
+  {
+   "id": "no-hscroll-600",
+   "area": "layout",
+   "pass": true,
+   "detail": "[600,600,true]"
+  },
+  {
+   "id": "no-hscroll-390",
+   "area": "layout",
+   "pass": true,
+   "detail": "[390,390,true]"
+  },
+  {
+   "id": "canvas-fits-390",
+   "area": "layout",
+   "pass": true,
+   "detail": "{\"x\":31,\"y\":95.078125,\"width\":328,\"height\":246.5}"
+  },
+  {
+   "id": "tab-reaches-controls",
+   "area": "a11y",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "buttons-keyboard",
+   "area": "a11y",
+   "pass": true,
+   "detail": "tick 2 after Enter and Space on step"
+  },
+  {
+   "id": "sliders-labelled",
+   "area": "a11y",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "announce-on-pause",
+   "area": "a11y",
+   "pass": true,
+   "detail": "\"Tick 14: 895 rabbits, 6 foxes\" vs \"Tick 14: 895 rabbits, 6 foxes\", aria-live polite"
+  },
+  {
+   "id": "shortcut-s",
+   "area": "a11y",
+   "pass": true,
+   "detail": "tick 1"
+  },
+  {
+   "id": "shortcut-r",
+   "area": "a11y",
+   "pass": true,
+   "detail": "[[0,{\"rabbits\":100,\"foxes\":6,\"grass\":2439}],{\"rabbits\":100,\"foxes\":6,\"grass\":2439}]"
+  },
+  {
+   "id": "focus-visible",
+   "area": "a11y",
+   "pass": true,
+   "detail": "[\"play\",\"solid\",\"3px\",\"none\"]"
+  },
+  {
+   "id": "preset-save-reload",
+   "area": "persist",
+   "pass": true,
+   "detail": "[[\"alphaLoadDelete\"],[\"alpha\"]]"
+  },
+  {
+   "id": "preset-list",
+   "area": "persist",
+   "pass": true,
+   "detail": "[\"oneLoadDelete\",\"twoLoadDelete\"]"
+  },
+  {
+   "id": "preset-delete",
+   "area": "persist",
+   "pass": true,
+   "detail": "[[\"twoLoadDelete\"],[\"two\"]]"
+  },
+  {
+   "id": "preset-load-applies",
+   "area": "persist",
+   "pass": true,
+   "detail": "[[0,{\"rabbits\":33,\"foxes\":6,\"grass\":2399}],{\"rabbits\":33,\"foxes\":6,\"grass\":2399}]"
+  },
+  {
+   "id": "corrupt-storage",
+   "area": "persist",
+   "pass": true,
+   "detail": "[0,true,[]]"
+  },
+  {
+   "id": "ode-values-0",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":0.07484073069377406,\"y\":0.8694301634142199} ref {\"x\":0.07484073069377406,\"y\":0.8694301634142199}"
+  },
+  {
+   "id": "ode-values-1",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":4.940988081110374,\"y\":5.237792727027955} ref {\"x\":4.940988081110374,\"y\":5.237792727027955}"
+  },
+  {
+   "id": "ode-values-2",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":3.2034918618075943,\"y\":2.4101818527587198} ref {\"x\":3.2034918618075943,\"y\":2.4101818527587198}"
+  },
+  {
+   "id": "ode-steps-rounding",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":7.179825061745335,\"y\":10.510710244677728} ref {\"x\":7.179825061745335,\"y\":10.510710244677728}"
+  },
+  {
+   "id": "eq-dom",
+   "area": "domain",
+   "pass": true,
+   "detail": "6, 4"
+  },
+  {
+   "id": "drift-small",
+   "area": "domain",
+   "pass": true,
+   "detail": "2.32271362144e-8"
+  },
+  {
+   "id": "ode-ui-run",
+   "area": "domain",
+   "pass": true,
+   "detail": "5.12723257164, 2.94881042176 vs {\"x\":5.12723257163882,\"y\":2.948810421764974}"
+  },
+  {
+   "id": "ode-chart",
+   "area": "domain",
+   "pass": true,
+   "detail": "1501, 1501 points"
+  }
+ ]
+}

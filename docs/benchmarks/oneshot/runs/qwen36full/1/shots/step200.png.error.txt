@@ -1,0 +1,6 @@
+Error: page.evaluate: TypeError: world.history is not a function
+    at updateChart (http://127.0.0.1:65327/app.html:565:22)
+    at Object.step (http://127.0.0.1:65327/app.html:421:5)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

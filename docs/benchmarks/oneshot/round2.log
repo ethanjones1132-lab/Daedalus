@@ -1,0 +1,32 @@
+19:43:51 round two start; idle VRAM 1407 MiB
+service stopped
+19:54:17 round two start; idle VRAM 607 MiB
+service stopped
+20:02:53 qwen36full generation exit 0: 3 builds; 19:54:49 qwen36full: ncmoe 22 loaded True VRAM 7770 MiB
+20:07:36 qwen36full checks: score 0.155 (11/70) score 0.114 (8/70) score 0.420 (30/70) score 0.155 (11/70) score 0.114 (8/70) score 0.420 (30/70) 
+20:26:58 gemma26b generation exit 0: 3 builds; 20:11:38 gemma26b: ncmoe 16 loaded True VRAM 7826 MiB
+20:31:30 gemma26b checks: score 0.054 (3/70) score 0.034 (2/70) score 0.173 (13/70) score 0.054 (3/70) score 0.034 (2/70) score 0.173 (13/70) 
+{"arch": "gpt-oss", "experts": "32->24", "mean_importance_retained": 0.9565, "fallback_layers": []}
+20:44:44 keep24 slice exit 0
+INFO:gguf-set-metadata:* Loading: E:\qwen3-forge\models\Xing4.0-29B-A4B-IQ3_XXS.gguf
+INFO:gguf-set-metadata:* Preparing to change field 'xing4_0.nextn_predict_layers' from 1 to 0
+INFO:gguf-set-metadata:* Field changed. Successful completion.
+20:44:49 xing4 metadata fix exit 0
+21:02:39 tiel generation exit 0: 3 builds; 20:48:01 tiel: ncmoe 24 loaded True VRAM 7830 MiB
+21:07:22 tiel checks: score 0.112 (7/70) score 0.133 (10/70) score 0.083 (5/70) score 0.112 (7/70) score 0.133 (10/70) score 0.083 (5/70) 
+21:18:09 gptoss20b generation exit 0: 3 builds; 21:11:29 gptoss20b: ncmoe 11 loaded True VRAM 7800 MiB
+21:22:36 gptoss20b checks: score 0.000 (0/70) score 0.080 (5/70) score 0.080 (5/70) score 0.000 (0/70) score 0.080 (5/70) score 0.080 (5/70) 
+21:30:04 gptoss20b-keep24 generation exit 0: 3 builds; 21:25:44 gptoss20b-keep24: ncmoe 7 loaded True VRAM 7718 MiB
+21:34:47 gptoss20b-keep24 checks: score 0.000 (0/70) score 0.080 (5/70) score 0.080 (5/70) score 0.000 (0/70) score 0.080 (5/70) score 0.080 (5/70) 
+21:53:39 qwen36full-iq3xxs generation exit 0: 3 builds; 21:37:42 qwen36full-iq3xxs: ncmoe 26 loaded True VRAM 7596 MiB
+21:58:22 qwen36full-iq3xxs checks: score 0.499 (33/70) score 0.672 (46/70) score 0.085 (5/70) score 0.515 (34/70) score 0.672 (46/70) score 0.085 (5/70) 
+22:02:17 lfm25-8b-a1b generation exit 0: 3 builds; 21:59:21 lfm25-8b-a1b: ncmoe 0 loaded True VRAM 5921 MiB
+22:07:10 lfm25-8b-a1b checks: score 0.014 (1/70) score 0.014 (1/70) score 0.014 (1/70) score 0.014 (1/70) score 0.014 (1/70) score 0.014 (1/70) 
+23:02:17 xing4 generation exit 1: 2 builds; 22:12:08 xing4: ncmoe 22 loaded True VRAM 7592 MiB
+23:05:39 xing4 checks: score 0.000 (0/70) score 0.000 (0/70) score 0.000 (0/70) score 0.000 (0/70) 
+23:27:13 owner: stop K2-Horizon (thrashing at 0.15 GB RAM); rerun after Laya v3
+23:27:29 k2h generation exit 1: 0 builds; 23:12:00 k2h: ncmoe 30 loaded True VRAM 7807 MiB
+23:27:30 k2h checks: 
+23:27:30 round two loop done
+service started
+23:27:31 Versutus gate start requested; round two chain done

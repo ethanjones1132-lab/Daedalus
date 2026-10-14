@@ -1,0 +1,102 @@
+{
+ "n": 360,
+ "c1_single": {
+  "solved": 292,
+  "mean_secs": 1.359,
+  "by_category": {
+   "A": 50,
+   "B": 50,
+   "C": 58,
+   "D": 62,
+   "E": 72
+  }
+ },
+ "c2_recipe": {
+  "solved": 306,
+  "mean_secs": 10.109,
+  "by_category": {
+   "A": 54,
+   "B": 48,
+   "C": 64,
+   "D": 69,
+   "E": 71
+  }
+ },
+ "c6_oracle": {
+  "solved": 325
+ },
+ "v2_simulated": {
+  "solved": 300.0,
+  "mean_secs": 10.06156111111111
+ },
+ "v3_simulated": {
+  "solved": 302.0,
+  "mean_secs": 9.633330555555554
+ },
+ "ablations": {
+  "no_A": {
+   "solved": 304.0,
+   "mean_secs": 9.458033333333326
+  },
+  "no_B": {
+   "solved": 302.0,
+   "mean_secs": 9.464799999999999
+  },
+  "no_check": {
+   "solved": 291.0,
+   "mean_secs": 8.345302777777775
+  },
+  "no_C": {
+   "solved": 302.0,
+   "mean_secs": 9.633330555555554
+  },
+  "no_lib_gate": {
+   "solved": 301.0,
+   "mean_secs": 10.146566666666667
+  },
+  "old_probe": {
+   "solved": 298.0,
+   "mean_secs": 6.1013944444444395
+  },
+  "no_v1_route": {
+   "solved": 307.0,
+   "mean_secs": 13.53046666666668
+  }
+ },
+ "v3_live": {
+  "solved": 303,
+  "n": 360,
+  "mean_secs": 7.533,
+  "by_category": {
+   "A": 56,
+   "B": 45,
+   "C": 64,
+   "D": 69,
+   "E": 69
+  },
+  "notes": 104,
+  "repairs": 68,
+  "escalations": 0,
+  "early_stops": 0,
+  "probe_routes": 150,
+  "v1_probe_routes": 210,
+  "laya_fallbacks": 0
+ },
+ "bar": {
+  "v3_only": 24,
+  "recipe_only": 27,
+  "mcnemar_p": 0.7797679305530743,
+  "tasks_v3_better": 14,
+  "tasks_recipe_better": 20,
+  "task_sign_p": 0.39152830513194203,
+  "v3_secs": 7.533316666666667,
+  "recipe_secs": 10.109,
+  "tier2b_guard": {
+   "tasks_v3_better": 0,
+   "tasks_recipe_better": 6,
+   "task_sign_p": 0.03125,
+   "fails": true
+  },
+  "met": false
+ }
+}

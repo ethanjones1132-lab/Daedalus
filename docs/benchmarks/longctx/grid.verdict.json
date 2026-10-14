@@ -1,0 +1,109 @@
+{
+ "rows": [
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx16384_ub512_tdef",
+   "ctx": 16384,
+   "ubatch": 512,
+   "ctk": "q8_0",
+   "speed_ratio": 1.0,
+   "depth_ratio": null,
+   "spill_over_control_mib": 0,
+   "vram_peak_mib": 5677,
+   "pass": true,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx32768_ub512_tdef",
+   "ctx": 32768,
+   "ubatch": 512,
+   "ctk": "q8_0",
+   "speed_ratio": 1.0,
+   "depth_ratio": 1.0,
+   "spill_over_control_mib": 32,
+   "vram_peak_mib": 5953,
+   "pass": true,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx65536_ub512_tdef",
+   "ctx": 65536,
+   "ubatch": 512,
+   "ctk": "q8_0",
+   "speed_ratio": 1.028,
+   "depth_ratio": 1.0,
+   "spill_over_control_mib": 92,
+   "vram_peak_mib": 6474,
+   "pass": true,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx65536_ub1024_tdef",
+   "ctx": 65536,
+   "ubatch": 1024,
+   "ctk": "q8_0",
+   "speed_ratio": 0.783,
+   "depth_ratio": 0.544,
+   "spill_over_control_mib": 244,
+   "vram_peak_mib": 6677,
+   "pass": false,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx98304_ub512_tdef",
+   "ctx": 98304,
+   "ubatch": 512,
+   "ctk": "q8_0",
+   "speed_ratio": 1.026,
+   "depth_ratio": 0.994,
+   "spill_over_control_mib": 148,
+   "vram_peak_mib": 6912,
+   "pass": true,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx131072_ub512_tdef",
+   "ctx": 131072,
+   "ubatch": 512,
+   "ctk": "q8_0",
+   "speed_ratio": 1.02,
+   "depth_ratio": 0.987,
+   "spill_over_control_mib": 219,
+   "vram_peak_mib": 6986,
+   "pass": true,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx98304_ub512_tdef_kq4_0",
+   "ctx": 98304,
+   "ubatch": 512,
+   "ctk": "q4_0",
+   "speed_ratio": 1.017,
+   "depth_ratio": 0.482,
+   "spill_over_control_mib": 160,
+   "vram_peak_mib": 6493,
+   "pass": false,
+   "error": null
+  },
+  {
+   "tag": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96_ncmoe0_mtp2_ctx131072_ub512_tdef_kq4_0",
+   "ctx": 131072,
+   "ubatch": 512,
+   "ctk": "q4_0",
+   "speed_ratio": 0.995,
+   "depth_ratio": 0.463,
+   "spill_over_control_mib": 224,
+   "vram_peak_mib": 6866,
+   "pass": false,
+   "error": null
+  }
+ ],
+ "ctk": {
+  "16384": "q8_0",
+  "32768": "q8_0",
+  "65536": "q8_0",
+  "98304": "q8_0",
+  "131072": "q8_0"
+ },
+ "largest_pass": 131072,
+ "idle_vram_mib": 740
+}

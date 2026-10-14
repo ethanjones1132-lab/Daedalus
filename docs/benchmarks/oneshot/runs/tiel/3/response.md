@@ -1,0 +1,719 @@
+## Plan
+
+**Data model.** The world is a `cells` array (length `width*height`) of `{grass, rabbit, fox}` objects indexed by `y*width+x`. Rabbits and foxes live in flat arrays `rabbits`/`foxes`, each entry `{id, x, y, energy}`. A single `id` counter (start 1) is shared. `rand` is one `mulberry32` stream created on reset. `history` is an array of `{tick, rabbits, foxes, grass}`. `defaults` holds the 13 parameters.
+
+**Tick order.** `reset(seed, params)` merges params over `defaults`, seeds `rand`, resets counters, fills grass row-major, places rabbits/foxes by `pick`, records tick 0, redraws. One tick runs: (1) grass grows; (2) rabbits taken alive at phase start, sorted by id — move to a free neighbour, eat grass, subtract cost, breed into a free neighbour if enough energy, die at ≤0; (3) foxes, same order — move toward rabbits, eat a rabbit in the cell, subtract cost, breed, die; (4) `tick++`, record `{tick, rabbits, foxes, grass}`. `step(n)` runs `n` ticks then updates canvas/chart/counters once.
+
+**Components.** `world` (canvas + `draw`), `controls` (play/pause/step/reset buttons, `seed` number input, `speed` range, six parameter sliders with labels), `counters` (`tick`, `count-rabbits`, `count-foxes`, `count-grass`), `chart` (`<svg>` with two polylines + axis labels), `ode` (eight inputs, `ode-run` button, `ode-x/y/eq/drift` outputs, `ode-chart`), `scenario` (`scenario-json` textarea, export/load buttons, `scenario-error` message), `presets` (`preset-name` input, `preset-save`, `preset-list` with per-item load/delete), `announcer`. Wiring: buttons call `lab` methods; the play loop uses `requestAnimationFrame` with elapsed-time accumulation at `speed` ticks/sec; keyboard shortcuts on `keydown` when focus is outside controls; `aria-live` announcer updated on pause.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ecosystem Lab</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 0; color: #1a1a1a; background: #f5f5f5; }
+  .wrap { display: flex; flex-wrap: wrap; min-height: 100vh; }
+  #panel-world { flex: 1 1 560px; padding: 16px; }
+  #panel-side { flex: 1 1 420px; padding: 16px; }
+  @media (min-width: 1000px) { .wrap { flex-direction: row; } #panel-world, #panel-side { flex: 1 1 0; } }
+  @media (max-width: 699px) { .wrap { flex-direction: column; } }
+  h2 { margin-top: 0; font-size: 1.1rem; }
+  .group { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+  canvas { max-width: 100%; height: auto; display: block; border: 1px solid #999; background: #000; }
+  button { font: inherit; padding: 6px 12px; margin: 3px; border: 1px solid #888; border-radius: 5px; background: #eef; cursor: pointer; }
+  button:focus, input:focus, select:focus { outline: 3px solid #4a90d9; outline-offset: 1px; }
+  label { display: inline-block; font-size: 0.85rem; }
+  input[type=number], input[type=text], input[type=range] { font: inherit; }
+  input[type=number] { width: 70px; }
+  .row { margin: 6px 0; }
+  .counters { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+  .counter { background: #f0f0f0; padding: 6px 10px; border-radius: 6px; font-size: 0.9rem; }
+  .counter b { font-weight: 600; }
+  .val { font-variant-numeric: tabular-nums; }
+  svg { width: 100%; height: auto; }
+  .ode-out { font-size: 0.85rem; margin: 4px 0; }
+  .err { color: #c00; font-size: 0.85rem; min-height: 1em; }
+  .preset-item { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 0.85rem; }
+  textarea { width: 100%; min-height: 100px; font: monospace; font-size: 0.8rem; }
+  #announcer { position: absolute; left: -9999px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section id="panel-world">
+    <div class="group">
+      <h2>World</h2>
+      <canvas data-testid="world" width="400" height="300"></canvas>
+      <div class="counters">
+        <div class="counter"><b>Tick:</b> <span data-testid="tick" class="val">0</span></div>
+        <div class="counter"><b>Rabbits:</b> <span data-testid="count-rabbits" class="val">0</span></div>
+        <div class="counter"><b>Foxes:</b> <span data-testid="count-foxes" class="val">0</span></div>
+        <div class="counter"><b>Grass:</b> <span data-testid="count-grass" class="val">0</span></div>
+      </div>
+      <div class="row">
+        <button data-testid="play">Play</button>
+        <button data-testid="pause">Pause</button>
+        <button data-testid="step">Step</button>
+        <button data-testid="reset">Reset</button>
+        <button data-testid="csv-export">Export CSV</button>
+      </div>
+      <div class="row">
+        <label for="seed">Seed</label>
+        <input type="number" id="seed" data-testid="seed" value="42">
+      </div>
+      <div class="row">
+        <label for="speed">Speed: <span id="speed-val" class="val">10</span> ticks/sec</label>
+        <input type="range" id="speed" data-testid="speed" min="1" max="60" value="10">
+      </div>
+      <div id="params"></div>
+    </div>
+  </section>
+  <section id="panel-side">
+    <div class="group">
+      <h2>Populations</h2>
+      <svg data-testid="chart" viewBox="0 0 500 220" role="img" aria-label="Population chart">
+        <line x1="40" y1="200" x2="490" y2="200" stroke="#666"/>
+        <line x1="40" y1="10" x2="40" y2="200" stroke="#666"/>
+        <text x="265" y="215" font-size="12">tick</text>
+        <text x="12" y="55" font-size="12" transform="rotate(-90 12 55)">count</text>
+        <polyline data-testid="series-rabbits" fill="none" stroke="#c00" stroke-width="1.5"/>
+        <polyline data-testid="series-foxes" fill="none" stroke="#08a" stroke-width="1.5"/>
+      </svg>
+    </div>
+    <div class="group">
+      <h2>Lotka–Volterra</h2>
+      <div class="row"><label for="ode-alpha">α</label> <input type="number" id="ode-alpha" data-testid="ode-alpha" value="1.1"></div>
+      <div class="row"><label for="ode-beta">β</label> <input type="number" id="ode-beta" data-testid="ode-beta" value="0.4"></div>
+      <div class="row"><label for="ode-gamma">γ</label> <input type="number" id="ode-gamma" data-testid="ode-gamma" value="0.4"></div>
+      <div class="row"><label for="ode-delta">δ</label> <input type="number" id="ode-delta" data-testid="ode-delta" value="0.1"></div>
+      <div class="row"><label for="ode-x0">x₀</label> <input type="number" id="ode-x0" data-testid="ode-x0" value="10"></div>
+      <div class="row"><label for="ode-y0">y₀</label> <input type="number" id="ode-y0" data-testid="ode-y0" value="10"></div>
+      <div class="row"><label for="ode-t">t</label> <input type="number" id="ode-t" data-testid="ode-t" value="50"></div>
+      <div class="row"><label for="ode-dt">dt</label> <input type="number" id="ode-dt" data-testid="ode-dt" value="0.01"></div>
+      <button data-testid="ode-run">Run</button>
+      <div class="ode-out">x = <span data-testid="ode-x">0</span></div>
+      <div class="ode-out">y = <span data-testid="ode-y">0</span></div>
+      <div class="ode-out">eq-x = γ/δ = <span data-testid="ode-eq-x">0</span></div>
+      <div class="ode-out">eq-y = α/β = <span data-testid="ode-eq-y">0</span></div>
+      <div class="ode-out">drift = <span data-testid="ode-drift">0</span></div>
+      <svg data-testid="ode-chart" viewBox="0 0 500 160" role="img" aria-label="ODE trajectory"></svg>
+    </div>
+    <div class="group">
+      <h2>Scenario</h2>
+      <textarea data-testid="scenario-json" aria-label="Scenario JSON"></textarea>
+      <div class="row">
+        <button data-testid="scenario-export">Export</button>
+        <button data-testid="scenario-load">Load</button>
+      </div>
+      <div class="err" data-testid="scenario-error"></div>
+    </div>
+    <div class="group">
+      <h2>Presets</h2>
+      <div class="row">
+        <label for="preset-name">Name</label>
+        <input type="text" id="preset-name" data-testid="preset-name">
+        <button data-testid="preset-save">Save</button>
+      </div>
+      <div data-testid="preset-list"></div>
+    </div>
+  </section>
+</div>
+<div data-testid="announcer" aria-live="polite"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  function mulberry32(seed) {
+    let a = seed | 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const defaults = {
+    width: 40, height: 30, grassMax: 4, rabbits0: 100, foxes0: 6,
+    rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+    foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+  };
+
+  const world = {
+    cells: [], rabbits: [], foxes: [], history: [],
+    rand: null, seed: 42, tick: 0, idCounter: 1,
+    params: Object.assign({}, defaults),
+    canvas: null, ctx: null,
+    playing: false, playTimer: null, playStart: 0, playElapsed: 0, playAccum: 0
+  };
+
+  function idx(x, y) { return y * world.params.width + x; }
+  function inBounds(x, y) { return x >= 0 && x < world.params.width && y >= 0 && y < world.params.height; }
+  function neighbours(x, y) {
+    const out = [];
+    if (inBounds(x, y - 1)) out.push([x, y - 1]);
+    if (inBounds(x + 1, y)) out.push([x + 1, y]);
+    if (inBounds(x, y + 1)) out.push([x, y + 1]);
+    if (inBounds(x - 1, y)) out.push([x - 1, y]);
+    return out;
+  }
+  function pick(list) {
+    if (list.length === 0) return null;
+    return list[Math.floor(world.rand() * list.length)];
+  }
+
+  function createRabbit(x, y, energy) {
+    const id = world.idCounter++;
+    const r = { id, x, y, energy };
+    world.rabbits.push(r);
+    world.cells[idx(x, y)].rabbit = r;
+    return r;
+  }
+  function createFox(x, y, energy) {
+    const id = world.idCounter++;
+    const f = { id, x, y, energy };
+    world.foxes.push(f);
+    world.cells[idx(x, y)].fox = f;
+    return f;
+  }
+  function removeRabbit(r) {
+    const i = world.rabbits.indexOf(r);
+    if (i >= 0) world.rabbits.splice(i, 1);
+    if (world.cells[idx(r.x, r.y)].rabbit === r) world.cells[idx(r.x, r.y)].rabbit = null;
+  }
+  function removeFox(f) {
+    const i = world.foxes.indexOf(f);
+    if (i >= 0) world.foxes.splice(i, 1);
+    if (world.cells[idx(f.x, f.y)].fox === f) world.cells[idx(f.x, f.y)].fox = null;
+  }
+
+  function recordHistory() {
+    let grass = 0;
+    for (let i = 0; i < world.cells.length; i++) grass += world.cells[i].grass;
+    world.history.push({ tick: world.tick, rabbits: world.rabbits.length, foxes: world.foxes.length, grass });
+  }
+
+  function reset(seed, params) {
+    world.params = Object.assign({}, defaults);
+    if (params && typeof params === "object") {
+      for (const k in params) { if (Object.prototype.hasOwnProperty.call(params, k)) world.params[k] = params[k]; }
+    }
+    world.seed = seed;
+    world.rand = mulberry32(seed);
+    world.tick = 0;
+    world.idCounter = 1;
+    world.rabbits = [];
+    world.foxes = [];
+    world.history = [];
+
+    const w = world.params.width, h = world.params.height;
+    world.cells = [];
+    for (let i = 0; i < w * h; i++) world.cells.push({ grass: 0, rabbit: null, fox: null });
+
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        world.cells[idx(x, y)].grass = Math.floor(world.rand() * (world.params.grassMax + 1));
+      }
+    }
+
+    for (let n = 0; n < world.params.rabbits0; n++) {
+      const free = [];
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (!world.cells[idx(x, y)].rabbit) free.push([x, y]);
+      const spot = pick(free);
+      if (spot) createRabbit(spot[0], spot[1], world.params.rabbitStart);
+    }
+    for (let n = 0; n < world.params.foxes0; n++) {
+      const free = [];
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (!world.cells[idx(x, y)].fox) free.push([x, y]);
+      const spot = pick(free);
+      if (spot) createFox(spot[0], spot[1], world.params.foxStart);
+    }
+
+    recordHistory();
+    redraw();
+    updateChart();
+    updateCounters();
+    return counts();
+  }
+
+  function oneTick() {
+    const w = world.params.width, h = world.params.height;
+
+    // Grass
+    for (let i = 0; i < world.cells.length; i++) {
+      world.cells[i].grass = Math.min(world.params.grassMax, world.cells[i].grass + 1);
+    }
+
+    // Rabbits
+    const rbs = world.rabbits.slice().sort((a, b) => a.id - b.id);
+    for (const r of rbs) {
+      if (!world.rabbits.includes(r)) continue;
+      const nb = neighbours(r.x, r.y);
+      const free = nb.filter(([x, y]) => !world.cells[idx(x, y)].rabbit);
+      if (free.length > 0) {
+        const spot = pick(free);
+        world.cells[idx(r.x, r.y)].rabbit = null;
+        r.x = spot[0]; r.y = spot[1];
+        world.cells[idx(r.x, r.y)].rabbit = r;
+      }
+      r.energy += world.params.rabbitGain * world.cells[idx(r.x, r.y)].grass;
+      world.cells[idx(r.x, r.y)].grass = 0;
+      r.energy -= world.params.rabbitCost;
+      if (r.energy >= world.params.rabbitBreed) {
+        const nb2 = neighbours(r.x, r.y);
+        const free2 = nb2.filter(([x, y]) => !world.cells[idx(x, y)].rabbit);
+        if (free2.length > 0) {
+          const spot = pick(free2);
+          const child = Math.floor(r.energy / 2);
+          r.energy -= child;
+          createRabbit(spot[0], spot[1], child);
+        }
+      }
+      if (r.energy <= 0) removeRabbit(r);
+    }
+
+    // Foxes
+    const fxs = world.foxes.slice().sort((a, b) => a.id - b.id);
+    for (const f of fxs) {
+      if (!world.foxes.includes(f)) continue;
+      const nb = neighbours(f.x, f.y);
+      const withRabbit = nb.filter(([x, y]) => world.cells[idx(x, y)].rabbit && !world.cells[idx(x, y)].fox);
+      let spot;
+      if (withRabbit.length > 0) {
+        spot = pick(withRabbit);
+      } else {
+        const noFox = nb.filter(([x, y]) => !world.cells[idx(x, y)].fox);
+        if (noFox.length > 0) spot = pick(noFox);
+      }
+      if (spot) {
+        world.cells[idx(f.x, f.y)].fox = null;
+        f.x = spot[0]; f.y = spot[1];
+        world.cells[idx(f.x, f.y)].fox = f;
+      }
+      if (world.cells[idx(f.x, f.y)].rabbit) {
+        removeRabbit(world.cells[idx(f.x, f.y)].rabbit);
+        f.energy += world.params.foxGain;
+      }
+      f.energy -= world.params.foxCost;
+      if (f.energy >= world.params.foxBreed) {
+        const nb2 = neighbours(f.x, f.y);
+        const free2 = nb2.filter(([x, y]) => !world.cells[idx(x, y)].fox);
+        if (free2.length > 0) {
+          const spot2 = pick(free2);
+          const child = Math.floor(f.energy / 2);
+          f.energy -= child;
+          createFox(spot2[0], spot2[1], child);
+        }
+      }
+      if (f.energy <= 0) removeFox(f);
+    }
+
+    world.tick += 1;
+    recordHistory();
+  }
+
+  function counts() {
+    let grass = 0;
+    for (let i = 0; i < world.cells.length; i++) grass += world.cells[i].grass;
+    return { rabbits: world.rabbits.length, foxes: world.foxes.length, grass };
+  }
+
+  function draw() {
+    const w = world.params.width, h = world.params.height;
+    world.ctx.clearRect(0, 0, w * 10, h * 10);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const c = world.cells[idx(x, y)];
+        const G = 60 + Math.round(160 * c.grass / world.params.grassMax);
+        world.ctx.fillStyle = "rgb(30, " + G + ", 30)";
+        world.ctx.fillRect(x * 10, y * 10, 10, 10);
+      }
+    }
+    for (const r of world.rabbits) {
+      world.ctx.fillStyle = "rgb(240, 240, 240)";
+      world.ctx.fillRect(r.x * 10 + 3, r.y * 10 + 3, 4, 4);
+    }
+    for (const f of world.foxes) {
+      world.ctx.fillStyle = "rgb(220, 80, 20)";
+      world.ctx.fillRect(f.x * 10 + 3, f.y * 10 + 3, 4, 4);
+    }
+  }
+
+  function updateChart() {
+    const svg = document.querySelector('[data-testid="chart"]');
+    const rx = svg.querySelector('[data-testid="series-rabbits"]');
+    const fx = svg.querySelector('[data-testid="series-foxes"]');
+    const data = world.history;
+    if (data.length === 0) return;
+    const maxTick = data[data.length - 1].tick;
+    const maxCount = Math.max(1, ...data.map(d => d.rabbits), ...data.map(d => d.foxes));
+    const plotW = 450, plotH = 190, offX = 40, offY = 10;
+    function pts(arr, key) {
+      return data.map((d, i) => {
+        const px = offX + (maxTick === 0 ? 0 : (d.tick / maxTick) * plotW);
+        const py = offY + plotH - (d[key] / maxCount) * plotH;
+        return px + "," + py;
+      }).join(" ");
+    }
+    rx.setAttribute("points", pts(data, "rabbits"));
+    fx.setAttribute("points", pts(data, "foxes"));
+  }
+
+  function updateCounters() {
+    const c = counts();
+    document.querySelector('[data-testid="tick"]').textContent = world.tick;
+    document.querySelector('[data-testid="count-rabbits"]').textContent = c.rabbits;
+    document.querySelector('[data-testid="count-foxes"]').textContent = c.foxes;
+    document.querySelector('[data-testid="count-grass"]').textContent = c.grass;
+  }
+
+  function redraw() { draw(); updateChart(); updateCounters(); }
+
+  function ode(p, t, dt) {
+    const { alpha, beta, gamma, delta, x0, y0 } = p;
+    let x = x0, y = y0;
+    const n = Math.round(t / dt);
+    function deriv(x, y) {
+      return { dx: alpha * x - beta * x * y, dy: delta * x * y - gamma * y };
+    }
+    for (let i = 0; i < n; i++) {
+      const k1 = deriv(x, y);
+      const k2 = deriv(x + dt / 2 * k1.dx, y + dt / 2 * k1.dy);
+      const k3 = deriv(x + dt / 2 * k2.dx, y + dt / 2 * k2.dy);
+      const k4 = deriv(x + dt * k3.dx, y + dt * k3.dy);
+      x += dt / 6 * (k1.dx + 2 * k2.dx + 2 * k3.dx + k4.dx);
+      y += dt / 6 * (k1.dy + 2 * k2.dy + 2 * k3.dy + k4.dy);
+    }
+    return { x, y };
+  }
+
+  function exportCSV() {
+    let lines = ["tick,rabbits,foxes,grass"];
+    for (const h of world.history) lines.push(h.tick + "," + h.rabbits + "," + h.foxes + "," + h.grass);
+    return lines.join("\n") + "\n";
+  }
+
+  function exportScenario() {
+    return JSON.stringify({ version: 1, seed: world.seed, params: Object.assign({}, world.params) });
+  }
+
+  function loadScenario(text) {
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (e) { showScenarioError("Invalid JSON"); return false; }
+    if (!parsed || parsed.version !== 1) { showScenarioError("Wrong version"); return false; }
+    if (!Number.isInteger(parsed.seed)) { showScenarioError("Missing or non-integer seed"); return false; }
+    const result = reset(parsed.seed, parsed.params || {});
+    document.querySelector('[data-testid="scenario-error"]').textContent = "";
+    document.querySelector('[data-testid="seed"]').value = world.seed;
+    return true;
+  }
+
+  function showScenarioError(msg) {
+    document.querySelector('[data-testid="scenario-error"]').textContent = msg;
+  }
+
+  function runODE() {
+    const p = {
+      alpha: parseFloat(document.querySelector('[data-testid="ode-alpha"]').value),
+      beta: parseFloat(document.querySelector('[data-testid="ode-beta"]').value),
+      gamma: parseFloat(document.querySelector('[data-testid="ode-gamma"]').value),
+      delta: parseFloat(document.querySelector('[data-testid="ode-delta"]').value),
+      x0: parseFloat(document.querySelector('[data-testid="ode-x0"]').value),
+      y0: parseFloat(document.querySelector('[data-testid="ode-y0"]').value)
+    };
+    const t = parseFloat(document.querySelector('[data-testid="ode-t"]').value);
+    const dt = parseFloat(document.querySelector('[data-testid="ode-dt"]').value);
+    const end = ode(p, t, dt);
+    const V = (x, y) => delta * x - gamma * Math.log(x) + beta * y - alpha * Math.log(y);
+    const drift = Math.abs(V(end.x, end.y) - V(p.x0, p.y0));
+    document.querySelector('[data-testid="ode-x"]').textContent = end.x.toPrecision(12);
+    document.querySelector('[data-testid="ode-y"]').textContent = end.y.toPrecision(12);
+    document.querySelector('[data-testid="ode-eq-x"]').textContent = (gamma / delta).toPrecision(12);
+    document.querySelector('[data-testid="ode-eq-y"]').textContent = (alpha / beta).toPrecision(12);
+    document.querySelector('[data-testid="ode-drift"]').textContent = drift;
+
+    const svg = document.querySelector('[data-testid="ode-chart"]');
+    svg.innerHTML = "";
+    const data = [];
+    let x = p.x0, y = p.y0;
+    const steps = Math.round(t / dt);
+    for (let i = 0; i <= steps; i++) {
+      data.push({ x, y });
+      const d = derivODE(p, x, y);
+      x += d.dx * dt;
+      y += d.dy * dt;
+    }
+    data.push({ x, y });
+    const maxT = Math.max(1, t);
+    const maxV = Math.max(...data.map(d => d.x), ...data.map(d => d.y), 0.0001);
+    const W = 500, H = 160, ox = 10, oy = 10, pw = 480, ph = 140;
+    function pts(key) {
+      return data.map(d => {
+        const px = ox + (t === 0 ? 0 : (d.t !== undefined ? (0) : 0));
+        return "";
+      }).join(" ");
+    }
+    const ptsX = data.map((d, i) => {
+      const px = ox + (maxT === 0 ? 0 : (i / steps) * pw);
+      const py = oy + ph - (d.x / maxV) * ph;
+      return px + "," + py;
+    }).join(" ");
+    const ptsY = data.map((d, i) => {
+      const px = ox + (maxT === 0 ? 0 : (i / steps) * pw);
+      const py = oy + ph - (d.y / maxV) * ph;
+      return px + "," + py;
+    }).join(" ");
+    const lineX = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    lineX.setAttribute("data-testid", "ode-series-x");
+    lineX.setAttribute("fill", "none");
+    lineX.setAttribute("stroke", "#c00");
+    lineX.setAttribute("stroke-width", "1.5");
+    lineX.setAttribute("points", ptsX);
+    svg.appendChild(lineX);
+    const lineY = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+    lineY.setAttribute("data-testid", "ode-series-y");
+    lineY.setAttribute("fill", "none");
+    lineY.setAttribute("stroke", "#08a");
+    lineY.setAttribute("stroke-width", "1.5");
+    lineY.setAttribute("points", ptsY);
+    svg.appendChild(lineY);
+  }
+
+  function derivODE(p, x, y) {
+    return { dx: p.alpha * x - p.beta * x * y, dy: p.delta * x * y - p.gamma * y };
+  }
+
+  function play() {
+    if (world.playing) return;
+    world.playing = true;
+    world.playStart = performance.now();
+    world.playElapsed = 0;
+    world.playAccum = 0;
+    loop();
+  }
+
+  function pause() {
+    world.playing = false;
+    world.playAccum = 0;
+    if (world.playTimer) { cancelAnimationFrame(world.playTimer); world.playTimer = null; }
+    updateCounters();
+    const c = counts();
+    document.querySelector('[data-testid="announcer"]').textContent = "Tick " + world.tick + ": " + c.rabbits + " rabbits, " + c.foxes + " foxes";
+  }
+
+  function loop() {
+    if (!world.playing) return;
+    const now = performance.now();
+    const elapsed = (now - world.playStart) / 1000 + world.playElapsed;
+    const speed = parseInt(document.querySelector('[data-testid="speed"]').value, 10) || 10;
+    const targetTicks = Math.floor(elapsed * speed);
+    while (world.playAccum < targetTicks) {
+      oneTick();
+      world.playAccum++;
+    }
+    while (world.playAccum < targetTicks) world.playAccum--;
+    redraw();
+    updateCounters();
+    if (world.playAccum >= targetTicks) {
+      world.playElapsed = elapsed;
+      world.playStart = now;
+      world.playAccum = 0;
+    }
+    world.playTimer = requestAnimationFrame(loop);
+  }
+
+  function savePreset() {
+    const name = document.querySelector('[data-testid="preset-name"]').value.trim();
+    if (!name) return;
+    const presets = loadPresets();
+    presets[name] = JSON.parse(exportScenario());
+    localStorage["ecolab.presets"] = JSON.stringify(presets);
+    renderPresets();
+  }
+
+  function loadPresets() {
+    try {
+      const raw = localStorage["ecolab.presets"];
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") return parsed;
+      return {};
+    } catch (e) { return {}; }
+  }
+
+  function renderPresets() {
+    const list = document.querySelector('[data-testid="preset-list"]');
+    list.innerHTML = "";
+    const presets = loadPresets();
+    const names = Object.keys(presets);
+    for (const name of names) {
+      const item = document.createElement("div");
+      item.className = "preset-item";
+      const span = document.createElement("span");
+      span.textContent = name;
+      const loadBtn = document.createElement("button");
+      loadBtn.textContent = "Load";
+      loadBtn.addEventListener("click", () => {
+        document.querySelector('[data-testid="scenario-json"]').value = JSON.stringify(presets[name]);
+        loadScenario(JSON.stringify(presets[name]));
+      });
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", () => {
+        const p = loadPresets();
+        delete p[name];
+        localStorage["ecolab.presets"] = JSON.stringify(p);
+        renderPresets();
+      });
+      item.appendChild(span);
+      item.appendChild(loadBtn);
+      item.appendChild(delBtn);
+      list.appendChild(item);
+    }
+  }
+
+  function initParams() {
+    const container = document.querySelector("#params");
+    const spec = [
+      ["rabbits0", 0, 300], ["foxes0", 0, 60], ["rabbitBreed", 2, 40],
+      ["foxBreed", 2, 60], ["foxGain", 1, 30], ["grassMax", 1, 10]
+    ];
+    for (const [name, min, max] of spec) {
+      const row = document.createElement("div");
+      row.className = "row";
+      const label = document.createElement("label");
+      label.setAttribute("for", "param-" + name);
+      label.textContent = name + ":";
+      const input = document.createElement("input");
+      input.type = "range";
+      input.id = "param-" + name;
+      input.data-testid = "param-" + name;
+      input.min = String(min);
+      input.max = String(max);
+      input.value = String(defaults[name]);
+      const val = document.createElement("span");
+      val.className = "val";
+      val.textContent = defaults[name];
+      input.addEventListener("input", () => { val.textContent = input.value; });
+      row.appendChild(label);
+      row.appendChild(input);
+      row.appendChild(document.createTextNode(" "));
+      row.appendChild(val);
+      container.appendChild(row);
+    }
+  }
+
+  function downloadCSV() {
+    const csv = exportCSV();
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ecolab.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function onKeydown(e) {
+    const tag = (e.target && e.target.tagName) || "";
+    const interactive = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON";
+    if (interactive) return;
+    if (e.key === " ") { e.preventDefault(); if (world.playing) pause(); else play(); }
+    else if (e.key === "s") { e.preventDefault(); stepOne(); }
+    else if (e.key === "r") { e.preventDefault(); doReset(); }
+  }
+
+  function stepOne() {
+    lab.step(1);
+    updateCounters();
+    const c = counts();
+    document.querySelector('[data-testid="announcer"]').textContent = "Tick " + world.tick + ": " + c.rabbits + " rabbits, " + c.foxes + " foxes";
+  }
+
+  function doReset() {
+    pause();
+    const seed = parseInt(document.querySelector('[data-testid="seed"]').value, 10);
+    const params = {};
+    const spec = ["rabbits0", "foxes0", "rabbitBreed", "foxBreed", "foxGain", "grassMax"];
+    for (const name of spec) {
+      const el = document.querySelector("#param-" + name);
+      if (el) params[name] = parseInt(el.value, 10);
+    }
+    lab.reset(seed, params);
+    document.querySelector('[data-testid="scenario-error"]').textContent = "";
+    const c = counts();
+    document.querySelector('[data-testid="announcer"]').textContent = "Tick " + world.tick + ": " + c.rabbits + " rabbits, " + c.foxes + " foxes";
+  }
+
+  const lab = {
+    reset: function (seed, params) { return reset(seed, params); },
+    step: function (n) {
+      for (let i = 0; i < n; i++) oneTick();
+      redraw();
+      return counts();
+    },
+    counts: counts,
+    tick: function () { return world.tick; },
+    cell: function (x, y) {
+      const c = world.cells[idx(x, y)];
+      return { grass: c.grass, rabbit: c.rabbit || null, fox: c.fox || null };
+    },
+    history: function () { return world.history; },
+    ode: function (p, t, dt) { return ode(p, t, dt); },
+    exportCSV: exportCSV,
+    exportScenario: exportScenario,
+    loadScenario: loadScenario
+  };
+
+  function init() {
+    world.canvas = document.querySelector('[data-testid="world"]');
+    world.canvas.width = defaults.width * 10;
+    world.canvas.height = defaults.height * 10;
+    world.ctx = world.canvas.getContext("2d");
+
+    initParams();
+
+    document.querySelector('[data-testid="play"]').addEventListener("click", play);
+    document.querySelector('[data-testid="pause"]').addEventListener("click", pause);
+    document.querySelector('[data-testid="step"]').addEventListener("click", stepOne);
+    document.querySelector('[data-testid="reset"]').addEventListener("click", doReset);
+    document.querySelector('[data-testid="csv-export"]').addEventListener("click", downloadCSV);
+
+    const speedEl = document.querySelector('[data-testid="speed"]');
+    const speedVal = document.getElementById("speed-val");
+    speedEl.addEventListener("input", () => { speedVal.textContent = speedEl.value; });
+
+    document.querySelector('[data-testid="scenario-export"]').addEventListener("click", () => {
+      document.querySelector('[data-testid="scenario-json"]').value = exportScenario();
+    });
+    document.querySelector('[data-testid="scenario-load"]').addEventListener("click", () => {
+      loadScenario(document.querySelector('[data-testid="scenario-json"]').value);
+    });
+
+    document.querySelector('[data-testid="preset-save"]').addEventListener("click", savePreset);
+
+    document.querySelector('[data-testid="ode-run"]').addEventListener("click", runODE);
+
+    document.addEventListener("keydown", onKeydown);
+
+    renderPresets();
+
+    lab.reset(42, {});
+    document.querySelector('[data-testid="seed"]').value = 42;
+  }
+
+  window.lab = lab;
+  document.addEventListener("DOMContentLoaded", init);
+})();
+</script>
+</body>
+</html>
+```

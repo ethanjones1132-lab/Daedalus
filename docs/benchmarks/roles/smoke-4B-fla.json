@@ -1,0 +1,32 @@
+{
+ "model": "E:/AI/role-adapters/models/Qwen3.5-4B",
+ "transformers": "5.5.0",
+ "torch": "2.10.0+cu130",
+ "fla": true,
+ "causal_conv1d": false,
+ "load_s": 304.9,
+ "lora_target_modules": [
+  "down_proj",
+  "gate_proj",
+  "in_proj_a",
+  "in_proj_b",
+  "in_proj_qkv",
+  "in_proj_z",
+  "k_proj",
+  "o_proj",
+  "out_proj",
+  "q_proj",
+  "up_proj",
+  "v_proj"
+ ],
+ "step_secs": [
+  93.17,
+  14.41,
+  14.21,
+  14.38
+ ],
+ "tok_s": 286,
+ "peak_vram_gb": 8.42,
+ "seq": 4096,
+ "pass": false
+}

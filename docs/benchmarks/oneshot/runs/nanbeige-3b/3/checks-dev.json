@@ -1,0 +1,443 @@
+{
+ "score": 0.13773809523809524,
+ "areas": {
+  "logic": 0.1,
+  "time": 0.16666666666666666,
+  "canvas": 0,
+  "chart": 0,
+  "data": 0,
+  "algo": 0,
+  "layout": 0.2,
+  "a11y": 0.2857142857142857,
+  "persist": 0,
+  "domain": 0.625
+ },
+ "passed": 10,
+ "total": 70,
+ "console_errors": [
+  "TypeError: Cannot read properties of null (reading 'addEventListener')"
+ ],
+ "blocked_requests": 0,
+ "checks": [
+  {
+   "id": "api-present",
+   "area": "logic",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "reset-counts-0",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "reset-counts-1",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "reset-counts-2",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "params-apply",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "grass-bounds",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "one-per-cell",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "energy-positive",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "ids-initial",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "ui-step",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "play-rate",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "pause-stops",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "step-one",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "speed-change",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "speed-slider-dom",
+   "area": "time",
+   "pass": true,
+   "detail": "[\"range\",\"1\",\"60\",\"10\"]"
+  },
+  {
+   "id": "space-toggles",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "canvas-size",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "pixels-reset",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "pixels-after-step",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "pixels-after-reset-ui",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')"
+  },
+  {
+   "id": "fox-over-rabbit",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "points-equal-history",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "monotone-y",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "monotone-x",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "axes-labelled",
+   "area": "chart",
+   "pass": false,
+   "detail": ""
+  },
+  {
+   "id": "chart-resets",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')"
+  },
+  {
+   "id": "csv-exact",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "csv-download",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "scenario-roundtrip",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "scenario-defaults",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "scenario-bad-json",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "scenario-bad-version",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "scenario-ui-load",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')"
+  },
+  {
+   "id": "state-50-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-100-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-500-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "state-50-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-100-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-500-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "state-50-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-100-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "counts-500-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "breed-ids",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "extinction-foxes",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "extinction-all",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "side-by-side-1280",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "stacked-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "no-hscroll-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "[600,600,false]"
+  },
+  {
+   "id": "no-hscroll-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "[390,390,false]"
+  },
+  {
+   "id": "canvas-fits-390",
+   "area": "layout",
+   "pass": true,
+   "detail": "{\"x\":32,\"y\":32,\"width\":326,\"height\":245}"
+  },
+  {
+   "id": "tab-reaches-controls",
+   "area": "a11y",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "id": "buttons-keyboard",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "sliders-labelled",
+   "area": "a11y",
+   "pass": false,
+   "detail": "unlabelled: speed,param-rabbits0,param-foxes0,param-rabbitBreed,param-foxBreed,param-foxGain,param-grassMax"
+  },
+  {
+   "id": "announce-on-pause",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "shortcut-s",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "shortcut-r",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading '0')"
+  },
+  {
+   "id": "focus-visible",
+   "area": "a11y",
+   "pass": true,
+   "detail": "[\"play\",\"solid\",\"2px\",\"none\"]"
+  },
+  {
+   "id": "preset-save-reload",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "preset-list",
+   "area": "persist",
+   "pass": false,
+   "detail": "[]"
+  },
+  {
+   "id": "preset-delete",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: locator.click: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "preset-load-applies",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: state.grassTotal is not a function"
+  },
+  {
+   "id": "corrupt-storage",
+   "area": "persist",
+   "pass": false,
+   "detail": "[0,true,[\"TypeError: Cannot read properties of null (reading 'addEventListener')\"]]"
+  },
+  {
+   "id": "ode-values-0",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":0.07484073069377406,\"y\":0.8694301634142199} ref {\"x\":0.07484073069377406,\"y\":0.8694301634142199}"
+  },
+  {
+   "id": "ode-values-1",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":4.940988081110374,\"y\":5.237792727027955} ref {\"x\":4.940988081110374,\"y\":5.237792727027955}"
+  },
+  {
+   "id": "ode-values-2",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":3.2034918618075943,\"y\":2.4101818527587198} ref {\"x\":3.2034918618075943,\"y\":2.4101818527587198}"
+  },
+  {
+   "id": "ode-steps-rounding",
+   "area": "domain",
+   "pass": true,
+   "detail": "app {\"x\":7.179825061745335,\"y\":10.510710244677728} ref {\"x\":7.179825061745335,\"y\":10.510710244677728}"
+  },
+  {
+   "id": "eq-dom",
+   "area": "domain",
+   "pass": false,
+   "detail": "0, 0"
+  },
+  {
+   "id": "drift-small",
+   "area": "domain",
+   "pass": true,
+   "detail": "0"
+  },
+  {
+   "id": "ode-ui-run",
+   "area": "domain",
+   "pass": false,
+   "detail": "0, 0 vs {\"x\":5.12723257163882,\"y\":2.948810421764974}"
+  },
+  {
+   "id": "ode-chart",
+   "area": "domain",
+   "pass": false,
+   "detail": "0, 0 points"
+  }
+ ]
+}

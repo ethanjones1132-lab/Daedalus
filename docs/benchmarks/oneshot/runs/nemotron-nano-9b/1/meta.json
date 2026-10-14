@@ -1,0 +1,22 @@
+{
+ "model": "nemotron-nano-9b",
+ "file": "nvidia_NVIDIA-Nemotron-Nano-9B-v2-Q4_K_M.gguf",
+ "seed": 1,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7095,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 173.1,
+ "finish_reason": "stop",
+ "prompt_n": 3857,
+ "gen_n": 5964,
+ "gen_tps": 35.3,
+ "has_reasoning": true,
+ "ram_avail_gb": 1.58
+}

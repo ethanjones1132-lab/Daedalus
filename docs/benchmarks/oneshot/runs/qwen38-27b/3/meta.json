@@ -1,0 +1,22 @@
+{
+ "model": "qwen38-27b",
+ "file": "Qwen3.8-27B-UD-IQ2_XXS.gguf",
+ "seed": 3,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7772,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 2056.5,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 8858,
+ "gen_tps": 4.7,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.75
+}

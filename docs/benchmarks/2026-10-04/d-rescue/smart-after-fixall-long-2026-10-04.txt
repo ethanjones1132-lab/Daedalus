@@ -1,0 +1,12 @@
+﻿checked 2026-10-04T20:49:15
+     5 Retired Sectors Count               PO--CK   100 100 36  0                                                 
+   187 Reported Un-correctable             -O--CK   1   1   AP  12618                                             
+   197 Pending-Sparing Count               -O--C-   100 99  AP  32                                                
+   198 Offline Uncorrectable Sector Count  ----C-   100 99  AP  32                                                
+   199 Ultra DMA CRC Error                 -OSRCK   200 200 AP  0                                                 
+ 4 Short (offline)        7860       Read Failure (90%)          6293520         4           03/40/87 
+ 5 Short (offline)        7860       Read Failure (90%)          6293520         4           03/40/87 
+NOTE: DST Log entries are printed out in order from newest to oldest based ATA/SCSI/NVMe
+      specifications on where to find the latest entry.
+
+

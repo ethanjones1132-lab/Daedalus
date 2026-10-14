@@ -1,0 +1,22 @@
+{
+ "model": "llama31-8b",
+ "file": "Meta-Llama-3.1-8B-Instruct-Q5_K_S.gguf",
+ "seed": 1,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7741,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 500.8,
+ "finish_reason": "stop",
+ "prompt_n": 3743,
+ "gen_n": 6559,
+ "gen_tps": 13.7,
+ "has_reasoning": false,
+ "ram_avail_gb": 0.77
+}

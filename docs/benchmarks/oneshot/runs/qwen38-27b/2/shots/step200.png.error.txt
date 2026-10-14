@@ -1,0 +1,4 @@
+Error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'step')
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

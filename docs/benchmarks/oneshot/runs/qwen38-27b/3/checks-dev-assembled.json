@@ -1,0 +1,441 @@
+{
+ "score": 0.06345238095238095,
+ "areas": {
+  "logic": 0,
+  "time": 0.16666666666666666,
+  "canvas": 0,
+  "chart": 0,
+  "data": 0,
+  "algo": 0,
+  "layout": 0.2,
+  "a11y": 0.14285714285714285,
+  "persist": 0,
+  "domain": 0.125
+ },
+ "passed": 4,
+ "total": 70,
+ "console_errors": [],
+ "blocked_requests": 0,
+ "checks": [
+  {
+   "id": "api-present",
+   "area": "logic",
+   "pass": false,
+   "detail": "missing reset,step,counts,tick,cell,history,ode,exportCSV,exportScenario,loadScenario"
+  },
+  {
+   "id": "reset-counts-0",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "reset-counts-1",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "reset-counts-2",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "params-apply",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "grass-bounds",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "one-per-cell",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "energy-positive",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "ids-initial",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "ui-step",
+   "area": "logic",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'tick')"
+  },
+  {
+   "id": "play-rate",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "pause-stops",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "step-one",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "speed-change",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "speed-slider-dom",
+   "area": "time",
+   "pass": true,
+   "detail": "[\"range\",\"1\",\"60\",\"10\"]"
+  },
+  {
+   "id": "space-toggles",
+   "area": "time",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "canvas-size",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "pixels-reset",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "pixels-after-step",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "pixels-after-reset-ui",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'step')"
+  },
+  {
+   "id": "fox-over-rabbit",
+   "area": "canvas",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "points-equal-history",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "monotone-y",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "monotone-x",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "axes-labelled",
+   "area": "chart",
+   "pass": false,
+   "detail": ""
+  },
+  {
+   "id": "chart-resets",
+   "area": "chart",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'step')"
+  },
+  {
+   "id": "csv-exact",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "csv-download",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "scenario-roundtrip",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "scenario-defaults",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'loadScenario')"
+  },
+  {
+   "id": "scenario-bad-json",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "scenario-bad-version",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "scenario-ui-load",
+   "area": "data",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'step')"
+  },
+  {
+   "id": "state-50-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-100-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-500-0",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "state-50-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-100-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-500-1",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "state-50-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-100-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "counts-500-2",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "breed-ids",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "extinction-foxes",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "extinction-all",
+   "area": "algo",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "side-by-side-1280",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "stacked-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "error: locator.boundingBox: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "no-hscroll-600",
+   "area": "layout",
+   "pass": false,
+   "detail": "[600,600,false]"
+  },
+  {
+   "id": "no-hscroll-390",
+   "area": "layout",
+   "pass": false,
+   "detail": "[390,390,false]"
+  },
+  {
+   "id": "canvas-fits-390",
+   "area": "layout",
+   "pass": true,
+   "detail": "{\"x\":31,\"y\":132.59375,\"width\":328,\"height\":246.5}"
+  },
+  {
+   "id": "tab-reaches-controls",
+   "area": "a11y",
+   "pass": false,
+   "detail": "not reached: param-rabbits0,param-foxes0,param-rabbitBreed,param-foxBreed,param-foxGain,param-grassMax"
+  },
+  {
+   "id": "buttons-keyboard",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "sliders-labelled",
+   "area": "a11y",
+   "pass": false,
+   "detail": "unlabelled: speed,param-rabbits0,param-foxes0,param-rabbitBreed,param-foxBreed,param-foxGain,param-grassMax"
+  },
+  {
+   "id": "announce-on-pause",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "shortcut-s",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "shortcut-r",
+   "area": "a11y",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'step')"
+  },
+  {
+   "id": "focus-visible",
+   "area": "a11y",
+   "pass": true,
+   "detail": "[\"play\",\"solid\",\"2px\",\"none\"]"
+  },
+  {
+   "id": "preset-save-reload",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "preset-list",
+   "area": "persist",
+   "pass": false,
+   "detail": "[]"
+  },
+  {
+   "id": "preset-delete",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: locator.click: Timeout 4000ms exceeded."
+  },
+  {
+   "id": "preset-load-applies",
+   "area": "persist",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'reset')"
+  },
+  {
+   "id": "corrupt-storage",
+   "area": "persist",
+   "pass": false,
+   "detail": "[0,false,[]]"
+  },
+  {
+   "id": "ode-values-0",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'ode')"
+  },
+  {
+   "id": "ode-values-1",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'ode')"
+  },
+  {
+   "id": "ode-values-2",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'ode')"
+  },
+  {
+   "id": "ode-steps-rounding",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: page.evaluate: TypeError: Cannot read properties of undefined (reading 'ode')"
+  },
+  {
+   "id": "eq-dom",
+   "area": "domain",
+   "pass": false,
+   "detail": "0, 0"
+  },
+  {
+   "id": "drift-small",
+   "area": "domain",
+   "pass": true,
+   "detail": "0"
+  },
+  {
+   "id": "ode-ui-run",
+   "area": "domain",
+   "pass": false,
+   "detail": "0, 0 vs {\"x\":5.12723257163882,\"y\":2.948810421764974}"
+  },
+  {
+   "id": "ode-chart",
+   "area": "domain",
+   "pass": false,
+   "detail": "error: locator.getAttribute: Timeout 4000ms exceeded."
+  }
+ ]
+}

@@ -1,0 +1,1 @@
+{"verify": {"c_u": 2.0, "c_easy": 2.0, "c_hard": 2.0, "t_hi": 0.5, "t_lo": 0.3}, "noverify": {"c_u": 2.0, "c_easy": 2.0, "c_hard": 2.0, "t_hi": 2.0, "t_lo": -1.0}}

@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ecosystem Lab</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{background:#0d1310;color:#e3ece4;font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45}
+  .app{max-width:1180px;margin:0 auto;padding:16px 16px 40px}
+  .topbar h1{margin:0;font-size:20px;letter-spacing:.01em}
+  .topbar .sub{margin:2px 0 14px;color:#8fa697;font-size:13px}
+  .layout{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+  .panel{background:#151d18;border:1px solid #26332b;border-radius:12px;padding:14px;min-width:0}
+  #panel-world{flex:1 1 380px}
+  #panel-side{flex:1 1 380px}
+  h2{font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:#8fa697;margin:0 0 10px}
+  h2:not(:first-child){margin-top:18px}
+  .canvas-wrap{background:#0a0f0c;border:1px solid #26332b;border-radius:8px;padding:6px;overflow:hidden}
+  canvas{display:block;width:100%;height:auto;image-rendering:pixelated;border-radius:4px}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
+  button{font:inherit;background:#1e2a22;color:#dff0e4;border:1px solid #33473a;border-radius:8px;padding:6px 12px;cursor:pointer}
+  button:hover{background:#26362c}
+  button:active{transform:translateY(1px)}
+  input[type=number],input[type=text],textarea{font:inherit;background:#0f1713;color:#e3ece4;border:1px solid #33473a;border-radius:8px;padding:5px 8px;min-width:0}
+  input[type=number]{width:6.5em}
+  textarea{width:100%;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;resize:vertical}
+  input[type=range]{accent-color:#5fd68a;background:transparent;width:100%}
+  label{color:#a8bdaf}
+  button:focus,input:focus,textarea:focus,select:focus{outline:2px solid #5fd68a;outline-offset:2px}
+  .counters{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .counter{background:#0f1713;border:1px solid #26332b;border-radius:8px;padding:6px 10px;min-width:88px}
+  .counter .k{display:block;font-size:11px;color:#8fa697;text-transform:uppercase;letter-spacing:.06em}
+  .counter .v{display:block;font-size:18px;font-variant-numeric:tabular-nums}
+  .params{display:grid;grid-template-columns:1fr;gap:8px;margin-top:14px}
+  .field{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:center}
+  .field input[type=range]{grid-column:1 / -1;margin-top:2px}
+  .field .val{font-variant-numeric:tabular-nums;color:#c9dccf}
+  .chart{display:block;width:100%;height:auto;background:#0a0f0c;border:1px solid #26332b;border-radius:8px}
+  .ode-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .ode-grid label{display:grid;grid-template-columns:auto 1fr;gap:6px;align-items:center;font-size:12px}
+  .ode-grid input{width:100%}
+  .ode-out{display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin-top:10px;font-size:13px;font-variant-numeric:tabular-nums}
+  .ode-out .lab{color:#8fa697}
+  .ode-out span[data-testid]{word-break:break-all}
+  .error{color:#ff8f7a;min-height:1.2em;font-size:13px;margin-top:6px}
+  .preset-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+  .preset-item{display:flex;gap:8px;align-items:center;background:#0f1713;border:1px solid #26332b;border-radius:8px;padding:6px 8px}
+  .preset-item .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .preset-item button{padding:3px 8px;font-size:12px}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+  .hint{color:#7d9387;font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <h1>Ecosystem Lab</h1>
+    <p class="sub">Grass, rabbits and foxes on a grid — with charts, Lotka–Volterra comparison and shareable scenarios.</p>
+  </header>
+
+  <main class="layout">
+    <section class="panel" id="panel-world" data-testid="panel-world">
+      <h2>World</h2>
+      <div class="canvas-wrap"><canvas data-testid="world" width="400" height="300"></canvas></div>
+
+      <div class="row">
+        <button data-testid="play">Play</button>
+        <button data-testid="pause">Pause</button>
+        <button data-testid="step">Step</button>
+        <button data-testid="reset">Reset</button>
+      </div>
+
+      <div class="row">
+        <label for="seed">Seed</label>
+        <input id="seed" data-testid="seed" type="number" step="1" value="42">
+        <label for="speed">Speed</label>
+        <input id="speed" data-testid="speed" type="range" min="1" max="60" value="10">
+        <span class="val" id="speed-val">10</span>
+      </div>
+
+      <div class="counters">
+        <div class="counter"><span class="k">Tick</span><span class="v" data-testid="tick">0</span></div>
+        <div class="counter"><span class="k">Rabbits</span><span class="v" data-testid="count-rabbits">0</span></div>
+        <div class="counter"><span class="k">Foxes</span><span class="v" data-testid="count-foxes">0</span></div>
+        <div class="counter"><span class="k">Grass</span><span class="v" data-testid="count-grass">0</span></div>
+      </div>
+
+      <div class="params">
+        <div class="field">
+          <label for="param-rabbits0">Rabbits at start</label>
+          <span class="val" id="val-rabbits0">100</span>
+          <input id="param-rabbits0" data-testid="param-rabbits0" type="range" min="0" max="300" value="100">
+        </div>
+        <div class="field">
+          <label for="param-foxes0">Foxes at start</label>
+          <span class="val" id="val-foxes0">6</span>
+          <input id="param-foxes0" data-testid="param-foxes0" type="range" min="0" max="60" value="6">
+        </div>
+        <div class="field">
+          <label for="param-rabbitBreed">Rabbit breeding energy</label>
+          <span class="val" id="val-rabbitBreed">12</span>
+          <input id="param-rabbitBreed" data-testid="param-rabbitBreed" type="range" min="2" max="40" value="12">
+        </div>
+        <div class="field">
+          <label for="param-foxBreed">Fox breeding energy</label>
+          <span class="val" id="val-foxBreed">40</span>
+          <input id="param-foxBreed" data-testid="param-foxBreed" type="range" min="2" max="60" value="40">
+        </div>
+        <div class="field">
+          <label for="param-foxGain">Fox gain per rabbit</label>
+          <span class="val" id="val-foxGain">4</span>
+          <input id="param-foxGain" data-testid="param-foxGain" type="range" min="1" max="30" value="4">
+        </div>
+        <div class="field">
+          <label for="param-grassMax">Max grass</label>
+          <span class="val" id="val-grassMax">4</span>
+          <input id="param-grassMax" data-testid="param-grassMax" type="range" min="1" max="10" value="4">
+        </div>
+      </div>
+      <p class="hint">Sliders take effect at the next reset. Shortcuts: Space play/pause, S step, R reset.</p>
+    </section>
+
+    <section class="panel" id="panel-side" data-testid="panel-side">
+      <h2>Populations</h2>
+      <svg data-testid="chart" class="chart" viewBox="0 0 420 170" role="img" aria-label="Population history chart">
+        <rect x="46" y="14" width="366" height="132" fill="#0a0f0c" stroke="#243026"></rect>
+        <polyline data-testid="series-rabbits" fill="none" stroke="#f0f0f0" stroke-width="1.5" points=""></polyline>
+        <polyline data-testid="series-foxes" fill="none" stroke="#dc5014" stroke-width="1.5" points=""></polyline>
+        <text x="6" y="86" fill="#8fa697" font-size="12">count</text>
+        <text x="390" y="164" fill="#8fa697" font-size="12">tick</text>
+      </svg>
+
+      <h2>Lotka–Volterra</h2>
+      <div class="ode-grid">
+        <label>α <input data-testid="ode-alpha" type="number" step="0.01" value="1.1"></label>
+        <label>β <input data-testid="ode-beta" type="number" step="0.01" value="0.4"></label>
+        <label>γ <input data-testid="ode-gamma" type="number" step="0.01" value="0.4"></label>
+        <label>δ <input data-testid="ode-delta" type="number" step="0.01" value="0.1"></label>
+        <label>x₀ <input data-testid="ode-x0" type="number" step="0.1" value="10"></label>
+        <label>y₀ <input data-testid="ode-y0" type="number" step="0.1" value="10"></label>
+        <label>t <input data-testid="ode-t" type="number" step="1" value="50"></label>
+        <label>dt <input data-testid="ode-dt" type="number" step="0.001" value="0.01"></label>
+      </div>
+      <div class="row"><button data-testid="ode-run">Run ODE</button></div>
+      <div class="ode-out">
+        <span class="lab">x(t)</span><span data-testid="ode-x">–</span>
+        <span class="lab">y(t)</span><span data-testid="ode-y">–</span>
+        <span class="lab">γ/δ</span><span data-testid="ode-eq-x">–</span>
+        <span class="lab">α/β</span><span data-testid="ode-eq-y">–</span>
+        <span class="lab">drift</span><span data-testid="ode-drift">–</span>
+      </div>
+      <svg data-testid="ode-chart" class="chart" viewBox="0 0 420 200" role="img" aria-label="Lotka-Volterra trajectory">
+        <rect x="46" y="14" width="366" height="146" fill="#0a0f0c" stroke="#243026"></rect>
+        <polyline data-testid="ode-series-x" fill="none" stroke="#6ec8ff" stroke-width="1.5" points=""></polyline>
+        <polyline data-testid="ode-series-y" fill="none" stroke="#dc5014" stroke-width="1.5" points=""></polyline>
+        <text x="6" y="90" fill="#8fa697" font-size="12">N</text>
+        <text x="394" y="176" fill="#8fa697" font-size="12">t</text>
+      </svg>
+
+      <h2>Scenario</h2>
+      <textarea data-testid="scenario-json" rows="3" spellcheck="false" aria-label="Scenario JSON"></textarea>
+      <div class="row">
+        <button data-testid="scenario-export">Export scenario</button>
+        <button data-testid="scenario-load">Load scenario</button>
+        <button data-testid="csv-export">Download CSV</button>
+      </div>
+      <div class="error" data-testid="scenario-error" role="status"></div>
+
+      <h2>Presets</h2>
+      <div class="row">
+        <input data-testid="preset-name" type="text" placeholder="Preset name" aria-label="Preset name">
+        <button data-testid="preset-save">Save preset</button>
+      </div>
+      <div class="preset-list" data-testid="preset-list"></div>
+    </section>
+  </main>
+
+  <div id="announcer" data-testid="announcer" class="sr-only" aria-live="polite"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ------------------------------------------------------------------ */
+  /* Randomness                                                          */
+  /* ------------------------------------------------------------------ */
+  function mulberry32(seed) {
+    let a = seed | 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  const DEFAULTS = {
+    width: 40, height: 30, grassMax: 4,
+    rabbits0: 100, foxes0: 6,
+    rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+    foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+  };
+  const ODE_DEFAULTS = { alpha: 1.1, beta: 0.4, gamma: 0.4, delta: 0.1, x0: 10, y0: 10 };
+
+  /* ------------------------------------------------------------------ */
+  /* State                                                               */
+  /* ------------------------------------------------------------------ */
+  let P = Object.assign({}, DEFAULTS);
+  let W = P.width, H = P.height;
+  let rand = mulberry32(42);
+  let tickNum = 0;
+  let nextId = 1;
+  let currentSeed = 42;
+  let grass = new Int32Array(0);
+  let rabbitGrid = [];
+  let foxGrid = [];
+  let rabbits = [];
+  let foxes = [];
+  let history = [];
+
+  /* ------------------------------------------------------------------ */
+  /* Helpers                                                             */
+  /* ------------------------------------------------------------------ */
+  function pick(list) {
+    if (!list || list.length === 0) return null;
+    return list[Math.floor(rand() * list.length)];
+  }
+
+  function grassSum() {
+    let s = 0;
+    for (let i = 0; i < grass.length; i++) s += grass[i];
+    return s;
+  }
+
+  function neighbourIndices(x, y) {
+    const out = [];
+    if (y > 0) out.push((y - 1) * W + x);        // up
+    if (x + 1 < W) out.push(y * W + (x + 1));    // right
+    if (y + 1 < H) out.push((y + 1) * W + x);    // down
+    if (x > 0) out.push(y * W + (x - 1));        // left
+    return out;
+  }
+
+  function normalizeParams(obj) {
+    const out = {};
+    for (const k in DEFAULTS) {
+      let v = (obj && Object.prototype.hasOwnProperty.call(obj, k)) ? Number(obj[k]) : DEFAULTS[k];
+      if (!Number.isFinite(v)) v = DEFAULTS[k];
+      out[k] = v;
+    }
+    out.width = Math.max(1, Math.floor(out.width));
+    out.height = Math.max(1, Math.floor(out.height));
+    out.grassMax = Math.max(0, Math.floor(out.grassMax));
+    out.rabbits0 = Math.max(0, Math.floor(out.rabbits0));
+    out.foxes0 = Math.max(0, Math.floor(out.foxes0));
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Simulation                                                          */
+  /* ------------------------------------------------------------------ */
+  function record() {
+    history.push({
+      tick: tickNum,
+      rabbits: rabbits.length,
+      foxes: foxes.length,
+      grass: grassSum()
+    });
+  }
+
+  function doReset(seed, params) {
+    P = normalizeParams(params || {});
+    W = P.width;
+    H = P.height;
+    let s = Math.trunc(Number(seed));
+    if (!Number.isFinite(s)) s = 0;
+    currentSeed = s;
+    rand = mulberry32(currentSeed);
+    tickNum = 0;
+    nextId = 1;
+
+    const N = W * H;
+    grass = new Int32Array(N);
+    rabbitGrid = new Array(N).fill(null);
+    foxGrid = new Array(N).fill(null);
+    rabbits = [];
+    foxes = [];
+    history = [];
+
+    for (let i = 0; i < N; i++) grass[i] = Math.floor(rand() * (P.grassMax + 1));
+
+    const cells = [];
+    for (let i = 0; i < N; i++) cells.push(i);
+
+    for (let k = 0; k < P.rabbits0; k++) {
+      const free = cells.filter(function (i) { return rabbitGrid[i] === null; });
+      const c = pick(free);
+      if (c === null) break;
+      const x = c % W, y = (c - x) / W;
+      const a = { id: nextId++, x: x, y: y, energy: P.rabbitStart };
+      rabbits.push(a);
+      rabbitGrid[c] = a;
+    }
+    for (let k = 0; k < P.foxes0; k++) {
+      const free = cells.filter(function (i) { return foxGrid[i] === null; });
+      const c = pick(free);
+      if (c === null) break;
+      const x = c % W, y = (c - x) / W;
+      const a = { id: nextId++, x: x, y: y, energy: P.foxStart };
+      foxes.push(a);
+      foxGrid[c] = a;
+    }
+
+    record();
+    syncControls();
+    refresh();
+    return counts();
+  }
+
+  function oneTick() {
+    const N = W * H;
+
+    /* 1. grass grows */
+    for (let i = 0; i < N; i++) if (grass[i] < P.grassMax) grass[i]++;
+
+    /* 2. rabbits */
+    const rlist = rabbits.slice().sort(function (a, b) { return a.id - b.id; });
+    for (let q = 0; q < rlist.length; q++) {
+      const r = rlist[q];
+      let i = r.y * W + r.x;
+      if (rabbitGrid[i] !== r) continue;
+
+      /* move */
+      const nbs = neighbourIndices(r.x, r.y);
+      const free = [];
+      for (let k = 0; k < nbs.length; k++) if (rabbitGrid[nbs[k]] === null) free.push(nbs[k]);
+      if (free.length > 0) {
+        const t = pick(free);
+        rabbitGrid[i] = null;
+        const nx = t % W, ny = (t - nx) / W;
+        r.x = nx; r.y = ny;
+        rabbitGrid[t] = r;
+      }
+      i = r.y * W + r.x;
+
+      /* eat */
+      r.energy += P.rabbitGain * grass[i];
+      grass[i] = 0;
+
+      /* cost */
+      r.energy -= P.rabbitCost;
+
+      /* breed */
+      if (r.energy >= P.rabbitBreed) {
+        const nbs2 = neighbourIndices(r.x, r.y);
+        const free2 = [];
+        for (let k = 0; k < nbs2.length; k++) if (rabbitGrid[nbs2[k]] === null) free2.push(nbs2[k]);
+        if (free2.length > 0) {
+          const spot = pick(free2);
+          const child = Math.floor(r.energy / 2);
+          r.energy -= child;
+          const sx = spot % W, sy = (spot - sx) / W;
+          const baby = { id: nextId++, x: sx, y: sy, energy: child };
+          rabbits.push(baby);
+          rabbitGrid[spot] = baby;
+        }
+      }
+
+      /* die */
+      if (r.energy <= 0) {
+        const di = r.y * W + r.x;
+        if (rabbitGrid[di] === r) rabbitGrid[di] = null;
+        const k2 = rabbits.indexOf(r);
+        if (k2 >= 0) rabbits.splice(k2, 1);
+      }
+    }
+
+    /* 3. foxes */
+    const flist = foxes.slice().sort(function (a, b) { return a.id - b.id; });
+    for (let q = 0; q < flist.length; q++) {
+      const f = flist[q];
+      let i = f.y * W + f.x;
+      if (foxGrid[i] !== f) continue;
+
+      /* move */
+      const nbs = neighbourIndices(f.x, f.y);
+      let dest = null;
+      const hunt = [];
+      for (let k = 0; k < nbs.length; k++) {
+        if (rabbitGrid[nbs[k]] !== null && foxGrid[nbs[k]] === null) hunt.push(nbs[k]);
+      }
+      if (hunt.length > 0) {
+        dest = pick(hunt);
+      } else {
+        const free = [];
+        for (let k = 0; k < nbs.length; k++) if (foxGrid[nbs[k]] === null) free.push(nbs[k]);
+        if (free.length > 0) dest = pick(free);
+      }
+      if (dest !== null) {
+        foxGrid[i] = null;
+        const nx = dest % W, ny = (dest - nx) / W;
+        f.x = nx; f.y = ny;
+        foxGrid[dest] = f;
+      }
+      i = f.y * W + f.x;
+
+      /* eat */
+      const prey = rabbitGrid[i];
+      if (prey !== null) {
+        rabbitGrid[i] = null;
+        const kk = rabbits.indexOf(prey);
+        if (kk >= 0) rabbits.splice(kk, 1);
+        f.energy += P.foxGain;
+      }
+
+      /* cost */
+      f.energy -= P.foxCost;
+
+      /* breed */
+      if (f.energy >= P.foxBreed) {
+        const nbs2 = neighbourIndices(f.x, f.y);
+        const free2 = [];
+        for (let k = 0; k < nbs2.length; k++) if (foxGrid[nbs2[k]] === null) free2.push(nbs2[k]);
+        if (free2.length > 0) {
+          const spot = pick(free2);
+          const child = Math.floor(f.energy / 2);
+          f.energy -= child;
+          const sx = spot % W, sy = (spot - sx) / W;
+          const baby = { id: nextId++, x: sx, y: sy, energy: child };
+          foxes.push(baby);
+          foxGrid[spot] = baby;
+        }
+      }
+
+      /* die */
+      if (f.energy <= 0) {
+        const di = f.y * W + f.x;
+        if (foxGrid[di] === f) foxGrid[di] = null;
+        const k2 = foxes.indexOf(f);
+        if (k2 >= 0) foxes.splice(k2, 1);
+      }
+    }
+
+    /* 4. advance */
+    tickNum++;
+    record();
+  }
+
+  function counts() {
+    return { rabbits: rabbits.length, foxes: foxes.length, grass: grassSum() };
+  }
+
+  function cellAt(x, y) {
+    if (!(x >= 0 && x < W && y >= 0 && y < H)) return { grass: 0, rabbit: null, fox: null };
+    const i = y * W + x;
+    const r = rabbitGrid[i], f = foxGrid[i];
+    return {
+      grass: grass[i],
+      rabbit: r ? { id: r.id, energy: r.energy } : null,
+      fox: f ? { id: f.id, energy: f.energy } : null
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Lotka–Volterra                                                      */
+  /* ------------------------------------------------------------------ */
+  function lvDeriv(p, x, y) {
+    return [p.alpha * x - p.beta * x * y, p.delta * x * y - p.gamma * y];
+  }
+
+  function integrate(p, t, dt) {
+    const q = Object.assign({}, ODE_DEFAULTS, p || {});
+    let n = Math.round(t / dt);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    if (n > 200000) n = 200000;
+    let x = q.x0, y = q.y0;
+    const xs = [x], ys = [y];
+    for (let i = 0; i < n; i++) {
+      const k1 = lvDeriv(q, x, y);
+      const k2 = lvDeriv(q, x + dt / 2 * k1[0], y + dt / 2 * k1[1]);
+      const k3 = lvDeriv(q, x + dt / 2 * k2[0], y + dt / 2 * k2[1]);
+      const k4 = lvDeriv(q, x + dt * k3[0], y + dt * k3[1]);
+      x += dt / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]);
+      y += dt / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]);
+      xs.push(x); ys.push(y);
+    }
+    return { xs: xs, ys: ys, x: x, y: y, n: n };
+  }
+
+  function ode(p, t, dt) {
+    const q = Object.assign({}, ODE_DEFAULTS, p || {});
+    const r = integrate(q, t, dt);
+    return { x: r.x, y: r.y };
+  }
+
+  function potential(p, x, y) {
+    const lx = x > 0 ? Math.log(x) : NaN;
+    const ly = y > 0 ? Math.log(y) : NaN;
+    return p.delta * x - p.gamma * lx + p.beta * y - p.alpha * ly;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* DOM                                                                 */
+  /* ------------------------------------------------------------------ */
+  const canvas = document.querySelector('[data-testid="world"]');
+  const ctx = canvas.getContext('2d');
+  const seriesR = document.querySelector('[data-testid="series-rabbits"]');
+  const seriesF = document.querySelector('[data-testid="series-foxes"]');
+  const odeSeriesX = document.querySelector('[data-testid="ode-series-x"]');
+  const odeSeriesY = document.querySelector('[data-testid="ode-series-y"]');
+  const seedInput = document.querySelector('[data-testid="seed"]');
+  const speedInput = document.querySelector('[data-testid="speed"]');
+  const speedVal = document.getElementById('speed-val');
+  const announcer = document.getElementById('announcer');
+  const errorEl = document.querySelector('[data-testid="scenario-error"]');
+  const scenarioArea = document.querySelector('[data-testid="scenario-json"]');
+  const presetList = document.querySelector('[data-testid="preset-list"]');
+  const presetName = document.querySelector('[data-testid="preset-name"]');
+
+  const SLIDERS = [
+    ['param-rabbits0', 'rabbits0'],
+    ['param-foxes0', 'foxes0'],
+    ['param-rabbitBreed', 'rabbitBreed'],
+    ['param-foxBreed', 'foxBreed'],
+    ['param-foxGain', 'foxGain'],
+    ['param-grassMax', 'grassMax']
+  ];
+  const sliderEls = {};
+
+  SLIDERS.forEach(function (pair) {
+    const el = document.querySelector('[data-testid="' + pair[0] + '"]');
+    const out = document.getElementById('val-' + pair[1]);
+    sliderEls[pair[1]] = { el: el, out: out };
+    el.addEventListener('input', function () { out.textContent = el.value; });
+  });
+
+  function setSlider(key, v) {
+    const s = sliderEls[key];
+    if (!s) return;
+    let val = Number(v);
+    if (!Number.isFinite(val)) return;
+    const min = Number(s.el.min), max = Number(s.el.max);
+    if (Number.isFinite(min)) val = Math.max(min, val);
+    if (Number.isFinite(max)) val = Math.min(max, val);
+    s.el.value = String(val);
+    s.out.textContent = s.el.value;
+  }
+
+  function syncControls() {
+    seedInput.value = String(currentSeed);
+    for (const key in sliderEls) if (Object.prototype.hasOwnProperty.call(sliderEls, key)) setSlider(key, P[key]);
+  }
+
+  function sliderParams() {
+    const out = {};
+    for (const key in sliderEls) {
+      if (Object.prototype.hasOwnProperty.call(sliderEls, key)) {
+        const v = Number(sliderEls[key].el.value);
+        if (Number.isFinite(v)) out[key] = v;
+      }
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Rendering                                                           */
+  /* ------------------------------------------------------------------ */
+  function draw() {
+    if (canvas.width !== W * 10) canvas.width = W * 10;
+    if (canvas.height !== H * 10) canvas.height = H * 10;
+    const gm = P.grassMax > 0 ? P.grassMax : 1;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const g = grass[y * W + x];
+        const G = 60 + Math.round(160 * g / gm);
+        ctx.fillStyle = 'rgb(30, ' + G + ', 30)';
+        ctx.fillRect(x * 10, y * 10, 10, 10);
+      }
+    }
+    ctx.fillStyle = 'rgb(240, 240, 240)';
+    for (let i = 0; i < rabbits.length; i++) {
+      ctx.fillRect(rabbits[i].x * 10 + 2, rabbits[i].y * 10 + 2, 6, 6);
+    }
+    ctx.fillStyle = 'rgb(220, 80, 20)';
+    for (let i = 0; i < foxes.length; i++) {
+      ctx.fillRect(foxes[i].x * 10 + 1, foxes[i].y * 10 + 1, 8, 8);
+    }
+  }
+
+  function drawChart() {
+    const L = 46, R = 412, T = 14, B = 146;
+    let xmax = 1, ymax = 1;
+    for (let i = 0; i < history.length; i++) {
+      const p = history[i];
+      if (p.tick > xmax) xmax = p.tick;
+      if (p.rabbits > ymax) ymax = p.rabbits;
+      if (p.foxes > ymax) ymax = p.foxes;
+    }
+    const px = function (t) { return L + (t / xmax) * (R - L); };
+    const py = function (v) { return B - (v / ymax) * (B - T); };
+    const pr = [], pf = [];
+    for (let i = 0; i < history.length; i++) {
+      const p = history[i];
+      pr.push(px(p.tick).toFixed(2) + ',' + py(p.rabbits).toFixed(2));
+      pf.push(px(p.tick).toFixed(2) + ',' + py(p.foxes).toFixed(2));
+    }
+    seriesR.setAttribute('points', pr.join(' '));
+    seriesF.setAttribute('points', pf.join(' '));
+  }
+
+  function updateCounters() {
+    document.querySelector('[data-testid="tick"]').textContent = String(tickNum);
+    document.querySelector('[data-testid="count-rabbits"]').textContent = String(rabbits.length);
+    document.querySelector('[data-testid="count-foxes"]').textContent = String(foxes.length);
+    document.querySelector('[data-testid="count-grass"]').textContent = String(grassSum());
+  }
+
+  function updateAnnouncer() {
+    if (playing) {
+      announcer.textContent = '';
+    } else {
+      announcer.textContent = 'Tick ' + tickNum + ': ' + rabbits.length + ' rabbits, ' + foxes.length + ' foxes';
+    }
+  }
+
+  function refresh() {
+    draw();
+    drawChart();
+    updateCounters();
+    updateAnnouncer();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Clock                                                               */
+  /* ------------------------------------------------------------------ */
+  let playing = false;
+  let rafId = null;
+  let lastTs = 0;
+  let acc = 0;
+
+  function currentSpeed() {
+    const v = Number(speedInput.value);
+    return Number.isFinite(v) && v > 0 ? v : 1;
+  }
+
+  function frame(ts) {
+    if (!playing) return;
+    if (!lastTs) lastTs = ts;
+    const dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    acc += dt * currentSpeed();
+    const n = Math.floor(acc);
+    if (n > 0) { acc -= n; doStep(n); }
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function play() {
+    if (playing) return;
+    playing = true;
+    lastTs = 0;
+    acc = 0;
+    updateAnnouncer();
+    rafId = requestAnimationFrame(frame);
+  }
+
+  function pause() {
+    if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+    playing = false;
+    updateAnnouncer();
+  }
+
+  function doStep(n) {
+    n = Number(n);
+    if (!Number.isFinite(n)) n = 1;
+    n = Math.max(0, Math.floor(n));
+    for (let i = 0; i < n; i++) oneTick();
+    refresh();
+    return counts();
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* CSV / scenarios                                                     */
+  /* ------------------------------------------------------------------ */
+  function exportCSV() {
+    const lines = ['tick,rabbits,foxes,grass'];
+    for (let i = 0; i < history.length; i++) {
+      const p = history[i];
+      lines.push(p.tick + ',' + p.rabbits + ',' + p.foxes + ',' + p.grass);
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  function exportScenario() {
+    const params = {};
+    for (const k in DEFAULTS) params[k] = P[k];
+    return JSON.stringify({ version: 1, seed: currentSeed, params: params });
+  }
+
+  function setError(msg) {
+    errorEl.textContent = msg || '';
+  }
+
+  function loadScenario(text) {
+    let obj = null;
+    try { obj = JSON.parse(text); } catch (e) { obj = null; }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj) ||
+        obj.version !== 1 || !Number.isInteger(obj.seed)) {
+      setError('Invalid scenario: expected {"version":1,"seed":<integer>,...}');
+      return false;
+    }
+    setError('');
+    doReset(obj.seed, obj.params || {});
+    return true;
+  }
+
+  function downloadCSV() {
+    const text = exportCSV();
+    try {
+      const blob = new Blob([text], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'ecolab.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Presets                                                             */
+  /* ------------------------------------------------------------------ */
+  const PRESET_KEY = 'ecolab.presets';
+
+  function readPresets() {
+    try {
+      const raw = localStorage.getItem(PRESET_KEY);
+      if (!raw) return {};
+      const o = JSON.parse(raw);
+      if (o && typeof o === 'object' && !Array.isArray(o)) return o;
+      return {};
+    } catch (e) { return {}; }
+  }
+
+  function writePresets(o) {
+    try { localStorage.setItem(PRESET_KEY, JSON.stringify(o)); } catch (e) { /* ignore */ }
+  }
+
+  function renderPresets() {
+    const presets = readPresets();
+    presetList.innerHTML = '';
+    Object.keys(presets).forEach(function (name) {
+      const item = document.createElement('div');
+      item.className = 'preset-item';
+      item.setAttribute('data-testid', 'preset-item');
+
+      const nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = name;
+      item.appendChild(nm);
+
+      const lb = document.createElement('button');
+      lb.type = 'button';
+      lb.setAttribute('data-testid', 'preset-load');
+      lb.textContent = 'Load';
+      lb.addEventListener('click', function () {
+        const all = readPresets();
+        const sc = all[name];
+        if (!sc) return;
+        scenarioArea.value = JSON.stringify(sc);
+        loadScenario(JSON.stringify(sc));
+      });
+      item.appendChild(lb);
+
+      const db = document.createElement('button');
+      db.type = 'button';
+      db.setAttribute('data-testid', 'preset-delete');
+      db.textContent = 'Delete';
+      db.addEventListener('click', function () {
+        const all = readPresets();
+        delete all[name];
+        writePresets(all);
+        renderPresets();
+      });
+      item.appendChild(db);
+
+      presetList.appendChild(item);
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* ODE panel                                                           */
+  /* ------------------------------------------------------------------ */
+  function numField(testid, fallback) {
+    const el = document.querySelector('[data-testid="' + testid + '"]');
+    const v = Number(el.value);
+    return Number.isFinite(v) ? v : fallback;
+  }
+
+  function fmtNum(v) {
+    if (!Number.isFinite(v)) return String(v);
+    if (v === 0) return '0';
+    return v.toPrecision(12);
+  }
+
+  function runODE() {
+    const p = {
+      alpha: numField('ode-alpha', 1.1),
+      beta: numField('ode-beta', 0.4),
+      gamma: numField('ode-gamma', 0.4),
+      delta: numField('ode-delta', 0.1),
+      x0: numField('ode-x0', 10),
+      y0: numField('ode-y0', 10)
+    };
+    const t = numField('ode-t', 50);
+    const dt = numField('ode-dt', 0.01);
+
+    const res = integrate(p, t, dt);
+
+    document.querySelector('[data-testid="ode-x"]').textContent = fmtNum(res.x);
+    document.querySelector('[data-testid="ode-y"]').textContent = fmtNum(res.y);
+    document.querySelector('[data-testid="ode-eq-x"]').textContent =
+      fmtNum(p.delta !== 0 ? p.gamma / p.delta : NaN);
+    document.querySelector('[data-testid="ode-eq-y"]').textContent =
+      fmtNum(p.beta !== 0 ? p.alpha / p.beta : NaN);
+
+    const drift = Math.abs(potential(p, res.x, res.y) - potential(p, p.x0, p.y0));
+    document.querySelector('[data-testid="ode-drift"]').textContent = String(drift);
+
+    drawODEChart(res);
+  }
+
+  function drawODEChart(res) {
+    const L = 46, R = 412, T = 14, B = 160;
+    const n = res.xs.length;
+    let vmax = 0;
+    for (let i = 0; i < n; i++) {
+      if (Number.isFinite(res.xs[i])) vmax = Math.max(vmax, res.xs[i]);
+      if (Number.isFinite(res.ys[i])) vmax = Math.max(vmax, res.ys[i]);
+    }
+    if (!(vmax > 0)) vmax = 1;
+    const px = function (i) { return n <= 1 ? L : L + (i / (n - 1)) * (R - L); };
+    const py = function (v) {
+      if (!Number.isFinite(v)) return B;
+      return B - (v / vmax) * (B - T);
+    };
+    const ax = [], ay = [];
+    for (let i = 0; i < n; i++) {
+      ax.push(px(i).toFixed(2) + ',' + py(res.xs[i]).toFixed(2));
+      ay.push(px(i).toFixed(2) + ',' + py(res.ys[i]).toFixed(2));
+    }
+    odeSeriesX.setAttribute('points', ax.join(' '));
+    odeSeriesY.setAttribute('points', ay.join(' '));
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Wiring                                                              */
+  /* ------------------------------------------------------------------ */
+  document.querySelector('[data-testid="play"]').addEventListener('click', function () { play(); });
+  document.querySelector('[data-testid="pause"]').addEventListener('click', function () { pause(); });
+  document.querySelector('[data-testid="step"]').addEventListener('click', function () { doStep(1); });
+  document.querySelector('[data-testid="reset"]').addEventListener('click', function () {
+    const s = parseInt(seedInput.value, 10);
+    doReset(Number.isFinite(s) ? s : 0, sliderParams());
+  });
+
+  speedInput.addEventListener('input', function () { speedVal.textContent = speedInput.value; });
+
+  document.querySelector('[data-testid="scenario-export"]').addEventListener('click', function () {
+    scenarioArea.value = exportScenario();
+  });
+  document.querySelector('[data-testid="scenario-load"]').addEventListener('click', function () {
+    loadScenario(scenarioArea.value);
+  });
+  document.querySelector('[data-testid="csv-export"]').addEventListener('click', function () {
+    downloadCSV();
+  });
+
+  document.querySelector('[data-testid="ode-run"]').addEventListener('click', function () { runODE(); });
+
+  document.querySelector('[data-testid="preset-save"]').addEventListener('click', function () {
+    const name = (presetName.value || '').trim();
+    if (!name) return;
+    const all = readPresets();
+    all[name] = JSON.parse(exportScenario());
+    writePresets(all);
+    renderPresets();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    const ae = document.activeElement;
+    if (ae) {
+      const tag = ae.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || ae.isContentEditable) return;
+    }
+    if (e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();
+      if (playing) pause(); else play();
+    } else if (e.key === 's' || e.key === 'S') {
+      e.preventDefault();
+      doStep(1);
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      const s = parseInt(seedInput.value, 10);
+      doReset(Number.isFinite(s) ? s : 0, sliderParams());
+    }
+  });
+
+  /* ------------------------------------------------------------------ */
+  /* Public API                                                          */
+  /* ------------------------------------------------------------------ */
+  window.lab = {
+    reset: function (seed, params) {
+      return doReset(seed, params === undefined ? {} : params);
+    },
+    step: function (n) {
+      return doStep(n === undefined ? 1 : n);
+    },
+    counts: function () { return counts(); },
+    tick: function () { return tickNum; },
+    cell: function (x, y) { return cellAt(x, y); },
+    history: function () {
+      return history.map(function (p) {
+        return { tick: p.tick, rabbits: p.rabbits, foxes: p.foxes, grass: p.grass };
+      });
+    },
+    ode: function (p, t, dt) { return ode(p, t, dt); },
+    exportCSV: function () { return exportCSV(); },
+    exportScenario: function () { return exportScenario(); },
+    loadScenario: function (text) { return loadScenario(text); }
+  };
+
+  /* ------------------------------------------------------------------ */
+  /* Boot                                                                */
+  /* ------------------------------------------------------------------ */
+  seedInput.value = '42';
+  renderPresets();
+  doReset(42, {});
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,315 @@
+﻿
+==================== scan (12:13:04)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121304	User: admin
+==========================================================================================
+Vendor   Handle       Model Number            Serial Number          FwRev     
+NVMe     PD0          KINGSTON SNV2S1000G     50026B7686EF3C6F       CBG04418  
+Seagate  PD1          Game Drive Xbox         NZ13YSJF               0003      
+
+
+==================== device info (12:13:04)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121304	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+	Vendor ID: Seagate 
+	Model Number: Game Drive Xbox 
+	Serial Number: NZ13YSJF
+	Firmware Revision: 0003
+	World Wide Name: 5000C500E9996F6C
+	Drive Capacity (TB/TiB): 2.00/1.82
+	Temperature Data:
+		Current Temperature (C): 39
+		Highest Temperature (C): 53
+		Lowest Temperature (C): 9
+	Power On Time:  327 days 12 hours 25 minutes 
+	Power On Hours: 7860.42
+	MaxLBA: 3907029166
+	Native MaxLBA: Not Reported
+	Logical Sector Size (B): 512
+	Physical Sector Size (B): 4096
+	Sector Alignment: 0
+	Rotation Rate (RPM): 5400
+	Form Factor: 2.5"
+	Last DST information:
+		DST has never been run
+	Long Drive Self Test Time:  5 hours 30 minutes 
+	Interface speed:
+		Max Speed (Gb/s): 6.0
+		Negotiated Speed (Gb/s): 6.0
+	Annualized Workload Rate (TB/yr): 17.12
+	Total Bytes Read (TB): 8.39
+	Total Bytes Written (TB): 6.97
+	Encryption Support: Not Supported
+	Cache Size (MiB): 128.00
+	Read Look-Ahead: Enabled
+	Write Cache: Enabled
+	Low Current Spinup: Enabled
+	SMART Status: Good
+	ATA Security Information: Supported
+	Firmware Download Support: Full, Segmented, Deferred, DMA
+	Specifications Supported:
+		ACS-3
+		ACS-2
+		ATA8-ACS
+		ATA/ATAPI-7
+		ATA/ATAPI-6
+		ATA/ATAPI-5
+		ACS-3 (Revision 3B)
+		SATA 3.1
+		SATA 3.0
+		SATA 2.6
+		SATA 2.5
+		SATA II: Extensions
+		SATA 1.0a
+		ATA8-AST
+		SPC-4
+		SBC-3 (no version claimed)
+		UAS T10/2095-D revision 04
+		SPC-4 (no version claimed)
+		IEEE 1667-2009
+	Features Supported:
+		Read/Write Multiple
+		SATA NCQ [QD=32]
+		SATA Software Settings Preservation [Enabled]
+		SATA Hardware Feature Control
+		SATA Device Initiated Power Management
+		HPA
+		Power Management
+		Security
+		SMART [Enabled]
+		DCO
+		48bit Address
+		Set Max Security Extension
+		PUIS
+		APM [Enabled]
+		GPL
+		SMART Self-Test
+		SMART Error Logging
+		Write-Read-Verify
+		SCT Write Same
+		SCT Feature Control
+		SCT Data Tables
+		Host Logging
+	Adapter Information:
+		Adapter Type: USB
+		Vendor ID: 0BC2h
+		Product ID: 200Dh
+		Revision: 0100h
+
+
+==================== SMART check (12:13:06)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121306	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+SMART Check
+SMART Check Passed!
+
+
+==================== SMART attributes (12:13:07)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121307	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+=======Key======
+	Flags:
+	  P - pre-fail/warranty indicator
+	  O - online collection of data while device is running
+	  S - Performance degrades as current value decreases
+	  R - Error Rate - indicates tracking of an error rate
+	  C - Event Count - attribute represents a counter of events
+	  K - Self Preservation (saved across power-cycles)
+	Thresholds/Current/Worst:
+	  N/A - thresholds not available for this attribute/device
+	  AP  - threshold is always passing (value of zero)
+	  AF  - threshold is always failing (value of 255)
+	  INV - threshold is set to an invalid value (value of 254)
+	Other indicators:
+	  ? - See analyzed output for more information on raw data
+	  ! - attribute is currently failing
+	  ^ - attribute has previously failed
+	  % - attribute is currently issuing a warning
+	  ~ - attribute has previously warned about its condition
+	Temperature: (Celsius unless specified)
+	  m = minimum
+	  M = maximum
+	Columns:
+	  CV - current value (Also called nominal value in specifications)
+	  WV - worst ever value
+	  TV - threshold value (requires support of thresholds data)
+	  Raw - raw data associated with attribute. Vendor specific definition.
+-------------------------------------------------------------------------------------------
+SMART Version: 0x02A
+     # Attribute Name:                     Flags:   CV: WV: TV: Raw:
+-------------------------------------------------------------------------------------------
+?    1 Read Error Rate                     POSR--   51  51  6   0                                                 
+     3 Spin Up Time                        PO----   100 100 AP  00000000000000h                                   
+     4 Start/Stop Count                    -O--CK   37  37  20  65535                                             
+     5 Retired Sectors Count               PO--CK   100 100 36  0                                                 
+?    7 Seek Error Rate                     POSR--   77  60  45  0                                                 
+     9 Power On Hours                      -O--CK   92  92  AP  7860                                              
+    10 Spin Retry Count                    PO--C-   100 100 97  00000000000000h                                   
+    12 Drive Power Cycle Count             -O--CK   38  37  20  63778                                             
+   184 IOEDC Count                         -O--CK   100 100 99  0                                                 
+   187 Reported Un-correctable             -O--CK   1   1   AP  11439                                             
+   188 Command Timeout                     -O--CK   100 100 AP  0                                                 
+   189 High Fly Writes                     -O-RCK   100 100 AP  0                                                 
+?  190 Airflow Temperature                 -O---K   61  47  40  39 (m/M 31/40)                                    
+   191 Shock Sensor Counter                -O--CK   100 100 AP  4                                                 
+   192 Emergency Retract Count             -O--CK   100 100 AP  27                                                
+   193 Load-Unload Count                   -O--CK   20  20  AP  161888                                            
+?  194 Temperature                         -O---K   39  53  AP  39 (m/M 9/53)                                     
+   197 Pending-Sparing Count               -O--C-   99  99  AP  96                                                
+   198 Offline Uncorrectable Sector Count  ----C-   99  99  AP  96                                                
+   199 Ultra DMA CRC Error                 -OSRCK   200 200 AP  0                                                 
+   240 Head Flight Hours                   ------   100 253 AP  684                                               
+   241 Lifetime Writes From Host           ------   100 253 AP  13589861822                                       
+   242 Lifetime Reads From Host            ------   100 253 AP  16379649167                                       
+   254 Free Fall Event                     -O--CK   100 100 AP  0                                                 
+
+
+==================== SMART error log (12:13:07)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121307	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+SMART Summary Error Log- Version 1:
+	Found 5 errors! Total Error Count: 11443
+
+===============================================
+Error 1 - Drive State: Active/Idle Life Timestamp:  327 days 12 hours 
+1 - 0D:0H:34M:35S:979MS - Set Features - Set Transfer Mode: Unknown 0Ch
+2 - 0D:0H:34M:35S:990MS - Set Features - Set Transfer Mode: PIO Flow Control Mode 6
+3 - 0D:0H:34M:36S:3MS - Trusted Receive - Protocol: TCG 1 Protocol Specific: 0 Transfer Length: 1
+4 - 0D:0H:34M:36S:3MS - Read DMA Ext - LBA: 6293520 Count: 8
+5 - 0D:0H:34M:37S:655MS - Read FPDMA Queued - LBA: 6293520 Count: 65536 NCQ Tag: 1 FUA: 0 PRIO: 0 RARC: 0
+Error: Status: Error Reg Valid	Error: Uncorrectable Data	LBA: 6293520	Device: 00
+
+===============================================
+Error 2 - Drive State: Active/Idle Life Timestamp:  327 days 12 hours 
+1 - 0D:0H:34M:35S:978MS - Identify
+2 - 0D:0H:34M:35S:979MS - Set Features - Set Transfer Mode: Unknown 0Ch
+3 - 0D:0H:34M:35S:990MS - Set Features - Set Transfer Mode: PIO Flow Control Mode 6
+4 - 0D:0H:34M:36S:3MS - Trusted Receive - Protocol: TCG 1 Protocol Specific: 0 Transfer Length: 1
+5 - 0D:0H:34M:36S:3MS - Read DMA Ext - LBA: 6293520 Count: 8
+Error: Status: Error Reg Valid	Error: Uncorrectable Data	LBA: 6293520	Device: 00
+
+===============================================
+Error 3 - Drive State: Active/Idle Life Timestamp:  327 days 12 hours 
+1 - 0D:0H:34M:34S:81MS - Write FPDMA Queued - LBA: 6043184 Count: 65536 NCQ Tag: 1 FUA: 0 PRIO: 0 RARC: 0
+2 - 0D:0H:34M:34S:83MS - Write FPDMA Queued - LBA: 6043200 Count: 65536 NCQ Tag: 1 FUA: 0 PRIO: 0 RARC: 0
+3 - 0D:0H:34M:34S:84MS - Flush Cache
+4 - 0D:0H:34M:34S:136MS - Write FPDMA Queued - LBA: 6043192 Count: 65536 NCQ Tag: 1 FUA: 0 PRIO: 0 RARC: 0
+5 - 0D:0H:34M:34S:137MS - Read FPDMA Queued - LBA: 6293504 Count: 65536 NCQ Tag: 8 FUA: 0 PRIO: 0 RARC: 0
+Error: Status: Error Reg Valid	Error: Uncorrectable Data	LBA: 6293520	Device: 00
+
+===============================================
+Error 4 - Drive State: Active/Idle Life Timestamp:  327 days 12 hours 
+1 - 0D:0H:34M:30S:227MS - Set Features - Set Transfer Mode: Unknown 0Ch
+2 - 0D:0H:34M:30S:238MS - Set Features - Set Transfer Mode: PIO Flow Control Mode 6
+3 - 0D:0H:34M:30S:251MS - Trusted Receive - Protocol: TCG 1 Protocol Specific: 0 Transfer Length: 1
+4 - 0D:0H:34M:30S:252MS - Read DMA Ext - LBA: 6293520 Count: 8
+5 - 0D:0H:34M:31S:914MS - Read FPDMA Queued - LBA: 6293520 Count: 65536 NCQ Tag: 1 FUA: 0 PRIO: 0 RARC: 0
+Error: Status: Error Reg Valid	Error: Uncorrectable Data	LBA: 6293520	Device: 00
+
+===============================================
+Error 5 - Drive State: Active/Idle Life Timestamp:  327 days 12 hours 
+1 - 0D:0H:34M:30S:226MS - Identify
+2 - 0D:0H:34M:30S:227MS - Set Features - Set Transfer Mode: Unknown 0Ch
+3 - 0D:0H:34M:30S:238MS - Set Features - Set Transfer Mode: PIO Flow Control Mode 6
+4 - 0D:0H:34M:30S:251MS - Trusted Receive - Protocol: TCG 1 Protocol Specific: 0 Transfer Length: 1
+5 - 0D:0H:34M:30S:252MS - Read DMA Ext - LBA: 6293520 Count: 8
+Error: Status: Error Reg Valid	Error: Uncorrectable Data	LBA: 6293520	Device: 00
+
+
+==================== DST log (before) (12:13:08)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121308	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+
+===DST Log===
+DST Has never been run/no DST entries found.
+
+
+==================== short DST (12:13:08)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121308	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+Short DST
+
+    Test progress: 10% complete.  
+The self-test completed having the read element of the test failed.
+Short DST Failed!
+
+
+==================== DST log (after) (12:13:11)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121311	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+
+===DST Log===
+ # Test                   Timestamp  Execution Status            Error LBA       Checkpoint  Sense Info
+ 1 Short (offline)        7860       Read Failure (90%)          6293520         4           03/40/87 
+NOTE: DST Log entries are printed out in order from newest to oldest based ATA/SCSI/NVMe
+      specifications on where to find the latest entry.
+
+
+
+==================== FARM reliability log (12:13:12)
+==========================================================================================
+ openSeaChest_SMART - openSeaChest drive utilities - NVMe Enabled
+ Copyright (c) 2014-2026 Seagate Technology LLC and/or its Affiliates, All Rights Reserved
+ openSeaChest_SMART Version: 26.03.2 X86_64
+ Build Date: Jun  5 2026
+ Today: 20261004T121312	User: admin
+==========================================================================================
+
+\\.\PhysicalDrive1 - Game Drive Xbox - NZ13YSJF - 0003 - ATA
+Unable to read FARM data
+
+
+==================== done 2026-10-04T12:13:12

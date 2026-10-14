@@ -1,0 +1,189 @@
+qwen38-9b/1: score 0.100 (6/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.43, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-9b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-9b/3: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-9b/1: score 0.100 (6/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.43, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-9b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-9b/3: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/1: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/1: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b: no builds
+qwen35-9b-coder: no builds
+qwythos-9b: no builds
+ornith-9b: no builds
+nemotron-nano-9b: no builds
+gemma4-12b-coding: no builds
+llama31-8b: no builds
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+dsv4pro-qwen35-9b/1: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/3: score 0.040 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.00, persist 0.00, domain 0.00; console errors 3; blocked 0
+dsv4pro-qwen35-9b/1: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 1; blocked 0
+dsv4pro-qwen35-9b/3: score 0.040 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.00, persist 0.00, domain 0.00; console errors 3; blocked 0
+qwen35-9b/1: score 0.237 (17/70); logic 0.50, time 0.00, canvas 0.00, chart 0.60, data 0.43, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.50; console errors 0; blocked 0
+qwen35-9b/1: score 0.237 (17/70); logic 0.50, time 0.00, canvas 0.00, chart 0.60, data 0.43, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.50; console errors 0; blocked 0
+qwen35-9b-coder: no builds
+qwythos-9b: no builds
+ornith-9b: no builds
+nemotron-nano-9b: no builds
+gemma4-12b-coding: no builds
+llama31-8b: no builds
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen35-9b/1: score 0.237 (17/70); logic 0.50, time 0.00, canvas 0.00, chart 0.60, data 0.43, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.50; console errors 0; blocked 0
+qwen35-9b/2: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b/1: score 0.237 (17/70); logic 0.50, time 0.00, canvas 0.00, chart 0.60, data 0.43, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.50; console errors 0; blocked 0
+qwen35-9b/2: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b/3: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b-coder/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwythos-9b: no builds
+ornith-9b: no builds
+nemotron-nano-9b: no builds
+gemma4-12b-coding: no builds
+llama31-8b: no builds
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen35-9b/1: score 0.237 (17/70); logic 0.50, time 0.00, canvas 0.00, chart 0.60, data 0.43, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.50; console errors 0; blocked 0
+qwen35-9b/2: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b/3: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen35-9b-coder/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/3: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen35-9b-coder/3: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwythos-9b/1: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwythos-9b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwythos-9b/3: score 0.047 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.13; console errors 1; blocked 0
+qwythos-9b/1: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwythos-9b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwythos-9b/3: score 0.047 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.13; console errors 1; blocked 0
+ornith-9b/1: score 0.071 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/1: score 0.071 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/2: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+nemotron-nano-9b: no builds
+gemma4-12b-coding: no builds
+llama31-8b: no builds
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+ornith-9b/1: score 0.071 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/2: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/3: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/1: score 0.071 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/2: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+ornith-9b/3: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.20, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nemotron-nano-9b/1: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.20, domain 0.00; console errors 0; blocked 0
+nemotron-nano-9b/2: score 0.055 (4/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nemotron-nano-9b/1: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.20, domain 0.00; console errors 0; blocked 0
+nemotron-nano-9b/2: score 0.055 (4/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nemotron-nano-9b/3: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/1: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/2: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/3: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/1: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/2: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+gemma4-12b-coding/3: score 0.065 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 0; blocked 0
+llama31-8b/1: score 0.045 (3/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+llama31-8b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 2; blocked 0
+llama31-8b/1: score 0.045 (3/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+llama31-8b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 2; blocked 0
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+nemotron-nano-9b/1: score 0.054 (3/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.20, domain 0.00; console errors 0; blocked 0
+nemotron-nano-9b/2: score 0.055 (4/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nemotron-nano-9b/3: score 0.034 (2/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+nanbeige-3b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+llama31-8b/1: score 0.045 (3/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+llama31-8b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 2; blocked 0
+llama31-8b/3: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+llama31-8b/1: score 0.045 (3/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+llama31-8b/2: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 2; blocked 0
+llama31-8b/3: score 0.014 (1/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 0; blocked 0
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-27b: no builds
+bonsai-27b: no builds
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+qwen38-27b: no builds
+bonsai-27b: no builds
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/3: score 0.138 (10/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.63; console errors 1; blocked 0
+nanbeige-3b/1: score 0.075 (5/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/2: score 0.031 (2/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.14, persist 0.00, domain 0.00; console errors 1; blocked 0
+nanbeige-3b/3: score 0.138 (10/70); logic 0.10, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.29, persist 0.00, domain 0.63; console errors 1; blocked 0
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b: no builds
+bonsai-27b: no builds
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+bonsai-27b: no builds
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/3: score 0.063 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.13; console errors 0; blocked 0
+qwen38-27b/1: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/2: score 0.000 (0/70); logic 0.00, time 0.00, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.00, a11y 0.00, persist 0.00, domain 0.00; console errors 0; blocked 0
+qwen38-27b/3: score 0.063 (4/70); logic 0.00, time 0.17, canvas 0.00, chart 0.00, data 0.00, algo 0.00, layout 0.20, a11y 0.14, persist 0.00, domain 0.13; console errors 0; blocked 0

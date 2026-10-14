@@ -1,0 +1,36 @@
+{
+ "raw": 1800,
+ "kept": 896,
+ "by_family": {
+  "A": 125,
+  "C": 223,
+  "D": 178,
+  "B": 113,
+  "E": 257
+ },
+ "rejected": {
+  "A: test passes on the buggy file": 116,
+  "A: test fails on the reference": 112,
+  "C: test fails on the reference": 109,
+  "D: test passes on the buggy file": 96,
+  "B: overlaps a scored task": 86,
+  "B: test fails on the reference": 75,
+  "B: test passes on the buggy file": 74,
+  "E: test fails on the reference": 64,
+  "D: test fails on the reference": 57,
+  "D: overlaps a scored task": 28,
+  "E: overlaps a scored task": 28,
+  "C: test passes on the buggy file": 20,
+  "B: not JSON": 9,
+  "C: overlaps a scored task": 7,
+  "E: test passes on the buggy file": 6,
+  "E: no hidden file": 5,
+  "A: not JSON": 3,
+  "A: missing fields": 2,
+  "B: missing fields": 2,
+  "A: overlaps a scored task": 2,
+  "B: no hidden file": 1,
+  "D: not JSON": 1,
+  "C: missing fields": 1
+ }
+}

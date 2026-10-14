@@ -1,0 +1,53 @@
+01:23:36 headroom start
+01:32:28 headroom start
+02:26:20 headroom pass A start
+03:04:40 headroom pass A start
+03:04:41 headroom pass A exit 0
+03:04:41 headroom pass B1 start
+03:37:45 headroom pass B1 exit 0
+03:37:45 headroom pass B2 start
+04:21:59 headroom pass B2 exit 127
+04:23:15 k2h start (RAM available 7.0 GB)
+05:30:52 roster gemma4-12b start
+06:13:38 roster gemma4-12b run exit 0 (attempt 1)
+06:13:39 roster qwen38-9b start
+06:13:42 roster gemma4-12b checks done
+06:22:37 roster qwen38-9b run exit 0 (attempt 1)
+06:22:37 roster dsv4pro-qwen35-9b start
+06:22:39 roster qwen38-9b checks done
+06:31:57 roster dsv4pro-qwen35-9b run exit 0 (attempt 1)
+06:31:57 roster qwen35-9b start
+06:31:59 roster dsv4pro-qwen35-9b checks done
+06:46:36 roster qwen35-9b run exit 0 (attempt 1)
+06:46:37 roster qwen35-9b-coder start
+06:46:39 roster qwen35-9b checks done
+06:52:21 roster qwen35-9b-coder run exit 0 (attempt 1)
+06:52:22 roster qwythos-9b start
+06:52:24 roster qwen35-9b-coder checks done
+06:59:49 roster qwythos-9b run exit 0 (attempt 1)
+06:59:49 roster ornith-9b start
+06:59:51 roster qwythos-9b checks done
+07:14:23 roster ornith-9b run exit 0 (attempt 1)
+07:14:23 roster nemotron-nano-9b start
+07:14:25 roster ornith-9b checks done
+07:21:54 roster nemotron-nano-9b run exit 0 (attempt 1)
+07:21:55 roster gemma4-12b-coding start
+07:21:56 roster nemotron-nano-9b checks done
+07:35:27 roster gemma4-12b-coding run exit 0 (attempt 1)
+07:35:27 roster llama31-8b start
+07:35:29 roster gemma4-12b-coding checks done
+08:24:05 roster llama31-8b run exit 0 (attempt 1)
+08:24:05 roster nanbeige-3b start
+08:24:07 roster llama31-8b checks done
+08:41:14 roster nanbeige-3b run exit 0 (attempt 1)
+08:41:14 roster qwen38-27b start
+08:41:16 roster nanbeige-3b checks done
+09:56:54 roster qwen38-27b run exit 1 (attempt 1)
+11:12:25 roster qwen38-27b run exit 0 (attempt 2)
+11:12:25 roster bonsai-27b start
+11:12:27 roster qwen38-27b checks done
+11:12:34 roster bonsai-27b run exit 1 (attempt 1)
+11:12:35 roster bonsai-27b checks done
+11:12:35 chain phase all finished
+11:12:35 restoring the Versutus gate (healthy means lastHealthyAt after 2026-10-09T15:12:35)
+11:14:08 gate healthy (2026-10-09T15:14:05.975Z)

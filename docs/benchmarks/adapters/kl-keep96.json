@@ -1,0 +1,7 @@
+{
+ "model": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+ "exit": 0,
+ "mean_kld": 0.360482,
+ "p99_kld": 4.181082,
+ "same_top_p": 83.226
+}

@@ -1,0 +1,10 @@
+﻿started 2026-10-04T12:34:42
+     5 Retired Sectors Count               PO--CK   100 100 36  0                                                 
+   187 Reported Un-correctable             -O--CK   1   1   AP  11439                                             
+   197 Pending-Sparing Count               -O--C-   99  99  AP  88                                                
+   198 Offline Uncorrectable Sector Count  ----C-   99  99  AP  88                                                
+   199 Ultra DMA CRC Error                 -OSRCK   200 200 AP  0                                                 
+pending sectors: 88
+SKIPPED chkdsk: pending=88
+
+done 2026-10-04T12:34:46

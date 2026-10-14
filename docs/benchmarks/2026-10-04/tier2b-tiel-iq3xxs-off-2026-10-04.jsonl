@@ -1,0 +1,118 @@
+{"task": "merge_intervals", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 106, "secs": 55.4}
+{"task": "merge_intervals", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 106, "secs": 2.2}
+{"task": "merge_intervals", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 106, "secs": 2.2}
+{"task": "lru_cache", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 152, "secs": 6.0}
+{"task": "lru_cache", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 152, "secs": 3.2}
+{"task": "lru_cache", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 152, "secs": 3.1}
+{"task": "topological_sort", "category": "A", "sample": 0, "ok": false, "detail": "AssertionError: expected cycle error", "gen_n": 84, "secs": 2.8}
+{"task": "topological_sort", "category": "A", "sample": 1, "ok": false, "detail": "AssertionError: expected cycle error", "gen_n": 84, "secs": 1.7}
+{"task": "topological_sort", "category": "A", "sample": 2, "ok": false, "detail": "AssertionError: expected cycle error", "gen_n": 84, "secs": 1.7}
+{"task": "parse_csv_line", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 195, "secs": 4.6}
+{"task": "parse_csv_line", "category": "A", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 27, "secs": 0.9}
+{"task": "parse_csv_line", "category": "A", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 153, "secs": 3.1}
+{"task": "pkg_discount", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 36, "secs": 2.2}
+{"task": "pkg_discount", "category": "B", "sample": 1, "ok": false, "detail": "SyntaxError: unterminated string literal (detected at line 1)", "gen_n": 150, "secs": 4.8}
+{"task": "pkg_discount", "category": "B", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 36, "secs": 1.1}
+{"task": "pkg_auth", "category": "B", "sample": 0, "ok": false, "detail": "PermissionError: token invalid or expired", "gen_n": 45, "secs": 2.1}
+{"task": "pkg_auth", "category": "B", "sample": 1, "ok": false, "detail": "SyntaxError: unterminated string literal (detected at line 1)", "gen_n": 124, "secs": 3.8}
+{"task": "pkg_auth", "category": "B", "sample": 2, "ok": false, "detail": "PermissionError: token invalid or expired", "gen_n": 45, "secs": 1.1}
+{"task": "safe_divide_batch", "category": "C", "sample": 0, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.8}
+{"task": "safe_divide_batch", "category": "C", "sample": 1, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.3}
+{"task": "safe_divide_batch", "category": "C", "sample": 2, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.3}
+{"task": "retry_with_backoff", "category": "C", "sample": 0, "ok": false, "detail": "ValueError: boom", "gen_n": 78, "secs": 2.4}
+{"task": "retry_with_backoff", "category": "C", "sample": 1, "ok": false, "detail": "ValueError: boom", "gen_n": 78, "secs": 1.8}
+{"task": "retry_with_backoff", "category": "C", "sample": 2, "ok": false, "detail": "ValueError: boom", "gen_n": 78, "secs": 1.8}
+{"task": "load_or_create_json", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 105, "secs": 2.9}
+{"task": "load_or_create_json", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 105, "secs": 2.3}
+{"task": "load_or_create_json", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 105, "secs": 2.4}
+{"task": "run_checked", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 52, "secs": 2.0}
+{"task": "run_checked", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 52, "secs": 1.4}
+{"task": "run_checked", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 52, "secs": 1.4}
+{"task": "clamp_with_lib", "category": "E", "sample": 0, "ok": true, "detail": "ok", "gen_n": 36, "secs": 1.7}
+{"task": "clamp_with_lib", "category": "E", "sample": 1, "ok": true, "detail": "ok", "gen_n": 79, "secs": 1.9}
+{"task": "clamp_with_lib", "category": "E", "sample": 2, "ok": true, "detail": "ok", "gen_n": 36, "secs": 1.0}
+{"task": "find_rotation_point", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 103, "secs": 3.0}
+{"task": "find_rotation_point", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 103, "secs": 2.2}
+{"task": "find_rotation_point", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 103, "secs": 2.5}
+{"task": "nested_lookup", "category": "C", "sample": 0, "ok": true, "detail": "ok", "gen_n": 77, "secs": 2.7}
+{"task": "nested_lookup", "category": "C", "sample": 1, "ok": true, "detail": "ok", "gen_n": 77, "secs": 1.7}
+{"task": "nested_lookup", "category": "C", "sample": 2, "ok": true, "detail": "ok", "gen_n": 77, "secs": 1.8}
+{"task": "slugify_with_lib", "category": "E", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 26, "secs": 1.5}
+{"task": "slugify_with_lib", "category": "E", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 26, "secs": 0.8}
+{"task": "slugify_with_lib", "category": "E", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 30, "secs": 1.0}
+{"task": "binary_search_first", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 135, "secs": 3.8}
+{"task": "binary_search_first", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 135, "secs": 3.0}
+{"task": "binary_search_first", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 135, "secs": 3.1}
+{"task": "group_anagrams", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 51, "secs": 1.9}
+{"task": "group_anagrams", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 51, "secs": 1.2}
+{"task": "group_anagrams", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 51, "secs": 1.3}
+{"task": "drop_negatives", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 27, "secs": 1.4}
+{"task": "drop_negatives", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 27, "secs": 0.7}
+{"task": "drop_negatives", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 27, "secs": 0.7}
+{"task": "merge_sorted", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 98, "secs": 2.8}
+{"task": "merge_sorted", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 98, "secs": 2.1}
+{"task": "merge_sorted", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 98, "secs": 2.2}
+{"task": "roman_to_int", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 129, "secs": 3.5}
+{"task": "roman_to_int", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 124, "secs": 2.8}
+{"task": "roman_to_int", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 129, "secs": 2.9}
+{"task": "is_balanced", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 98, "secs": 3.0}
+{"task": "is_balanced", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 98, "secs": 2.4}
+{"task": "is_balanced", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 98, "secs": 2.4}
+{"task": "running_sum", "category": "A", "sample": 0, "ok": true, "detail": "ok", "gen_n": 44, "secs": 1.7}
+{"task": "running_sum", "category": "A", "sample": 1, "ok": true, "detail": "ok", "gen_n": 44, "secs": 1.1}
+{"task": "running_sum", "category": "A", "sample": 2, "ok": true, "detail": "ok", "gen_n": 44, "secs": 1.1}
+{"task": "pkg_inventory", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 33, "secs": 1.7}
+{"task": "pkg_inventory", "category": "B", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 42, "secs": 1.1}
+{"task": "pkg_inventory", "category": "B", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 133, "secs": 3.5}
+{"task": "pkg_tax", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 31, "secs": 1.5}
+{"task": "pkg_tax", "category": "B", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 31, "secs": 0.8}
+{"task": "pkg_tax", "category": "B", "sample": 2, "ok": false, "detail": "AssertionError", "gen_n": 31, "secs": 0.9}
+{"task": "pkg_rate_limit", "category": "B", "sample": 0, "ok": true, "detail": "ok", "gen_n": 32, "secs": 1.5}
+{"task": "pkg_rate_limit", "category": "B", "sample": 1, "ok": true, "detail": "ok", "gen_n": 32, "secs": 0.8}
+{"task": "pkg_rate_limit", "category": "B", "sample": 2, "ok": true, "detail": "ok", "gen_n": 32, "secs": 0.8}
+{"task": "pkg_shipping", "category": "B", "sample": 0, "ok": true, "detail": "ok", "gen_n": 61, "secs": 2.0}
+{"task": "pkg_shipping", "category": "B", "sample": 1, "ok": true, "detail": "ok", "gen_n": 61, "secs": 1.4}
+{"task": "pkg_shipping", "category": "B", "sample": 2, "ok": true, "detail": "ok", "gen_n": 61, "secs": 1.4}
+{"task": "pkg_grade", "category": "B", "sample": 0, "ok": false, "detail": "AssertionError", "gen_n": 23, "secs": 1.4}
+{"task": "pkg_grade", "category": "B", "sample": 1, "ok": false, "detail": "AssertionError", "gen_n": 23, "secs": 0.6}
+{"task": "pkg_grade", "category": "B", "sample": 2, "ok": true, "detail": "ok", "gen_n": 34, "secs": 0.9}
+{"task": "mutable_default_counter", "category": "C", "sample": 0, "ok": true, "detail": "ok", "gen_n": 46, "secs": 1.7}
+{"task": "mutable_default_counter", "category": "C", "sample": 1, "ok": true, "detail": "ok", "gen_n": 46, "secs": 1.1}
+{"task": "mutable_default_counter", "category": "C", "sample": 2, "ok": true, "detail": "ok", "gen_n": 46, "secs": 1.1}
+{"task": "coalesce", "category": "C", "sample": 0, "ok": true, "detail": "ok", "gen_n": 35, "secs": 1.6}
+{"task": "coalesce", "category": "C", "sample": 1, "ok": true, "detail": "ok", "gen_n": 35, "secs": 0.9}
+{"task": "coalesce", "category": "C", "sample": 2, "ok": true, "detail": "ok", "gen_n": 35, "secs": 1.0}
+{"task": "chunk_list", "category": "C", "sample": 0, "ok": true, "detail": "ok", "gen_n": 53, "secs": 2.0}
+{"task": "chunk_list", "category": "C", "sample": 1, "ok": true, "detail": "ok", "gen_n": 53, "secs": 1.2}
+{"task": "chunk_list", "category": "C", "sample": 2, "ok": true, "detail": "ok", "gen_n": 53, "secs": 1.2}
+{"task": "parse_bool", "category": "C", "sample": 0, "ok": false, "detail": "AssertionError: expected ValueError", "gen_n": 79, "secs": 2.5}
+{"task": "parse_bool", "category": "C", "sample": 1, "ok": false, "detail": "AssertionError: expected ValueError", "gen_n": 79, "secs": 1.9}
+{"task": "parse_bool", "category": "C", "sample": 2, "ok": false, "detail": "AssertionError: expected ValueError", "gen_n": 78, "secs": 1.9}
+{"task": "atomic_write", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 134, "secs": 3.8}
+{"task": "atomic_write", "category": "D", "sample": 1, "ok": false, "detail": "NameError: name 'os' is not defined. Did you forget to import 'os'?", "gen_n": 68, "secs": 1.6}
+{"task": "atomic_write", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 132, "secs": 3.1}
+{"task": "read_text_lines", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 44, "secs": 1.9}
+{"task": "read_text_lines", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 46, "secs": 1.3}
+{"task": "read_text_lines", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 46, "secs": 1.2}
+{"task": "ensure_parent_write", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.9}
+{"task": "ensure_parent_write", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.3}
+{"task": "ensure_parent_write", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 58, "secs": 1.3}
+{"task": "append_log_line", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 41, "secs": 1.6}
+{"task": "append_log_line", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 41, "secs": 1.0}
+{"task": "append_log_line", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 41, "secs": 1.1}
+{"task": "capture_stdout", "category": "D", "sample": 0, "ok": true, "detail": "ok", "gen_n": 71, "secs": 2.4}
+{"task": "capture_stdout", "category": "D", "sample": 1, "ok": true, "detail": "ok", "gen_n": 79, "secs": 2.0}
+{"task": "capture_stdout", "category": "D", "sample": 2, "ok": true, "detail": "ok", "gen_n": 79, "secs": 2.0}
+{"task": "quantize_with_lib", "category": "E", "sample": 0, "ok": true, "detail": "ok", "gen_n": 128, "secs": 3.8}
+{"task": "quantize_with_lib", "category": "E", "sample": 1, "ok": true, "detail": "ok", "gen_n": 151, "secs": 4.3}
+{"task": "quantize_with_lib", "category": "E", "sample": 2, "ok": true, "detail": "ok", "gen_n": 141, "secs": 3.7}
+{"task": "hash_with_lib", "category": "E", "sample": 0, "ok": false, "detail": "ModuleNotFoundError: No module named 'digestutil'", "gen_n": 48, "secs": 1.9}
+{"task": "hash_with_lib", "category": "E", "sample": 1, "ok": false, "detail": "ModuleNotFoundError: No module named 'digestutil'", "gen_n": 48, "secs": 1.3}
+{"task": "hash_with_lib", "category": "E", "sample": 2, "ok": false, "detail": "ModuleNotFoundError: No module named 'digestutil'", "gen_n": 48, "secs": 1.3}
+{"task": "format_with_lib", "category": "E", "sample": 0, "ok": true, "detail": "ok", "gen_n": 142, "secs": 4.2}
+{"task": "format_with_lib", "category": "E", "sample": 1, "ok": false, "detail": "SyntaxError: unterminated string literal (detected at line 5)", "gen_n": 122, "secs": 3.4}
+{"task": "format_with_lib", "category": "E", "sample": 2, "ok": true, "detail": "ok", "gen_n": 61, "secs": 1.6}
+{"task": "normalize_with_lib", "category": "E", "sample": 0, "ok": true, "detail": "ok", "gen_n": 59, "secs": 2.0}
+{"task": "normalize_with_lib", "category": "E", "sample": 1, "ok": false, "detail": "SyntaxError: invalid syntax", "gen_n": 107, "secs": 2.6}
+{"task": "normalize_with_lib", "category": "E", "sample": 2, "ok": true, "detail": "ok", "gen_n": 57, "secs": 1.5}
+{"summary": true, "model": "Tiel-Coder-35B-A3B-MTP-UD-IQ3_XXS.gguf", "server": "C:\\qwen3-forge-stage\\tools\\llama-master-836d57176\\llama-server.exe", "ncmoe": 24, "mtp": 2, "spec_type": "draft-mtp", "budget": 0, "chat_kwargs": {"enable_thinking": false}, "passed": 83, "total": 117, "server_restarts": 0, "minutes": 4.8}

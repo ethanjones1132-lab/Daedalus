@@ -1,0 +1,7 @@
+Error: page.evaluate: TypeError: Cannot read properties of null (reading 'getContext')
+    at updateUI (http://127.0.0.1:53044/app.html:266:26)
+    at step (http://127.0.0.1:53044/app.html:244:7)
+    at Object.step (http://127.0.0.1:53044/app.html:288:50)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

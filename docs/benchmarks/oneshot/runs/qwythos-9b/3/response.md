@@ -1,0 +1,535 @@
+## Plan
+The app is a single HTML file containing a full simulation engine and UI. The data model consists of a world object with `width`, `height`, `grassMax`, and a `cells` array (row-major). Each cell holds `grass` (0–grassMax) and optional `rabbit`/`fox` objects with `id`, `energy`, and position. Animals are stored in separate `rabbits` and `foxes` arrays, each with a `nextId` counter shared between them. The simulation state includes `tick`, `history` array, and a `rand` generator (mulberry32) seeded at reset.
+
+The tick order is strict: 1) grass grows, 2) rabbits move, eat, lose energy, breed, die, 3) foxes move, eat, lose energy, breed, die, 4) increment tick, record history. Movement uses the neighbour list [up, right, down, left] filtered for free spots (rabbits) or rabbit-containing spots (foxes). Breeding checks neighbours for free spots, picks one, halves energy, spawns child. Death removes the animal if energy ≤ 0.
+
+Components: a `<canvas>` for the world, an `<svg>` for the population chart, a `<div>` for the Lotka–Volterra panel with its own `<svg>`, input controls (seed, speed, sliders), counters, buttons (play, pause, step, reset, CSV export, scenario load/export, preset save/load/delete), and an announcer `div` for accessibility. All logic is exposed via the `window.lab` API: `reset`, `step`, `counts`, `tick`, `cell`, `history`, `ode`, `exportCSV`, `exportScenario`, `loadScenario`. The UI reads from this API and updates the DOM accordingly. The layout adapts to viewport width: side panel right on large screens, below on small. No external dependencies; all math is vanilla JS.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ecosystem Lab</title>
+<style>
+  :root { --bg: #f5f5f0; --panel: #fff; --text: #222; --border: #ccc; --accent: #4a90d9; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  h1 { margin: 0; font-size: 18px; }
+  #seed-input { width: 80px; }
+  main { flex: 1; display: flex; overflow: hidden; }
+  #panel-world { flex: 1; display: flex; flex-direction: column; padding: 8px; overflow: hidden; }
+  #panel-side { width: 380px; background: var(--panel); border-left: 1px solid var(--border); overflow-y: auto; display: flex; flex-direction: column; }
+  @media (max-width: 699px) { #panel-side { width: 100%; border-left: none; border-top: 1px solid var(--border); flex-direction: row; flex: 1; } #panel-world { flex: 1; } }
+  #world-canvas { background: #111; margin-bottom: 8px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .counter { padding: 4px 8px; background: #eee; border: 1px solid var(--border); border-radius: 4px; font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .row label { font-size: 12px; margin-right: 4px; }
+  input[type=range] { width: 120px; }
+  .side-section { padding: 8px; border-bottom: 1px solid var(--border); }
+  .side-section:last-child { border-bottom: none; }
+  .side-section h3 { margin: 0 0 8px; font-size: 14px; }
+  #chart-svg { width: 100%; height: 140px; }
+  #ode-panel { padding: 8px; }
+  #ode-panel h3 { margin: 0 0 8px; font-size: 14px; }
+  #ode-controls { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; font-size: 11px; }
+  #ode-controls input { width: 100%; box-sizing: border-box; }
+  #ode-results { font-size: 12px; margin-top: 4px; }
+  #ode-chart { width: 100%; height: 100px; margin-top: 4px; }
+  #scenario-area { padding: 8px; }
+  #scenario-area textarea { width: 100%; height: 80px; font-family: monospace; font-size: 11px; }
+  #presets-area { padding: 8px; }
+  #presets-list { display: flex; flex-wrap: wrap; gap: 4px; }
+  .preset-item { padding: 4px 6px; background: #f0f0f0; border: 1px solid var(--border); border-radius: 3px; font-size: 11px; }
+  .preset-item button { margin-left: 4px; font-size: 10px; }
+  #announcer { position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden; }
+  button { cursor: pointer; padding: 4px 8px; border: 1px solid var(--border); background: #fff; border-radius: 3px; font-size: 12px; }
+  button:hover { background: #fafafa; }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+<h1>Ecosystem Lab</h1>
+<input type="number" id="seed-input" data-testid="seed" value="42">
+<button id="reset" data-testid="reset">Reset</button>
+<button id="play" data-testid="play">Play</button>
+<button id="pause" data-testid="pause">Pause</button>
+<button id="step" data-testid="step">Step</button>
+</header>
+<main>
+<div id="panel-world">
+<canvas id="world-canvas" data-testid="world"></canvas>
+<div class="controls">
+<div class="counter" id="count-tick" data-testid="tick">tick 0</div>
+<div class="counter" id="count-rabbits" data-testid="count-rabbits">rabbits 0</div>
+<div class="counter" id="count-foxes" data-testid="count-foxes">foxes 0</div>
+<div class="counter" id="count-grass" data-testid="count-grass">grass 0</div>
+</div>
+<div class="row">
+<label for="param-rabbits0">Rabbits start</label>
+<input type="range" id="param-rabbits0" data-testid="param-rabbits0" min="0" max="300" value="100">
+<label for="param-foxes0">Foxes start</label>
+<input type="range" id="param-foxes0" data-testid="param-foxes0" min="0" max="60" value="6">
+<label for="param-rabbitBreed">Rabbit breed</label>
+<input type="range" id="param-rabbitBreed" data-testid="param-rabbitBreed" min="2" max="40" value="12">
+<label for="param-foxBreed">Fox breed</label>
+<input type="range" id="param-foxBreed" data-testid="param-foxBreed" min="2" max="60" value="40">
+<label for="param-foxGain">Fox gain</label>
+<input type="range" id="param-foxGain" data-testid="param-foxGain" min="1" max="30" value="4">
+<label for="param-grassMax">Grass max</label>
+<input type="range" id="param-grassMax" data-testid="param-grassMax" min="1" max="10" value="4">
+</div>
+</div>
+<div id="panel-side">
+<div class="side-section">
+<h3>Population</h3>
+<svg id="chart-svg" data-testid="chart" width="300" height="140"></svg>
+</div>
+<div class="side-section">
+<h3>Lotka–Volterra</h3>
+<div id="ode-panel">
+<div id="ode-controls">
+<input type="number" id="ode-alpha" data-testid="ode-alpha" value="1.1">
+<input type="number" id="ode-beta" data-testid="ode-beta" value="0.4">
+<input type="number" id="ode-gamma" data-testid="ode-gamma" value="0.4">
+<input type="number" id="ode-delta" data-testid="ode-delta" value="0.1">
+<input type="number" id="ode-x0" data-testid="ode-x0" value="10">
+<input type="number" id="ode-y0" data-testid="ode-y0" value="10">
+<input type="number" id="ode-t" data-testid="ode-t" value="50">
+<input type="number" id="ode-dt" data-testid="ode-dt" value="0.01">
+</div>
+<button id="ode-run" data-testid="ode-run">Run ODE</button>
+<div id="ode-results"></div>
+<svg id="ode-chart" data-testid="ode-chart" width="280" height="100"></svg>
+</div>
+</div>
+<div class="side-section">
+<h3>Scenario</h3>
+<textarea id="scenario-json" data-testid="scenario-json"></textarea>
+<button id="scenario-export" data-testid="scenario-export">Export</button>
+<button id="scenario-load" data-testid="scenario-load">Load</button>
+<div id="scenario-error" data-testid="scenario-error"></div>
+</div>
+<div class="side-section">
+<h3>Presets</h3>
+<input type="text" id="preset-name" placeholder="Preset name">
+<button id="preset-save" data-testid="preset-save">Save</button>
+<div id="presets-list"></div>
+</div>
+</div>
+</main>
+<div id="announcer" aria-live="polite"></div>
+</div>
+<script>
+(function(){
+const defaults = {
+  width: 40, height: 30, grassMax: 4, rabbits0: 100, foxes0: 6,
+  rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+  foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+};
+let world = {
+  width: defaults.width, height: defaults.height, grassMax: defaults.grassMax,
+  cells: [], rabbits: [], foxes: [], tick: 0, history: [],
+  nextId: 1, rand: null, playing: false, speed: 10, lastTime: 0, accumulator: 0
+};
+let params = {...defaults};
+function mulberry32(seed){
+  let a = seed | 0;
+  return function(){
+    a = (a + 0x6D2B79F5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function pick(list){
+  if(!list.length) return null;
+  return list[Math.floor(world.rand() * list.length)];
+}
+function reset(seed, p = {}){
+  world = { ...world, tick: 0, history: [], nextId: 1, rand: mulberry32(seed), playing: false, accumulator: 0, lastTime: 0 };
+  params = { ...defaults, ...p };
+  world.width = params.width; world.height = params.height; world.grassMax = params.grassMax;
+  world.cells = new Array(world.width*world.height).fill(null).map(()=>({grass:0, rabbit:null, fox:null}));
+  for(let y=0;y<world.height;y++){
+    for(let x=0;x<world.width;x++){
+      world.cells[y*world.width+x].grass = Math.floor(world.rand() * (world.grassMax+1));
+    }
+  }
+  const rabbits = [];
+  for(let i=0;i<params.rabbits0;i++){
+    const free = world.cells.filter(c=>!c.rabbit).map(c=>c);
+    const spot = pick(free);
+    if(spot){
+      spot.rabbit = {id: world.nextId++, energy: params.rabbitStart};
+      rabbits.push(spot.rabbit);
+    }
+  }
+  const foxes = [];
+  for(let i=0;i<params.foxes0;i++){
+    const free = world.cells.filter(c=>!c.fox).map(c=>c);
+    const spot = pick(free);
+    if(spot){
+      spot.fox = {id: world.nextId++, energy: params.foxStart};
+      foxes.push(spot.fox);
+    }
+  }
+  world.rabbits = rabbits; world.foxes = foxes;
+  recordHistory();
+  drawWorld();
+  drawChart();
+  updateCounters();
+  announce(`Tick ${world.tick}: ${world.rabbits.length} rabbits, ${world.foxes.length} foxes`);
+  return counts();
+}
+function recordHistory(){
+  const g = world.cells.reduce((s,c)=>s+c.grass,0);
+  world.history.push({tick: world.tick, rabbits: world.rabbits.length, foxes: world.foxes.length, grass: g});
+}
+function tick(){
+  // grass
+  for(let i=0;i<world.cells.length;i++){
+    world.cells[i].grass = Math.min(world.grassMax, world.cells[i].grass+1);
+  }
+  // rabbits
+  const rabbitsAlive = world.rabbits.filter(r=>r.energy>0);
+  rabbitsAlive.sort((a,b)=>a.id-b.id);
+  for(const r of rabbitsAlive){
+    const cell = world.cells[r.x+world.y*world.width];
+    // move
+    const neigh = [];
+    const dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+    for(const d of dirs){
+      const nx = r.x+d[0], ny = r.y+d[1];
+      if(nx>=0&&nx<world.width&&ny>=0&&ny<world.height){
+        const c = world.cells[ny*world.width+nx];
+        if(!c.rabbit) neigh.push(c);
+      }
+    }
+    const move = pick(neigh);
+    if(move){
+      cell.rabbit = null;
+      move.rabbit = r; move.rabbit.x = r.x; move.rabbit.y = r.y;
+    }
+    // eat
+    r.energy += params.rabbitGain * cell.grass;
+    cell.grass = 0;
+    // cost
+    r.energy -= params.rabbitCost;
+    // breed
+    if(r.energy >= params.rabbitBreed){
+      const neigh = [];
+      for(const d of dirs){
+        const nx = r.x+d[0], ny = r.y+d[1];
+        if(nx>=0&&nx<world.width&&ny>=0&&ny<world.height){
+          const c = world.cells[ny*world.width+nx];
+          if(!c.rabbit) neigh.push(c);
+        }
+      }
+      const spot = pick(neigh);
+      if(spot){
+        const child = Math.floor(r.energy/2);
+        r.energy -= child;
+        spot.rabbit = {id: world.nextId++, energy: child};
+        world.rabbits.push(spot.rabbit);
+      }
+    }
+  }
+  world.rabbits = rabbitsAlive.filter(r=>r.energy>0);
+  // foxes
+  const foxesAlive = world.foxes.filter(f=>f.energy>0);
+  foxesAlive.sort((a,b)=>a.id-b.id);
+  for(const f of foxesAlive){
+    const cell = world.cells[f.x+world.y*world.width];
+    // move
+    const neighRabbit = [];
+    const neighFree = [];
+    const dirs = [[0,-1],[1,0],[0,1],[-1,0]];
+    for(const d of dirs){
+      const nx = f.x+d[0], ny = f.y+d[1];
+      if(nx>=0&&nx<world.width&&ny>=0&&ny<world.height){
+        const c = world.cells[ny*world.width+nx];
+        if(c.rabbit && !c.fox) neighRabbit.push(c);
+        else if(!c.fox) neighFree.push(c);
+      }
+    }
+    let move = pick(neighRabbit);
+    if(!move) move = pick(neighFree);
+    if(move){
+      cell.fox = null;
+      move.fox = f; move.fox.x = f.x; move.fox.y = f.y;
+    }
+    // eat
+    if(cell.rabbit){
+      cell.rabbit = null;
+      f.energy += params.foxGain;
+    }
+    // cost
+    f.energy -= params.foxCost;
+    // breed
+    if(f.energy >= params.foxBreed){
+      const neigh = [];
+      for(const d of dirs){
+        const nx = f.x+d[0], ny = f.y+d[1];
+        if(nx>=0&&nx<world.width&&ny>=0&&ny<world.height){
+          const c = world.cells[ny*world.width+nx];
+          if(!c.fox) neigh.push(c);
+        }
+      }
+      const spot = pick(neigh);
+      if(spot){
+        const child = Math.floor(f.energy/2);
+        f.energy -= child;
+        spot.fox = {id: world.nextId++, energy: child};
+        world.foxes.push(spot.fox);
+      }
+    }
+  }
+  world.foxes = foxesAlive.filter(f=>f.energy>0);
+  world.tick++;
+  recordHistory();
+  drawWorld();
+  drawChart();
+  updateCounters();
+}
+function step(n=1){
+  for(let i=0;i<n;i++) tick();
+  return counts();
+}
+function counts(){
+  const g = world.cells.reduce((s,c)=>s+c.grass,0);
+  return {rabbits: world.rabbits.length, foxes: world.foxes.length, grass: g};
+}
+function cell(x,y){
+  const c = world.cells[y*world.width+x];
+  return {grass: c.grass, rabbit: c.rabbit, fox: c.fox};
+}
+function drawWorld(){
+  const cvs = document.getElementById('world-canvas');
+  const ctx = cvs.getContext('2d');
+  const size = 10;
+  cvs.width = world.width*size; cvs.height = world.height*size;
+  ctx.clearRect(0,0,cvs.width,cvs.height);
+  for(let i=0;i<world.cells.length;i++){
+    const c = world.cells[i];
+    const x = (i%world.width)*size, y = Math.floor(i/world.width)*size;
+    const G = 60 + Math.round(160*c.grass/world.grassMax);
+    ctx.fillStyle = `rgb(30,${G},30)`;
+    ctx.fillRect(x,y,size,size);
+    if(c.rabbit){
+      ctx.fillStyle = 'rgb(240,240,240)';
+      ctx.fillRect(x+2,y+2,6,6);
+    }
+    if(c.fox){
+      ctx.fillStyle = 'rgb(220,80,20)';
+      ctx.fillRect(x+2,y+2,6,6);
+    }
+  }
+}
+function drawChart(){
+  const svg = document.getElementById('chart-svg');
+  const w = svg.clientWidth, h = svg.clientHeight;
+  const pad = 20;
+  const maxR = Math.max(1, ...world.history.map(h=>h.rabbits));
+  const maxF = Math.max(1, ...world.history.map(h=>h.foxes));
+  const maxG = Math.max(1, ...world.history.map(h=>h.grass));
+  const scaleX = (t)=>pad + (t/world.tick)* (w-2*pad);
+  const scaleY = (v, isGrass)=>pad + (1 - v/maxG)* (h-2*pad);
+  let rab = '', fox = '';
+  for(const h of world.history){
+    const x = scaleX(h.tick);
+    const yR = scaleY(h.rabbits, false);
+    const yF = scaleY(h.foxes, false);
+    const yG = scaleY(h.grass, true);
+    rab += `${x},${yR} `;
+    fox += `${x},${yF} `;
+  }
+  svg.innerHTML = `<polyline data-testid="series-rabbits" points="${rab}" fill="none" stroke="blue" stroke-width="2"/>
+  <polyline data-testid="series-foxes" points="${fox}" fill="none" stroke="red" stroke-width="2"/>
+  <text x="${pad}" y="${pad-4}" font-size="10">tick</text>
+  <text x="${w-pad}" y="${h-pad}" font-size="10" transform="rotate(-90,${w-pad},${pad})">count</text>`;
+}
+function updateCounters(){
+  const c = counts();
+  document.getElementById('count-tick').textContent = `tick ${c.tick}`;
+  document.getElementById('count-rabbits').textContent = `rabbits ${c.rabbits}`;
+  document.getElementById('count-foxes').textContent = `foxes ${c.foxes}`;
+  document.getElementById('count-grass').textContent = `grass ${c.grass}`;
+}
+function announce(msg){
+  const a = document.getElementById('announcer');
+  a.textContent = msg;
+}
+// ODE
+function odeRun(){
+  const a = parseFloat(document.getElementById('ode-alpha').value);
+  const b = parseFloat(document.getElementById('ode-beta').value);
+  const c = parseFloat(document.getElementById('ode-gamma').value);
+  const d = parseFloat(document.getElementById('ode-delta').value);
+  const x0 = parseFloat(document.getElementById('ode-x0').value);
+  const y0 = parseFloat(document.getElementById('ode-y0').value);
+  const t = parseFloat(document.getElementById('ode-t').value);
+  const dt = parseFloat(document.getElementById('ode-dt').value);
+  const n = Math.round(t/dt);
+  let x = x0, y = y0;
+  for(let i=0;i<n;i++){
+    const k1x = a*x - b*x*y, k1y = d*x*y - c*y;
+    const x2 = x + 0.5*dt*k1x, y2 = y + 0.5*dt*k1y;
+    const k2x = a*x2 - b*x2*y2, k2y = d*x2*y2 - c*y2;
+    const x3 = x + 0.5*dt*k2x, y3 = y + 0.5*dt*k2y;
+    const k3x = a*x3 - b*x3*y3, k3y = d*x3*y3 - c*y3;
+    const x4 = x + dt*k3x, y4 = y + dt*k3y;
+    const k4x = a*x4 - b*x4*y4, k4y = d*x4*y4 - c*y4;
+    x = x + dt*(k1x + 2*k2x + 2*k3x + k4x)/6;
+    y = y + dt*(k1y + 2*k2y + 2*k3y + k4y)/6;
+  }
+  const eqX = c/d, eqY = a/b;
+  const V = (x,y)=> d*x - c*Math.log(x) + b*y - a*Math.log(y);
+  const drift = Math.abs(V(x,y) - V(x0,y0));
+  document.getElementById('ode-results').innerHTML = `x = ${x.toFixed(8)}<br>y = ${y.toFixed(8)}<br>eq-x = ${eqX.toFixed(8)}<br>eq-y = ${eqY.toFixed(8)}<br>drift = ${drift.toFixed(8)}`;
+  const svg = document.getElementById('ode-chart');
+  const w = svg.clientWidth, h = svg.clientHeight;
+  const pad = 20;
+  const maxX = Math.max(x0,x);
+  const maxY = Math.max(y0,y);
+  const scaleX = (v)=>pad + (v/maxX)*(w-2*pad);
+  const scaleY = (v)=>pad + (1 - v/maxY)*(h-2*pad);
+  let s = '';
+  for(let i=0;i<=n;i++){
+    const t = i*dt;
+    const k1x = a*x - b*x*y, k1y = d*x*y - c*y;
+    const x2 = x + 0.5*dt*k1x, y2 = y + 0.5*dt*k1y;
+    const k2x = a*x2 - b*x2*y2, k2y = d*x2*y2 - c*y2;
+    const x3 = x + 0.5*dt*k2x, y3 = y + 0.5*dt*k2y;
+    const k3x = a*x3 - b*x3*y3, k3y = d*x3*y3 - c*y3;
+    const x4 = x + dt*k3x, y4 = y + dt*k3y;
+    const k4x = a*x4 - b*x4*y4, k4y = d*x4*y4 - c*y4;
+    x = x + dt*(k1x + 2*k2x + 2*k3x + k4x)/6;
+    y = y + dt*(k1y + 2*k2y + 2*k3y + k4y)/6;
+    const px = scaleX(x), py = scaleY(y);
+    s += `${px},${py} `;
+  }
+  svg.innerHTML = `<polyline data-testid="ode-series-x" points="${s}" fill="none" stroke="blue" stroke-width="2"/>
+  <polyline data-testid="ode-series-y" points="${s}" fill="none" stroke="red" stroke-width="2"/>`;
+}
+document.getElementById('ode-run').addEventListener('click', odeRun);
+// CSV
+function exportCSV(){
+  const lines = ['tick,rabbits,foxes,grass'];
+  for(const h of world.history){
+    lines.push(`${h.tick},${h.rabbits},${h.foxes},${h.grass}`);
+  }
+  return lines.join('\n') + '\n';
+}
+document.getElementById('csv-export').addEventListener('click', ()=>{
+  const blob = new Blob([exportCSV()],{type:'text/csv'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'ecolab.csv';
+  a.click();
+});
+// Scenario
+function exportScenario(){
+  return JSON.stringify({version:1, seed: world.rand ? world.rand(0) : 0, params: {...params}}, null,2);
+}
+document.getElementById('scenario-export').addEventListener('click', ()=>{
+  document.getElementById('scenario-json').value = exportScenario();
+});
+function loadScenario(text){
+  try{
+    const obj = JSON.parse(text);
+    if(obj.version !== 1) throw new Error('bad version');
+    if(!Number.isInteger(obj.seed)) throw new Error('seed not integer');
+    reset(obj.seed, obj.params);
+    document.getElementById('scenario-error').textContent = '';
+    return true;
+  }catch(e){
+    document.getElementById('scenario-error').textContent = e.message;
+    return false;
+  }
+}
+document.getElementById('scenario-load').addEventListener('click', ()=>loadScenario(document.getElementById('scenario-json').value));
+// Presets
+function savePreset(name){
+  const store = JSON.parse(localStorage.getItem('ecolab.presets')||'{}');
+  store[name] = exportScenario();
+  localStorage.setItem('ecolab.presets', JSON.stringify(store));
+  renderPresets();
+}
+function loadPreset(name){
+  const store = JSON.parse(localStorage.getItem('ecolab.presets')||'{}');
+  if(store[name]){
+    reset(JSON.parse(store[name]).seed, JSON.parse(store[name]).params);
+    document.getElementById('preset-name').value = name;
+  }
+}
+function deletePreset(name){
+  const store = JSON.parse(localStorage.getItem('ecolab.presets')||'{}');
+  delete store[name];
+  localStorage.setItem('ecolab.presets', JSON.stringify(store));
+  renderPresets();
+}
+function renderPresets(){
+  const store = JSON.parse(localStorage.getItem('ecolab.presets')||'{}');
+  const list = document.getElementById('presets-list');
+  list.innerHTML = '';
+  for(const name in store){
+    const div = document.createElement('div');
+    div.className = 'preset-item';
+    div.textContent = name;
+    div.innerHTML += `<button data-testid="preset-load" data-name="${name}">Load</button><button data-testid="preset-delete" data-name="${name}">Delete</button>`;
+    list.appendChild(div);
+  }
+}
+document.getElementById('preset-save').addEventListener('click', savePreset);
+document.querySelectorAll('.preset-item button[data-testid="preset-load"]').forEach(btn=>{
+  btn.addEventListener('click', ()=>loadPreset(btn.dataset.name));
+});
+document.querySelectorAll('.preset-item button[data-testid="preset-delete"]').forEach(btn=>{
+  btn.addEventListener('click', ()=>deletePreset(btn.dataset.name));
+});
+// Play loop
+function loop(){
+  if(!world.playing) return;
+  const now = performance.now();
+  const dt = (now - world.lastTime)/1000;
+  world.lastTime = now;
+  world.accumulator += dt * world.speed;
+  while(world.accumulator >= 1){
+    tick();
+    world.accumulator -= 1;
+  }
+  requestAnimationFrame(loop);
+}
+document.getElementById('play').addEventListener('click', ()=>{
+  world.playing = true;
+  world.lastTime = performance.now();
+  requestAnimationFrame(loop);
+});
+document.getElementById('pause').addEventListener('click', ()=>{
+  world.playing = false;
+});
+document.getElementById('step').addEventListener('click', ()=>{
+  step(1);
+});
+document.getElementById('reset').addEventListener('click', ()=>{
+  const seed = parseInt(document.getElementById('seed-input').value,10) || 42;
+  reset(seed, {});
+});
+// Speed slider
+document.getElementById('speed').addEventListener('input', e=>{
+  world.speed = parseInt(e.target.value,10) || 10;
+});
+// Init
+reset(42, {});
+document.getElementById('seed-input').value = 42;
+})();
+</script>
+</body>
+</html>
+```

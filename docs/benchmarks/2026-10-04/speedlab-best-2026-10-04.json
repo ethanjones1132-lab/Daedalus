@@ -1,0 +1,74 @@
+{
+ "gptoss20b": {
+  "label": "ngram-only-11",
+  "ncmoe": 11,
+  "spec": "ngram-mod",
+  "depth": 16,
+  "extra": [],
+  "gen_tps_mean": 46.26,
+  "paging_risk": false,
+  "draft": "",
+  "base_label": "place-14",
+  "base_tps": 21.3,
+  "lossy_fewer_experts": {
+   "used": 3,
+   "tps": 26.52,
+   "ok": false
+  },
+  "ub1024_prefill10k": 683.2
+ },
+ "gemma26b": {
+  "label": "plus-ngram",
+  "ncmoe": 16,
+  "spec": "draft-mtp,ngram-mod",
+  "depth": 2,
+  "extra": [],
+  "gen_tps_mean": 101.7,
+  "paging_risk": true,
+  "draft": "C:\\qwen3-forge-stage\\mtp-gemma-4-26B-A4B-it.gguf",
+  "base_label": "place-16",
+  "base_tps": 46.26,
+  "lossy_fewer_experts": {
+   "used": 6,
+   "tps": 55.83,
+   "ok": false
+  },
+  "ub1024_prefill10k": 1149.6
+ },
+ "qwen36keep96": {
+  "label": "combined:draft-mtp,ngram-mod:0:2:",
+  "ncmoe": 0,
+  "spec": "draft-mtp,ngram-mod",
+  "depth": 2,
+  "extra": [],
+  "gen_tps_mean": 274.46,
+  "paging_risk": false,
+  "draft": "",
+  "base_label": "place-0",
+  "base_tps": 130.32,
+  "lossy_fewer_experts": {
+   "used": 6,
+   "tps": 132.48,
+   "ok": true
+  },
+  "ub1024_prefill10k": 2344.0
+ },
+ "gptoss20b-keep24": {
+  "label": "combined:ngram-mod:7:16:",
+  "ncmoe": 7,
+  "spec": "ngram-mod",
+  "depth": 16,
+  "extra": [],
+  "gen_tps_mean": 86.87,
+  "paging_risk": false,
+  "draft": "",
+  "base_label": "place-11",
+  "base_tps": 26.03,
+  "lossy_fewer_experts": {
+   "used": 3,
+   "tps": 33.89,
+   "ok": true
+  },
+  "ub1024_prefill10k": 719.2
+ }
+}

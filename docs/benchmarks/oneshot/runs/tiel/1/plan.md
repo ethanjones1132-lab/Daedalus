@@ -1,0 +1,7 @@
+## Plan
+
+**Data model.** The world is a `cells` array (length `width*height`, row-major) holding `{grass, rabbit, fox}`. Two parallel arrays, `rabbits` and `foxes`, hold `{id, x, y, energy}`. A single `id` counter starts at 1 and increments for every animal created. `rand` is a `mulberry32` stream created once per `reset`. `history` is an array of `{tick, rabbits, foxes, grass}`. `params` is a plain object holding all 13 parameters.
+
+**Tick order.** `reset(seed, params)` merges params over defaults, seeds `rand`, sets `tick=0`, id=1, clears history, fills grass row-major, places rabbits then foxes (each via `pick` over free cells), records tick 0, redraws. One tick runs: (1) grass grows; (2) rabbits act in ascending-id order—move to a free neighbour, eat grass, lose cost, breed into a free neighbour, die at energy≤0; (3) foxes act in ascending-id order—move toward a rabbit-free-of-foxes else any fox-free cell, eat a rabbit in the cell, lose cost, breed, die; (4) `tick++`, record `{tick, rabbits, foxes, grass=sum}`. `step(n)` runs `n` ticks then updates canvas/chart/counters once.
+
+**Components.** `world` (canvas + `draw`), `controls` (play/pause/step/reset, seed input, speed slider, six param sliders, tick/counters), `chart` (SVG polylines), `ode` (inputs, run button, outputs, chart), `scenario` (textarea, export/load, error), `presets` (name input, save, list). All logic lives in a `Simulation` class exposed as `window.lab`; the UI calls it so they never disagree. Play uses `requestAnimationFrame` with elapsed-time accumulation at `speed` ticks/sec.

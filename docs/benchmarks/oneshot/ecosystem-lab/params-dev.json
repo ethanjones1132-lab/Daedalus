@@ -1,0 +1,63 @@
+{
+ "set": "dev",
+ "cases": [
+  {
+   "seed": 7,
+   "params": {}
+  },
+  {
+   "seed": 42,
+   "params": {
+    "rabbits0": 150,
+    "foxes0": 10
+   }
+  },
+  {
+   "seed": 2026,
+   "params": {
+    "width": 30,
+    "height": 20,
+    "rabbitBreed": 10
+   }
+  }
+ ],
+ "ode": [
+  {
+   "p": {
+    "alpha": 1.1,
+    "beta": 0.4,
+    "gamma": 0.4,
+    "delta": 0.1,
+    "x0": 10,
+    "y0": 10
+   },
+   "t": 50,
+   "dt": 0.01
+  },
+  {
+   "p": {
+    "alpha": 0.8,
+    "beta": 0.2,
+    "gamma": 0.6,
+    "delta": 0.15,
+    "x0": 5,
+    "y0": 3
+   },
+   "t": 30,
+   "dt": 0.02
+  },
+  {
+   "p": {
+    "alpha": 1.5,
+    "beta": 1.0,
+    "gamma": 3.0,
+    "delta": 1.0,
+    "x0": 4,
+    "y0": 2
+   },
+   "t": 12.345,
+   "dt": 0.01
+  }
+ ],
+ "ui_seed": 99
+}

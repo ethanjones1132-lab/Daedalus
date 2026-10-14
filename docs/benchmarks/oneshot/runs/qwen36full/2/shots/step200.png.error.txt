@@ -1,0 +1,6 @@
+Error: page.evaluate: TypeError: state.history is not a function
+    at updateChart (http://127.0.0.1:60793/app.html:619:22)
+    at Object.step (http://127.0.0.1:60793/app.html:872:5)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

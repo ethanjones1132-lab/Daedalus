@@ -1,0 +1,20 @@
+{
+ "model": "lfm25-8b-a1b",
+ "file": "LFM2.5-8B-A1B-Q4_K_M.gguf",
+ "seed": 2,
+ "ncmoe": 0,
+ "fit": [
+  {
+   "ncmoe": 0,
+   "loaded": true,
+   "vram_used_mib": 5921
+  }
+ ],
+ "wall_s": 105.9,
+ "finish_reason": "length",
+ "prompt_n": 3812,
+ "gen_n": 32768,
+ "gen_tps": 311.4,
+ "has_reasoning": false,
+ "ram_avail_gb": 4.21
+}

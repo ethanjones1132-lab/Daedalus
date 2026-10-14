@@ -1,0 +1,20 @@
+{
+ "model": "xing4",
+ "file": "Xing4.0-29B-A4B-IQ3_XXS.gguf",
+ "seed": 1,
+ "ncmoe": 22,
+ "fit": [
+  {
+   "ncmoe": 22,
+   "loaded": true,
+   "vram_used_mib": 7592
+  }
+ ],
+ "wall_s": 1386.4,
+ "finish_reason": "length",
+ "prompt_n": 4157,
+ "gen_n": 32768,
+ "gen_tps": 24.6,
+ "has_reasoning": false,
+ "ram_avail_gb": 2.17
+}

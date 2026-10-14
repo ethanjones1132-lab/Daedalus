@@ -1,0 +1,5 @@
+Error: page.evaluate: ReferenceError: grid is not defined
+    at Object.step (http://127.0.0.1:63626/app.html:245:9)
+    at eval (eval at evaluate (:370:30), <anonymous>:1:18)
+    at UtilityScript.evaluate (<anonymous>:372:16)
+    at UtilityScript.<anonymous> (<anonymous>:1:44)

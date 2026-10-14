@@ -1,0 +1,3663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ecosystem Lab</title>
+  <style>
+    body {font-family: Arial, sans-serif; margin:0; display:flex; height:100vh; overflow:hidden;}
+    #panel-world {flex:1; overflow:auto; position:fixed; top:0; left:0; width:calc(100% - width(700px)); background:#f0f0f0;}
+    #panel-side {flex:1; overflow:auto; position:fixed; top:0; right:0; background:#fff; border:1px solid #ccc; height:calc(100% - height(700px)); display:flex; flex-direction:column; padding:10px;}
+    canvas {background:#fff; display:flex; align-items:center; justify-content:center; flex-grow:0;}
+    .controls {background:#222; color:#fff; padding:10px; display:flex; flex-direction:column; gap:5px; height:80px;}
+    button, select {padding:5px; cursor:pointer;}
+    input {padding:5px; width:100%; box-sizing:border-box;}
+    #announcer {position:absolute; top:10px; left:10px; background:rgba(0,0,0,0.7); color:#fff; padding:5px; min-height:1.5em; font-size:1.2em;}
+    .grid {display:grid; grid-template-columns: repeat(var(--width),1fr); gap:1px;}
+    .cell {background:#fff; border:1px solid #ccc; display:flex; align-items:center; justify-content:center; font-size:0.8em;}
+    .rabbit {width:8px; height:8px; background:rgb(240,240,240); border-radius:50%; margin:4px;}
+    .fox {width:6px; height:6px; background:rgb(220,80,20); border-radius:50%; margin:4px;}
+    .chart {flex:1; padding:10px; overflow:auto; background:#fafafa;}
+    .chart svg {width:100%; height:200px;}
+  </style>
+</head>
+<body>
+  <div id="panel-world">
+    <canvas id="worldCanvas" data-testid="canvas"></canvas>
+  </div>
+  <div id="panel-side">
+    <div id="controls" class="controls">
+      <button data-testid="play">Play</button>
+      <button data-testid="pause">Pause</button>
+      <button data-testid="step">Step</button>
+      <button data-testid="reset">Reset</button>
+      <label for="seed">Seed: <span id="seedVal"></span></label>
+      <input type="range" id="speed" min="1" max="60" value="10">
+      <label for="param-rabbits0">Rabbits0: <span id="rabbitVal"></span></label>
+      <input type="range" id="param-foxes0" min="0" max="60" value="12">
+      <input type="range" id="param-rabbitBreed" min="2" max="40" value="2">
+      <input type="range" id="param-foxBreed" min="2" max="60" value="2">
+      <label for="param-foxGain">FoxGain: <span id="foxGainVal"></span></label>
+      <input type="range" id="param-grassMax" min="1" max="10" value="4">
+      <label for="seedVal"></label>
+    </div>
+    <div id="chart"></div>
+    <div id="ode-chart"></div>
+    <div id="preset-list"></div>
+    <div id="scenario-tools">
+      <textarea id="scenario-json" rows="4" cols="40" style="border:1px solid #ccc; padding:5px;"></textarea>
+      <button id="scenario-export">Export CSV</button>
+      <button id="scenario-load">Load Scenario</button>
+      <button id="preset-list">Presets</button>
+      <div id="scenario-error" class="error" style="color:red;"></div>
+    </div>
+  </div>
+  <div id="announcer"></div>
+  <script>
+function mulberry32(seed){
+ let a = seed|0;
+ return function (){
+ a = (a + 0x6D2B79F5) | 0;
+ let t = a;
+ t = Math.imul(t ^ (t >>> 15), t | 1);
+ t ^= t + Math.imul(t ^ (t >>> 7), t | 61;
+ return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+function reset(seed, params){
+ let rand = mulberry32(seed);
+ let tick = 0;
+ let id = 1;
+ let history = [];
+ let grass = [];
+ let rabbits = [];
+ let foxes = [];
+ let historyPoint = function() { return {tick, rabbits, foxes, grass}; };
+ let history.push(historyPoint());
+ let render();
+}
+function step(n){
+ let startTick = tick;
+ tick += n;
+ for(let i=0; i<history.length; i++) {
+ let {tick, rabbits, foxes, grass} = history[i];
+ grass = grass.map(g => Math.min(g + 1, params.grassMax));
+ let nextRabbit = [];
+ let nextFox = [];
+ for(let r of rabbits) {
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.rabbit) neigh.push(cell);
+ }
+ }
+ let move = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat = false;
+ let gain = 0;
+ if(move) {
+ let nextRabbit = [];
+ let nextFox = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextRabbit.push(nb);
+ else if(!nb.fox) nextFox.push(nb);
+ }
+ if(move) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) {
+ nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextRabbit.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move2 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat2 = false;
+ let gain2 = 0;
+ if(move2) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move2) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move3 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat3 = false;
+ let gain3 = 0;
+ if(move3) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move3) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move4 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat4 = false;
+ let gain4 = 0;
+ if(move4) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move4) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move5 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat5 = false;
+ let gain5 = 0;
+ if(move5) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move5) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move6 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat6 = false;
+ let gain6 = 0;
+ if(move6) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move6) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move7 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat7 = false;
+ let gain7 = 0;
+ if(move7) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move7) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move8 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat8 = false;
+ let gain8 = 0;
+ if(move8) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move8) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.rabbit) nb.rabbit.energy -= nb.gain * grassAt(nb.x, nb.y);
+ grassAt(nb.x, nb.y) = 0;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move9 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat9 = false;
+ let gain9 = 0;
+ if(move9) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move9) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move10 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat10 = false;
+ let gain10 = 0;
+ if(move10) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move10) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move11 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat11 = false;
+ let gain11 = 0;
+ if(move11) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move11) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move12 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat12 = false;
+ let gain12 = 0;
+ if(move12) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move12) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move13 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat13 = false;
+ let gain13 = 0;
+ if(move13) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move13) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move14 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat14 = false;
+ let gain14 = 0;
+ if(move14) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move14) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move15 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat15 = false;
+ let gain15 = 0;
+ if(move15) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move15) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move16 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat16 = false;
+ let gain16 = 0;
+ if(move16) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move16) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move17 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat17 = false;
+ let gain17 = 0;
+ if(move17) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move17) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move18 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat18 = false;
+ let gain18 = 0;
+ if(move18) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move18) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move19 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat19 = false;
+ let gain19 = 0;
+ if(move19) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move19) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move20 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat20 = false;
+ let gain20 = 0;
+ if(move20) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move20) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move21 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat21 = false;
+ let gain21 = 0;
+ if(move21) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move21) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move22 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat22 = false;
+ let gain22 = 0;
+ if(move22) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move22) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move23 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat23 = false;
+ let gain23 = 0;
+ if(move23) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move23) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move24 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat24 = false;
+ let gain24 = 0;
+ if(move24) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move24) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move25 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat25 = false;
+ let gain24 = 0;
+ if(move25) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move25) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move26 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat26 = false;
+ let gain24 = 0;
+ if(move26) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move26) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move27 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat27 = false;
+ let gain24 = 0;
+ if(move27) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move27) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move28 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat28 = false;
+ let gain24 = 0;
+ if(move28) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move28) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move29 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat29 = false;
+ let gain24 = 0;
+ if(move29) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move29) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move30 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat30 = false;
+ let gain24 = 0;
+ if(move30) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move30) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move31 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat31 = false;
+ let gain24 = 0;
+ if(move31) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move31) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move32 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat32 = false;
+ let gain24 = 0;
+ if(move32) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move32) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move33 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat33 = false;
+ let gain24 = 0;
+ if(move33) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move33) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move34 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat34 = false;
+ let gain24 = 0;
+ if(move34) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move34) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move35 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat35 = false;
+ let gain24 = 0;
+ if(move35) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move35) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move36 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat36 = false;
+ let gain24 = 0;
+ if(move36) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move36) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move37 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat37 = false;
+ let gain24 = 0;
+ if(move37) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move37) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move38 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat38 = false;
+ let gain24 = 0;
+ if(move38) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move38) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move39 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat39 = false;
+ let gain24 = 0;
+ if(move39) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move39) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move40 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat40 = false;
+ let gain24 = 0;
+ if(move40) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move40) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move41 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat41 = false;
+ let gain24 = 0;
+ if(move41) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move41) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move42 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat42 = false;
+ let gain24 = 0;
+ if(move42) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move42) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move43 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat43 = false;
+ let gain24 = 0;
+ if(move43) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move43) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move44 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat44 = false;
+ let gain24 = 0;
+ if(move44) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move44) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move45 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat45 = false;
+ let gain24 = 0;
+ if(move45) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move45) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move46 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat46 = false;
+ let gain24 = 0;
+ if(move46) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move46) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move47 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat47 = false;
+ let gain24 = 0;
+ if(move47) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move47) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move48 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat48 = false;
+ let gain24 = 0;
+ if(move48) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move48) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move49 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat49 = false;
+ let gain24 = 0;
+ if(move49) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move49) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move50 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat50 = false;
+ let gain24 = 0;
+ if(move50) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move50) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move51 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat51 = false;
+ let gain24 = 0;
+ if(move51) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move51) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move52 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat52 = false;
+ let gain24 = 0;
+ if(move52) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move52) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move53 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat53 = false;
+ let gain24 = 0;
+ if(move53) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move53) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move54 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat54 = false;
+ let gain24 = 0;
+ if(move54) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move54) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move55 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat55 = false;
+ let gain24 = 0;
+ if(move55) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move55) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move56 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat56 = false;
+ let gain24 = 0;
+ if(move56) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move56) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move57 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat57 = false;
+ let gain24 = 0;
+ if(move57) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move57) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move58 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat58 = false;
+ let gain24 = 0;
+ if(move58) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move58) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move59 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat59 = false;
+ let gain24 = 0;
+ if(move59) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move59) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move60 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat60 = false;
+ let gain24 = 0;
+ if(move60) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move60) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move61 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat61 = false;
+ let gain24 = 0;
+ if(move61) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move61) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move62 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat62 = false;
+ let gain24 = 0;
+ if(move62) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move62) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move63 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat63 = false;
+ let gain24 = 0;
+ if(move63) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move63) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move64 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat64 = false;
+ let gain24 = 0;
+ if(move64) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move64) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move65 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat65 = false;
+ let gain24 = 0;
+ if(move65) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move65) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move66 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat66 = false;
+ let gain24 = 0;
+ if(move66) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move66) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move67 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat67 = false;
+ let gain24 = 0;
+ if(move67) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move67) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move68 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat68 = false;
+ let gain24 = 0;
+ if(move68) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move68) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move69 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat69 = false;
+ let gain24 = 0;
+ if(move69) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move69) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move70 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat70 = false;
+ let gain24 = 0;
+ if(move70) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move70) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move71 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat71 = false;
+ let gain24 = 0;
+ if(move71) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move71) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move72 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat72 = false;
+ let gain24 = 0;
+ if(move72) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move72) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move73 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat73 = false;
+ let gain24 = 0;
+ if(move73) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move73) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move74 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat74 = false;
+ let gain24 = 0;
+ if(move74) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move74) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move75 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat75 = false;
+ let gain24 = 0;
+ if(move75) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move75) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move76 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat76 = false;
+ let gain24 = 0;
+ if(move76) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move76) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move77 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat77 = false;
+ let gain24 = 0;
+ if(move77) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move77) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = next.x + dx, ny = next.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(!cell.fox) neigh2.push(cell);
+ }
+ }
+ if(neigh2.length) {
+ let spot = pick(neigh2);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ }
+ if(grant) {
+ let nextFox = [];
+ let neigh = [];
+ for(let (dx,dy) of [[0,-1],[1,0],[0,1],[-1,0]]) {
+ let nx = r.x + dx, ny = r.y + dy;
+ if(nx>=0 && nx<params.width && ny>=0 && ny<params.height){
+ let cell = cellAt(nx, ny);
+ if(nb) {
+ if(!nb.rabbit) neigh.push(cell);
+ }
+ }
+ let move78 = neigh.length ? Math.floor(rand() * neigh.length) : null;
+ let eat78 = false;
+ let gain24 = 0;
+ if(move78) {
+ let nextFox = [];
+ let nextRabbit = [];
+ for(let nb of neigh) {
+ if(!nb.rabbit) nextFox.push(nb);
+ else if(!nb.fox) nextRabbit.push(nb);
+ }
+ if(move78) {
+ let spot = pick(nextRabbit);
+ if(spot) {
+ let nb = cellAt(spot.x, spot.y);
+ if(nb.fox) nb.fox.energy -= spot.gain;
+ }
+ }
+ if(!nextFox.length) {
+ let next = foxes;
+ let neigh2 = [];
+ for(let (dx,dy) of [[0

@@ -1,0 +1,51 @@
+{
+ "measures_fp32": {
+  "hidden_auc": 1.0,
+  "library_auc": 0.9895833333333334,
+  "verify_auc": 0.7887562185905794,
+  "valid_auc": 0.6655882790420943
+ },
+ "measures_lean": {
+  "hidden_auc": 1.0,
+  "library_auc": 0.9895833333333334,
+  "verify_auc": 0.7864863539121739,
+  "valid_auc": 0.6610516138628588
+ },
+ "auc_delta": {
+  "hidden_auc": 0.0,
+  "library_auc": 0.0,
+  "verify_auc": -0.0023,
+  "valid_auc": -0.0045
+ },
+ "matched_probabilities": 3663,
+ "median_abs_dp": 0.0032,
+ "p95_abs_dp": 0.0197,
+ "max_abs_dp": 0.1089,
+ "routing_tasks": 60,
+ "routing_identical": 57,
+ "routing_agreement": 0.95,
+ "route_counts": {
+  "fp32": {
+   "P": 36,
+   "P3": 24
+  },
+  "lean": {
+   "P": 33,
+   "P3": 26,
+   "R": 1
+  }
+ },
+ "mean_secs_per_call_in_label_run": {
+  "fp32": 0.406,
+  "lean": 0.4682
+ },
+ "rows": {
+  "fp32": 4686,
+  "lean": 2706
+ },
+ "pass": {
+  "auc_within_0.02": true,
+  "median_dp_under_0.02": true,
+  "routing_95": true
+ }
+}

@@ -1,0 +1,34 @@
+07:36:50 llama31-8b: place 99 spec ngram loaded True VRAM 7741 MiB
+07:45:11 llama31-8b/1: 6559 tokens in 500.8 s, finish stop
+07:53:15 llama31-8b/2: 7288 tokens in 484.5 s, finish stop
+08:23:49 llama31-8b/3: 32768 tokens in 1834.2 s, finish length
+llama31-8b/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+llama31-8b/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+llama31-8b/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+llama31-8b/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+llama31-8b/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+llama31-8b/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0

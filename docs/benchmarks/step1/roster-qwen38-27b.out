@@ -1,0 +1,76 @@
+08:42:42 qwen38-27b: place 99 spec ngram loaded True VRAM 7777 MiB
+09:44:20 qwen38-27b/1: 17174 tokens in 3697.5 s, finish stop
+Traceback (most recent call last):
+  File "C:\Projects\home-base-recovered\.claude\worktrees\micro-agent-swarm-design-929d42\scripts\oneshot\oneshot_bench.py", line 514, in <module>
+    main()
+  File "C:\Projects\home-base-recovered\.claude\worktrees\micro-agent-swarm-design-929d42\scripts\oneshot\oneshot_bench.py", line 502, in main
+    run_llama(a.model, seeds_of(a.seeds), runs, prompt, a.max_tokens, a.stop_file)
+  File "C:\Projects\home-base-recovered\.claude\worktrees\micro-agent-swarm-design-929d42\scripts\oneshot\oneshot_bench.py", line 337, in run_llama
+    r = _post("/v1/chat/completions", {
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Projects\home-base-recovered\.claude\worktrees\micro-agent-swarm-design-929d42\scripts\oneshot\oneshot_bench.py", line 251, in _post
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 1373, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\urllib\request.py", line 1348, in do_open
+    r = h.getresponse()
+        ^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\http\client.py", line 1450, in getresponse
+    response.begin()
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\http\client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\http\client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<home>\AppData\Roaming\uv\python\cpython-3.12-windows-x86_64-none\Lib\socket.py", line 720, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] An existing connection was forcibly closed by the remote host
+10:00:05 qwen38-27b: place 99 spec ngram loaded True VRAM 7772 MiB
+10:37:53 qwen38-27b/2: 10000 tokens in 2267.8 s, finish stop
+11:12:10 qwen38-27b/3: 8858 tokens in 2056.5 s, finish stop
+qwen38-27b/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+qwen38-27b/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+qwen38-27b/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+qwen38-27b/1: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+qwen38-27b/2: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0
+qwen38-27b/3: open',
+  path: 'C:\\Projects\\home-base-recovered\\.claude\\worktrees\\micro-agent-swarm-design-929d42\\scripts\\oneshot\\docs\\benchmarks\\oneshot\\ecosystem-lab\\params-dev.json'
+}
+
+Node.js v24.14.0

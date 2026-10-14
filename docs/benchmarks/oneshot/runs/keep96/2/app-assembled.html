@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta>
+    <title>Ecosystem Lab</title>
+  </meta>
+</head>
+<body>
+  <div id="panel-world">
+    <canvas data-testid="world"></canvas>
+    <div id="controls">
+      <button data-testid="play">Play</button>
+      <button data-testid="pause">Pause</button>
+      <button data-testid="step">Step</button>
+      <button data-testid="reset">Reset</button>
+      <input type="number" data-testid="seed" value="42">
+      <input type="range" data-testid="speed" min="1" max="60" value="10">
+      <label for="param_rabbits0">Rabbits0:</label>
+      <input type="range" data-testid="param_rabbits0" min="0" max="300" value="100">
+      <label for="param_foxes0">Foxes0:</label>
+      <input type="range" data-testid="param_foxes0" min="0" max="60" value="6">
+      <label for="param_rabbitBreed">RabbitBreed:</label>
+      <input type="range" data-testid="param_rabbitBreed" min="2" max="40" value="12">
+      <label for="param_foxBreed">FoxBreed:</label>
+      <input type="range" data-testid="param_foxBreed" min="2" max="60" value="40">
+      <label for="param_foxGain">FoxGain:</label>
+      <input type="range" data-testid="param_foxGain" min="1" max="30" value="4">
+      <label for="param_grassMax">GrassMax:</label>
+      <input type="range" data-testid="param_grassMax" min="1" max="10" value="4">
+      <div id="counters">
+        <div id="tick">Tick: 0</div>
+        <div id="count_rabbits">Rabbits: 0</div>
+        <div id="count_foxes">Foxes: 0</div>
+        <div id="count_grass">Grass: 0</div>
+      </div>
+    </div>
+  </div>
+  <div id="panel-side">
+    <svg data-testid="chart">
+      <polyline data-testid="series-rabbits"></polyline>
+      <polyline data-testid="series-foxes"></polyline>
+      <text data-testid="x-axis">tick</text>
+      <text data-testid="y-axis">count</text>
+    </svg>
+    <div id="lotka-volterra">
+      <input type="number" data-testid="ode-alpha" value="1.1">
+      <input type="number" data-testid="ode-beta" value="0.4">
+      <input type="number" data-testid="ode-gamma" value="0.4">
+      <input type="number" data-testid="ode-delta" value="0.1">
+      <input type="number" data-testid="ode-x0" value="10">
+      <input type="number" data-testid="ode-y0" value="10">
+      <input type="number" data-testid="ode-t" value="50">
+      <input type="number" data-testid="ode-dt" value="0.01">
+      <button data-testid="ode-run">Run ODE</button>
+      <svg data-testid="ode-chart">
+        <polyline data-testid="ode-series-x"></polyline>
+        <polyline data-testid="ode-series-y"></polyline>
+      </svg>
+    </div>
+    <div id="scenario">
+      <textarea data-testid="scenario-json"></textarea>
+      <button data-testid="scenario-export">Export Scenario</button>
+      <button data-testid="scenario-load">Load Scenario</button>
+      <div data-testid="scenario-error"></div>
+    </div>
+    <div id="presets">
+      <input type="text" data-testid="preset-name">
+      <button data-testid="preset-save">Save Preset</button>
+      <div data-testid="preset-list"></div>
+    </div>
+  </div>
+  <div id="announcer" aria-live="polite"></div>
+<script>
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+const DEFAULTS = {
+  width: 40, height: 30, grassMax: 4,
+  rabbits0: 100, foxes0: 6,
+  rabbitStart: 6, rabbitGain: 1, rabbitCost: 1, rabbitBreed: 12,
+  foxStart: 12, foxGain: 4, foxCost: 2, foxBreed: 40
+};
+
+let params = {};
+let rand, tick, idCounter, history, grid, rabbits, foxes;
+let playing = false;
+let playTimer = null;
+
+function pick(list) {
+  if (list.length === 0) return null;
+  return list[Math.floor(rand() * list.length)];
+}
+
+function reset(seed, p) {
+  params = {};
+  for (let k in DEFAULTS) params[k] = DEFAULTS[k];
+  for (let k in p) params[k] = p[k];
+  rand = mulberry32(seed);
+  tick = 0;
+  idCounter = 1;
+  history = [];
+  grid = [];
+  rabbits = [];
+  foxes = [];
+  for (let y = 0; y < params.height; y++) {
+    grid[y] = [];
+    for (let x = 0; x < params.width; x++) {
+      grid[y][x] = { grass: 0, rabbit: null, fox: null };
+    }
+  }
+  // Grass
+  for (let y = 0; y < params.height; y++) {
+    for (let x = 0; x < params.width; x++) {
+      grid[y][x].grass = Math.floor(rand() * (params.grassMax + 1));
+    }
+  }
+  // Rabbits
+  for (let i = 0; i < params.rabbits0; i++) {
+    let candidates = [];
+    for (let y = 0; y < params.height; y++) {
+      for (let x = 0; x < params.width; x++) {
+        if (!grid[y][x].rabbit) candidates.push({ x, y });
+      }
+    }
+    let spot = pick(candidates);
+    if (spot) {
+      let id = idCounter++;
+      grid[spot.y][spot.x].rabbit = { id, energy: params.rabbitStart };
+      rabbits.push({ id, x: spot.x, y: spot.y, energy: params.rabbitStart });
+    }
+  }
+  // Foxes
+  for (let i = 0; i < params.foxes0; i++) {
+    let candidates = [];
+    for (let y = 0; y < params.height; y++) {
+      for (let x = 0; x < params.width; x++) {
+        if (!grid[y][x].fox) candidates.push({ x, y });
+      }
+    }
+    let spot = pick(candidates);
+    if (spot) {
+      let id = idCounter++;
+      grid[spot.y][spot.x].fox = { id, energy: params.foxStart };
+      foxes.push({ id, x: spot.x, y: spot.y, energy: params.foxStart });
+    }
+  }
+  history.push({ tick: 0, rabbits: rabbits.length, foxes: foxes.length, grass: 0 });
+  for (let y = 0; y < params.height; y++) {
+    for (let x = 0; x < params.width; x++) {
+      history[0].grass += grid[y][x].grass;
+    }
+  }
+  redraw();
+  updateCounters();
+  updateChart();
+  return counts();
+}
+
+function step(n) {
+  for (let i = 0; i < n; i++) {
+    doTick();
+  }
+  redraw();
+  updateCounters();
+  updateChart();
+  return counts();
+}
+
+function doTick() {
+  // Grass
+  for (let y = 0; y < params.height; y++) {
+    for (let x = 0; x < params.width; x++) {
+      grid[y][x].grass = Math.min(params.grassMax, grid[y][x].grass + 1);
+    }
+  }
+  // Rabbits
+  let currentRabbits = rabbits.slice();
+  currentRabbits.sort((a, b) => a.id - b.id);
+  for (let r of currentRabbits) {
+    // Move
+    let neighbors = getNeighbors(r.x, r.y).filter(n => !grid[n.y][n.x].rabbit);
+    if (neighbors.length > 0) {
+      let spot = pick(neighbors);
+      grid[r.y][r.x].rabbit = null;
+      grid[spot.y][spot.x].rabbit = r;
+      r.x = spot.x;
+      r.y = spot.y;
+    }
+    // Eat
+    r.energy += params.rabbitGain * grid[r.y][r.x].grass;
+    grid[r.y][r.x].grass = 0;
+    // Cost
+    r.energy -= params.rabbitCost;
+    // Breed
+    if (r.energy >= params.rabbitBreed) {
+      let neighbors = getNeighbors(r.x, r.y).filter(n => !grid[n.y][n.x].rabbit);
+      if (neighbors.length > 0) {
+        let spot = pick(neighbors);
+        let child = Math.floor(r.energy / 2);
+        r.energy -= child;
+        let id = idCounter++;
+        grid[spot.y][spot.x].rabbit = { id, energy: child };
+        rabbits.push({ id, x: spot.x, y: spot.y, energy: child });
+      }
+    }
+    // Die
+    if (r.energy <= 0) {
+      grid[r.y][r.x].rabbit = null;
+      let idx = rabbits.indexOf(r);
+      if (idx >= 0) rabbits.splice(idx, 1);
+    }
+  }
+  // Foxes
+  let currentFoxes = foxes.slice();
+  currentFoxes.sort((a, b) => a.id - b.id);
+  for (let f of currentFoxes) {
+    // Move
+    let neighbors = getNeighbors(f.x, f.y);
+    let firstChoice = neighbors.filter(n => grid[n.y][n.x].rabbit && !grid[n.y][n.x].fox);
+    if (firstChoice.length > 0) {
+      let spot = pick(firstChoice);
+      grid[f.y][f.x].fox = null;
+      grid[spot.y][spot.x].fox = f;
+      f.x = spot.x;
+      f.y = spot.y;
+    } else {
+      let secondChoice = neighbors.filter(n => !grid[n.y][n.x].fox);
+      if (secondChoice.length > 0) {
+        let spot = pick(secondChoice);
+        grid[f.y][f.x].fox = null;
+        grid[spot.y][spot.x].fox = f;
+        f.x = spot.x;
+        f.y = spot.y;
+      }
+    }
+    // Eat
+    if (grid[f.y][f.x].rabbit) {
+      grid[f.y][f.x].rabbit = null;
+      f.energy += params.foxGain;
+      let idx = rabbits.indexOf(rabbits.find(r => r.id === grid[f.y][f.x].rabbit?.id));
+      // Actually, we need to find the rabbit by id
+      let rToRemove = rabbits.find(r => r.id === grid[f.y][f.x].rabbit?.id);
+      if (rToRemove) {
+        let idx = rabbits.indexOf(rToRemove);
+        if (idx >= 0) rabbits.splice(idx, 1);
+      }
+    }
+    // Cost
+    f.energy -= params.foxCost;
+    // Breed
+    if (f.energy >= params.foxBreed) {
+      let neighbors = getNeighbors(f.x, f.y).filter(n => !grid[n.y][n.x].fox);
+      if (neighbors.length > 0) {
+        let spot = pick(neighbors);
+        let child = Math.floor(f.energy / 2);
+        f.energy -= child;
+        let id = idCounter++;
+        grid[spot.y][spot.x].fox = { id, energy: child };
+        foxes.push({ id, x: spot.x, y: spot.y, energy: child });
+      }
+    }
+    // Die
+    if (f.energy <= 0) {
+      grid[f.y][f.x].fox = null;
+      let idx = foxes.indexOf(f);
+      if (idx >= 0) foxes.splice(idx, 1);
+    }
+  }
+  tick++;
+  let grassSum = 0;
+  for (let y = 0; y < params.height; y++) {
+    for (let x = 0; x < params.width; x++) {
+      grassSum += grid[y][x].grass;
+    }
+  }
+  history.push({ tick, rabbits: rabbits.length, foxes: foxes.length, grass: grassSum });
+}
+
+function getNeighbors(x, y) {
+  let dirs = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+  let result = [];
+  for (let d of dirs) {
+    let nx = x + d[0], ny = y + d[1];
+    if (nx >= 0 && nx < params.width && ny >= 0 && ny < params.height) {
+      result.push({ x: nx, y: ny });
+    }
+  }
+  return result;
+}
+
+function counts() {
+  return {
+    rabbits: rabbits.length,
+    foxes: foxes.length,
+    grass: history[history.length - 1].grass
+  };
+}
+
+function tick() { return tick; }
+
+function cell(x, y) {
+  let c = grid[y][x];
+  return {
+    grass: c.grass,
+    rabbit: c.rabbit ? { id: c.rabbit.id, energy: c.rabbit.energy } : null,
+    fox: c.fox ? { id: c.fox.id, energy: c.fox.energy } : null
+  };
+}
+
+function history() { return history; }
+
+function ode(p, t, dt) {
+  let alpha = p.alpha, beta = p.beta, gamma = p.gamma, delta = p.delta;
+  let x = p.x0, y = p.y0;
+  let n = Math.round(t / dt);
+  for (let i = 0; i < n; i++) {
+    let dx = (alpha * x - beta * x * y);
+    let dy = (delta * x * y - gamma * y);
+    x += dx;
+    y += dy;
+  }
+  return { x, y };
+}
+
+function exportCSV() {
+  let csv = "tick,rabbits,foxes,grass\n";
+  for (let h of history) {
+    csv += `${h.tick},${h.rabbits},${h.foxes},${h.grass}\n`;
+  }
+  return csv;
+}
+
+function exportScenario() {
+  return JSON.stringify({
+    version: 1,
+    seed: 0, // We don't have the original seed stored, but we can store the current one if we track it
+    params: params
+  });
+}
+
+function loadScenario(text) {
+  try {
+    let data = JSON.parse(text);
+    if (data.version !== 1 || typeof data.seed !== 'number' || !Number.isInteger(data.seed)) {
+      return false;
+    }
+    let p = {};
+    for (let k in DEFAULTS) p[k] = DEFAULTS[k];
+    if (data.params) {
+      for (let k in data.params) {
+        if (k in DEFAULTS) p[k] = data.params[k];
+      }
+    }
+    reset(data.seed, p);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function redraw() {
+  let canvas = document.getElementById('world');
+  if (!canvas) return;
+  let w = params.width * 10;
+  let h = params.height * 10;
+  canvas.width = w;
+  canvas.height = h;
+  let ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
+  for (let y = 0; y < params.height; y++) {
+    for (let x = 0; x < params.width; x++) {
+      let c = grid[y][x];
+      let G = 60 + Math.round(160 * c.grass / params.grassMax);
+      ctx.fillStyle = `rgb(30, ${G}, 30)`;
+      ctx.fillRect(x * 10, y * 10, 10, 10);
+      if (c.rabbit) {
+        ctx.fillStyle = 'rgb(240, 240, 240)';
+        ctx.fillRect(x * 10 + 2, y * 10 + 2, 10, 10);
+      }
+      if (c.fox) {
+        ctx.fillStyle = 'rgb(220, 80, 20)';
+        ctx.fillRect(x * 10 + 2, y * 10 + 2, 10, 10);
+      }
+    }
+  }
+}
+
+function updateCounters() {
+  let c = counts();
+  document.getElementById('tick').textContent = `Tick: ${tick}`;
+  document.getElementById('count_rabbits').textContent = `Rabbits: ${c.rabbits}`;
+  document.getElementById('count_foxes').textContent = `Foxes: ${c.foxes}`;
+  document.getElementById('count_grass').textContent = `Grass: ${c.grass}`;
+  document.getElementById('announcer').textContent = `Tick ${tick}: ${c.rabbits} rabbits, ${c.foxes} foxes`;
+}
+
+function updateChart() {
+  let svg = document.getElementById('chart');
+  if (!svg) return;
+  let h = history;
+  if (h.length === 0) return;
+  let maxR = 0, maxF = 0;
+  for (let i = 0; i < h.length; i++) {
+    maxR = Math.max(maxR, h[i].rabbits);
+    maxF = Math.max(maxF, h[i].foxes);
+  }
+  let max = Math.max(maxR, maxF, 1);
+  let w = 400, h = 400;
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+  let scaleX = (x) => 50 + x * (w - 50) / (h.length - 1);
+  let scaleY = (y) => 50 + (1 - y / max) * (h - 50);
+  let pointsR = [], pointsF = [];
+  for (let i = 0; i < h.length; i++) {
+    pointsR.push(`${scaleX(i)},${scaleY(h[i].rabbits)}`);
+    pointsF.push(`${scaleX(i)},${scaleY(h[i].foxes)}`);
+  }
+  let polylineR = svg.querySelector('series-rabbits');
+  let polylineF = svg.querySelector('series-foxes');
+  if (polylineR) polylineR.setAttribute('points', pointsR.join(' '));
+  if (polylineF) polylineF.setAttribute('points', pointsF.join(' '));
+}
+
+// Presets
+function savePreset(name) {
+  let presets = {};
+  try { presets = JSON.parse(localStorage['ecolab.presets'] || '{}'); } catch (e) {}
+  presets[name] = { seed: 0, params: params }; // We don't have the seed, so we store params only
+  localStorage['ecolab.presets'] = JSON.stringify(presets);
+}
+
+function loadPreset(name) {
+  let presets = {};
+  try { presets = JSON.parse(localStorage['ecolab.presets'] || '{}'); } catch (e) {}
+  if (presets[name]) {
+    let p = presets[name];
+    reset(0, p.params);
+  }
+}
+
+function deletePreset(name) {
+  let presets = {};
+  try { presets = JSON.parse(localStorage['ecolab.presets'] || '{}'); } catch (e) {}
+  delete presets[name];
+  localStorage['ecolab.presets'] = JSON.stringify(presets);
+}
+
+function updatePresets() {
+  let list = document.getElementById('preset-list');
+  if (!list) return;
+  list.innerHTML = '';
+  let presets = {};
+  try { presets = JSON.parse(localStorage['ecolab.presets'] || '{}'); } catch (e) {}
+  for (let name in presets) {
+    let item = document.createElement('div');
+    item.innerHTML = `<span>${name}</span><button data-testid="preset-load">Load</button><button data-testid="preset-delete">Delete</button>`;
+    list.appendChild(item);
+  }
+}
+
+// ODE
+function runODE() {
+  let alpha = parseFloat(document.getElementById('ode-alpha').value);
+  let beta = parseFloat(document.getElementById('ode-beta').value);
+  let gamma = parseFloat(document.getElementById('ode-gamma').value);
+  let delta = parseFloat(document.getElementById('ode-delta').value);
+  let x0 = parseFloat(document.getElementById('ode-x0').value);
+  let y0 = parseFloat(document.getElementById('ode-y0').value);
+  let t = parseFloat(document.getElementById('ode-t').value);
+  let dt = parseFloat(document.getElementById('ode-dt').value);
+  let p = { alpha, beta, gamma, delta, x0, y0 };
+  let result = ode(p, t, dt);
+  document.getElementById('ode-x').textContent = result.x;
+  document.getElementById('ode-y').textContent = result.y;
+  document.getElementById('ode-eq-x').textContent = gamma / delta;
+  document.getElementById('ode-eq-y').textContent = alpha / beta;
+  let V = (x, y) => delta * x - gamma * Math.log(x) + beta * y - alpha * Math.log(y);
+  let drift = Math.abs(V(result.x, result.y) - V(x0, y0));
+  document.getElementById('ode-drift').textContent = drift;
+  // Draw ODE chart
+  let svg = document.getElementById('ode-chart');
+  if (!svg) return;
+  let w = 400, h = 400;
+  svg.setAttribute('width', w);
+  svg.setAttribute('height', h);
+  let n = Math.round(t / dt);
+  let x = x0, y = y0;
+  let pointsX = [], pointsY = [];
+  for (let i = 0; i <= n; i++) {
+    pointsX.push(`${50 + i * (w - 50) / n},${50 + (1 - x / (x0 + 1)) * (h - 50)}`);
+    pointsY.push(`${50 + i * (w - 50) / n},${50 + (1 - y / (y0 + 1)) * (h - 50)}`);
+    let dx = (alpha * x - beta * x * y);
+    let dy = (delta * x * y - gamma * y);
+    x += dx;
+    y += dy;
+  }
+  let polylineX = svg.querySelector('ode-series-x');
+  let polylineY = svg.querySelector('ode-series-y');
+  if (polylineX) polylineX.setAttribute('points', pointsX.join(' '));
+  if (polylineY) polylineY.setAttribute('points', pointsY.join(' '));
+}
+
+// Play/Pause
+function startPlay() {
+  playing = true;
+  playTimer = setInterval(() => {
+    if (!playing) return;
+    let speed = parseInt(document.getElementById('speed').value);
+    step(speed);
+  }, 1000 / speed);
+}
+
+function stopPlay() {
+  playing = false;
+  clearInterval(playTimer);
+}
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if (e.key === ' ') {
+    e.preventDefault();
+    if (playing) stopPlay();
+    else startPlay();
+  } else if (e.key === 's') {
+    e.preventDefault();
+    step(1);
+  } else if (e.key === 'r') {
+    e.preventDefault();
+    let seed = parseInt(document.getElementById('seed').value);
+    reset(seed, {});
+  }
+});
+
+// Initialize
+reset(42, {});
+</script></body>
+</html>

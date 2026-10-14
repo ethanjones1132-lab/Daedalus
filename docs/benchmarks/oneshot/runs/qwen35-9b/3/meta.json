@@ -1,0 +1,22 @@
+{
+ "model": "qwen35-9b",
+ "file": "unsloth-Qwen3.5-9B-Q5_K_M.gguf",
+ "seed": 3,
+ "ncmoe": 99,
+ "spec": "ngram",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 7089,
+   "spec": "ngram"
+  }
+ ],
+ "wall_s": 255.4,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 10038,
+ "gen_tps": 39.6,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.67
+}

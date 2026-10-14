@@ -1,0 +1,1 @@
+Need plan 400 words. Then full html. Due to time, produce concise.

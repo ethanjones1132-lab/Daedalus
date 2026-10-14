@@ -1,0 +1,49 @@
+﻿checked 2026-10-04T11:34:46
+
+
+FriendlyName      : KINGSTON SNV2S1000G
+SerialNumber      : 0000_0000_0000_0000_0026_B768_6EF3_C6F5.
+FirmwareVersion   : CBG04418
+MediaType         : SSD
+BusType           : NVMe
+HealthStatus      : Healthy
+OperationalStatus : OK
+Size              : 1000204886016
+
+
+
+
+
+ObjectId                : {1}\\ETHANSPC\root/Microsoft/Windows/Storage/Providers_v2\SPACES_StorageReliabilityCounter.Ob
+                          jectId="{3fbccff7-c356-11ef-9aec-806e6f6e6963}:RC:{0dd4d068-43e8-0629-0b38-155f2e69ef4c}"
+PassThroughClass        : 
+PassThroughIds          : 
+PassThroughNamespace    : 
+PassThroughServer       : 
+UniqueId                : {3fbccff7-c356-11ef-9aec-806e6f6e6963}:RC:{0dd4d068-43e8-0629-0b38-155f2e69ef4c}
+DeviceId                : 0
+FlushLatencyMax         : 159
+LoadUnloadCycleCount    : 
+LoadUnloadCycleCountMax : 
+ManufactureDate         : 
+PowerOnHours            : 
+ReadErrorsCorrected     : 
+ReadErrorsTotal         : 
+ReadErrorsUncorrected   : 
+ReadLatencyMax          : 2690
+StartStopCycleCount     : 
+StartStopCycleCountMax  : 
+Temperature             : 41
+TemperatureMax          : 75
+Wear                    : 0
+WriteErrorsCorrected    : 
+WriteErrorsTotal        : 
+WriteErrorsUncorrected  : 
+WriteLatencyMax         : 430
+PSComputerName          : 
+CimClass                : root/microsoft/windows/storage:MSFT_StorageReliabilityCounter
+CimInstanceProperties   : {ObjectId, PassThroughClass, PassThroughIds, PassThroughNamespace...}
+CimSystemProperties     : Microsoft.Management.Infrastructure.CimSystemProperties
+
+
+

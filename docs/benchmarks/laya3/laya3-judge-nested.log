@@ -1,0 +1,362 @@
+Laya worker up; 2797 MB available with Qwen and Laya loaded
+d_median_dilution_volume t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 25 s
+d_median_dilution_volume t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 23 s
+d_median_dilution_volume t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_proration_month_days t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence scale; 75 s
+d_proration_month_days t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence none; 60 s
+d_proration_month_days t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence none; 87 s
+d_quilt_block_month_days t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 58 s
+d_quilt_block_month_days t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 55 s
+d_quilt_block_month_days t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 47 s
+d_median_sensor_low t0: r8 0/8, pr 2/3 pass grading; p3 fixes [False, False] evidence missing; 29 s
+d_median_sensor_low t1: r8 0/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 27 s
+d_median_sensor_low t2: r8 3/8, pr 3/3 pass grading; p3 fixes [False, False] evidence type; 30 s
+d_chess_clock_after_moves t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 21 s
+d_chess_clock_after_moves t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_chess_clock_after_moves t2: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 22 s
+d_dominant_moon_phase t0: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_dominant_moon_phase t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 32 s
+d_dominant_moon_phase t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 26 s
+d_next_departure_index t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 38 s
+d_next_departure_index t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 31 s
+d_next_departure_index t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 36 s
+d_cumulative_split_times t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 28 s
+d_cumulative_split_times t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 25 s
+d_cumulative_split_times t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 24 s
+d_median_gym_duration t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 23 s
+d_median_gym_duration t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 24 s
+d_median_gym_duration t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 19 s
+d_cumulative_rentals t0: r8 3/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 19 s
+d_cumulative_rentals t1: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 21 s
+d_cumulative_rentals t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 17 s
+d_badge_hsv_to_rgb t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 113 s
+d_badge_hsv_to_rgb t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 72 s
+d_badge_hsv_to_rgb t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 84 s
+d_gps_track_odometer t0: r8 6/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 60 s
+d_gps_track_odometer t1: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 54 s
+d_gps_track_odometer t2: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 55 s
+d_lower_median_pressure t0: r8 1/8, pr 3/3 pass grading; p3 fixes [False, False] evidence missing; 29 s
+d_lower_median_pressure t1: r8 2/8, pr 3/3 pass grading; p3 fixes [False, False] evidence missing; 35 s
+d_lower_median_pressure t2: r8 1/8, pr 1/3 pass grading; p3 fixes [False, False] evidence missing; 23 s
+d_alarm_first_at_or_after t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 27 s
+d_alarm_first_at_or_after t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 32 s
+d_alarm_first_at_or_after t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 34 s
+d_museum_ticket_median t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 19 s
+d_museum_ticket_median t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_museum_ticket_median t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 24 s
+d_median_fuel_economy t0: r8 1/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 31 s
+d_median_fuel_economy t1: r8 2/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 34 s
+d_median_fuel_economy t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 23 s
+d_deposit_median_low t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True] evidence none; 31 s
+d_deposit_median_low t1: r8 4/8, pr 3/3 pass grading; p3 fixes [False, False] evidence type; 35 s
+d_deposit_median_low t2: r8 6/8, pr 3/3 pass grading; p3 fixes [False, True] evidence missing; 31 s
+d_translation_memory_score t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 29 s
+d_translation_memory_score t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 24 s
+d_translation_memory_score t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 28 s
+d_sensor_calibration_median t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 37 s
+d_sensor_calibration_median t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 32 s
+d_sensor_calibration_median t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 28 s
+d_median_claim t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 20 s
+d_median_claim t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 24 s
+d_median_claim t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 19 s
+d_odometer_running_totals t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True] evidence none; 26 s
+d_odometer_running_totals t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 22 s
+d_odometer_running_totals t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 24 s
+d_word_tally_whitespace t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 19 s
+d_word_tally_whitespace t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 23 s
+d_word_tally_whitespace t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 18 s
+d_tile_coords_floor t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 68 s
+d_tile_coords_floor t1: r8 7/8, pr 3/3 pass grading; p3 fixes [False] evidence none; 53 s
+d_tile_coords_floor t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 53 s
+d_median_invoice t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 28 s
+d_median_invoice t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 24 s
+d_median_invoice t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence none; 36 s
+d_poll_winner_order t0: r8 8/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 33 s
+d_poll_winner_order t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 34 s
+d_poll_winner_order t2: r8 6/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 32 s
+d_solar_efficiency_scale t0: r8 1/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 78 s
+d_solar_efficiency_scale t1: r8 1/8, pr 0/3 pass grading; p3 fixes [True, False] evidence type; 70 s
+d_solar_efficiency_scale t2: r8 2/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 94 s
+d_pulse_meter_m3 t0: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 28 s
+d_pulse_meter_m3 t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 23 s
+d_pulse_meter_m3 t2: r8 5/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 22 s
+d_role_rank_outranks t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 19 s
+d_role_rank_outranks t1: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence base; 20 s
+d_role_rank_outranks t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence base; 22 s
+d_drone_ceiling_feet t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 44 s
+d_drone_ceiling_feet t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 33 s
+d_drone_ceiling_feet t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 31 s
+d_tournament_bracket_pairs t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 22 s
+d_tournament_bracket_pairs t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 33 s
+d_tournament_bracket_pairs t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 21 s
+d_battery_permille t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 69 s
+d_battery_permille t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 59 s
+d_battery_permille t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 52 s
+d_cricket_overs_runrate t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 29 s
+d_cricket_overs_runrate t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 21 s
+d_cricket_overs_runrate t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 20 s
+d_hotel_booking_units t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 18 s
+d_hotel_booking_units t1: r8 7/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 20 s
+d_hotel_booking_units t2: r8 6/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 28 s
+d_conveyor_belt_speed_units t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 176 s
+d_conveyor_belt_speed_units t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 134 s
+d_conveyor_belt_speed_units t2: r8 1/8, pr 0/3 pass grading; p3 fixes [True, False] evidence type; 74 s
+d_delivery_window_exclusive t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_delivery_window_exclusive t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 24 s
+d_delivery_window_exclusive t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 44 s
+d_laser_head_lift_cm_scale t0: r8 6/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 51 s
+d_laser_head_lift_cm_scale t1: r8 4/8, pr 2/3 pass grading; p3 fixes [False, False] evidence type; 35 s
+d_laser_head_lift_cm_scale t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 25 s
+d_allergen_label_index t0: r8 3/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 62 s
+d_allergen_label_index t1: r8 4/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 41 s
+d_allergen_label_index t2: r8 2/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 66 s
+d_signal_timing_ticks t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 33 s
+d_signal_timing_ticks t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 26 s
+d_signal_timing_ticks t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 20 s
+d_thumbnail_dimension_order t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 30 s
+d_thumbnail_dimension_order t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 32 s
+d_thumbnail_dimension_order t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 30 s
+d_unit_label_offset t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 22 s
+d_unit_label_offset t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 18 s
+d_unit_label_offset t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 19 s
+d_textfit_half_columns t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 43 s
+d_textfit_half_columns t1: r8 6/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 50 s
+d_textfit_half_columns t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 41 s
+d_font_heading_step t0: r8 2/8, pr 1/3 pass grading; p3 fixes [False, False] evidence type; 79 s
+d_font_heading_step t1: r8 5/8, pr 1/3 pass grading; p3 fixes [True, False] evidence type; 27 s
+d_font_heading_step t2: r8 4/8, pr 0/3 pass grading; p3 fixes [True, False] evidence type; 45 s
+d_survey_likert_offset t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 21 s
+d_survey_likert_offset t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, False] evidence type; 22 s
+d_survey_likert_offset t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence missing; 20 s
+d_theatre_row_index t0: r8 8/8, pr 3/3 pass grading; p3 fixes [False, False] evidence type; 26 s
+d_theatre_row_index t1: r8 8/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 35 s
+d_theatre_row_index t2: r8 8/8, pr 2/3 pass grading; p3 fixes [True, False] evidence type; 58 s
+d_backup_snapshot_order t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 27 s
+d_backup_snapshot_order t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 26 s
+d_backup_snapshot_order t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence order; 30 s
+d_subtitle_shift_ms t0: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 38 s
+d_subtitle_shift_ms t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 39 s
+d_subtitle_shift_ms t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 36 s
+d_nutrition_percent_dv t0: r8 2/8, pr 1/3 pass grading; p3 fixes [True, True] evidence type; 53 s
+d_nutrition_percent_dv t1: r8 3/8, pr 0/3 pass grading; p3 fixes [False, False] evidence type; 110 s
+d_nutrition_percent_dv t2: r8 5/8, pr 2/3 pass grading; p3 fixes [True, True] evidence type; 37 s
+d_knitting_row_index t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 60 s
+d_knitting_row_index t1: r8 4/8, pr 0/3 pass grading; p3 fixes [False, True] evidence type; 75 s
+d_knitting_row_index t2: r8 5/8, pr 1/3 pass grading; p3 fixes [False, True] evidence type; 50 s
+d_review_ratio_stat t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 40 s
+d_review_ratio_stat t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 39 s
+d_review_ratio_stat t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 38 s
+d_draft_overall_pick t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True, True] evidence type; 42 s
+d_draft_overall_pick t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 65 s
+d_draft_overall_pick t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 97 s
+d_parse_kerf_mm_or t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 56 s
+d_parse_kerf_mm_or t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_parse_kerf_mm_or t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_refills_remaining_parse t0: r8 6/8, pr 1/3 pass grading; p3 fixes [True] evidence None; 78 s
+d_refills_remaining_parse t1: r8 2/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 45 s
+d_refills_remaining_parse t2: r8 4/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 41 s
+d_password_grade_rules t0: r8 6/8, pr 2/3 pass grading; p3 fixes [False] evidence None; 118 s
+d_password_grade_rules t1: r8 6/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 90 s
+d_password_grade_rules t2: r8 2/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 74 s
+d_normalize_coupon_code t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 56 s
+d_normalize_coupon_code t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 32 s
+d_normalize_coupon_code t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 53 s
+d_format_address_label_line t0: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 60 s
+d_format_address_label_line t1: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 74 s
+d_format_address_label_line t2: r8 0/8, pr 0/3 pass grading; p3 fixes [False] evidence None; 54 s
+d_flight_leg_minutes t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 75 s
+d_flight_leg_minutes t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 73 s
+d_flight_leg_minutes t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 80 s
+d_parse_save_slot_id t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_parse_save_slot_id t1: r8 4/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 54 s
+d_parse_save_slot_id t2: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 41 s
+d_badge_tier_fallback t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 75 s
+d_badge_tier_fallback t1: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 73 s
+d_badge_tier_fallback t2: r8 6/8, pr 1/3 pass grading; p3 fixes [True] evidence None; 69 s
+d_parse_marathon_split t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 55 s
+d_parse_marathon_split t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 55 s
+d_parse_marathon_split t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 57 s
+d_lift_wait_minutes t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_lift_wait_minutes t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 44 s
+d_lift_wait_minutes t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 51 s
+d_bottle_vintage_or t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_bottle_vintage_or t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_bottle_vintage_or t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 45 s
+d_csv_export_field t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 57 s
+d_csv_export_field t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_csv_export_field t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 52 s
+d_parse_setlist_titles t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 42 s
+d_parse_setlist_titles t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_parse_setlist_titles t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 44 s
+d_parse_printer_job t0: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 58 s
+d_parse_printer_job t1: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 55 s
+d_parse_printer_job t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 63 s
+d_job_interval_seconds t0: r8 7/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 48 s
+d_job_interval_seconds t1: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_job_interval_seconds t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_panel_tilt_degrees t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_panel_tilt_degrees t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 43 s
+d_panel_tilt_degrees t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 44 s
+d_crossword_grid_rows t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_crossword_grid_rows t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 55 s
+d_crossword_grid_rows t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_convert_length_or_default t0: r8 7/8, pr 1/3 pass grading; p3 fixes [True] evidence None; 60 s
+d_convert_length_or_default t1: r8 5/8, pr 0/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_convert_length_or_default t2: r8 6/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 46 s
+d_parse_semver_or t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 34 s
+d_parse_semver_or t1: r8 4/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 35 s
+d_parse_semver_or t2: r8 2/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 36 s
+d_compost_probe_temp t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 36 s
+d_compost_probe_temp t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 37 s
+d_compost_probe_temp t2: r8 7/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 35 s
+d_backoff_seconds_spec t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 49 s
+d_backoff_seconds_spec t1: r8 5/8, pr 2/3 pass grading; p3 fixes [False] evidence None; 51 s
+d_backoff_seconds_spec t2: r8 5/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 44 s
+d_parse_bid_amount t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 66 s
+d_parse_bid_amount t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 40 s
+d_parse_bid_amount t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 40 s
+d_cricket_scorecard_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 51 s
+d_cricket_scorecard_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 57 s
+d_cricket_scorecard_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 51 s
+d_labelbox_csv_header t0: r8 8/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 74 s
+d_labelbox_csv_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 66 s
+d_labelbox_csv_header t2: r8 8/8, pr 0/3 pass grading; p3 fixes [True] evidence None; 62 s
+d_ballot_tally_append t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 82 s
+d_ballot_tally_append t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 81 s
+d_ballot_tally_append t2: r8 4/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 83 s
+d_deposit_csv_quoting t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 109 s
+d_deposit_csv_quoting t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 117 s
+d_deposit_csv_quoting t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 111 s
+d_fontsize_store_overwrite t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 83 s
+d_fontsize_store_overwrite t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 63 s
+d_fontsize_store_overwrite t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_gym_roster_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 78 s
+d_gym_roster_header t1: r8 5/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 81 s
+d_gym_roster_header t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 65 s
+d_spellcheck_wordlist_lines t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 59 s
+d_spellcheck_wordlist_lines t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_spellcheck_wordlist_lines t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 61 s
+d_tide_table_header t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 78 s
+d_tide_table_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 60 s
+d_tide_table_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 67 s
+d_bp_csv_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 61 s
+d_bp_csv_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 69 s
+d_bp_csv_header t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 68 s
+d_dna_sequence_csv_header t0: r8 4/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 67 s
+d_dna_sequence_csv_header t1: r8 5/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 73 s
+d_dna_sequence_csv_header t2: r8 1/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 67 s
+d_ferry_sailings_header t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 79 s
+d_ferry_sailings_header t1: r8 8/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_ferry_sailings_header t2: r8 7/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 67 s
+d_crossword_grid_header t0: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_crossword_grid_header t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 63 s
+d_crossword_grid_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_save_slot_roundtrip t0: r8 3/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 62 s
+d_save_slot_roundtrip t1: r8 1/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_save_slot_roundtrip t2: r8 2/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 65 s
+d_delivery_windows_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_delivery_windows_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 60 s
+d_delivery_windows_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 55 s
+d_batch_store_header t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 49 s
+d_batch_store_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_batch_store_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 52 s
+d_auction_ledger_sort t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 62 s
+d_auction_ledger_sort t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 61 s
+d_auction_ledger_sort t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 77 s
+d_laser_jobs_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 95 s
+d_laser_jobs_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 89 s
+d_laser_jobs_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 85 s
+d_dental_appointment_book t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 98 s
+d_dental_appointment_book t1: r8 3/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 69 s
+d_dental_appointment_book t2: r8 3/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 63 s
+d_fxrates_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 56 s
+d_fxrates_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 55 s
+d_fxrates_header t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_printer_queue_append t0: r8 3/8, pr 1/3 pass grading; p3 fixes [True] evidence None; 94 s
+d_printer_queue_append t1: r8 4/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 76 s
+d_printer_queue_append t2: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 75 s
+d_survey_header_row t0: r8 7/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 56 s
+d_survey_header_row t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 60 s
+d_survey_header_row t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_thumb_csv_overwrite t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 66 s
+d_thumb_csv_overwrite t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_thumb_csv_overwrite t2: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 80 s
+d_roombook_csv_header t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_roombook_csv_header t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 68 s
+d_roombook_csv_header t2: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 59 s
+d_telescope_booking_append t0: r8 5/8, pr 0/3 pass grading; p3 fixes [True] evidence None; 71 s
+d_telescope_booking_append t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 100 s
+d_telescope_booking_append t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 104 s
+d_star_catalog_brightest t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 59 s
+d_star_catalog_brightest t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_star_catalog_brightest t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_top_word_frequencies t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 43 s
+d_top_word_frequencies t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 34 s
+d_top_word_frequencies t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 38 s
+d_chess_clock_readout t0: r8 7/8, pr 1/3 pass grading; p3 fixes [True] evidence None; 106 s
+d_chess_clock_readout t1: r8 7/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 74 s
+d_chess_clock_readout t2: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 87 s
+d_loan_overdue_fine t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 41 s
+d_loan_overdue_fine t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_loan_overdue_fine t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 39 s
+d_save_slot_path t0: r8 6/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 74 s
+d_save_slot_path t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 70 s
+d_save_slot_path t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_sensor_calibration_map t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 96 s
+d_sensor_calibration_map t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 52 s
+d_sensor_calibration_map t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 60 s
+d_trail_climb_summary t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 29 s
+d_trail_climb_summary t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 26 s
+d_trail_climb_summary t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 22 s
+d_timezone_appointment_utc t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 65 s
+d_timezone_appointment_utc t1: r8 8/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 73 s
+d_timezone_appointment_utc t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 64 s
+d_delivery_window_span t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+d_delivery_window_span t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 43 s
+d_delivery_window_span t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_tyre_pressure_load t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 75 s
+d_tyre_pressure_load t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 61 s
+d_tyre_pressure_load t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 95 s
+d_bakery_batch_plan t0: r8 6/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 67 s
+d_bakery_batch_plan t1: r8 6/8, pr 3/3 pass grading; p3 fixes [False] evidence None; 73 s
+d_bakery_batch_plan t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 64 s
+d_nutrition_label_scaling t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 43 s
+d_nutrition_label_scaling t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 51 s
+d_nutrition_label_scaling t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 39 s
+d_quota_alloc t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 42 s
+d_quota_alloc t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 43 s
+d_quota_alloc t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_printer_job_time t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 41 s
+d_printer_job_time t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 66 s
+d_printer_job_time t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 91 s
+d_code_review_stats t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 33 s
+d_code_review_stats t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 34 s
+d_code_review_stats t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 35 s
+d_currency_exchange_convert t0: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 54 s
+d_currency_exchange_convert t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_currency_exchange_convert t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 48 s
+d_trip_mpg_fuel_helper t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 28 s
+d_trip_mpg_fuel_helper t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 35 s
+d_trip_mpg_fuel_helper t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 32 s
+d_ticket_queue_rank t0: r8 4/8, pr 0/3 pass grading; p3 fixes [True] evidence None; 65 s
+d_ticket_queue_rank t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 70 s
+d_ticket_queue_rank t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_garage_block_fee t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 98 s
+d_garage_block_fee t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 44 s
+d_garage_block_fee t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 53 s
+d_rate_limit_sliding_window t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_rate_limit_sliding_window t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 80 s
+d_rate_limit_sliding_window t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 61 s
+d_chairlift_queue_minutes t0: r8 8/8, pr 2/3 pass grading; p3 fixes [True] evidence None; 62 s
+d_chairlift_queue_minutes t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 44 s
+d_chairlift_queue_minutes t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 47 s
+d_station_kw_alloc t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 82 s
+d_station_kw_alloc t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 52 s
+d_station_kw_alloc t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 70 s
+d_csv_export_row t0: r8 5/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 50 s
+d_csv_export_row t1: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 46 s
+d_csv_export_row t2: r8 7/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 33 s
+d_warehouse_pick_route t0: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 64 s
+d_warehouse_pick_route t1: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 64 s
+d_warehouse_pick_route t2: r8 8/8, pr 3/3 pass grading; p3 fixes [True] evidence None; 58 s
+done in 306.3 min

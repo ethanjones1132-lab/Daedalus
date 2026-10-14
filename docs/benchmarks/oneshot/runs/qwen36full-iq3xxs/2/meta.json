@@ -1,0 +1,20 @@
+{
+ "model": "qwen36full-iq3xxs",
+ "file": "Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
+ "seed": 2,
+ "ncmoe": 26,
+ "fit": [
+  {
+   "ncmoe": 26,
+   "loaded": true,
+   "vram_used_mib": 7596
+  }
+ ],
+ "wall_s": 261.5,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 9675,
+ "gen_tps": 38.3,
+ "has_reasoning": false,
+ "ram_avail_gb": 0.7
+}

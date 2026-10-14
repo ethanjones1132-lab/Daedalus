@@ -1,0 +1,13 @@
+{
+ "truncated": false,
+ "app_bytes": 29631,
+ "app_lines": 845,
+ "external_refs": 0,
+ "plan_words": 243,
+ "gen_n": 10038,
+ "gen_tps": 39.6,
+ "wall_s": 255.4,
+ "finish_reason": "stop",
+ "console_errors": 1,
+ "blocked_requests": 0
+}

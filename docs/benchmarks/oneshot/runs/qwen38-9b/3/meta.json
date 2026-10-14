@@ -1,0 +1,22 @@
+{
+ "model": "qwen38-9b",
+ "file": "published-Q4_K_M.gguf",
+ "seed": 3,
+ "ncmoe": 99,
+ "spec": "mtp",
+ "fit": [
+  {
+   "ncmoe": 99,
+   "loaded": true,
+   "vram_used_mib": 6848,
+   "spec": "mtp"
+  }
+ ],
+ "wall_s": 140.1,
+ "finish_reason": "stop",
+ "prompt_n": 3941,
+ "gen_n": 10161,
+ "gen_tps": 73.7,
+ "has_reasoning": false,
+ "ram_avail_gb": 1.35
+}
