@@ -43,7 +43,7 @@ export const BUILTIN_MODES: Record<string, AgentMode> = {
     tools_filter: [
       "read_file", "write_file", "edit_file", "multi_edit", "apply_patch",
       "glob", "grep", "list_directory",
-      "git_metadata",
+      "git_metadata", "git_diff", "git_log",
       "bash",
       // win32-only registry entry (shell-bundle); intersection with the live
       // registry drops it on non-win32, so no platform branch is needed here.
