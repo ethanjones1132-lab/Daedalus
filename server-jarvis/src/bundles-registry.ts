@@ -14,6 +14,7 @@ import { registerMcpClientBundle } from "./mcp-client-bundle";
 import { registerInteractiveBundle } from "./interactive-bundle";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
 import { registerGitDiffBundle } from "./git-diff-bundle";
+import { registerGitLogBundle } from "./git-log-bundle";
 
 /** Register the standard Jarvis tool bundles on a fresh runtime. */
 export function registerStandardBundles(runtime: ToolRuntime): void {
@@ -26,4 +27,5 @@ export function registerStandardBundles(runtime: ToolRuntime): void {
   registerInteractiveBundle(runtime);
   registerGitMetadataBundle(runtime);
   registerGitDiffBundle(runtime);
+  registerGitLogBundle(runtime);
 }
