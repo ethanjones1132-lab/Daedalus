@@ -43,7 +43,7 @@ describe("mcp client bundle", () => {
       expect(result.is_error).toBe(false);
       expect(typeof result.output).toBe("string");
     } finally {
-      rmSync(ws, { recursive: true, force: true });
+      rmSyncRetry(ws, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

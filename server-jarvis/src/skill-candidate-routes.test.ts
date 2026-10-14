@@ -105,7 +105,7 @@ beforeEach(() => {
 
 afterEach(() => {
   delete (globalThis as { __skillCandidatesDirOverride?: string }).__skillCandidatesDirOverride;
-  if (root) rmSync(root, { recursive: true, force: true });
+  if (root) rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("skill candidate lifecycle routes", () => {

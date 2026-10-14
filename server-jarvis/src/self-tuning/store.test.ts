@@ -67,7 +67,7 @@ describe("schema migrations apply to a pre-existing database", () => {
       // Windows keeps the file handle while the store's connection is open;
       // teardown must never mask the assertion under test.
       try {
-        rmSync(dir, { recursive: true, force: true });
+        rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
       } catch { /* temp dir reaped by the OS */ }
     }
   }
@@ -272,7 +272,7 @@ describe("SelfTuningStore trajectory retention", () => {
     try {
       fn(new SelfTuningStore(path), path);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }
 

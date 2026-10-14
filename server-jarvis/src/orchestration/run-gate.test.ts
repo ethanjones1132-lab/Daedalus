@@ -34,7 +34,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "named_test.py"));
       expect(target?.reason).toBe("explicit_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -47,7 +47,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "test_app.py"));
       expect(target?.reason).toBe("adjacent_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -60,7 +60,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "_t.py"));
       expect(target?.reason).toBe("adjacent_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -82,7 +82,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "_t.py"));
       expect(target?.reason).toBe("adjacent_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -102,7 +102,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "_t.py"));
       expect(target?.reason).toBe("adjacent_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -123,7 +123,7 @@ describe("run gate target selection", () => {
       );
       expect(target?.path).toBe(join(root, "workspace", "_t.py"));
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -136,7 +136,7 @@ describe("run gate target selection", () => {
       expect(target?.path).toBe(join(root, "script.py"));
       expect(target?.reason).toBe("standalone_script");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -151,7 +151,7 @@ describe("run gate execution", () => {
       expect(result.target).toBe(join(root, "test_app.py"));
       expect(result.targetReason).toBe("adjacent_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -163,7 +163,7 @@ describe("run gate execution", () => {
       expect(result.status).toBe("passed");
       expect(result.targetReason).toBe("explicit_test");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -179,7 +179,7 @@ describe("run gate execution", () => {
       expect(result.targetReason).toBe("standalone_script");
       expect(result.reason).toBeUndefined();
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -193,7 +193,7 @@ describe("run gate execution", () => {
       expect(result.issues[0]?.path).toBe(join(root, "test_app.py"));
       expect(result.issues[0]?.error).toContain("RuntimeError");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

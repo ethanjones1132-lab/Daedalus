@@ -22,7 +22,7 @@ describe("loadPrompt resolution", () => {
       expect(loadPrompt("router.md")).toBe("PROMPT_BODY");
     } finally {
       delete process.env.JARVIS_PROMPTS_DIR;
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -63,7 +63,7 @@ describe("loadPrompt resolution", () => {
       cwd: root,
     });
 
-    rmSync(root, { recursive: true, force: true });
+    rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 
     if (sub.exitCode !== 0) {
       throw new Error(
@@ -122,7 +122,7 @@ describe("loadPrompt resolution", () => {
       cwd: root,
     });
 
-    rmSync(root, { recursive: true, force: true });
+    rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 
     if (sub.exitCode !== 0) {
       throw new Error(
@@ -181,7 +181,7 @@ describe("loadPrompt resolution", () => {
       expect(() => loadPrompt("nonexistent.md")).toThrow(/Prompt file not found/);
     } finally {
       process.chdir(originalCwd);
-      rmSync(isolatedCwd, { recursive: true, force: true });
+      rmSyncRetry(isolatedCwd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

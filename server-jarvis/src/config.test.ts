@@ -88,7 +88,7 @@ describe("trajectory snapshot retention config", () => {
       thrown = error;
     } finally {
       after = readFileSync(file, "utf8");
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
     expect(thrown).toBeInstanceOf(InvalidConfigError);
     expect(after).toBe(before);

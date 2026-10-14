@@ -431,7 +431,7 @@ describe("session-memory", () => {
       expect(reader.getTaskRun("disk-sess")?.schemaVersion).toBe(2);
       expect(reader.getTaskRun("disk-sess")?.reconstruction).toBe("none");
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -486,7 +486,7 @@ describe("session-memory", () => {
       expect(actual.verifiedAt).toBe(expected.verifiedAt);
       expect(actual.updatedAt).toBe(expected.updatedAt);
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -532,7 +532,7 @@ describe("session-memory", () => {
       expect(task?.plan).toBeUndefined();
       expect(task?.objective).toBe("old flat objective");
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -572,7 +572,7 @@ describe("session-memory", () => {
       expect(warnings).toHaveLength(1);
     } finally {
       console.warn = originalWarn;
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

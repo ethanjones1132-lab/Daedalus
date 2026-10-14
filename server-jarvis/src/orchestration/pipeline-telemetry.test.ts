@@ -265,7 +265,7 @@ describe("pipeline stage telemetry", () => {
       expect(readFileSync(join(workspace, "target.txt"), "utf8")).toBe("after\n");
       expect(result.state.executor?.toolCalls.find((call) => call.name === "edit_file")?.is_error).toBe(false);
     } finally {
-      rmSync(workspace, { recursive: true, force: true });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -365,7 +365,7 @@ describe("pipeline stage telemetry", () => {
       // After the live complete read of the small on-disk file, ledger unlocks.
       expect(hasFileBeenRead(resolved)).toBe(true);
     } finally {
-      rmSync(workspace, { recursive: true, force: true });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

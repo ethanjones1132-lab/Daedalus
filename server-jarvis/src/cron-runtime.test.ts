@@ -198,7 +198,7 @@ describe("runCronWithRetries contract", () => {
       expect(await persisted.exists()).toBe(true);
     }
 
-    rmSync(tmp, { recursive: true, force: true });
+    rmSyncRetry(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("exhausts maxAttempts when the tool keeps failing", async () => {
@@ -224,7 +224,7 @@ describe("runCronWithRetries contract", () => {
     expect(evidence.every((e) => e.status === "failed")).toBe(true);
     expect(evidence[0]?.error_code).toBe("handler_error");
 
-    rmSync(tmp, { recursive: true, force: true });
+    rmSyncRetry(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it("passes cancellation to the tool execution context and stops the request", async () => {

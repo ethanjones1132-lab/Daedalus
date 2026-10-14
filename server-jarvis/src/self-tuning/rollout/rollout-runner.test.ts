@@ -361,7 +361,7 @@ describe("runGradedFixtureCheck", () => {
       expect(check?.ran).toBe(true);
       expect(check?.passed).toBe(true);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -373,7 +373,7 @@ describe("runGradedFixtureCheck", () => {
       expect(check?.passed).toBe(false);
       expect(check?.detail).toContain("boom");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -388,7 +388,7 @@ describe("runGradedFixtureCheck", () => {
       expect(Date.now() - startedAt).toBeLessThan(20_000);
       expect(check?.passed).not.toBe(true);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 30_000);
 
@@ -397,7 +397,7 @@ describe("runGradedFixtureCheck", () => {
     try {
       expect(await runGradedFixtureCheck(root)).toBeNull();
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -419,7 +419,7 @@ describe("runGradedFixtureCheck", () => {
       // Disk must also carry the restored oracle, not the neutered stub.
       expect(readFileSync(join(root, "_t.py"), "utf8")).toBe(authentic);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -435,7 +435,7 @@ describe("runGradedFixtureCheck", () => {
       expect(check?.passed).toBe(true);
       expect(readFileSync(join(root, "_t.py"), "utf8")).toBe(authentic);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -448,7 +448,7 @@ describe("runGradedFixtureCheck", () => {
       const check = await runGradedFixtureCheck(root);
       expect(check?.passed).toBe(true);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

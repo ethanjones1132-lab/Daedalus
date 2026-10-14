@@ -36,7 +36,7 @@ function makeFixtureRoot(name: string) {
       return filePath;
     },
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     },
   };
 }

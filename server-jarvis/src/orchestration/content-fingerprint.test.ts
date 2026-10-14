@@ -28,7 +28,7 @@ describe("content fingerprints", () => {
       expect(present.bytes).toBe(6);
       expect(present.sha256).toHaveLength(64);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -1309,7 +1309,7 @@ describe("PersistentConductor", () => {
     } finally {
       if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
       else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
-      rmSync(promptDir, { recursive: true, force: true });
+      rmSyncRetry(promptDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1356,8 +1356,8 @@ describe("PersistentConductor", () => {
     } finally {
       if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
       else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
-      rmSync(promptDir, { recursive: true, force: true });
-      rmSync(sessionsRoot, { recursive: true, force: true });
+      rmSyncRetry(promptDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      rmSyncRetry(sessionsRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1410,8 +1410,8 @@ describe("PersistentConductor", () => {
     } finally {
       if (previousPromptsDir === undefined) delete process.env.JARVIS_PROMPTS_DIR;
       else process.env.JARVIS_PROMPTS_DIR = previousPromptsDir;
-      rmSync(promptDir, { recursive: true, force: true });
-      rmSync(sessionsRoot, { recursive: true, force: true });
+      rmSyncRetry(promptDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      rmSyncRetry(sessionsRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1425,7 +1425,7 @@ describe("PersistentConductor", () => {
 
     afterEach(() => {
       delete (globalThis as any).__skillCandidatesDirOverride;
-      if (candidatesDir) rmSync(candidatesDir, { recursive: true, force: true });
+      if (candidatesDir) rmSyncRetry(candidatesDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     });
 
     function mockOllamaCapture(chatBodies: Array<{ messages: Array<{ role: string; content: string }> }>) {
@@ -1609,7 +1609,7 @@ describe("PersistentConductor", () => {
       expect(loaded?.messages.length).toBeGreaterThan(2);
       expect(loaded?.messages.some((m) => m.content.includes("persist me"))).toBe(true);
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1661,7 +1661,7 @@ describe("PersistentConductor", () => {
       expect(after.kvGeneration).toBe(1);
       expect(after.prefixTokensRecomputed).toBeGreaterThan(0);
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1701,7 +1701,7 @@ describe("PersistentConductor", () => {
       expect(existsSync(stalePath)).toBe(false);
       expect(existsSync(freshPath)).toBe(true);
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1724,7 +1724,7 @@ describe("PersistentConductor", () => {
       expect(removed).toBe(0);
       expect(require("fs").existsSync(fakeFile)).toBe(true);
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1766,7 +1766,7 @@ describe("PersistentConductor", () => {
       const safeName = "iso-sess".replace(/[^a-zA-Z0-9._-]/g, "_");
       expect(safeName).toBe("iso-sess");
     } finally {
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -1800,7 +1800,7 @@ describe("PersistentConductor", () => {
       expect(readFileSync(path, "utf-8")).not.toContain("secret persisted content");
     } finally {
       console.warn = originalWarn;
-      rmSync(tempRoot, { recursive: true, force: true });
+      rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

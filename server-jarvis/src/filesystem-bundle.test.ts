@@ -29,7 +29,7 @@ function linkDirectory(target: string, link: string): void {
 afterEach(() => {
   while (cleanups.length) {
     const dir = cleanups.pop()!;
-    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    try { rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {}
   }
 });
 

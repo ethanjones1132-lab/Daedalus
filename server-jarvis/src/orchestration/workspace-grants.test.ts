@@ -7,7 +7,7 @@ import { extractRootGrants } from "./workspace-grants";
 const roots: string[] = [];
 
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("workspace root grants", () => {

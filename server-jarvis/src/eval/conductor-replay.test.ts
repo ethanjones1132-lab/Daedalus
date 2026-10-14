@@ -813,7 +813,7 @@ function withCliDatabase<T>(callback: (context: {
     return callback({ db, dbPath, insertRun });
   } finally {
     db.close();
-    rmSync(root, { recursive: true, force: true });
+    rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

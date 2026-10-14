@@ -51,7 +51,7 @@ describe("dashboard-service", () => {
       expect(state.lastUpdated).toBeInstanceOf(Date);
     } finally {
       service.destroy();
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -68,7 +68,7 @@ describe("dashboard-service", () => {
       service.removeListener("stateChanged", handler);
     } finally {
       service.destroy();
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -87,7 +87,7 @@ describe("dashboard-service", () => {
       expect(service.getState().jobs).toEqual([]);
     } finally {
       service.destroy();
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -104,7 +104,7 @@ describe("dashboard-service", () => {
       expect(service.getState().pollInterval).toBe(12345);
     } finally {
       service.destroy();
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -114,7 +114,7 @@ describe("dashboard-service", () => {
       service.destroy();
       expect(() => service.destroy()).not.toThrow();
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -141,7 +141,7 @@ describe("dashboard-service", () => {
       expect(unknown).toBe("#6b7280");
     } finally {
       service.destroy();
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

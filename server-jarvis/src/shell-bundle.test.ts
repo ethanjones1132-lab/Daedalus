@@ -67,8 +67,8 @@ describe("ShellBundle", () => {
         basename(granted).toLowerCase(),
       );
     } finally {
-      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-      rmSync(granted, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(granted, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   }, { timeout: 15_000 });
 
@@ -88,8 +88,8 @@ describe("ShellBundle", () => {
       expect(result.is_error).toBe(true);
       expect(result.output).toContain("outside the workspace");
     } finally {
-      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-      rmSync(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   }, { timeout: 15_000 });
 
@@ -110,8 +110,8 @@ describe("ShellBundle", () => {
       expect(result.is_error).toBe(true);
       expect(result.output).toContain("outside the workspace");
     } finally {
-      rmSync(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-      rmSync(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+      rmSyncRetry(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
   }, { timeout: 15_000 });
 });

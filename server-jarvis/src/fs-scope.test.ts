@@ -25,7 +25,7 @@ function config(root: string, mode: "strict" | "permissive" | "off" = "strict"):
 }
 
 afterEach(() => {
-  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of tempRoots.splice(0)) rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("fs-scope", () => {

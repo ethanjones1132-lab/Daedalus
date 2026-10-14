@@ -303,7 +303,7 @@ describe("persistCampaignWinner", () => {
     resetPolicyStagingForTests();
     resetLearnedPoolStateForTests();
     resetGlobalThetaToBaseline();
-    rmSync(root, { recursive: true, force: true });
+    rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   const improved = (key = THETA_KEYS[0]!, value = BASELINE_THETA[key] + 2): CampaignResult => ({

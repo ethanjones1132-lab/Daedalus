@@ -49,7 +49,7 @@ describe("installSelfLog", () => {
       console.log = originalLog;
       console.warn = originalWarn;
       console.error = originalError;
-      rmSync(dir, { recursive: true, force: true });
+      rmSyncRetry(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -35,7 +35,7 @@ let activeWorkspaces: string[] = [];
 afterEach(() => {
   globalThis.fetch = originalFetch;
   for (const ws of activeWorkspaces) {
-    try { rmSync(ws, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { rmSyncRetry(ws, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch { /* best-effort */ }
   }
   activeWorkspaces = [];
 });

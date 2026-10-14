@@ -114,7 +114,7 @@ describe("snapshot survives unreadable directories", () => {
       expect(Object.keys(files)).toHaveLength(1);
       expect(Object.keys(files)[0]).toContain("ok.txt");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -125,7 +125,7 @@ describe("snapshot survives unreadable directories", () => {
         throw eperm(directory);
       })).rejects.toThrow("EPERM");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -161,7 +161,7 @@ describe("snapshot survives a directory misreported as a file entry", () => {
       expect(files[Object.keys(files).find((k) => k.includes("ok.txt"))!]).toStartWith("sha256:");
       expect(files[Object.keys(files).find((k) => k.includes("weird"))!]).toBe("unreadable:EISDIR");
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });
@@ -317,7 +317,7 @@ describe("Claude executor delegate", () => {
       expect(afterIdentity).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(afterIdentity).not.toBe(beforeIdentity);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 

@@ -16,7 +16,7 @@ const workspaces: string[] = [];
 afterEach(() => {
   globalThis.fetch = originalFetch;
   for (const workspace of workspaces.splice(0)) {
-    rmSync(workspace, { recursive: true, force: true });
+    rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 });
 

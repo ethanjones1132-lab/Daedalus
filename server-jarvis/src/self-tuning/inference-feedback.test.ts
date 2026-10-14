@@ -484,7 +484,7 @@ describe("findInferenceMetricsScript (env override precedence)", () => {
     } else {
       process.env.JARVIS_INFERENCE_METRICS_SCRIPT = savedEnv;
     }
-    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    if (tempRoot) rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   test("JARVIS_INFERENCE_METRICS_SCRIPT takes priority when the configured file exists", () => {

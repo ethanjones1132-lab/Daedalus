@@ -206,7 +206,7 @@ describe("orchestrator transcript context", () => {
     } finally {
       if (previousRoot === undefined) delete globalState.__skillCandidatesDirOverride;
       else globalState.__skillCandidatesDirOverride = previousRoot;
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

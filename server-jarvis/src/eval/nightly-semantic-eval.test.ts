@@ -31,7 +31,7 @@ describe("nightly semantic evaluation runner", () => {
       expect(JSON.parse(readFileSync(result.artifact_path, "utf-8")).status).toBe("passed");
       expect(JSON.parse(readFileSync(result.latest_path, "utf-8")).run_id).toBe(result.run_id);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -52,7 +52,7 @@ describe("nightly semantic evaluation runner", () => {
       expect(result.regressions[0]).toContain("case-a");
       expect(JSON.parse(readFileSync(result.alert_path!, "utf-8")).status).toBe("regressed");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -70,7 +70,7 @@ describe("nightly semantic evaluation runner", () => {
       expect(result.alert_path).toBeDefined();
       expect(result.regressions[0]).toContain("baseline missing");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

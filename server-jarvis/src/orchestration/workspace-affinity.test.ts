@@ -13,7 +13,7 @@ function tempWorkspace(): string {
 }
 
 afterEach(() => {
-  for (const path of created.splice(0)) rmSync(path, { recursive: true, force: true });
+  for (const path of created.splice(0)) rmSyncRetry(path, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 });
 
 describe("workspace affinity", () => {

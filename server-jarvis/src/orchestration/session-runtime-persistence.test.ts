@@ -203,7 +203,7 @@ describe("session runtime persistence", () => {
       writeJsonAtomic(path, { version: 2, marker: "healed" });
       expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual({ version: 2, marker: "healed" });
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -60,7 +60,7 @@ describe("seedFixtureWorkspace", () => {
       expect(existsSync(graded)).toBe(true);
       expect(readFileSync(graded, "utf8")).toBe(withSubdir!.test);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
@@ -71,8 +71,8 @@ describe("seedFixtureWorkspace", () => {
     try {
       expect(a).not.toBe(b);
     } finally {
-      rmSync(a, { recursive: true, force: true });
-      rmSync(b, { recursive: true, force: true });
+      rmSyncRetry(a, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      rmSyncRetry(b, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 });

@@ -17,7 +17,7 @@ const temporaryDirectories: string[] = [];
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
-    rmSync(directory, { recursive: true, force: true });
+    rmSyncRetry(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 });
 

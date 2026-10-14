@@ -16,7 +16,7 @@ function makeAgentRoot(name: string) {
   return {
     root,
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     },
   };
 }

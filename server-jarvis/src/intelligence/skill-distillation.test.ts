@@ -34,7 +34,7 @@ describe("skill distillation (Track C)", () => {
 
   afterEach(() => {
     delete (globalThis as any).__skillCandidatesDirOverride;
-    if (tempRoot) rmSync(tempRoot, { recursive: true, force: true });
+    if (tempRoot) rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   test("distills a candidate from a successful run", () => {

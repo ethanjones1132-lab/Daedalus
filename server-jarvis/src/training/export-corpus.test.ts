@@ -10,7 +10,7 @@ async function withTempDir<T>(fn: (root: string) => T | Promise<T>): Promise<T> 
   try {
     return await fn(root);
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

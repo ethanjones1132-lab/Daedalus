@@ -21,7 +21,7 @@ function makeTempWorkspace(): string {
 afterEach(() => {
   while (cleanups.length) {
     const d = cleanups.pop()!;
-    try { rmSync(d, { recursive: true, force: true }); } catch {}
+    try { rmSyncRetry(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 }); } catch {}
   }
 });
 

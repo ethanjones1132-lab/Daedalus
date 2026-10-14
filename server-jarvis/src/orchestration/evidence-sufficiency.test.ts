@@ -339,8 +339,8 @@ describe("assessWorkspaceEvidence", () => {
       expect(a.sufficient).toBe(false);
       expect(a.contentReads).toBe(2);
     } finally {
-      rmSync(workspace, { recursive: true, force: true });
-      rmSync(grant, { recursive: true, force: true });
+      rmSyncRetry(workspace, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+      rmSyncRetry(grant, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
 
