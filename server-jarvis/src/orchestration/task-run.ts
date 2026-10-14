@@ -10,6 +10,101 @@ export type TaskRunDepth = "standard" | "deep";
 export type TaskRunStatus = "active" | "paused" | "completed" | "failed" | "cancelled";
 
 /**
+ * Goal-linked execution state (Roadmap Priority #2, Part 2). Distinct from
+ * {@link TaskRunStatus}, which preserves the original continuation machine: an
+ * ordinary goal-less run never carries this. `waiting_for_user` and `blocked`
+ * are intentionally NOT collapsed into `paused`, so a resumed run keeps its
+ * cause (a pending approval vs. a hard blocker) and a status-only path can
+ * never promote any of them to `completed`.
+ */
+export type GoalExecutionStatus =
+  | "idle"
+  | "active"
+  | "paused"
+  | "waiting_for_user"
+  | "blocked"
+  | "failed"
+  | "cancelled"
+  | "completed";
+
+/**
+ * Durable outcome of one external side effect (an action with a real-world
+ * consequence). `ambiguous` means the effect may have begun but its terminal
+ * outcome could not be observed (crash/restart mid-flight) — it must never be
+ * blindly replayed; it is surfaced for review with its exact original identity.
+ */
+export type TaskRunEffectOutcome = "none" | "started" | "completed" | "ambiguous";
+
+/**
+ * One durable, identity-stable effect record. `effectId` is the idempotency
+ * key: a restart reconciles by this exact id before deciding whether an effect
+ * may be attempted again.
+ */
+export interface TaskRunEffectRecord {
+  effectId: string;
+  kind: string;
+  outcome: TaskRunEffectOutcome;
+  /** Optional durable reference to the effect's result/output (never a transcript). */
+  ref?: string;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+/**
+ * Durable execution checkpoint for a Goal-linked TaskRun. Records only
+ * structured state and references — never transcripts or memory text.
+ */
+export interface TaskRunCheckpoint {
+  /** Current plan item id or stage name (opaque). */
+  stage: string | null;
+  state: GoalExecutionStatus;
+  /** Monotonic attempt counter for the current stage. */
+  attempt: number;
+  /** Identity of the effect currently in flight, if any. */
+  currentEffectId: string | null;
+  /** Durable effect ledger, newest last. */
+  effects: TaskRunEffectRecord[];
+  /** Set when a run was recovered without a durable terminal observation. */
+  interruption?: TaskRunInterruption;
+  /** Durable evidence pointers (opaque refs) accumulated for this run. */
+  evidenceRefs: string[];
+  startedAt: string;
+  updatedAt: string;
+  resumedAt?: string;
+  finishedAt?: string;
+}
+
+/** A recorded interruption/recovery fact for a Goal-linked run. */
+export interface TaskRunInterruption {
+  detectedAt: string;
+  reason: string;
+  /** The run outcome observed before the interruption, if any. */
+  priorOutcome: string | null;
+  /** Whether the run was resumed after this interruption. */
+  resumed: boolean;
+}
+
+/**
+ * Stable native-authorized Goal association. `bindingId` is the one-shot
+ * capability identity the owned native child registered; `taskRunId` is the
+ * stable native execution identity bound at registration and preserved across
+ * restart before any retry. `goalId` is never derived from message text, a
+ * client field, or memory.
+ */
+export interface TaskRunGoalLink {
+  goalId: string;
+  bindingId: string;
+  /** Stable native-bound TaskRun identity for this Goal execution. */
+  taskRunId: string;
+  sessionId: string;
+  agentId: string;
+  projectRoot: string | null;
+  objective: string;
+  criteria: string[];
+  linkedAt: string;
+}
+
+/**
  * TaskRunContract schema version.
  * - 1 / missing: legacy (flat remainingWork + numeric evidenceCount only)
  * - 2: TaskPlan ledger with ordered items, acceptance checks, itemized evidence
@@ -136,6 +231,15 @@ export interface TaskRunContract {
   lastWriteTargets?: string[];
   lastOutcome?: string;
   lastTurnId?: string;
+  /**
+   * Stable native-authorized Goal association (Roadmap Priority #2, Part 2).
+   * Absent on ordinary goal-less runs, which preserve prior behavior exactly.
+   */
+  goal?: TaskRunGoalLink;
+  /**
+   * Durable Goal-linked execution checkpoint. Present only on Goal-linked runs.
+   */
+  checkpoint?: TaskRunCheckpoint;
   createdAt: string;
   updatedAt: string;
 }
@@ -159,6 +263,8 @@ export interface CreateTaskRunInput {
   estimatedComplexity?: "low" | "medium" | "high";
   /** Optional ordered plan items to seed the v2 ledger. */
   planItems?: CreateTaskPlanItemInput[];
+  /** Optional native-authorized Goal association for this run. */
+  goal?: TaskRunGoalLink;
 }
 
 export interface TaskRunAcceptanceInput {
@@ -954,6 +1060,8 @@ export function normalizeTaskRunOnRead(raw: unknown): TaskRunContract | undefine
       : undefined,
     lastOutcome: typeof r.lastOutcome === "string" ? r.lastOutcome : undefined,
     lastTurnId: typeof r.lastTurnId === "string" ? r.lastTurnId : undefined,
+    goal: normalizeGoalLinkOnRead(r.goal),
+    checkpoint: normalizeCheckpointOnRead(r.checkpoint),
     createdAt: typeof r.createdAt === "string" ? r.createdAt : nowIso(),
     updatedAt: typeof r.updatedAt === "string" ? r.updatedAt : nowIso(),
     reconstruction: "none",
@@ -995,6 +1103,105 @@ function isTaskPlanGradingMode(value: unknown): value is TaskPlanGradingMode {
   return value === "conductor_direct_diff"
     || value === "reviewer_mediated"
     || value === "runtime_check";
+}
+
+const GOAL_EXECUTION_STATES = new Set<GoalExecutionStatus>([
+  "idle",
+  "active",
+  "paused",
+  "waiting_for_user",
+  "blocked",
+  "failed",
+  "cancelled",
+  "completed",
+]);
+const EFFECT_OUTCOMES = new Set<TaskRunEffectOutcome>([
+  "none",
+  "started",
+  "completed",
+  "ambiguous",
+]);
+
+function normalizeGoalLinkOnRead(raw: unknown): TaskRunGoalLink | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const g = raw as Record<string, unknown>;
+  if (typeof g.goalId !== "string" || g.goalId.trim().length === 0) return undefined;
+  if (typeof g.bindingId !== "string" || g.bindingId.trim().length === 0) return undefined;
+  if (typeof g.taskRunId !== "string" || g.taskRunId.trim().length === 0) return undefined;
+  if (typeof g.sessionId !== "string" || typeof g.agentId !== "string") return undefined;
+  if (g.projectRoot !== null && typeof g.projectRoot !== "string") return undefined;
+  if (typeof g.objective !== "string") return undefined;
+  const criteria = Array.isArray(g.criteria)
+    ? g.criteria.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  return {
+    goalId: g.goalId.trim(),
+    bindingId: g.bindingId.trim(),
+    taskRunId: g.taskRunId.trim(),
+    sessionId: g.sessionId,
+    agentId: g.agentId,
+    projectRoot: typeof g.projectRoot === "string" ? g.projectRoot : null,
+    objective: g.objective,
+    criteria,
+    linkedAt: typeof g.linkedAt === "string" ? g.linkedAt : nowIso(),
+  };
+}
+
+function normalizeEffectOnRead(raw: unknown): TaskRunEffectRecord | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const e = raw as Record<string, unknown>;
+  if (typeof e.effectId !== "string" || e.effectId.trim().length === 0) return undefined;
+  if (typeof e.kind !== "string") return undefined;
+  const outcome = EFFECT_OUTCOMES.has(e.outcome as TaskRunEffectOutcome)
+    ? (e.outcome as TaskRunEffectOutcome)
+    : "ambiguous";
+  return {
+    effectId: e.effectId.trim(),
+    kind: e.kind,
+    outcome,
+    ...(typeof e.ref === "string" ? { ref: e.ref } : {}),
+    ...(typeof e.startedAt === "string" ? { startedAt: e.startedAt } : {}),
+    ...(typeof e.finishedAt === "string" ? { finishedAt: e.finishedAt } : {}),
+  };
+}
+
+function normalizeCheckpointOnRead(raw: unknown): TaskRunCheckpoint | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const c = raw as Record<string, unknown>;
+  const state = GOAL_EXECUTION_STATES.has(c.state as GoalExecutionStatus)
+    ? (c.state as GoalExecutionStatus)
+    : "idle";
+  const effects = Array.isArray(c.effects)
+    ? c.effects.map(normalizeEffectOnRead).filter((entry): entry is TaskRunEffectRecord => entry !== undefined)
+    : [];
+  const evidenceRefs = Array.isArray(c.evidenceRefs)
+    ? c.evidenceRefs.filter((entry): entry is string => typeof entry === "string")
+    : [];
+  let interruption: TaskRunInterruption | undefined;
+  if (c.interruption && typeof c.interruption === "object") {
+    const i = c.interruption as Record<string, unknown>;
+    if (typeof i.detectedAt === "string" && typeof i.reason === "string") {
+      interruption = {
+        detectedAt: i.detectedAt,
+        reason: i.reason,
+        priorOutcome: typeof i.priorOutcome === "string" ? i.priorOutcome : null,
+        resumed: i.resumed === true,
+      };
+    }
+  }
+  return {
+    stage: typeof c.stage === "string" ? c.stage : null,
+    state,
+    attempt: typeof c.attempt === "number" && Number.isFinite(c.attempt) ? Math.max(0, c.attempt) : 0,
+    currentEffectId: typeof c.currentEffectId === "string" ? c.currentEffectId : null,
+    effects,
+    ...(interruption ? { interruption } : {}),
+    evidenceRefs,
+    startedAt: typeof c.startedAt === "string" ? c.startedAt : nowIso(),
+    updatedAt: typeof c.updatedAt === "string" ? c.updatedAt : nowIso(),
+    ...(typeof c.resumedAt === "string" ? { resumedAt: c.resumedAt } : {}),
+    ...(typeof c.finishedAt === "string" ? { finishedAt: c.finishedAt } : {}),
+  };
 }
 
 function normalizeGroundingOnRead(raw: unknown): TaskPlanEvidenceGrounding | undefined {
@@ -1124,10 +1331,239 @@ export function createTaskRun(input: CreateTaskRunInput): TaskRunContract {
     createdAt: now,
     updatedAt: now,
   };
+  if (input.goal) {
+    contract = applyGoalLink(contract, input.goal);
+  }
   if (plan.items.length > 0) {
     contract = advancePlanQueue(contract);
   }
   return contract;
+}
+
+/**
+ * Attach a native-authorized Goal association to a contract and initialize its
+ * checkpoint. Pure; returns a new contract. Ordinary goal-less contracts are
+ * returned unchanged.
+ */
+export function applyGoalLink(
+  contract: TaskRunContract,
+  goal: TaskRunGoalLink,
+): TaskRunContract {
+  const now = nowIso();
+  const base = contract.checkpoint
+    ? contract
+    : {
+        ...contract,
+        checkpoint: {
+          stage: null,
+          state: resolveGoalExecutionState(contract),
+          attempt: 0,
+          currentEffectId: null,
+          effects: [],
+          evidenceRefs: [],
+          startedAt: now,
+          updatedAt: now,
+        } satisfies TaskRunCheckpoint,
+      };
+  const next: TaskRunContract = {
+    ...base,
+    goal,
+    checkpoint: {
+      ...(base.checkpoint as TaskRunCheckpoint),
+      state: resolveGoalExecutionState(base),
+      updatedAt: now,
+    },
+    updatedAt: now,
+  };
+  return next;
+}
+
+/**
+ * Derive the Goal-linked execution state from the existing run/plan state
+ * without collapsing distinct causes. `failed`/`cancelled`/`completed` are
+ * explicit run outcomes; a live plan with blocked items is `blocked`; a plan
+ * with a pending user approval is `waiting_for_user`; otherwise active/paused.
+ */
+export function resolveGoalExecutionState(contract: TaskRunContract): GoalExecutionStatus {
+  if (contract.status === "failed") return "failed";
+  if (contract.status === "cancelled") return "cancelled";
+  if (contract.status === "completed") return "completed";
+  const plan = contract.plan;
+  if (plan && plan.items.length > 0) {
+    if (plan.items.some((item) => item.status === "blocked")) return "blocked";
+  }
+  if (contract.status === "paused") return "paused";
+  return "active";
+}
+
+/**
+ * Record the current plan item/stage into the checkpoint. Pure. A no-op on a
+ * contract with no Goal association (ordinary goal-less runs are untouched).
+ */
+export function recordCheckpointStage(
+  contract: TaskRunContract,
+  stage: string | null,
+  state: GoalExecutionStatus = "active",
+): TaskRunContract {
+  if (!contract.goal || !contract.checkpoint) return contract;
+  const now = nowIso();
+  return {
+    ...contract,
+    checkpoint: { ...contract.checkpoint, stage, state, updatedAt: now },
+    updatedAt: now,
+  };
+}
+
+/**
+ * Begin one effect in the checkpoint. The caller supplies a stable effect
+ * identity so a restart can reconcile by the exact id. Pure.
+ */
+export function beginEffect(
+  contract: TaskRunContract,
+  effectId: string,
+  kind: string,
+  ref?: string,
+): TaskRunContract {
+  if (!contract.goal || !contract.checkpoint) return contract;
+  const id = effectId.trim();
+  if (!id) throw new Error("beginEffect: effectId must be non-empty");
+  const now = nowIso();
+  const existing = contract.checkpoint.effects.find((effect) => effect.effectId === id);
+  // Never blindly start an already-recorded effect: retain its identity and
+  // outcome. A caller that wants a retry must settle the prior effect first.
+  if (existing) return contract;
+  return {
+    ...contract,
+    checkpoint: {
+      ...contract.checkpoint,
+      currentEffectId: id,
+      attempt: contract.checkpoint.attempt + 1,
+      effects: [
+        ...contract.checkpoint.effects,
+        { effectId: id, kind, outcome: "started", ref, startedAt: now },
+      ],
+      updatedAt: now,
+    },
+    updatedAt: now,
+  };
+}
+
+/**
+ * Settle the current (or named) effect with a terminal or ambiguous outcome.
+ * Pure. Never overwrites a settled effect with a different outcome.
+ */
+export function settleEffect(
+  contract: TaskRunContract,
+  outcome: Exclude<TaskRunEffectOutcome, "none">,
+  opts: { effectId?: string; ref?: string } = {},
+): TaskRunContract {
+  if (!contract.goal || !contract.checkpoint) return contract;
+  const targetId = (opts.effectId ?? contract.checkpoint.currentEffectId ?? "").trim();
+  if (!targetId) return contract;
+  const now = nowIso();
+  let settled = false;
+  const effects = contract.checkpoint.effects.map((effect) => {
+    if (effect.effectId !== targetId) return effect;
+    if (effect.outcome !== "started") return effect;
+    settled = true;
+    return {
+      ...effect,
+      outcome,
+      ...(opts.ref ? { ref: opts.ref } : {}),
+      finishedAt: now,
+    };
+  });
+  if (!settled) return contract;
+  return {
+    ...contract,
+    checkpoint: {
+      ...contract.checkpoint,
+      currentEffectId:
+        contract.checkpoint.currentEffectId === targetId
+          ? null
+          : contract.checkpoint.currentEffectId,
+      effects,
+      updatedAt: now,
+    },
+    updatedAt: now,
+  };
+}
+
+/**
+ * Reconcile a Goal-linked run recovered from durable state after a restart.
+ *
+ * - An explicit terminal run (`completed`/`failed`/`cancelled`) is preserved.
+ * - A live run with an in-flight effect whose terminal outcome was never
+ *   observed becomes `ambiguous` and the execution state becomes `blocked`,
+ *   so the effect must not be blindly replayed; it is surfaced for review with
+ *   the exact original effect identity.
+ * - A live run with no in-flight effect becomes resumable (`paused`).
+ * Pure; returns the reconciled contract and whether an ambiguous effect exists.
+ */
+export function reconcileRecoveredRun(
+  contract: TaskRunContract,
+  reason: string,
+): { contract: TaskRunContract; ambiguousEffectId: string | null } {
+  if (!contract.goal || !contract.checkpoint) {
+    return { contract, ambiguousEffectId: null };
+  }
+  if (["completed", "failed", "cancelled"].includes(contract.status)) {
+    return { contract, ambiguousEffectId: null };
+  }
+  const now = nowIso();
+  const currentId = contract.checkpoint.currentEffectId;
+  const inFlight = currentId
+    ? contract.checkpoint.effects.find((effect) => effect.effectId === currentId)
+    : undefined;
+
+  if (inFlight && inFlight.outcome === "started") {
+    const effects = contract.checkpoint.effects.map((effect) =>
+      effect.effectId === currentId ? { ...effect, outcome: "ambiguous" as const } : effect,
+    );
+    return {
+      contract: {
+        ...contract,
+        status: "paused",
+        checkpoint: {
+          ...contract.checkpoint,
+          state: "blocked",
+          currentEffectId: currentId,
+          effects,
+          interruption: {
+            detectedAt: now,
+            reason,
+            priorOutcome: contract.lastOutcome ?? null,
+            resumed: true,
+          },
+          resumedAt: now,
+          updatedAt: now,
+        },
+        updatedAt: now,
+      },
+      ambiguousEffectId: currentId,
+    };
+  }
+
+  return {
+    contract: {
+      ...contract,
+      status: "active",
+      checkpoint: {
+        ...contract.checkpoint,
+        state: "paused",
+        interruption: {
+          detectedAt: now,
+          reason,
+          priorOutcome: contract.lastOutcome ?? null,
+          resumed: true,
+        },
+        resumedAt: now,
+        updatedAt: now,
+      },
+      updatedAt: now,
+    },
+    ambiguousEffectId: null,
+  };
 }
 
 export function resolveTaskRunTurn(
@@ -1241,4 +1677,116 @@ export function assessTaskRunAcceptance(input: TaskRunAcceptanceInput): TaskRunA
     return { accepted: false, status: "paused", reason: "workspace_task_has_no_evidence" };
   }
   return { accepted: true, status: "completed", reason: "objective_completion_contract_met" };
+}
+
+/**
+ * Bounded, transcript-free view of a Goal-linked TaskRun checkpoint
+ * (Roadmap Priority #2, Part 2). It exposes only stable identities, bounded
+ * structured status/stage/effect-state, and evidence *references* — never
+ * transcripts or recalled memory text. `progressEvidenceRefs` are references
+ * from the actual TaskPlan item evidence pointers and the durable checkpoint
+ * evidence ledger (progress evidence). `acceptedOutputEvidence` is deliberately
+ * NOT populated here: trusted accepted-output evidence belongs to Part 4's
+ * acceptance gate, so it is surfaced as pending/unverified with the completion
+ * gate left open.
+ */
+export interface GoalCheckpointView {
+  goalId: string;
+  bindingId: string;
+  sessionId: string;
+  taskRunId: string;
+  objective: string;
+  status: TaskRunStatus;
+  state: GoalExecutionStatus;
+  stage: string | null;
+  attempt: number;
+  currentEffectId: string | null;
+  effects: Array<{
+    effectId: string;
+    kind: string;
+    outcome: TaskRunEffectOutcome;
+    ref?: string;
+  }>;
+  interrupted: boolean;
+  ambiguousEffectId: string | null;
+  /** Progress evidence references only (TaskPlan/checkpoint actual refs). */
+  progressEvidenceRefs: string[];
+  /**
+   * Part 4 trusted accepted-output evidence. Empty/absent here because that
+   * gate is not implemented; consumers must render it pending/unverified.
+   */
+  acceptedOutputEvidence: { pending: true; unverified: true; refs: string[] };
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+
+const MAX_VIEW_EFFECTS = 64;
+const MAX_VIEW_EVIDENCE_REFS = 100;
+const MAX_VIEW_REF_CHARS = 512;
+
+function boundedRefs(refs: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const ref of refs) {
+    if (typeof ref !== "string") continue;
+    const trimmed = ref.trim();
+    if (!trimmed || trimmed.length > MAX_VIEW_REF_CHARS) continue;
+    out.push(trimmed);
+    if (out.length >= MAX_VIEW_EVIDENCE_REFS) break;
+  }
+  return out;
+}
+
+/**
+ * Build the bounded checkpoint view for a Goal-linked contract. Returns null
+ * for an ordinary goal-less contract or one whose native Goal association is
+ * absent. Pure; never reads transcripts or memory text.
+ */
+export function buildGoalCheckpointView(
+  contract: TaskRunContract,
+): GoalCheckpointView | null {
+  const goal = contract.goal;
+  const checkpoint = contract.checkpoint;
+  if (!goal || !checkpoint) return null;
+
+  // Progress evidence references come only from actual persisted
+  // TaskPlan/checkpoint evidence references (never reconstructed prose).
+  const planRefs: string[] = [];
+  for (const item of contract.plan?.items ?? []) {
+    const ref = item.evidence?.ref;
+    if (typeof ref === "string") planRefs.push(ref);
+  }
+  const progressEvidenceRefs = boundedRefs([...checkpoint.evidenceRefs, ...planRefs]);
+
+  const effects = checkpoint.effects.slice(0, MAX_VIEW_EFFECTS).map((effect) => ({
+    effectId: effect.effectId,
+    kind: effect.kind,
+    outcome: effect.outcome,
+    ...(effect.ref ? { ref: effect.ref } : {}),
+  }));
+
+  const ambiguousEffectId =
+    checkpoint.effects.find((effect) => effect.outcome === "ambiguous")?.effectId ??
+    (checkpoint.state === "blocked" ? checkpoint.currentEffectId : null);
+
+  return {
+    goalId: goal.goalId,
+    bindingId: goal.bindingId,
+    sessionId: contract.sessionId,
+    taskRunId: contract.taskRunId,
+    objective: contract.objective,
+    status: contract.status,
+    state: checkpoint.state,
+    stage: checkpoint.stage,
+    attempt: checkpoint.attempt,
+    currentEffectId: checkpoint.currentEffectId,
+    effects,
+    interrupted: checkpoint.interruption !== undefined,
+    ambiguousEffectId,
+    progressEvidenceRefs,
+    acceptedOutputEvidence: { pending: true, unverified: true, refs: [] },
+    startedAt: checkpoint.startedAt,
+    updatedAt: checkpoint.updatedAt,
+    finishedAt: checkpoint.finishedAt ?? null,
+  };
 }

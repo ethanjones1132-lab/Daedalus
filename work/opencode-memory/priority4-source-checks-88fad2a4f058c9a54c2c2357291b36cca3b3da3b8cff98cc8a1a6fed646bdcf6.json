@@ -1,0 +1,136 @@
+{
+  "report": "priority-4-phase-4-4-source-checks",
+  "phase": "Priority 4.4 — Cross-workflow readiness and evidence handoff",
+  "status": "4 OF 5 PASS — DIFF-CHECK FAIL (exit 2, unrelated pre-existing P3 whitespace)",
+  "reason": "Final corrected-source checkpoint results for the frozen Phase 4.4 source-worktree identity 88fad2a4f058c9a54c2c2357291b36cca3b3da3b8cff98cc8a1a6fed646bdcf6 (795 files). The five permitted checks were run at the corrected identity: `cargo check` exit 0 PASS (the same eight warning categories already listed in the old-fingerprint report bf861df9fc0019e859718ca4cfb6df7bc89967c774ce40d90572f4f4c77bbb87), server typecheck exit 0 PASS, server build exit 0 PASS, UI build exit 0 PASS (with the Vite chunk-size advisory), and `git diff --check` exit 2 FAIL solely for the unrelated pre-existing docs/implementation/roadmap-priority-3-status.md:3 trailing whitespace. Four of five checks passed; not all five passed. The source-worktree fingerprint was the same before and after the checks. No test, runtime, live research, scheduler, or external action was run.",
+  "source_identity": {
+    "type": "source-worktree fingerprint (SHA-256 over source/build-input trees; not a commit)",
+    "commit_sha": null,
+    "worktree_fingerprint": "88fad2a4f058c9a54c2c2357291b36cca3b3da3b8cff98cc8a1a6fed646bdcf6",
+    "file_count": 795,
+    "algorithm": "SHA-256 over the UTF-8 compact JSON array of sorted [relative_path, file_SHA256, byte_length] entries from `git ls-files --cached --others --exclude-standard` under src-tauri, server-jarvis, src-ui, excluding path components node_modules, target, dist, build, .turbo, .next.",
+    "scope": "Source/build-input trees only (src-tauri, server-jarvis, src-ui). This fingerprints source/build-input trees only; it does not cover docs, generated output directories, or a commit, and it is not a commit SHA.",
+    "note": "The corrected, frozen Phase 4.4 source-worktree identity after the Luna-reviewed one-line restoration of the pre-existing `JarvisTerminalOutcome` type deleted by the P4.4 selector edit. This is a source-worktree fingerprint, explicitly NOT a commit SHA; no commit SHA exists for this checkpoint and none is claimed.",
+    "fingerprint_same_before_and_after_checks": true,
+    "fingerprint_stability_note": "The source-worktree fingerprint was 88fad2a4f058c9a54c2c2357291b36cca3b3da3b8cff98cc8a1a6fed646bdcf6 before and after the checks: running the checks did not change source."
+  },
+  "capture_time": "2026-10-07T01:22:53Z",
+  "result_recorded_at": "2026-10-07T01:22:53Z",
+  "luna_review": {
+    "task": "Phase 4.4 corrected-source one-line restoration review",
+    "result": "clean",
+    "scope": "Luna reviewed the exact one-line restoration of the pre-existing `JarvisTerminalOutcome` type in src-ui/src/components/jarvis/types.ts, which the P4.4 selector edit had deleted, and the restoration was clean.",
+    "as_of": "2026-10-07"
+  },
+  "summary": {
+    "checks_passed": 4,
+    "checks_failed": 1,
+    "checks_total": 5,
+    "statement": "Four of five permitted checks passed. `cargo check`, server typecheck, server build, and UI build each exited 0; `git diff --check` exited 2 and failed. This is NOT an all-five-pass result.",
+    "fingerprint_same_before_and_after": true
+  },
+  "warnings_or_failures": {
+    "status": "FOUR OF FIVE PASS; git diff --check exit 2 (unrelated pre-existing P3 trailing whitespace)",
+    "text": "cargo check exited 0 with the same eight warning categories already listed in the old-fingerprint report. UI build exited 0 with a Vite advisory that some chunks are larger than 500 kB and a 1,365.86 kB JS bundle. git diff --check exited 2, failing solely for docs/implementation/roadmap-priority-3-status.md:3 trailing whitespace.",
+    "cargo_check_warnings": [
+      {
+        "category": "non_camel_case_types",
+        "location": "src/db/mod.rs:189"
+      },
+      {
+        "category": "non_camel_case_types",
+        "location": "src/jarvis/learning.rs:657"
+      },
+      {
+        "category": "deprecated",
+        "detail": "Atomic fetch_update",
+        "location": "src/supervisor.rs:73"
+      },
+      {
+        "category": "unused",
+        "detail": "Manager",
+        "location": "src/commands/trusted_acceptance.rs:21"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "bun_instance_id",
+        "location": "line 1024"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "status",
+        "location": "line 1051"
+      },
+      {
+        "category": "unused assignment",
+        "detail": "reason",
+        "location": "line 1052"
+      },
+      {
+        "category": "dead_code",
+        "detail": "shlex_join",
+        "location": "src/wsl.rs:311"
+      }
+    ],
+    "ui_build_vite_advisory": "Some chunks are larger than 500 kB after minification; JS bundle 1,365.86 kB.",
+    "diff_check_failure": "docs/implementation/roadmap-priority-3-status.md:3: trailing whitespace.",
+    "note": "The `git diff --check` failure is the known-but-unrelated pre-existing docs/implementation/roadmap-priority-3-status.md:3 trailing whitespace on the shared worktree; that Priority 3 docs file was neither modified nor staged. The failure is recorded honestly and is not claimed as a Phase 4.4 source defect."
+  },
+  "checks": [
+    {
+      "name": "rust_compile",
+      "command": "(cd src-tauri && /Users/charlottehughes/.cargo/bin/cargo check)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": "Eight warning categories from captured output (same as the old-fingerprint report); see warnings_or_failures.cargo_check_warnings."
+    },
+    {
+      "name": "server_typecheck",
+      "command": "(cd server-jarvis && bun run typecheck)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": null
+    },
+    {
+      "name": "server_build",
+      "command": "(cd server-jarvis && bun run build)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": null
+    },
+    {
+      "name": "ui_build",
+      "command": "(cd src-ui && bun run build)",
+      "exit_code": 0,
+      "status": "PASS",
+      "warning_or_failure": "Vite advisory: some chunks are larger than 500 kB; 1,365.86 kB JS bundle."
+    },
+    {
+      "name": "diff_check",
+      "command": "git diff --check",
+      "exit_code": 2,
+      "status": "FAIL",
+      "warning_or_failure": "docs/implementation/roadmap-priority-3-status.md:3: trailing whitespace.",
+      "note": "Exit 2 failed solely for the unrelated pre-existing Priority 3 docs trailing whitespace; that file was not modified or staged."
+    }
+  ],
+  "actions_not_taken": {
+    "tests": "not run",
+    "runtime": "not run",
+    "live_research": "not run",
+    "scheduler": "not run",
+    "external_actions": "not run",
+    "note": "No test, runtime, live research, scheduler, or external action was run. Only the five permitted checks above were run."
+  },
+  "deviations": [
+    {
+      "item": "path-scoped git diff --check during documentation inspection before final freeze",
+      "detail": "Earlier, during documentation inspection before final freeze, a path-scoped `git diff --check` over the P4 docs paths ran and produced no output, but its exit code was not retained. It is not the permitted final full `git diff --check` and is not claimed as one; the full `git diff --check` in this report exited 2 for the unrelated Priority 3 whitespace."
+    }
+  ],
+  "prior_failed_report": {
+    "path": "work/opencode-memory/priority4-source-checks-bf861df9fc0019e859718ca4cfb6df7bc89967c774ce40d90572f4f4c77bbb87.json",
+    "status": "PARTIAL / STOPPED ON UI BUILD FAILURE",
+    "note": "The prior first-check-attempt record at the old source-worktree fingerprint bf861df9fc0019e859718ca4cfb6df7bc89967c774ce40d90572f4f4c77bbb87 is kept intact and unchanged; it is not represented as an all-five-pass result."
+  }
+}

@@ -3,7 +3,9 @@
 // ═══════════════════════════════════════════════════════════════
 
 use crate::db::AppDb;
-use tauri::State;
+use crate::jarvis::memory::contracts::MemoryError;
+use rusqlite::OptionalExtension;
+use tauri::{AppHandle, Manager, State};
 
 // ── Compaction ────────────────────────────────────────────────
 
@@ -99,31 +101,36 @@ pub fn update_db_token_count(
 /// via the local model, and returns a summary payload.
 #[tauri::command]
 pub async fn compact_session_db(
-    db: State<'_, AppDb>,
+    app: AppHandle,
+    _db: State<'_, AppDb>,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    let sid = session_id.clone();
-    let db_path = db.db_path.clone();
-
-    let messages: Vec<(String, String)> = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open DB at {:?}: {}", db_path, e))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC",
-            )
-            .map_err(|e| e.to_string())?;
-        let msgs: Vec<(String, String)> = stmt
-            .query_map([&sid], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        Ok::<_, String>(msgs)
+    // Take the sanitized, suppression-aware transcript snapshot under the
+    // operation gate (pending-cleanup drain + revision capture) so a forgotten
+    // or corrected source can never enter the model-facing summary and no
+    // unrelated mutation can interleave. Run on a blocking thread so the
+    // bounded HTTP does not block the Tauri executor; a cleanup failure
+    // surfaces as a typed error rather than a stale summary.
+    let app_for_snapshot = app.clone();
+    let session_for_snapshot = session_id.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_snapshot.state::<AppDb>();
+        crate::jarvis::memory::transport::snapshot_sanitized_session_messages(
+            state.inner(),
+            crate::jarvis::memory::transport::native_memory_transport(),
+            &session_for_snapshot,
+            chrono::Utc::now(),
+        )
+        .map_err(|error| error.message)
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))??;
+    .map_err(|error| format!("memory snapshot task join error: {error}"))??;
+
+    let messages: Vec<(String, String)> = snapshot
+        .messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.clone()))
+        .collect();
 
     if messages.len() < 4 {
         return Ok(serde_json::json!({ "compacted": false, "reason": "too few messages" }));
@@ -132,6 +139,32 @@ pub async fn compact_session_db(
     let split = messages.len() / 2;
     let (old, recent) = messages.split_at(split);
     let summary = compact_messages(old, "http://127.0.0.1:11434", "qwen2.5:7b", 1024).await?;
+
+    // Refuse to publish a summary built from a snapshot that a memory mutation
+    // invalidated while the model was running. The raw stale summary never
+    // returns; the caller may retry against a fresh sanitized snapshot.
+    let app_for_recheck = app.clone();
+    let session_for_recheck = session_id.clone();
+    let (store_revision, continuity_revision, session_binding_revision) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = app_for_recheck.state::<AppDb>();
+            crate::jarvis::memory::transport::memory_context_revisions(
+                state.inner(),
+                &session_for_recheck,
+            )
+            .map_err(|error| error.message)
+        })
+        .await
+        .map_err(|error| format!("memory revision recheck task join error: {error}"))??;
+    if store_revision != snapshot.store_revision
+        || continuity_revision != snapshot.continuity_revision
+        || session_binding_revision != snapshot.session_binding_revision
+    {
+        return Ok(serde_json::json!({
+            "compacted": false,
+            "reason": "memory_invalidated",
+        }));
+    }
 
     Ok(serde_json::json!({
         "compacted": true,
@@ -162,6 +195,9 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub archived: bool,
     pub message_count: i64,
+    /// Explicit, validated project workspace binding, if any. `None` means
+    /// the Session has no project scope (Agent scope only).
+    pub project_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,10 +221,45 @@ pub struct SessionRunRecord {
     pub tool_count: i64,
     pub cancelled_reason: Option<String>,
     pub partial_output: Option<String>,
+    /// Stable native-authorized Goal association (Roadmap Priority #2, Part 2).
+    /// Null on ordinary goal-less runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_id: Option<String>,
+}
+
+/// Validate a caller-supplied Goal association for a terminal Session run.
+/// The Goal must exist and its Agent/canonical-project binding must match the
+/// run's owning Session. A `goal_id` that does not resolve, belongs to a
+/// different Agent, or overstates workspace scope is refused so the run is
+/// never attributed to a Goal the user did not authorize. A terminal Goal is
+/// allowed here (a run may finish after the Goal was closed).
+fn validate_run_goal_binding(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    goal_id: &str,
+) -> Result<(), String> {
+    let goal = crate::commands::goals::load_goal_for_run_validation(conn, goal_id)?;
+    let session: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT agent_id, project_root FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (session_agent, session_project_root) =
+        session.ok_or_else(|| format!("session not found: {}", session_id))?;
+    crate::commands::goals::validate_goal_session_scope(
+        &goal,
+        &session_agent,
+        session_project_root.as_deref(),
+        session_id,
+    )
 }
 
 /// Persist the terminal outcome of one native SSE turn. `run_id` is emitted
 /// by the Bun pipeline and is the durable idempotency key for relay retries.
+/// This is the ordinary goal-less writer; it never sets a Goal association.
 pub fn persist_terminal_run(
     db: &AppDb,
     session_id: &str,
@@ -217,6 +288,7 @@ pub fn persist_terminal_run(
         tool_count,
         cancelled_reason,
         partial_output,
+        None,
     )
 }
 
@@ -243,9 +315,80 @@ pub fn persist_terminal_run_at(
         tool_count,
         cancelled_reason,
         partial_output,
+        None,
     )
 }
 
+/// Goal-specific terminal writer. `goal_id` here is NOT client authority: the
+/// caller obtains it only after native verified the consumed private
+/// registration/receipt for this exact binding, Session, turn, saved-user
+/// row/hash, Goal, TaskRun identity, and Bun run id. A `None` goal writes the
+/// ordinary goal-less record. Kept separate so the ordinary API and its call
+/// sites/tests are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_goal_terminal_run(
+    db: &AppDb,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+    goal_id: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    if !matches!(
+        outcome,
+        "success" | "partial" | "failed" | "timed_out" | "cancelled"
+    ) {
+        return Err(format!("invalid terminal outcome: {outcome}"));
+    }
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+        goal_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn persist_goal_terminal_run_at(
+    db_path: &std::path::Path,
+    session_id: &str,
+    run_id: &str,
+    outcome: &str,
+    selected_model: Option<&str>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<&str>,
+    partial_output: Option<&str>,
+    goal_id: Option<&str>,
+) -> Result<SessionRunRecord, String> {
+    let conn = rusqlite::Connection::open(db_path)
+        .map_err(|e| format!("Failed to open session database: {e}"))?;
+    persist_terminal_run_conn(
+        &conn,
+        session_id,
+        run_id,
+        outcome,
+        selected_model,
+        token_count,
+        tool_count,
+        cancelled_reason,
+        partial_output,
+        goal_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn persist_terminal_run_conn(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -256,6 +399,7 @@ fn persist_terminal_run_conn(
     tool_count: i64,
     cancelled_reason: Option<&str>,
     partial_output: Option<&str>,
+    goal_id: Option<&str>,
 ) -> Result<SessionRunRecord, String> {
     if !matches!(
         outcome,
@@ -263,21 +407,58 @@ fn persist_terminal_run_conn(
     ) {
         return Err(format!("invalid terminal outcome: {outcome}"));
     }
+    // `goal_id` reaches this writer only after native verified the owned child's
+    // consume receipt against the native registration. Never trust a raw client
+    // Goal id here; the caller must supply the receipt-verified value or None.
+    if let Some(goal_id) = goal_id {
+        validate_run_goal_binding(conn, session_id, goal_id)?;
+    }
+    // Never overwrite an existing run's Goal association with a conflicting
+    // one: a re-persist of the same run id keeps its original Goal (idempotent
+    // replay) and refuses a different Goal.
+    if let Some(goal_id) = goal_id {
+        let existing: Option<Option<String>> = conn
+            .query_row(
+                "SELECT goal_id FROM session_runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some(Some(existing_goal)) = existing {
+            if existing_goal != goal_id {
+                return Err(format!(
+                    "session run '{}' is already associated with a different goal",
+                    run_id
+                ));
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO session_runs
-         (run_id, session_id, outcome, selected_model, token_count, tool_count, cancelled_reason, partial_output, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+         (run_id, session_id, outcome, selected_model, token_count, tool_count, cancelled_reason, partial_output, goal_id, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT(run_id) DO UPDATE SET
            outcome=excluded.outcome, selected_model=excluded.selected_model,
            token_count=excluded.token_count, tool_count=excluded.tool_count,
            cancelled_reason=excluded.cancelled_reason, partial_output=excluded.partial_output,
+           goal_id=COALESCE(session_runs.goal_id, excluded.goal_id),
            finished_at=excluded.finished_at",
         rusqlite::params![
             run_id, session_id, outcome, selected_model, token_count.max(0), tool_count.max(0),
-            cancelled_reason, partial_output,
+            cancelled_reason, partial_output, goal_id,
         ],
     )
     .map_err(|e| format!("Failed to persist terminal session run: {e}"))?;
+    let stored_goal: Option<String> = conn
+        .query_row(
+            "SELECT goal_id FROM session_runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
     Ok(SessionRunRecord {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
@@ -287,6 +468,7 @@ fn persist_terminal_run_conn(
         tool_count: tool_count.max(0),
         cancelled_reason: cancelled_reason.map(str::to_string),
         partial_output: partial_output.map(str::to_string),
+        goal_id: stored_goal,
     })
 }
 
@@ -296,7 +478,7 @@ pub fn list_session_runs(db: &AppDb, session_id: &str) -> Result<Vec<SessionRunR
     let mut stmt = conn
         .prepare(
             "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
-                    cancelled_reason, partial_output, finished_at
+                    cancelled_reason, partial_output, goal_id, finished_at
              FROM session_runs WHERE session_id = ? ORDER BY finished_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -311,6 +493,7 @@ pub fn list_session_runs(db: &AppDb, session_id: &str) -> Result<Vec<SessionRunR
                 tool_count: row.get(5)?,
                 cancelled_reason: row.get(6)?,
                 partial_output: row.get(7)?,
+                goal_id: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -323,7 +506,7 @@ pub fn list_all_session_runs(db: &AppDb) -> Result<Vec<SessionRunRecord>, String
     let mut stmt = conn
         .prepare(
             "SELECT session_id, run_id, outcome, selected_model, token_count, tool_count,
-                    cancelled_reason, partial_output, finished_at
+                    cancelled_reason, partial_output, goal_id, finished_at
              FROM session_runs ORDER BY finished_at DESC",
         )
         .map_err(|e| e.to_string())?;
@@ -338,6 +521,7 @@ pub fn list_all_session_runs(db: &AppDb) -> Result<Vec<SessionRunRecord>, String
                 tool_count: row.get(5)?,
                 cancelled_reason: row.get(6)?,
                 partial_output: row.get(7)?,
+                goal_id: row.get(8)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -355,6 +539,86 @@ pub fn get_session_runs(
 #[tauri::command]
 pub fn get_all_session_runs(db: State<AppDb>) -> Result<Vec<SessionRunRecord>, String> {
     list_all_session_runs(&db)
+}
+
+/// Authoritative learning source selectors: every persisted Session that owns
+/// at least one completed (successful, terminal) run, with those exact runs.
+/// Values are identifiers only.
+///
+/// The run record is native's own durable `session_runs` mirror, written by the
+/// native SSE relay with the exact `run_id` the Bun pipeline emits as
+/// `agent_run_id`. Native `agent_runs`/`stage_runs` are created by migration but
+/// never written by native (see the SelfTuningStore comment in
+/// server-jarvis/src/self-tuning/store.ts: telemetry lives in Bun's own DB), so
+/// they cannot provide a native run authority; `session_runs` can and does. A
+/// failed read is an `Err` so the UI cannot render it as an empty eligible list;
+/// the caller still revalidates the exact tuple on submit.
+pub fn list_learning_source_choices(
+    db: &AppDb,
+) -> Result<crate::jarvis::learning::LearningSourceChoices, String> {
+    use crate::jarvis::learning::{LearningRunChoice, LearningSessionChoice, LearningSourceChoices};
+
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.agent_id, s.title, COALESCE(s.project_root, ''),
+                    r.run_id, r.outcome, r.selected_model, COALESCE(r.finished_at, '')
+             FROM sessions s
+             JOIN session_runs r ON r.session_id = s.id AND r.outcome = 'success'
+             ORDER BY s.updated_at DESC, r.finished_at DESC
+             LIMIT 1000",
+        )
+        .map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+
+    let mut sessions: Vec<LearningSessionChoice> = Vec::new();
+    for row in rows {
+        let (session_id, agent_id, title, project_root, run_id, outcome, selected_model, finished_at) =
+            row.map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+        let run = LearningRunChoice {
+            agent_run_id: run_id,
+            outcome,
+            selected_model,
+            finished_at,
+        };
+        if let Some(existing) = sessions.iter_mut().find(|s| s.session_id == session_id) {
+            existing.runs.push(run);
+            continue;
+        }
+        sessions.push(LearningSessionChoice {
+            session_id,
+            agent_id,
+            title,
+            project_root: if project_root.is_empty() {
+                None
+            } else {
+                Some(project_root)
+            },
+            runs: vec![run],
+        });
+    }
+
+    Ok(LearningSourceChoices { sessions })
+}
+
+#[tauri::command]
+pub fn get_learning_source_choices(
+    db: State<AppDb>,
+) -> Result<crate::jarvis::learning::LearningSourceChoices, String> {
+    list_learning_source_choices(&db)
 }
 
 /// Task 4.1: the webview streams `/chat/stream` directly from the Bun server
@@ -390,6 +654,54 @@ pub fn record_terminal_run(
     )
 }
 
+/// Goal-specific terminal record command. `binding_id` is a correlation
+/// identity, NOT authorization: native loads its own registration row and
+/// requires the owned Bun child's consume receipt to verify the exact binding,
+/// Session, turn, saved-user row/hash, Goal, stable TaskRun identity, and Bun
+/// run id before any `session_runs.goal_id` is set. Any missing/mismatched
+/// proof fails closed and the run is written goal-less.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub fn record_goal_terminal_run(
+    db: State<AppDb>,
+    session_id: String,
+    run_id: String,
+    outcome: String,
+    selected_model: Option<String>,
+    token_count: i64,
+    tool_count: i64,
+    cancelled_reason: Option<String>,
+    partial_output: Option<String>,
+    binding_id: Option<String>,
+) -> Result<SessionRunRecord, String> {
+    let goal_id = match binding_id.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(binding_id) => {
+            let transport = crate::jarvis::memory::transport::native_memory_transport();
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            crate::jarvis::memory::transport::resolve_goal_terminal_authority(
+                &conn,
+                transport,
+                binding_id,
+                &run_id,
+            )
+            .map_err(|error| error.message)?
+        }
+    };
+    persist_goal_terminal_run(
+        &db,
+        &session_id,
+        &run_id,
+        &outcome,
+        selected_model.as_deref(),
+        token_count,
+        tool_count,
+        cancelled_reason.as_deref(),
+        partial_output.as_deref(),
+        goal_id.as_deref(),
+    )
+}
+
 // ── &AppDb helpers ───────────────────────────────────────────────────
 //
 // These hold the canonical SQLite session logic. Both the native "Sessions"
@@ -404,7 +716,8 @@ pub fn list_session_rows(db: &AppDb) -> Result<Vec<SessionSummary>, String> {
             "SELECT s.id, s.agent_id, s.title, s.backend, s.model,
                     COALESCE(s.context_tokens, 0), COALESCE(s.total_tokens, 0),
                     s.created_at, s.updated_at, COALESCE(s.archived, 0),
-                    COALESCE((SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), 0)
+                    COALESCE((SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id), 0),
+                    s.project_root
              FROM sessions s
              ORDER BY s.updated_at DESC",
         )
@@ -423,6 +736,7 @@ pub fn list_session_rows(db: &AppDb) -> Result<Vec<SessionSummary>, String> {
                 updated_at: row.get(8)?,
                 archived: row.get::<_, i64>(9)? != 0,
                 message_count: row.get(10)?,
+                project_root: row.get(11)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -461,11 +775,14 @@ pub fn create_session_row(
         updated_at: now,
         archived: false,
         message_count: 0,
+        project_root: None,
     })
 }
 
-pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+pub fn delete_session_row_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<bool, String> {
     conn.execute(
         "DELETE FROM messages WHERE session_id = ?",
         rusqlite::params![session_id],
@@ -478,6 +795,11 @@ pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> 
         )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
+}
+
+pub fn delete_session_row(db: &AppDb, session_id: &str) -> Result<bool, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    delete_session_row_conn(&conn, session_id)
 }
 
 #[tauri::command]
@@ -507,8 +829,35 @@ pub fn create_session(
 }
 
 #[tauri::command]
-pub fn delete_session(db: State<AppDb>, session_id: String) -> Result<bool, String> {
-    delete_session_row(&db, &session_id)
+pub async fn delete_session(app: AppHandle, session_id: String) -> Result<bool, String> {
+    super::memory_turn::run_derived_gated_mutation(
+        app,
+        session_id.clone(),
+        {
+            let session_for_plan = session_id.clone();
+            move |_conn| {
+                // The deleted Session's own derived prompt state must be evicted
+                // before it disappears; the outbox row has no Session FK, so it
+                // survives that Session's deletion and the drain reuses the
+                // exact original initiating-Session wire key.
+                Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                    invalidation:
+                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            affected_session_ids: vec![session_for_plan],
+                            memory_ids: Vec::new(),
+                            source_message_ids: Vec::new(),
+                        },
+                    scope: None,
+                })
+            }
+        },
+        move |conn, _plan| {
+            delete_session_row_conn(conn, &session_id).map_err(MemoryError::storage_unavailable)
+        },
+    )
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command]
@@ -576,17 +925,132 @@ pub fn insert_message_row(
     tokens: i64,
 ) -> Result<String, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(&conn, session_id, role, content, tokens, None)
+}
+
+/// Read the single assistant message already associated with one turn, if any.
+fn existing_turn_message_id(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT message_id FROM memory_turn_messages WHERE turn_id = ? LIMIT 1",
+        [turn_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| format!("Failed to read turn association: {}", e))
+}
+
+/// Insert a message row inside one SQLite transaction. When `memory_turn_id` is
+/// supplied for an assistant message, the whole append is atomic at-most-once for
+/// that turn:
+///
+/// 1. The persisted Session/turn identity is validated from the canonical
+///    `memory_turn_preparations` row.
+/// 2. If the turn already owns an assistant association, an exact-content replay
+///    returns that existing DB message id with no new write; differing content is
+///    rejected as a conflict. This removes the race-prone pre-check.
+/// 3. Otherwise the row is inserted, associated, and — in the same transaction —
+///    the model-facing transcript is neutralized for any selected/applied memory
+///    the turn used that has since been invalidated.
+///
+/// This is transcript association only and never confers factual authority.
+/// Callers that omit the turn id retain the original behavior exactly.
+pub fn insert_message_row_conn(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    tokens: i64,
+    memory_turn_id: Option<&str>,
+) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    conn.execute(
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("Failed to begin message transaction: {}", e))?;
+
+    if let Some(turn_id) = memory_turn_id {
+        // Association is only defined for a persisted assistant message tied to
+        // the exact same Session/turn. A cross-Session or non-assistant pairing
+        // is rejected before any write.
+        if role != "assistant" {
+            return Err("Memory turn association requires an assistant message".to_string());
+        }
+        let persisted = crate::jarvis::memory::turn::read_memory_turn(&tx, session_id, turn_id)
+            .map_err(|_| "Memory turn does not belong to this Session".to_string())?;
+
+        // Atomic at-most-once: an already associated row is authoritative for
+        // this turn. Exact content is an idempotent replay of the same append;
+        // any other content is a conflicting append and is rejected.
+        if let Some(existing_id) = existing_turn_message_id(&tx, turn_id)? {
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT role, content FROM messages WHERE id = ? AND session_id = ?",
+                    rusqlite::params![&existing_id, session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to read associated message: {}", e))?;
+            return match existing {
+                Some((existing_role, existing_content))
+                    if existing_role == "assistant" && existing_content == content =>
+                {
+                    Ok(existing_id)
+                }
+                _ => Err(
+                    "Memory turn already has a different assistant message".to_string(),
+                ),
+            };
+        }
+
+        tx.execute(
+            "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            rusqlite::params![&id, session_id, role, content, tokens, &now],
+        )
+        .map_err(|e| format!("Failed to insert message: {}", e))?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            rusqlite::params![&now, session_id],
+        )
+        .map_err(|e| format!("Failed to update session timestamp: {}", e))?;
+
+        tx.execute(
+            "INSERT INTO memory_turn_messages (turn_id, message_id) VALUES (?, ?)",
+            rusqlite::params![turn_id, &id],
+        )
+        .map_err(|e| format!("Failed to associate assistant message with turn: {}", e))?;
+
+        // Same-transaction late-write barrier: neutralize the model-facing
+        // transcript for any invalidated memory this turn selected/applied. The
+        // operator transcript row itself stays raw.
+        crate::jarvis::memory::continuity::suppress_invalidated_turn_attachments(
+            &tx,
+            &persisted,
+            &id,
+            chrono::Utc::now(),
+        )
+        .map_err(|e| e.message)?;
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit message transaction: {}", e))?;
+        return Ok(id);
+    }
+
+    tx.execute(
         "INSERT INTO messages (id, session_id, role, content, tokens, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         rusqlite::params![&id, session_id, role, content, tokens, &now],
     )
     .map_err(|e| format!("Failed to insert message: {}", e))?;
-    let _ = conn.execute(
+    tx.execute(
         "UPDATE sessions SET updated_at = ? WHERE id = ?",
         rusqlite::params![&now, session_id],
-    );
+    )
+    .map_err(|e| format!("Failed to update session timestamp: {}", e))?;
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit message transaction: {}", e))?;
     Ok(id)
 }
 
@@ -597,8 +1061,30 @@ pub fn append_message(
     role: String,
     content: String,
     tokens: Option<i64>,
+    memory_turn_id: Option<String>,
 ) -> Result<String, String> {
-    insert_message_row(&db, &session_id, &role, &content, tokens.unwrap_or(0))
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(
+        &conn,
+        &session_id,
+        &role,
+        &content,
+        tokens.unwrap_or(0),
+        memory_turn_id.as_deref(),
+    )
+}
+
+/// Awaited assistant append for the relay runner: run the transaction on the
+/// caller's blocking thread against the shared AppDb. Returns the generated DB
+/// message id.
+pub fn append_assistant_message_for_turn(
+    db: &AppDb,
+    session_id: &str,
+    content: &str,
+    memory_turn_id: &str,
+) -> Result<String, String> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    insert_message_row_conn(&conn, session_id, "assistant", content, 0, Some(memory_turn_id))
 }
 
 #[tauri::command]

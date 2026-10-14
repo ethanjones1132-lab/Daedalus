@@ -14,6 +14,24 @@ pub use sessions::*;
 pub mod memory;
 pub use memory::*;
 
+// Native memory turn commands (Phase 2.2: preparation/sync/diagnostics)
+pub mod memory_turn;
+pub use memory_turn::*;
+
+// Native memory capture commands (Phase 3.2: gated capture/correct/forget/proposal)
+pub mod memory_capture;
+pub use memory_capture::*;
+
+// Native durable Goal authority and association contracts
+// (Roadmap Priority #2, Part 1)
+pub mod goals;
+pub use goals::*;
+
+// Project Steward read-only workspace review snapshot
+// (Roadmap Priority #4, Phase 4.1, Task 1)
+pub mod project_steward;
+pub use project_steward::*;
+
 // Skills command handlers (SQLite-backed)
 pub mod skills;
 pub use skills::*;
@@ -41,6 +59,18 @@ pub use system::*;
 // Action registry command handlers
 pub mod action_registry;
 pub use action_registry::*;
+
+// Trusted acceptance manifest registry (Roadmap Priority #2, Part 4 slice 1)
+pub mod trusted_manifests;
+pub use trusted_manifests::*;
+
+// Trusted action execution receipts (Roadmap Priority #2, Part 4)
+pub mod trusted_execution;
+pub use trusted_execution::*;
+
+// Trusted acceptance checks and terminal delivery (Roadmap Priority #2, Part 4)
+pub mod trusted_acceptance;
+pub use trusted_acceptance::*;
 
 // Legacy dashboard/get_* command handlers (WSL-backed)
 pub mod legacy;

@@ -1,3 +1,5 @@
+import { lazy, Suspense } from 'react';
+import { FeatureModes } from '../workflows/FeatureModes';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { RefreshCw, Search } from 'lucide-react';
@@ -30,7 +32,7 @@ import { BUCKET_ORDER, dateBucket, recallMetaById, type DateBucket, type RecallM
 const TIER_TONE: Record<Tier, Tone> = { hot: 'warn', warm: 'info', cold: 'muted' };
 const TIERS: Tier[] = ['hot', 'warm', 'cold'];
 
-export default function MemoryPage() {
+function MemoryPage() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [recallMeta, setRecallMeta] = useState<Record<string, RecallMeta>>({});
   const [tierStats, setTierStats] = useState<Record<Tier, number> | null>(null);
@@ -256,3 +258,6 @@ export default function MemoryPage() {
   );
 }
 
+
+const AdvancedMemoryPage = lazy(() => import('./ScopedMemoryPage'));
+export default function MemoryPageSurface() { return <FeatureModes label="Scoped controls" primary={<MemoryPage />} advanced={<Suspense fallback={<div role="status">Loading controls…</div>}><AdvancedMemoryPage /></Suspense>} />; }

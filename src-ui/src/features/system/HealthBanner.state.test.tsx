@@ -196,7 +196,7 @@ describe('HealthBanner recovery', () => {
     expect(announcement()).toHaveTextContent(
       'Health recovered: all services required by the active inference backend (openrouter) are running.',
     );
-    expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, Gemma llama.cpp server, Local model and Claude proxy.');
+    expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, llama.cpp server, Local model and Claude proxy.');
   });
 
   it('announces a degradation that appears after health', async () => {

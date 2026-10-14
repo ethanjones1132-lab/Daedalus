@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionsPage from './SessionsPage';
@@ -19,6 +20,8 @@ const sessions = [
 
 function installNativeMock() {
   invokeMock.mockImplementation(async (command: string, args?: { sessionId: string }) => {
+    const nativeValue = nativeMemoryFixture(command, args);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
     if (command === 'jarvis_list_sessions') return sessions;
     if (command === 'get_all_session_runs') return [];
     if (command === 'get_session_history') return [];
@@ -133,6 +136,7 @@ describe('Jarvis Session draft ownership', () => {
     fireEvent.change(composer, { target: { value: 'same text edited' } });
     fireEvent.change(composer, { target: { value: 'same text' } });
 
+    await waitFor(() => expect(resolveFetch).toBeTypeOf('function'));
     await act(async () => { resolveFetch(response.response); });
     await screen.findByRole('button', { name: 'Stop streaming' });
     await emit(response.controller, { type: 'result', result: 'answer' });

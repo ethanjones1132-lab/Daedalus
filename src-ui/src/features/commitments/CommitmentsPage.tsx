@@ -30,6 +30,7 @@ interface Commitment {
   created_at: string;
   completed_at: string | null;
   agent_id: string | null;
+  goal_id?: string | null;
 }
 
 type Filter = 'open' | 'completed' | 'all';
@@ -315,6 +316,7 @@ function CommitmentRow({
           </p>
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-ink-3">
             <span className={cn(overdue && 'text-warn')}>{formatDue(c.due)}{overdue && ' · overdue'}</span>
+            {c.goal_id && <span>Goal {c.goal_id}</span>}
             <span>{c.agent_id ? `owner ${c.agent_id}` : 'owner unassigned'}</span>
             {created !== 'unknown' && <span className="text-ink-4">added {created}</span>}
             {done && c.completed_at && <span className="text-ink-4">completed {formatIsoAge(c.completed_at)}</span>}

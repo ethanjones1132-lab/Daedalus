@@ -1,6 +1,14 @@
+pub mod capture;
+pub mod capture_contracts;
+pub mod contracts;
+pub mod continuity;
 pub mod engine;
 pub mod frontmatter;
 pub mod paths;
+pub mod scope;
+pub mod scoped;
+pub mod transport;
+pub mod turn;
 pub mod types;
 
 // Legacy file-based modules kept for `learning.rs` (research output only).

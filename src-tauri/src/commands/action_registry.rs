@@ -231,6 +231,70 @@ pub fn dispatch_action(db: State<AppDb>, action_id: String) -> Result<ActionDisp
     dispatch_approved_action(db.inner(), action_id)
 }
 
+/// Resolve exactly one active `open`/`in_progress` Action Registry item that
+/// already satisfies the same approval condition `dispatch_approved_action`
+/// enforces, for trusted-manifest binding, and return its exact id as opaque
+/// identity. Only identity, status, and existing approval metadata are read;
+/// the action title, description, and any other text are never consumed or
+/// trusted. This writes nothing.
+///
+/// Callers that already hold the SQLite lock pass the connection so this never
+/// re-enters the mutex. Fail-closed: a missing, duplicated, non-active, or
+/// approval-ambiguous/unavailable action is rejected with an actionable error
+/// rather than inferring approval.
+pub fn resolve_bindable_action_conn(
+    conn: &rusqlite::Connection,
+    action_id: &str,
+) -> Result<String, String> {
+    let action_id = action_id.trim();
+    if action_id.is_empty() {
+        return Err("an exact Action Registry action id is required".to_string());
+    }
+    let config = crate::commands::settings::load_jarvis_config_conn(conn)?;
+    let root = resolve_repo_root(&config.jarvis_path)
+        .join("workspace")
+        .join("action-registry");
+    let active = read_bucket(&root.join("data").join("active.json"))
+        .map_err(|e| format!("could not read the active Action Registry bucket: {e}"))?;
+
+    let matches: Vec<&RegistryAction> = active.iter().filter(|action| action.id == action_id).collect();
+    if matches.is_empty() {
+        return Err(format!(
+            "action '{action_id}' is not present in the active Action Registry bucket; binding requires exactly one active open/in_progress action"
+        ));
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "action '{action_id}' is ambiguous: {} active entries share that id",
+            matches.len()
+        ));
+    }
+    let action = matches[0];
+    if !matches!(action.status.as_str(), "open" | "in_progress") {
+        return Err(format!(
+            "action '{action_id}' is not bindable: status is '{}' (only open/in_progress are allowed)",
+            action.status
+        ));
+    }
+    if action.approval_required {
+        match action.approval_status.as_deref() {
+            Some("approved") | Some("waived") => {}
+            Some(other) => {
+                return Err(format!(
+                    "action '{action_id}' is not approved: approval status is '{other}'"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "action '{action_id}' requires approval but its approval metadata is unavailable; binding is refused rather than inferring approval"
+                ));
+            }
+        }
+    }
+
+    Ok(action.id.clone())
+}
+
 /// Return bucket counts and alert totals for the action registry dashboard.
 #[tauri::command]
 pub fn get_action_registry_summary(db: State<AppDb>) -> Result<ActionRegistrySummary, String> {
@@ -377,6 +441,274 @@ pub fn update_action_approval(
     let _ = sync_action_registry(app, db);
 
     Ok(true)
+}
+
+// ── Trusted terminal delivery (Roadmap Priority #2, Part 4) ──
+
+/// Bounded proof that one Action Registry action is terminally done. Only
+/// identity/status/evidence fields are read; the action's other JSON fields are
+/// preserved untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRegistryTerminalProof {
+    pub action_id: String,
+    pub done_present: bool,
+    pub active_absent: bool,
+    pub run_id: String,
+    pub acceptance_result: String,
+}
+
+fn data_dir(db: &AppDb) -> Result<PathBuf, String> {
+    Ok(registry_root(db)?.join("data"))
+}
+
+/// Parse a bucket file into `{ "actions": [...] }`, tolerating a bare array.
+/// A missing file is an authoritative empty bucket.
+fn read_bucket_value(path: &Path) -> Result<serde_json::Value, String> {
+    if !path.exists() {
+        return Ok(serde_json::json!({ "actions": [] }));
+    }
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    match parsed {
+        serde_json::Value::Array(actions) => Ok(serde_json::json!({ "actions": actions })),
+        serde_json::Value::Object(mut map) => {
+            if !map.contains_key("actions") {
+                map.insert("actions".to_string(), serde_json::Value::Array(vec![]));
+            }
+            Ok(serde_json::Value::Object(map))
+        }
+        _ => Err(format!("bucket {} has an unsupported shape", path.display())),
+    }
+}
+
+/// Write a bucket via a temp file + rename so a partial write cannot corrupt it.
+fn write_bucket_value(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("serialize {}: {}", path.display(), e))?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, raw).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, path).map_err(|e| format!("rename {}: {}", tmp.display(), e))?;
+    Ok(())
+}
+
+/// Count the actions in a bucket with the exact id. Duplicates are surfaced, not
+/// collapsed, so callers can refuse an ambiguous registry state.
+fn matching_count(value: &serde_json::Value, action_id: &str) -> usize {
+    value
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .map(|actions| {
+            actions
+                .iter()
+                .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The unique action row for `action_id`, requiring exactly one match.
+fn unique_action<'a>(
+    value: &'a serde_json::Value,
+    action_id: &str,
+    bucket: &str,
+) -> Result<&'a serde_json::Value, String> {
+    let actions = value
+        .get("actions")
+        .and_then(|a| a.as_array())
+        .ok_or_else(|| format!("{bucket} bucket is malformed"))?;
+    let mut matches = actions
+        .iter()
+        .filter(|a| a.get("id").and_then(|id| id.as_str()) == Some(action_id));
+    let first = matches
+        .next()
+        .ok_or_else(|| format!("action '{action_id}' is not present in the {bucket} bucket"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "action '{action_id}' appears more than once in the {bucket} bucket; reconciliation required"
+        ));
+    }
+    Ok(first)
+}
+
+fn proof_from_action(
+    action: &serde_json::Value,
+    action_id: &str,
+) -> ActionRegistryTerminalProof {
+    let run_id = action
+        .get("execution_evidence")
+        .and_then(|e| e.get("run_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let acceptance_result = action
+        .get("execution_evidence")
+        .and_then(|e| e.get("acceptance_result"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    ActionRegistryTerminalProof {
+        action_id: action_id.to_string(),
+        done_present: true,
+        active_absent: false,
+        run_id,
+        acceptance_result,
+    }
+}
+
+/// Exact persisted terminal evidence for a done row: status must be `done` and
+/// both evidence fields must equal the expected payload exactly.
+fn done_row_matches(action: &serde_json::Value, evidence: &serde_json::Value) -> bool {
+    let status_ok = action.get("status").and_then(|v| v.as_str()) == Some("done");
+    let exec_ok = action.get("execution_evidence") == Some(evidence);
+    let accept_ok = action.get("acceptance_evidence") == Some(evidence);
+    status_ok && exec_ok && accept_ok
+}
+
+/// After all trusted acceptance checks pass, mark exactly one Action Registry
+/// action terminally done. The exact existing action object is moved to the
+/// `done` bucket with its unknown JSON fields preserved; `status` and the
+/// runtime execution/acceptance evidence are updated. Refuses any ambiguous or
+/// duplicate registry state and never silently removes rows. Both files are
+/// re-read and must show exactly one done row with exact evidence and zero
+/// active rows before terminal is proven.
+pub fn finalize_action_registry_done(
+    db: &AppDb,
+    action_id: &str,
+    evidence: &serde_json::Value,
+) -> Result<ActionRegistryTerminalProof, String> {
+    let dir = data_dir(db)?;
+    let active_path = dir.join("active.json");
+    let done_path = dir.join("done.json");
+
+    let mut active = read_bucket_value(&active_path)?;
+    let mut done = read_bucket_value(&done_path)?;
+
+    let active_count = matching_count(&active, action_id);
+    let done_count = matching_count(&done, action_id);
+    if done_count > 1 {
+        return Err(format!(
+            "action '{action_id}' appears {done_count} times in the done bucket; reconciliation required"
+        ));
+    }
+
+    if done_count == 1 {
+        // Idempotent: exactly one done row, no active row, and exact evidence.
+        if active_count != 0 {
+            return Err(format!(
+                "action '{action_id}' is present in both done and active; reconciliation required"
+            ));
+        }
+        let done_row = unique_action(&done, action_id, "done")?;
+        if !done_row_matches(done_row, evidence) {
+            return Err(format!(
+                "action '{action_id}' done row does not match the expected terminal evidence"
+            ));
+        }
+        let mut proof = proof_from_action(done_row, action_id);
+        proof.active_absent = true;
+        return Ok(proof);
+    }
+
+    // Fresh terminal write requires exactly one active row.
+    if active_count != 1 {
+        return Err(format!(
+            "action '{action_id}' must have exactly one active row to terminate (found {active_count})"
+        ));
+    }
+    let action = unique_action(&active, action_id, "active")?.clone();
+    let status = action
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !matches!(status, "open" | "in_progress") {
+        return Err(format!(
+            "action '{action_id}' is not terminally deliverable: status is '{status}'"
+        ));
+    }
+
+    // Build the terminal object from the exact existing action so unknown fields
+    // are preserved; only status/evidence/timestamp are overwritten.
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut terminal = action;
+    terminal["status"] = serde_json::Value::String("done".to_string());
+    terminal["updated_at"] = serde_json::Value::String(now);
+    terminal["execution_evidence"] = evidence.clone();
+    terminal["acceptance_evidence"] = evidence.clone();
+
+    // Move the single active row into done, removing it from active.
+    {
+        let arr = done
+            .get_mut("actions")
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| "done bucket is malformed".to_string())?;
+        arr.push(terminal);
+    }
+    {
+        let arr = active
+            .get_mut("actions")
+            .and_then(|a| a.as_array_mut())
+            .ok_or_else(|| "active bucket is malformed".to_string())?;
+        arr.retain(|a| a.get("id").and_then(|id| id.as_str()) != Some(action_id));
+    }
+
+    // Write done before active so an interruption cannot leave a done action
+    // still active.
+    write_bucket_value(&done_path, &done)?;
+    write_bucket_value(&active_path, &active)?;
+
+    // Exact readback.
+    let done_after = read_bucket_value(&done_path)?;
+    let active_after = read_bucket_value(&active_path)?;
+    if matching_count(&done_after, action_id) != 1
+        || matching_count(&active_after, action_id) != 0
+    {
+        return Err(format!(
+            "action '{action_id}' terminal write could not be confirmed; reconciliation required"
+        ));
+    }
+    let done_row = unique_action(&done_after, action_id, "done")?;
+    if !done_row_matches(done_row, evidence) {
+        return Err(format!(
+            "action '{action_id}' done row evidence does not match after write"
+        ));
+    }
+    let mut proof = proof_from_action(done_row, action_id);
+    proof.active_absent = true;
+    Ok(proof)
+}
+
+/// Read back an already-terminal action row and verify it exactly. Requires a
+/// single done row, zero active rows, `status = done`, and exact persisted
+/// execution/acceptance evidence equal to `evidence`; unrelated or stale done
+/// evidence is never accepted as proof.
+pub fn verify_action_registry_done(
+    db: &AppDb,
+    action_id: &str,
+    evidence: &serde_json::Value,
+) -> Result<ActionRegistryTerminalProof, String> {
+    let dir = data_dir(db)?;
+    let done = read_bucket_value(&dir.join("done.json"))?;
+    let active = read_bucket_value(&dir.join("active.json"))?;
+    if matching_count(&done, action_id) != 1 {
+        return Err(format!(
+            "action '{action_id}' does not have exactly one done row"
+        ));
+    }
+    if matching_count(&active, action_id) != 0 {
+        return Err(format!(
+            "action '{action_id}' is still present in the active bucket"
+        ));
+    }
+    let done_row = unique_action(&done, action_id, "done")?;
+    if !done_row_matches(done_row, evidence) {
+        return Err(format!(
+            "action '{action_id}' done row does not match the expected terminal evidence"
+        ));
+    }
+    let mut proof = proof_from_action(done_row, action_id);
+    proof.active_absent = true;
+    Ok(proof)
 }
 
 #[cfg(test)]

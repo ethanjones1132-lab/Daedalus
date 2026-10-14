@@ -1,9 +1,15 @@
-use crate::commands::sessions::persist_terminal_run_at;
+use crate::commands::sessions::{persist_goal_terminal_run_at, persist_terminal_run_at};
+use crate::db::AppDb;
+use crate::jarvis::memory::contracts::MemoryError;
+use crate::jarvis::memory::transport::NativeMemoryTransport;
+use crate::jarvis::memory::turn::{
+    MemoryRecallStatus, MemoryTurnDiagnostic, MemoryTurnIdentityRequest,
+};
 use crate::jarvis::types::*;
 use crate::wsl::wsl_openclaw;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Accumulates the evidence needed to persist one durable `session_runs` record.
 /// The Bun server is the source of truth for run identity and outcome, but the
@@ -19,6 +25,12 @@ struct TerminalRunAccumulator {
     outcome: Option<String>,
     partial_output: Option<String>,
     cancelled_reason: Option<String>,
+    /// Aggregate successful answer text observed on this relay turn, held
+    /// independently of any UI React state. Includes both streamed deltas and
+    /// the orchestrator `ResultThenDone` aggregate token. It is the exact text
+    /// the native relay persists as the turn's assistant message; UI must NOT
+    /// duplicate the append.
+    answer_text: String,
 }
 
 impl TerminalRunAccumulator {
@@ -127,6 +139,235 @@ fn map_terminal_outcome(subtype: &str, code: Option<&str>, is_error: bool) -> St
     }
 }
 
+/// Phase 2.4 shared relay finalizer. ID-only: syncs the authenticated Bun
+/// receipt for one native turn into App SQLite exactly once before the relay
+/// publishes its terminal outcome. It never treats model/tool success as an
+/// accepted memory fact and never fabricates runtime evidence. A bounded
+/// failure is returned so the caller can surface truthful memory-unavailable
+/// metadata while preserving the ordinary inference result.
+pub fn finalize_relay_memory_turn(
+    db: &AppDb,
+    transport: &NativeMemoryTransport,
+    identity: MemoryTurnIdentityRequest,
+) -> Result<MemoryTurnDiagnostic, MemoryError> {
+    crate::jarvis::memory::transport::sync_memory_turn(db, transport, identity, chrono::Utc::now())
+}
+
+/// UI/relay-caller wait bound for one native memory finalization. Above the
+/// owned transport's own 1 s connect / 3 s total request bounds. A timeout
+/// surfaces a typed pending status and never manufactures success.
+const RELAY_MEMORY_FINALIZE_TIMEOUT_MS: u64 = 5_000;
+
+/// Emit a metadata-only relay memory failure/pending status. Never content,
+/// never scope, never terminal evidence.
+fn emit_relay_memory_failure(app: &AppHandle, session_id: &str, turn_id: &str, code: &str) {
+    let _ = app.emit(
+        "jarvis://memory-status",
+        serde_json::json!({
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "status": "unavailable",
+            "selected_ids": [],
+            "store_revision": serde_json::Value::Null,
+            "code": code,
+        }),
+    );
+}
+
+/// Emit the honest capture status for one relay turn. The UI projects this with
+/// `captureReceiptState`: a receipt is emitted only when capture committed;
+/// otherwise a metadata-only error code is sent. `error_code` is reserved for an
+/// ACTUAL capture failure (`capture_failed`, `capture_pending`,
+/// `capture_unavailable`); a sync or append failure is reported independently
+/// via the boolean flags and never falsely fails a committed receipt. Never
+/// assistant prose.
+fn emit_relay_capture_status(
+    app: &AppHandle,
+    session_id: &str,
+    turn_id: &str,
+    receipt: Option<&crate::jarvis::memory::capture_contracts::CaptureReceipt>,
+    error_code: Option<&str>,
+    sync_failed: bool,
+    append_failed: bool,
+) {
+    let _ = app.emit(
+        "jarvis://memory-capture",
+        serde_json::json!({
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "receipt": receipt,
+            "error_code": error_code,
+            "sync_failed": sync_failed,
+            "append_failed": append_failed,
+        }),
+    );
+}
+
+/// One-shot wrapper around [`finalize_relay_turn_with_capture`] for the relay
+/// thread. Only attempts finalization when a real persisted Session/turn
+/// identity exists.
+///
+/// The blocking finalization (sync + optional assistant append + capture) runs
+/// on an AppHandle-owned worker so the relay caller's wait is **bounded** even
+/// if the native operation gate or the AppDb queue is backed up. The worker
+/// only returns data over a channel; it never emits a late diagnostic after the
+/// caller has timed out. The caller emits exactly one result — the actual native
+/// diagnostic projection, the capture status, and the nullable assistant DB id
+/// — before the ordinary terminal publication.
+#[allow(clippy::too_many_arguments)]
+fn attempt_relay_memory_finalize(
+    app: &AppHandle,
+    session_id: &str,
+    turn_id: &str,
+    expected_source_message_id: &str,
+    expected_message_hash: &str,
+    enabled: bool,
+    finalized: &mut bool,
+    run_acc: &TerminalRunAccumulator,
+) -> Option<String> {
+    if !enabled || *finalized {
+        return None;
+    }
+    *finalized = true;
+
+    let worker_app = app.clone();
+    let worker_session = session_id.to_string();
+    let worker_turn = turn_id.to_string();
+    let worker_source = expected_source_message_id.to_string();
+    let worker_hash = expected_message_hash.to_string();
+    let worker_answer = {
+        let trimmed = run_acc.answer_text.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(run_acc.answer_text.clone())
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<
+        Result<crate::commands::memory_capture::RelayTurnFinalization, String>,
+    >();
+    std::thread::spawn(move || {
+        let transport = crate::jarvis::memory::transport::native_memory_transport();
+        let db_state = worker_app.state::<AppDb>();
+        let result = crate::commands::memory_capture::finalize_relay_turn_with_capture(
+            db_state.inner(),
+            transport,
+            MemoryTurnIdentityRequest {
+                session_id: worker_session,
+                turn_id: worker_turn,
+            },
+            &worker_source,
+            &worker_hash,
+            worker_answer.as_deref(),
+        )
+        .map_err(|error| error.to_string());
+        // Return data only; the receiver may already be gone.
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_millis(RELAY_MEMORY_FINALIZE_TIMEOUT_MS)) {
+        Ok(Ok(outcome)) => {
+            // A reused turn id whose canonical stored turn does not own this
+            // newly saved relay source is never synced, appended, or captured.
+            // Report the conflict and suppress publication of the old turn's
+            // metadata or receipt.
+            if outcome.source_conflict {
+                emit_relay_memory_failure(app, session_id, turn_id, "memory_source_conflict");
+                // The unassociated transcript row (if any) is still reported so
+                // the UI suppresses a duplicate without losing the answer.
+                return outcome.assistant_message_id;
+            }
+            let diagnostic = &outcome.diagnostic;
+            if diagnostic.turn_id != turn_id || diagnostic.session_id != session_id {
+                emit_relay_memory_failure(app, session_id, turn_id, "memory_turn_mismatch");
+                return None;
+            }
+            // Authoritative native diagnostic projection: prepared selection
+            // metadata, applied IDs, scope, and current-source revalidation
+            // availability. Never recalled text or the raw block.
+            let _ = app.emit(
+                "jarvis://memory-diagnostic",
+                serde_json::json!({
+                    "turn_id": diagnostic.turn_id,
+                    "session_id": diagnostic.session_id,
+                    "scope": &diagnostic.scope,
+                    "store_revision": diagnostic.store_revision,
+                    "selected": &diagnostic.selected,
+                    "applied_selected_ids": &diagnostic.applied_selected_ids,
+                    "state": diagnostic.state,
+                    "recall_status": diagnostic.recall_status,
+                    "error_code": diagnostic.error_code,
+                    "terminal_status": diagnostic.terminal_status,
+                    "revalidation": &diagnostic.revalidation,
+                }),
+            );
+            // `error_code` is reserved for an ACTUAL capture failure. A sync or
+            // append failure is reported independently and never falsely fails a
+            // committed receipt.
+            let capture_error = if outcome.capture_failed {
+                Some("capture_failed")
+            } else {
+                None
+            };
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                outcome.capture.as_ref(),
+                capture_error,
+                outcome.sync_failed,
+                outcome.append_failed,
+            );
+            outcome.assistant_message_id
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "[memory] relay finalize failed session={} turn={} error={}",
+                session_id, turn_id, error
+            );
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_unavailable"),
+                false,
+                false,
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // The worker may still complete later; it only sends to a dropped
+            // channel and never emits, so no late diagnostic can repaint.
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_pending");
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_pending"),
+                false,
+                false,
+            );
+            None
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            emit_relay_memory_failure(app, session_id, turn_id, "memory_finalization_failed");
+            emit_relay_capture_status(
+                app,
+                session_id,
+                turn_id,
+                None,
+                Some("capture_unavailable"),
+                false,
+                false,
+            );
+            None
+        }
+    }
+}
+
 /// Send a chat turn to the native Bun server (the JARVIS_API) and relay its SSE
 /// stream back to the UI as `jarvis://token` / `jarvis://done` / `jarvis://error`
 /// events.
@@ -136,6 +377,8 @@ fn map_terminal_outcome(subtype: &str, code: Option<&str>, is_error: bool) -> St
 /// `POST /chat/stream` and forward frames. The previous implementation shelled out to
 /// `wsl.exe -- bash -c "bun run main.tsx …"`, which silently did nothing once the WSL
 /// distro was lost — that was why prompting appeared dead.
+#[allow(unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_jarvis_message(
     app: AppHandle,
     base_url: String,
@@ -143,7 +386,22 @@ pub fn run_jarvis_message(
     message: String,
     history: Vec<serde_json::Value>,
     db_path: PathBuf,
+    turn_id: String,
+    source_message_id: String,
+    source_message_hash: String,
+    memory_preparation_id: Option<String>,
+    initial_memory_status: MemoryRecallStatus,
+    // Native-registered Goal run binding for this relay turn, if any. It is a
+    // correlation identity, NOT authorization: the terminal writer loads the
+    // native registration row and requires the owned Bun child's consume receipt
+    // to verify the exact binding/Session/turn/saved-user source/Goal/TaskRun
+    // identity before setting `session_runs.goal_id`. Never derived from the
+    // client body.
+    goal_binding_id: Option<String>,
 ) -> Result<(), String> {
+    // A real persisted Session/turn identity is required for memory
+    // finalization; a blank Session runs ordinary relay inference only.
+    let memory_turn_enabled = !session_id.is_empty();
     let effective_session_id = if session_id.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -153,6 +411,11 @@ pub fn run_jarvis_message(
     let sid = effective_session_id;
 
     std::thread::spawn(move || {
+        let mut memory_finalized = false;
+        // One accumulator for the whole relay turn, including pre-stream
+        // failures: it holds the aggregate answer text the native relay owns and
+        // persists as the turn's assistant message.
+        let mut run_acc = TerminalRunAccumulator::default();
         eprintln!(
             "[jarvis-chat] relay thread started session={} url={}",
             sid, url
@@ -167,12 +430,35 @@ pub fn run_jarvis_message(
             }),
         );
 
-        let emit_error = |app: &AppHandle, sid: &str, msg: String| {
-            let _ = app.emit(
-                "jarvis://error",
-                serde_json::json!({ "error": msg, "session_id": sid }),
-            );
-        };
+        // Every terminal path carries nullable `assistant_message_id` plus
+        // explicit native ownership metadata. `native_owns_append: true` means
+        // the native relay owns the append attempt for this turn; a null id
+        // means native did not append a row and the UI must NOT fall back.
+        let emit_error =
+            |app: &AppHandle, sid: &str, turn_id: &str, msg: String, assistant_message_id: Option<&str>| {
+                let _ = app.emit(
+                    "jarvis://error",
+                    serde_json::json!({
+                        "error": msg,
+                        "session_id": sid,
+                        "turn_id": turn_id,
+                        "assistant_message_id": assistant_message_id,
+                        "native_owns_append": true,
+                    }),
+                );
+            };
+        let emit_done =
+            |app: &AppHandle, sid: &str, turn_id: &str, assistant_message_id: Option<&str>| {
+                let _ = app.emit(
+                    "jarvis://done",
+                    serde_json::json!({
+                        "session_id": sid,
+                        "turn_id": turn_id,
+                        "assistant_message_id": assistant_message_id,
+                        "native_owns_append": true,
+                    }),
+                );
+            };
 
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(900))
@@ -187,30 +473,68 @@ pub fn run_jarvis_message(
         {
             Ok(c) => c,
             Err(e) => {
-                emit_error(&app, &sid, format!("HTTP client error: {e}"));
+                let assistant_message_id = attempt_relay_memory_finalize(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    &source_message_id,
+                    &source_message_hash,
+                    memory_turn_enabled,
+                    &mut memory_finalized,
+                    &run_acc,
+                );
+                emit_error(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    format!("HTTP client error: {e}"),
+                    assistant_message_id.as_deref(),
+                );
                 return;
             }
         };
 
-        let resp = match client
-            .post(&url)
-            .json(&serde_json::json!({
-                "message": message,
-                "session_id": sid,
-                "history": history,
-            }))
-            .send()
-        {
+        let mut request_body = serde_json::json!({
+            "message": message,
+            "session_id": sid,
+            "history": history,
+            "turn_id": turn_id,
+            "memory_status": &initial_memory_status,
+        });
+        if let Some(preparation_id) = memory_preparation_id.as_deref() {
+            request_body["memory_preparation_id"] = serde_json::Value::String(preparation_id.to_string());
+        }
+        // Exact persisted saved-user source row for a Goal-linked relay turn.
+        // Association identity only: the owned Bun child matches it against the
+        // binding registered over the private capability before consuming, and
+        // an ordinary goal-less relay turn omits it.
+        if goal_binding_id.is_some() && !source_message_id.is_empty() {
+            request_body["source_message_id"] =
+                serde_json::Value::String(source_message_id.clone());
+        }
+        let resp = match client.post(&url).json(&request_body).send() {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
                     "[jarvis-chat] stream POST failed session={} error={}",
                     sid, e
                 );
+                let assistant_message_id = attempt_relay_memory_finalize(
+                    &app,
+                    &sid,
+                    &turn_id,
+                    &source_message_id,
+                    &source_message_hash,
+                    memory_turn_enabled,
+                    &mut memory_finalized,
+                    &run_acc,
+                );
                 emit_error(
                     &app,
                     &sid,
+                    &turn_id,
                     format!("Could not reach the Jarvis server: {e}"),
+                    assistant_message_id.as_deref(),
                 );
                 return;
             }
@@ -225,7 +549,23 @@ pub fn run_jarvis_message(
         if !resp.status().is_success() {
             let code = resp.status();
             let body = resp.text().unwrap_or_default();
-            emit_error(&app, &sid, format!("Jarvis server returned {code}: {body}"));
+            let assistant_message_id = attempt_relay_memory_finalize(
+                &app,
+                &sid,
+                &turn_id,
+                &source_message_id,
+                &source_message_hash,
+                memory_turn_enabled,
+                &mut memory_finalized,
+                &run_acc,
+            );
+            emit_error(
+                &app,
+                &sid,
+                &turn_id,
+                format!("Jarvis server returned {code}: {body}"),
+                assistant_message_id.as_deref(),
+            );
             return;
         }
 
@@ -235,7 +575,9 @@ pub fn run_jarvis_message(
         let reader = BufReader::new(resp);
         let mut relay = SseRelay::new();
         let mut terminated = false;
-        let mut run_acc = TerminalRunAccumulator::default();
+        // Nullable DB id of the assistant row the relay persisted. Included in
+        // the terminal event so the UI suppresses a duplicate append.
+        let mut relay_assistant_message_id: Option<String> = None;
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
@@ -252,6 +594,7 @@ pub fn run_jarvis_message(
             match relay.handle_line(&line) {
                 SseFrameOutcome::Continue => {}
                 SseFrameOutcome::Token(text) => {
+                    run_acc.answer_text.push_str(&text);
                     let _ = app.emit(
                         "jarvis://token",
                         serde_json::json!({ "text": text, "session_id": sid }),
@@ -302,28 +645,70 @@ pub fn run_jarvis_message(
                     );
                 }
                 SseFrameOutcome::Error(err) => {
-                    emit_error(&app, &sid, err);
+                    let assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_error(&app, &sid, &turn_id, err, assistant_message_id.as_deref());
                     terminated = true;
                     break;
                 }
                 SseFrameOutcome::ResultThenDone { token, error } => {
                     // Orchestrator aggregate: surface the answer (or failure) that
                     // never streamed as deltas, then close the turn.
-                    if let Some(t) = token {
+                    if let Some(t) = &token {
+                        run_acc.answer_text.push_str(t);
                         let _ = app.emit(
                             "jarvis://token",
                             serde_json::json!({ "text": t, "session_id": sid }),
                         );
                     }
+                    // Finalize before any terminal error/done publication.
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
                     if let Some(e) = error {
-                        emit_error(&app, &sid, e);
+                        emit_error(&app, &sid, &turn_id, e, relay_assistant_message_id.as_deref());
                     }
-                    let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
+                    );
                     terminated = true;
                     break;
                 }
                 SseFrameOutcome::Done => {
-                    let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
+                    );
                     terminated = true;
                     break;
                 }
@@ -337,9 +722,66 @@ pub fn run_jarvis_message(
                 }
                 SseFrameOutcome::Cancelled => {
                     // User-initiated stop — clear the spinner without a scary error banner.
-                    let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+                    relay_assistant_message_id = attempt_relay_memory_finalize(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        &source_message_id,
+                        &source_message_hash,
+                        memory_turn_enabled,
+                        &mut memory_finalized,
+                        &run_acc,
+                    );
+                    emit_done(
+                        &app,
+                        &sid,
+                        &turn_id,
+                        relay_assistant_message_id.as_deref(),
+                    );
                     terminated = true;
                     break;
+                }
+                SseFrameOutcome::MemoryStatus {
+                    turn_id: frame_turn,
+                    status,
+                    selected_ids,
+                    store_revision,
+                    code,
+                } => {
+                    // Forward the transient native memory metadata. Never
+                    // authority and never content; only this turn is surfaced.
+                    if frame_turn == turn_id {
+                        let _ = app.emit(
+                            "jarvis://memory-status",
+                            serde_json::json!({
+                                "turn_id": turn_id,
+                                "status": status,
+                                "selected_ids": selected_ids,
+                                "store_revision": store_revision,
+                                "code": code,
+                                "session_id": sid,
+                            }),
+                        );
+                    }
+                }
+                SseFrameOutcome::MemoryApplied {
+                    turn_id: frame_turn,
+                    stage,
+                    selected_ids,
+                    status,
+                } => {
+                    if frame_turn == turn_id {
+                        let _ = app.emit(
+                            "jarvis://memory-applied",
+                            serde_json::json!({
+                                "turn_id": turn_id,
+                                "stage": stage,
+                                "selected_ids": selected_ids,
+                                "status": status,
+                                "session_id": sid,
+                            }),
+                        );
+                    }
                 }
                 SseFrameOutcome::ToolCall {
                     call_id,
@@ -432,23 +874,73 @@ pub fn run_jarvis_message(
             } else {
                 run_acc.tool_use_count
             };
-            let _ = persist_terminal_run_at(
-                &db_path,
-                &sid,
-                run_id,
-                outcome,
-                run_acc.selected_model.as_deref(),
-                run_acc.token_count,
-                tool_count,
-                run_acc.cancelled_reason.as_deref(),
-                run_acc.partial_output.as_deref(),
-            );
+            // Goal proof: `goal_binding_id` is only a correlation id. Native
+            // resolves the authorized Goal itself by verifying its registration
+            // row against the owned child's consume receipt for this exact run
+            // id. A missing/mismatched receipt leaves the run goal-less.
+            let verified_goal_id = match goal_binding_id.as_deref() {
+                Some(binding_id) if !binding_id.is_empty() => {
+                    let transport =
+                        crate::jarvis::memory::transport::native_memory_transport();
+                    match rusqlite::Connection::open(&db_path) {
+                        Ok(conn) => crate::jarvis::memory::transport::
+                            resolve_goal_terminal_authority(&conn, transport, binding_id, run_id)
+                            .ok()
+                            .flatten(),
+                        Err(_) => None,
+                    }
+                }
+                _ => None,
+            };
+            let _ = match verified_goal_id.as_deref() {
+                // A verified Goal association uses the Goal-specific writer.
+                Some(goal_id) => persist_goal_terminal_run_at(
+                    &db_path,
+                    &sid,
+                    run_id,
+                    outcome,
+                    run_acc.selected_model.as_deref(),
+                    run_acc.token_count,
+                    tool_count,
+                    run_acc.cancelled_reason.as_deref(),
+                    run_acc.partial_output.as_deref(),
+                    Some(goal_id),
+                ),
+                // An ordinary goal-less run keeps the unchanged writer.
+                None => persist_terminal_run_at(
+                    &db_path,
+                    &sid,
+                    run_id,
+                    outcome,
+                    run_acc.selected_model.as_deref(),
+                    run_acc.token_count,
+                    tool_count,
+                    run_acc.cancelled_reason.as_deref(),
+                    run_acc.partial_output.as_deref(),
+                ),
+            };
         }
 
         // Guarantee the UI's streaming spinner is always cleared, even if the stream
-        // ended without an explicit terminal frame.
+        // ended without an explicit terminal frame. Finalize the memory turn
+        // before the EOF terminal publication.
         if !terminated {
-            let _ = app.emit("jarvis://done", serde_json::json!({ "session_id": sid }));
+            relay_assistant_message_id = attempt_relay_memory_finalize(
+                &app,
+                &sid,
+                &turn_id,
+                &source_message_id,
+                &source_message_hash,
+                memory_turn_enabled,
+                &mut memory_finalized,
+                &run_acc,
+            );
+            emit_done(
+                &app,
+                &sid,
+                &turn_id,
+                relay_assistant_message_id.as_deref(),
+            );
         }
     });
 
@@ -534,6 +1026,23 @@ pub enum SseFrameOutcome {
     /// Emitted as `agent_run_id` after the pipeline completes; used by self-tuning
     /// to correlate a user rating with the run record in SQLite.
     AgentRunId { run_id: String },
+    /// Transient native memory status metadata (`memory_status`). Informational
+    /// only — never authority and never content.
+    MemoryStatus {
+        turn_id: String,
+        status: String,
+        selected_ids: Vec<String>,
+        store_revision: Option<i64>,
+        code: Option<String>,
+    },
+    /// Per-call actual applied memory metadata (`memory_applied`). Informational
+    /// only; applied IDs are authenticated from the native receipt, not here.
+    MemoryApplied {
+        turn_id: String,
+        stage: String,
+        selected_ids: Vec<String>,
+        status: String,
+    },
 }
 
 /// Stateful SSE frame relay. Holds the one piece of cross-frame state the
@@ -742,6 +1251,60 @@ impl SseRelay {
                     .unwrap_or("")
                     .to_string(),
             },
+            Some("memory_status") => {
+                let turn_id = evt
+                    .get("turn_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let status = evt
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let selected_ids = evt
+                    .get("selected_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|values| values.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let store_revision = evt.get("store_revision").and_then(|v| v.as_i64());
+                let code = evt.get("code").and_then(|v| v.as_str()).map(String::from);
+                SseFrameOutcome::MemoryStatus {
+                    turn_id,
+                    status,
+                    selected_ids,
+                    store_revision,
+                    code,
+                }
+            }
+            Some("memory_applied") => {
+                let turn_id = evt
+                    .get("turn_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let stage = evt
+                    .get("stage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let selected_ids = evt
+                    .get("selected_ids")
+                    .and_then(|v| v.as_array())
+                    .map(|values| values.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let status = evt
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                SseFrameOutcome::MemoryApplied {
+                    turn_id,
+                    stage,
+                    selected_ids,
+                    status,
+                }
+            }
             Some("message_stop") => SseFrameOutcome::MessageStop,
             Some("cancelled") => SseFrameOutcome::Cancelled,
             Some("reasoning_complete") => {

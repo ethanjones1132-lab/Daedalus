@@ -188,7 +188,7 @@ describe('every row carries text for the state it claims', () => {
       'Bun server',
       'Bridge',
       'Ollama',
-      'Gemma llama.cpp server',
+      'llama.cpp server',
       'Local model',
       'OpenRouter key',
       'Claude proxy',
@@ -217,7 +217,7 @@ describe('recovery is announced as text', () => {
     const subsystems = projectHealthSubsystems(stockOpenRouter);
 
     expect(recoverAnnouncement(subsystems)).toBe(
-      'Health recovered: all services required by the active inference backend (openrouter) are running. Not required by this backend: Ollama, Gemma llama.cpp server, Local model and Claude proxy.',
+      'Health recovered: all services required by the active inference backend (openrouter) are running. Not required by this backend: Ollama, llama.cpp server, Local model and Claude proxy.',
     );
   });
 
@@ -230,7 +230,7 @@ describe('recovery is announced as text', () => {
     });
 
     expect(recoverAnnouncement(subsystems)).toBe(
-      'Health recovered: all services required by the active inference backend (ollama) are running. Not required by this backend: Gemma llama.cpp server, OpenRouter key and Claude proxy.',
+      'Health recovered: all services required by the active inference backend (ollama) are running. Not required by this backend: llama.cpp server, OpenRouter key and Claude proxy.',
     );
   });
 

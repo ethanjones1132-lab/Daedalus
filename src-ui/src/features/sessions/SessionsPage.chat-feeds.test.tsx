@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 // Boundary contracts for the Chat Feeds Session list and transcript reads.
 //
 // `ChatFeedsView` is the one `usePolling` caller that carried no private guard:
@@ -54,6 +55,8 @@ beforeEach(() => {
   historyRequests = [];
   vi.mocked(invoke).mockReset();
   vi.mocked(invoke).mockImplementation(async (command, args) => {
+    const nativeValue = nativeMemoryFixture(command, args);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
     if (command === 'list_sessions') {
       const request = deferred<BackendSession[]>();
       listRequests.push(request);

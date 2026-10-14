@@ -8,6 +8,7 @@ import { Composer } from './Composer';
 import { Inspector } from './Inspector';
 import { Transcript } from './Transcript';
 import WorkspaceGrantsChip from './WorkspaceGrantsChip';
+import { MemoryTurnControls } from './MemoryTurnControls';
 import { useSessionTurn, type SessionTurn, type SessionTurnProps } from './useSessionTurn';
 
 export const INSPECTOR_STORAGE_KEY = 'jarvis-inspector-open';
@@ -206,7 +207,7 @@ export function ChatPanel({ recentSessions = [], title, onStreamingChange, ...pr
         </header>
 
         <Transcript turn={turn} config={config} />
-        <Composer turn={turn} />
+        <MemoryTurnControls turn={turn} /><Composer turn={turn} />
       </div>
 
       {inspectorOpen && <Inspector turn={turn} />}

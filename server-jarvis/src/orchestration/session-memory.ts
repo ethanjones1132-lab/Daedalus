@@ -6,11 +6,17 @@ import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
 import type { ToolResult } from "../tool-types";
 import {
+  applyGoalLink,
+  buildGoalCheckpointView,
+  createTaskRun,
+  reconcileRecoveredRun,
   resolveTaskRunTurn,
   setTaskPlan,
   type CreateTaskPlanItemInput,
+  type GoalCheckpointView,
   type TaskRunContract,
   type TaskRunDepth,
+  type TaskRunGoalLink,
 } from "./task-run";
 import type { TurnRequirement } from "./turn-requirements";
 import {
@@ -18,6 +24,11 @@ import {
   type OwnedPlanningAttachment,
 } from "./runtime-loop";
 import { parseSessionMemoryState, writeJsonAtomic } from "./session-runtime-persistence";
+import {
+  sessionInvalidationWatermark,
+  trySessionInvalidationWatermark,
+} from "../memory-derived-state";
+import type { MemoryDerivedInvalidation } from "../memory-contract";
 
 export interface ToolResultCacheEntry {
   key: string;
@@ -64,15 +75,99 @@ export interface SessionMemoryState {
   failureHistory: FailurePatternEntry[];
   /** Durable objective/checkpoint contract shared by continuation turns. */
   taskRun?: TaskRunContract;
+  /**
+   * Persisted invalidation watermark this snapshot was last sanitized against.
+   * A late write whose marker is older than the current watermark is
+   * re-sanitized before it can reach disk.
+   */
+  derivedWatermark?: number;
 }
 
 export interface BeginTaskRunInput {
   message: string;
   requirement: TurnRequirement;
+  sessionId?: string;
   workspacePath?: string;
   sessionGrants?: string[];
   depth?: TaskRunDepth;
   estimatedComplexity?: "low" | "medium" | "high";
+  /**
+   * Optional private Phase 3.4 continuity action from the native envelope.
+   * Only the native registered envelope can supply this; HTTP-only callers
+   * cannot. When present it is consumed BEFORE the legacy heuristic objective
+   * replacement. Absent means ordinary behavior.
+   */
+  continuity?: ContinuityAction;
+  /**
+   * Optional native-authorized Goal association for this turn. Only a binding
+   * the owned native child registered (after validating the Goal's
+   * Session/Agent/scope binding) can supply this. It is independent of memory
+   * availability. Absent means the turn is goal-less; an ordinary goal-less
+   * run never inherits a prior Goal.
+   */
+  goal?: TaskRunGoalLink;
+}
+
+/** Native objective action Bun applies to TaskRun state. */
+export interface ContinuityAction {
+  mode: "preserve" | "resume" | "replace" | "clear";
+  /** Accepted active objective text, or null for a clear. */
+  objective: string | null;
+}
+
+/** The derived native objective text after neutralization. Reconstructed from
+ * the envelope/sanitized history, never from a persisted summary/current_goal. */
+const OBJECTIVE_NEUTRALIZED_MARKER = "[Memory source removed]";
+
+/**
+ * Internal continuation cue for an explicit native resume. It matches the
+ * existing narrow continuation-phrase list so `resolveTaskRunTurn` continues
+ * the stored run even when the accepted objective is long. It is never shown
+ * to the model: routing/inference use the accepted goal.
+ */
+const RESUME_CONTINUATION_CUE = "continue";
+
+/**
+ * Repair the objective text of a contract being resumed. A neutralized OR
+ * mismatching stored objective is replaced from the native accepted text; if
+ * the accepted text is unavailable the text is left neutralized and the plan is
+ * marked for textual reconstruction, retaining independent executed evidence.
+ * Never reconstructs from an old summary/current_goal.
+ */
+function repairObjectiveForResume(
+  contract: TaskRunContract,
+  accepted: string | null,
+): TaskRunContract {
+  const neutralized = contract.objective === OBJECTIVE_NEUTRALIZED_MARKER;
+  const mismatching = accepted != null && contract.objective !== accepted;
+  if (!neutralized && !mismatching) return contract;
+  if (accepted) {
+    // A mismatching, non-neutralized stored objective is a cached plan for a
+    // DIFFERENT goal (for example a previewed replacement whose capture
+    // failed). Neutralize its textual carriers BEFORE adopting the accepted
+    // objective so the old plan text/remaining work/outcome cannot masquerade
+    // as authority for the accepted goal, while independent executed evidence,
+    // ids, status, progress and grants are retained. An already-neutralized
+    // contract keeps its existing reconstruction marker.
+    const base = mismatching && !neutralized
+      ? neutralizeTaskRunTextualCarriers(contract)
+      : contract;
+    return {
+      ...base,
+      objective: accepted,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (neutralized) return contract;
+  // No accepted text and a mismatching objective: neutralize textual carriers
+  // (existing policy) while retaining independent executed evidence ids.
+  return {
+    ...contract,
+    objective: OBJECTIVE_NEUTRALIZED_MARKER,
+    remainingWork: [],
+    reconstruction: "reconstruction_required",
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 export interface RecordToolResultInput {
@@ -219,8 +314,49 @@ export class SessionMemory {
     return this.getSession(sessionId).taskRun;
   }
 
+  /**
+   * Resolve this turn's TaskRun contract, applying the native continuity action
+   * (when present) BEFORE the legacy heuristic.
+   *
+   * - `preserve`: a genuinely independent ephemeral question contract built
+   *   from the CURRENT question; the stored TaskRun is byte/field unchanged.
+   * - `resume`: existing continuation using the native ACCEPTED objective (never
+   *   the literal "Continue active objective" phrase), persisted normally.
+   * - `replace`/`clear`: an explicit objective boundary for the current task
+   *   only, taken BEFORE the legacy resolver so a heuristic continuation cannot
+   *   retain the old task/plan.
+   * - absent: exact legacy behavior (resolveTaskRunTurn), persisted.
+   */
   beginTaskRun(sessionId: string, input: BeginTaskRunInput): TaskRunContract {
     const session = this.getSession(sessionId);
+    const continuity = input.continuity;
+    if (continuity?.mode === "preserve") {
+      // Ephemeral only. The stored TaskRun must not change at all.
+      return this.ephemeralQuestionContract(input);
+    }
+    if (continuity?.mode === "resume") {
+      const next = this.resumeTaskRun(session, input, continuity);
+      const linked = input.goal ? applyGoalLink(next, input.goal) : next;
+      session.taskRun = linked;
+      session.lastActiveAt = Date.now();
+      this.persist(session);
+      return linked;
+    }
+    if (continuity?.mode === "replace" || continuity?.mode === "clear") {
+      let next = applyContinuityBoundary(
+        this.boundaryBaseContract(session, input),
+        continuity,
+      );
+      // `replace` may carry a fresh native-authorized Goal; `clear` must not
+      // retain or absorb one — it is an explicit goal-less boundary.
+      if (continuity.mode === "replace" && input.goal) {
+        next = applyGoalLink(next, input.goal);
+      }
+      session.taskRun = next;
+      session.lastActiveAt = Date.now();
+      this.persist(session);
+      return next;
+    }
     const resolved = resolveTaskRunTurn(
       session.taskRun,
       input.message,
@@ -233,7 +369,11 @@ export class SessionMemory {
         estimatedComplexity: input.estimatedComplexity,
       },
     );
-    session.taskRun = {
+    // Goal linkage: an explicit native binding applies to this turn. Without
+    // one, a genuine continuation retains the prior Goal, while a NEW
+    // unrelated run is goal-less (resolveTaskRunTurn mints a fresh contract
+    // with no goal), so a new request can never silently inherit a prior Goal.
+    let next: TaskRunContract = {
       ...resolved.contract,
       workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
       ...(resolved.isContinuation
@@ -244,9 +384,130 @@ export class SessionMemory {
           }),
       updatedAt: new Date().toISOString(),
     };
+    if (input.goal) {
+      next = applyGoalLink(next, input.goal);
+    } else if (!resolved.isContinuation) {
+      // A fresh run with no native binding must not carry a stale goal.
+      next = { ...next, goal: undefined, checkpoint: undefined };
+    }
+    session.taskRun = next;
     session.lastActiveAt = Date.now();
     this.persist(session);
-    return session.taskRun;
+    return next;
+  }
+
+  /**
+   * A genuinely independent ephemeral contract for a preserve side question.
+   * Fresh transient id, fresh empty plan/progress/evidence, question-only
+   * requirement/depth/writeIntent. Prior granted roots are carried as
+   * PERMISSION ONLY. Never persisted and never aliases the stored plan.
+   */
+  ephemeralQuestionContract(input: BeginTaskRunInput): TaskRunContract {
+    return createTaskRun({
+      taskRunId: `task_${crypto.randomUUID()}`,
+      sessionId: input.sessionId ?? "unknown",
+      objective: input.message,
+      workspacePath: input.workspacePath,
+      sessionGrants: input.sessionGrants,
+      requirement: input.requirement,
+      depth: input.depth ?? "standard",
+      estimatedComplexity: input.estimatedComplexity ?? "medium",
+    });
+  }
+
+  /**
+   * Resume the accepted goal using existing continuation semantics. The native
+   * accepted objective (not the literal phrase) is the effective input. A
+   * neutralized or mismatching stored objective is repaired from native text
+   * BEFORE routing. On a goal resume with no existing run, a fresh accepted-goal
+   * task is created with NO invented grants (prior granted roots only).
+   */
+  private resumeTaskRun(
+    session: SessionMemoryState,
+    input: BeginTaskRunInput,
+    continuity: ContinuityAction,
+  ): TaskRunContract {
+    const accepted = continuity.objective ?? null;
+    const stored = session.taskRun;
+    if (!stored) {
+      return createTaskRun({
+        taskRunId: `task_${crypto.randomUUID()}`,
+        sessionId: session.sessionId,
+        objective: accepted ?? input.message,
+        workspacePath: input.workspacePath,
+        sessionGrants: input.sessionGrants,
+        requirement: input.requirement,
+        depth: input.depth ?? "standard",
+        estimatedComplexity: input.estimatedComplexity ?? "medium",
+      });
+    }
+    // Repair a neutralized OR mismatching objective text from the native
+    // accepted text before routing. Never reconstruct from an old summary/
+    // current_goal. A mismatching plan/plan-text is treated as a textual
+    // reconstruction requirement per the existing neutralization policy while
+    // independent executed evidence is retained.
+    const repaired = repairObjectiveForResume(stored, accepted);
+    // Explicit resume ALWAYS continues the accepted goal. The legacy resolver
+    // only continues for a continuation cue or a short full-execution work
+    // order, so a longer accepted objective would silently mint a NEW TaskRun
+    // and lose the plan/ids/count/evidence. Force continuation by passing an
+    // INTERNAL cue and a base that is live (`status: "active"`), regardless of
+    // the stored terminal status. Routing/inference still use the accepted goal
+    // (not this cue).
+    const base: TaskRunContract = {
+      ...repaired,
+      status: "active",
+    };
+    const resolved = resolveTaskRunTurn(
+      base,
+      RESUME_CONTINUATION_CUE,
+      input.requirement,
+      {
+        sessionId: session.sessionId,
+        workspacePath: input.workspacePath,
+        sessionGrants: input.sessionGrants,
+        depth: input.depth,
+        estimatedComplexity: input.estimatedComplexity,
+      },
+    );
+    const next: TaskRunContract = {
+      ...resolved.contract,
+      // The accepted objective is authoritative regardless of continuation
+      // heuristics; never let the literal phrase/cue become the objective.
+      objective: accepted ?? resolved.contract.objective,
+      workspacePath: resolved.contract.workspacePath ?? input.workspacePath,
+      status: "active",
+      updatedAt: new Date().toISOString(),
+    };
+    return next;
+  }
+
+  /**
+   * Base contract for an explicit replace/clear. Taken BEFORE the legacy
+   * resolver, and INTENTIONALLY fresh rather than spreading the stored
+   * contract: an explicit objective boundary must start a new task text/plan/
+   * progress boundary so the old task's execution intent (objective, depth,
+   * writeIntent, count, status, evidence) does not remain under an unrelated
+   * accepted goal. Independent Session caches (tool/file/check facts) live on
+   * `SessionMemoryState`, not here, and previously granted roots are retained
+   * as permission only. Historical execution evidence is NOT attributed to the
+   * new goal (`evidenceCount` resets).
+   */
+  private boundaryBaseContract(
+    session: SessionMemoryState,
+    input: BeginTaskRunInput,
+  ): TaskRunContract {
+    const stored = session.taskRun;
+    return createTaskRun({
+      taskRunId: stored?.taskRunId ?? `task_${crypto.randomUUID()}`,
+      sessionId: session.sessionId,
+      objective: input.message,
+      workspacePath: stored?.workspacePath ?? input.workspacePath,
+      sessionGrants: stored?.sessionGrants ?? input.sessionGrants,
+      requirement: input.requirement,
+      depth: input.depth ?? "standard",
+      estimatedComplexity: input.estimatedComplexity ?? "medium",
+    });
   }
 
   updateTaskRun(
@@ -285,6 +546,18 @@ export class SessionMemory {
     session.lastActiveAt = Date.now();
     this.persist(session);
     return session.taskRun;
+  }
+
+  /**
+   * Pure ephemeral planning for a preserve/resume side turn: seed this turn's
+   * contract from intake planning WITHOUT touching the durable TaskRun. Never
+   * persists or advances the stored plan/status/evidence/count.
+   */
+  beginTaskRunLocalPlanning(
+    contract: TaskRunContract,
+    planning: OwnedPlanningAttachment,
+  ): TaskRunContract {
+    return seedTaskPlanFromPlanning(contract, planning, {});
   }
 
   /** Replace the full TaskPlan ledger (planner-mediated validate, or reconstruction). */
@@ -349,16 +622,30 @@ export class SessionMemory {
     this.persist(session);
   }
 
-  toSharedContextHints(sessionId: string, workspacePath?: string): SharedContextHints | undefined {
+  toSharedContextHints(
+    sessionId: string,
+    workspacePath?: string,
+    options?: { freshWorkspaceReads?: boolean },
+  ): SharedContextHints | undefined {
     if (!this.config().enabled) return undefined;
     const session = this.getSession(sessionId);
     this.pruneExpired(session);
     const activeWorkspace = normalizeWorkspacePath(workspacePath);
+    // Phase 4.3: when a descriptive/unknown project fact requires a current
+    // source read, historical workspace tool results and discovered facts must
+    // not be offered as inference hints for this turn. This fails closed even
+    // when there is no active workspace: the requirement is set independent of
+    // workspace presence, so an absent workspace must not re-enable stale
+    // history. Independent TaskRun/check evidence is not part of
+    // SharedContextHints and is left untouched.
+    const omitWorkspaceHistory = options?.freshWorkspaceReads === true;
 
     const prior_tool_results: Record<string, string> = {};
-    for (const entry of Object.values(session.toolResults)) {
-      if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
-      prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
+    if (!omitWorkspaceHistory) {
+      for (const entry of Object.values(session.toolResults)) {
+        if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
+        prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
+      }
     }
 
     const failure_patterns = session.failureHistory
@@ -367,11 +654,13 @@ export class SessionMemory {
       .slice(0, this.config().max_failure_patterns)
       .map((f) => (f.count > 1 ? `${f.pattern} (seen ${f.count}x)` : f.pattern));
 
-    const relevant_memories = Object.values(session.discoveredFacts)
-      .filter((fact) => !activeWorkspace || fact.workspacePath === activeWorkspace)
-      .sort((a, b) => b.timestamp - a.timestamp)
-      .slice(0, 16)
-      .map((f) => f.value);
+    const relevant_memories = omitWorkspaceHistory
+      ? []
+      : Object.values(session.discoveredFacts)
+        .filter((fact) => !activeWorkspace || fact.workspacePath === activeWorkspace)
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 16)
+        .map((f) => f.value);
 
     return mergeSharedContextHints(undefined, {
       prior_tool_results: Object.keys(prior_tool_results).length > 0 ? prior_tool_results : undefined,
@@ -513,6 +802,99 @@ export class SessionMemory {
     }
   }
 
+  /**
+   * Drop every in-memory Session carrier. Phase 3.2 scoped invalidation uses
+   * `evictMemoryDerivedState` instead so independent TaskRuns/tool/file/check
+   * state is preserved; this remains for explicit Session teardown.
+   */
+  clearAll(): void {
+    this.sessions.clear();
+  }
+
+  /**
+   * Scoped eviction for one affected Session: load any persisted instance file
+   * (even when persistence is currently disabled, since it may be enabled
+   * later), then REPLACE the cached carrier with a detached, deep-cloned,
+   * scrubbed object bearing the current immutable generation. Memory-derived
+   * discovered facts and stale TaskRun textual carriers are neutralized while
+   * independent tool results, file snapshots, failure history, grants, executed
+   * evidence, and plan progress are preserved. Persists synchronously and throws
+   * on failure so the native ACK is withheld.
+   *
+   * The pre-eviction object is never mutated or re-stamped: it keeps its older
+   * generation permanently, so an in-flight writer holding it can neither
+   * restore derived text nor affect the fresh cached state.
+   */
+  evictMemoryDerivedState(
+    sessionId: string,
+    _invalidation: MemoryDerivedInvalidation,
+  ): void {
+    // Strict read: a corrupt watermark fails closed and withholds the ACK.
+    const current = sessionInvalidationWatermark(sessionId);
+    const existing = this.sessions.get(sessionId) ?? this.loadFromDiskForScrub(sessionId);
+    if (!existing) return;
+
+    const fresh = deepCloneState(existing);
+    setSessionGeneration(fresh, current);
+    fresh.derivedWatermark = current;
+    this.evictDerivedFields(fresh);
+
+    const path = memoryFilePath(fresh.sessionId, this.sessionsRoot);
+    if (this.config().persist || existsSync(path)) {
+      this.persistOrThrow(fresh);
+    }
+    // Replace the cached identity; the old object is detached and permanently
+    // stale by its old generation.
+    this.sessions.set(sessionId, fresh);
+  }
+
+  private evictDerivedFields(session: SessionMemoryState): void {
+    for (const key of Object.keys(session.discoveredFacts)) {
+      const fact = session.discoveredFacts[key];
+      // Accepted-memory-origin facts and unknown/untyped legacy facts are
+      // discarded conservatively; only explicitly verified tool/file sources
+      // are preserved.
+      if (shouldDiscardDerivedFact(fact)) {
+        delete session.discoveredFacts[key];
+      }
+    }
+    if (session.taskRun) {
+      session.taskRun = neutralizeTaskRunTextualCarriers(session.taskRun);
+    }
+    // Session-level outcome text is untyped/derived and may embed a suppressed
+    // source; drop it until fresh sanitized context rebuilds the carrier.
+    session.lastOutcome = undefined;
+    session.lastActiveAt = Date.now();
+  }
+
+  /**
+   * Strictly load a persisted Session file for scrubbing even when persistence
+   * is currently disabled. A missing file yields `null`; an unreadable or
+   * invalid file throws so the cleanup ACK is withheld rather than leaving
+   * stale on-disk state.
+   */
+  private loadFromDiskForScrub(sessionId: string): SessionMemoryState | null {
+    const path = memoryFilePath(sessionId, this.sessionsRoot);
+    if (!existsSync(path)) return null;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(path, "utf-8"));
+    } catch {
+      throw new Error("memory_derived_unavailable:corrupt_session_state");
+    }
+    const parsed = parseSessionMemoryState(raw, sessionId);
+    if (!parsed.ok) {
+      throw new Error("memory_derived_unavailable:invalid_session_state");
+    }
+    setSessionGeneration(parsed.state, parsed.state.derivedWatermark ?? 0);
+    return parsed.state;
+  }
+
+  private persistOrThrow(session: SessionMemoryState): void {
+    session.derivedWatermark = sessionGeneration(session);
+    writeJsonAtomic(memoryFilePath(session.sessionId, this.sessionsRoot), session);
+  }
+
   getSessionState(sessionId: string): SessionMemoryState | undefined {
     return this.sessions.get(sessionId);
   }
@@ -634,6 +1016,7 @@ export class SessionMemory {
       discoveredFacts: {},
       failureHistory: [],
     };
+    setSessionGeneration(created, trySessionInvalidationWatermark(sessionId) ?? 0);
     this.touch(sessionId, created);
     return created;
   }
@@ -655,7 +1038,14 @@ export class SessionMemory {
 
   private persist(session: SessionMemoryState): void {
     if (!this.config().persist) return;
+    // Never let a stale in-flight carrier (or one whose watermark cannot be
+    // trusted) overwrite the fresh cached state on disk with older progress /
+    // evidence / TaskRun text. Fresh independent writes go through the current
+    // Session getter, whose object carries the current generation.
+    const current = trySessionInvalidationWatermark(session.sessionId);
+    if (current === null || sessionGeneration(session) < current) return;
     try {
+      session.derivedWatermark = sessionGeneration(session);
       writeJsonAtomic(memoryFilePath(session.sessionId, this.sessionsRoot), session);
     } catch {
       console.warn("[SessionMemory] Failed to persist state: write_failed");
@@ -678,10 +1068,246 @@ export class SessionMemory {
       console.warn("[SessionMemory] Ignoring persisted state: invalid_state");
       return null;
     }
+    // Never render stale persisted derived text. If the marker predates the
+    // current watermark (or cannot be trusted), scrub the in-memory carrier at
+    // load time; when the marker is trustworthy the scrubbed carrier is stamped
+    // current so fresh independent writes can persist again.
+    const persistedGeneration = parsed.state.derivedWatermark ?? 0;
+    const current = trySessionInvalidationWatermark(sessionId);
+    if (current === null || persistedGeneration < current) {
+      this.evictDerivedFields(parsed.state);
+    }
+    const effectiveGeneration =
+      current !== null && persistedGeneration < current ? current : persistedGeneration;
+    setSessionGeneration(parsed.state, effectiveGeneration);
+
+    // Restart reconciliation for a Goal-linked live run. This is the process
+    // restart/eviction path (the carrier was not in memory), so a live run
+    // recovered here never observed its own terminal outcome. An in-flight
+    // effect whose outcome was never recorded becomes `ambiguous`/`blocked`
+    // (never blindly replayed); otherwise the run becomes resumable `paused`.
+    // Guarded by `resumedAt` so a repeated load cannot re-mark an already
+    // reconciled run.
+    const taskRun = parsed.state.taskRun;
+    if (
+      taskRun?.goal
+      && !["completed", "failed", "cancelled"].includes(taskRun.status)
+      && taskRun.checkpoint
+      && !taskRun.checkpoint.resumedAt
+    ) {
+      const { contract } = reconcileRecoveredRun(taskRun, "process_restart");
+      parsed.state.taskRun = contract;
+      parsed.state.lastActiveAt = Date.now();
+      if (this.config().persist) {
+        try {
+          writeJsonAtomic(memoryFilePath(parsed.state.sessionId, this.sessionsRoot), parsed.state);
+        } catch {
+          console.warn("[SessionMemory] Failed to persist reconciled Goal run: write_failed");
+        }
+      }
+    }
     return parsed.state;
   }
 }
 
+/**
+ * Immutable per-object generation. Assigned once when a SessionMemoryState is
+ * created or loaded from disk and never re-stamped; a late writer holding an
+ * old identity can never be treated as fresh.
+ */
+const SESSION_GENERATIONS = new WeakMap<SessionMemoryState, number>();
+
+function sessionGeneration(session: SessionMemoryState): number {
+  return SESSION_GENERATIONS.get(session) ?? 0;
+}
+
+function setSessionGeneration(session: SessionMemoryState, generation: number): void {
+  SESSION_GENERATIONS.set(session, generation);
+}
+
+/** Deep clone so a fresh eviction carrier shares no nested TaskRun/plan refs. */
+function deepCloneState(state: SessionMemoryState): SessionMemoryState {
+  return JSON.parse(JSON.stringify(state)) as SessionMemoryState;
+}
+
 export function __resetSessionMemoryForTests(): void {
   // No module-level cache beyond instance state; tests use dedicated instances.
+}
+
+/**
+ * Explicit memory/recall/proposal/legacy-unknown origins are always
+ * memory-derived.
+ */
+const EXPLICIT_MEMORY_FACT_SOURCES = new Set([
+  "memory",
+  "memory_recall",
+  "accepted_memory",
+  "recall",
+  "user_statement",
+  "assistant_proposal",
+  "verified_observation",
+  "legacy_unknown",
+  "legacy",
+]);
+
+/**
+ * Actual independent typed tool/file sources. Only these are preserved; a
+ * `file:`/`artifact:` key prefix is NOT proof of typed provenance.
+ */
+const INDEPENDENT_TOOL_FACT_SOURCES = new Set([
+  "read_file",
+  "list_directory",
+  "glob",
+  "grep",
+  "web_fetch",
+  "write_file",
+  "edit_file",
+  "multi_edit",
+  "apply_patch",
+  "write",
+  "edit",
+  "multiedit",
+  "tool_result",
+]);
+
+/**
+ * Facts from an explicit memory/recall/proposal origin are discarded FIRST;
+ * untyped/unknown legacy facts are discarded REGARDLESS of key prefix; only
+ * genuinely independent typed tool/file observations survive.
+ */
+function shouldDiscardDerivedFact(fact: DiscoveredFactEntry): boolean {
+  const source = fact.source.trim().toLowerCase();
+  if (
+    EXPLICIT_MEMORY_FACT_SOURCES.has(source) ||
+    source.includes("memory") ||
+    source.includes("recall") ||
+    source.includes("proposal")
+  ) {
+    return true;
+  }
+  if (INDEPENDENT_TOOL_FACT_SOURCES.has(source)) return false;
+  return true;
+}
+
+/** Exact neutral marker for any future model-facing suppressed carrier. */
+const MEMORY_SOURCE_REMOVED = "[Memory source removed]";
+
+/**
+ * Apply an explicit `replace`/`clear` objective boundary to a contract for the
+ * originating Session only. It never widens grants, adds scheduler behavior, or
+ * touches unrelated TaskRuns.
+ *
+ * - `replace`: set the accepted objective on the intentionally fresh base
+ *   (the old task's objective/depth/writeIntent/count/status/plan/evidence do
+ *   not carry into the new goal).
+ * - `clear`: STOP the old run as an active continuation so a later ordinary
+ *   "continue" cannot resurrect the cleared task, its neutral marker, or its
+ *   sticky write intent. Grants and independent Session caches are retained;
+ *   the run is terminal (`cancelled`) with no live plan.
+ */
+function applyContinuityBoundary(
+  contract: TaskRunContract,
+  continuity: ContinuityAction,
+): TaskRunContract {
+  if (continuity.mode === "replace") {
+    if (!continuity.objective) return contract;
+    return {
+      ...contract,
+      objective: continuity.objective,
+      status: "active",
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  if (continuity.mode === "clear") {
+    return {
+      ...contract,
+      objective: OBJECTIVE_NEUTRALIZED_MARKER,
+      remainingWork: [],
+      reconstruction: "reconstruction_required",
+      plan: undefined,
+      // Stop the old run: a terminal status means it is no longer live, so a
+      // following ordinary continue cannot resume it or its sticky write
+      // intent. Independent Session caches/grants are retained.
+      status: "cancelled",
+      writeIntent: false,
+      lastOutcome: undefined,
+      lastTurnId: undefined,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return contract;
+}
+
+/**
+ * Neutralize the stale textual carriers of a TaskRun until fresh sanitized
+ * native context rebuilds it. The objective, plan titles/descriptions/acceptance
+ * descriptions, blocked/evidence summaries, remaining work, and last outcome are
+ * all untrusted once a memory source is removed (exact spans cannot be proven),
+ * so they are replaced with the neutral marker. IDs, status, progress,
+ * dependsOn, grading mode, repair cycles, evidence refs/grounding, checks,
+ * grants/permissions, and tool/file caches are preserved. The result is a deep
+ * clone so no nested TaskRun/plan reference is shared with the pre-eviction
+ * carrier.
+ */
+function neutralizeTaskRunTextualCarriers(taskRun: TaskRunContract): TaskRunContract {
+  const clone = JSON.parse(JSON.stringify(taskRun)) as TaskRunContract;
+  clone.objective = MEMORY_SOURCE_REMOVED;
+  clone.remainingWork = [];
+  clone.lastOutcome = MEMORY_SOURCE_REMOVED;
+  clone.reconstruction = "reconstruction_required";
+  clone.updatedAt = new Date().toISOString();
+  if (clone.plan) {
+    clone.plan = {
+      activeItemId: clone.plan.activeItemId,
+      items: clone.plan.items.map((item) => ({
+        ...item,
+        title: MEMORY_SOURCE_REMOVED,
+        description: undefined,
+        blockedReason: undefined,
+        acceptanceChecks: (item.acceptanceChecks ?? []).map((check) => ({
+          ...check,
+          description: MEMORY_SOURCE_REMOVED,
+        })),
+        evidence: item.evidence
+          ? { ...item.evidence, summary: undefined }
+          : item.evidence,
+      })),
+    };
+  }
+  return clone;
+}
+
+/**
+ * Read the persisted per-Session TaskRun for a Goal-owned execution and build
+ * its bounded checkpoint view (Roadmap Priority #2, Part 2). This is the
+ * authorized durable read path used over the private capability: it returns only
+ * bounded structured status/IDs/stage/effect-state/evidence references, never
+ * transcripts or raw memory. A missing/corrupt file, a session/goal/binding/
+ * task-run identity mismatch, or a goal-less run yields null (fail closed).
+ *
+ * The persisted state is read WITHOUT re-running the mutating restart
+ * reconciliation; recovery identity (Goal/binding/TaskRun/effect) is preserved
+ * exactly as persisted so a read never rewrites durable progress.
+ */
+export function readPersistedGoalCheckpoint(
+  query: { sessionId: string; goalId: string; bindingId: string; taskRunId: string },
+  sessionsRoot: string = SESSIONS_DIR,
+): GoalCheckpointView | null {
+  const safe = query.sessionId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const path = join(memoryDir(sessionsRoot), `${safe}.json`);
+  if (!existsSync(path)) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+  const parsed = parseSessionMemoryState(raw, query.sessionId);
+  if (!parsed.ok) return null;
+  const contract = parsed.state.taskRun;
+  if (!contract || !contract.goal || !contract.checkpoint) return null;
+  if (contract.goal.goalId !== query.goalId) return null;
+  if (contract.goal.bindingId !== query.bindingId) return null;
+  if (contract.goal.taskRunId !== query.taskRunId) return null;
+  return buildGoalCheckpointView(contract);
 }

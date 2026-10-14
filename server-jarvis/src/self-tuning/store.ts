@@ -1837,6 +1837,33 @@ export class SelfTuningStore {
     }
   }
 
+  /**
+   * Exact-tuple lookup of the one stored trajectory snapshot for a completed
+   * run and Session. Returns the single matching row, or `null` when the tuple
+   * has zero or more than one row (absent or ambiguous) or the read fails —
+   * callers must fail closed rather than treating this as evidence.
+   */
+  getTrajectorySnapshotByRunAndSession(
+    agentRunId: string,
+    sessionId: string,
+  ): TrajectorySnapshot | null {
+    const db = this.getDb();
+    if (!db) return null;
+    try {
+      const rows = db
+        .query(
+          "SELECT id, agent_run_id, session_id, snapshot_json, created_at FROM trajectory_snapshots WHERE agent_run_id = ? AND session_id = ? LIMIT 2",
+        )
+        .all(agentRunId, sessionId) as TrajectorySnapshot[];
+      return rows.length === 1 ? rows[0] : null;
+    } catch (e) {
+      console.error("[SelfTuningStore] getTrajectorySnapshotByRunAndSession failed:", e);
+      return null;
+    } finally {
+      db.close();
+    }
+  }
+
   // B-04: replan telemetry. One row per `conductor_replan` re-invocation.
   // Insert errors are logged and swallowed (telemetry must never break a turn).
   insertReplanEvent(ev: ReplanEvent): void {

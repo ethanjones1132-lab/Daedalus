@@ -26,7 +26,7 @@ export const KNOWN_SETTING_KEYS = new Set([
   'reasoning', 'web_search', 'companion', 'orchestrator', 'system_prompt', 'mode',
   'prizepicks_prompt', 'temperature', 'surface_temperatures', 'max_tokens',
   'top_p', 'top_k', 'bridge_port', 'bridge_enabled', 'jarvis_path', 'compaction',
-  'profiles', 'active_profile', 'api_sports_key', 'agents_root',
+  'profiles', 'active_profile', 'api_sports_key', 'agents_root', 'goal_notifications_enabled',
 ]);
 
 type Load = 'idle' | 'loading' | 'ready' | 'failed';

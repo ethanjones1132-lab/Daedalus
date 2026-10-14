@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionsPage from './SessionsPage';
@@ -26,7 +27,9 @@ const props = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  invokeMock.mockImplementation(async (command: string) => {
+  invokeMock.mockImplementation(async (command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
     if (command === 'get_session_history') return [];
     if (command === 'jarvis_list_sessions' || command === 'get_all_session_runs') return [];
     if (command === 'jarvis_get_config' || command === 'jarvis_check_status' || command === 'jarvis_get_companion') return null;
@@ -118,7 +121,7 @@ describe('ChatPanel state machine', () => {
     fireEvent.keyDown(composer, { key: 'Enter' });
     fireEvent.keyDown(composer, { key: 'Enter' });
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     resolveFetch(new Response('data: {"type":"result","result":"hi"}\n\n', {
       status: 200,
       headers: { 'Content-Type': 'text/event-stream' },
@@ -151,7 +154,7 @@ describe('ChatPanel state machine', () => {
     fireEvent.change(composer, { target: { value: 'belongs to session one' } });
     fireEvent.keyDown(composer, { key: 'Enter' });
     const transcript = screen.getByRole('log');
-    expect(await within(transcript).findByText('belongs to session one')).toBeInTheDocument();
+    await waitFor(() => expect(within(transcript).getByText('belongs to session one')).toBeInTheDocument());
 
     view.rerender(<ChatPanel {...props} activeSession="session-2" />);
 
@@ -238,7 +241,7 @@ describe('ChatPanel state machine', () => {
       partialOutput: 'Useful partial answer',
     })));
     expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(1);
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
   });
 
   it('falls back to streamed text and bounds partial telemetry for a streamed partial result', async () => {
@@ -267,7 +270,7 @@ describe('ChatPanel state machine', () => {
     })));
     const terminalCall = invokeMock.mock.calls.find(call => call[0] === 'record_terminal_run');
     expect(terminalCall?.[1]?.partialOutput).toHaveLength(PARTIAL_OUTPUT_LIMIT);
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
   });
 
   it.each([
@@ -294,7 +297,7 @@ describe('ChatPanel state machine', () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
       outcome: 'failed',
     })));
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
   });
 
   it('renders a stage-timeout result as timed out instead of success', async () => {
@@ -319,7 +322,7 @@ describe('ChatPanel state machine', () => {
       outcome: 'timed_out',
       partialOutput: 'A stage timed out.',
     })));
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
   });
 
   it('distinguishes an empty unterminated stream from an authoritative empty result', async () => {

@@ -71,6 +71,7 @@ const KNOWN_SETTING_KEYS: &[&str] = &[
     "active_profile",
     "api_sports_key",
     "agents_root",
+    "goal_notifications_enabled",
 ];
 
 pub fn set_setting_value(db: &AppDb, key: &str, value: &str) -> Result<(), String> {

@@ -131,6 +131,12 @@ export interface StreamSessionOptions {
   write: StreamWriteFn;
   /** True once the client has disconnected / the stream was aborted. */
   isAborted: () => boolean;
+  /**
+   * Stable per-turn identity. Carried on every terminal frame so a direct
+   * answer without an inference run id, setup errors, partial/cancelled
+   * outcomes, and EOF can still be correlated by turn.
+   */
+  turnId?: string;
 }
 
 /**
@@ -142,6 +148,7 @@ export class StreamSession {
   private readonly sessionId: string;
   private readonly write: StreamWriteFn;
   private readonly isAborted: () => boolean;
+  private readonly turnId: string | undefined;
   private terminalSent = false;
   private outcomeSent = false;
 
@@ -149,6 +156,11 @@ export class StreamSession {
     this.sessionId = opts.sessionId;
     this.write = opts.write;
     this.isAborted = opts.isAborted;
+    this.turnId = opts.turnId;
+  }
+
+  private turnTag(): { turn_id?: string } {
+    return this.turnId ? { turn_id: this.turnId } : {};
   }
 
   /** Fresh visible-text pipe for one model turn. */
@@ -178,7 +190,7 @@ export class StreamSession {
   }
 
   async init(model: string | null | undefined): Promise<void> {
-    await this.write(sseFrame({ type: "init", session_id: this.sessionId, model: model ?? null }));
+    await this.write(sseFrame({ type: "init", session_id: this.sessionId, model: model ?? null, ...this.turnTag() }));
   }
 
   /** Emit the terminal error outcome. The transport terminator is sent separately. */
@@ -189,6 +201,7 @@ export class StreamSession {
       error: message,
       ...(code ? { code } : {}),
       session_id: this.sessionId,
+      ...this.turnTag(),
     }));
   }
 
@@ -217,7 +230,7 @@ export class StreamSession {
     if (!this.noteOutcome()) return;
     if (!this.terminalSent) {
       this.terminalSent = true;
-      await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
+      await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId, ...this.turnTag() }));
     }
     const isError = opts?.isError ?? false;
     const subtype = opts?.subtype ?? (isError ? "error" : "success");
@@ -228,6 +241,7 @@ export class StreamSession {
       ...(opts?.code ? { code: opts.code } : {}),
       result,
       session_id: this.sessionId,
+      ...this.turnTag(),
     }));
   }
 
@@ -249,6 +263,6 @@ export class StreamSession {
     }
     if (this.terminalSent) return;
     this.terminalSent = true;
-    await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId }));
+    await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId, ...this.turnTag() }));
   }
 }

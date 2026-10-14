@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatPanel } from './ChatPanel';
@@ -21,7 +22,9 @@ const props = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  invokeMock.mockImplementation(async (command: string) => {
+  invokeMock.mockImplementation(async (command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
     if (command === 'get_session_history') return [];
     if (command === 'jarvis_get_session_grants') return { session_id: 'session-1', grants: [] };
     return true;

@@ -1,3 +1,5 @@
+import { lazy, Suspense } from 'react';
+import { FeatureModes } from '../workflows/FeatureModes';
 import { useId, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import {
@@ -248,4 +250,7 @@ export function SkillsPage() {
   );
 }
 
-export default SkillsPage;
+
+
+const AdvancedSkillsPage = lazy(() => import('./SkillLearningPage'));
+export default function SkillsPageSurface() { return <FeatureModes label="Learning evaluation" primary={<SkillsPage />} advanced={<Suspense fallback={<div role="status">Loading controls…</div>}><AdvancedSkillsPage /></Suspense>} />; }

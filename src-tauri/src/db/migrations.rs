@@ -18,7 +18,11 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
          PRAGMA cache_size = -20000;",
     )?;
 
-    // Drop old memory table if it has 'path' column to recreate it with the correct schema
+    // Older versions of this database shipped a file-path-based `memory`
+    // table. Instead of destroying it to make room for the current schema,
+    // preserve it verbatim as `memory_legacy_path_backup`. The backup is
+    // never exposed to automatic retrieval; it exists so operators can
+    // recover pre-scope information deliberately.
     let has_path_col: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('memory') WHERE name = 'path'",
@@ -28,7 +32,28 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         .unwrap_or(0)
         > 0;
     if has_path_col {
-        let _ = conn.execute("DROP TABLE memory;", []);
+        let backup_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_legacy_path_backup'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            > 0;
+        if backup_exists {
+            // A backup already exists AND the live table still has the old
+            // path schema. Renaming would overwrite recoverable data, so fail
+            // loudly instead of silently discarding it.
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(
+                    "memory_legacy_path_backup already exists while memory still has a path \
+                     column; refusing to overwrite legacy memory data"
+                        .to_string(),
+                ),
+            ));
+        }
+        conn.execute("ALTER TABLE memory RENAME TO memory_legacy_path_backup", [])?;
     }
 
     conn.execute_batch(
@@ -237,7 +262,8 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
             updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
          CREATE INDEX IF NOT EXISTS idx_agent_projections_status ON agent_projections(status);
-         CREATE INDEX IF NOT EXISTS idx_agent_projections_active ON agent_projections(active, status);
+         -- idx_agent_projections_active is created in apply_schema_patches, after
+         -- `active` is added to tables that predate it.
          CREATE INDEX IF NOT EXISTS idx_agent_projections_hash   ON agent_projections(source_hash);
         "#,
     )?;
@@ -253,6 +279,15 @@ pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     create_self_tuning_tables(conn)?;
     create_session_memory_table(conn)?;
     apply_schema_patches(conn)?;
+    apply_scoped_memory_migrations(conn)?;
+    apply_memory_turn_migrations(conn)?;
+    apply_memory_capture_migrations(conn)?;
+    apply_goal_migrations(conn)?;
+    apply_cron_activation_migrations(conn)?;
+    apply_goal_notification_migrations(conn)?;
+    apply_trusted_manifest_migrations(conn)?;
+    apply_trusted_execution_migrations(conn)?;
+    apply_trusted_acceptance_migrations(conn)?;
 
     Ok(())
 }
@@ -354,6 +389,19 @@ fn add_column_if_missing(
     column: &str,
     ddl: &str,
 ) -> Result<(), rusqlite::Error> {
+    // `ddl` is the full column definition. A bare type ("TEXT") would add a
+    // column literally named TEXT and never create `column`.
+    let names_column = ddl
+        .strip_prefix(column)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+    if !names_column {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+            Some(format!(
+                "add_column_if_missing({table}.{column}): definition must start with the column name, got {ddl:?}"
+            )),
+        ));
+    }
     if !table_has_column(conn, table, column)? {
         // SQL identifiers cannot be parameterised; we already validated
         // the table name with PRAGMA table_info above so reuse it directly.
@@ -742,6 +790,1103 @@ fn apply_schema_patches(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Phase 1 scoped-memory schema. Additive only: it never rebuilds the current
+/// `memory` table or its FTS triggers. The whole group runs inside a savepoint
+/// so a partial failure cannot leave the store in a half-migrated state.
+pub fn apply_scoped_memory_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT scoped_memory_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        // Nullable workspace binding on persisted Sessions.
+        add_column_if_missing(conn, "sessions", "project_root", "project_root TEXT")?;
+        // Explicit monotonic Session workspace-binding revision. Advances on
+        // every `project_root` change so a preparation can detect a pure rebind
+        // that changes the effective memory scope even when the global store
+        // and continuity revisions are unchanged.
+        add_column_if_missing(
+            conn,
+            "sessions",
+            "binding_revision",
+            "binding_revision INTEGER NOT NULL DEFAULT 0",
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS sessions_binding_revision_au
+            AFTER UPDATE OF project_root ON sessions
+            FOR EACH ROW
+            WHEN NEW.binding_revision <= OLD.binding_revision
+            BEGIN
+                UPDATE sessions SET binding_revision = OLD.binding_revision + 1
+                WHERE id = NEW.id;
+            END;
+            "#,
+        )?;
+
+        // Scope + provenance + per-entry revision on memory rows.
+        add_column_if_missing(
+            conn,
+            "memory",
+            "scope_kind",
+            "scope_kind TEXT NOT NULL DEFAULT 'legacy_unscoped'",
+        )?;
+        add_column_if_missing(conn, "memory", "project_root", "project_root TEXT")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "authority_kind",
+            "authority_kind TEXT NOT NULL DEFAULT 'legacy_unknown'",
+        )?;
+        add_column_if_missing(conn, "memory", "source_run_id", "source_run_id TEXT")?;
+        add_column_if_missing(conn, "memory", "verified_at", "verified_at TEXT")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "revision",
+            "revision INTEGER NOT NULL DEFAULT 1",
+        )?;
+        // Phase 4 additive statement classification. Existing rows and every
+        // legacy/automatic capture migrate to the conservative `unknown`; no
+        // title/category/source inference is performed.
+        let statement_kind_added = !table_has_column(conn, "memory", "statement_kind")?;
+        add_column_if_missing(
+            conn,
+            "memory",
+            "statement_kind",
+            "statement_kind TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+
+        // Singleton store revision. A monotonic invalidation counter, not a
+        // mutation count: it changes transactionally with knowledge/scope/
+        // eligibility mutations and not with recall usage counters.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_store_state (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                revision  INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO memory_store_state (singleton, revision) VALUES (1, 0);
+            "#,
+        )?;
+
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_memory_scope_eligibility
+                ON memory(scope_kind, agent_id, project_root, status, tier);
+            "#,
+        )?;
+
+        // ── Validation triggers ──────────────────────────────────────
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_scope_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NOT (
+                (NEW.scope_kind = 'project' AND NEW.project_root IS NOT NULL AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'agent'   AND NEW.project_root IS NULL     AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'user'    AND NEW.project_root IS NULL     AND NEW.agent_id = '')
+             OR (NEW.scope_kind = 'legacy_unscoped')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope shape');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NOT (
+                (NEW.scope_kind = 'project' AND NEW.project_root IS NOT NULL AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'agent'   AND NEW.project_root IS NULL     AND NEW.agent_id <> '')
+             OR (NEW.scope_kind = 'user'    AND NEW.project_root IS NULL     AND NEW.agent_id = '')
+             OR (NEW.scope_kind = 'legacy_unscoped')
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope shape');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.scope_kind NOT IN ('project','agent','user','legacy_unscoped')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_scope_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.scope_kind NOT IN ('project','agent','user','legacy_unscoped')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory scope kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_authority_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.authority_kind NOT IN
+                ('manual','user_statement','verified_observation','assistant_proposal','legacy_unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory authority kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_authority_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.authority_kind NOT IN
+                ('manual','user_statement','verified_observation','assistant_proposal','legacy_unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory authority kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_statement_kind_validate_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.statement_kind NOT IN
+                ('normative_constraint','descriptive_fact','unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory statement kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_statement_kind_validate_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.statement_kind NOT IN
+                ('normative_constraint','descriptive_fact','unknown')
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid memory statement kind');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_revision_positive_bi
+            BEFORE INSERT ON memory
+            WHEN NEW.revision < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'memory revision must be positive');
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_revision_positive_bu
+            BEFORE UPDATE ON memory
+            WHEN NEW.revision < 1
+            BEGIN
+                SELECT RAISE(ABORT, 'memory revision must be positive');
+            END;
+
+            -- An established (non-legacy) scope is immutable. Legacy rows can
+            -- be adopted once: their OLD scope_kind is still legacy_unscoped.
+            CREATE TRIGGER IF NOT EXISTS memory_scope_immutable_bu
+            BEFORE UPDATE OF scope_kind, project_root, agent_id ON memory
+            WHEN OLD.scope_kind <> 'legacy_unscoped'
+             AND (NEW.scope_kind IS NOT OLD.scope_kind
+                  OR NEW.project_root IS NOT OLD.project_root
+                  OR NEW.agent_id IS NOT OLD.agent_id)
+            BEGIN
+                SELECT RAISE(ABORT, 'memory scope cannot be reassigned');
+            END;
+            "#,
+        )?;
+
+        // ── Store revision triggers ─────────────────────────────────
+        let semantic_change = "NEW.title IS NOT OLD.title
+             OR NEW.content IS NOT OLD.content
+             OR NEW.tags IS NOT OLD.tags
+             OR NEW.category IS NOT OLD.category
+             OR NEW.agent_id IS NOT OLD.agent_id
+             OR NEW.scope_kind IS NOT OLD.scope_kind
+             OR NEW.project_root IS NOT OLD.project_root
+             OR NEW.authority_kind IS NOT OLD.authority_kind
+             OR NEW.source IS NOT OLD.source
+             OR NEW.source_session_id IS NOT OLD.source_session_id
+             OR NEW.source_message_ids IS NOT OLD.source_message_ids
+             OR NEW.source_run_id IS NOT OLD.source_run_id
+             OR NEW.verified_at IS NOT OLD.verified_at
+             OR NEW.confidence IS NOT OLD.confidence
+             OR NEW.status IS NOT OLD.status
+             OR NEW.expires_at IS NOT OLD.expires_at
+             OR NEW.review_after IS NOT OLD.review_after
+             OR NEW.supersedes_id IS NOT OLD.supersedes_id
+             OR NEW.metadata IS NOT OLD.metadata
+             OR NEW.tier IS NOT OLD.tier
+             OR NEW.summary IS NOT OLD.summary
+             OR NEW.statement_kind IS NOT OLD.statement_kind";
+
+        // The revision triggers are created with `IF NOT EXISTS`, so an
+        // existing database would keep the pre-Phase-4 trigger bodies that do
+        // not compare `statement_kind`. When the column is first introduced,
+        // drop the two revision triggers so the create block below rebuilds
+        // them with the extended `semantic_change` predicate.
+        if statement_kind_added {
+            conn.execute_batch(
+                r#"
+                DROP TRIGGER IF EXISTS memory_store_revision_au;
+                DROP TRIGGER IF EXISTS memory_row_revision_au;
+                "#,
+            )?;
+        }
+
+        conn.execute_batch(&format!(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_ai
+            AFTER INSERT ON memory
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_ad
+            AFTER DELETE ON memory
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_au
+            AFTER UPDATE ON memory
+            WHEN {semantic_change}
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+
+            -- Legacy mutations do not set revision explicitly; bump the
+            -- per-row revision for those same semantic changes so invalidation
+            -- is uniform. Scoped updates set revision themselves, so
+            -- NEW.revision <> OLD.revision and this trigger stays out of the way.
+            CREATE TRIGGER IF NOT EXISTS memory_row_revision_au
+            AFTER UPDATE ON memory
+            WHEN NEW.revision = OLD.revision AND ({semantic_change})
+            BEGIN
+                UPDATE memory SET revision = revision + 1 WHERE id = NEW.id;
+            END;
+            "#
+        ))?;
+
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT scoped_memory_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT scoped_memory_migration; \
+                 RELEASE SAVEPOINT scoped_memory_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Phase 2.1 native turn preparation schema. Additive only and idempotent: it
+/// creates the durable per-turn identity table and its indexes without touching
+/// existing Session, message, or memory rows. The row stores metadata plus the
+/// immutable original user message; it never stores recalled text or the
+/// rendered block.
+pub fn apply_memory_turn_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_turn_preparations (
+          turn_id TEXT PRIMARY KEY,
+          preparation_id TEXT UNIQUE,
+          session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+          source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+          user_message TEXT NOT NULL,
+          message_hash TEXT NOT NULL,
+          scope_json TEXT NOT NULL CHECK(json_valid(scope_json)),
+          include_user_scope INTEGER NOT NULL DEFAULT 0 CHECK(include_user_scope IN (0,1)),
+          effective_workspace TEXT,
+          store_revision INTEGER NOT NULL,
+          selected_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(selected_json)),
+          applied_selected_ids_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(applied_selected_ids_json)),
+          app_instance_id TEXT NOT NULL,
+          bun_instance_id TEXT,
+          state TEXT NOT NULL CHECK(state IN ('prepared','registered','started','terminal','invalidated','expired','unavailable','unterminated')),
+          recall_status TEXT NOT NULL,
+          error_code TEXT,
+          prepared_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          started_at TEXT,
+          finished_at TEXT,
+          terminal_status TEXT CHECK(terminal_status IS NULL OR terminal_status IN ('completed','partial','cancelled','failed','unterminated')),
+          run_id TEXT,
+          runtime_evidence_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(runtime_evidence_json)),
+          revalidation_json TEXT NOT NULL DEFAULT '{"state":"not_required","memory_ids":[],"evidence_tool_call_ids":[],"reason_code":null}' CHECK(json_valid(revalidation_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_turn_session ON memory_turn_preparations(session_id, prepared_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_turn_pending ON memory_turn_preparations(state, expires_at);
+        "#,
+    )?;
+    // Existing databases created before Phase 4.3 need the additive column. The
+    // SQLite ALTER TABLE cannot add a CHECK constraint, so the JSON validity is
+    // enforced by the table definition above for new databases and by native
+    // serialization for upgraded ones.
+    add_column_if_missing(
+        conn,
+        "memory_turn_preparations",
+        "revalidation_json",
+        "revalidation_json TEXT NOT NULL DEFAULT '{\"state\":\"not_required\",\"memory_ids\":[],\"evidence_tool_call_ids\":[],\"reason_code\":null}'",
+    )?;
+    // Upgraded databases cannot gain a CHECK constraint through ALTER TABLE, so
+    // the JSON validity is enforced by equivalent triggers. New databases also
+    // carry the column CHECK; these triggers are idempotent and harmless there.
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS memory_turn_revalidation_valid_bi
+        BEFORE INSERT ON memory_turn_preparations
+        WHEN NEW.revalidation_json IS NULL OR json_valid(NEW.revalidation_json) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid memory turn revalidation json');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS memory_turn_revalidation_valid_bu
+        BEFORE UPDATE ON memory_turn_preparations
+        WHEN NEW.revalidation_json IS NULL OR json_valid(NEW.revalidation_json) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'invalid memory turn revalidation json');
+        END;
+        "#,
+    )
+}
+
+/// Phase 3.1 native capture schema. Additive only and idempotent: it creates
+/// the operation ledger, per-turn capture receipts, structured Session
+/// continuity, prompt-source suppressions, turn/message associations, and the
+/// derived-invalidation outbox without touching or backfilling existing memory,
+/// Session, message, or turn rows. No old summary/current_goal is ever promoted
+/// into an accepted memory or typed continuity objective. The whole group runs
+/// inside a named savepoint so a partial failure cannot leave the store in a
+/// half-migrated state.
+pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT memory_capture_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            -- Idempotent operation ledger. One row per (Session, operation_id).
+            -- payload_hash is the canonical SHA-256 of the exact operation inputs;
+            -- response_json is the original persisted response, replayed verbatim
+            -- on an exact retry and never overwritten once written.
+            CREATE TABLE IF NOT EXISTS memory_operations (
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                operation_id  TEXT NOT NULL,
+                payload_hash  TEXT NOT NULL,
+                response_json TEXT NOT NULL CHECK(json_valid(response_json)),
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_operations_session
+                ON memory_operations(session_id, created_at);
+
+            -- At most one committed capture receipt per native turn. terminal_hash
+            -- is the authenticated tuple hash from the Phase 2 turn snapshot; it is
+            -- nullable before the terminal observation is finalized but never
+            -- rewritten once the receipt has a terminal status.
+            CREATE TABLE IF NOT EXISTS memory_capture_receipts (
+                turn_id       TEXT PRIMARY KEY
+                    REFERENCES memory_turn_preparations(turn_id) ON DELETE CASCADE,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                terminal_hash TEXT,
+                receipt_json  TEXT NOT NULL CHECK(json_valid(receipt_json)),
+                updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_capture_receipts_session
+                ON memory_capture_receipts(session_id, updated_at);
+
+            -- Structured Session continuity. Distinct from the legacy
+            -- session_memory summary/current_goal row; legacy fields are never
+            -- read into this table by migration.
+            CREATE TABLE IF NOT EXISTS session_continuity (
+                session_id            TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                active_objective_json TEXT CHECK(
+                    active_objective_json IS NULL OR json_valid(active_objective_json)
+                ),
+                latest_turn_id        TEXT
+                    REFERENCES memory_turn_preparations(turn_id) ON DELETE SET NULL,
+                revision              INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+                updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+
+            -- Prompt-source suppression: exact (Session, message, memory) ids whose
+            -- source instructions must not be replayed from any derived prompt
+            -- state. The visible operator transcript is untouched; deleted source
+            -- rows leave the audit ids recorded here rather than reviving facts.
+            CREATE TABLE IF NOT EXISTS memory_prompt_suppressions (
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                message_id  TEXT NOT NULL,
+                memory_id   TEXT NOT NULL,
+                reason      TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                PRIMARY KEY (session_id, message_id, memory_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_prompt_suppressions_memory
+                ON memory_prompt_suppressions(memory_id);
+
+            -- Assistant turn/message association. Establishes transcript
+            -- provenance only; it never grants factual authority.
+            CREATE TABLE IF NOT EXISTS memory_turn_messages (
+                turn_id    TEXT NOT NULL REFERENCES memory_turn_preparations(turn_id) ON DELETE CASCADE,
+                message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+                PRIMARY KEY (turn_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_turn_messages_message
+                ON memory_turn_messages(message_id);
+
+            -- Derived-state invalidation outbox. Drained in Part 3.2; persisted
+            -- atomically with the native mutation that produced it. It has NO
+            -- Session FK so a pending cleanup survives the deletion of the
+            -- initiating Session. session_id holds the ORIGINAL initiating
+            -- Session id (audit metadata only, possibly deleted); operation_id
+            -- holds the raw native operation id. The wire key is rebuilt
+            -- deterministically as `session/<session_id>/operation/<operation_id>`
+            -- so the initial cleanup and every later drain send the exact same
+            -- key. scope_json holds the actual MemoryScope JSON;
+            -- source_message_ids_json holds the exact source message ids.
+            -- Malformed metadata is a typed storage failure, never silently
+            -- defaulted.
+            CREATE TABLE IF NOT EXISTS memory_derived_invalidations (
+                session_id                 TEXT NOT NULL,
+                operation_id               TEXT NOT NULL,
+                scope_json                 TEXT NOT NULL CHECK(json_valid(scope_json)),
+                affected_session_ids_json  TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(affected_session_ids_json)),
+                memory_ids_json            TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(memory_ids_json)),
+                acknowledged_at            TEXT,
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_derived_invalidations_pending
+                ON memory_derived_invalidations(acknowledged_at);
+            "#,
+        )?;
+        add_column_if_missing(
+            conn,
+            "memory_derived_invalidations",
+            "source_message_ids_json",
+            "source_message_ids_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
+
+        // Phase 3.4 internal action cursor. Records the stable `(created_at,
+        // rowid)` order key of the LAST accepted objective action (replace,
+        // clear, or explicit operator set), independent of whether an active
+        // objective still exists. A delayed older automatic directive is
+        // rejected by comparing its source order key against this cursor even
+        // after a later clear (which leaves `active_objective_json` NULL) and
+        // even if the recorded source message is later removed. This is internal
+        // durability only; it never widens the frozen public continuity DTOs.
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "last_action_source_message_id",
+            "last_action_source_message_id TEXT",
+        )?;
+        add_column_if_missing(conn, "session_continuity", "last_action_created_at", "last_action_created_at TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "last_action_rowid", "last_action_rowid INTEGER")?;
+        // A manual operator set is a monotonic HIGHWATER boundary: every source
+        // already recorded when the operator acted (including one numerically
+        // equal to the chosen source) is protected from later automatic
+        // directives. Stored as the `(created_at,rowid)` key of the
+        // highest-order message present at the manual call. Automatic
+        // directives at or below this boundary are stale; only a source saved
+        // strictly after the boundary may change the objective.
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_created_at", "manual_boundary_created_at TEXT")?;
+        add_column_if_missing(conn, "session_continuity", "manual_boundary_rowid", "manual_boundary_rowid INTEGER")?;
+
+        // Additive Part 3.2 outbox. Committed Part 3.1 already created
+        // `memory_derived_invalidations` WITH a `REFERENCES sessions ON DELETE
+        // CASCADE` FK; `CREATE TABLE IF NOT EXISTS` cannot remove it, so a
+        // pending cleanup row could be cascaded away by a Session delete. This
+        // NEW table has NO Session FK and is the production outbox. The old
+        // table is retained (never dropped, rows preserved); every surviving row
+        // is copied here idempotently (`INSERT OR IGNORE`), preserving the
+        // original initiating Session id, the raw operation id, the resolved
+        // scope, the source/affected/memory ids, and the acknowledgement.
+        // `source_message_ids_json` is added to the old table before the copy so
+        // the column always exists.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_derived_cleanup_outbox (
+                session_id                 TEXT NOT NULL,
+                operation_id               TEXT NOT NULL,
+                scope_json                 TEXT NOT NULL CHECK(json_valid(scope_json)),
+                affected_session_ids_json  TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(affected_session_ids_json)),
+                memory_ids_json            TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(memory_ids_json)),
+                source_message_ids_json    TEXT NOT NULL DEFAULT '[]'
+                    CHECK(json_valid(source_message_ids_json)),
+                acknowledged_at            TEXT,
+                PRIMARY KEY (session_id, operation_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_derived_cleanup_outbox_pending
+                ON memory_derived_cleanup_outbox(acknowledged_at);
+            INSERT OR IGNORE INTO memory_derived_cleanup_outbox
+                (session_id, operation_id, scope_json, affected_session_ids_json,
+                 memory_ids_json, source_message_ids_json, acknowledged_at)
+            SELECT session_id, operation_id, scope_json, affected_session_ids_json,
+                   memory_ids_json, source_message_ids_json, acknowledged_at
+              FROM memory_derived_invalidations;
+            "#,
+        )?;
+
+        // A new prompt-source suppression is a semantic invalidation, so it
+        // must advance the singleton store revision even when it commits
+        // without a memory-row change (for example a historically-tombstoned
+        // forget with no-op memory update). This lets a prepared snapshot's
+        // revision recheck detect a suppression that lands during a model call.
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS memory_store_revision_suppression_ai
+            AFTER INSERT ON memory_prompt_suppressions
+            BEGIN
+                UPDATE memory_store_state SET revision = revision + 1 WHERE singleton = 1;
+            END;
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT memory_capture_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT memory_capture_migration; \
+                 RELEASE SAVEPOINT memory_capture_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 1 — durable native Goal authority. Additive only
+/// and idempotent: it creates the goal authority tables and adds nullable
+/// `goal_id` association columns to existing native run/schedule tables without
+/// touching or backfilling existing Session, run, cron, memory, or commitment
+/// rows. No relationship is wired in this part; the columns and `goal_links`
+/// table are declared association points only. The whole group runs inside a
+/// named savepoint so a partial failure cannot leave the store half-migrated.
+pub fn apply_goal_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT goal_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            -- User-owned goal objective. `objective_authority` is constrained to
+            -- `user_statement`: a model-generated summary can never be promoted
+            -- into an accepted objective. Lifecycle `status` is one of the eight
+            -- declared states; the command layer enforces the transition graph.
+            CREATE TABLE IF NOT EXISTS goals (
+                id                  TEXT PRIMARY KEY,
+                objective           TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK(status IN ('pending','running','waiting_for_user','blocked','paused','completed','failed','cancelled')),
+                agent_id            TEXT NOT NULL DEFAULT 'jarvis',
+                project_root        TEXT,
+                objective_authority TEXT NOT NULL DEFAULT 'user_statement'
+                                    CHECK(objective_authority IN ('user_statement')),
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goals_status       ON goals(status);
+            CREATE INDEX IF NOT EXISTS idx_goals_agent_status ON goals(agent_id, status);
+            CREATE INDEX IF NOT EXISTS idx_goals_scope        ON goals(agent_id, project_root);
+
+            -- User-provided acceptance criteria with stable per-criterion
+            -- identity. `authority` is constrained to `user_statement` so a
+            -- model summary or tool output can never become an accepted
+            -- criterion. `ordinal` is the stable display order within a goal.
+            CREATE TABLE IF NOT EXISTS goal_criteria (
+                id         TEXT PRIMARY KEY,
+                goal_id    TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                ordinal    INTEGER NOT NULL,
+                text       TEXT NOT NULL,
+                authority  TEXT NOT NULL DEFAULT 'user_statement'
+                           CHECK(authority IN ('user_statement')),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(goal_id, ordinal)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_criteria_goal ON goal_criteria(goal_id, ordinal);
+
+            -- Append-only lifecycle audit. Records creation, objective/criteria
+            -- edits, and explicit transitions with the previous/next status.
+            CREATE TABLE IF NOT EXISTS goal_events (
+                id          TEXT PRIMARY KEY,
+                goal_id     TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                event_type  TEXT NOT NULL CHECK(event_type IN ('created','updated','transition')),
+                from_status TEXT,
+                to_status   TEXT,
+                actor       TEXT NOT NULL DEFAULT 'user',
+                reason      TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_events_goal ON goal_events(goal_id, created_at);
+
+            -- Generic association point for entities that do not own a goal_id
+            -- column (TaskPlan/TaskRun in Bun, output evidence) and for explicit
+            -- operator linking. Nothing in this part writes it automatically.
+            CREATE TABLE IF NOT EXISTS goal_links (
+                id          TEXT PRIMARY KEY,
+                goal_id     TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                target_kind TEXT NOT NULL
+                            CHECK(target_kind IN ('task_plan','task_run','commitment','cron_job','cron_run','session_run','evidence')),
+                target_id   TEXT NOT NULL,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(goal_id, target_kind, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_links_goal   ON goal_links(goal_id);
+            CREATE INDEX IF NOT EXISTS idx_goal_links_target ON goal_links(target_kind, target_id);
+            "#,
+        )?;
+
+        // Stable optional `goal_id` association contracts on existing native
+        // tables. Nullable and unwired in Part 1; later parts populate them.
+        add_column_if_missing(conn, "session_runs", "goal_id", "goal_id TEXT")?;
+        add_column_if_missing(conn, "cron_jobs", "goal_id", "goal_id TEXT")?;
+        add_column_if_missing(conn, "cron_runs", "goal_id", "goal_id TEXT")?;
+
+        // Roadmap Priority #2, Part 2: durable native record of each registered
+        // Goal run binding. A terminal run may set `session_runs.goal_id` only
+        // when the owned Bun child's consume receipt verifies against this row
+        // (exact Session/turn/saved-user source row+hash/Goal/stable TaskRun
+        // identity/Bun run identity). `binding_id` is the native-minted opaque
+        // one-shot identity; no client value is authority. Bounded and additive.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS goal_run_bindings (
+                binding_id          TEXT PRIMARY KEY,
+                goal_id             TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+                session_id          TEXT NOT NULL,
+                agent_id            TEXT NOT NULL,
+                project_root        TEXT,
+                turn_id             TEXT NOT NULL,
+                source_message_id   TEXT NOT NULL,
+                source_message_hash TEXT NOT NULL,
+                task_run_id         TEXT NOT NULL,
+                bun_instance_id     TEXT,
+                issued_at           TEXT NOT NULL,
+                expires_at          TEXT NOT NULL,
+                consumed_at         TEXT,
+                consumed_run_id     TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(session_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_run_bindings_goal    ON goal_run_bindings(goal_id);
+            CREATE INDEX IF NOT EXISTS idx_goal_run_bindings_session ON goal_run_bindings(session_id, turn_id);
+            "#,
+        )?;
+
+        // A terminal goal's status is immutable at the storage layer. The
+        // command layer also rejects terminal transitions; this guards against
+        // any other writer silently reviving closed work.
+        conn.execute_batch(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS goal_terminal_status_immutable_bu
+            BEFORE UPDATE OF status ON goals
+            WHEN OLD.status IN ('completed','failed','cancelled')
+             AND NEW.status IS NOT OLD.status
+            BEGIN
+                SELECT RAISE(ABORT, 'terminal goal status is immutable');
+            END;
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT goal_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT goal_migration; \
+                 RELEASE SAVEPOINT goal_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 3 — durable cron activation/occurrence authority.
+/// Additive and idempotent. A `cron_activations` row is the durable claim for one
+/// deterministic schedule occurrence of one cron job. The unique
+/// `(cron_job_id, schedule_occurrence)` constraint is the dedupe key: a claimed
+/// occurrence can never be claimed again, so a confirmed/completed effect can
+/// never be re-dispatched across restarts. `goal_id`/`agent_id`/`session_id` are
+/// the validated association snapshot; pending, non-terminal claims become an
+/// explicit `ambiguous` reconcile state on restart rather than being replayed.
+/// No existing cron row is backfilled.
+pub fn apply_cron_activation_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT cron_activation_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS cron_activations (
+                activation_id       TEXT PRIMARY KEY,
+                cron_job_id         TEXT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+                goal_id             TEXT,
+                agent_id            TEXT NOT NULL,
+                session_id          TEXT,
+                project_root        TEXT,
+                schedule_occurrence TEXT NOT NULL,
+                trigger_kind        TEXT NOT NULL DEFAULT 'schedule'
+                                    CHECK(trigger_kind IN ('schedule','manual','missed')),
+                claim_state         TEXT NOT NULL DEFAULT 'claimed'
+                                    CHECK(claim_state IN ('claimed','dispatched','completed','failed','cancelled','ambiguous','waiting_for_user','blocked')),
+                run_id              TEXT,
+                bun_run_id          TEXT,
+                terminal_reason     TEXT,
+                claimed_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                dispatched_at       TEXT,
+                settled_at          TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(cron_job_id, schedule_occurrence)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_job   ON cron_activations(cron_job_id, claim_state);
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_goal  ON cron_activations(goal_id, claim_state);
+            CREATE INDEX IF NOT EXISTS idx_cron_activations_state ON cron_activations(claim_state);
+            "#,
+        )?;
+
+        // Correlate the append-only run history with the durable activation and
+        // its deterministic occurrence. Nullable/additive: existing rows keep
+        // their history and read back as unlinked.
+        add_column_if_missing(conn, "cron_runs", "activation_id", "activation_id TEXT")?;
+        add_column_if_missing(
+            conn,
+            "cron_runs",
+            "schedule_occurrence",
+            "schedule_occurrence TEXT",
+        )?;
+        add_column_if_missing(conn, "cron_runs", "terminal_reason", "terminal_reason TEXT")?;
+
+        // Durable cancellation intent. `claim_state`'s CHECK does not include a
+        // cancellation-pending value, so intent lives in dedicated nullable
+        // columns instead of an unreviewed enum member. `cancel_requested_at`
+        // set + `cancel_acknowledged_at` null means a request exists that no
+        // task has confirmed; after a restart these reconcile to `ambiguous`
+        // rather than being reported as `cancelled`.
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_requested_at",
+            "cancel_requested_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_requested_reason",
+            "cancel_requested_reason TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "cron_activations",
+            "cancel_acknowledged_at",
+            "cancel_acknowledged_at TEXT",
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT cron_activation_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT cron_activation_migration; \
+                 RELEASE SAVEPOINT cron_activation_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Roadmap Priority #2 Part 3 — durable dedupe ledger for in-app Goal
+/// notifications. One row is written per emitted notification, keyed by a
+/// deterministic persisted identity (activation/occurrence plus state), so an
+/// in-app toast is emitted at most once per durable state change even across a
+/// restart. Additive and idempotent; no existing row is touched. The ledger
+/// stores only identifiers and short fixed copy — never prompt contents.
+pub fn apply_goal_notification_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT goal_notification_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS goal_notifications (
+                notification_key TEXT PRIMARY KEY,
+                goal_id          TEXT NOT NULL,
+                activation_id    TEXT,
+                cron_job_id      TEXT,
+                run_id           TEXT,
+                kind             TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                message          TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_goal_notifications_goal
+                ON goal_notifications(goal_id, created_at);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT goal_notification_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT goal_notification_migration; \
+                 RELEASE SAVEPOINT goal_notification_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent registry for user-registered trusted acceptance
+/// manifests (Roadmap Priority #2, Part 4 slice 1). This is the *only* native
+/// trust authority: the file-backed Action Registry under
+/// `workspace/action-registry` remains untrusted action data. No row is
+/// auto-seeded — every manifest is an explicit user add/replace through
+/// Settings — so an empty table means no trusted executable manifest.
+///
+/// `action_id` is the opaque Action Registry identity a manifest is bound to.
+/// It is nullable only for legacy rows created before this column existed; such
+/// rows stay unbound/unavailable until the user explicitly replaces/rebinds
+/// them with an exact action id. Uniqueness is enforced per canonical project
+/// root + action id.
+pub fn apply_trusted_manifest_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_manifest_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_manifests (
+                manifest_id      TEXT PRIMARY KEY,
+                registry_version INTEGER NOT NULL,
+                schema_version   INTEGER NOT NULL,
+                content_hash     TEXT NOT NULL,
+                content_json     TEXT NOT NULL CHECK(json_valid(content_json)),
+                agent_id         TEXT NOT NULL,
+                project_root     TEXT NOT NULL,
+                action_id        TEXT,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_manifests_scope
+                ON trusted_acceptance_manifests(agent_id, project_root);
+            "#,
+        )?;
+        // Additive, fail-closed upgrade for databases created before action
+        // binding existed: existing rows keep a NULL binding and stay unbound.
+        add_column_if_missing(
+            conn,
+            "trusted_acceptance_manifests",
+            "action_id",
+            "action_id TEXT",
+        )?;
+        // One trusted manifest per canonical workspace + Action Registry id.
+        // SQLite treats NULLs as distinct, so legacy unbound rows never collide.
+        conn.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_manifests_root_action
+                ON trusted_acceptance_manifests(project_root, action_id);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_manifest_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_manifest_migration; \
+                 RELEASE SAVEPOINT trusted_manifest_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent durable receipt table for native-approved trusted
+/// manifest executions (Roadmap Priority #2, Part 4). `execution_id` is the
+/// caller-supplied opaque `operation_id`; idempotency is keyed by
+/// `(action_id, operation_id)`. A partial unique index permits at most one
+/// unresolved operation per action so a fresh operation is refused while an
+/// earlier one is claimed/dispatched/ambiguous/pending_acceptance, while a new
+/// explicit operation id is allowed after a terminal outcome. The row records
+/// the exact captured Agent/projection/root identity, runtime-owned tool
+/// outcomes/evidence, and the `pending_acceptance` state. A tool run never
+/// itself completes a Goal.
+pub fn apply_trusted_execution_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_execution_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_action_executions (
+                execution_id                  TEXT PRIMARY KEY,
+                idempotency_key               TEXT NOT NULL UNIQUE,
+                action_id                     TEXT NOT NULL,
+                manifest_id                   TEXT NOT NULL,
+                manifest_registry_version     INTEGER NOT NULL,
+                manifest_content_hash         TEXT NOT NULL,
+                manifest_schema_version       INTEGER NOT NULL,
+                agent_id                      TEXT NOT NULL,
+                project_root                  TEXT NOT NULL,
+                projection_slug               TEXT NOT NULL,
+                projection_source_path        TEXT NOT NULL DEFAULT '',
+                projection_source_hash        TEXT NOT NULL,
+                projection_active_source_hash TEXT NOT NULL,
+                projection_version            INTEGER NOT NULL,
+                projection_activated_at       TEXT NOT NULL,
+                status                        TEXT NOT NULL,
+                terminal_reason               TEXT,
+                run_id                        TEXT,
+                bun_run_id                    TEXT,
+                evidence_json                 TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                started_at                    TEXT,
+                settled_at                    TEXT,
+                cancel_requested_at           TEXT,
+                created_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at                    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_manifest
+                ON trusted_action_executions(manifest_id);
+            "#,
+        )?;
+        // Migration-safe column addition for databases created before the
+        // projection source path was captured. Existing (historical) rows keep
+        // an empty path; new rows persist the exact captured source path.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "projection_source_path",
+            "projection_source_path TEXT NOT NULL DEFAULT ''",
+        )?;
+        // Migration-safe durable cancellation intent for the exact execution.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "cancel_requested_at",
+            "cancel_requested_at TEXT",
+        )?;
+        // Migration-safe index change: the earlier shape had a non-unique
+        // (action_id, status) index. Replace it with a partial unique guard that
+        // permits at most one unresolved operation per action, so a fresh
+        // operation is refused (atomically) while an earlier one is claimed,
+        // dispatched, ambiguous, or pending_acceptance. Terminal/retryable
+        // statuses are excluded so an explicit new operation is allowed.
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_trusted_executions_action;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trusted_executions_action_unresolved
+                ON trusted_action_executions(action_id)
+                WHERE status IN ('claimed','dispatched','ambiguous','pending_acceptance');
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_execution_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_execution_migration; \
+                 RELEASE SAVEPOINT trusted_execution_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Additive, idempotent durable acceptance-attempt receipts (Roadmap Priority
+/// #2, Part 4). One `trusted_acceptance_receipts` row per trusted execution
+/// attempt (keyed by execution id) records the runtime-owned acceptance
+/// outcome, and `trusted_acceptance_criteria` holds one accepted-evidence row
+/// per (criterion, check). `runtime_started_at`/`runtime_finished_at` on the
+/// execution receipt capture the actual Bun runtime bounds (distinct from the
+/// native claim time), making them available through exact readback.
+pub fn apply_trusted_acceptance_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch("SAVEPOINT trusted_acceptance_migration;")?;
+    let result = (|| -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_receipts (
+                acceptance_key       TEXT PRIMARY KEY,
+                execution_id         TEXT NOT NULL UNIQUE,
+                action_id            TEXT NOT NULL,
+                manifest_id          TEXT NOT NULL,
+                goal_id              TEXT NOT NULL,
+                status               TEXT NOT NULL,
+                terminal_reason      TEXT,
+                bun_run_id           TEXT,
+                bun_instance_id      TEXT,
+                evidence_json        TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                runtime_started_at   TEXT,
+                runtime_finished_at  TEXT,
+                settled_at           TEXT,
+                created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_action
+                ON trusted_acceptance_receipts(action_id, status);
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_goal
+                ON trusted_acceptance_receipts(goal_id, status);
+
+            CREATE TABLE IF NOT EXISTS trusted_acceptance_criteria (
+                id              TEXT PRIMARY KEY,
+                acceptance_key  TEXT NOT NULL
+                                REFERENCES trusted_acceptance_receipts(acceptance_key) ON DELETE CASCADE,
+                criterion_id    TEXT NOT NULL,
+                tool            TEXT NOT NULL,
+                check_index     INTEGER NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                actual_sha256   TEXT,
+                accepted        INTEGER NOT NULL DEFAULT 0,
+                evidence_json   TEXT CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                UNIQUE(acceptance_key, criterion_id, check_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_trusted_acceptance_criteria_key
+                ON trusted_acceptance_criteria(acceptance_key, criterion_id);
+            "#,
+        )?;
+        // Migration-safe runtime-bound columns on the execution receipt. These
+        // MUST be added before the index that references `runtime_finished_at`,
+        // so a pre-existing database schema migrates cleanly.
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "runtime_started_at",
+            "runtime_started_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "trusted_action_executions",
+            "runtime_finished_at",
+            "runtime_finished_at TEXT",
+        )?;
+        conn.execute_batch(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_trusted_executions_runtime
+                ON trusted_action_executions(status, runtime_finished_at);
+            "#,
+        )?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT trusted_acceptance_migration;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT trusted_acceptance_migration; \
+                 RELEASE SAVEPOINT trusted_acceptance_migration;",
+            );
+            Err(err)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +1911,98 @@ mod tests {
         assert!(table_has_column(&conn, "stage_runs", "mode_id").unwrap());
         assert!(table_has_column(&conn, "tuning_proposals", "proposal_type").unwrap());
         assert!(table_has_column(&conn, "tuning_outcomes", "user_rating_delta").unwrap());
+    }
+
+    /// A database created before agent_projections gained `active` keeps its
+    /// old table (CREATE TABLE IF NOT EXISTS is a no-op), so nothing may index
+    /// `active` until apply_schema_patches has added the column. On 2026-10-06
+    /// this aborted every launch on an existing install with "no such column:
+    /// active" before the window opened.
+    #[test]
+    fn migrations_upgrade_pre_activation_agent_projections() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE agent_projections (
+                slug                TEXT PRIMARY KEY,
+                source_path         TEXT NOT NULL DEFAULT '',
+                source_hash         TEXT NOT NULL DEFAULT '',
+                projection_version  INTEGER NOT NULL DEFAULT 1,
+                status              TEXT NOT NULL DEFAULT 'pending'
+                                    CHECK(status IN ('valid', 'invalid', 'pending')),
+                validation_errors   TEXT CHECK(validation_errors IS NULL OR json_valid(validation_errors)),
+                name                TEXT NOT NULL DEFAULT '',
+                description         TEXT,
+                tools_json          TEXT CHECK(tools_json IS NULL OR json_valid(tools_json)),
+                version_tag         TEXT,
+                activated_at        TEXT,
+                created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            );
+            CREATE INDEX idx_agent_projections_status ON agent_projections(status);
+            CREATE INDEX idx_agent_projections_hash ON agent_projections(source_hash);
+            INSERT INTO agent_projections (slug, status) VALUES ('legacy', 'valid');
+            "#,
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        for column in [
+            "active",
+            "active_source_hash",
+            "source_size_bytes",
+            "last_validated_at",
+            "deactivated_at",
+        ] {
+            assert!(table_has_column(&conn, "agent_projections", column).unwrap(), "{column}");
+        }
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_agent_projections_active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+        let (status, active): (String, i64) = conn
+            .query_row(
+                "SELECT status, active FROM agent_projections WHERE slug = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), active), ("valid", 0));
+    }
+
+    #[test]
+    fn add_column_rejects_a_definition_without_the_column_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+
+        let error = add_column_if_missing(&conn, "t", "note", "TEXT").unwrap_err();
+        assert!(error.to_string().contains("must start with the column name"), "{error}");
+        assert!(!table_has_column(&conn, "t", "TEXT").unwrap());
+
+        add_column_if_missing(&conn, "t", "note", "note TEXT").unwrap();
+        assert!(table_has_column(&conn, "t", "note").unwrap());
+    }
+
+    #[test]
+    fn fresh_migrations_create_session_continuity_cursor_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for column in [
+            "last_action_source_message_id",
+            "last_action_created_at",
+            "last_action_rowid",
+            "manual_boundary_created_at",
+            "manual_boundary_rowid",
+        ] {
+            assert!(table_has_column(&conn, "session_continuity", column).unwrap(), "{column}");
+        }
+        assert!(!table_has_column(&conn, "session_continuity", "TEXT").unwrap());
+        assert!(table_has_column(&conn, "memory_derived_invalidations", "source_message_ids_json").unwrap());
     }
 
     #[test]

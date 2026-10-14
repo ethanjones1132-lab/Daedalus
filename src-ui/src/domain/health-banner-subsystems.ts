@@ -55,7 +55,7 @@ const NAMES: Record<HealthSubsystemKey, string> = {
   bun: 'Bun server',
   bridge: 'Bridge',
   ollama: 'Ollama',
-  llama_cpp: 'Gemma llama.cpp server',
+  llama_cpp: 'llama.cpp server',
   model: 'Local model',
   openrouter_key: 'OpenRouter key',
   claude_proxy: 'Claude proxy',

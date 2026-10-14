@@ -3,6 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useToast } from '../design';
 import { parseActionRegistryAlerts, type ActionRegistryAlert } from '../domain/action-registry-state';
+import { useWorkflow } from '../features/workflows/WorkflowContext';
+import type { GoalNotificationSelector } from '../domain/types';
 import { useNavigation } from './navigation';
 
 /**
@@ -17,6 +19,9 @@ import { useNavigation } from './navigation';
  * listeners register exactly once and are never torn down by a re-render.
  */
 export function useAppSignals() {
+  const flow = useWorkflow();
+  const flowRef = useRef(flow);
+  flowRef.current = flow;
   const toast = useToast();
   const { navigate } = useNavigation();
   const toastRef = useRef(toast);
@@ -80,6 +85,21 @@ export function useAppSignals() {
         );
       }),
     );
+
+    track(listen<unknown>('goal://notifications', event => {
+      if (disposed || typeof event.payload !== 'object' || event.payload === null) return;
+      const n = event.payload as Record<string, unknown>;
+      if (typeof n.message !== 'string' || !n.message) return;
+      const selector: GoalNotificationSelector | null = typeof n.goal_id === 'string' && n.goal_id.trim() ? {
+        goal_id: n.goal_id,
+        ...(typeof n.activation_id === 'string' && n.activation_id ? { activation_id: n.activation_id } : {}),
+        ...(typeof n.cron_job_id === 'string' && n.cron_job_id ? { cron_job_id: n.cron_job_id } : {}),
+        ...(typeof n.run_id === 'string' && n.run_id ? { run_id: n.run_id } : {}),
+      } : null;
+      const action = selector ? { label: 'Open Goals', onClick: () => flowRef.current.openGoalNotification(selector) } : undefined;
+      const notify = n.kind === 'scheduled_run_blocked' || n.kind === 'scheduled_run_failed' ? toastRef.current.error : n.kind === 'scheduled_run_waiting_for_user' || n.kind === 'scheduled_run_cancelled' ? toastRef.current.warn : n.kind === 'scheduled_run_verified_completed' ? toastRef.current.success : toastRef.current.info;
+      notify(n.message, typeof n.title === 'string' ? n.title : undefined, undefined, action);
+    }));
 
     return () => {
       disposed = true;

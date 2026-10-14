@@ -1,3 +1,5 @@
+import { lazy, Suspense } from 'react';
+import { FeatureModes } from '../workflows/FeatureModes';
 // Cron — scheduled jobs: a next-runs timeline, missed-job recovery, the job
 // table with per-job operations, run history, and insights.
 //
@@ -38,7 +40,7 @@ function latestOutcomes(runs: CronRun[]): Record<string, string> {
   return Object.fromEntries(Object.entries(newest).map(([id, run]) => [id, run.status]));
 }
 
-export default function CronPage() {
+function CronPage() {
   const cron = useCronJobs();
   const {
     jobs,
@@ -272,3 +274,6 @@ export default function CronPage() {
     </Page>
   );
 }
+
+const AdvancedCronPage = lazy(() => import('./GoalCronPage'));
+export default function CronPageSurface() { return <FeatureModes label="Goal schedules" primary={<CronPage />} advanced={<Suspense fallback={<div role="status">Loading controls…</div>}><AdvancedCronPage /></Suspense>} />; }

@@ -2,22 +2,61 @@
 // ── Jarvis Bun Server v2.0 ──
 // ═══════════════════════════════════════════════════════════════
 // WSL-side HTTP server on port 19877.
-// Uses OpenAI-compatible APIs for llama.cpp Gemma, Ollama, and OpenRouter.
-// Gemma via llama.cpp is the default local chat and persistent-conductor backend.
+// Uses OpenAI-compatible APIs for llama.cpp, Ollama, and OpenRouter.
+// Qwen3.6 keep96 via llama.cpp is the default local chat and persistent-conductor backend.
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
 import { installSelfLog } from "./self-log";
 installSelfLog();
+// Native memory bootstrap must capture and strip the owned capability from
+// `process.env` before any tool runtime or child subprocess can clone it.
+import {
+  createGoalRunRegistry,
+  createNativeMemoryRegistry,
+  handleNativeMemoryRequest,
+  resolveTurnMemory,
+  type ConsumeMemoryResult,
+  type ConsumedGoalBinding,
+  type MemoryAppliedObservation,
+  type MemoryTurnTerminalStatus,
+  type ScopeCandidateIdentity,
+} from "./native-memory";
+import { resolveBoundMemoryWorkspace } from "./memory-workspace";
+import {
+  fitTurnMemory,
+  resolveTurnMemoryInputBudget,
+  withTurnMemory,
+  TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
+  TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS,
+  type AppliedTurnMemory,
+} from "./turn-memory-context";
+import type { PreparedMemoryTurn } from "./memory-contract";
+import type { MemoryRevalidationPolicy, MemoryRevalidationResult } from "./memory-contract";
+import type { ToolCallRecord } from "./orchestration/stage-output";
+import {
+  appliedRevalidationPolicy,
+  assessMemoryRevalidation,
+  buildMemoryRevalidationPolicy,
+  filterUnrevalidatedSelections,
+  unavailableForUntrustedTransport,
+} from "./memory-revalidation";
+import {
+  configureMemoryDerivedState,
+  invalidateMemoryDerivedState,
+  MemoryDerivedStateUnavailableError,
+  noteMemoryDerivedActivity,
+  trySessionInvalidationWatermark,
+} from "./memory-derived-state";
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
 
 import { serve } from "bun";
-import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join } from "path";
+import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "fs";
+import { join, isAbsolute, relative, resolve } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -27,7 +66,14 @@ import { handleAgentRequest } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
-import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
+import {
+  buildClaudeCliChatArgs,
+  streamClaudeCli,
+  isClaudeCliAvailable,
+  compactTurnHistoryForCli,
+  claudeCliSupportsNoSessionPersistence,
+  configuredCliForcesResume,
+} from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import {
   listOpenRouterModels,
@@ -86,7 +132,8 @@ import {
   makeExecutionContext,
   toApiTools,
 } from "./tool-runtime";
-import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
+import type { ToolRuntime, ExecutionContext, ToolResult } from "./tool-runtime";
+import { resolveWorkspacePathIdentity } from "./orchestration/path-identity";
 import { registerStandardBundles } from "./bundles-registry";
 import { deprecatedSessionsPostResponse } from "./session-authority";
 import { searchWeb } from "./web-bundle";
@@ -142,7 +189,11 @@ import { extractDeltaText } from "./sse-delta";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
-import { SessionMemory, mergeSharedContextHints } from "./orchestration/session-memory";
+import {
+  SessionMemory,
+  mergeSharedContextHints,
+  type ContinuityAction,
+} from "./orchestration/session-memory";
 import {
   AgentPool,
   firstTokenTimeoutFor,
@@ -229,11 +280,14 @@ import {
   assessTaskRunAcceptance,
   getActivePlanItem,
   reconcileTaskRunStatus,
+  recordCheckpointStage,
   resolveDeepReadIntent,
+  resolveGoalExecutionState,
   recordWriteTargets,
   terminalSubtypeForRunOutcome,
   unfinishedPlanItemInputs,
   type TaskRunContract,
+  type TaskRunGoalLink,
 } from "./orchestration/task-run";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
@@ -441,6 +495,64 @@ function buildChatRuntime(
   return { runtime, ctx };
 }
 
+/** Map a pipeline run outcome onto the frozen memory terminal vocabulary. */
+function terminalStatusForRunOutcome(
+  outcome: "success" | "degraded" | "failed" | "partial",
+): MemoryTurnTerminalStatus {
+  if (outcome === "success") return "completed";
+  if (outcome === "failed") return "failed";
+  return "partial";
+}
+
+function pathWithinRoot(realRoot: string, realCandidate: string): boolean {
+  const rel = relative(realRoot, realCandidate);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * Canonical path attached to a runtime evidence ref. A relative argument is
+ * resolved against the trusted execution workspace (never the Bun process
+ * cwd) and accepted only when the real path stays inside the execution
+ * workspace or an authorized session grant. A path that is nonexistent,
+ * outside every authorized root, or otherwise not runtime-normalizable yields
+ * null rather than a fabricated location. Observation is not authority.
+ */
+function canonicalToolArgumentPath(
+  args: Record<string, unknown> | undefined | null,
+  ctx: Pick<ExecutionContext, "workspace_path" | "session_grants">,
+): string | null {
+  if (!args || typeof args !== "object") return null;
+  const workspace = typeof ctx.workspace_path === "string" && ctx.workspace_path ? ctx.workspace_path : null;
+  const roots = [workspace, ...(ctx.session_grants ?? [])]
+    .filter((root): root is string => typeof root === "string" && root.length > 0)
+    .map((root) => {
+      try { return realpathSync(root); } catch { return null; }
+    })
+    .filter((root): root is string => root !== null);
+  if (roots.length === 0) return null;
+
+  // `relative_workspace_path` is the runtime's own alias for `path`; include
+  // it so a path the runtime normalized is still attributable.
+  for (const key of ["path", "relative_workspace_path", "file_path", "directory"] as const) {
+    const value = (args as Record<string, unknown>)[key];
+    if (typeof value !== "string" || value.trim().length === 0) continue;
+    const candidate = isAbsolute(value)
+      ? value
+      : workspace
+        ? resolve(workspace, value)
+        : null;
+    if (!candidate) return null;
+    try {
+      const real = realpathSync(candidate);
+      if (!roots.some((root) => pathWithinRoot(root, real))) return null;
+      return resolveWorkspacePathIdentity(real) ?? null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /**
  * Build a sandbox permissions block describing tool constraints to the model.
  * Rendered as a stable system-prompt prefix that never changes between turns,
@@ -474,6 +586,13 @@ export interface JarvisSession {
   message_count: number;
   last_active?: string;
   total_tokens?: number;
+  /**
+   * Canonical persisted Agent identity for the Session. Scope input only; it
+   * is never a filesystem grant or memory authority.
+   */
+  agent_id: string;
+  /** Explicit validated project binding, if any. `null` is Agent scope. */
+  project_root: string | null;
 }
 
 export interface JarvisMessage {
@@ -499,6 +618,18 @@ export interface BridgeResponse {
 }
 
 type StreamJarvisOptions = ChatStreamOptions;
+
+/**
+ * A successfully consumed native memory snapshot for one turn. Only a
+ * validated, single-consumption registry envelope produces this value; an
+ * absent/raw/failed reference never does. Presence here is the sole
+ * authorization for runtime observations and final-request injection.
+ */
+interface ActiveTurnMemory {
+  preparationId: string;
+  envelope: PreparedMemoryTurn;
+  consumeStatus: ConsumeMemoryResult["status"];
+}
 
 // OpenClaw interfaces removed — Jarvis is now self-contained
 
@@ -568,8 +699,40 @@ const PORT = Number(process.env.JARVIS_SERVER_PORT ?? 19877);
 /** Process-wide local conductor — maintains per-session Ollama prefix state. */
 const persistentConductor = new PersistentConductor(loadConfig);
 
+/** Ephemeral owned-registry for native memory. Empty when this server was not
+ *  launched with the native capability; internal routes then report
+ *  `memory_unavailable` instead of serving a second App-memory authority.
+ *  Semantic mutations drive scoped derived-state cleanup through the `derived`
+ *  field of the private `/internal/memory/invalidate` route; the predecessor's
+ *  broad `sessionMemory.clearAll()` callback was removed so independent
+ *  TaskRuns/tool/file/check caches survive memory mutation. */
+const nativeMemoryRegistry = createNativeMemoryRegistry();
+
+/** Ephemeral bounded one-shot registry for native-authorized Goal run
+ *  bindings. Independent of native memory; a binding becomes TaskRun/run Goal
+ *  authority only after the owned native child registered it (which itself
+ *  only happens after native validated the Goal's Session/Agent/scope binding).
+ *  A public `/chat/stream` caller cannot register or forge a binding. */
+const goalRunRegistry = createGoalRunRegistry();
+
 /** Inter-workflow shared memory — tool results, file snapshots, failure patterns. */
 const sessionMemory = new SessionMemory(() => loadConfig().orchestrator.session_memory);
+
+// Phase 3.2 scoped derived-state cleanup. Each hook persists synchronously and
+// throws on failure so the private route withholds its ACK on incomplete
+// cleanup. Unrelated Sessions, independent evidence caches, and TaskRuns are
+// never globally reset.
+configureMemoryDerivedState({
+  sessionsRoot: SESSIONS_DIR,
+  host: {
+    evictSessionDerivedState: (sessionId, invalidation) => {
+      sessionMemory.evictMemoryDerivedState(sessionId, invalidation);
+    },
+    evictConductorSession: (sessionId) => {
+      persistentConductor.evictDerivedState(sessionId);
+    },
+  },
+});
 
 /** Last effective authority per session, retained for terse continuation turns. */
 const MAX_CONTINUATION_REQUIREMENTS = 256;
@@ -817,7 +980,7 @@ async function discoverModels(configOverride?: Partial<JarvisConfig>): Promise<a
         name: model.id ?? cfg.llama_cpp.model,
         context_length: cfg.llama_cpp.context_window,
         pricing: "free",
-        description: "Local Gemma model served by llama.cpp",
+        description: "Local model served by llama.cpp",
         source: "llama_cpp",
         already_installed: true,
       }));
@@ -1297,6 +1460,12 @@ class DegenerateStreamError extends Error {
 
 async function streamJarvis(message: string, sessionId: string, options: StreamJarvisOptions = {}): Promise<Response> {
   const turnStartedAt = Date.now();
+  // Fail closed: record this Session turn's derived-context activity epoch
+  // BEFORE any derived state is loaded or created (native and ordinary turns
+  // alike). If the epoch cannot be durably persisted, no derived context may be
+  // created, so the turn is refused rather than accumulating un-invalidatable
+  // state.
+  noteMemoryDerivedActivity(sessionId);
   // Invariant: the turn budget and coordinator route derive from the same
   // continuation-aware requirement; do not freeze a raw-message budget first.
   const priorTaskRun = sessionMemory.getTaskRun(sessionId);
@@ -1326,12 +1495,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
   // while real work remains.
   const writeTaskIntent = initialRequirement === "full_execution" &&
     (hasWriteIntent(message) || (priorTaskRunLive && priorTaskRun?.writeIntent === true));
-  const turnBudget = createTurnBudget(
-    initialRequirement,
-    deepTaskIntent || forcedDeepRead || writeTaskIntent ? "high" : "medium",
-    turnStartedAt,
-    { forcedDeepRead, deepTask: deepTaskIntent || writeTaskIntent },
-  );
+  // The turn budget is created AFTER the native continuity action is known
+  // (below), from the same effective requirement/depth/intent used to begin and
+  // route the turn — never a stored objective a side question must not use.
+  // `ensureTurnBudget` is a closure over this binding.
+  let turnBudget: ReturnType<typeof createTurnBudget>;
   const ensureTurnBudget = (stage: string): void => {
     if (Date.now() >= turnBudget.deadlineAt) {
       throw new TurnDeadlineExceededError(stage, turnBudget.turn_ms);
@@ -1348,33 +1516,294 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if ((m as any).tool_call_id) msg.tool_call_id = (m as any).tool_call_id;
       return msg;
     });
-  const activeWorkspacePath = workspaceAffinity.resolve(
-    sessionId,
-    message,
-    turnHistory,
-    cfg.jarvis_path,
-  );
-  const turnSessionGrants = cfg.tools.grant_session_roots
+  // Roots named by the RAW current message. For an explicit native objective
+  // control (`Objective: ...`, clear, resume) the message text is CONTEXT, not
+  // a permission source: a goal may name arbitrary paths and must never create
+  // or widen session root grants. New roots from such a message are ignored;
+  // the stored run's prior granted roots remain valid permissions.
+  let turnSessionGrants = cfg.tools.grant_session_roots
     ? extractRootGrants(message)
     : [];
+
+  // ── Native memory: resolve the trusted reference at the real workspace boundary ──
+  // References only. The client cannot supply memory text, scope, Agent
+  // identity, effective workspace, or terminal status. Project-scope recall
+  // additionally requires canonical equality of prepared project root,
+  // prepared effective workspace, and this actual active workspace (enforced
+  // inside the registry). Any failure yields a null envelope and ordinary
+  // inference; it never changes workspace grants.
+  const providedTurnId = typeof options.turnId === "string" && options.turnId.length > 0
+    ? options.turnId
+    : undefined;
+  // Ordinary streams receive a stable server-local transient turn identity so
+  // terminal/status frames can always correlate them. It is never persisted,
+  // never native-recorded, and carries no memory authority. A caller-provided
+  // native turn id is preserved exactly.
+  const memoryTurnId = providedTurnId ?? crypto.randomUUID();
+  const memoryPreparationId = typeof options.memoryPreparationId === "string" && options.memoryPreparationId.length > 0
+    ? options.memoryPreparationId
+    : undefined;
+  // Exact persisted native saved-user source row id for a native/Goal turn.
+  // Bounded at the request boundary into private turn options; identity only,
+  // never authority on its own.
+  const sourceMessageId = typeof options.sourceMessageId === "string" && options.sourceMessageId.length > 0
+    ? options.sourceMessageId
+    : undefined;
+  // Consume a native-authorized Goal run binding for this exact Session/turn
+  // and exact native saved-source row, at most once, verifying the hash of the
+  // actual message body against the native-bound value. The owned native child
+  // registered it only after validating the Goal's Agent/workspace binding and
+  // loading the exact persisted source row; no public field can create it and
+  // it is independent of memory availability. A missing source id or a
+  // null/mismatch/expired/replayed binding means a goal-less turn.
+  const consumedGoalBinding: ConsumedGoalBinding | null =
+    providedTurnId && sourceMessageId
+      ? goalRunRegistry.consume(providedTurnId, sessionId, sourceMessageId, message)
+      : null;
+  const goalLink: TaskRunGoalLink | null = consumedGoalBinding
+    ? {
+        goalId: consumedGoalBinding.goal_id,
+        bindingId: consumedGoalBinding.binding_id ?? providedTurnId,
+        taskRunId: consumedGoalBinding.task_run_id,
+        sessionId: consumedGoalBinding.session_id,
+        agentId: consumedGoalBinding.agent_id,
+        projectRoot: consumedGoalBinding.project_root,
+        objective: consumedGoalBinding.objective,
+        criteria: consumedGoalBinding.criteria,
+        linkedAt: new Date().toISOString(),
+      }
+    : null;
+  const scopeCandidateIdentity: ScopeCandidateIdentity | null =
+    providedTurnId && memoryPreparationId
+      ? {
+          preparation_id: memoryPreparationId,
+          turn_id: providedTurnId,
+          session_id: sessionId,
+          message,
+        }
+      : null;
+  // Resolve the effective workspace BEFORE consuming memory. An authenticated
+  // project binding may supply a missing root for a new bound Session only
+  // within existing authorized roots; a latest explicit user path always wins.
+  // Binding is not a grant, and the candidate is never its own authorization
+  // override. This resets no permission and widens no read/write grant.
+  const boundWorkspace = resolveBoundMemoryWorkspace({
+    sessionId,
+    identity: scopeCandidateIdentity,
+    registry: nativeMemoryRegistry,
+    affinity: workspaceAffinity,
+    cfg,
+    rawMessage: message,
+    history: turnHistory,
+    sessionGrants: turnSessionGrants,
+  });
+  const activeWorkspacePath = boundWorkspace.active_workspace;
   const workspaceReadScope = resolveWorkspaceReadScope(message, activeWorkspacePath);
   console.log(`[Jarvis] Active workspace session=${sessionId} path=${activeWorkspacePath}`);
+
+  let turnMemoryConsume: ConsumeMemoryResult | null = null;
+  if (providedTurnId && memoryPreparationId) {
+    try {
+      turnMemoryConsume = resolveTurnMemory(
+        nativeMemoryRegistry,
+        {
+          preparationId: memoryPreparationId,
+          turnId: providedTurnId,
+          sessionId,
+          message,
+        },
+        activeWorkspacePath,
+      );
+    } catch (error) {
+      // Activity-tracking failure is fail-closed: do not silently downgrade to
+      // "no memory" and continue building derived state with no epoch.
+      if (error instanceof MemoryDerivedStateUnavailableError) throw error;
+      console.warn(
+        `[Jarvis] Native memory reference resolution failed session=${sessionId}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+      turnMemoryConsume = { envelope: null, status: "unavailable", code: "memory_unavailable" };
+    }
+  }
+  // A bound project that could not supply this turn's workspace (unauthorized
+  // or conflicting with an explicit user choice) is reported without injecting
+  // its memory. The registry consume above remains authoritative when it ran.
+  if (!turnMemoryConsume && boundWorkspace.memory_status !== null) {
+    turnMemoryConsume = {
+      envelope: null,
+      status: boundWorkspace.memory_status,
+      code: boundWorkspace.memory_status,
+    };
+  }
+  const activeTurnMemory: ActiveTurnMemory | null = turnMemoryConsume?.envelope
+    ? {
+        preparationId: turnMemoryConsume.envelope.preparation_id,
+        envelope: turnMemoryConsume.envelope,
+        consumeStatus: turnMemoryConsume.status,
+      }
+    : null;
+  const turnMemoryEnvelope = activeTurnMemory?.envelope ?? null;
+  // Phase 4.3: build the fresh-source policy from the authenticated prepared
+  // selection and the canonical workspace only. Public `/chat/stream` fields
+  // (`memory`, `scope`, `agent_id`, message text) can never set it.
+  const memoryRevalidationPolicy: MemoryRevalidationPolicy = buildMemoryRevalidationPolicy(
+    turnMemoryEnvelope?.selected.map((item) => item.selection) ?? [],
+    activeWorkspacePath,
+  );
+  // Snapshot the current invalidation watermark for this started turn. This
+  // guard applies to EVERY turn that has a Session (native and ordinary HTTP),
+  // not just native-provided turn ids. If a semantic mutation advances it
+  // before a late write, that write is suppressed rather than allowed to
+  // restore stale memory-derived metadata. A watermark that cannot be trusted
+  // (null) is treated as permanently invalidated (fail closed).
+  const turnStartedWatermark = trySessionInvalidationWatermark(sessionId);
+  const turnInvalidated = (): boolean => {
+    if (turnStartedWatermark === null) return true;
+    const current = trySessionInvalidationWatermark(sessionId);
+    return current === null || current !== turnStartedWatermark;
+  };
+  console.log(
+    `[Jarvis] Memory turn session=${sessionId} turn=${memoryTurnId ?? "<none>"} ` +
+    `status=${turnMemoryConsume?.status ?? "unavailable"} applied_envelope=${activeTurnMemory ? "yes" : "no"}`,
+  );
+
   const streamLease = activeStreams.begin(sessionId);
   const streamAbort = streamLease.controller;
+  // Private Phase 3.4 continuity action from the native registered envelope.
+  // Only a consumed native envelope can populate TaskRun authority; HTTP-only
+  // callers cannot supply it.
+  const nativeContinuity = turnMemoryEnvelope?.continuity ?? undefined;
+  const continuityAction: ContinuityAction | undefined = nativeContinuity
+    ? {
+        mode: nativeContinuity.mode,
+        objective: nativeContinuity.snapshot.active_objective?.text ?? null,
+      }
+    : undefined;
+  // Effective requirement/objective must derive from the SAME effective turn
+  // contract used for routing so a side question/resume never computes the
+  // wrong budget or continuation from a stored objective it should not use.
+  //   - preserve: classify the CURRENT question independently (never inherit
+  //     the prior full_execution requirement or sticky deep/write intent).
+  //   - resume: use the accepted goal's continuation/prior requirement.
+  //   - replace/clear: accepted current goal, independent of prior heuristics.
+  //   - absent: existing continuation-aware resolution.
+  const continuityMode = continuityAction?.mode;
+  // A native objective control message can name arbitrary paths in its goal
+  // text. Ignore those new roots for ALL native continuity modes; existing
+  // prior grants on the stored run remain the only permissions (carried as
+  // permission only, never re-derived from the objective text).
+  if (continuityMode !== undefined) {
+    turnSessionGrants = priorTaskRun?.sessionGrants ?? [];
+  }
+  // A user QUESTION (preserve) legitimately narrows its own read allowlist via
+  // the existing resolver — keep it. An explicit goal control (replace/clear/
+  // resume) is context, not a workspace scope declaration: never let explicit
+  // paths inside the accepted goal text shape a read allowlist.
+  const effectiveWorkspaceReadScope =
+    continuityMode === "replace" || continuityMode === "clear" || continuityMode === "resume"
+      ? undefined
+      : workspaceReadScope;
+  // The effective user text every downstream inference boundary must use, so
+  // `resume` never feeds the literal "Continue active objective" and `replace`
+  // uses the accepted goal rather than the raw directive. `preserve` and
+  // `clear` use the current question. Never the literal directive phrase.
+  const effectiveUserMessage = continuityMode === "resume" || continuityMode === "replace"
+    ? (continuityAction?.objective ?? message)
+    : message;
+  // Rebind the execution message now that the ORIGINAL raw request has served
+  // registry consume, workspace boundary/grant derivation and source proof.
+  // Every later consumer (tool-intent detection, context-window optimization,
+  // web-search/CLI prompt assembly, acceptance input, repetition and routing)
+  // must see the accepted goal for a native resume/replace, never the literal
+  // directive text. Preserve/clear/ordinary are unchanged because
+  // `effectiveUserMessage` equals the original there. The original native
+  // source tuple/message-hash is never re-recorded or replaced.
+  message = effectiveUserMessage;
+  // Native-mode requirement classification. Every native mode classifies the
+  // EFFECTIVE user text with no inherited previous requirement: preserve uses
+  // the current question, replace uses the accepted goal, clear uses the
+  // current control command. Only a `resume` whose stored objective EXACTLY
+  // matches the native accepted objective may inherit the prior requirement/
+  // depth/writeIntent; a mismatched or neutralized stored goal (for example a
+  // failed capture of a previewed replacement) classifies the accepted goal on
+  // its own instead of resuming an unrelated plan.
+  const matchingResume = continuityMode === "resume"
+    && priorTaskRun !== undefined
+    && continuityAction?.objective != null
+    && priorTaskRun.objective === continuityAction.objective;
+  const ownRequirement =
+    resolveTurnRequirement(effectiveUserMessage, undefined, false).result.requirement;
+  const effectiveRequirement = continuityMode === undefined
+    ? initialResolvedRequirement.result.requirement
+    : matchingResume
+      ? (priorTaskRun?.requirement ?? ownRequirement)
+      : ownRequirement;
+  // `preserve` and `clear` run this turn's pipeline against a LOCAL contract so
+  // completion/planning writers cannot reactivate a cleared boundary or touch
+  // the stored task. `resume`/`replace` persist normally.
+  const continuityLocalTaskRun =
+    continuityMode === "preserve" || continuityMode === "clear";
+  // Deep/write/forced-deep intent come from the EFFECTIVE task for every native
+  // mode. Only a matching resume may inherit the prior depth/writeIntent; a
+  // preserve side question, an explicit replace and a clear never inherit the
+  // stored sticky flags, but do classify their own request (which may itself be
+  // a deep read or a write).
+  const effectiveForcedDeepRead = continuityMode === undefined
+    ? forcedDeepRead
+    : FORCE_DEEP_READ_PATTERN.test(effectiveUserMessage);
+  const effectiveDeepTaskIntent = continuityMode === undefined
+    ? deepTaskIntent
+    : resolveDeepReadIntent(
+        effectiveUserMessage,
+        matchingResume ? priorTaskRun?.depth : undefined,
+      );
+  const effectiveWriteTaskIntent = continuityMode === undefined
+    ? writeTaskIntent
+    : effectiveRequirement === "full_execution" &&
+      (hasWriteIntent(effectiveUserMessage)
+        || (matchingResume && priorTaskRun?.writeIntent === true));
+  // Rebuild the budget from the ACTUAL effective values so begin depth, route
+  // requirement and budget agree. A native goal control can change the deep/
+  // write tier even when the requirement string is unchanged. The ordinary
+  // (no-continuity) path passes identical values, so its budget is unchanged.
+  turnBudget = createTurnBudget(
+    effectiveRequirement,
+    effectiveDeepTaskIntent || effectiveForcedDeepRead || effectiveWriteTaskIntent ? "high" : "medium",
+    turnStartedAt,
+    { forcedDeepRead: effectiveForcedDeepRead, deepTask: effectiveDeepTaskIntent || effectiveWriteTaskIntent },
+  );
   let activeTaskRun: TaskRunContract;
   try {
-    activeTaskRun = sessionMemory.beginTaskRun(sessionId, {
-      message,
-      requirement: initialResolvedRequirement.result.requirement,
+    // Depth is classified from the effective task: preserve/clear/replace use
+    // the current message or accepted goal independently, never the stored
+    // deep-task depth. Only a matching resume may keep the accepted goal's
+    // depth.
+    const beginDepth = effectiveDeepTaskIntent ? "deep" as const : "standard" as const;
+    const beginInput = {
+      message: effectiveUserMessage,
+      requirement: effectiveRequirement,
+      sessionId,
       workspacePath: activeWorkspacePath,
       sessionGrants: turnSessionGrants,
-      depth: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "deep" : "standard",
-      estimatedComplexity: resolveDeepReadIntent(message, priorTaskRun?.depth) ? "high" : "medium",
-    });
+      depth: beginDepth,
+      estimatedComplexity: (beginDepth === "deep" ? "high" : "medium") as "low" | "medium" | "high",
+      continuity: continuityAction,
+      goal: goalLink ?? undefined,
+    };
+    activeTaskRun = sessionMemory.beginTaskRun(sessionId, beginInput);
+    // A clear persists the terminal boundary at begin, but its own turn must
+    // not persist completion/planning over that boundary: run this turn on a
+    // local detached contract. Same local guards as preserve.
+    if (continuityMode === "clear") {
+      activeTaskRun = sessionMemory.ephemeralQuestionContract(beginInput);
+    }
   } catch (error) {
     streamLease.release();
     throw error;
   }
+  // The effective contract for routing/planning/skills/inference. A preserve
+  // side question / clear turn is fully ephemeral; its mutations target this
+  // local contract only, so the stored task/plan/status/evidence stay intact.
   const { readable, writable } = new TransformStream();
   const rawWriter = writable.getWriter();
   const encoder = new TextEncoder();
@@ -1423,11 +1852,236 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         return false;
       }
     };
+    // ── Per-turn native memory observations ────────────────────────────────
+    // All observations are gated on a validated consumed snapshot
+    // (`activeTurnMemory`). A raw/forged/failed reference never attaches
+    // evidence or a terminal outcome to any receipt. Frames carry IDs and
+    // status only — never recalled content.
+    let memoryTerminalRecorded = false;
+    // Phase 4.3: actual runtime tool records for THIS turn, used only to assess
+    // current-source evidence. Cache hits never reach `ctx.onToolResult`.
+    const observedToolCallRecords: ToolCallRecord[] = [];
+    // Set when the turn runs through a transport that cannot produce trusted
+    // Jarvis runtime read refs (e.g. the external Claude CLI runner).
+    let memoryRevalidationUntrusted = false;
+    const emitMemoryStatusFrame = async (
+      status: ConsumeMemoryResult["status"],
+      envelope: PreparedMemoryTurn | null,
+      code?: string,
+    ): Promise<void> => {
+      await streamWrite(`data: ${JSON.stringify({
+        type: "memory_status",
+        turn_id: memoryTurnId,
+        status,
+        selected_ids: envelope ? envelope.selected.map((item) => item.selection.id) : [],
+        store_revision: envelope ? envelope.store_revision : null,
+        ...(code ? { code } : {}),
+        session_id: sessionId,
+      })}\n\n`);
+    };
+    const observeTurnMemoryObservation = (observation: MemoryAppliedObservation): void => {
+      if (!activeTurnMemory) return;
+      // Actual applied IDs/status for the authenticated native receipt.
+      nativeMemoryRegistry.observeApplied(activeTurnMemory.preparationId, observation);
+      if (memoryTurnId) {
+        void streamWrite(`data: ${JSON.stringify({
+          type: "memory_applied",
+          turn_id: memoryTurnId,
+          stage: observation.stage,
+          selected_ids: observation.selected_ids,
+          status: observation.status,
+          session_id: sessionId,
+        })}\n\n`);
+      }
+    };
+    const observeTurnMemoryApplied = (stage: string, applied: AppliedTurnMemory): void => {
+      observeTurnMemoryObservation({
+        stage,
+        selected_ids: applied.selected_ids,
+        status: applied.status,
+      });
+    };
+    const observeTurnMemoryToolEvidence = (
+      call: ToolCall,
+      result: ToolResult,
+      executionCtx: Pick<ExecutionContext, "workspace_path" | "session_grants">,
+    ): void => {
+      if (!activeTurnMemory) return;
+      const rawOutput = result.is_error ? (result.error || result.output) : result.output;
+      let digest = "";
+      try {
+        digest = new Bun.CryptoHasher("sha256").update(rawOutput ?? "").digest("hex");
+      } catch {
+        digest = "";
+      }
+      if (!digest) return;
+      observedToolCallRecords.push({
+        name: call.name,
+        arguments: call.arguments,
+        output: rawOutput ?? "",
+        is_error: result.is_error,
+        ...(result.error_code ? { error_code: result.error_code } : {}),
+        duration_ms: result.duration_ms ?? 0,
+      });
+      nativeMemoryRegistry.observeToolEvidence(activeTurnMemory.preparationId, {
+        tool_call_id: call.id,
+        tool_name: call.name,
+        canonical_path: canonicalToolArgumentPath(call.arguments, executionCtx),
+        output_sha256: digest,
+        observed_at: new Date().toISOString(),
+        success: !result.is_error,
+      });
+    };
+    /**
+     * Fit the same snapshot against a CLEAN base message list and return the
+     * cloned list carrying at most one carrier. Never mutate the clean base.
+     * The envelope is supplied explicitly so a caller can attach a fail-closed
+     * filtered envelope (Phase 4.3) rather than the raw prepared snapshot.
+     */
+    const attachTurnMemory = (
+      envelope: PreparedMemoryTurn | null,
+      cleanMessages: readonly any[],
+      toolSchemas: unknown,
+      contextWindowTokens: number | null,
+      outputReserveTokens: number | null,
+    ): { messages: any[]; applied: AppliedTurnMemory | null } => {
+      if (!envelope) return { messages: cleanMessages as any[], applied: null };
+      const applied = fitTurnMemory(
+        envelope,
+        cleanMessages as any,
+        resolveTurnMemoryInputBudget({
+          contextWindowTokens,
+          outputReserveTokens,
+          toolSchemaTokens: toolSchemas ? countTokens(JSON.stringify(toolSchemas)) : 0,
+        }),
+      );
+      return {
+        messages: applied.block ? withTurnMemory(cleanMessages as any, applied) : (cleanMessages as any[]),
+        applied,
+      };
+    };
+
+    // ── Phase 4.3 fail-closed envelope eligibility ─────────────────────────
+    // A provider must never receive project descriptive/unknown memory that
+    // requires current source unless THIS turn already produced authenticated
+    // canonical read evidence. The filtered envelope is derived from the same
+    // prepared policy and the same `assessMemoryRevalidation` contract used by
+    // the terminal receipt; omitted items remain absent from the native applied
+    // IDs so they are never labelled used.
+    const trustedEligibleEnvelope = (): PreparedMemoryTurn | null => {
+      if (!turnMemoryEnvelope) return null;
+      if (memoryRevalidationUntrusted) {
+        return filterUnrevalidatedSelections(
+          turnMemoryEnvelope,
+          memoryRevalidationPolicy,
+          unavailableForUntrustedTransport(memoryRevalidationPolicy),
+        );
+      }
+      let result: MemoryRevalidationResult;
+      try {
+        const evidence = activeTurnMemory
+          ? nativeMemoryRegistry.receipt(activeTurnMemory.preparationId)?.runtime_evidence ?? []
+          : [];
+        result = assessMemoryRevalidation(
+          memoryRevalidationPolicy,
+          observedToolCallRecords,
+          evidence,
+          message,
+          activeWorkspacePath,
+        );
+      } catch {
+        result = {
+          state: "unavailable",
+          memory_ids: memoryRevalidationPolicy.memory_ids,
+          evidence_tool_call_ids: [],
+          reason_code: "unsupported_evidence_path",
+        };
+      }
+      return filterUnrevalidatedSelections(turnMemoryEnvelope, memoryRevalidationPolicy, result);
+    };
+    // An external CLI transport (direct Claude CLI or the delegate) runs its
+    // own tools and can never produce trusted runtime refs, so freshness-
+    // required selections are always excluded from its context.
+    const untrustedEligibleEnvelope: PreparedMemoryTurn | null = turnMemoryEnvelope
+      ? filterUnrevalidatedSelections(
+          turnMemoryEnvelope,
+          memoryRevalidationPolicy,
+          unavailableForUntrustedTransport(memoryRevalidationPolicy),
+        )
+      : null;
+    // Single explicit fail-closed message shared by every blocked gate path.
+    const memorySynthesisGateError =
+      "This answer was stopped because recalled project memory was applied " +
+      "without a successful current-turn read of the workspace source that " +
+      "supports it. No answer was produced from unverified memory. Retry with " +
+      "a specific file or directory so the workspace can be read first.";
+
+    const recordMemoryTerminal = (
+      status: MemoryTurnTerminalStatus,
+      errorCode: string | null = null,
+    ): void => {
+      if (!activeTurnMemory || memoryTerminalRecorded) return;
+      // A started turn retains a valid snapshot and MUST report its actual
+      // terminal outcome, applied ids, and tool refs even if a semantic
+      // mutation invalidated memory during the turn. These are diagnostics, not
+      // accepted facts, so the derived-persistence watermark does NOT gate the
+      // authenticated runtime lifecycle.
+      memoryTerminalRecorded = true;
+      // Phase 4.3: attach current-source evidence availability before the
+      // terminal outcome freezes the receipt. Revalidation covers only the
+      // relevant project descriptive/unknown selections ACTUALLY APPLIED this
+      // turn (authenticated registry applied-selected IDs), never a
+      // prepared-but-budget-omitted selection. A turn that requires fresh
+      // workspace reads but ran on an untrusted transport (external CLI) is
+      // explicitly `unavailable`; it is never reported as fresh.
+      const terminalReceipt = nativeMemoryRegistry.receipt(activeTurnMemory.preparationId);
+      const terminalPolicy = appliedRevalidationPolicy(
+        memoryRevalidationPolicy,
+        terminalReceipt?.applied_selected_ids ?? [],
+      );
+      let revalidation: MemoryRevalidationResult;
+      if (memoryRevalidationUntrusted) {
+        revalidation = unavailableForUntrustedTransport(terminalPolicy);
+      } else {
+        try {
+          revalidation = assessMemoryRevalidation(
+            terminalPolicy,
+            observedToolCallRecords,
+            terminalReceipt?.runtime_evidence ?? [],
+            message,
+            activeWorkspacePath,
+          );
+        } catch {
+          revalidation = {
+            state: "unavailable",
+            memory_ids: terminalPolicy.memory_ids,
+            evidence_tool_call_ids: [],
+            reason_code: "unsupported_evidence_path",
+          };
+        }
+      }
+      nativeMemoryRegistry.observeRevalidation(activeTurnMemory.preparationId, revalidation);
+      nativeMemoryRegistry.observeTerminal(activeTurnMemory.preparationId, {
+        terminal_status: status,
+        finished_at: new Date().toISOString(),
+        run_id: orchestratorAgentRunId ?? null,
+        error_code: errorCode,
+      });
+    };
     const session = new StreamSession({
       sessionId,
       write: streamWrite,
       isAborted: () => streamAbort.signal.aborted,
+      turnId: memoryTurnId,
     });
+    // Emit the stable turn identity + prepared selection metadata before
+    // admission so setup failure, cancellation, and EOF still carry it. A
+    // client-supplied memory_status can never elevate readiness/application.
+    await emitMemoryStatusFrame(
+      turnMemoryConsume?.status ?? "unavailable",
+      turnMemoryEnvelope,
+      turnMemoryConsume?.code ?? (activeTurnMemory ? undefined : "memory_unavailable"),
+    );
     const emitCancelled = async (): Promise<never> => {
       if (clientDisconnected) throw new StreamCancelledError();
       // 2026-07-13 finding (session 7254c3ae): a "superseded" cancellation
@@ -1442,9 +2096,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if (cancelReason === "superseded") {
         console.warn(`[Jarvis] Stream superseded by a newer turn session=${sessionId} — prior in-flight work discarded`);
       }
+      // A client disconnect leaves the turn outcome unknowable to the client:
+      // record it as unterminated, never as a successful completion.
+      recordMemoryTerminal(clientDisconnected ? "unterminated" : "cancelled", cancelReason);
       if (session.noteOutcome()) {
         session.noteTerminal();
-        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, reason: cancelReason })}\n\n`);
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, turn_id: memoryTurnId, reason: cancelReason })}\n\n`);
       }
       throw new StreamCancelledError();
     };
@@ -1478,12 +2135,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           deadlineAt: turnBudget.deadlineAt,
         }),
         onDeadline: async () => {
-          if (sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
+          if (!turnInvalidated() && !continuityLocalTaskRun && sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
             sessionMemory.updateTaskRun(sessionId, {
               status: "paused",
               lastOutcome: "admission_deadline",
             });
           }
+          recordMemoryTerminal("failed", "turn_deadline_exceeded");
           await session.error(
             "The turn deadline expired while waiting for orchestration capacity.",
             "turn_deadline_exceeded",
@@ -1519,8 +2177,34 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
       // ── Claude CLI path ──────────────────────────────────────────
       if (cfg.active_backend === "claude_cli") {
+        // The external CLI runs its own tools and cannot produce trusted Jarvis
+        // runtime read refs, so a turn requiring fresh workspace reads is never
+        // reported as fresh.
+        memoryRevalidationUntrusted = true;
         const reasoningParser = new ReasoningParser(sessionId);
-        const resumedSessionId = cliSessionMap.get(sessionId);
+        // Memory-enabled fresh-turn mode. A consumed snapshot must never ride
+        // on `cliSessionMap` resume: deleted/invalidated memory could otherwise
+        // survive in the CLI's persisted session. The mode additionally
+        // requires the installed executable to accept
+        // `--no-session-persistence`; if it cannot, or configured args force
+        // resume/continue (including equals forms), report unavailable and run
+        // ordinary CLI inference WITHOUT a memory appendix or an unknown flag.
+        const memoryCliRequested = activeTurnMemory !== null;
+        const cliArgsForceResume = configuredCliForcesResume(cfg.claude_cli.args);
+        const cliSupportsNoPersistence = memoryCliRequested && !cliArgsForceResume
+          ? await claudeCliSupportsNoSessionPersistence(cfg.claude_cli.path)
+          : false;
+        const memoryCliSupported = memoryCliRequested && !cliArgsForceResume && cliSupportsNoPersistence;
+        if (memoryCliRequested && !memoryCliSupported) {
+          const reason = cliArgsForceResume ? "cli_mode_unsupported" : "cli_capability_unavailable";
+          console.warn(`[Jarvis] Memory-enabled Claude CLI mode unavailable (${reason}) session=${sessionId} — running ordinary CLI inference without recall`);
+          await emitMemoryStatusFrame("unavailable", null, reason);
+          // Truthful private receipt: record unavailability/empty application
+          // rather than leaving recall_status at `ready` while only the wire
+          // frame says unavailable.
+          observeTurnMemoryObservation({ stage: "claude_cli", selected_ids: [], status: "unavailable" });
+        }
+        const resumedSessionId = memoryCliSupported ? undefined : cliSessionMap.get(sessionId);
         const historyForCli = !resumedSessionId
           ? compactTurnHistoryForCli(
               turnHistory,
@@ -1535,7 +2219,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               return `${m.role}: ${m.content}`;
             }).join("\n\n")}\n\n`
           : "";
-        const promptBody = `${historyPrompt}user: ${message}`;
+        const basePromptBody = `${historyPrompt}user: ${message}`;
+        let promptBody = basePromptBody;
+        let cliMemoryApplied: AppliedTurnMemory | null = null;
+        if (memoryCliSupported && activeTurnMemory) {
+          // Budget against the actual CLI request: bounded history + user
+          // prompt + the appended system prompt, plus an explicit conservative
+          // reserve for unknown CLI stock/MCP tool-schema and output overhead.
+          const cliBaseMessages: Array<{ role: string; content: string }> = [
+            ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+            { role: "user", content: basePromptBody },
+          ];
+          cliMemoryApplied = fitTurnMemory(
+            untrustedEligibleEnvelope ?? activeTurnMemory.envelope,
+            cliBaseMessages,
+            resolveTurnMemoryInputBudget({
+              contextWindowTokens: null,
+              // Reserve the configured positive output budget; the utility
+              // falls back to its default only when none is configured.
+              outputReserveTokens: cfg.max_tokens,
+              additionalReserveTokens: TURN_MEMORY_CLI_OVERHEAD_RESERVE_TOKENS,
+            }),
+          );
+          if (cliMemoryApplied.block) {
+            promptBody = `${basePromptBody}\n\n${cliMemoryApplied.block}`;
+          }
+        }
 
         // Build CLI args: system prompt via --append-system-prompt, model, prompt as positional
         const cliArgs = buildClaudeCliChatArgs(
@@ -1546,9 +2255,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             proxyModel: cfg.ollama?.model || "qwen3:8b",
           },
         );
+        if (memoryCliSupported) {
+          // No persistence: this fresh turn carries bounded native history and
+          // the ephemeral snapshot, and must not become a resumable session.
+          cliArgs.push("--no-session-persistence");
+        }
         if (systemPrompt) {
           cliArgs.push("--append-system-prompt", systemPrompt);
         }
+        let cliMemoryObserved = false;
+        const observeCliMemoryOnDispatch = (): void => {
+          if (cliMemoryObserved || !cliMemoryApplied) return;
+          cliMemoryObserved = true;
+          observeTurnMemoryApplied("claude_cli", cliMemoryApplied);
+        };
 
         for await (const evt of streamClaudeCli(cfg, {
           prompt: promptBody,
@@ -1558,6 +2278,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }, streamAbort.signal)) {
           if (streamAbort.signal.aborted) {
             await emitCancelled();
+          }
+          // Any real CLI event (not the pre-spawn `init`, not a spawn `error`)
+          // proves a request was actually dispatched with the fitted snapshot.
+          if (evt.type !== "init" && evt.type !== "error") {
+            observeCliMemoryOnDispatch();
           }
           if (evt.type === "stream_event" && evt.delta?.text) {
             const text: string = evt.delta.text;
@@ -1593,17 +2318,31 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               session_id: sessionId,
             })}\n\n`));
           } else if (evt.type === "message_stop") {
+            // Transport terminator only. An assistant `message_stop` is NOT
+            // the authoritative whole-turn result and must never latch the
+            // turn as completed before a later error/partial/cancel.
             session.noteTerminal();
-            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId })}\n\n`);
+            await streamWrite(`data: ${JSON.stringify({ type: "message_stop", session_id: sessionId, turn_id: memoryTurnId })}\n\n`);
           } else if (evt.type === "error") {
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
             }
+            recordMemoryTerminal("failed", "claude_cli_error");
             if (session.noteOutcome()) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId, turn_id: memoryTurnId })}\n\n`));
             }
           } else if (evt.type === "result") {
-            if (evt.session_id) {
+            // The CLI `result` record is the authoritative turn outcome.
+            const cliResultIsError = evt.is_error === true
+              || (typeof evt.subtype === "string" && evt.subtype.startsWith("error"));
+            const cliResultIsPartial = !cliResultIsError
+              && typeof evt.subtype === "string"
+              && /partial|interrupt|length|max_turns|max_tokens/i.test(evt.subtype);
+            recordMemoryTerminal(
+              cliResultIsError ? "failed" : cliResultIsPartial ? "partial" : "completed",
+              cliResultIsError ? (evt.subtype ?? "claude_cli_result_error") : null,
+            );
+            if (evt.session_id && !memoryCliSupported) {
               cliSessionMap.set(sessionId, evt.session_id);
             }
             if (reasoningParser) {
@@ -1622,7 +2361,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "reasoning_complete", trace, session_id: sessionId })}\n\n`));
             }
             if (session.noteOutcome()) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId })}\n\n`));
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId, turn_id: memoryTurnId })}\n\n`));
             }
           }
         }
@@ -1640,6 +2379,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // interactive tools (ask_user_question) can scope state per-session.
       ctx.session_id = sessionId;
       ctx.session_grants = activeTaskRun.sessionGrants ?? [];
+      // Trusted canonical Tool runtime observation for this turn only, and
+      // only when a validated snapshot was consumed. Hashes the raw result
+      // before any caller context truncation.
+      if (activeTurnMemory) {
+        ctx.onToolResult = (call, result) => observeTurnMemoryToolEvidence(call, result, ctx);
+      }
       // Wire the approval hook: emit a `tool_approval_request` SSE event so
       // the Tauri runner relays it to the UI (ToolApprovalModal), then await
       // the user's decision from the process-level registry. Auto-denies after
@@ -1678,6 +2423,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const previousOutcome = repetitionStore.lastOutcome(sessionId);
         if (previousOutcome && shouldShortCircuitRepeat(previousOutcome, message)) {
           console.warn(`[Jarvis Orchestrator] short-circuiting near-identical retry session=${sessionId} prior_code=${previousOutcome.errorCode}`);
+          recordMemoryTerminal("partial", "retry_short_circuited");
           await session.finish(
             "This is essentially the same request that just failed " +
             `(${previousOutcome.errorCode === "no_progress_repetition" ? "no new evidence was gathered" : "not enough workspace evidence could be gathered"}), ` +
@@ -1712,14 +2458,16 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
-        // Setup context message using turn history if present
-        let contextMessage = message;
+        // Setup context message using turn history if present. Uses the
+        // effective user text so a resume executes the accepted goal and a
+        // replace uses the accepted objective, never the literal directive.
+        let contextMessage = effectiveUserMessage;
         if (turnHistory.length > 0) {
-          const historyBudget = HISTORY_BUDGET_TOKENS[initialRequirement];
+          const historyBudget = HISTORY_BUDGET_TOKENS[effectiveRequirement];
           const historyBlock = buildBoundedHistoryBlock(turnHistory, historyBudget, 800);
           contextMessage = historyBlock
-            ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${message}`
-            : message;
+            ? `Conversation History:\n${historyBlock}\n\nLatest User Request: ${effectiveUserMessage}`
+            : effectiveUserMessage;
         }
         // Continuation self-sufficiency (2026-07-16 evening): a bare
         // "continue" reached the executor/synthesizer as the literal word
@@ -1729,9 +2477,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // depend on client-supplied history (which may also be truncated
         // past the original request by the history budget).
         if (
+          !turnInvalidated() &&
+          activeTaskRun.reconstruction !== "reconstruction_required" &&
           activeTaskRun.turnCount > 1 &&
           activeTaskRun.objective &&
-          activeTaskRun.objective.trim() !== message.trim()
+          activeTaskRun.objective.trim() !== effectiveUserMessage.trim()
         ) {
           const priorOutcome = priorTaskRun?.lastOutcome
             ? ` Last turn outcome: ${priorTaskRun.lastOutcome}.`
@@ -2100,6 +2850,55 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             request: ctrl,
           });
 
+          // ── Ephemeral native memory at this stage's final provider boundary ──
+          // The cascade path carries the reference and refits + attaches
+          // independently per candidate; the single-provider path fits inline
+          // against the fully assembled request (cache-stable prefix +
+          // normalization already applied), reserving tool schemas and output.
+          // `requestBody` itself stays memory-free as the clean base so a
+          // candidate/retry never re-fits a list that already has memory.
+          const providerContextWindow = isLlamaCpp
+            ? cfg.llama_cpp.context_window
+            : isOllama
+              ? (cfg.profiles?.[cfg.active_profile]?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192)
+              : isOpenCodeProvider
+                ? null
+                : (openRouterEffective?.context_length ?? null);
+          const stageContextCeiling = typeof callOptions?.contextCeilingTokens === "number"
+            && callOptions.contextCeilingTokens > 0
+            ? callOptions.contextCeilingTokens
+            : null;
+          // Unknown provider context resolves to the conservative floor FIRST,
+          // then intersects any valid positive stage ceiling, so a larger
+          // ceiling can never enlarge the unknown-model floor.
+          const candidateContextWindow = stageContextCeiling == null
+            ? providerContextWindow
+            : Math.min(providerContextWindow ?? TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS, stageContextCeiling);
+          const orchestratorOutputReserve = typeof requestBody.max_tokens === "number"
+            ? requestBody.max_tokens
+            : typeof requestBody.max_completion_tokens === "number"
+              ? requestBody.max_completion_tokens
+              : cfg.max_tokens;
+          const attemptMemoryFallback = turnMemoryEnvelope && useFallback
+            ? {
+                envelope: turnMemoryEnvelope,
+                // Candidate catalog metadata wins inside the cascade; the stage
+                // ceiling bounds it. No primary-model fallback is supplied, so
+                // a candidate without metadata stays conservatively floored.
+                contextCeilingTokens: stageContextCeiling,
+                fallbackContextWindowFor: (): number | null => null,
+                outputReserveTokens: orchestratorOutputReserve,
+                onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
+              }
+            : undefined;
+          if (turnMemoryEnvelope && !useFallback) {
+            const attached = attachTurnMemory(turnMemoryEnvelope, normalizedMessages, requestBody.tools, candidateContextWindow, orchestratorOutputReserve);
+            if (attached.applied) {
+              requestBody.messages = attached.messages;
+              observeTurnMemoryApplied(stageLabel ?? "orchestrator", attached.applied);
+            }
+          }
+
           let fetchRes: Response;
           let actualModelUsed = modelName;
           let actualProviderUsed: string = isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : effectiveProvider;
@@ -2112,6 +2911,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 excludeModels: stageExclusions,
                 deadlineAt: turnBudget.deadlineAt,
                 turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
+                memory: attemptMemoryFallback,
               });
               fetchRes = result.response;
               actualModelUsed = result.model_used;
@@ -2172,7 +2972,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             if (isLocalInference && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
               throw new Error(isLlamaCpp
-                ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+                ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local llama.cpp server is running.`
                 : `Cannot connect to Ollama. Tried: ${localTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
             }
             throw fetchErr;
@@ -2189,11 +2989,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               console.warn(`[Jarvis Orchestrator] Model ${actualModelUsed} does not support native tools. Retrying without tools...`);
               delete requestBody.tools;
               const instructions = buildTextToolInstructions(runtime.listTools());
-              const systemMessage = requestBody.messages.find((item: any) => item.role === "system");
-              if (systemMessage) {
-                systemMessage.content = [systemMessage.content, instructions].filter(Boolean).join("\n\n");
+              // Rebuild from the CLEAN base, add text-tool instructions, then
+              // refit against the changed system/tool cost and attach exactly
+              // one new carrier. Never re-fit a list that already has memory.
+              const retryBase = normalizedMessages.map((m: any) => ({ ...m }));
+              const retrySystemIndex = retryBase.findIndex((m: any) => m.role === "system");
+              if (retrySystemIndex >= 0) {
+                retryBase[retrySystemIndex] = {
+                  ...retryBase[retrySystemIndex],
+                  content: [retryBase[retrySystemIndex].content, instructions].filter(Boolean).join("\n\n"),
+                };
               } else {
-                requestBody.messages.unshift({ role: "system", content: instructions });
+                retryBase.unshift({ role: "system", content: instructions });
+              }
+              if (turnMemoryEnvelope) {
+                const retryOutputReserve = typeof requestBody.max_tokens === "number"
+                  ? requestBody.max_tokens
+                  : typeof requestBody.max_completion_tokens === "number"
+                    ? requestBody.max_completion_tokens
+                    : cfg.max_tokens;
+                const retryAttached = attachTurnMemory(turnMemoryEnvelope, retryBase, undefined, null, retryOutputReserve);
+                requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
+                if (retryAttached.applied) {
+                  observeTurnMemoryApplied(`${stageLabel ?? "orchestrator"}:retry`, retryAttached.applied);
+                }
+              } else {
+                requestBody.messages = retryBase;
               }
               clearTimeout(timeout);
               cleanupRequestAbort();
@@ -3052,7 +3873,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           : "";
         const workspaceRootHint = `Active filesystem workspace root: ${activeWorkspacePath}. Resolve relative filesystem paths against the ordered allowed roots.${grantedRootsHint}`;
         const memoryHints = mergeSharedContextHints(
-          sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath),
+          sessionMemory.toSharedContextHints(sessionId, activeWorkspacePath, {
+            freshWorkspaceReads: memoryRevalidationPolicy.requires_fresh_workspace_reads,
+          }),
           { relevant_memories: [workspaceRootHint] },
         );
         // M8: route-entry owns the decision tree; wall-clock still starts here so
@@ -3067,10 +3890,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           coordinatorDurationMs,
           routeSource,
         } = await resolveCoordinatorRouteEntry({
-          message,
-          priorRequirement:
-            activeTaskRun.requirement ?? continuationRequirements.get(sessionId),
-          taskRunLive: !["completed", "failed", "cancelled"].includes(activeTaskRun.status),
+          // Route/turnRequirement must be classified from the SAME effective
+          // task as the budget above: a native goal control routes on the
+          // accepted goal, and only a matching resume inherits the prior
+          // requirement. Ordinary turns pass the raw message unchanged.
+          // A matching resume with an INTACT surviving plan hands the route
+          // seam an internal continuation cue so it reuses the active TaskPlan
+          // as an explicit continuation instead of re-authoring one from the
+          // long accepted goal. The cue is routing metadata only: coordinator
+          // callbacks/context and every provider input still use the accepted
+          // goal via `contextMessage`/`effectiveUserMessage`. A neutral
+          // reconstruction-required plan is never routed through active reuse.
+          message: matchingResume && activeTaskRun.reconstruction === "none"
+            ? "continue"
+            : effectiveUserMessage,
+          priorRequirement: continuityMode === undefined
+            ? (activeTaskRun.requirement ?? continuationRequirements.get(sessionId))
+            : matchingResume
+              ? (priorTaskRun?.requirement ?? activeTaskRun.requirement)
+              : undefined,
+          taskRunLive: continuityMode === undefined
+            ? !["completed", "failed", "cancelled"].includes(activeTaskRun.status)
+            : matchingResume,
           taskRunStatus: activeTaskRun.status,
           taskRunTurnCount: activeTaskRun.turnCount,
           continuationCarry: {
@@ -3086,7 +3927,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           routeViaModel: () =>
             coordinator.route(contextMessage, {
                sessionId,
-               rawMessage: message,
+               rawMessage: effectiveUserMessage,
                history: turnHistory,
                lastOutcome: sessionMemory.getLastOutcome(sessionId),
                sessionMemoryHints: memoryHints,
@@ -3124,7 +3965,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // (executor→synthesizer) so planner/reviewer/supervision tax cannot
         // re-starve. Applied before normalize for telemetry, then re-asserted
         // after normalize because full_execution invariants re-add reviewer.
-        if (forcedDeepRead && !shortCircuit && !useActivePlanContinuation) {
+        if (effectiveForcedDeepRead && !shortCircuit && !useActivePlanContinuation) {
           route = applyForcedDeepReadRoute(route);
           console.log(
             `[Jarvis Orchestrator] forced deep read: direct executor route with extended budget ` +
@@ -3136,7 +3977,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // exists; ceremony cost 30-60s/turn live and starved synthesis).
         // Active-plan continuation already chose executor[+reviewer]→synthesizer.
         const leanContinuation = !shortCircuit
-          && !forcedDeepRead
+          && !effectiveForcedDeepRead
           && !useActivePlanContinuation
           && activeTaskRun.depth === "deep"
           && activeTaskRun.turnCount > 1
@@ -3155,21 +3996,31 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
            routeSource,
          );
          if (!streamLease.isCurrent() || streamAbort.signal.aborted) await emitCancelled();
-         sessionMemory.updateTaskRun(sessionId, {
-          estimatedComplexity: route.context.estimated_complexity,
-        });
+         if (!turnInvalidated() && !continuityLocalTaskRun) {
+           sessionMemory.updateTaskRun(sessionId, {
+            estimatedComplexity: route.context.estimated_complexity,
+          });
+         }
         // Owned-runtime-loop (Task 5): seed TaskPlan from intake planning.
         // Simple (low): Conductor-authored items land only when ledger is empty
         // or unusable — never wipe verified/blocked progress on continuation.
         // Complex: brief only — ledger filled after Planner validate in pipeline.
         // Active-plan continuation must not reseed — plan is already expanded.
-        if (route.plan_authorship && !useActivePlanContinuation) {
+        // A preserve/resume side turn never seeds durable planning: the seed
+        // applies to the ephemeral contract for this turn only.
+        if (route.plan_authorship && !useActivePlanContinuation && !turnInvalidated()) {
           const priorPlanItems = activeTaskRun.plan?.items?.length ?? 0;
-          const seeded = sessionMemory.applyOwnedPlanning(sessionId, {
-            plan_authorship: route.plan_authorship,
-            plan_items: route.plan_items ?? [],
-            plan_brief: route.plan_brief,
-          });
+          const seeded = continuityLocalTaskRun
+            ? sessionMemory.beginTaskRunLocalPlanning(activeTaskRun, {
+                plan_authorship: route.plan_authorship,
+                plan_items: route.plan_items ?? [],
+                plan_brief: route.plan_brief,
+              })
+            : sessionMemory.applyOwnedPlanning(sessionId, {
+                plan_authorship: route.plan_authorship,
+                plan_items: route.plan_items ?? [],
+                plan_brief: route.plan_brief,
+              });
           if (seeded) {
             activeTaskRun = seeded;
             const itemCount = seeded.plan?.items.length ?? 0;
@@ -3192,7 +4043,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // because full_execution invariants re-add reviewer/planner.
         const forcedPipeline = useActivePlanContinuation && activePlanPipeline && !shortCircuit
           ? activePlanPipeline
-          : (forcedDeepRead || leanContinuation) && !shortCircuit
+          : (effectiveForcedDeepRead || leanContinuation) && !shortCircuit
             ? (["executor", "synthesizer"] as StageName[])
             : normalized.pipeline;
         const reconciled = reconcileRouteWithBudget(
@@ -3210,7 +4061,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const executablePipeline = reconciled.pipeline;
         const executableRoute = { ...route, pipeline: executablePipeline as typeof route.pipeline };
         const executionProfile: ExecutionProfile = normalized.profile;
-        if (shouldRememberRequirement(shortCircuit)) {
+        // The cached continuation requirement belongs to the STORED task. A
+        // preserve side question must not overwrite it with its own
+        // classification; a clear removes the old continuation boundary so a
+        // later ordinary continue cannot resurrect the cleared task.
+        if (continuityMode === "clear") {
+          continuationRequirements.delete(sessionId);
+        } else if (continuityMode !== "preserve" && shouldRememberRequirement(shortCircuit)) {
           rememberContinuationRequirement(sessionId, turnReq.requirement);
         }
         console.log(
@@ -3224,11 +4081,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         const agentRunId = `run_${crypto.randomUUID()}`;
         orchestratorAgentRunId = agentRunId;
+        // Bind the stable Bun run identity to the consumed Goal binding tombstone
+        // exactly once so native can verify the terminal association. A binding
+        // already attached to a different run is refused (no run).
+        if (consumedGoalBinding) {
+          const attached = goalRunRegistry.attachRunIdentity(
+            consumedGoalBinding.binding_id,
+            agentRunId,
+          );
+          if (!attached) {
+            console.warn(
+              `[Jarvis] goal binding ${consumedGoalBinding.binding_id} could not attach run identity`,
+            );
+          }
+        }
         selfTuningProposer.initializeTunedConfigs();
         const runFinalizer = new RunFinalizer({
           agentRunId,
           sessionId,
-          userRequest: message,
+          userRequest: effectiveUserMessage,
           taskType: route.task_type,
           pipeline: executablePipeline as string[],
           route,
@@ -3245,15 +4116,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         orchestratorRunFinalizer = runFinalizer;
         runFinalizer.start();
         const conductorRunId = runFinalizer.runConductorId;
-        if (workspaceReadScope) {
+        if (effectiveWorkspaceReadScope) {
           await writer.write(encoder.encode(`data: ${JSON.stringify({
             type: "scope_notice",
             mode: "explicit_allowlist",
-            workspace_root: workspaceReadScope.workspaceRoot,
-            allowed_paths: workspaceReadScope.allowedPaths,
-            allow_root_listing: workspaceReadScope.allowRootListing,
-            shell: workspaceReadScope.denyShell ? "denied" : "unchanged",
-            network: workspaceReadScope.denyNetwork ? "denied" : "unchanged",
+            workspace_root: effectiveWorkspaceReadScope.workspaceRoot,
+            allowed_paths: effectiveWorkspaceReadScope.allowedPaths,
+            allow_root_listing: effectiveWorkspaceReadScope.allowRootListing,
+            shell: effectiveWorkspaceReadScope.denyShell ? "denied" : "unchanged",
+            network: effectiveWorkspaceReadScope.denyNetwork ? "denied" : "unchanged",
             session_id: sessionId,
             run_id: agentRunId,
           })}\n\n`));
@@ -3312,7 +4183,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.task_type,
         );
         runFinalizer.setInstructionVariants(instructionSelection);
-        const resolvedSkills = resolveSkillsForTurn(activeTaskRun.objective, route.task_type);
+        const resolvedSkills = resolveSkillsForTurn(effectiveUserMessage, route.task_type);
         // Staged policy canary arm: ~10% of turns while a canary is active use
         // request-scoped overlay for routing/budget reads (global maps stay production).
         const policyCanaryTurn = conductorLearning.shouldRouteToCanaryPolicy();
@@ -3378,8 +4249,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           route.context.estimated_complexity,
           agentRunId,
         );
-        // Bind TaskPlan ledger for per-item grading in afterStage.
-        liveConductor.setPlanContext(sessionMemory.getTaskRun(sessionId) ?? activeTaskRun);
+        // Bind TaskPlan ledger for per-item grading in afterStage. A
+        // preserve/resume side turn binds its ephemeral contract, never the
+        // stored task/plan it must not change.
+        liveConductor.setPlanContext(
+          continuityLocalTaskRun
+            ? activeTaskRun
+            : sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+        );
         const executor = new PipelineExecutor(
           callModel,
           runtime,
@@ -3423,7 +4300,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const pipelineOptions = {
           topology: normalized.topology,
           executionProfile,
-          rawMessage: message,
+          rawMessage: effectiveUserMessage,
           turnRequirement: turnReq.requirement,
           estimatedComplexity: route.context.estimated_complexity,
           taskRunDepth: activeTaskRun.depth,
@@ -3432,7 +4309,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // and effect gate armed even though the follow-up names no mutation.
           taskRunWriteIntent: activeTaskRun.writeIntent === true,
           // Owned-runtime-loop: TaskPlan ledger + planning ownership for this turn.
-          taskRunContract: sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
+          // A preserve/resume side turn uses its ephemeral contract so saved plan
+          // progress cannot advance from side-question evidence.
+          taskRunContract: continuityLocalTaskRun
+            ? activeTaskRun
+            : sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
           ownedPlanning: route.plan_authorship
             ? {
                 plan_authorship: route.plan_authorship,
@@ -3441,15 +4322,96 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               }
             : undefined,
            onTaskPlanUpdate: (contract: TaskRunContract) => {
-             if (!ownsSessionState()) return;
-             sessionMemory.setTaskRunContract(sessionId, contract);
-             liveConductor.setPlanContext(contract);
+             if (!ownsSessionState() || turnInvalidated()) return;
+             // Goal-linked runs record a durable checkpoint stage/state so a
+             // restart can resume the exact plan position without replaying
+             // ambiguous effects. Ordinary goal-less runs are unchanged.
+             const withCheckpoint = contract.goal
+               ? recordCheckpointStage(
+                   contract,
+                   getActivePlanItem(contract)?.id ?? contract.checkpoint?.stage ?? null,
+                   resolveGoalExecutionState(contract),
+                 )
+               : contract;
+             if (continuityLocalTaskRun) {
+               // Side turn: keep the plan mutation ephemeral; never persist it
+               // over the stored task run.
+               activeTaskRun = withCheckpoint;
+               liveConductor.setPlanContext(withCheckpoint);
+               return;
+             }
+             sessionMemory.setTaskRunContract(sessionId, withCheckpoint);
+             liveConductor.setPlanContext(withCheckpoint);
            },
-          workspaceReadScope,
+          workspaceReadScope: effectiveWorkspaceReadScope,
           turnAbort: streamAbort.signal,
           workerInstructions: instructionSelection.instructions,
           sharedContext: mergedSharedContext,
           sessionMemory: sessionMemory,
+          // Phase 4.3: bypass the workspace read-result cache for this turn when
+          // a descriptive/unknown project fact requires current source.
+          memoryRevalidation: memoryRevalidationPolicy,
+          // Phase 4.3 fail-closed synthesis gate. Resolved at the pipeline's
+          // pre-synthesis boundary against the ACTUAL applied-selected IDs from
+          // the authenticated native registry plus this turn's trusted runtime
+          // evidence. A required-but-unvalidated applied selection stops final
+          // synthesis rather than letting the final answer rest on it.
+          memorySynthesisGate: activeTurnMemory
+            ? () => {
+                let receipt: ReturnType<typeof nativeMemoryRegistry.receipt> = null;
+                try {
+                  receipt = nativeMemoryRegistry.receipt(activeTurnMemory.preparationId);
+                } catch {
+                  receipt = null;
+                }
+                // Missing/invalid authenticated receipt: the actual applied
+                // subset is unknowable. If the prepared turn required current
+                // source for relevant project memory we cannot prove it was
+                // satisfied, so fail closed. No fallback identity (prepared
+                // ids, wildcard, or another turn) is substituted. Ordinary
+                // turns without such a prepared selection are unaffected.
+                if (!receipt) {
+                  if (!memoryRevalidationPolicy.requires_fresh_workspace_reads) return null;
+                  return {
+                    blocked: true as const,
+                    error: memorySynthesisGateError,
+                    error_code: "memory_revalidation_unavailable",
+                  };
+                }
+                const appliedPolicy = appliedRevalidationPolicy(
+                  memoryRevalidationPolicy,
+                  receipt.applied_selected_ids,
+                );
+                if (!appliedPolicy.requires_fresh_workspace_reads) return null;
+                let assessment: MemoryRevalidationResult;
+                if (memoryRevalidationUntrusted) {
+                  assessment = unavailableForUntrustedTransport(appliedPolicy);
+                } else {
+                  try {
+                    assessment = assessMemoryRevalidation(
+                      appliedPolicy,
+                      observedToolCallRecords,
+                      receipt.runtime_evidence,
+                      message,
+                      activeWorkspacePath,
+                    );
+                  } catch {
+                    assessment = {
+                      state: "unavailable",
+                      memory_ids: appliedPolicy.memory_ids,
+                      evidence_tool_call_ids: [],
+                      reason_code: "unsupported_evidence_path",
+                    };
+                  }
+                }
+                if (assessment.state === "fresh_evidence") return null;
+                return {
+                  blocked: true as const,
+                  error: memorySynthesisGateError,
+                  error_code: "memory_revalidation_unavailable",
+                };
+              }
+            : undefined,
           sessionGrants: activeTaskRun.sessionGrants,
           workspaceRoot: activeWorkspacePath,
           // F6 latency: a low-complexity turn's synthesis does not need the
@@ -3457,9 +4419,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // like trivial short-circuits and workspace reads already do. Medium/
           // high complexity keep the strong model.
           preferFastSynthesizer: routeSource === "trivial_short_circuit"
-            || Boolean(workspaceReadScope)
+            || Boolean(effectiveWorkspaceReadScope)
             || route.context.estimated_complexity === "low",
           distilledSkillsBlock: resolvedSkills.promptBlock,
+          // Ephemeral recall snapshot rides only to the delegate's final CLI
+          // boundary (and is refit there); never TaskRun/contextMessage/caches.
+          // The delegate is an external CLI that runs its own tools, so
+          // freshness-required project memory is excluded fail-closed.
+          turnMemory: untrustedEligibleEnvelope ?? undefined,
+          onMemoryApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
           maxRecursionDepth: cfg.orchestrator.max_recursion_depth,
           maxReviewRepairRounds: cfg.orchestrator.max_review_repair_rounds,
           // Task 2.4: the executor reports evidence progress into the live
@@ -3514,7 +4482,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 coordinator,
                 routeOptions: {
                   sessionId,
-                  rawMessage: message,
+                  rawMessage: effectiveUserMessage,
                   history: turnHistory,
                    lastOutcome: sessionMemory.getLastOutcome(sessionId),
                    sessionMemoryHints: memoryHints,
@@ -3626,7 +4594,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const turnWriteTargets = successfulToolCalls
           .filter((call) => TURN_WRITE_TOOLS.has(call.name))
           .flatMap((call) => collectToolPathTargets(call.arguments));
-         if (ownsSessionState() && turnWriteTargets.length > 0) {
+         if (ownsSessionState() && !turnInvalidated() && turnWriteTargets.length > 0 && !continuityLocalTaskRun) {
            sessionMemory.updateTaskRun(sessionId, {
             lastWriteTargets: recordWriteTargets(
               sessionMemory.getTaskRun(sessionId) ?? activeTaskRun,
@@ -3645,9 +4613,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // synthesizer prose must not mark multi-item plans completed while
         // items remain pending/blocked. Latest contract may have mid-turn
         // plan mutations via onTaskPlanUpdate.
-         const latestTaskRun = ownsSessionState()
-           ? sessionMemory.getTaskRun(sessionId) ?? activeTaskRun
-           : activeTaskRun;
+         const latestTaskRun = continuityLocalTaskRun
+           ? activeTaskRun
+           : ownsSessionState()
+             ? sessionMemory.getTaskRun(sessionId) ?? activeTaskRun
+             : activeTaskRun;
         const reconciledStatus = reconcileTaskRunStatus({
           contract: latestTaskRun,
           turnAcceptanceStatus: taskAcceptance.status,
@@ -3690,7 +4660,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           decision.runOutcome,
           reward?.outcomeFloor,
         );
-         if (ownsSessionState()) {
+         if (ownsSessionState() && !turnInvalidated() && !continuityLocalTaskRun) {
            sessionMemory.updateTaskRun(sessionId, {
              status: decision.taskStatus,
              evidenceCount,
@@ -3746,7 +4716,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           breakdown: JSON.parse(serializeRunRewardBreakdown(runReward)),
         });
         const finalOutputForLog = trimmedAnswer || result.error || `(no output: ${result.error_code ?? "empty_completion"})`;
-         if (ownsSessionState()) {
+         if (ownsSessionState() && !turnInvalidated() && !continuityLocalTaskRun) {
            sessionMemory.recordPipelineOutcome(sessionId, {
              outcome: rewardOutcome,
              errorCode: result.error_code,
@@ -3840,7 +4810,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             agentRunId,
             sessionId,
             taskType: route.task_type,
-            userRequest: message,
+            userRequest: effectiveUserMessage,
             workerInstructions: route.worker_instructions,
             stageRuns: stageRunsForDistill,
             runOutcome: rewardOutcome,
@@ -3849,15 +4819,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }, distillCfg);
           if (candidate) {
             if (distillCfg.auto_promote) {
-              // Judge-gated promotion for THIS candidate only — not the whole
-              // pending queue. The old unconditional `runSkillPromotionPass`
-              // bulk call auto-promoted on heuristics alone with zero
-              // semantic review; that safety gap is why `auto_promote`
-              // defaults to false below.
-              const promotion = await promoteSkillCandidate(candidate.id, callModel, distillCfg);
+              // Fail closed: a candidate produced here has no user-authorized
+              // accepted proof attached, so we must not auto-promote it. Leave
+              // the just-created candidate unchanged and surface an explicit
+              // evidence_required state awaiting accepted proof. No model or
+              // judge call is made from this path.
               console.log(
                 `[Jarvis Orchestrator] Distilled skill candidate ${candidate.id} (confidence=${candidate.confidence.toFixed(2)}); ` +
-                `auto_promote result: ${promotion.ok ? promotion.candidate?.status : `error=${promotion.error}`}`,
+                `auto_promote skipped: evidence_required, awaiting accepted proof`,
               );
             } else {
               // Default (organism loop v1 safety fix): heuristic screen only.
@@ -3867,7 +4836,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // (POST /skills/candidates/:id/promote), which adds the
               // semantic judge gate before anything can inject into prompts.
               const heuristic = evaluateSkillPromotion(candidate, distillCfg);
-              if (!heuristic.promote) {
+              if (!heuristic.promote && candidate.status === "candidate") {
                 updateSkillCandidateStatus(candidate.id, "rejected", heuristic.score, heuristic.reason, heuristic.detail);
               }
               console.log(
@@ -3900,8 +4869,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           fallback_events: orchFallbackEvents,
           fallback_reason: orchLastFallbackReason,
           fallback_model: orchLastFallbackModel,
-          scope_mode: workspaceReadScope ? "explicit_allowlist" : "inferred",
-          scope_compliant: workspaceReadScope
+          scope_mode: effectiveWorkspaceReadScope ? "explicit_allowlist" : "inferred",
+          scope_compliant: effectiveWorkspaceReadScope
             ? (result.toolCalls ?? []).every((call) => call.error_code !== "policy_denied")
             : undefined,
           executed_tools: (result.toolCalls ?? [])
@@ -3934,6 +4903,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             error: result.error_code,
           });
           repetitionStore.recordOutcome(sessionId, message, result.error_code);
+          recordMemoryTerminal("failed", result.error_code ?? null);
           await session.finish("", { isError: true, code: result.error_code });
         } else if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
@@ -3968,6 +4938,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // no `code`, so a client (or this repo's own benchmark script)
           // could see a turn failed but never WHY — the same information
           // the short-circuit memo already tracks server-side.
+          recordMemoryTerminal("failed", result.error_code ?? null);
           await session.finish(result.error, { isError: true, code: result.error_code });
         } else if (!trimmedAnswer) {
           // Empty (non-fatal) completion: show the friendly retry notice, but
@@ -4000,6 +4971,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const noOutputNotice = result.error_code === "turn_deadline" || result.error_code === "stage_window_exhausted"
             ? "The turn ran out of time before producing an answer, and no workspace evidence was gathered to summarize. A narrower request (name a specific file or directory) fits the budget better."
             : "The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.";
+          recordMemoryTerminal(terminalStatusForRunOutcome(verifiedRunOutcome), result.error_code ?? null);
           await session.finish(noOutputNotice);
         } else {
           // Success path. The orchestrator runs many model calls per user
@@ -4069,6 +5041,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // "partial" (e.g. a rewriter-stage timeout on a turn that also
           // happens to be a repeat) — `finalAnswer` was already replaced
           // with the refusal text above, so the tag must match.
+          recordMemoryTerminal(
+            terminalStatusForRunOutcome(verifiedRunOutcome),
+            repetitionVerdict.repeated ? "no_progress_repetition" : (result.error_code ?? null),
+          );
           await session.finish(finalAnswer, {
             subtype: terminalSubtypeForRunOutcome(verifiedRunOutcome),
             ...(repetitionVerdict.repeated
@@ -4265,6 +5241,42 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
 
+        // ── Ephemeral native memory at the final direct-provider boundary ──
+        // Injected after compaction, context optimization, and normalization.
+        // The cascade path refits + attaches independently per candidate; the
+        // single-provider path fits inline. `requestBody` stays memory-free as
+        // the clean base so a candidate/retry never re-fits a list already
+        // carrying memory. activeHistory/originalHistory stay untouched.
+        const directUseFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+        const directOutputReserve = typeof requestBody.max_tokens === "number"
+          ? requestBody.max_tokens
+          : typeof requestBody.max_completion_tokens === "number"
+            ? requestBody.max_completion_tokens
+            : cfg.max_tokens;
+        // Phase 4.3: only attach project descriptive/unknown memory that is
+        // already supported by THIS turn's authenticated canonical reads. The
+        // filtered envelope removes unsupported selections before they can
+        // reach the provider, so a streamed answer can never rest on them.
+        const directEligibleEnvelope = trustedEligibleEnvelope();
+        const directMemoryFallback = directEligibleEnvelope && directUseFallback
+          ? {
+              envelope: directEligibleEnvelope,
+              // No stage ceiling and no primary-model fallback: each candidate
+              // uses its own catalog context, otherwise the conservative floor.
+              contextCeilingTokens: null,
+              fallbackContextWindowFor: (): number | null => null,
+              outputReserveTokens: directOutputReserve,
+              onApplied: (observation: MemoryAppliedObservation) => observeTurnMemoryObservation(observation),
+            }
+          : undefined;
+        if (directEligibleEnvelope && !directUseFallback) {
+          const attached = attachTurnMemory(directEligibleEnvelope, normalizedMessages, requestBody.tools, num_ctx, directOutputReserve);
+          if (attached.applied) {
+            requestBody.messages = attached.messages;
+            observeTurnMemoryApplied("agent_loop", attached.applied);
+          }
+        }
+
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (isOllama && !isLlamaCpp) headers.Authorization = "Bearer ollama";
         else if (!isLlamaCpp) headers.Authorization = `Bearer ${cfg.openrouter.api_key}`;
@@ -4273,7 +5285,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           headers["X-Title"] = cfg.openrouter.site_name || "Jarvis";
         }
 
-        const useFallback = !isOllama && cfg.openrouter.enable_fallbacks;
+        const useFallback = directUseFallback;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
         const ctrl = new AbortController();
         const requestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
@@ -4298,6 +5310,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               stage: "agent_loop",
               deadlineAt: turnBudget.deadlineAt,
               turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
+              memory: directMemoryFallback,
             });
             fetchRes = result.response;
             actualModelUsed = result.model_used;
@@ -4337,7 +5350,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
           if (isOllama && (fetchErr.message?.includes("ECONNREFUSED") || fetchErr.message?.includes("fetch failed"))) {
             throw new Error(isLlamaCpp
-              ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local Gemma server is running.`
+              ? `Cannot connect to llama.cpp at ${baseUrl}. Make sure the local llama.cpp server is running.`
               : `Cannot connect to Ollama. Tried: ${ollamaTarget?.tried.join("; ") || baseUrl}. Make sure Ollama is running and the model is pulled (ollama pull ${modelName}).`);
           }
           throw fetchErr;
@@ -4357,11 +5370,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             delete requestBody.tools;
             useTextToolProtocol = true;
             const instructions = buildTextToolInstructions(runtime.listTools());
-            const systemMessage = requestBody.messages.find((item: any) => item.role === "system");
-            if (systemMessage) {
-              systemMessage.content = [systemMessage.content, instructions].filter(Boolean).join("\n\n");
+            // Rebuild from the CLEAN base, add text-tool instructions, then
+            // refit against the changed system/tool cost and attach exactly one
+            // new carrier. Never reuse the initial applied IDs.
+            const retryBase = normalizedMessages.map((m: any) => ({ ...m }));
+            const retrySystemIndex = retryBase.findIndex((m: any) => m.role === "system");
+            if (retrySystemIndex >= 0) {
+              retryBase[retrySystemIndex] = {
+                ...retryBase[retrySystemIndex],
+                content: [retryBase[retrySystemIndex].content, instructions].filter(Boolean).join("\n\n"),
+              };
             } else {
-              requestBody.messages.unshift({ role: "system", content: instructions });
+              retryBase.unshift({ role: "system", content: instructions });
+            }
+            const retryOutputReserve = typeof requestBody.max_tokens === "number"
+              ? requestBody.max_tokens
+              : typeof requestBody.max_completion_tokens === "number"
+                ? requestBody.max_completion_tokens
+                : cfg.max_tokens;
+            const retryAttached = attachTurnMemory(trustedEligibleEnvelope(), retryBase, undefined, num_ctx, retryOutputReserve);
+            requestBody.messages = retryAttached.applied ? retryAttached.messages : retryBase;
+            if (retryAttached.applied) {
+              observeTurnMemoryApplied("agent_loop:retry", retryAttached.applied);
             }
             const retryCtrl = new AbortController();
             // Recompute immediately before the fallback fetch. Time consumed by
@@ -4779,6 +5809,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (call.name === "ask_user_question") {
+              recordMemoryTerminal("completed");
               await session.finish(toolOutput);
               loopDone = true;
               break;
@@ -4831,6 +5862,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             logOpenRouterCost(sessionCostInfo);
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, tool_count: toolExecutionCount, session_id: sessionId })}\n\n`));
           }
+          recordMemoryTerminal("completed");
           await session.finish(resultText);
           loopDone = true;
         } else {
@@ -4905,6 +5937,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
             // If the user was asked a question, stop the loop and wait for their response.
             if (tc.function.name === "ask_user_question") {
+              recordMemoryTerminal("completed");
               await session.finish("Waiting for user response to question.");
               loopDone = true;
               break;
@@ -5020,6 +6053,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         retry_count: lastFallbackRetries,
         fallback_model: lastFallbackModel,
       });
+      recordMemoryTerminal("failed", errorCode ?? null);
       try {
         await session.error(userFacingMsg, errorCode);
       } catch {}
@@ -5040,6 +6074,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       cleanupRequestAbort();
       cleanupExternalAbort();
       streamLease.release();
+      // Last authoritative terminal, recorded BEFORE any terminal SSE that
+      // ensureTerminal may still emit, so native final sync always finds it.
+      if (!memoryTerminalRecorded) {
+        recordMemoryTerminal(
+          clientDisconnected ? "unterminated" : streamAbort.signal.aborted ? "cancelled" : "unterminated",
+        );
+      }
       try {
         await session.ensureTerminal();
       } catch {}
@@ -5202,7 +6243,7 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     configWarnings.push(`Model "${cfg.ollama.model}" not found in Ollama. Run: ollama pull ${cfg.ollama.model}`);
   }
   if (cfg.active_backend === "llama_cpp" && !llamaCppRunning) {
-    configWarnings.push(`llama.cpp is not responding at ${cfg.llama_cpp.base_url}. Start the local Gemma server.`);
+    configWarnings.push(`llama.cpp is not responding at ${cfg.llama_cpp.base_url}. Start the local llama.cpp server.`);
   } else if (cfg.active_backend === "llama_cpp" && !llamaCppModelAvailable) {
     configWarnings.push(`Model "${cfg.llama_cpp.model}" is not served by llama.cpp.`);
   }
@@ -5278,6 +6319,16 @@ export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
   const isNoisy = path === "/status" || path === "/health" || path === "/health/readiness";
+
+  // Internal native-memory routes bypass general CORS/preflight handling and
+  // are capability-authenticated. Unknown paths fall through untouched.
+  const internalMemory = await handleNativeMemoryRequest(
+    req,
+    nativeMemoryRegistry,
+    invalidateMemoryDerivedState,
+    goalRunRegistry,
+  );
+  if (internalMemory) return internalMemory;
 
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -5377,24 +6428,84 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({ candidates: listSkillCandidates(status ?? undefined) });
     }
     if (path === "/skills/promote" && req.method === "POST") {
+      class PromoteRequestInvalidError extends Error {}
+      const parsedBody = await req.json().catch(() => undefined);
+      const rawCandidates =
+        parsedBody && typeof parsedBody === "object" && !Array.isArray(parsedBody)
+          ? (parsedBody as { candidates?: unknown }).candidates
+          : undefined;
+      let requests: {
+        candidateId: string;
+        reportHash: string;
+        decisionRecordHash: string;
+        expectedLifecycleVersion: number;
+      }[];
+      try {
+        if (!Array.isArray(rawCandidates) || rawCandidates.length === 0) {
+          throw new PromoteRequestInvalidError("candidates must be a nonempty array");
+        }
+        const seenCandidateIds = new Set<string>();
+        requests = rawCandidates.map((entry, index) => {
+          if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}] must be a plain object`);
+          }
+          const record = entry as Record<string, unknown>;
+          const candidateId = record.candidate_id;
+          const reportHash = record.report_hash;
+          const decisionRecordHash = record.record_hash;
+          const expectedLifecycleVersion = record.expected_version;
+          if (typeof candidateId !== "string" || candidateId.trim().length === 0) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].candidate_id must be a nonempty string`);
+          }
+          if (seenCandidateIds.has(candidateId)) {
+            throw new PromoteRequestInvalidError(`duplicate candidate_id ${candidateId}`);
+          }
+          seenCandidateIds.add(candidateId);
+          if (typeof reportHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(reportHash)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].report_hash must be 64 hex characters`);
+          }
+          if (typeof decisionRecordHash !== "string" || !/^[0-9a-fA-F]{64}$/.test(decisionRecordHash)) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].record_hash must be 64 hex characters`);
+          }
+          if (
+            typeof expectedLifecycleVersion !== "number" ||
+            !Number.isSafeInteger(expectedLifecycleVersion) ||
+            expectedLifecycleVersion < 0
+          ) {
+            throw new PromoteRequestInvalidError(`candidate[${index}].expected_version must be a nonnegative safe integer`);
+          }
+          return { candidateId, reportHash, decisionRecordHash, expectedLifecycleVersion };
+        });
+      } catch (e) {
+        if (e instanceof PromoteRequestInvalidError) {
+          return Response.json({ ok: false, error: "invalid_promotion_request", detail: e.message }, { status: 400 });
+        }
+        throw e;
+      }
+
       const cfg = loadConfig();
       const distillCfg = cfg.orchestrator.skill_distillation;
-      // Bulk promotion now requires a prior passing judge decision for every
-      // candidate. Default to an empty batch when distillation is disabled.
       if (!distillCfg?.enabled) {
         return Response.json({ ok: true, decisions: [] });
       }
-      const candidateIds = listSkillCandidates("candidate").map((c) => c.id);
       try {
         const decisions = await promoteCandidates(
-          candidateIds,
+          requests,
           makeCallModel(cfg, "orchestrator"),
           distillCfg,
         );
+        const allPromoted =
+          decisions.length > 0 && decisions.every((decision) => decision.decision === "promote");
+        if (!allPromoted) {
+          return Response.json({ ok: false, decisions }, { status: 409 });
+        }
         return Response.json({ ok: true, decisions });
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
-        return Response.json({ ok: false, error: "judge_required", detail: message }, { status: 428 });
+        if (message.startsWith("promotion_request_invalid:")) {
+          return Response.json({ ok: false, error: "invalid_promotion_request", detail: message }, { status: 400 });
+        }
+        return Response.json({ ok: false, error: "promotion_failed", detail: message }, { status: 503 });
       }
     }
 

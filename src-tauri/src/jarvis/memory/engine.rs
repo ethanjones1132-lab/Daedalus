@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+use super::contracts::MemoryError;
+
 const RECALL_LIMIT: usize = 5;
 const RECALL_CANDIDATE_LIMIT: usize = 30;
 const MAX_MEMORY_CONTENT_BYTES: usize = 4096;
@@ -37,6 +39,17 @@ pub struct MemoryEntry {
     pub archived_at: Option<String>,   // When this was archived to Drive
     // v3.1 — P1: integer epoch millis for fast recency scoring (avoids RFC3339 parsing per candidate)
     pub updated_at_ms: i64,
+}
+
+/// Legacy (unscoped) list projection that carries the authoritative SQL row
+/// revision alongside the frozen `MemoryEntry` fields. The `MemoryEntry` fields
+/// are flattened so existing consumers keep their prior JSON shape, with
+/// `revision` added as the only new field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyMemoryEntry {
+    #[serde(flatten)]
+    pub memory: MemoryEntry,
+    pub revision: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,8 +124,8 @@ pub struct MemoryWrite {
 }
 
 #[derive(Debug, Clone)]
-struct SafetyBlock {
-    reason: String,
+pub(crate) struct SafetyBlock {
+    pub(crate) reason: String,
 }
 
 pub fn list_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
@@ -126,6 +139,35 @@ pub fn list_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
         .query_map([], memory_from_row)
         .map_err(|e| e.to_string())?;
     collect_memories(rows)
+}
+
+/// List legacy (unscoped) memories with the authoritative SQL row revision.
+/// Selects `memory_columns()` plus the real `revision` column; `memory_from_row`
+/// maps the first 25 columns and column 25 is the actual DB revision. The
+/// shared `MemoryEntry`/`memory_columns()` shape is intentionally unchanged so
+/// scoped column indexes do not shift.
+pub fn list_legacy_memories_with_revision(
+    conn: &Connection,
+) -> Result<Vec<LegacyMemoryEntry>, String> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}, revision FROM memory WHERE scope_kind = 'legacy_unscoped' ORDER BY status ASC, updated_at DESC",
+            memory_columns()
+        ))
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(LegacyMemoryEntry {
+                memory: memory_from_row(row)?,
+                revision: row.get(25)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(entries)
 }
 
 pub fn read_memory(conn: &Connection, id: &str) -> Result<MemoryEntry, String> {
@@ -172,6 +214,7 @@ pub fn update_manual_memory(
 ) -> Result<MemoryEntry, String> {
     validate_memory_payload(&title, &content, &category).map_err(|b| b.reason)?;
     let before = read_memory(conn, &id)?;
+    require_legacy_scope(conn, &id)?;
     let now = now();
     let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
@@ -237,6 +280,7 @@ pub fn restore_memory(conn: &Connection, id: &str) -> Result<bool, String> {
         Ok(m) => m,
         Err(_) => return Ok(false),
     };
+    require_legacy_scope(conn, id)?;
     let now = now();
     conn.execute(
         "UPDATE memory SET status = 'active', updated_at = ?, supersedes_id = NULL WHERE id = ?",
@@ -1281,7 +1325,7 @@ fn finish_run(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_memory_event(
+pub(crate) fn write_memory_event(
     conn: &Connection,
     memory_id: Option<&str>,
     event_type: &str,
@@ -1365,10 +1409,14 @@ fn like_candidates(conn: &Connection, query: &str) -> Result<Vec<MemoryEntry>, S
     collect_memories(rows)
 }
 
+/// Legacy consolidation scan. Restricted to quarantined pre-scope rows so it
+/// never merges or mutates explicitly scoped memory.
 fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT {} FROM memory WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?",
+            "SELECT {} FROM memory
+             WHERE status = 'active' AND scope_kind = 'legacy_unscoped'
+             ORDER BY updated_at DESC LIMIT ?",
             memory_columns()
         ))
         .map_err(|e| e.to_string())?;
@@ -1376,6 +1424,70 @@ fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
         .query_map([RECALL_CANDIDATE_LIMIT as i64], memory_from_row)
         .map_err(|e| e.to_string())?;
     collect_memories(rows)
+}
+
+/// The exact ids a legacy consolidation/auto-dream run can touch: active
+/// legacy-unscoped rows only. This is the same filter `consolidate_memories`
+/// uses, exposed so the command can resolve derived invalidation for those
+/// exact candidates without enumerating (or blocking on) unrelated explicitly
+/// scoped facts.
+pub fn legacy_consolidation_candidate_ids(
+    conn: &Connection,
+) -> Result<Vec<String>, MemoryError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM memory
+             WHERE status = 'active' AND scope_kind = 'legacy_unscoped'
+             ORDER BY updated_at DESC LIMIT ?",
+        )
+        .map_err(MemoryError::from)?;
+    let rows = stmt
+        .query_map([RECALL_CANDIDATE_LIMIT as i64], |row| row.get::<_, String>(0))
+        .map_err(MemoryError::from)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+}
+
+fn memory_scope_kind_of(conn: &Connection, id: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT scope_kind FROM memory WHERE id = ?",
+        [id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+fn require_legacy_scope(conn: &Connection, id: &str) -> Result<(), String> {
+    match memory_scope_kind_of(conn, id)? {
+        Some(kind) if kind == "legacy_unscoped" => Ok(()),
+        Some(_) => Err(
+            "This memory is explicitly scoped; use the scoped memory APIs to change it".to_string(),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Preflight guard for the legacy (unscoped) command routes. A row that exists
+/// but is explicitly scoped must be rejected with a typed scope mismatch: the
+/// generic legacy engine helpers cannot enforce scope, so the legacy command
+/// route must refuse before it can bypass scoped revision/safety checks. A
+/// genuinely absent row returns the compatibility `false` (the historical
+/// not-found-as-false contract); a real storage failure is surfaced, never
+/// masked as `false`. The legacy delete route additionally requires the row to
+/// be verified legacy unscoped, so a scoped fact can never be tombstoned
+/// through it.
+pub fn legacy_command_guard(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
+    let kind = match memory_scope_kind_of(conn, id) {
+        Ok(kind) => kind,
+        Err(_) => return Err(MemoryError::storage_unavailable("Memory storage is unavailable")),
+    };
+    match kind.as_deref() {
+        Some("legacy_unscoped") => Ok(true),
+        Some(_) => Err(MemoryError::invalid_scope(
+            "This memory is explicitly scoped; use the scoped memory APIs to change it",
+        )),
+        None => Ok(false),
+    }
 }
 
 fn find_similar_memory(
@@ -1393,11 +1505,20 @@ fn find_similar_memory(
     };
     let normalized_title = normalize_key(title);
     let normalized_content = normalize_key(&truncate(content, 160));
-    Ok(candidates.into_iter().find(|m| {
-        m.category == category
-            && (normalize_key(&m.title) == normalized_title
-                || normalize_key(&truncate(&m.content, 160)) == normalized_content)
-    }))
+    for candidate in candidates {
+        // Merge candidates are restricted to quarantined pre-scope rows so a
+        // scoped record is never silently merged into legacy memory.
+        if memory_scope_kind_of(conn, &candidate.id)?.as_deref() != Some("legacy_unscoped") {
+            continue;
+        }
+        if candidate.category == category
+            && (normalize_key(&candidate.title) == normalized_title
+                || normalize_key(&truncate(&candidate.content, 160)) == normalized_content)
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn get_session_memory(
@@ -1439,7 +1560,7 @@ fn active_prompt_deltas(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(collected)
 }
 
-fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
+pub(crate) fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
     let allowed = ["general", "user", "feedback", "project", "reference"];
     if !allowed.contains(&category) {
         return Err(SafetyBlock {
@@ -1494,7 +1615,7 @@ fn validate_skill_change(change: &str) -> Result<(), SafetyBlock> {
     validate_memory_payload("skill improvement", change, "feedback")
 }
 
-fn score_memory(memory: &MemoryEntry, terms: &[String]) -> (f64, Vec<String>) {
+pub(crate) fn score_memory(memory: &MemoryEntry, terms: &[String]) -> (f64, Vec<String>) {
     // Fast path: score fields separately, short-circuit on title match
     let title_lower = memory.title.to_lowercase();
     let tags_lower = memory.tags.to_lowercase();
@@ -1744,7 +1865,7 @@ fn title_from_content(content: &str) -> String {
     title
 }
 
-fn query_terms(query: &str) -> Vec<String> {
+pub(crate) fn query_terms(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     query
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -1755,7 +1876,7 @@ fn query_terms(query: &str) -> Vec<String> {
         .collect()
 }
 
-fn fts_expr(query: &str) -> Option<String> {
+pub(crate) fn fts_expr(query: &str) -> Option<String> {
     let terms = query_terms(query);
     if terms.is_empty() {
         None
@@ -1827,14 +1948,14 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn memory_columns() -> &'static str {
+pub(crate) fn memory_columns() -> &'static str {
     "id, title, content, tags, category, created_at, updated_at, relevance_score,
      agent_id, source, source_session_id, source_message_ids, confidence, last_used_at,
      usage_count, expires_at, review_after, status, supersedes_id, metadata,
      tier, drive_file_id, summary, archived_at, updated_at_ms"
 }
 
-fn prefixed_memory_columns(prefix: &str) -> String {
+pub(crate) fn prefixed_memory_columns(prefix: &str) -> String {
     memory_columns()
         .split(',')
         .map(|col| format!("{}.{}", prefix, col.trim()))
@@ -1842,7 +1963,7 @@ fn prefixed_memory_columns(prefix: &str) -> String {
         .join(", ")
 }
 
-fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+pub(crate) fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     Ok(MemoryEntry {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -2048,94 +2169,108 @@ pub fn apply_deferred_review(
     Ok((mem_changed, skill_changed))
 }
 
-/// Review a session: derive durable memories from session memory and
-/// message history, then apply them through the deferred review path.
-/// Returns a machine-readable review result and is safe to call multiple
-/// times (subsequent calls are idempotent at the memory layer).
+/// Review a session for operator inspection. Phase 3.4 makes this READ-ONLY
+/// with respect to learning: it never derives memories from the transcript or
+/// legacy summary, never runs deferred review/consolidation, and never mutates
+/// skills. It reports the accepted capture-receipt counts recorded by the Phase
+/// 3 capture lifecycle. The signature and command name remain compatible.
 pub fn review_session(conn: &Connection, session_id: &str) -> Result<Value, String> {
-    let sm = get_session_memory(conn, session_id)?;
+    use crate::jarvis::memory::capture_contracts::{CaptureOperationStatus, CaptureReceipt};
 
-    let mut memories: Vec<Value> = Vec::new();
-    if let Some(sm) = &sm {
-        if !sm.current_goal.trim().is_empty() {
-            memories.push(json!({
-                "title": "Session goal",
-                "content": sm.current_goal.clone(),
-                "category": "general",
-            }));
-        }
-        if !sm.summary.trim().is_empty() {
-            memories.push(json!({
-                "title": "Session summary",
-                "content": sm.summary.clone(),
-                "category": "general",
-            }));
-        }
-    }
-
-    // Pull any user messages as extra review signal, but keep the review small
-    // and deterministic.
-    let user_messages: Vec<String> = {
+    let mut receipts = 0i64;
+    // Truthful status-derived counts. `accepted_operations` counts the durable
+    // accepted statuses (Saved | Corrected | Forgotten) so a goal clear
+    // (Forgotten) is not missed. Pending and Blocked are excluded from
+    // `accepted_operations` and reported separately.
+    let mut accepted_operations = 0i64;
+    let mut pending_operations = 0i64;
+    let mut blocked_operations = 0i64;
+    {
         let mut stmt = conn
-            .prepare(
-                "SELECT content FROM messages
-                 WHERE session_id = ? AND role = 'user'
-                 ORDER BY created_at ASC LIMIT 20",
-            )
+            .prepare("SELECT receipt_json FROM memory_capture_receipts WHERE session_id = ?")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([session_id], |row| row.get::<_, String>(0))
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
-    let combined_user = user_messages
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if !combined_user.is_empty() {
-        memories.push(json!({
-            "title": "User turns",
-            "content": truncate(&combined_user, 1200),
-            "category": "user",
-        }));
+        for row in rows {
+            let raw = row.map_err(|e| e.to_string())?;
+            receipts += 1;
+            // A persisted receipt is CHECK(json_valid) and typed; a row that no
+            // longer decodes is corrupt storage and must fail closed, never be
+            // silently skipped or undercounted.
+            let receipt: CaptureReceipt = serde_json::from_str(&raw).map_err(|_| {
+                "corrupt persisted capture receipt in review_session".to_string()
+            })?;
+            // Validate the typed receipt before trusting its counts: the receipt
+            // must belong to the requested Session, carry a nonempty turn id and
+            // unique nonempty operation ids, use positive revisions, and its
+            // stored `saved_count`/`pending_count` must agree with the statuses
+            // it contains. A disagreement is corrupt storage, not a number to
+            // report, so it propagates as a failure.
+            if receipt.session_id != session_id {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            if receipt.turn_id.trim().is_empty() {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            if receipt.store_revision < 1 || receipt.continuity_revision < 1 {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+            let mut operation_ids = std::collections::HashSet::new();
+            let mut saved_statuses = 0usize;
+            let mut pending_statuses = 0usize;
+            for operation in &receipt.operations {
+                if operation.operation_id.trim().is_empty()
+                    || !operation_ids.insert(operation.operation_id.as_str())
+                {
+                    return Err("corrupt persisted capture receipt in review_session".to_string());
+                }
+                match operation.status {
+                    CaptureOperationStatus::Saved | CaptureOperationStatus::Corrected => {
+                        saved_statuses += 1;
+                        accepted_operations += 1;
+                    }
+                    CaptureOperationStatus::Forgotten => {
+                        accepted_operations += 1;
+                    }
+                    CaptureOperationStatus::Pending => {
+                        pending_statuses += 1;
+                        pending_operations += 1;
+                    }
+                    CaptureOperationStatus::Blocked => {
+                        blocked_operations += 1;
+                    }
+                }
+            }
+            if receipt.saved_count != saved_statuses || receipt.pending_count != pending_statuses {
+                return Err("corrupt persisted capture receipt in review_session".to_string());
+            }
+        }
     }
-
-    if memories.is_empty() {
-        return Ok(json!({
-            "reviewed": true,
-            "session_id": session_id,
-            "memories_created": 0,
-            "skills_updated": 0,
-            "note": "no reviewable content",
-        }));
-    }
-
-    let review_json = json!({ "memories": memories, "skill_updates": [] });
-    let (mem_changed, skill_changed) =
-        apply_deferred_review(conn, session_id, &review_json.to_string())?;
-
     Ok(json!({
         "reviewed": true,
         "session_id": session_id,
-        "memories_created": mem_changed,
-        "skills_updated": skill_changed,
+        "memories_created": 0,
+        "skills_updated": 0,
+        "capture_receipts": receipts,
+        "accepted_operations": accepted_operations,
+        "pending_operations": pending_operations,
+        "blocked_operations": blocked_operations,
     }))
 }
 
-/// Session-end flush: commit any pending state. Called when a session
-/// ends (/new, app shutdown, context compression).
+/// Session-end flush. Phase 3.4 resets ONLY review bookkeeping; it preserves
+/// active typed continuity and runs no old housekeeping, summary extraction,
+/// consolidation, or skill/prompt-delta mutation. Recorded user instructions
+/// are captured by the turn/transport recovery path instead.
 pub fn commit_session_end(conn: &Connection, session_id: &str) -> Result<(), String> {
-    // Force a final consolidation pass
-    let _ = consolidate_memories(conn);
-    // Reset counter so next session starts fresh
     conn.execute(
-        "UPDATE session_memory SET turn_counter = 0, updated_at = ? WHERE session_id = ?",
+        "UPDATE session_memory
+         SET turn_counter = 0, last_review_at = NULL, updated_at = ?
+         WHERE session_id = ?",
         params![now(), session_id],
     )
-    .map_err(|e| format!("Failed to reset counter on session end: {}", e))?;
+    .map_err(|e| format!("Failed to reset review bookkeeping on session end: {}", e))?;
     Ok(())
 }
 

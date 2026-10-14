@@ -33,6 +33,9 @@ import {
 
 export type RouteId =
   | 'sessions'
+  | 'goals'
+  | 'learning'
+  | 'project-steward'
   | 'overview'
   | 'agents'
   | 'skills'
@@ -70,6 +73,9 @@ export interface RouteDef {
 }
 
 export const ROUTES: RouteDef[] = [
+  { id: 'goals', label: 'Goals', group: 'Automate', icon: ShieldCheck, description: 'Durable Goals, recurring execution, and trusted acceptance receipts', component: lazy(() => import('../features/workflows/GoalsPage')) },
+  { id: 'learning', label: 'Learning', group: 'Build', icon: BookMarked, description: 'Bounded research, durable evidence, and user-authored synthesis', component: lazy(() => import('../features/workflows/LearningPage')) },
+  { id: 'project-steward', label: 'Project Steward', group: 'Work', icon: Workflow, description: 'Create a project Goal, prepare its Session turn, and review recorded runs', component: lazy(() => import('../features/workflows/ProjectStewardPage')) },
   {
     id: 'sessions',
     label: 'Sessions',

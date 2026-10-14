@@ -1,5 +1,7 @@
 # Jarvis home-base — Completion Backlog
 
+> **Current priority authority — 2026-10-04:** [Current Product Roadmap](CURRENT_ROADMAP.md) governs development order and completion criteria. This backlog remains historical evidence and a reference for supporting fixes; its statuses do not establish completion of the current roadmap.
+
 Durable backlog of audited gaps/bugs, worked one item at a time to a "luxury"
 standard (root-cause fix + defensive edges + verification). The 4 AM / 7 AM
 restoration routine reads this file, picks the next unchecked item, implements it,

@@ -1,3 +1,5 @@
+import { lazy, Suspense } from 'react';
+import { FeatureModes } from '../workflows/FeatureModes';
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { RefreshCw, RefreshCcwDot } from 'lucide-react';
@@ -89,7 +91,7 @@ function mutationSuccessText(mutation: RegistryMutation): string {
   return 'Action registry update confirmed.';
 }
 
-export default function ActionsPage() {
+function ActionsPage() {
   const [state, dispatch] = useReducer(reduceRegistryState<RegistrySnapshot>, initialRegistryState<RegistrySnapshot>());
   const [alertState, dispatchAlerts] = useReducer(
     reduceRegistryState<ActionRegistryAlert[]>,
@@ -451,3 +453,6 @@ function BoardSkeleton() {
     </div>
   );
 }
+
+const AdvancedActionsPage = lazy(() => import('./TrustedActionsPage'));
+export default function ActionsPageSurface() { return <FeatureModes label="Trusted receipts" primary={<ActionsPage />} advanced={<Suspense fallback={<div role="status">Loading controls…</div>}><AdvancedActionsPage /></Suspense>} />; }

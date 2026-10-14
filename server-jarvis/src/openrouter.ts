@@ -16,6 +16,15 @@ import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall,
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
 import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
+import { countTokens } from "./tokens";
+import type { MemoryAppliedObservation } from "./native-memory";
+import type { PreparedMemoryTurn } from "./memory-contract";
+import {
+  fitTurnMemory,
+  resolveTurnMemoryInputBudget,
+  withTurnMemory,
+  TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS,
+} from "./turn-memory-context";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -585,6 +594,30 @@ interface FallbackResolveOptions {
   deadlineAt?: number;
   /** Original turn budget, retained for actionable timeout metadata. */
   turnBudgetMs?: number;
+  /**
+   * Ephemeral native recall to refit and attach independently for every
+   * cascade candidate (including same-model retries). `requestBody` must be
+   * supplied WITHOUT any memory carrier; this option attaches exactly one
+   * framed block per attempted request against that attempt's own messages,
+   * tools, output reserve, and context constraint.
+   */
+  memory?: {
+    envelope: PreparedMemoryTurn;
+    /**
+     * Effective stage transcript/context ceiling. Intersected with the
+     * candidate's own known context length; never used to widen it.
+     */
+    contextCeilingTokens?: number | null;
+    /**
+     * Fallback context window for a candidate with no reliable catalog
+     * metadata. Omit/null to keep the conservative unknown-context floor
+     * rather than borrowing a larger primary limit.
+     */
+    fallbackContextWindowFor?: (provider: HttpProviderId, modelId: string) => number | null;
+    /** Configured output reserve used when the attempt body reports none. */
+    outputReserveTokens?: number | null;
+    onApplied?: (observation: MemoryAppliedObservation) => void;
+  };
 }
 
 function assertFallbackDeadline(options: FallbackResolveOptions): void {
@@ -891,15 +924,25 @@ function normalizeAnthropicSse(response: Response, requestedModel: string): Resp
  * that accumulated `role: "tool"` and `tool_calls` fields would cause a 400
  * error on every non-tool-capable model in the fallback cascade.
  */
+interface BuiltAttemptBody {
+  body: Record<string, any>;
+  /**
+   * Candidate catalog metadata when reliably resolved (OpenRouter only).
+   * Undefined means the candidate's context/output limits are unknown and must
+   * be treated conservatively — never substituted with a larger primary limit.
+   */
+  effective?: EffectiveOpenRouterRequestConfig;
+}
+
 async function buildAttemptBody(
   cfg: JarvisConfig,
   provider: HttpProviderId,
   requestBody: any,
   model: string,
-): Promise<Record<string, any>> {
+): Promise<BuiltAttemptBody> {
   const body: Record<string, any> = { ...requestBody, model };
   if (provider === "openrouter") {
-    await applyOpenRouterRequestConfig(body, cfg, model, body.messages ?? [], {
+    const effective = await applyOpenRouterRequestConfig(body, cfg, model, body.messages ?? [], {
       requestedTemperature: requestBody.temperature,
       requestedTopP: requestBody.top_p,
     });
@@ -908,19 +951,41 @@ async function buildAttemptBody(
     if (!body.tools && Array.isArray(body.messages)) {
       body.messages = sanitizeToolMessages(body.messages);
     }
-  } else {
-    delete body.tools;
-    delete body.tool_choice;
-    // Always sanitize for non-OpenRouter providers (OpenCode Zen/Go) — they
-    // use the text tool protocol and cannot process native tool message fields.
-    if (Array.isArray(body.messages)) {
-      body.messages = sanitizeToolMessages(body.messages);
-    }
-    if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
-      return buildAnthropicAttemptBody(body, model);
-    }
+    return { body, effective };
   }
-  return body;
+  delete body.tools;
+  delete body.tool_choice;
+  // Always sanitize for non-OpenRouter providers (OpenCode Zen/Go) — they
+  // use the text tool protocol and cannot process native tool message fields.
+  if (Array.isArray(body.messages)) {
+    body.messages = sanitizeToolMessages(body.messages);
+  }
+  if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
+    // No OpenCode catalog context metadata exists here; remains conservative.
+    return { body: buildAnthropicAttemptBody(body, model) };
+  }
+  return { body };
+}
+
+/**
+ * Message list used only for token accounting. Anthropic-converted bodies
+ * carry the system prompt at top level, so it must be counted even though it
+ * never becomes a synthetic message in the wire payload.
+ */
+function memoryCostMessages(body: Record<string, any>): Array<{ role: string; content: string }> {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const system = body.system;
+  if (typeof system === "string" && system.trim()) {
+    return [{ role: "system", content: system }, ...messages];
+  }
+  if (Array.isArray(system)) {
+    const text = system
+      .map((block: any) => (typeof block === "string" ? block : typeof block?.text === "string" ? block.text : ""))
+      .filter((part: string) => part.length > 0)
+      .join("\n\n");
+    if (text) return [{ role: "system", content: text }, ...messages];
+  }
+  return messages;
 }
 
 /**
@@ -1024,7 +1089,62 @@ export async function chatCompletionWithFallback(
       let headersTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         totalAttempts += 1;
-        const attemptBody = await buildAttemptBody(cfg, provider, requestBody, model);
+        const { body: attemptBody, effective: attemptEffective } = await buildAttemptBody(cfg, provider, requestBody, model);
+        // Refit memory against THIS candidate's complete assembled request
+        // (top-level system + messages + tools + output reserve + the
+        // candidate's own known context) and attach exactly one carrier.
+        // `requestBody` stays memory-free so the next candidate/retry rebuilds
+        // clean rather than re-fitting a list that already has memory.
+        if (options.memory) {
+          // Candidate metadata wins; a missing value stays conservative rather
+          // than borrowing a possibly-larger primary model's limit.
+          const candidateContext = attemptEffective?.context_length ?? null;
+          const fallbackContext = candidateContext == null
+            ? (options.memory.fallbackContextWindowFor?.(provider, model) ?? null)
+            : null;
+          const baseContext = candidateContext ?? fallbackContext;
+          const ceiling = typeof options.memory.contextCeilingTokens === "number"
+            && options.memory.contextCeilingTokens > 0
+            ? options.memory.contextCeilingTokens
+            : null;
+          // Unknown candidate/provider context resolves to the conservative
+          // floor FIRST, then intersects any valid positive stage ceiling. A
+          // larger ceiling can never enlarge the unknown-model floor.
+          const effectiveBase = baseContext ?? TURN_MEMORY_UNKNOWN_CONTEXT_TOKENS;
+          const contextWindowTokens = ceiling == null
+            ? effectiveBase
+            : Math.min(effectiveBase, ceiling);
+          const outputReserve = typeof attemptBody.max_tokens === "number"
+            ? attemptBody.max_tokens
+            : typeof attemptBody.max_completion_tokens === "number"
+              ? attemptBody.max_completion_tokens
+              : (typeof options.memory.outputReserveTokens === "number" ? options.memory.outputReserveTokens : null);
+          const cleanCostMessages = memoryCostMessages(attemptBody);
+          const applied = fitTurnMemory(
+            options.memory.envelope,
+            cleanCostMessages as any,
+            resolveTurnMemoryInputBudget({
+              contextWindowTokens,
+              outputReserveTokens: outputReserve,
+              toolSchemaTokens: attemptBody.tools ? countTokens(JSON.stringify(attemptBody.tools)) : 0,
+            }),
+          );
+          if (applied.block) {
+            attemptBody.messages = withTurnMemory(
+              Array.isArray(attemptBody.messages) ? attemptBody.messages : [],
+              applied,
+            );
+          }
+          try {
+            options.memory.onApplied?.({
+              stage: options.stage ?? "agent",
+              selected_ids: applied.selected_ids,
+              status: applied.status,
+            });
+          } catch {
+            // Observation is diagnostics only; never affect the cascade.
+          }
+        }
         // Headers leash (live incident 2026-07-16 PM, session f458849c): the
         // body-bytes watchdog below only arms AFTER the HTTP response headers
         // arrive. A provider that accepts the connection and never answers

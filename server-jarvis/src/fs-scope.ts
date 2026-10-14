@@ -233,10 +233,26 @@ function resolveHallucinatedRootPath(
   return null;
 }
 
-function outsideError(inputPath: string, cfg: JarvisConfig, roots: string[]): Error {
-  return new Error(
+export class WorkspaceSandboxDeniedError extends Error {
+  readonly forWrite: boolean;
+
+  constructor(message: string, forWrite: boolean) {
+    super(message);
+    this.name = "WorkspaceSandboxDeniedError";
+    this.forWrite = forWrite;
+  }
+}
+
+function outsideError(
+  inputPath: string,
+  cfg: JarvisConfig,
+  roots: string[],
+  forWrite: boolean,
+): WorkspaceSandboxDeniedError {
+  return new WorkspaceSandboxDeniedError(
     `Path "${inputPath}" is outside the workspace. Sandbox mode: ${cfg.tools.sandbox_mode}. ` +
     `Allowed roots: ${roots.length > 0 ? roots.join(", ") : "(none)"}`,
+    forWrite,
   );
 }
 
@@ -359,7 +375,7 @@ export function resolveSafePath(
     }
   }
 
-  throw outsideError(inputPath, cfg, rootPaths);
+  throw outsideError(inputPath, cfg, rootPaths, options.forWrite === true);
 }
 
 export function safePath(

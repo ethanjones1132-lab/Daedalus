@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionsPage from './SessionsPage';
@@ -55,6 +56,8 @@ function applyWrite(args: Record<string, any>): StoreRow {
 
 /** The `session_runs` fake used by every test in this file. */
 async function nativeFallback(command: string, args: Record<string, any> = {}) {
+  const nativeValue = nativeMemoryFixture(command, args);
+  if (nativeValue !== undefined) return nativeValue;
   switch (command) {
     case 'jarvis_list_sessions': return [session];
     case 'jarvis_new_session': return session;
@@ -193,6 +196,8 @@ describe('a recorded run is confirmed by read-back, never assumed', () => {
     // A second writer (or a relay retry) already stored a different outcome
     // under the same durable run_id before our read-back ran.
     invokeMock.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, args);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_runs') {
         return [{ ...store[0], outcome: 'cancelled', cancelled_reason: 'client_abort' }];
       }
@@ -366,6 +371,8 @@ describe('the Session list shows the durable run, never a local assumption', () 
     seed([{ session_id: 'session-1', run_id: 'run-new', outcome: 'success', token_count: 1, tool_count: 0 }]);
     let failReads = true;
     invokeMock.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, args);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_runs') {
         if (failReads) throw readFailure();
         return store.map(row => ({ ...row }));

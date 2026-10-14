@@ -2,6 +2,7 @@ pub mod commands;
 pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
+pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
 pub mod supervisor;
@@ -264,8 +265,8 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     std::thread::spawn(move || warm_model(model));
 }
 
-/// Start the configured local llama.cpp server with the measured Gemma 4
-/// placement, MTP head, and bounded reasoning budget. The Child is owned by
+/// Start the configured local llama.cpp server with the placement, speculation
+/// and reasoning budget from `LlamaCppConfig::server_args`. The Child is owned by
 /// the shared lifecycle manager, so switching backends or exiting Daedalus
 /// only stops a server that this process actually spawned.
 pub(crate) async fn start_llama_cpp_server(
@@ -297,8 +298,15 @@ pub(crate) async fn start_llama_cpp_server(
         return Err(format!("llama-server executable not found: {}", server_path.display()));
     }
     if !model_path.is_file() {
-        return Err(format!("Gemma GGUF not found: {}", model_path.display()));
+        return Err(format!("llama.cpp model GGUF not found: {}", model_path.display()));
     }
+    let mtp_head_exists = mtp_path.is_file();
+    if mtp_path.as_os_str().is_empty() {
+        println!("[Daedalus] no separate MTP head configured; draft-mtp uses the model's embedded MTP layer");
+    } else if !mtp_head_exists {
+        eprintln!("[Daedalus] MTP head not found at {}; starting without draft-mtp", mtp_path.display());
+    }
+    let server_args = config.server_args(mtp_head_exists);
 
     let outcome = process_lifecycle::launch(
         process_lifecycle::ManagedProcess::LlamaCpp,
@@ -313,32 +321,7 @@ pub(crate) async fn start_llama_cpp_server(
 
             use std::process::{Command, Stdio};
             let mut command = Command::new(&server_path);
-            command.args([
-                "-m", model_path.to_string_lossy().as_ref(),
-                "--alias", &config.model,
-                "--host", "127.0.0.1",
-                "--port", &config.port.to_string(),
-                "-ngl", "99",
-                "--n-cpu-moe", "20",
-                "-c", &config.context_window.to_string(),
-                "-ctk", "q8_0", "-ctv", "q8_0",
-                "--flash-attn", "on",
-                "-b", "512", "-ub", "512", "-np", "1",
-                "--jinja",
-                "--reasoning-budget", &config.reasoning_budget.to_string(),
-                "--no-webui",
-            ]);
-            if mtp_path.is_file() {
-                command.args([
-                    "--spec-type", "draft-mtp",
-                    "-md", mtp_path.to_string_lossy().as_ref(),
-                    "--spec-draft-n-max", "2",
-                ]);
-            } else if mtp_path.as_os_str().is_empty() {
-                eprintln!("[Daedalus] no MTP head configured (llama_cpp.mtp_path); starting without MTP");
-            } else {
-                eprintln!("[Daedalus] MTP head not found at {}; starting without MTP", mtp_path.display());
-            }
+            command.args(&server_args);
 
             let log_dir = std::env::var_os("USERPROFILE")
                 .map(std::path::PathBuf::from)
@@ -391,7 +374,7 @@ pub fn reconcile_backend_services(
         }
         if matches!(backend, crate::jarvis::types::JarvisBackend::LlamaCpp) {
             if let Err(error) = start_llama_cpp_server(llama_cpp).await {
-                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         } else {
             process_lifecycle::stop(process_lifecycle::ManagedProcess::LlamaCpp);
@@ -1114,14 +1097,25 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let looks_like_local_bun =
         is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
 
+    // Owned-process authority: only this spawned child receives the private
+    // capability and app instance id. Never logged, never persisted to config.
+    let (cap_name, cap_value, app_name, app_value) =
+        crate::jarvis::memory::transport::owned_memory_env();
+
     let spawn_result = if is_windows && !looks_like_local_bun {
         // Original WSL path for dev / full WSL setups.
         let cmd = format!("exec {} {}", bun, entry);
         let mut command = std::process::Command::new("wsl.exe");
         command
             .args(["--", "bash", "-lc", &cmd])
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+        // WSL does not inherit the Windows environment; WSLENV lists the
+        // variables to forward. The values are passed via `.env`, never
+        // interpolated into the shell command.
+        forward_env_to_wsl(&mut command, &[cap_name, app_name]);
         crate::wsl::hide_windows_console(&mut command);
         command.spawn()
     } else if looks_like_local_bun {
@@ -1131,6 +1125,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         let mut command = std::process::Command::new(&bun);
         command
             .arg(entry)
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
         if should_hide_jarvis_server_console(is_windows, looks_like_local_bun) {
@@ -1142,6 +1138,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         std::process::Command::new(&bun)
             .arg(entry)
             .env("JARVIS_HOME", wsl_home())
+            .env(cap_name, &cap_value)
+            .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
             .spawn()
@@ -1403,6 +1401,34 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
     }
     log::info!(target: "jarvis::startup", "bootstrap config migration complete");
+    // Phase 2.2 recovery: a native restart leaves no Bun registry, so pending
+    // preparations are stale and started-but-unsynced turns are unterminated.
+    // Never re-registers an old turn; explicit retries get new turn ids.
+    match crate::jarvis::memory::transport::recover_pending_memory_turns(
+        &db_state,
+        chrono::Utc::now(),
+    ) {
+        Ok(count) if count > 0 => {
+            log::info!(target: "jarvis::startup", "memory turn recovery updated {count} stale turn(s)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(target: "jarvis::startup", "memory turn recovery failed: {e:?}"),
+    }
+    // Phase 3.3 recovery: capture recorded explicit user directives on any
+    // persisted turn that never received a capture receipt, through the same
+    // derived gate as the live paths. Idempotent and best-effort; a Bun that is
+    // not yet live leaves derived cleanup in the durable outbox.
+    match crate::commands::memory_capture::recover_recorded_memory_captures(
+        &db_state,
+        crate::jarvis::memory::transport::native_memory_transport(),
+        chrono::Utc::now(),
+    ) {
+        Ok(count) if count > 0 => {
+            log::info!(target: "jarvis::startup", "memory capture recovery committed {count} turn(s)");
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!(target: "jarvis::startup", "memory capture recovery failed: {e:?}"),
+    }
     let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
     log::info!(target: "jarvis::startup", "bootstrap config load complete");
     {
@@ -1419,7 +1445,7 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         }
         crate::jarvis::types::JarvisBackend::LlamaCpp => {
             if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
-                eprintln!("[Daedalus] Gemma server startup failed: {error}");
+                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         }
         crate::jarvis::types::JarvisBackend::OpenRouter => {
@@ -1517,36 +1543,24 @@ pub fn run() {
     };
 
     let home = crate::get_home_dir();
-    let db_path = std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop/jarvis.db");
+    let app_data_dir =
+        std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop");
 
-    if let Some(parent) = db_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let db = match rusqlite::Connection::open(&db_path) {
-        Ok(conn) => {
-            conn.execute_batch(
-                "PRAGMA journal_mode = WAL; \
-                 PRAGMA foreign_keys = ON; \
-                 PRAGMA synchronous = NORMAL; \
-                 PRAGMA temp_store = MEMORY; \
-                 PRAGMA mmap_size = 30000000000; \
-                 PRAGMA cache_size = -20000;",
-            )
-            .ok();
-            // Wait up to 5s on lock contention instead of erroring instantly with
-            // "database is locked" (the manual open path skipped AppDb::new's setup).
-            let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
-            crate::db::run_migrations(&conn).ok();
-            let db = crate::db::AppDb {
-                conn: std::sync::Mutex::new(conn),
-                db_path: db_path.clone(),
-            };
+    // Both initialization paths go through `AppDb::new`, which retains the
+    // app-data root handle and binds the opened `jarvis.db` to that same
+    // directory inode before publishing AppDb. A failure to establish the
+    // binding fails closed here rather than serving a path-only database.
+    let db = match crate::db::AppDb::new(&app_data_dir) {
+        Ok(db) => {
             let _ = crate::commands::skills::seed_skills(&db);
             db
         }
         Err(e) => {
-            eprintln!("[Jarvis] Failed to open DB at {:?}: {}", db_path, e);
+            eprintln!(
+                "[Jarvis] Failed to open DB at {:?}: {}",
+                app_data_dir.join("jarvis.db"),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -1612,7 +1626,9 @@ pub fn run() {
             get_session_history,
             get_session_runs,
             get_all_session_runs,
+            get_learning_source_choices,
             record_terminal_run,
+            record_goal_terminal_run,
             export_session,
             compact_session_db,
             update_token_count,
@@ -1628,6 +1644,38 @@ pub fn run() {
             memory_events_list,
             memory_runs_list,
             memory_run_now,
+            memory_bind_session_workspace,
+            memory_scoped_save,
+            memory_scoped_read,
+            memory_scoped_list,
+            memory_scoped_update,
+            memory_scoped_delete,
+            memory_scoped_restore,
+            memory_scoped_recall_preview,
+            memory_scoped_classify,
+            memory_adopt_legacy,
+            memory_prepare_turn,
+            memory_turn_history,
+            memory_sync_turn,
+            memory_turn_diagnostic,
+            memory_capture_turn,
+            memory_capture_receipts,
+            memory_continuity_read,
+            memory_continuity_set,
+            memory_scoped_correct,
+            memory_scoped_forget,
+            memory_stage_proposal,
+            goal_create,
+            goal_list,
+            goal_get,
+            goal_update,
+            goal_transition,
+            goal_links_list,
+            goal_link_add,
+            goal_link_remove,
+            goal_prepare_run,
+            goal_run_progress,
+            project_steward_workspace_snapshot,
             list_memory_files,
             read_memory_file,
             list_workspace_files,
@@ -1639,6 +1687,7 @@ pub fn run() {
             jarvis_list_memories_by_tier,
             jarvis_recall_cold_memory,
             run_learning_session,
+            get_learning_research_receipt,
             list_skills,
             get_skill,
             enable_skill,
@@ -1657,9 +1706,11 @@ pub fn run() {
             edit_cron_job,
             enable_cron_job,
             disable_cron_job,
+            cancel_cron_job,
             delete_cron_job,
             run_cron_job,
             get_cron_runs,
+            get_cron_activations,
             get_in_flight_cron_jobs,
             list_pending_missed_jobs,
             dismiss_missed_cron_job,
@@ -1697,6 +1748,7 @@ pub fn run() {
             unregister_hook,
             get_commitments,
             add_commitment,
+            set_commitment_goal,
             complete_commitment,
             delete_commitment,
             get_action_registry_summary,
@@ -1705,6 +1757,16 @@ pub fn run() {
             sync_action_registry,
             update_action_approval,
             dispatch_action,
+            list_trusted_acceptance_manifests,
+            create_trusted_acceptance_manifest,
+            replace_trusted_acceptance_manifest,
+            remove_trusted_acceptance_manifest,
+            execute_trusted_manifest_action,
+            get_trusted_execution,
+            list_trusted_executions,
+            cancel_trusted_execution,
+            run_trusted_acceptance,
+            get_trusted_acceptance,
             get_plugins,
             enable_plugin,
             disable_plugin,

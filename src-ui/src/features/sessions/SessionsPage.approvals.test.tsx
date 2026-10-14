@@ -1,3 +1,4 @@
+import { nativeMemoryFixture } from './test-native-memory';
 import { useState } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -123,7 +124,9 @@ async function emitApproval(payload: Partial<ApprovalPayload> = {}, expectDialog
 
 beforeEach(() => {
   invokeMock.mockReset();
-  invokeMock.mockImplementation(async (command: string) => {
+  invokeMock.mockImplementation(async (command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
     if (command === 'get_session_history') return [];
     if (command === 'jarvis_get_session_grants') return { session_id: 'session-1', grants: [] };
     return true;
@@ -189,7 +192,9 @@ describe('ChatPanel tool approval decisions', () => {
   it('filters and deduplicates direct approval frames across the same Session', async () => {
     const stream = directSseStream();
     const decision = deferred<void>();
-    invokeMock.mockImplementation((command: string) => {
+    invokeMock.mockImplementation((command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return decision.promise;
       if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
@@ -282,7 +287,9 @@ describe('ChatPanel tool approval decisions', () => {
     ['Approve', ' ', 'approve'],
   ] as const)('lets Enter and Space activate only the focused %s control', async (control, key, decision) => {
     const pending = deferred<void>();
-    invokeMock.mockImplementation((command: string) => {
+    invokeMock.mockImplementation((command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
       if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
@@ -310,7 +317,9 @@ describe('ChatPanel tool approval decisions', () => {
 
   it('serializes repeated decision input across every entry path while pending', async () => {
     const pending = deferred<void>();
-    invokeMock.mockImplementation((command: string) => {
+    invokeMock.mockImplementation((command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
       if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
@@ -364,7 +373,9 @@ describe('ChatPanel tool approval decisions', () => {
 
   it.each(['Escape', 'Backdrop'] as const)('issues one rejection for repeated %s input', async (action) => {
     const pending = deferred<void>();
-    invokeMock.mockImplementation((command: string) => {
+    invokeMock.mockImplementation((command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') return pending.promise;
       if (command === 'jarvis_get_session_grants') return Promise.resolve({ session_id: 'session-1', grants: [] });
@@ -409,7 +420,9 @@ describe('ChatPanel tool approval decisions', () => {
     const first = deferred<void>();
     const retry = deferred<void>();
     let decisionAttempt = 0;
-    invokeMock.mockImplementation((command: string) => {
+    invokeMock.mockImplementation((command: string, nativeArgs: Record<string, any> = {}) => {
+    const nativeValue = nativeMemoryFixture(command, nativeArgs);
+    if (nativeValue !== undefined) return Promise.resolve(nativeValue);
       if (command === 'get_session_history') return Promise.resolve([]);
       if (command === 'jarvis_tool_decision') {
         decisionAttempt += 1;

@@ -60,6 +60,12 @@ export type CallModelFn = (
      * (recordStageRun happens after the call and cannot invent the id first).
      */
     stageRunId?: string;
+    /**
+     * Effective stage context ceiling in tokens. When set, the final-request
+     * memory fit intersects it with the provider context window so a stage
+     * transcript bound is never exceeded by the recall carrier.
+     */
+    contextCeilingTokens?: number;
   }
 ) => Promise<{
   content: string;

@@ -1,3 +1,5 @@
+import TrustedManifestsPanel from './TrustedManifestsPanel';
+import GoalNotificationsPanel from './GoalNotificationsPanel';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertLine, Page, PageHeader, StatusLine } from '../../design';
@@ -130,7 +132,7 @@ export default function SettingsPage() {
 
           <h2 className="d-label pt-5">Application</h2>
           <AppearancePanel />
-          <AdvancedPanel />
+          <GoalNotificationsPanel /><TrustedManifestsPanel /><AdvancedPanel />
 
           {draft && <SaveBar dirty={dirty} saving={saving} saved={saved} saveError={saveError} onSave={() => void save()} onDiscard={discard} />}
         </div>

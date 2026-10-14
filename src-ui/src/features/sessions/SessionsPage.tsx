@@ -1,3 +1,6 @@
+import { useWorkflow } from '../workflows/WorkflowContext';
+import { decodeCanonicalSessionRows, decodeGoalIdentity, normalizeHandoffRoot } from './steward-handoff';
+import { AlertLine } from '../../design';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { JarvisConfig, JarvisSession } from '../../domain/types';
@@ -40,6 +43,14 @@ function readCollapsed(): boolean {
  * the run record of the last turn, and the active Session.
  */
 export default function SessionsPage() {
+  const flow = useWorkflow();
+  const [chatHandoff, setChatHandoff] = useState<typeof flow.handoff>(null);
+  const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
+  const handoffSeqRef = useRef(0);
+  const handoffConsumedRef = useRef(flow.consumeHandoff);
+  handoffConsumedRef.current = flow.consumeHandoff;
+  const projectStewardHandoff = flow.handoff;
+  const handleChatHandoffApplied = useCallback(() => { setChatHandoff(null); handoffConsumedRef.current(); }, []);
   const [sessions, setSessions] = useState<JarvisSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -196,6 +207,76 @@ export default function SessionsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intentSessionId, nonce]);
 
+  // Project Steward one-shot handoff. Re-read the persisted Session and the
+  // native Goal before consuming anything: require the Session to exist, be
+  // non-archived, and match the Goal's Agent and canonical project root. Only
+  // then select the Session/Goal and pre-fill the task; nothing is sent here.
+  useEffect(() => {
+    if (!projectStewardHandoff) return;
+    const seq = ++handoffSeqRef.current;
+    let cancelled = false;
+    const consume = () => {
+      if (cancelled || seq !== handoffSeqRef.current) return;
+      handoffConsumedRef.current?.();
+    };
+    const reject = (message: string) => {
+      if (cancelled || seq !== handoffSeqRef.current) return;
+      setHandoffNotice(message);
+      consume();
+    };
+    void (async () => {
+      try {
+        const [sessionRows, rawGoal] = await Promise.all([
+          invoke<unknown>('list_sessions'),
+          invoke<unknown>('goal_get', { id: projectStewardHandoff.goal_id }),
+        ]);
+        if (cancelled || seq !== handoffSeqRef.current) return;
+        const decodedSessions = decodeCanonicalSessionRows(sessionRows);
+        if (!decodedSessions.ok) {
+          reject('Project Steward: the Session list could not be read. The task was not opened in Chat.');
+          return;
+        }
+        const session = decodedSessions.rows.find(
+          (row) => row.id === projectStewardHandoff.session_id,
+        );
+        const goal = decodeGoalIdentity(rawGoal);
+        if (!session) {
+          reject('Project Steward: the selected Session no longer exists. The task was not opened in Chat.');
+          return;
+        }
+        if (session.archived) {
+          reject('Project Steward: the selected Session is archived. The task was not opened in Chat.');
+          return;
+        }
+        if (!goal || goal.id !== projectStewardHandoff.goal_id) {
+          reject('Project Steward: the native Goal could not be re-read. The task was not opened in Chat.');
+          return;
+        }
+        const sessionAgent = typeof session.agent_id === 'string' ? session.agent_id : '';
+        const sessionRoot = normalizeHandoffRoot(session.project_root);
+        const goalRoot = normalizeHandoffRoot(goal.project_root);
+        if (!sessionAgent || sessionAgent !== goal.agent_id) {
+          reject('Project Steward: the Session Agent no longer matches the Goal. The task was not opened in Chat.');
+          return;
+        }
+        if (!sessionRoot || !goalRoot || sessionRoot !== goalRoot) {
+          reject('Project Steward: the Session workspace no longer matches the Goal. The task was not opened in Chat.');
+          return;
+        }
+        setHandoffNotice(null);
+        setIndexTab('sessions');
+        setActiveSession(projectStewardHandoff.session_id);
+        setChatHandoff(projectStewardHandoff);
+      } catch {
+        reject('Project Steward: the Session/Goal readback failed. The task was not opened in Chat.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectStewardHandoff]);
+
+
   const toggleIndex = useCallback(() => {
     setIndexCollapsed((c) => {
       try {
@@ -247,7 +328,12 @@ export default function SessionsPage() {
         onToggleCollapsed={toggleIndex}
       />
       <div className="relative flex min-h-0 min-w-0 flex-1">
+        {handoffNotice && <AlertLine className="absolute left-4 right-4 top-2 z-20">{handoffNotice}</AlertLine>}
         <ChatPanel
+          sessions={sessions}
+          onSessionsChanged={loadSessions}
+          projectStewardHandoff={chatHandoff}
+          onProjectStewardHandoffApplied={handleChatHandoffApplied}
           activeSession={activeSession}
           setActiveSession={setActiveSession}
           config={config}
