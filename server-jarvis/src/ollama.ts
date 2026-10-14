@@ -89,9 +89,10 @@ export function __resetWindowsHostIPCacheForTests(): void {
 
 /**
  * Resolve the Windows host IP as seen from WSL2, so Ollama on the Windows side
- * is reachable. On native Windows (`process.platform === "win32"`) this returns
- * `127.0.0.1` immediately — rewriting localhost → 172.17.0.1 is a WSL-only
- * concern and hangs fetch probes when the Bun server runs as bun.exe.
+ * is reachable. On native Windows (`process.platform === "win32"`) and macOS
+ * (`process.platform === "darwin"`) this returns `127.0.0.1` immediately —
+ * rewriting localhost to a Windows host is a WSL-only concern and hangs fetch
+ * probes when the Bun server runs as bun.exe.
  */
 export function resolveWindowsHostIP(platform: NodeJS.Platform = process.platform): string {
   const now = Date.now();
@@ -99,10 +100,11 @@ export function resolveWindowsHostIP(platform: NodeJS.Platform = process.platfor
     return cachedHostIP;
   }
 
-  // Native Windows Bun: Ollama is local. Never fall through to the WSL path
-  // (which ends at the hard-coded docker-bridge fallback 172.17.0.1 and was
-  // spamming "Could not resolve Windows host IP" every 30s while probes hung).
-  if (platform === "win32") {
+  // Native Windows and macOS Bun: Ollama is local. Never fall through to the
+  // WSL path (which ends at the hard-coded docker-bridge fallback 172.17.0.1
+  // and was spamming "Could not resolve Windows host IP" every 30s while
+  // probes hung). On macOS there is no Windows host IP and no wsl.exe.
+  if (platform === "win32" || platform === "darwin") {
     cachedHostIP = "127.0.0.1";
     cachedHostIPTimestamp = now;
     return cachedHostIP;

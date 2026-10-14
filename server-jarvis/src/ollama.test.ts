@@ -67,6 +67,13 @@ describe("resolveWindowsHostIP platform branches", () => {
     expect(resolveWindowsHostIP("win32")).toBe("127.0.0.1");
   });
 
+  test("on darwin returns loopback without WSL fallback", () => {
+    __resetWindowsHostIPCacheForTests();
+    expect(resolveWindowsHostIP("darwin")).toBe("127.0.0.1");
+    // Cache sticks for subsequent calls.
+    expect(resolveWindowsHostIP("darwin")).toBe("127.0.0.1");
+  });
+
   test("effectiveOllamaUrl on win32 keeps traffic on loopback", () => {
     __resetWindowsHostIPCacheForTests();
     // Force the win32 branch via resolveWindowsHostIP("win32") first so the
@@ -81,6 +88,19 @@ describe("resolveWindowsHostIP platform branches", () => {
       expect(resolveWindowsHostIP("win32")).toBe("127.0.0.1");
     }
   });
+
+  test("effectiveOllamaUrl on darwin keeps traffic on loopback", () => {
+    __resetWindowsHostIPCacheForTests();
+    if (process.platform === "darwin") {
+      const url = effectiveOllamaUrl(makeConfig("http://localhost:11434"));
+      expect(url).toContain("127.0.0.1");
+      expect(url).not.toContain("172.17.0.1");
+    } else {
+      // On non-darwin hosts, just pin the pure darwin helper contract above.
+      expect(resolveWindowsHostIP("darwin")).toBe("127.0.0.1");
+    }
+  });
+
 });
 
 describe("Ollama integration", () => {
