@@ -40,6 +40,8 @@ const FULL_TOOLBOX: ToolDefinition[] = [
   tool("grep"),
   tool("list_directory"),
   tool("git_metadata"),
+  tool("git_diff"),
+  tool("git_log"),
   tool("bash"),
   tool("powershell"),
   tool("web_search"),
