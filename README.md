@@ -44,7 +44,7 @@ Every orchestrated turn is written to `self-tuning.db`. For a long time that dat
 
 Two defects diagnosed by hand in July took instrumented builds, log reading, and roughly 400k tokens per attempt. Both were already sitting in the database. A query would have surfaced either in milliseconds.
 
-`server-jarvis/src/eval/conductor-replay.ts` (282 lines, 17 tests) replays stored traces against five invariants — `repeated_nudge`, `placeholder_in_note`, `stage_deadline_exceeded`, `noop_executor_turns`, `turn_cap_saturation`:
+`server-jarvis/src/eval/conductor-replay.ts` (529 lines, 43 tests) replays stored traces against five invariants — `repeated_nudge`, `placeholder_in_note`, `stage_deadline_exceeded`, `noop_executor_turns`, `turn_cap_saturation`:
 
 ```bash
 bun scripts/replay-conductor.ts [--limit N] [--since TS] [--db PATH] [--json]
