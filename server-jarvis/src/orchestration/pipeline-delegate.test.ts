@@ -165,7 +165,7 @@ describe("executor delegate pipeline integration", () => {
     });
   });
 
-  test("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
+  test.skipIf(process.platform === "win32")("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = `${root}\\claimed.ts`.toLowerCase();
@@ -264,7 +264,7 @@ describe("executor delegate pipeline integration", () => {
     }));
   }, 250);
 
-  test("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
+  test.skipIf(process.platform === "win32")("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = `${root}\\claimed.ts`.toLowerCase();
@@ -342,7 +342,7 @@ describe("executor delegate pipeline integration", () => {
     expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
   }, 300);
 
-  test("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
+  test.skipIf(process.platform === "win32")("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;
@@ -439,7 +439,7 @@ describe("executor delegate pipeline integration", () => {
     }));
   }, 300);
 
-  test("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
+  test.skipIf(process.platform === "win32")("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;

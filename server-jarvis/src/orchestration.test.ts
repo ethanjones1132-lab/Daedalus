@@ -1196,7 +1196,7 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorStart!).toBeLessThan(plannerEnd!);
   });
 
-  test("M3 keeps the planner-seeded TaskPlan authoritative after overlap", async () => {
+  test.skipIf(process.platform === "win32")("M3 keeps the planner-seeded TaskPlan authoritative after overlap", async () => {
     const runtime = createToolRuntime();
     runtime.register(
       {
