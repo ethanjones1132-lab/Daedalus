@@ -661,7 +661,7 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(glob.output).toContain("inside.txt");
   });
 
-  test("grep and glob can inspect an explicitly granted outside directory link", async () => {
+  test.skipIf(process.platform === "win32")("grep and glob can inspect an explicitly granted outside directory link", async () => {
     const workspace = makeTempWorkspace();
     const outside = makeTempWorkspace();
     writeFileSync(join(outside, "secret.txt"), "SECRET outside");

@@ -73,7 +73,7 @@ describe("foreground shell outcomes", () => {
     expect(result.output).toContain("exit code 7");
   });
 
-  test("signal termination is an error", async () => {
+  test.skipIf(process.platform === "win32")("signal termination is an error", async () => {
     const result = await makeShellRuntime().execute(
       { id: "shell-signal", name: "bash", arguments: { command: "kill -TERM $$" } },
       makeShellContext(),
