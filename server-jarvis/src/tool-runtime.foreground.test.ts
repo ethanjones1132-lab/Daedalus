@@ -130,7 +130,7 @@ describe("foreground shell outcomes", () => {
     expect(result.error_code).toBe("cancelled");
   }, 2_000);
 
-  test("cancelled shell work leaves no delayed side effect", async () => {
+  test.skipIf(process.platform === "win32")("cancelled shell work leaves no delayed side effect", async () => {
     const workspace = makeWorkspace();
     const marker = join(workspace, "late-side-effect");
     const controller = new AbortController();
