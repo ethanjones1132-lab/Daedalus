@@ -160,9 +160,9 @@ bash scripts/verify.sh --test       # + cargo test + bun test
 bash scripts/verify.sh --build      # + server dist + UI dist
 ```
 
-**Last full recorded run — 2026-10-14: 3,412/3,412 Bun tests and the full Cargo suite green, both `tsc` jobs clean (Windows environment; platform-specific tests skipped where the OS cannot reproduce them).**
+**Last full recorded run — 2026-10-14 (macOS): 3,553/3,553 Bun tests in `server-jarvis` (215 test files) and 1,788/1,788 UI tests (176 of 188 `*.test.{ts,tsx}` files), plus 134/134 Cargo tests green; both `tsc` jobs and both builds clean (all platform-skip predicates run on this OS).**
 
-The tree has grown since that run: **185 test files under `server-jarvis/src`**, 215 across the repo including the UI. Reproduce with `bash scripts/verify.sh --test` rather than trusting this paragraph — the number in a README is a claim, and the command is the evidence.
+On macOS, run the full gate rather than the Windows-oriented subset: `python3 /Users/charlottehughes/code/mac-sprints-20261014/control/verify.py Daedalus` (or `bash scripts/verify.sh --test` for the local subset). The number in a README is a claim, and the command is the evidence.
 
 Suite growth is itself the artifact of how this repo is maintained: **240 Bun tests on 2026-06-24 → 2,469 on 2026-08-01**, added by a cron-driven maintenance loop that ships small, test-first, commit-attributed changes on a daily cadence. `PRIORITIES.md` records each pass with its commit SHAs and the test delta it produced.
 
