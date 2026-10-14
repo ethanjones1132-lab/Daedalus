@@ -61,6 +61,8 @@ describe("READ_ONLY_TOOLS", () => {
     // taxonomy, so its order follows bundle registration order rather than the
     // order someone typed. Membership is the security property; sequence is not.
     expect([...READ_ONLY_TOOLS].sort()).toEqual([
+      "git_diff",
+      "git_log",
       "git_metadata",
       "glob",
       "grep",
