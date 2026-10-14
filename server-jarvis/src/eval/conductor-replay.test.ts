@@ -710,6 +710,7 @@ interface CliRunInput {
   finalOutput?: string;
   stages: CliStageInput[];
   delegate?: boolean;
+  createdAt?: string;
 }
 
 function withCliDatabase<T>(callback: (context: {
@@ -769,7 +770,7 @@ function withCliDatabase<T>(callback: (context: {
     );
   `);
   const insertRun = (run: CliRunInput): void => {
-    const createdAt = new Date().toISOString();
+    const createdAt = run.createdAt ?? new Date().toISOString();
     db.query(
       "INSERT INTO agent_runs (id, task_type, outcome, final_output, verified_via, check_tier, duration_ms, created_at) VALUES (?, 'write', ?, ?, ?, ?, 100, ?)",
     ).run(
@@ -817,15 +818,22 @@ function withCliDatabase<T>(callback: (context: {
   }
 }
 
-function runCli(relativeScript: "replay-conductor.ts" | "benchmark-conductor-completion.ts", dbPath: string) {
+function runCli(
+  relativeScript: "replay-conductor.ts" | "benchmark-conductor-completion.ts",
+  dbPath: string,
+  options: { limit?: number; since?: string } = {},
+) {
+  const args = [
+    "bun",
+    join(import.meta.dir, "..", "..", "scripts", relativeScript),
+    "--db",
+    dbPath,
+  ];
+  if (options.limit !== undefined) args.push("--limit", String(options.limit));
+  if (options.since) args.push("--since", options.since);
+  args.push("--json");
   const result = Bun.spawnSync({
-    cmd: [
-      "bun",
-      join(import.meta.dir, "..", "..", "scripts", relativeScript),
-      "--db",
-      dbPath,
-      "--json",
-    ],
+    cmd: args,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -967,6 +975,55 @@ describe("conductor tool-evidence CLI gates", () => {
         .query("SELECT tool_calls_json FROM stage_runs WHERE agent_run_id = 'run_read_only'")
         .get() as { tool_calls_json: string };
       expect(after.tool_calls_json).toBe(before.tool_calls_json);
+    });
+  });
+});
+
+describe("conductor replay CLI limit and since filters", () => {
+  test("--limit returns only the newest requested runs", () => {
+    withCliDatabase(({ dbPath, insertRun }) => {
+      insertRun({ id: "run_old", outcome: "success", createdAt: "2026-01-01T00:00:00.000Z", stages: [{ id: "stage_old", toolCallsJson: '{"bad":' }] });
+      insertRun({ id: "run_mid", outcome: "success", createdAt: "2026-02-02T00:00:00.000Z", stages: [{ id: "stage_mid", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_new", outcome: "success", createdAt: "2026-03-03T00:00:00.000Z", stages: [{ id: "stage_new", toolCallsJson: "[]" }] });
+      const full = runCli("replay-conductor.ts", dbPath);
+      expect(full.exitCode).toBe(1);
+      const filtered = runCli("replay-conductor.ts", dbPath, { limit: 2 });
+      const output = JSON.parse(filtered.stdout) as { scanned: number; violations: Array<{ agentRunId: string }> };
+      expect(filtered.exitCode).toBe(0);
+      expect(output.scanned).toBe(2);
+      expect(output.violations).toHaveLength(0);
+    });
+  });
+
+  test("--since includes runs on or after the boundary and preserves read-only SQLite", () => {
+    withCliDatabase(({ db, dbPath, insertRun }) => {
+      insertRun({ id: "run_before", outcome: "success", createdAt: "2026-01-01T00:00:00.000Z", stages: [{ id: "stage_before", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_boundary", outcome: "success", createdAt: "2026-02-02T00:00:00.000Z", stages: [{ id: "stage_boundary", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_after", outcome: "success", createdAt: "2026-03-03T00:00:00.000Z", stages: [{ id: "stage_after", toolCallsJson: "[]" }] });
+      const beforeIds = db.query("SELECT id FROM agent_runs ORDER BY id").all();
+      const result = runCli("replay-conductor.ts", dbPath, { since: "2026-02-02T00:00:00.000Z" });
+      const output = JSON.parse(result.stdout) as { scanned: number };
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(output.scanned).toBe(2);
+      const afterIds = db.query("SELECT id FROM agent_runs ORDER BY id").all();
+      expect(afterIds).toEqual(beforeIds);
+    });
+  });
+
+  test("--limit and --since compose without changing DB contents", () => {
+    withCliDatabase(({ db, dbPath, insertRun }) => {
+      insertRun({ id: "run_one", outcome: "success", createdAt: "2026-01-01T00:00:00.000Z", stages: [{ id: "stage_one", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_two", outcome: "success", createdAt: "2026-02-02T00:00:00.000Z", stages: [{ id: "stage_two", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_three", outcome: "success", createdAt: "2026-03-03T00:00:00.000Z", stages: [{ id: "stage_three", toolCallsJson: "[]" }] });
+      insertRun({ id: "run_four", outcome: "success", createdAt: "2026-04-04T00:00:00.000Z", stages: [{ id: "stage_four", toolCallsJson: "[]" }] });
+      const before = db.query("SELECT COUNT(*) AS n FROM agent_runs").get() as { n: number };
+      const result = runCli("replay-conductor.ts", dbPath, { limit: 1, since: "2026-02-02T00:00:00.000Z" });
+      const output = JSON.parse(result.stdout) as { scanned: number };
+      const after = db.query("SELECT COUNT(*) AS n FROM agent_runs").get() as { n: number };
+      expect(result.exitCode).toBe(0);
+      expect(output.scanned).toBe(1);
+      expect(after.n).toBe(before.n);
     });
   });
 });
