@@ -1,0 +1,67 @@
+{
+  "skill_name": "agent-router",
+  "evals": [
+    {
+      "id": 1,
+      "name": "bulk-read-plan-docs",
+      "prompt": "go through all the plan docs in docs/superpowers/plans/ and tell me which ones still have unfinished tasks. one line each with what's left",
+      "expected_output": "Bulk reading routed to the cheap OpenCode tier first (DeepSeek v4.1 Flash / Zen free), with the driver spot-checking results instead of reading every doc inline; a routing log at the end.",
+      "files": [],
+      "assertions": [
+        "Routes the bulk reading of the plan docs to the cheap OpenCode tier (DeepSeek v4.1 Flash, Mimo, or a Zen free model) as the first choice",
+        "Driver does not read every plan doc inline in its own context",
+        "Driver verifies the cheap tier's output (spot-checks some docs or cross-checks claims) before reporting",
+        "Plans to end with a routing log listing the delegation(s)",
+        "Does not use Sonnet, a cross-vendor frontier model, or Opus subagents for this read-only summarization"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "long-horizon-test-fix",
+      "prompt": "the server-jarvis test suite has a bunch of failures after the llama.cpp backend merge (cb91055). get it all green again without skipping tests, and make sure nothing regresses in the provider routing",
+      "expected_output": "Sonnet driver diagnoses (Opus gate for heavy reasoning) and writes briefs; fixes go to Haiku 5.5 at xhigh (in parallel if clusters are independent), or a Sonnet sub-lead only if coordinating them would flood the driver; pool model triages logs; driver checks each result; cross-vendor final review (GPT-6.1 Sol or Grok 4.7); routing log.",
+      "files": [],
+      "assertions": [
+        "Driver (Sonnet) diagnoses root causes and writes per-fix briefs, each with a verifiable acceptance check",
+        "Sends the fix plan to Opus (agent-router:approver) for approval before dispatching workers, since it touches core provider routing",
+        "Routes the well-specified fixes to Haiku 5.5 at xhigh (or GPT-6 Luna), not to a Sonnet executor by default",
+        "Uses Sonnet only as a sub-lead coordinating parallel Haiku workers, and only with a stated reason, or not at all",
+        "Driver checks each fix's diff/evidence before building on it",
+        "Uses a worker-pool model (Zen free / DeepSeek / Mimo / Haiku) for grunt work such as triaging failing test output",
+        "Gets a cross-vendor final review from GPT-6.1 Sol (high) or Grok 4.7 for the provider-routing changes",
+        "Keeps the main session on one model and does not use Fable",
+        "Plans to end with a routing log"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "small-rename-no-overroute",
+      "prompt": "rename openCodeGoCostRank to goCostRank everywhere in server-jarvis, keep tests passing",
+      "expected_output": "Handled inline (or with one cheap mechanical helper at most) without a Sonnet executor, cross-vendor review, or multi-agent fan-out; tests run to confirm.",
+      "files": [],
+      "assertions": [
+        "Does the rename inline, or at most hands it to a single cheap/mechanical worker, without a Sonnet executor or multi-milestone plan",
+        "Does not request a cross-vendor (GPT-6 / Grok) review for this change",
+        "Runs the server-jarvis tests (or typecheck) to confirm nothing broke",
+        "Does not switch the main session model or raise effort above high",
+        "Does not consult Opus for this small change"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "parallel-split-refactor",
+      "prompt": "server-jarvis/src/index.ts is 5.7k lines. split the http route handlers out into per-area modules under src/routes/ (chat, models, memory, cron, etc) with zero behavior change. tests + typecheck must stay green",
+      "expected_output": "Sonnet driver maps the areas and writes the module plan and briefs; parallel Haiku 5.5 xhigh workers (directly, or under a Sonnet sub-lead with a stated reason) each extract one area on disjoint files/worktrees; driver checks each; cross-vendor review by Sol or Grok; routing log.",
+      "files": [],
+      "assertions": [
+        "Driver (Sonnet) maps the route areas and writes the target module layout and per-area briefs itself",
+        "Sends the refactor plan to Opus (agent-router:approver) for approval before dispatching workers",
+        "Area extractions are done by parallel workers (Haiku 5.5 xhigh, or Luna/DeepSeek), not all inline by the driver",
+        "If Sonnet is used, it is as a sub-lead coordinating parallel Haiku workers with a stated reason; Sonnet is not the sole implementer",
+        "Workers get disjoint files or separate worktrees and there is an integration step with tests + typecheck",
+        "Gets a cross-vendor review (GPT-6.1 Sol or Grok 4.7) of the refactor before calling it done",
+        "Plans to end with a routing log"
+      ]
+    }
+  ]
+}
