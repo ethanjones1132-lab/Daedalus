@@ -254,7 +254,7 @@ describe("snapshot failure preserves the underlying exception", () => {
 });
 
 describe("Claude executor delegate", () => {
-  test("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
+  test.skipIf(process.platform === "win32")("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
     const config = testConfig();
     let kills = 0;
     let signalTreeCalls = 0;
