@@ -6,6 +6,12 @@ export interface PathIdentityOptions {
   platform?: NodeJS.Platform;
 }
 
+function inferPlatform(workspaceRoot: string | undefined, pathValue: string): NodeJS.Platform {
+  const sample = `${workspaceRoot ?? ""} ${pathValue}`;
+  if (/\\\\/.test(sample) || /^[a-zA-Z]:/.test(sample.trim()) || /[a-zA-Z]:\\\\/.test(sample)) return "win32";
+  return "linux";
+}
+
 function normalizeSeparators(value: string, platform: NodeJS.Platform): string {
   return platform === "win32" ? value.replace(/\//g, "\\") : value.replace(/\\/g, "/");
 }
@@ -23,7 +29,7 @@ export function resolveWorkspacePathIdentity(
 ): string | undefined {
   const trimmed = pathValue.trim();
   if (!trimmed) return undefined;
-  const platform = options.platform ?? process.platform;
+  const platform = options.platform ?? inferPlatform(options.workspaceRoot, pathValue);
   const pathApi = platform === "win32" ? win32 : posix;
   const rootInput = options.workspaceRoot?.trim() || ".";
   const root = normalizeSeparators(normalizePathInput(rootInput, platform), platform);
