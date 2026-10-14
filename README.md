@@ -148,6 +148,11 @@ cd src-tauri && cargo tauri build   # → target/release/bundle/nsis/Jarvis_*_x6
 
 # Linux / WSL
 bash build-wsl.sh
+
+# macOS (unsigned; not notarized) — installed Tauri CLI; external target dir per the Mac gate
+CARGO_TARGET_DIR=/Users/charlottehughes/Documents/Codex/2026-10-14/h/work/daedalus-native-target \\
+  /Users/charlottehughes/Documents/Codex/2026-10-14/h/work/sprint-tools/node_modules/.bin/tauri build --bundles app
+# → .../release/bundle/macos/Jarvis.app (Contents/MacOS/home-base, unsigned)
 ```
 
 ---
