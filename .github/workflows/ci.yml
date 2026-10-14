@@ -39,19 +39,24 @@ jobs:
 
       # ── Theme-husk guard ──────────────────────────────────────────
       # Tailwind v4 silently emits no CSS for unknown named-color
-      # utilities, so a stripped index.css @theme block compiles green
-      # but renders the whole UI unstyled. Fail loudly if the brand
-      # tokens / utilities are absent from the generated stylesheet.
+      # utilities, and @theme inline does not emit --color-* custom
+      # properties. A stripped app.css theme still compiles green and
+      # renders the UI unstyled. Fail if the Daedalus --d-* definitions
+      # or the utilities they generate are absent from the stylesheet.
       - name: Theme tokens present in built CSS
         run: |
           set -euo pipefail
           css=$(ls dist/assets/index-*.css | head -1)
           echo "Inspecting $css"
-          for tok in --color-bone --color-royal --color-accent; do
+          # :root / [data-theme=light] definitions. The colon avoids
+          # matching a longer name such as --d-ink-2 or --d-accent-hot.
+          for tok in --d-canvas: --d-ink: --d-accent:; do
             grep -q -- "$tok" "$css" \
-              || { echo "::error::theme token '$tok' missing from built CSS — index.css @theme block may be a husk"; exit 1; }
+              || { echo "::error::theme token '$tok' missing from built CSS — app.css theme may be a husk"; exit 1; }
           done
-          for util in '\.text-bone' '\.bg-accent' '\.border-iron'; do
+          # Utilities generated from @theme inline. The character class
+          # requires the base class (.text-ink), not only .text-ink-2.
+          for util in '\.bg-canvas[{,]' '\.text-ink[{,]' '\.bg-accent[{,]' '\.border-line[{,]'; do
             grep -qE "$util" "$css" \
               || { echo "::error::utility '$util' did not generate — theme is dead"; exit 1; }
           done
