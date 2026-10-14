@@ -1607,7 +1607,7 @@ describe("Orchestration & Routing Tests", () => {
     expect(BUILTIN_MODES.executor.tools_filter).toEqual([
       "read_file", "write_file", "edit_file", "multi_edit", "apply_patch",
       "glob", "grep", "list_directory",
-      "git_metadata",
+      "git_metadata", "git_diff", "git_log",
       "bash",
       "powershell",
       "web_search", "web_fetch",
