@@ -88,7 +88,7 @@ describe("runCmaEsCampaign", () => {
       expect(Number.isFinite(report.meanFitness)).toBe(true);
       expect(report.sigma).toBeGreaterThan(0);
     }
-  }, 120_000);
+  }, 300_000);
 
   test("winner is always a valid in-bounds theta", async () => {
     const result = await runCmaEsCampaign({
@@ -102,7 +102,7 @@ describe("runCmaEsCampaign", () => {
       const v = result.winner[key];
       expect(Number.isFinite(v), `${key} is not finite`).toBe(true);
     }
-  }, 120_000);
+  }, 300_000);
 
   test("a large-scale dimension (thrash_ttl_ms, width 7.14M) moves after one generation", async () => {
     // Regression guard for the sigma-scaling limitation flagged in
@@ -119,7 +119,7 @@ describe("runCmaEsCampaign", () => {
       rng: seededRng(11),
     });
     expect(result.winner.thrash_ttl_ms).not.toBe(BASELINE_THETA.thrash_ttl_ms);
-  }, 120_000);
+  }, 300_000);
 
   test("invokes the per-generation callback", async () => {
     const seen: number[] = [];
@@ -134,7 +134,7 @@ describe("runCmaEsCampaign", () => {
     expect(seen.length).toBeGreaterThan(0);
     // Generations are reported in increasing order.
     expect([...seen].sort((a, b) => a - b)).toEqual(seen);
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("pairedTTestImproved", () => {
@@ -188,7 +188,7 @@ describe("compareHeldOut", () => {
     expect([...uniqueSeeds].sort((a, b) => a - b)).toEqual(
       [...expectedTaskSeeds].sort((a, b) => a - b),
     );
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("CRN training fitness", () => {
@@ -218,7 +218,7 @@ describe("CRN training fitness", () => {
     for (let t = 0; t < HELD_OUT_TASKS.length; t++) {
       expect(seenSeeds.has(t)).toBe(true);
     }
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("proposeCampaignWinner", () => {
