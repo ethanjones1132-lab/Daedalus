@@ -1,3 +1,4 @@
+import { sectionCount } from '../../lib/list-tally';
 // ═══════════════════════════════════════════════════════════════
 // ── MemoryView — Scoped operator inspection and controls ────────
 // ═══════════════════════════════════════════════════════════════
@@ -446,7 +447,7 @@ export default function MemoryView() {
       <SectionHeader
         title="Memory"
         subtitle="Scoped inspection and operator controls"
-        count={legacyMode ? legacyEntries.length : entries.length}
+        count={legacyMode ? sectionCount(legacyEntries, { loading, failed: error !== null }) : sectionCount(entries, { loading, failed: error !== null })}
         action={
           <label className="flex items-center gap-2 text-xs text-ink/70">
             <input

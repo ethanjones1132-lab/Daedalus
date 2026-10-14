@@ -1,3 +1,4 @@
+import { projectImprovementScore } from '../../lib/skill-score-reading';
 import type { Ref } from 'react';
 import { Badge, Chip, cn, Panel, StatusDot } from '../../design';
 import type { SkillCandidateAction, SkillCandidateMutation } from '../../domain/skill-candidate-operation-state';
@@ -96,6 +97,7 @@ export function SkillCard({
   const meta = skillMeta(skill);
   const distilled = isDistilledSkill(skill);
   const candidateId = candidateIdOf(skill);
+  const improvement = projectImprovementScore(skill.improvement_score);
   const sourceLabel = distilled ? 'distilled' : (meta.source ?? null);
 
   return (
@@ -186,7 +188,7 @@ export function SkillCard({
 
       <div className="mt-auto flex items-center gap-3 border-t border-line pt-2 font-mono text-[10.5px] text-ink-3">
         <span>v{skill.version}</span>
-        {skill.improvement_score > 0 && <span>score {skill.improvement_score.toFixed(2)}</span>}
+        {improvement.text && <span title={improvement.basis ?? undefined}>score {improvement.text}</span>}
         <span className="ml-auto">{formatDate(skill.updated_at)}</span>
       </div>
     </Panel>

@@ -1,3 +1,6 @@
+import { defaultUrlTransform } from 'react-markdown';
+import { projectLink } from '../../lib/link-scheme';
+import RefusedMarkdownLink from './RefusedMarkdownLink';
 import {
   isValidElement,
   memo,
@@ -90,8 +93,10 @@ const markdownComponents = {
   },
   a(props: ComponentPropsWithoutRef<'a'>) {
     const { href, children } = props;
+    const link = projectLink(href);
+    if (!link.allowed) return <RefusedMarkdownLink address={link.address} text={children} />;
     return (
-      <a href={href} target="_blank" rel="noopener noreferrer">
+      <a href={link.href} target="_blank" rel="noopener noreferrer">
         {children}
       </a>
     );
@@ -191,6 +196,7 @@ function MarkdownView({ content, className }: MarkdownViewProps) {
   return (
     <div className={cn('d-prose', className)}>
       <ReactMarkdown
+        urlTransform={(value, key) => key === 'href' ? value : defaultUrlTransform(value)}
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
         components={markdownComponents}

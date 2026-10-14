@@ -1,3 +1,6 @@
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { TRANSCRIPT_WINDOW, anchoredScrollTop, extendWindow, transcriptWindow, windowSlice, windowStart } from '../../lib/transcript-window';
+import { TranscriptWindowNotice } from './TranscriptWindowNotice';
 import { ArrowDown, Bug, Code2, Lightbulb, type LucideIcon } from 'lucide-react';
 import { AlertLine, Mark } from '../../design';
 import type { JarvisConfig } from '../../domain/types';
@@ -97,6 +100,19 @@ function HistorySkeleton() {
 }
 
 export function Transcript({ turn, config }: { turn: SessionTurn; config: JarvisConfig | null }) {
+  const [visible, setVisible] = useState(TRANSCRIPT_WINDOW);
+  const anchor = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  useEffect(() => setVisible(TRANSCRIPT_WINDOW), [turn.selectedSessionId]);
+  const extend = () => {
+    const node = turn.scrollContainerRef.current;
+    anchor.current = node ? { scrollHeight: node.scrollHeight, scrollTop: node.scrollTop } : null;
+    setVisible(current => extendWindow(current, turn.messages.length));
+  };
+  useLayoutEffect(() => {
+    const node = turn.scrollContainerRef.current;
+    if (node && anchor.current) { node.scrollTop = anchoredScrollTop(anchor.current, node.scrollHeight); anchor.current = null; }
+  }, [visible, turn.scrollContainerRef]);
+
   const {
     messages,
     loadingHistory,
@@ -138,12 +154,12 @@ export function Transcript({ turn, config }: { turn: SessionTurn; config: Jarvis
           {empty && <EmptySession config={config} onPick={onSuggestionClick} />}
 
           {messages.length > 0 && (
-            <div className="space-y-9">
-              {messages.map((msg, i) => (
+            <div className="space-y-9"><TranscriptWindowNotice window={transcriptWindow(messages.length, visible)} onExtend={extend} />
+              {windowSlice(messages, visible).map((msg, i) => (
                 <TurnMessage
                   key={msg.id ?? i}
                   message={msg}
-                  index={i}
+                  index={i + windowStart(messages.length, visible)}
                   streamStatus={msg.isStreaming && !msg.content.trim() && !showSkeleton ? streamStatusText : undefined}
                 />
               ))}

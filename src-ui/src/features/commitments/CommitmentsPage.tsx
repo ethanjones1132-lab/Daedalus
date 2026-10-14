@@ -1,3 +1,5 @@
+import RecordIdBadge from '../system/RecordIdBadge';
+import { decideCreateReadback, createFailureSentence, type CreateFailure } from '../../domain/create-readback';
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Plus, RefreshCw, Trash2 } from 'lucide-react';
@@ -61,7 +63,7 @@ export default function CommitmentsPage() {
   const [text, setText] = useState('');
   const [due, setDue] = useState('');
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const createPending = useRef(false);
   const [filter, setFilter] = useState<Filter>('open');
   const { success } = useToast();
@@ -81,14 +83,15 @@ export default function CommitmentsPage() {
     setLoading(true);
     try {
       const snapshot = await invoke<Commitment[]>('get_commitments');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileCommitments(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setCommitments(result.rows);
       setLoaded(true);
       setError(null);
+      return snapshot;
     } catch {
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let rowFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -99,6 +102,7 @@ export default function CommitmentsPage() {
       }
       publishOperations(next);
       if (!rowFailure) setError('Could not refresh commitments. Retry reloads the list only.');
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -121,17 +125,18 @@ export default function CommitmentsPage() {
     createPending.current = true;
     setCreating(true);
     try {
-      await invoke<Commitment>('add_commitment', {
+      const returned = await invoke<Commitment>('add_commitment', {
         text: text.trim(),
         due: due ? new Date(due).toISOString() : null,
       });
+      const verdict = decideCreateReadback<Commitment>(returned, await fetchCommitments());
+      if (verdict.status !== 'confirmed') { setCreateFailure(verdict.status); return; }
       success('Commitment added');
-      setCreateError(false);
+      setCreateFailure(null);
       setText('');
       setDue('');
-      await fetchCommitments();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -210,13 +215,14 @@ export default function CommitmentsPage() {
             {creating ? 'Adding…' : 'Add'}
           </Button>
         </div>
-        {createError && (
+        {createFailure && (
           <AlertLine
             className="mt-3"
-            onRetry={add}
+            onRetry={createFailure === 'write-failed' ? add : undefined}
+            retryLabel="Retry adding the commitment"
             retryDisabled={creating || !text.trim()}
           >
-            Could not add the commitment. Your draft was kept.
+            {createFailureSentence('commitment', createFailure)}
           </AlertLine>
         )}
       </Panel>
@@ -315,6 +321,7 @@ function CommitmentRow({
             {c.text}
           </p>
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-ink-3">
+            <RecordIdBadge id={c.id} label="commitment" />
             <span className={cn(overdue && 'text-warn')}>{formatDue(c.due)}{overdue && ' · overdue'}</span>
             {c.goal_id && <span>Goal {c.goal_id}</span>}
             <span>{c.agent_id ? `owner ${c.agent_id}` : 'owner unassigned'}</span>

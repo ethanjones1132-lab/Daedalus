@@ -30,7 +30,7 @@ async function renderIdle(ui: React.ReactNode) {
 }
 
 describe('add_node refresh boundary', () => {
-  it('keeps creation successful when list refresh fails and retries only the list', async () => {
+  it('keeps creation unconfirmed when list refresh fails and retries only the list', async () => {
     const creation = deferred<unknown>();
     const refresh = deferred<unknown>();
     let listCalls = 0;
@@ -46,13 +46,14 @@ describe('add_node refresh boundary', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add' }));
     expect(screen.queryByText('Added node example')).not.toBeInTheDocument();
     await act(async () => { creation.resolve({ id: 'created' }); });
-    expect(screen.getByText('Added node example')).toBeInTheDocument();
-    expect(name).toHaveValue('');
+    expect(screen.queryByText('Added node example')).not.toBeInTheDocument();
+    expect(name).toHaveValue('example');
     expect(name).toBeDisabled();
     await act(async () => { refresh.reject(new Error('List refresh unavailable')); });
-    expect(screen.getByText('Added node example')).toBeInTheDocument();
+    expect(screen.queryByText('Added node example')).not.toBeInTheDocument();
     expect(screen.queryByText(/Could not (add|register) the/)).not.toBeInTheDocument();
-    expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert').map(node => node.textContent).join(' ')).toContain('the node list could not be read back');
+    expect(screen.queryByText('List refresh unavailable')).not.toBeInTheDocument();
     expect(name).toBeEnabled();
     fireEvent.change(name, { target: { value: 'next draft' } });
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
@@ -64,9 +65,10 @@ describe('add_node refresh boundary', () => {
 
 describe('NodesPage creation guard', () => {
   it('invokes add_node exactly once across click and Enter repetition while pending', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -89,16 +91,17 @@ describe('NodesPage creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Adding…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_node')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'n1' }); });
+    await act(async () => { const created = { id: 'n1', name: 'edge-1', address: '10.0.0.5:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] }; store.push(created); first.resolve(created); });
     expect(screen.getByPlaceholderText('Node name')).toHaveValue('');
     expect(screen.getByPlaceholderText('Address (host:port)')).toHaveValue('');
   });
 
   it('retains the draft after a rejected add with retryable feedback', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -115,12 +118,12 @@ describe('NodesPage creation guard', () => {
     expect(screen.getByPlaceholderText('Address (host:port)')).toHaveValue('10.0.0.5:7000');
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_nodes') return Promise.resolve([]);
+      if (command === 'get_nodes') return Promise.resolve([...store]);
       if (command === 'add_node') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await act(async () => { retry.resolve({ id: 'n1' }); });
+    await act(async () => { const created = { id: 'n1', name: 'edge-1', address: '10.0.0.5:7000', status: 'unknown', latency_ms: null, last_ping: '', capabilities: [] }; store.push(created); retry.resolve(created); });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Node name')).toHaveValue('');
   });

@@ -74,8 +74,8 @@ export function useSkillsController() {
         const reconciled = applySkillListRead(list, protections.current, readId);
         protections.current = reconciled.protections;
         setSkills(reconciled.skills);
-      } catch (e) {
-        if (readId === listReadId.current) setError(String(e));
+      } catch {
+        if (readId === listReadId.current) setError('Could not read skills. Retry the read.');
       } finally {
         if (readId === listReadId.current) setLoading(false);
       }

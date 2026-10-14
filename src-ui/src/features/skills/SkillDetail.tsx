@@ -1,3 +1,4 @@
+import { decodeSkillScore } from '../../lib/skill-score-reading';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { RotateCcw, X } from 'lucide-react';
@@ -122,8 +123,8 @@ export function SkillDetail({
         limit: 50,
       });
       setRevisions(revs);
-    } catch (e) {
-      setRevError(String(e));
+    } catch {
+      setRevError('Could not read skill revisions. Retry the read.');
     } finally {
       setLoadingRevs(false);
     }
@@ -140,8 +141,8 @@ export function SkillDetail({
         success(`Restored ${skill.name} to v${rev.version}`, 'Revision restored');
         await loadRevisions();
         onChanged();
-      } catch (e) {
-        toastError(String(e), 'Restore failed');
+      } catch {
+        toastError('The skill revision could not be restored. Retry the same revision.', 'Restore failed');
       }
     },
     [skill.name, loadRevisions, onChanged, success, toastError],
@@ -217,13 +218,14 @@ export function SkillDetail({
           )}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <span className="d-label">Confidence</span>
-            <Badge tone="neutral">{candidateDetail.confidence.toFixed(2)}</Badge>
+            <Badge tone="neutral">{decodeSkillScore(candidateDetail.confidence, 'confidence').label}</Badge>
             {candidateDetail.eval_score !== undefined && (
               <>
                 <span className="d-label">Eval score</span>
-                <Badge tone={candidateDetail.eval_score >= 0.75 ? 'ok' : 'warn'}>{candidateDetail.eval_score.toFixed(2)}</Badge>
+                <Badge tone={candidateDetail.eval_score >= 0.75 ? 'ok' : 'warn'}>{decodeSkillScore(candidateDetail.eval_score, 'eval_score').label}</Badge>
               </>
             )}
+            {decodeSkillScore(candidateDetail.confidence, 'confidence').basis && <p className="text-xs text-ink-3">{decodeSkillScore(candidateDetail.confidence, 'confidence').basis}</p>}
             {candidateDetail.status === 'rejected' && candidateDetail.rejection_reason && (
               <>
                 <span className="d-label">Rejected</span>

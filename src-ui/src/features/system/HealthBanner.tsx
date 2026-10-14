@@ -90,7 +90,7 @@ export default function HealthBanner() {
     : { level: 'unavailable' as const, label: 'Unavailable', summary: 'Health observation is unavailable.' };
   const level = presentation.level;
   const style = level === 'ok' ? null : BAND_STYLES[level];
-  const subsystems = projectHealthSubsystems(status);
+  const subsystems = projectHealthSubsystems(status, error);
   // The band unmounts itself when healthy, so recovery is only ever said here.
   const announcement = level === 'ok' ? recoverAnnouncement(subsystems) : presentation.summary;
 
@@ -149,7 +149,7 @@ export default function HealthBanner() {
                 onClick={() => setExpanded((e) => !e)}
                 className="group flex min-h-8 w-full items-center gap-3 text-left"
               >
-                <StatusDot tone={style.tone} live={level !== 'unavailable'} />
+                <StatusDot tone={style.tone} live={!error && level !== 'unavailable'} />
                 <span className={cn('d-label shrink-0 font-medium', LABEL_TEXT[level])}>{presentation.label}</span>
                 <span className="min-w-0 flex-1 truncate text-ink-2">{presentation.summary}</span>
                 <span className="d-label flex shrink-0 items-center gap-1 text-ink-3 group-hover:text-ink-2">
@@ -167,7 +167,7 @@ export default function HealthBanner() {
                     <li key={row.key} aria-label={row.announcement} className="inline-flex items-center gap-1.5">
                       <StatusDot tone={DOT_TONE[row.state]} />
                       <span className="text-ink-2">{row.name}</span>
-                      <span className={STATE_TEXT[row.state]}>{row.stateWord}</span>
+                      <span className={STATE_TEXT[row.state]}>{row.stateWord}{row.stale && ' (stale)'}</span>
                       <span className="text-ink-4">· {row.requirementLabel}</span>
                       {row.detail && <span className="text-ink-4">({row.detail})</span>}
                     </li>

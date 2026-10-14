@@ -31,7 +31,7 @@ import { normalizeRoute } from "../orchestration/route-normalization";
 import { judgeAnswer } from "./judge";
 import { makeCallModel } from "./call-model";
 import { SEMANTIC_CASES, type SemanticCase } from "./semantic-cases";
-import type { ReplayResult } from "../training/promotion-gate";
+import type { ReplayEvidenceRow } from "../training/replay-evidence";
 
 export interface SemanticCaseResult {
   id: string;
@@ -124,13 +124,39 @@ export function toSemanticBaseline(report: SemanticReport): SemanticBaseline {
   return { version: 1, averageScore: report.averageScore, scores };
 }
 
+/** The expected-case manifest the offline promotion gate requires before it may
+ * approve anything: which cases this suite owes a verdict on, in the gate's own
+ * versioned envelope. Emitted from the suite itself rather than from a report, so
+ * a case that stops running cannot quietly shrink the evidence set. Only the case
+ * id is read — a case's request, rubric, or fixture carries no coverage meaning. */
+export function toSemanticCoverageContract(
+  cases: readonly { readonly id: string }[] = SEMANTIC_CASES,
+): {
+  schema_version: 1;
+  eval_suite: string;
+  generated_at: string;
+  expected_cases: string[];
+} {
+  return {
+    schema_version: 1,
+    eval_suite: SEMANTIC_EVAL_SUITE,
+    generated_at: new Date().toISOString(),
+    expected_cases: cases.map((c) => c.id),
+  };
+}
+
 /** Convert a semantic report into the replay evidence consumed by the offline
  * training promotion gate. Keeping this adapter here prevents callers from
- * inferring pass/fail from raw scores differently across training jobs. */
+ * inferring pass/fail from raw scores differently across training jobs.
+ *
+ * The A side is left absent when the report has no pinned baseline for that case:
+ * the gate rejects that as `replay_missing_baseline` rather than scoring the B
+ * side alone, which is why this function never substitutes a zero or the
+ * candidate's own score for a missing baseline. */
 export function toPromotionReplayResults(
   report: SemanticReport,
   baseline?: SemanticBaseline,
-): ReplayResult[] {
+): ReplayEvidenceRow[] {
   return report.results.map((result) => ({
     case_id: result.id,
     passed: result.score >= REGRESSION_ABSOLUTE_FLOOR,
@@ -142,6 +168,7 @@ export function toPromotionReplayResults(
 // A live model is non-deterministic — only fail on a real regression, not noise.
 const REGRESSION_DROP_THRESHOLD = 0.15;
 const REGRESSION_ABSOLUTE_FLOOR = 0.6;
+const SEMANTIC_EVAL_SUITE = "semantic-live";
 
 export function diffSemanticBaseline(report: SemanticReport, baseline: SemanticBaseline): string[] {
   const diffs: string[] = [];

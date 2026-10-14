@@ -1,3 +1,4 @@
+import { AGENT_RECORD_FIELD_BASIS, decodeAgentModelLabel } from '../../domain/agent-routing-scope';
 import { Pencil, Power, Trash2 } from 'lucide-react';
 import type { Agent, AgentOperation, AgentOperationAction } from '../../domain/agent-operation-state';
 import { AlertLine, Chip, cn, IconButton, StatusDot, StatusLine } from '../../design';
@@ -57,7 +58,7 @@ export function AgentRow({
             </span>
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            <Chip>{agent.model}</Chip>
+            <Chip title={decodeAgentModelLabel(agent.model).basis}>{decodeAgentModelLabel(agent.model).label}</Chip>
             {agent.backend && agent.backend !== 'jarvis' && <Chip className="text-info">{agent.backend}</Chip>}
           </div>
           {agent.description && <p className="mt-1.5 line-clamp-2 text-[12px] leading-snug text-ink-3">{agent.description}</p>}
@@ -68,7 +69,7 @@ export function AgentRow({
             selected ? 'opacity-100' : 'opacity-0 group-focus-within:opacity-100 group-hover:opacity-100',
           )}
         >
-          <IconButton size="xs" aria-label={agent.enabled ? 'Disable' : 'Enable'} title={agent.enabled ? 'Disable' : 'Enable'} onClick={onToggle} disabled={locked}>
+          <IconButton size="xs" aria-label={agent.enabled ? 'Disable' : 'Enable'} title={AGENT_RECORD_FIELD_BASIS} onClick={onToggle} disabled={locked}>
             <Power aria-hidden="true" />
           </IconButton>
           <IconButton size="xs" aria-label="Edit" title="Edit" onClick={onEdit} disabled={locked}>

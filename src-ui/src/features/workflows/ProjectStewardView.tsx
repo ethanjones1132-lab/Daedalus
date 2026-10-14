@@ -1,3 +1,4 @@
+import { sectionCount } from '../../lib/list-tally';
 // ── ProjectStewardView — explicit Project Steward setup flow ──
 //    (Roadmap Priority #4, Phase 4.1, Task 2)
 //
@@ -1051,7 +1052,7 @@ export default function ProjectStewardView({
       <SectionHeader
         title="Project Steward"
         subtitle="Start a project-scoped Goal from a persisted Session, then hand its task to Chat"
-        count={eligibleSessions.length}
+        count={sectionCount(eligibleSessions, { loading: loading, failed: loadError !== null })}
       />
 
       {onNavigateWorkflow && (

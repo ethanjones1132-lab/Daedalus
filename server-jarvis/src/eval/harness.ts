@@ -15,7 +15,7 @@ import { AgentPool, DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-p
 import { getToolsForMode } from "../orchestration/modes";
 import { classifyTurnRequirements } from "../orchestration/turn-requirements";
 import type { ToolDefinition } from "../tool-types";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { saveSkillCandidateForEvaluationFixture } from "../intelligence/skill-store";
@@ -306,7 +306,7 @@ export interface Baseline {
   version: number;
   total: number;
   passed: number;
-  /** id -> "pass" | "fail" */
+  /** id -> outcome, preserving the existing on-disk string schema. */
   outcomes: Record<string, "pass" | "fail">;
 }
 
@@ -323,53 +323,140 @@ export function toBaseline(report: EvalReport): Baseline {
 export function diffBaseline(report: EvalReport, baseline: Baseline): string[] {
   const diffs: string[] = [];
   const live = toBaseline(report);
+  const liveOutcomes = live.outcomes as Record<string, unknown>;
+  const baseOutcomes = baseline.outcomes as Record<string, unknown>;
 
   if (live.total !== baseline.total) {
     diffs.push(`case count changed: ${baseline.total} -> ${live.total} (update baseline.json)`);
   }
-  for (const [id, outcome] of Object.entries(baseline.outcomes)) {
-    const now = live.outcomes[id];
+  for (const [id, outcome] of Object.entries(baseOutcomes)) {
+    const now = liveOutcomes[id];
     if (now === undefined) diffs.push(`case removed: ${id}`);
     else if (now !== outcome) diffs.push(`case ${id}: ${outcome} -> ${now}`);
   }
-  for (const id of Object.keys(live.outcomes)) {
-    if (!(id in baseline.outcomes)) diffs.push(`case added: ${id} (update baseline.json)`);
+  for (const id of Object.keys(liveOutcomes)) {
+    if (!(id in baseOutcomes)) diffs.push(`case added: ${id} (update baseline.json)`);
   }
   return diffs;
 }
 
+// ── CLI gate ─────────────────────────────────────────────────────
+/**
+ * Decide the CLI regression gate's exit code and output lines from a report
+ * and a baseline path. Kept separate from the `import.meta.main` entrypoint so
+ * it can be exercised with isolated fixtures (temp baselines) without touching
+ * the repo's `baseline.json`.
+ *
+ * Fail-closed rule: a missing or malformed baseline is a gate FAILURE, not a
+ * warning. Without a readable snapshot we cannot prove the suite has not
+ * regressed, so the only way to (re)create a baseline is an explicit
+ * `--write-baseline`.
+ */
+/**
+ * Decide whether a parsed value is a structurally trustworthy Baseline.
+ *
+ * Fail-closed rule, tightened: a baseline only counts as readable when
+ *   - `total` is a non-negative integer,
+ *   - `outcomes` is a plain (non-array, non-null) object whose every value is
+ *     "pass" or "fail",
+ *   - `total` equals the number of entries in `outcomes`.
+ *
+ * Without all three we cannot prove the suite has not regressed, so the only
+ * way to (re)create a baseline is an explicit `--write-baseline`.
+ */
+export function validateBaseline(parsed: unknown): { ok: true; baseline: Baseline } | { ok: false; reason: string } {
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, reason: "baseline is not a valid Baseline object" };
+  }
+  const rec = parsed as Partial<Baseline>;
+  if (rec.version !== 1) return { ok: false, reason: "baseline.version must be 1" };
+  if (typeof rec.passed !== "number" || !Number.isInteger(rec.passed) || rec.passed < 0) {
+    return { ok: false, reason: "baseline.passed is not a non-negative integer" };
+  }
+
+  if (typeof rec.total !== "number" || !Number.isInteger(rec.total) || rec.total < 0) {
+    return { ok: false, reason: "baseline.total is not a non-negative integer" };
+  }
+  if (rec.outcomes === null || typeof rec.outcomes !== "object" || Array.isArray(rec.outcomes)) {
+    return { ok: false, reason: "baseline.outcomes is not an object" };
+  }
+
+  const entries = Object.entries(rec.outcomes as Record<string, unknown>);
+  if (entries.length !== rec.total) {
+    return {
+      ok: false,
+      reason: `baseline.total=${rec.total} does not match ${entries.length} outcomes entries`,
+    };
+  }
+  for (const [id, value] of entries) {
+    if (value === "pass" || value === "fail") continue;
+    return { ok: false, reason: `baseline.outcomes["${id}"] is ${JSON.stringify(value)}, not a pass/fail outcome` };
+  }
+
+  if (rec.passed !== entries.filter(([, value]) => value === "pass").length) {
+    return { ok: false, reason: "baseline.passed does not match passing outcomes" };
+  }
+  return { ok: true, baseline: rec as Baseline };
+}
+
+export function runCliGate(opts: {
+  report: EvalReport;
+  baselinePath: string;
+  writeBaseline: boolean;
+}): { exitCode: number; output: string[] } {
+  const { report, baselinePath, writeBaseline } = opts;
+  const output: string[] = [];
+
+  if (writeBaseline) {
+    writeFileSync(baselinePath, JSON.stringify(toBaseline(report), null, 2) + "\n");
+    output.push(`Wrote baseline (${report.passed}/${report.total} passing) to ${baselinePath}`);
+    return { exitCode: 0, output };
+  }
+
+  for (const r of report.results) {
+    output.push(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
+  }
+  output.push(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
+
+  // Read + validate the baseline. A missing file, invalid JSON, or a
+  // structurally untrustworthy object all mean the gate cannot be evaluated
+  // honestly.
+  let baseline: Baseline | null = null;
+  let readError: string | null = null;
+  try {
+    const parsed = JSON.parse(readFileSync(baselinePath, "utf8")) as unknown;
+    const verdict = validateBaseline(parsed);
+    if (verdict.ok) baseline = verdict.baseline;
+    else readError = verdict.reason;
+  } catch (e) {
+    readError = String(e);
+  }
+
+  if (readError !== null || baseline === null) {
+    output.push(`\nBaseline unreadable at ${baselinePath}: ${readError}`);
+    output.push("Failing closed — no readable baseline to regress against.");
+    output.push("Re-run with --write-baseline to create one explicitly.");
+    return { exitCode: 1, output };
+  }
+
+  // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
+  // complete regression gate matching harness.test.ts.
+  const drift = diffBaseline(report, baseline);
+  if (drift.length) {
+    output.push("\nBaseline drift detected:");
+    for (const d of drift) output.push(`  - ${d}`);
+    output.push("If intended, re-run with --write-baseline to update the snapshot.");
+  }
+
+  return { exitCode: report.failed > 0 || drift.length > 0 ? 1 : 0, output };
+}
+
 // ── CLI ──────────────────────────────────────────────────────────
 if (import.meta.main) {
-  const { writeFileSync } = await import("fs");
-  const { join } = await import("path");
   const report = await runEval();
   const baselinePath = join(import.meta.dir, "baseline.json");
-
-  if (process.argv.includes("--write-baseline")) {
-    writeFileSync(baselinePath, JSON.stringify(toBaseline(report), null, 2) + "\n");
-    console.log(`Wrote baseline (${report.passed}/${report.total} passing) to ${baselinePath}`);
-  } else {
-    for (const r of report.results) {
-      console.log(`${r.pass ? "PASS" : "FAIL"}  ${r.id}${r.pass ? "" : "  — " + r.detail}`);
-    }
-    console.log(`\n${report.passed}/${report.total} passed, ${report.failed} failed`);
-
-    // Gate on baseline DRIFT too (not just hard failures), so the CLI is a
-    // complete regression gate matching harness.test.ts.
-    const { readFileSync } = await import("fs");
-    let drift: string[] = [];
-    try {
-      const baseline = JSON.parse(readFileSync(baselinePath, "utf8")) as Baseline;
-      drift = diffBaseline(report, baseline);
-      if (drift.length) {
-        console.log("\nBaseline drift detected:");
-        for (const d of drift) console.log(`  - ${d}`);
-        console.log("If intended, re-run with --write-baseline to update the snapshot.");
-      }
-    } catch (e) {
-      console.log(`\n(could not read baseline: ${e})`);
-    }
-
-    if (report.failed > 0 || drift.length > 0) process.exit(1);
-  }
+  const writeBaseline = process.argv.includes("--write-baseline");
+  const { exitCode, output } = runCliGate({ report, baselinePath, writeBaseline });
+  for (const line of output) console.log(line);
+  process.exit(exitCode);
 }

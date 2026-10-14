@@ -109,7 +109,7 @@ export default function SessionsPage() {
           if (request !== sessionsRequest.current) return;
           setRunTelemetry(decideSessionRunTelemetry(read, visibleIds));
         });
-      } catch (e) {
+      } catch {
         if (request !== sessionsRequest.current) return;
         const next = { ...sessionDeleteOperationsRef.current };
         let removalFailure = false;
@@ -120,7 +120,7 @@ export default function SessionsPage() {
           }
         }
         if (removalFailure) publishSessionDeleteOperations(next);
-        else setSessionsError(String(e));
+        else setSessionsError('Retry to read the Session list again.');
       } finally {
         if (request === sessionsRequest.current) {
           if (options?.deletionRead) sessionDeleteReadPending.current = false;

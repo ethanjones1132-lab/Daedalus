@@ -49,7 +49,7 @@ describe('Gateway observation recovery', () => {
     await settle(0, false);
     expect(screen.getByText('Gateway is stopped')).toBeInTheDocument();
     expect(screen.getByText('offline')).toBeInTheDocument();
-    expect(screen.getByText('1h 1m')).toBeInTheDocument();
+    expect(screen.getAllByText('Not measured')).toHaveLength(2);
     expect(screen.getByText('19878')).toBeInTheDocument();
     expect(screen.getByText('observed-version')).toBeInTheDocument();
     expect(refresh()).toBeEnabled();

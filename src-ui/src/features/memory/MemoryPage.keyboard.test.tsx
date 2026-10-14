@@ -157,9 +157,9 @@ describe('Memory keyboard inspection', () => {
     expect(details).not.toHaveTextContent('undefined');
     expect(details).not.toHaveTextContent('null');
     expect(details).not.toHaveTextContent('private_note');
-    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
-      'list_recent_memories',
+    expect(invokeMock.mock.calls.map(([command]) => command).sort()).toEqual([
       'jarvis_get_tier_stats',
+      'list_recent_memories',
     ]);
   });
 
@@ -185,9 +185,9 @@ describe('Memory keyboard inspection', () => {
     await mount();
     await userEvent.setup().click(inspectButton('First memory'));
 
-    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
-      'list_recent_memories',
+    expect(invokeMock.mock.calls.map(([command]) => command).sort()).toEqual([
       'jarvis_get_tier_stats',
+      'list_recent_memories',
     ]);
   });
 });

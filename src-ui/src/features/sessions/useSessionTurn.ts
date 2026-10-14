@@ -1,3 +1,4 @@
+import { decodeStopConfirmation, initialStopRequestState, isCurrentStopRequest, projectStopRequest, reduceStopRequest, type StopRequestEvent, type StopRequestState, type StopOutcome } from '../../domain/turn-cancellation';
 import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -626,6 +627,8 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   const onSessionCreatedRef = useRef(onSessionCreated);
   const streamAbortRef = useRef<AbortController | null>(null);
   const sendGateRef = useRef(new SendGate());
+  // Owns setup from native Session creation until the HTTP request begins.
+  const submissionRef = useRef<{ generation: number; dispatched: boolean; optimisticUserId?: string } | null>(null);
   // 2026-07-13 live incident (session 7254c3ae): a rapid second Enter-press
   // bypassed the React-state `isStreaming` guard because setState is
   // async/batched. The server-side ActiveStreamRegistry then silently
@@ -633,6 +636,20 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   // closes the race on the client side; see SendInFlightGuard.
   const sendInFlightRef = useRef(new SendInFlightGuard());
   const stopRequestedRef = useRef(false);
+  const [stopRequest, setStopRequest] = useState<StopRequestState>(initialStopRequestState);
+  const stopRequestRef = useRef<StopRequestState>(initialStopRequestState);
+  const stopAttemptRef = useRef(0);
+  const stopInFlightRef = useRef(false);
+  const stopView = projectStopRequest(stopRequest);
+  const dispatchStopRequest = useCallback((event: StopRequestEvent) => {
+    const next = reduceStopRequest(stopRequestRef.current, event);
+    stopRequestRef.current = next;
+    if (mountedRef.current) setStopRequest(next);
+  }, []);
+  const resetStopRequest = useCallback(() => {
+    stopInFlightRef.current = false;
+    dispatchStopRequest({ type: 'clear' });
+  }, [dispatchStopRequest]);
   // Whether any response text frame has landed this Session turn. Ref-backed
   // so the pure `buildTurnProgress` view-model can distinguish "receiving
   // response text" from unverified stage work without a dedicated state
@@ -861,6 +878,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     // batching cannot drop the last ~16ms of streamed text.
     const pending = takePendingTokens();
     setIsStreaming(false);
+    resetStopRequest();
     setPipelineStage('');
     setRecursionDepth(null);
     clearPendingApproval();
@@ -956,7 +974,10 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       streamAbortRef.current?.abort('Session switched');
       streamAbortRef.current = null;
       sendGateRef.current.invalidate();
+      submissionRef.current = null;
+      sendInFlightRef.current.finish();
       stopRequestedRef.current = false;
+    resetStopRequest();
       discardPendingTokens();
       setMessages([]);
       setIsStreaming(false);
@@ -1050,6 +1071,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     return () => {
       mountedRef.current = false;
       sendGateRef.current.invalidate();
+      submissionRef.current = null;
       sendInFlightRef.current.finish();
       const controller = streamAbortRef.current;
       streamAbortRef.current = null;
@@ -1164,7 +1186,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       }).catch((e: any) => {
         if (conversationEpochRef.current !== ownerEpoch || !matchesStreamSession(sid)) return;
         console.error('Failed to persist assistant message:', e);
-        setError('Append failed: ' + (e?.message || String(e)));
+        setError('Append failed: Daedalus could not save this message to the Session.');
       });
     };
 
@@ -1767,7 +1789,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         // No saved row -> no inference. Throw a truthful persistence failure to
         // the existing draft-recovery path; never claim the optimistic bubble
         // is saved.
-        throw new Error('Could not save your message: ' + (e?.message || String(e)));
+        throw new Error('Append failed: Daedalus could not save this message to the Session.');
       }
 
       // 2. Prepare native recall and load native prompt history. References
@@ -1866,6 +1888,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       }
       stopIfStale();
 
+      if (submissionRef.current?.generation === sendGeneration) submissionRef.current.dispatched = true;
       const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1888,8 +1911,8 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       });
 
       if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`Jarvis server returned ${response.status}: ${body}`);
+        await response.text().catch(() => '');
+        throw new Error(`Jarvis server returned ${response.status}.`);
       }
       if (!response.body) {
         throw new Error('Jarvis server returned no response stream.');
@@ -2265,6 +2288,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         const pending = takePendingTokens();
         setIsStreaming(false);
         stopRequestedRef.current = false;
+    resetStopRequest();
         setError(null);
         setMessages(prev => {
           const withTokens = applyTokenChunk(prev, pending);
@@ -2533,7 +2557,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       sendInFlightRef.current.finish();
       return;
     }
+    submissionRef.current = { generation: sendGeneration, dispatched: false };
     stopRequestedRef.current = false;
+    resetStopRequest();
     discardPendingTokens();
     setError(null);
     // Phase 2.4 — clear the previous turn's memory surface. The native history
@@ -2585,6 +2611,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     // (see streamFromJarvisApi) so dedupeMessages recognizes the reload-from-
     // history copy as the same instance rather than rendering it twice.
     const clientMessageId = crypto.randomUUID();
+    if (submissionRef.current?.generation === sendGeneration) submissionRef.current.optimisticUserId = clientMessageId;
     // Stable local identity for the optimistic assistant bubble. The direct
     // finalizer reconciles the actual persisted DB id onto exactly this id.
     const assistantClientMessageId = crypto.randomUUID();
@@ -2614,6 +2641,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
             name: userMsg.slice(0, 60),
             ...(selectedAgentId !== 'main' ? { agentId: selectedAgentId } : {}),
           });
+          if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
           newSessionId = newSession.id;
           pendingNewSessionRef.current = newSession.id;
           pendingNewSessionAgentRef.current = selectedAgentId;
@@ -2629,6 +2657,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         // never launches inference.
         if (pendingProjectRoot) {
           const bound = await bindWorkspaceForSession(newSessionId, pendingProjectRoot);
+          if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
           if (!bound) {
             if (mountedRef.current && sendGateRef.current.isCurrent(sendGeneration)) {
               setIsStreaming(false);
@@ -2656,6 +2685,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         onSessionsChanged();
       }
 
+      if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
       const goalForTurn = selectedGoalId;
       await streamFromJarvisApi(effectiveSessionId, userMsg, sendGeneration, () => {
         if (!override) {
@@ -2676,16 +2706,25 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setIsStreaming(false);
       if (stopRequestedRef.current) {
         stopRequestedRef.current = false;
+    resetStopRequest();
         setError(null);
-        setMessages(prev => finalizeStreamingMessages(applyTokenChunk(prev, pending)));
+        setMessages(prev => {
+          const withTokens = applyTokenChunk(prev, pending);
+          const last = withTokens[withTokens.length - 1];
+          if (last?.role === 'assistant' && last.isStreaming) {
+            const content = sanitizeAssistantDisplay(last.content);
+            return content ? [...withTokens.slice(0, -1), { ...last, content, isStreaming: false, isCancelled: true }] : withTokens.slice(0, -1);
+          }
+          return finalizeStreamingMessages(withTokens);
+        });
         return;
       }
       // Task 7 Part C (incident 1d4727cf): finalize the streaming bubble into
       // a designed error bubble — friendly text, `errorCode` as small muted
       // detail — instead of leaving a plain assistant-looking message and
       // relying solely on the (dismissable, easy-to-miss) banner below.
-      const errorMessage = String(e instanceof Error ? e.message : e);
-       const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
+      const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
+       const errorMessage = errorCode ? String(e instanceof Error ? e.message : e) : 'The turn failed. Your message is kept as a draft — send it again to retry.';
        setError(errorMessage);
        if (!override) {
          publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
@@ -2706,13 +2745,11 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         return withTokens;
       });
     } finally {
-      sendGateRef.current.release(sendGeneration);
-      // Mirror the React `isStreaming` state into the synchronous guard so
-      // the next handleSend call can proceed normally. The `isCurrent`/
-      // `invalidate` dance in sendGateRef handles stale completions, but
-      // the in-flight guard is the simpler "is anything in flight right
-      // now" check that needs a single finish() on every exit.
-      sendInFlightRef.current.finish();
+      // A replaced submission cannot release the replacement's synchronous lock.
+      if (sendGateRef.current.release(sendGeneration)) {
+        if (submissionRef.current?.generation === sendGeneration) submissionRef.current = null;
+        sendInFlightRef.current.finish();
+      }
     }
   }, [isStreaming, messages, activeSession, sessionId, onSessionCreated, onSessionsChanged, setActiveSession, clearRunRecord, streamFromJarvisApi, discardPendingTokens, takePendingTokens, applyTokenChunk, publishDraftStore, resetActivityLedger, includeUserScope, pendingAgentId, pendingProjectRoot, selectedGoalId, bindWorkspaceForSession]);
 
@@ -2730,38 +2767,61 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     void handleSend(RESUME_OBJECTIVE_DIRECTIVE);
   }, [isStreaming, activeSession, memoryContinuity, handleSend]);
 
-  // Phase 1.3 — real Stop. POST /chat/cancel on the Bun server; SseRelay now
-  // treats the resulting `cancelled` frame as terminal, so isStreaming flips.
+  // Before HTTP dispatch, Stop retires local setup without claiming a remote
+  // cancellation. Once dispatched, Native confirmation alone authorizes
+  // tearing down the reader; refusal keeps the live turn available to retry.
   const handleStop = useCallback(async () => {
-    const sid = activeSession || sessionId;
-    if (!sid) {
+    const submission = submissionRef.current;
+    if (submission && !submission.dispatched && sendGateRef.current.isCurrent(submission.generation)) {
+      // Nothing has been sent to the server yet. Retire local setup immediately;
+      // the native memory finalizer can still account for a saved user row.
+      sendGateRef.current.invalidate();
+      submissionRef.current = null;
+      sendInFlightRef.current.finish();
+      streamAbortRef.current?.abort('Stopped before dispatch');
+      streamAbortRef.current = null;
+      resetStopRequest();
+      discardPendingTokens();
+      clearPendingApproval();
       setIsStreaming(false);
+      setMessages(prev => prev.filter(message => message.id !== submission.optimisticUserId && !(message.role === 'assistant' && message.isStreaming && !message.content)));
+      setError('Turn stopped before it was sent. Your draft was kept.');
       return;
     }
+    const sid = activeSession || sessionId;
+    if (!sid) return;
+    // One request per attempt, whatever the entry point: a click, a second
+    // click, or Esc in the composer all land here.
+    if (stopInFlightRef.current) return;
+    stopInFlightRef.current = true;
+    const attempt = ++stopAttemptRef.current;
+    const controller = streamAbortRef.current;
+    dispatchStopRequest({ type: 'begin', attempt, sessionId: sid });
+    let outcome: StopOutcome;
+    try {
+      outcome = decodeStopConfirmation(await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid)));
+    } catch {
+      // The reason is withheld: it can carry a store path, and the operator
+      // gets a sentence they can act on rather than one they can only read.
+      outcome = 'unavailable';
+    }
+    if (!mountedRef.current) return;
+    // A newer attempt, or a Session this view has already left, owns the
+    // control now. This answer is about a turn that is no longer on screen.
+    if (!isCurrentStopRequest(stopRequestRef.current, attempt, sid)) return;
+    stopInFlightRef.current = false;
+    dispatchStopRequest({ type: 'settle', attempt, sessionId: sid, outcome });
+    if (outcome !== 'confirmed') return;
+    // A confirmation that arrives after the turn already ended confirms
+    // nothing: the reader this stop named has been released, so there is no
+    // turn left to tear down and nothing to record as a user stop.
+    if (streamAbortRef.current !== controller) return;
     stopRequestedRef.current = true;
     clearPendingApproval();
-    const controller = streamAbortRef.current;
     setReasoningText('');
     setShowReasoning(false);
-    fetch(`${JARVIS_API_URL}/chat/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sid }),
-    }).catch(() => {});
-    try {
-      const cancelled = await invoke<boolean>('cancel_chat_stream', sessionInvokeArgs(sid));
-      if (cancelled) {
-        controller?.abort('Explicit Stop confirmed');
-      } else {
-        controller?.abort('Explicit Stop was not confirmed');
-        setIsStreaming(false);
-      }
-    } catch (e) {
-      console.error('Failed to cancel stream:', e);
-      controller?.abort('Explicit Stop request failed');
-      setIsStreaming(false);
-    }
-  }, [activeSession, clearPendingApproval, sessionId]);
+    controller?.abort('Explicit Stop confirmed by the server');
+  }, [activeSession, clearPendingApproval, dispatchStopRequest, sessionId, resetStopRequest, discardPendingTokens]);
 
   // Phase 1.1 — approve / deny the pending tool call and forward the decision
   // to the Bun server. Surface any POST error so the user can retry.
@@ -2830,7 +2890,10 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     streamAbortRef.current?.abort('New Session');
     streamAbortRef.current = null;
     sendGateRef.current.invalidate();
+    submissionRef.current = null;
+    sendInFlightRef.current.finish();
     stopRequestedRef.current = false;
+    resetStopRequest();
     discardPendingTokens();
     setIsStreaming(false);
     setMessages([]);
@@ -2977,6 +3040,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     memoryDiagnosticForSession, memoryReceiptForSession, memoryContinuityForSession,
     memoryContinuityError, memoryContinuityPending, memoryTurnReadError, memoryTurnId,
     persistedUserMessages, refreshMemoryTurn, handleSetObjective, handleResumeObjective,
+    stopView,
     // transcript
     messages,
     loadingHistory,

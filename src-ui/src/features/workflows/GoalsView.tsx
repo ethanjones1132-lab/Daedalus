@@ -1,3 +1,4 @@
+import { sectionCount } from '../../lib/list-tally';
 // ── GoalsView — durable user-owned Goals with acceptance criteria ──
 //    (goal_create/goal_list/goal_get/goal_update/goal_transition/
 //     goal_links_list). Completion is never inferred here: trusted acceptance
@@ -2853,7 +2854,7 @@ export default function GoalsView({
       <SectionHeader
         title="Goals"
         subtitle="User-owned objectives and the acceptance criteria they must meet"
-        count={goals.length}
+        count={sectionCount(goals, { loading: loading, failed: error !== null })}
       />
 
       {onNavigateWorkflow && (

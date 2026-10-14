@@ -65,7 +65,7 @@ export default function NodesPage() {
     const trimmedAddress = address.trim();
     void list.create(
       () => invoke<ComputeNode>('add_node', { name: trimmedName, address: trimmedAddress }),
-      `Added node ${trimmedName}`,
+      (confirmed) => `Added node ${confirmed.name}`,
       () => {
         setName('');
         setAddress('');
@@ -98,8 +98,8 @@ export default function NodesPage() {
 
       <div className="space-y-4">
         {list.createError && (
-          <AlertLine onRetry={add} retryDisabled={list.creating || !canAdd}>
-            Could not add the node. Your draft was kept.
+          <AlertLine onRetry={list.createCanRetry ? add : undefined} retryDisabled={list.creating || !canAdd}>
+            {list.createMessage}
           </AlertLine>
         )}
 

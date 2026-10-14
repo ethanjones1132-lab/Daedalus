@@ -22,8 +22,8 @@ import { usePolling } from '../../hooks/usePolling';
  *
  * Backend reality (verified in Rust, commands/system.rs): `running` is a
  * listening-port probe on 19876; `active_connections` and `uptime_seconds`
- * are hard-coded 0. A zero is therefore shown as "not measured", never as a
- * measurement. A failed read never infers "stopped": the last observation is
+ * are placeholder fields. They are shown as "Not measured" until Native
+ * supplies a measured-field contract. A failed read never infers "stopped": the last observation is
  * kept and labelled stale.
  */
 
@@ -36,14 +36,7 @@ interface GatewayStatus {
   timestamp: string;
 }
 
-function formatUptime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
+
 
 export default function GatewayPage() {
   const [{ snapshot: status, loading, error }, dispatch] = useReducer(
@@ -119,13 +112,13 @@ export default function GatewayPage() {
                 <Stat label="Version" value={<span className="text-[26px]">{status.version}</span>} />
                 <Stat
                   label="Connections"
-                  value={status.active_connections > 0 ? status.active_connections : '—'}
-                  sub={status.active_connections > 0 ? undefined : 'not measured'}
+                  value="Not measured"
+                  sub="native placeholder field"
                 />
                 <Stat
                   label="Uptime"
-                  value={status.uptime_seconds > 0 ? formatUptime(status.uptime_seconds) : '—'}
-                  sub={status.uptime_seconds > 0 ? undefined : 'not measured'}
+                  value="Not measured"
+                  sub="native placeholder field"
                 />
               </div>
             </Panel>

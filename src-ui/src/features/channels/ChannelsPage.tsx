@@ -1,3 +1,5 @@
+import { listRead, projectListTally } from '../../lib/list-tally';
+import { channelProbePhase, projectChannelLiveness } from '../../domain/channel-liveness';
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ArrowUpRight, Hash, Plug, Plus, RefreshCw, Trash2, Unplug, X } from 'lucide-react';
@@ -342,11 +344,6 @@ export default function ChannelsPage() {
       const operation: ChannelOperation<Channel> = { row: channel, action, phase: 'writing', after: requestId.current };
       publishOperations({ ...operationsRef.current, [channel.id]: operation });
       if (action === 'connect') {
-        setVerifiedChannels((current) => {
-          const next = new Set(current);
-          next.delete(channel.id);
-          return next;
-        });
         if (!(await verifyDelivery(channel))) {
           publishOperations({
             ...operationsRef.current,
@@ -404,6 +401,7 @@ export default function ChannelsPage() {
   const deleteOperation = pendingDelete ? operations[pendingDelete.id] : undefined;
   const deleting = deleteOperation?.action === 'remove' && deleteOperation.phase === 'writing';
 
+  const headerTally = projectListTally(channels, listRead(channels, { loading, failed: error !== null }));
   const connectedCount = useMemo(() => channels.filter(isConnected).length, [channels]);
   const verifiedCount = useMemo(
     () => channels.filter((channel) => verifiedChannels.has(channel.id)).length,
@@ -458,10 +456,10 @@ export default function ChannelsPage() {
           <Panel flush>
             <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
               <h2 className="text-[13px] font-semibold text-ink">Configured channels</h2>
-              <span className="font-mono text-[11px] tabular text-ink-3">{channels.length}</span>
+              <span className="font-mono text-[11px] tabular text-ink-3">{headerTally.count ?? '—'}</span>
               <div className="ml-auto flex flex-wrap items-center gap-1.5">
-                <Badge tone={connectedCount > 0 ? 'ok' : 'muted'}>{connectedCount} connected</Badge>
-                <Badge tone={verifiedCount > 0 ? 'ok' : 'muted'}>{verifiedCount} delivery verified</Badge>
+                {headerTally.count !== null && <Badge tone={connectedCount > 0 ? 'ok' : 'muted'}>{connectedCount} stored login flags</Badge>}
+                {headerTally.count !== null && <Badge tone={verifiedCount > 0 ? 'ok' : 'muted'}>{verifiedCount} delivery verified</Badge>}
               </div>
             </div>
 
@@ -500,14 +498,15 @@ export default function ChannelsPage() {
                   const verified = verifiedChannels.has(c.id);
                   const operation = operations[c.id];
                   const locked = channelLocked(operation);
+                  const liveness = projectChannelLiveness(c, { verified, probe: channelProbePhase(operation) });
                   return (
-                    <li key={c.id} className="px-4 py-3">
+                    <li key={c.id} aria-label={liveness.announcement} className="px-4 py-3">
                       <div className="flex items-start gap-3">
                         <span
                           aria-hidden="true"
                           className={cn(
                             'mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-[7px] border',
-                            connected ? 'border-ok/30 bg-ok-wash text-ok' : 'border-line-strong bg-sunken text-ink-3',
+                            liveness.confirmed ? 'border-ok/30 bg-ok-wash text-ok' : 'border-line-strong bg-sunken text-ink-3',
                           )}
                         >
                           <Hash className="size-4" />
@@ -517,19 +516,12 @@ export default function ChannelsPage() {
                             <h3 className="truncate text-[13.5px] font-medium text-ink">{c.name}</h3>
                             <Badge tone="neutral">{c.type}</Badge>
                             {configured && <Badge tone="muted">configured</Badge>}
-                            {connected ? (
-                              <Badge tone="ok" dot>
-                                connected
-                              </Badge>
-                            ) : (
-                              <Badge tone="warn" dot>
-                                not connected
-                              </Badge>
-                            )}
+                            <Badge tone={liveness.confirmed ? 'ok' : 'warn'} dot>{liveness.claimLabel}{liveness.stale ? ' (stale)' : ''}</Badge>
                             {verified && <Badge tone="ok">delivery verified</Badge>}
                             {!supported && <Badge tone="warn">unsupported adapter</Badge>}
                             {supported && !configured && <Badge tone="warn">needs channel ID</Badge>}
                           </div>
+                          <p className="mt-1 text-xs text-ink-3">{liveness.basis}</p>
                           <p className="mt-1 font-mono text-[11px] text-ink-3">
                             {channelId(c) ? `#${channelId(c)}` : 'no destination'}
                             <span className="mx-1.5 text-ink-4">·</span>

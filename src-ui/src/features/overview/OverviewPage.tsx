@@ -1,3 +1,4 @@
+import { decodeMemoryReading } from '../../lib/memory-reading';
 import { useCallback, useReducer, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowUpRight, RefreshCw } from 'lucide-react';
@@ -155,7 +156,8 @@ function Pulse({ data }: { data: OverviewData }) {
   const enabled = agents.filter((a) => a.enabled);
   const active = activeSessions(sessions);
   const recent = newestFirst(sessions).slice(0, RECENT_LIMIT);
-  const memory = Number.isFinite(health.memory.used_percent) ? health.memory.used_percent : null;
+  const memoryReading = decodeMemoryReading(health.memory);
+  const memory = memoryReading.percent;
   const disk = parsePercent(health.disk.use_percent);
 
   return (
@@ -252,8 +254,8 @@ function Pulse({ data }: { data: OverviewData }) {
               <Gauge
                 label="Memory"
                 pct={memory}
-                text={memory === null ? '—' : `${memory.toFixed(1)}%`}
-                sub={`${Math.round(health.memory.used_mb)} of ${Math.round(health.memory.total_mb)} MB`}
+                text={memory === null ? 'Not measured' : `${memory.toFixed(1)}%`}
+                sub={memoryReading.basis ?? `${Math.round(health.memory.used_mb)} of ${Math.round(health.memory.total_mb)} MB`}
               />
               <Gauge label="Disk" pct={disk} text={health.disk.use_percent || '—'} sub={`${health.disk.used || '—'} of ${health.disk.total || '—'}`} />
             </div>

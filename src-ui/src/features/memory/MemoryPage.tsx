@@ -1,3 +1,4 @@
+import MemoryTierCounts from './MemoryTierCounts';
 import { lazy, Suspense } from 'react';
 import { FeatureModes } from '../workflows/FeatureModes';
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
@@ -14,10 +15,8 @@ import {
   Panel,
   Select,
   Skeleton,
-  StatusDot,
   StatusLine,
   cn,
-  type Tone,
 } from '../../design';
 import {
   decodeMemoryRecallResults,
@@ -29,13 +28,9 @@ import { MemoryDetail } from './MemoryDetail';
 import { MemoryRow } from './MemoryRow';
 import { BUCKET_ORDER, dateBucket, recallMetaById, type DateBucket, type RecallMeta } from './memory-format';
 
-const TIER_TONE: Record<Tier, Tone> = { hot: 'warn', warm: 'info', cold: 'muted' };
-const TIERS: Tier[] = ['hot', 'warm', 'cold'];
-
 function MemoryPage() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [recallMeta, setRecallMeta] = useState<Record<string, RecallMeta>>({});
-  const [tierStats, setTierStats] = useState<Record<Tier, number> | null>(null);
   const [query, setQuery] = useState('');
   const [tier, setTier] = useState<Tier | 'all'>('all');
   const [loading, setLoading] = useState(true);
@@ -64,13 +59,9 @@ function MemoryPage() {
         setMemories(entries);
         setRecallMeta(recallMetaById(results, entries));
       } else {
-        const [list, stats] = await Promise.all([
-          invoke<MemoryEntry[]>('list_recent_memories'),
-          invoke<Record<Tier, number>>('jarvis_get_tier_stats').catch(() => null),
-        ]);
+        const list = await invoke<MemoryEntry[]>('list_recent_memories');
         if (id !== requestId.current) return;
         setMemories(list);
-        setTierStats(stats);
       }
     } catch {
       if (id !== requestId.current) return;
@@ -180,17 +171,7 @@ function MemoryPage() {
             Search
           </Button>
         </div>
-        {tierStats && (
-          <ul aria-label="Memory tiers" className="flex flex-wrap items-center gap-x-6 gap-y-1.5">
-            {TIERS.map((t) => (
-              <li key={t} className="flex items-center gap-2 text-[12px] text-ink-2">
-                <StatusDot tone={TIER_TONE[t]} />
-                <span className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-ink-3">{t}</span>
-                <span className="tabular font-mono text-[13px] text-ink">{tierStats[t] ?? 0}</span>
-              </li>
-            ))}
-          </ul>
-        )}
+        <MemoryTierCounts />
       </Panel>
 
       <div className={cn(selected && 'grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_460px]')}>

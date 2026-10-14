@@ -42,8 +42,8 @@ export function useResourceList<T>(
     setError(null);
     try {
       setItems(await fetchFn());
-    } catch (e) {
-      setError(String(e));
+    } catch {
+      setError('Could not read resources. Retry the read.');
     } finally {
       setLoading(false);
     }

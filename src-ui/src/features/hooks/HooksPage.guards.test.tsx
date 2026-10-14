@@ -26,7 +26,7 @@ describe('register_hook refresh boundary', () => {
   const field = 'Hook name';
   const button = 'Register';
   const success = 'Registered hook example';
-  it('keeps creation successful when list refresh fails and retries only the list', async () => {
+  it('keeps creation unconfirmed when list refresh fails and retries only the list', async () => {
     const creation = deferred<unknown>();
     const refresh = deferred<unknown>();
     let listCalls = 0;
@@ -41,13 +41,14 @@ describe('register_hook refresh boundary', () => {
     fireEvent.click(screen.getByRole('button', { name: button }));
     expect(screen.queryByText(success)).not.toBeInTheDocument();
     await act(async () => { creation.resolve({ id: 'created' }); });
-    expect(screen.getByText(success)).toBeInTheDocument();
-    expect(name).toHaveValue('');
+    expect(screen.queryByText(success)).not.toBeInTheDocument();
+    expect(name).toHaveValue('example');
     expect(name).toBeDisabled();
     await act(async () => { refresh.reject(new Error('List refresh unavailable')); });
-    expect(screen.getByText(success)).toBeInTheDocument();
+    expect(screen.queryByText(success)).not.toBeInTheDocument();
     expect(screen.queryByText(/Could not (add|register) the/)).not.toBeInTheDocument();
-    expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert').map(node => node.textContent).join(' ')).toContain('the hook list could not be read back');
+    expect(screen.queryByText('List refresh unavailable')).not.toBeInTheDocument();
     expect(name).toBeEnabled();
     fireEvent.change(name, { target: { value: 'next draft' } });
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
@@ -59,9 +60,10 @@ describe('register_hook refresh boundary', () => {
 
 describe('HooksPage creation guard', () => {
   it('invokes register_hook exactly once across click and Enter repetition while pending', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -86,17 +88,18 @@ describe('HooksPage creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Registering…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'register_hook')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'h1', name: 'on-start', event: 'session.start', script: '', enabled: true, created_at: '' }); });
+    await act(async () => { const created = { id: 'h1', name: 'on-start', event: 'session.start', script: '', enabled: true, created_at: '' }; store.push(created); first.resolve(created); });
     expect(screen.getByPlaceholderText('Hook name')).toHaveValue('');
     expect(screen.getByPlaceholderText('Hook name')).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Register' })).toBeDisabled();
   });
 
   it('retains the draft after a rejected register with retryable feedback and no native error detail', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -116,7 +119,7 @@ describe('HooksPage creation guard', () => {
     expect(screen.getByPlaceholderText('Hook name')).toBeEnabled();
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_hooks') return Promise.resolve([]);
+      if (command === 'get_hooks') return Promise.resolve([...store]);
       if (command === 'register_hook') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -126,7 +129,7 @@ describe('HooksPage creation guard', () => {
       'register_hook',
       { name: 'on-start', event: 'session.start', script: 'run.sh' },
     ]);
-    await act(async () => { retry.resolve({ id: 'h1' }); });
+    await act(async () => { const created = { id: 'h1', name: 'on-start', event: 'session.start', script: '', enabled: true, created_at: '' }; store.push(created); retry.resolve(created); });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Hook name')).toHaveValue('');
   });

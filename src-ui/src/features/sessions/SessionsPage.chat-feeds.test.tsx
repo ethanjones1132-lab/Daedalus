@@ -112,7 +112,8 @@ describe('Chat Feeds read ordering', () => {
   it('keeps reading after a settled read and shows each newest observation', async () => {
     await mount();
     await resolveList(0, []);
-    expect(screen.getByText('No sessions match filter')).toBeInTheDocument();
+    // Not a filter miss: nothing has been typed, so an empty read is an empty list.
+    expect(screen.getByText('No sessions yet.')).toBeInTheDocument();
     await advance(15000);
     expect(listCalls()).toHaveLength(2);
     await resolveList(1, [alpha]);
@@ -133,7 +134,7 @@ describe('Chat Feeds read ordering', () => {
       'a superseded read must never publish its transcript',
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByText('Failed to load chat history'),
+      screen.queryByText("Could not load this session's transcript."),
       'a superseded read must not end the pending state of the current one',
     ).not.toBeInTheDocument();
 
@@ -141,5 +142,56 @@ describe('Chat Feeds read ordering', () => {
     expect(screen.getByText(/beta transcript line/)).toBeInTheDocument();
     expect(screen.queryByText(/alpha transcript line/)).not.toBeInTheDocument();
     expect(screen.getByText('session-beta')).toBeInTheDocument();
+  });
+});
+
+describe('Chat Feeds read states', () => {
+  it('announces a failed list read and retries it without native error text', async () => {
+    await mount();
+    await act(async () => { listRequests[0].reject(new Error('database is locked at /Users/x/store.json')); });
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('Could not load sessions.');
+    expect(screen.queryByText(/database is locked/)).not.toBeInTheDocument();
+    expect(screen.queryByText('No sessions yet.')).not.toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
+    await resolveList(1, [alpha]);
+    expect(row(/Alpha/)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps loaded rows, marked stale, when a refresh fails', async () => {
+    await mount();
+    await resolveList(0, [alpha]);
+    await advance(15000);
+    await act(async () => { listRequests[1].reject(new Error('locked')); });
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Could not refresh sessions. Showing previously loaded sessions; they may be stale.',
+    );
+    expect(row(/Alpha/)).toBeInTheDocument();
+  });
+
+  it('announces a pending transcript, then a failed one, and retries the same Session', async () => {
+    await mount();
+    await resolveList(0, [alpha]);
+    fireEvent.click(row(/Alpha/));
+    expect(screen.getByRole('status', { name: 'Session transcript' })).toHaveTextContent('Loading transcript…');
+
+    await act(async () => { historyRequests[0].request.reject(new Error('session row vanished')); });
+    expect(screen.getByRole('alert')).toHaveTextContent("Could not load this session's transcript.");
+    expect(screen.queryByText(/session row vanished/)).not.toBeInTheDocument();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry transcript' })); });
+    expect(historyRequests.map((entry) => entry.sessionId)).toEqual(['session-alpha', 'session-alpha']);
+    await resolveHistory(1, [message('session-alpha', 'alpha transcript line')]);
+    expect(screen.getByText(/alpha transcript line/)).toBeInTheDocument();
+  });
+
+  it('separates an empty list from a filter miss', async () => {
+    await mount();
+    await resolveList(0, [alpha]);
+    fireEvent.change(screen.getByPlaceholderText('Filter sessions...'), { target: { value: 'nope' } });
+    expect(screen.getByText('No sessions match "nope".')).toBeInTheDocument();
+    expect(screen.queryByText('No sessions yet.')).not.toBeInTheDocument();
   });
 });

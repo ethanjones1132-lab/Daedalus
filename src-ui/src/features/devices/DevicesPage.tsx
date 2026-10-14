@@ -71,7 +71,7 @@ export default function DevicesPage() {
     if (!trimmed) return;
     void list.create(
       () => invoke<Device>('add_device', { name: trimmed, deviceType: type }),
-      `Added device ${trimmed}`,
+      (confirmed) => `Added device ${confirmed.name}`,
       () => setName(''),
     );
   };
@@ -101,8 +101,8 @@ export default function DevicesPage() {
 
       <div className="space-y-4">
         {list.createError && (
-          <AlertLine onRetry={add} retryDisabled={list.creating || !name.trim()}>
-            Could not add the device. Your draft was kept.
+          <AlertLine onRetry={list.createCanRetry ? add : undefined} retryDisabled={list.creating || !name.trim()}>
+            {list.createMessage}
           </AlertLine>
         )}
 

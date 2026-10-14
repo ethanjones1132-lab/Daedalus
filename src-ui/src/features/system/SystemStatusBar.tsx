@@ -248,7 +248,7 @@ export default function SystemStatusBar() {
         />
       ))}
 
-      <Chip tone={percentTone(view.health.memoryPercent)} label={percentLabel('MEM', view.health.memoryPercent, healthStale)} />
+      <Chip name={view.health.memoryReading?.basis ?? undefined} tone={percentTone(view.health.memoryPercent)} label={percentLabel('MEM', view.health.memoryPercent, healthStale)} />
       <Chip tone={percentTone(view.health.diskPercent)} label={percentLabel('DSK', view.health.diskPercent, healthStale)} />
       <Chip tone={inferenceTone} label={inferenceLabel(view)} />
       {hit !== null && (

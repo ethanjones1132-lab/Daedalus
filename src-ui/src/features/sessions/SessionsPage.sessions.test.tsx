@@ -47,7 +47,7 @@ describe('Sessions resource states', () => {
       return [];
     });
     render(<SessionsPage />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('sqlite unavailable');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Retry to read the Session list again.');
     expect(screen.queryByText('No sessions yet')).not.toBeInTheDocument();
 
     const retry = deferred<unknown[]>();
@@ -74,7 +74,7 @@ describe('Sessions resource states', () => {
     expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument();
     await act(async () => refresh.reject('native surface disconnected'));
     expect(await screen.findByRole('alert')).toHaveTextContent('Showing previously loaded sessions');
-    expect(screen.getByRole('alert')).toHaveTextContent('native surface disconnected');
+    expect(document.body.textContent).not.toContain('native surface disconnected');
     expect(screen.getByText('Saved work', { selector: 'span' })).toBeInTheDocument();
   });
 

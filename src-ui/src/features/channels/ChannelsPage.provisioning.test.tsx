@@ -93,7 +93,7 @@ describe('Discord channel provisioning', () => {
     expect(JSON.stringify(init)).not.toMatch(/token|secret/i);
     expect(invokeMock).not.toHaveBeenCalledWith('login_channel', expect.anything());
     await act(async () => { send.resolve(deliveredResponse()); });
-    await screen.findByText('1 connected');
+    await screen.findByText('1 stored login flags');
     expect(invokeMock).toHaveBeenCalledWith('login_channel', { id: 'ch-1' });
     expect(screen.getByText('delivery verified')).toBeInTheDocument();
   });

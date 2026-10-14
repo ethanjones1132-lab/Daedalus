@@ -578,8 +578,8 @@ type SaveState =
   | { kind: 'ambiguous'; message: string }
   | { kind: 'unavailable'; message: string };
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function errorText(_error: unknown): string {
+  return 'Learning operation failed. Retry the same operation.';
 }
 
 /**

@@ -17,7 +17,7 @@ const health = {
   ollama: { running: true, model: 'llama3', url: '' }, bun_server: { running: true, url: 'http://127.0.0.1:19877' },
   bridge: { running: true, port: 19878 },
   disk: { total: '500G', used: '300G', available: '200G', use_percent: '60%' },
-  memory: { total_mb: 16000, available_mb: 2000, used_mb: 14000, used_percent: 87.5 }, timestamp: '',
+  memory: { total_mb: 16000, available_mb: 2000, used_mb: 14000, used_percent: 87 }, timestamp: '',
 };
 const sessions = [session('s-old', 'Old one', 3000), session('s-new', 'Newest', 5), session('s-mid', 'Middle', 600, { archived: true })];
 
@@ -51,7 +51,7 @@ describe('OverviewPage', () => {
 
   it('shows memory and disk as text beside the dials', async () => {
     await act(async () => { render(<OverviewPage />); });
-    expect(screen.getByText('87.5%')).toBeInTheDocument();
+    expect(screen.getByText('87.0%')).toBeInTheDocument();
     expect(screen.getByText('60%')).toBeInTheDocument();
   });
 

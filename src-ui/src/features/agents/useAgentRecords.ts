@@ -103,9 +103,9 @@ export function useAgentRecords() {
       for (const id of result.confirmed) {
         const operation = previous[id];
         if (!operation) continue;
-        if (operation.action === 'edit') successRef.current('Agent updated');
-        if (operation.action === 'enable') successRef.current('Agent enabled');
-        if (operation.action === 'disable') successRef.current('Agent disabled');
+        if (operation.action === 'edit') successRef.current('Agent record updated');
+        if (operation.action === 'enable') successRef.current('Agent record enabled');
+        if (operation.action === 'disable') successRef.current('Agent record disabled');
         if (operation.action === 'delete' && operation.row) successRef.current(`Deleted ${operation.row.name}`);
         if (operation.action === 'edit' && editingIdRef.current === id) setEditing(null);
       }

@@ -99,15 +99,16 @@ export function Disclosure({ summary, children, defaultOpen, open, onOpenChange,
 }
 
 interface BoundaryState {
-  error: Error | null;
+  error: unknown;
+  hasError: boolean;
 }
 
 /** Catches render errors in one view so the shell survives. */
-export class ErrorBoundary extends Component<{ children: ReactNode; label?: string }, BoundaryState> {
-  state: BoundaryState = { error: null };
+export class ErrorBoundary extends Component<{ children: ReactNode; label?: string; fallback?: ReactNode }, BoundaryState> {
+  state: BoundaryState = { error: null, hasError: false };
 
-  static getDerivedStateFromError(error: Error): BoundaryState {
-    return { error };
+  static getDerivedStateFromError(error: unknown): BoundaryState {
+    return { error, hasError: true };
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
@@ -115,11 +116,12 @@ export class ErrorBoundary extends Component<{ children: ReactNode; label?: stri
   }
 
   render() {
-    if (this.state.error) {
+    if (this.state.hasError) {
+      if (this.props.fallback !== undefined) return this.props.fallback;
       return (
         <div className="p-8">
-          <AlertLine onRetry={() => this.setState({ error: null })} retryText="Try again">
-            {this.props.label ?? 'This view'} failed to render: {this.state.error.message}
+          <AlertLine onRetry={() => this.setState({ error: null, hasError: false })} retryText="Retry">
+            This view stopped unexpectedly. Daedalus is still running.
           </AlertLine>
         </div>
       );

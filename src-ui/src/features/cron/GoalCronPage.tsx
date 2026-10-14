@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { sectionCount } from '../../lib/list-tally';
 import { aggregateInsights, selectInsightJobs } from '../../domain/cron-insights';
 import {
   reconcileCronOperations,
@@ -913,6 +914,7 @@ function CronJobCard({
   job,
   onRefresh,
   isInFlight,
+  inFlightReadFailed,
   operation,
   onToggle,
   onRun,
@@ -923,6 +925,7 @@ function CronJobCard({
   job: CronJob;
   onRefresh: () => void;
   isInFlight: boolean;
+  inFlightReadFailed: boolean;
   operation?: CronOperation<CronJob>;
   onToggle: (job: CronJob) => void;
   onRun: (job: CronJob) => void;
@@ -954,9 +957,9 @@ function CronJobCard({
               {!job.enabled && <Pill variant="warning">disabled</Pill>}
               <Pill variant="default">{job.agent_id}</Pill>
               {isInFlight && (
-                <Pill variant="success">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent mr-1.5 animate-pulse" />
-                  Running
+                <Pill variant={inFlightReadFailed ? 'warning' : 'success'}>
+                  {!inFlightReadFailed && <span aria-hidden="true" className="inline-block w-1.5 h-1.5 rounded-full bg-accent mr-1.5 animate-pulse" />}
+                  {inFlightReadFailed ? 'Running (stale)' : 'Running'}
                 </Pill>
               )}
             </div>
@@ -1101,6 +1104,10 @@ export default function CronView() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const jobsRef = useRef<CronJob[]>([]);
   const [inFlightIds, setInFlightIds] = useState<Set<string>>(new Set());
+  // The in-flight poll keeps the previous set when it fails, so a retained run
+  // claim has to be able to say it is retained: the pill is a claim about one run
+  // still executing, and after a failed read nothing confirms that.
+  const [inFlightReadFailed, setInFlightReadFailed] = useState(false);
   const [pendingMissed, setPendingMissed] = useState<CronJob[]>([]);
   const pendingMissedRef = useRef<CronJob[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -1182,7 +1189,10 @@ export default function CronView() {
       const ids = await invoke<string[]>('get_in_flight_cron_jobs');
       if (requestId !== inFlightRequestId.current) return;
       setInFlightIds(new Set(ids));
+      setInFlightReadFailed(false);
     } catch {
+      if (requestId !== inFlightRequestId.current) return;
+      setInFlightReadFailed(true);
       return;
     }
   }, [hasMutation]);
@@ -1278,6 +1288,7 @@ export default function CronView() {
     publishOperations(reconciliation.operations);
     updateJobs(reconciliation.rows);
     setInFlightIds(new Set(snapshot.inFlightIds));
+    setInFlightReadFailed(false);
     updatePendingMissed(snapshot.pendingMissed);
     jobsRequestId.current = Math.max(jobsRequestId.current, snapshot.requestId);
     inFlightRequestId.current = Math.max(inFlightRequestId.current, snapshot.requestId);
@@ -1545,6 +1556,7 @@ export default function CronView() {
     publishOperations(reconciliation.operations);
     updateJobs(reconciliation.rows);
     setInFlightIds(new Set(snapshot.inFlightIds));
+    setInFlightReadFailed(false);
     updatePendingMissed(snapshot.pendingMissed);
     jobsRequestId.current = Math.max(jobsRequestId.current, snapshot.requestId);
     inFlightRequestId.current = Math.max(inFlightRequestId.current, snapshot.requestId);
@@ -1708,7 +1720,7 @@ export default function CronView() {
     <PageTransition>
       <SectionHeader
         title="Cron Jobs"
-        count={jobs.length}
+        count={sectionCount(jobs, { loading, failed: error !== null })}
         subtitle={jobs.length > 0 ? `${enabledCount} enabled · ${learningCount} learning · ${reviewCount} review` : undefined}
         action={
           <div className="flex items-center gap-2">
@@ -2016,6 +2028,7 @@ export default function CronView() {
               job={job}
               onRefresh={fetchJobs}
               isInFlight={inFlightIds.has(job.id)}
+              inFlightReadFailed={inFlightReadFailed}
               operation={operations[job.id]}
               onToggle={handleToggle}
               onRun={handleRun}

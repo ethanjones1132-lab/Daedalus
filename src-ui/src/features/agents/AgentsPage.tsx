@@ -1,3 +1,5 @@
+import { sectionCount } from '../../lib/list-tally';
+import { AGENT_RECORD_SCOPE } from '../../domain/agent-routing-scope';
 import { Plus, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { agentOperationLocked } from '../../domain/agent-operation-state';
@@ -101,9 +103,10 @@ export default function AgentsPage() {
         <LifecycleTrack stations={stations} compact label="Agents root lifecycle" />
       </Panel>
 
+      <p className="mb-4 text-xs text-ink-3">{AGENT_RECORD_SCOPE}</p>
       <div className="grid items-start gap-5 lg:grid-cols-[minmax(340px,400px)_minmax(0,1fr)]">
         <Panel flush className="overflow-hidden">
-          <SectionHeader title="Agents" count={agents.length} />
+          <SectionHeader title="Agents" count={sectionCount(agents, { loading, failed: listError !== null })} />
           <div className="max-h-[372px] overflow-y-auto">
             {listError && (
               <div className="p-3">

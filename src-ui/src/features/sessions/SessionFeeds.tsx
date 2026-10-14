@@ -1,7 +1,9 @@
+import { TRANSCRIPT_WINDOW, extendWindow, transcriptWindow, windowSlice } from '../../lib/transcript-window';
+import { TranscriptWindowNotice } from './TranscriptWindowNotice';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowLeft, BookOpenText, Wrench } from 'lucide-react';
-import { AlertLine, Badge, Button, EmptyState, SearchInput, Skeleton, StatusDot, StatusLine, cn, formatIsoAge, useToast } from '../../design';
+import { AlertLine, Badge, Button, EmptyState, SearchInput, Skeleton, StatusDot, StatusLine, cn, formatIsoAge } from '../../design';
 import { usePolling } from '../../hooks/usePolling';
 import { createReadGuard, type ReadIdentity } from '../../lib/read-identity';
 import type { BackendSession, SessionMessage } from '../../types';
@@ -25,12 +27,14 @@ export interface FeedReader {
   selected: BackendSession | null;
   history: SessionMessage[] | null;
   loading: boolean;
+  error: boolean;
+  retry: () => void;
   open: (session: BackendSession) => void;
   close: () => void;
 }
 
 export function useFeedReader(): FeedReader {
-  const { error: toastError } = useToast();
+  const [error, setError] = useState(false);
   const [selected, setSelected] = useState<BackendSession | null>(null);
   const [history, setHistory] = useState<SessionMessage[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -41,17 +45,18 @@ export function useFeedReader(): FeedReader {
       const request = historyRead.issue();
       setSelected(session);
       setLoading(true);
+      setError(false);
       setHistory(null);
       try {
         const messages = await invoke<SessionMessage[]>('get_session_history', { sessionId: session.id });
         historyRead.publish(request.id, () => setHistory(messages));
-      } catch (e) {
-        historyRead.publish(request.id, () => toastError(`Failed to load history: ${e}`, 'Chat Error'));
+      } catch {
+        historyRead.publish(request.id, () => setError(true));
       } finally {
         historyRead.publish(request.id, () => setLoading(false));
       }
     },
-    [historyRead, toastError],
+    [historyRead],
   );
 
   const close = useCallback(() => {
@@ -61,7 +66,7 @@ export function useFeedReader(): FeedReader {
     setLoading(false);
   }, [historyRead]);
 
-  return { selected, history, loading, open: (s) => void open(s), close };
+  return { selected, history, loading, error, retry: () => { if (selected) void open(selected); }, open: (s) => void open(s), close };
 }
 
 /** The Feeds list (index column). */
@@ -70,23 +75,27 @@ export function FeedList({ reader }: { reader: FeedReader }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
+  const [observed, setObserved] = useState(false);
+  const [retry, setRetry] = useState(0);
 
   const fetchSessions = useCallback(async (read: ReadIdentity) => {
+    setLoading(true);
     try {
       const result = await invoke<BackendSession[]>('list_sessions');
       const sorted = [...result].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
       if (!read.isCurrent()) return; // a newer poll has already read this list
       setSessions(sorted);
+      setObserved(true);
       setError(null);
-    } catch (e) {
+    } catch {
       if (!read.isCurrent()) return;
-      setError(String(e));
+      setError('Could not read Sessions. Retry the read.');
     } finally {
       if (read.isCurrent()) setLoading(false);
     }
   }, []);
 
-  usePolling(fetchSessions, 15000, [fetchSessions]);
+  usePolling(fetchSessions, 15000, [fetchSessions, retry]);
 
   const filtered = sessions.filter((session) => {
     if (!query) return true;
@@ -99,17 +108,10 @@ export function FeedList({ reader }: { reader: FeedReader }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="shrink-0 px-3 pb-2">
-        <SearchInput value={query} onChange={setQuery} placeholder="Filter sessions…" aria-label="Filter feeds" />
+        <SearchInput value={query} onChange={setQuery} placeholder="Filter sessions..." aria-label="Filter feeds" />
       </div>
-      {loading ? (
-        <div className="px-3">
-          <StatusLine label="Feeds loading">Loading native Sessions…</StatusLine>
-        </div>
-      ) : error ? (
-        <div className="px-3">
-          <AlertLine>Could not load native Sessions: {error}</AlertLine>
-        </div>
-      ) : (
+      {error && <div className="px-3"><AlertLine onRetry={() => setRetry(value => value + 1)}>{observed ? 'Could not refresh sessions. Showing previously loaded sessions; they may be stale.' : 'Could not load sessions.'}</AlertLine></div>}
+      {loading && !observed ? <div className="px-3"><StatusLine label="Feeds loading">Loading native Sessions…</StatusLine></div> : (
         <ul className="min-h-0 flex-1 space-y-px overflow-y-auto px-1.5 pb-3">
           {filtered.map((session) => {
             const selected = reader.selected?.id === session.id;
@@ -138,7 +140,7 @@ export function FeedList({ reader }: { reader: FeedReader }) {
               </li>
             );
           })}
-          {filtered.length === 0 && <EmptyState compact title="No sessions match filter" />}
+          {filtered.length === 0 && observed && <EmptyState compact title={sessions.length === 0 ? 'No sessions yet.' : `No sessions match "${query}".`} />}
         </ul>
       )}
     </div>
@@ -147,7 +149,10 @@ export function FeedList({ reader }: { reader: FeedReader }) {
 
 /** The read-only transcript of the selected feed, laid over the center pane. */
 export function FeedTranscript({ reader, onReturn, liveTurn }: { reader: FeedReader; onReturn: () => void; liveTurn: boolean }) {
+  const [visible, setVisible] = useState(TRANSCRIPT_WINDOW);
+
   const { selected, history, loading } = reader;
+  useEffect(() => setVisible(TRANSCRIPT_WINDOW), [selected?.id]);
   const endRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     endRef.current?.scrollIntoView?.({ behavior: 'smooth' });
@@ -177,7 +182,7 @@ export function FeedTranscript({ reader, onReturn, liveTurn }: { reader: FeedRea
         />
       ) : loading ? (
         <div className="mx-auto w-full max-w-[760px] space-y-4 px-8 pt-10">
-          <StatusLine label="Feed history loading">Loading the Session feed…</StatusLine>
+          <StatusLine label="Session transcript">Loading transcript…</StatusLine>
           <Skeleton className="w-2/3" />
           <Skeleton className="w-5/6" />
           <Skeleton className="w-1/2" />
@@ -193,11 +198,11 @@ export function FeedTranscript({ reader, onReturn, liveTurn }: { reader: FeedRea
               </div>
               <div className="mt-1 truncate font-mono text-[11px] text-ink-3">{selected.id}</div>
             </div>
-            <div className="space-y-7">
-              {history.map((msg, index) => {
+            <div className="space-y-7"><TranscriptWindowNotice window={transcriptWindow(history.length, visible)} onExtend={() => setVisible(current => extendWindow(current, history.length))} />
+              {windowSlice(history, visible).map((msg, index) => {
                 const isUser = msg.role === 'user';
                 const isTool = msg.role === 'tool' || msg.content.startsWith('[tool:') || msg.content.startsWith('[result:');
-                const content = msg.content.length > 2000 ? `${msg.content.slice(0, 2000)}\n\n... (truncated)` : msg.content;
+                const content = msg.content;
                 return (
                   <article key={msg.id || index}>
                     <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[0.14em] text-ink-3">
@@ -225,7 +230,7 @@ export function FeedTranscript({ reader, onReturn, liveTurn }: { reader: FeedRea
           </div>
         </div>
       ) : (
-        <EmptyState title="Failed to load chat history" className="flex-1" />
+        <div className="p-8"><AlertLine onRetry={reader.retry} retryLabel="Retry transcript" retryText="Retry transcript">Could not load this session's transcript.</AlertLine></div>
       )}
     </section>
   );

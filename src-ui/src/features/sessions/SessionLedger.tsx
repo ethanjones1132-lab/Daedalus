@@ -1,3 +1,4 @@
+import { decodeContextUsage } from '../../lib/context-usage';
 import { useCallback, useId, useReducer, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ChevronRight, RefreshCw } from 'lucide-react';
@@ -80,8 +81,8 @@ export default function SessionLedger({ className }: { className?: string }) {
       <ul className="min-h-0 flex-1 space-y-px overflow-y-auto px-1.5 pb-3 pt-1">
         {(sessions ?? []).map((session) => {
           const isExpanded = expanded.has(session.id);
-          const percentUsed =
-            session.context_tokens > 0 ? Math.min(100, (session.total_tokens / session.context_tokens) * 100) : null;
+          const contextUsage = decodeContextUsage({ totalTokens: session.total_tokens, contextTokens: session.context_tokens });
+          const percentUsed = contextUsage.barPercent;
           const regionId = `${disclosureId}-${session.id}`;
           return (
             <li key={session.id} className={cn('rounded-lg', isExpanded && 'bg-surface ring-1 ring-line')}>
@@ -129,15 +130,16 @@ export default function SessionLedger({ className }: { className?: string }) {
                         ['Updated', formatIsoAge(session.updated_at)],
                       ]}
                     />
-                    {percentUsed !== null && (
+                    {(
                       <div>
                         <div className="mb-1.5 flex items-center justify-between">
                           <span className="d-label text-[9.5px]">Context usage</span>
-                          <span className={cn('font-mono text-[11px] tabular', percentUsed >= 80 ? 'text-err' : percentUsed >= 60 ? 'text-warn' : 'text-ink-2')}>
-                            {percentUsed.toFixed(1)}%
+                          <span className={cn('font-mono text-[11px] tabular', percentUsed !== null && percentUsed >= 80 ? 'text-err' : percentUsed !== null && percentUsed >= 60 ? 'text-warn' : 'text-ink-2')}>
+                            {contextUsage.percent}
                           </span>
                         </div>
-                        <Meter value={percentUsed} tone={loadTone(percentUsed, 60, 80)} />
+                        {percentUsed !== null && <Meter value={percentUsed} tone={loadTone(percentUsed, 60, 80)} />}
+                        {contextUsage.basis && <p className="mt-1 text-xs text-ink-3">{contextUsage.basis}</p>}
                       </div>
                     )}
                   </div>

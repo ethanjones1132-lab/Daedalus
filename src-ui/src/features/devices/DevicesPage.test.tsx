@@ -30,7 +30,7 @@ async function renderIdle(ui: React.ReactNode) {
 }
 
 describe('add_device refresh boundary', () => {
-  it('keeps creation successful when list refresh fails and retries only the list', async () => {
+  it('keeps creation unconfirmed when list refresh fails and retries only the list', async () => {
     const creation = deferred<unknown>();
     const refresh = deferred<unknown>();
     let listCalls = 0;
@@ -45,13 +45,14 @@ describe('add_device refresh boundary', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add' }));
     expect(screen.queryByText('Added device example')).not.toBeInTheDocument();
     await act(async () => { creation.resolve({ id: 'created' }); });
-    expect(screen.getByText('Added device example')).toBeInTheDocument();
-    expect(name).toHaveValue('');
+    expect(screen.queryByText('Added device example')).not.toBeInTheDocument();
+    expect(name).toHaveValue('example');
     expect(name).toBeDisabled();
     await act(async () => { refresh.reject(new Error('List refresh unavailable')); });
-    expect(screen.getByText('Added device example')).toBeInTheDocument();
+    expect(screen.queryByText('Added device example')).not.toBeInTheDocument();
     expect(screen.queryByText(/Could not (add|register) the/)).not.toBeInTheDocument();
-    expect(screen.getByText('Error: List refresh unavailable')).toBeInTheDocument();
+    expect(screen.getAllByRole('alert').map(node => node.textContent).join(' ')).toContain('the device list could not be read back');
+    expect(screen.queryByText('List refresh unavailable')).not.toBeInTheDocument();
     expect(name).toBeEnabled();
     fireEvent.change(name, { target: { value: 'next draft' } });
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
@@ -63,9 +64,10 @@ describe('add_device refresh boundary', () => {
 
 describe('DevicesPage creation guard', () => {
   it('invokes add_device exactly once across click and Enter repetition while pending', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -87,15 +89,16 @@ describe('DevicesPage creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Adding…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_device')).toHaveLength(1);
 
-    await act(async () => { first.resolve({ id: 'd1' }); });
+    await act(async () => { const created = { id: 'd1', name: 'studio-mac', device_type: 'desktop', status: 'unknown', last_seen: '' }; store.push(created); first.resolve(created); });
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('');
   });
 
   it('retains the draft after a rejected add with retryable feedback', async () => {
+    const store: unknown[] = [];
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -110,12 +113,12 @@ describe('DevicesPage creation guard', () => {
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('studio-mac');
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_devices') return Promise.resolve([]);
+      if (command === 'get_devices') return Promise.resolve([...store]);
       if (command === 'add_device') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await act(async () => { retry.resolve({ id: 'd1' }); });
+    await act(async () => { const created = { id: 'd1', name: 'studio-mac', device_type: 'desktop', status: 'unknown', last_seen: '' }; store.push(created); retry.resolve(created); });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Device name')).toHaveValue('');
   });

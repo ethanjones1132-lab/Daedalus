@@ -18,16 +18,16 @@ describe('Gateway honest readouts', () => {
     vi.mocked(invoke).mockResolvedValue(base);
     await act(async () => { render(<GatewayPage />); });
     expect(await screen.findByText('Gateway is running')).toBeInTheDocument();
-    expect(screen.getAllByText('not measured')).toHaveLength(2);
+    expect(screen.getAllByText('Not measured')).toHaveLength(2);
     expect(screen.queryByText('0')).not.toBeInTheDocument();
   });
 
-  it('shows real connection and uptime values when the backend reports them', async () => {
+  it('does not treat placeholder fields as measured when an injected value is nonzero', async () => {
     vi.mocked(invoke).mockResolvedValue({ ...base, active_connections: 4, uptime_seconds: 125 });
     await act(async () => { render(<GatewayPage />); });
-    expect(await screen.findByText('4')).toBeInTheDocument();
-    expect(screen.getByText('2m 5s')).toBeInTheDocument();
-    expect(screen.queryByText('not measured')).not.toBeInTheDocument();
+    expect(await screen.findAllByText('Not measured')).toHaveLength(2);
+    expect(screen.queryByText('4')).not.toBeInTheDocument();
+    expect(screen.queryByText('2m 5s')).not.toBeInTheDocument();
   });
 
   it('is labelled legacy and is not presented as the Bun server', async () => {

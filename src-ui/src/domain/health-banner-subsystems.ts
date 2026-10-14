@@ -34,6 +34,7 @@ export interface HealthSubsystemRow {
   detail: string | null;
   /** One sentence carrying the whole row, used as its accessible name. */
   announcement: string;
+  stale: boolean;
 }
 
 export interface HealthSubsystems {
@@ -104,11 +105,12 @@ function row(
     requirementLabel: REQUIREMENT_LABELS[requirement],
     requirementClause,
     detail,
+    stale: false,
     announcement: `${name} ${stateWord}${requirementClause}.`,
   };
 }
 
-export function projectHealthSubsystems(status: JarvisStatus | null): HealthSubsystems {
+export function projectHealthSubsystems(status: JarvisStatus | null, stale = false): HealthSubsystems {
   const { backend, requirements } = projectServiceRequirements(status?.active_backend);
   const modelId = nonEmptyString(status?.model);
   // A local model is only ever measured by Ollama. For every other backend
@@ -135,6 +137,7 @@ export function projectHealthSubsystems(status: JarvisStatus | null): HealthSubs
     row('openrouter_key', 'key', flagState(status?.openrouter_key_set), openrouterKeyRequirement(backend)),
     row('claude_proxy', 'process', flagState(status?.claude_proxy_running), requirements.proxy, ':19878'),
   ];
+  for (const entry of rows) { entry.stale = stale; if (stale) entry.announcement = `${entry.name} ${entry.stateWord} (stale)${entry.requirementClause}.`; }
   return { backend, rows, faults: rows.filter((entry) => entry.state === 'down' && entry.requirement === 'required') };
 }
 

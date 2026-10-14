@@ -1,3 +1,5 @@
+import { decodeMemoryReading, type MemoryReading } from '../lib/memory-reading';
+
 export interface OllamaHealth {
   running: boolean;
   model: string | null;
@@ -302,6 +304,12 @@ export interface SystemTelemetryView {
       proxy: ServiceState;
     };
     memoryPercent: number | null;
+    /**
+     * The decoded memory reading, or `null` while no health read has come back.
+     * `null` here means the read is outstanding, which is different from a
+     * reading this build cannot make: only the latter carries a basis sentence.
+     */
+    memoryReading: MemoryReading | null;
     diskPercent: number | null;
     bunGiveUp: boolean;
     proxyGiveUp: boolean;
@@ -311,6 +319,8 @@ export interface SystemTelemetryView {
     status: TelemetryResourceStatus;
     stale: boolean;
     error: boolean;
+    /** The request is still in flight: nothing has come back, so nothing is claimed. */
+    awaiting: boolean;
     hasData: boolean;
     hasAttempts: boolean;
     errorRate: number | null;
@@ -345,7 +355,12 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const inferenceData = state.inference.data;
   const inferenceStale = isStale(state.inference.status, inferenceData !== null);
   const healthStatus = state.health.status;
-  const memoryPercent = healthData ? parsePercent(healthData.memory.used_percent) : null;
+  // The memory field is decoded once, here, because the top bar and the Overview
+  // read the same record: a zeroed `memory_health` is Native's "the probe did
+  // not report" sentinel rather than a real 0%, and both surfaces used to print
+  // it as one.
+  const memoryReading = healthData ? decodeMemoryReading(healthData.memory) : null;
+  const memoryPercent = memoryReading === null ? null : memoryReading.percent;
   const diskPercent = healthData ? parsePercent(healthData.disk.use_percent) : null;
   const { backend, requirements } = projectServiceRequirements(activeBackend);
   const services = {
@@ -362,9 +377,13 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     ? Math.max(...errorRates)
     : null;
   const hasInferenceError = errorRate !== null && errorRate > 0.1;
-  const inferenceUnavailable = state.inference.status === 'unavailable' || state.inference.status === 'stale' || state.inference.status === 'pending' || state.inference.status === 'unknown';
-  // `inferenceUnavailable` also covers a read that is merely still in flight, so
-  // the attributable reason is narrower: an unreadable resource, not a pending one.
+  // A read that has not come back yet is not a fault, so it never degrades the
+  // verdict on its own: `pending` is the word this surface already prints for a
+  // request in flight, and the reads are issued together, so a half-observation
+  // is the ordinary case. The unreadable cases stay faults, and they are
+  // attributable — `inferenceReadFailed` names one as `inference_unavailable`
+  // below, so a fault that reaches the verdict can always name its cause.
+  const inferenceAwaiting = state.inference.status === 'pending' || state.inference.status === 'unknown';
   const inferenceReadFailed = state.inference.status === 'unavailable' || state.inference.status === 'stale';
 
   // A service that is not running is a fault only when the confirmed active
@@ -397,8 +416,10 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     overall = 'stale';
   } else if (services.bun === 'down' || services.bridge === 'down') {
     overall = 'stopped';
-  } else if (inferenceUnavailable || reasons.length > 0) {
+  } else if (reasons.length > 0) {
     overall = 'degraded';
+  } else if (inferenceAwaiting) {
+    overall = 'pending';
   } else {
     overall = 'healthy';
   }
@@ -415,6 +436,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       requirements,
       services,
       memoryPercent,
+      memoryReading,
       diskPercent,
       bunGiveUp: healthData?.supervisor?.bun_give_up ?? false,
       proxyGiveUp: healthData?.supervisor?.proxy_give_up ?? false,
@@ -426,6 +448,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       status: state.inference.status,
       stale: inferenceStale,
       error: state.inference.error,
+      awaiting: inferenceAwaiting,
       hasData: inferenceData !== null,
       hasAttempts: inferenceData !== null && inferenceData.window_size > 0,
       errorRate,

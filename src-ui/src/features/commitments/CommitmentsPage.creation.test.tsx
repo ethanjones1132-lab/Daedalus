@@ -40,8 +40,9 @@ function fillDraft(text = 'Ship the weekly report', due = '2026-10-01') {
 describe('CommitmentsPage creation guard', () => {
   it('invokes add_commitment exactly once across click and Enter repetition while pending', async () => {
     const first = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_commitments') return Promise.resolve([]);
+      if (command === 'get_commitments') return Promise.resolve([...store]);
       if (command === 'add_commitment') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -70,7 +71,11 @@ describe('CommitmentsPage creation guard', () => {
     expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('Ship the weekly report');
     expect(screen.getByLabelText('Due date')).toHaveValue('2026-10-01');
 
-    await act(async () => { first.resolve({ id: 'c1', text: 'Ship the weekly report', status: 'open', due: null, created_at: '', completed_at: null, agent_id: null }); });
+    const created = { id: 'c1', text: 'Ship the weekly report', status: 'open', due: '2026-10-01T00:00:00.000Z', created_at: '', completed_at: null, agent_id: null };
+    await act(async () => {
+      store.push(created);
+      first.resolve(created);
+    });
     expect(screen.getByText('Commitment added')).toBeInTheDocument();
     expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('');
     expect(screen.getByPlaceholderText('What needs to be done?')).toBeEnabled();
@@ -79,8 +84,9 @@ describe('CommitmentsPage creation guard', () => {
   it('retains text and due after a rejected add with retryable inline feedback and no native detail', async () => {
     const first = deferred<unknown>();
     const retry = deferred<unknown>();
+    const store: unknown[] = [];
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_commitments') return Promise.resolve([]);
+      if (command === 'get_commitments') return Promise.resolve([...store]);
       if (command === 'add_commitment') return first.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -99,12 +105,11 @@ describe('CommitmentsPage creation guard', () => {
     expect(screen.getByPlaceholderText('What needs to be done?')).toBeEnabled();
 
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_commitments') return Promise.resolve([]);
+      if (command === 'get_commitments') return Promise.resolve([...store]);
       if (command === 'add_commitment') return retry.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry adding the commitment' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_commitment')).toHaveLength(2);
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_commitment')[1]).toEqual([
       'add_commitment',
@@ -114,18 +119,28 @@ describe('CommitmentsPage creation guard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Adding…' }));
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_commitment')).toHaveLength(2);
 
-    await act(async () => { retry.resolve({ id: 'c2' }); });
+    const created = { id: 'c2', text: 'Ship the weekly report', status: 'open', due: '2026-10-01T00:00:00.000Z', created_at: '', completed_at: null, agent_id: null };
+    await act(async () => {
+      store.push(created);
+      retry.resolve(created);
+    });
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('');
     expect(screen.getByLabelText('Due date')).toHaveValue('');
   });
 
-  it('keeps creation successful when the list refresh fails and retries only the list', async () => {
+  it('does not report a create the confirming read could not confirm, and the list retry reloads only the list', async () => {
     const creation = deferred<unknown>();
-    const refresh = deferred<unknown>();
+    const confirming = deferred<unknown>();
+    const reload = deferred<unknown>();
     let listCalls = 0;
     invokeMock.mockImplementation((command: string) => {
-      if (command === 'get_commitments') return ++listCalls === 2 ? refresh.promise : Promise.resolve([]);
+      if (command === 'get_commitments') {
+        listCalls += 1;
+        if (listCalls === 1) return Promise.resolve([]);
+        if (listCalls === 2) return confirming.promise;
+        return reload.promise;
+      }
       if (command === 'add_commitment') return creation.promise;
       throw new Error(`Unexpected command: ${command}`);
     });
@@ -134,23 +149,28 @@ describe('CommitmentsPage creation guard', () => {
     fillDraft('next commitment');
     fireEvent.click(screen.getByRole('button', { name: 'Add' }));
     expect(screen.queryByText('Commitment added')).not.toBeInTheDocument();
-    await act(async () => { creation.resolve({ id: 'c1' }); });
-    expect(screen.getByText('Commitment added')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('');
+    await act(async () => { creation.resolve({ id: 'c1', text: 'next commitment', status: 'open', due: null, created_at: '', completed_at: null, agent_id: null }); });
+    // The write resolved; nothing has confirmed it yet.
+    expect(screen.queryByText('Commitment added')).not.toBeInTheDocument();
 
-    await act(async () => { refresh.reject(new Error('List refresh unavailable')); });
-    // A failed follow-up list refresh must not be reported as a failed creation.
-    expect(screen.getByText('Commitment added')).toBeInTheDocument();
-    expect(screen.queryByText(/Could not add the commitment/)).not.toBeInTheDocument();
+    await act(async () => { confirming.reject(new Error('List refresh unavailable')); });
+    // A failed read-back is a list failure *and* an unconfirmed create, not a success.
+    expect(screen.queryByText('Commitment added')).not.toBeInTheDocument();
     expect(screen.queryByText('Add failed')).not.toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent('Could not refresh commitments. Retry reloads the list only.');
-    expect(screen.queryByText('Error: List refresh unavailable')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('alert').map(node => node.textContent ?? '').join(' '))
+      .toContain('Could not refresh commitments. Retry reloads the list only.');
+    expect(screen.getAllByRole('alert').map(node => node.textContent ?? '').join(' '))
+      .toContain('the commitment list could not be read back');
+    expect(screen.queryByText('List refresh unavailable')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('next commitment');
 
-    // The empty draft after a resolved create is preserved for a later attempt.
-    fireEvent.change(screen.getByPlaceholderText('What needs to be done?'), { target: { value: 'next draft' } });
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Retry' })); });
+    // The list Retry reloads the list and never repeats the create.
+    const listRetries = screen.getAllByRole('button', { name: 'Retry' });
+    expect(listRetries).toHaveLength(1);
+    fireEvent.click(listRetries[0]);
     expect(invokeMock.mock.calls.filter(([c]) => c === 'add_commitment')).toHaveLength(1);
-    expect(listCalls).toBe(3);
-    expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('next draft');
+    await act(async () => { reload.resolve([{ id: 'c1', text: 'next commitment', status: 'open', due: null, created_at: '', completed_at: null, agent_id: null }]); });
+    expect(screen.getByTestId('record-id')).toHaveTextContent('c1');
+    expect(screen.getByPlaceholderText('What needs to be done?')).toHaveValue('next commitment');
   });
 });

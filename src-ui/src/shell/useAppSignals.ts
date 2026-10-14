@@ -1,4 +1,5 @@
-import { useEffect, useRef } from 'react';
+import { initialAlertChannelState, projectAlertChannel, reduceAlertChannel, type AlertChannelId } from '../domain/registry-alert-channel';
+import { useEffect, useRef, useReducer, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useToast } from '../design';
@@ -19,6 +20,8 @@ import { useNavigation } from './navigation';
  * listeners register exactly once and are never torn down by a re-render.
  */
 export function useAppSignals() {
+  const [attempt, setAttempt] = useState(0);
+  const [channel, dispatchChannel] = useReducer(reduceAlertChannel, undefined, initialAlertChannelState);
   const flow = useWorkflow();
   const flowRef = useRef(flow);
   flowRef.current = flow;
@@ -31,16 +34,17 @@ export function useAppSignals() {
 
   useEffect(() => {
     let disposed = false;
+    dispatchChannel({ type: 'begin', attempt });
     const unsubs: Array<() => void> = [];
 
-    const track = (pending: Promise<() => void>) => {
+    const track = (pending: Promise<() => void>, channelId?: AlertChannelId) => {
       void Promise.resolve(pending)
         .then((unlisten) => {
           // Guard the async-listen race: the effect may already be torn down.
           if (disposed) unlisten();
-          else unsubs.push(unlisten);
+          else { unsubs.push(unlisten); if (channelId) dispatchChannel({ type: 'live', attempt, channel: channelId }); }
         })
-        .catch(() => undefined);
+        .catch(() => { if (!disposed && channelId) dispatchChannel({ type: 'failed', attempt, channel: channelId }); });
     };
 
     const showRegistryAlert = (alerts: ActionRegistryAlert[]) => {
@@ -56,10 +60,11 @@ export function useAppSignals() {
     void invoke<unknown>('get_action_registry_alerts')
       .then((value) => {
         if (disposed) return;
+        dispatchChannel({ type: 'live', attempt, channel: 'boot-read' });
         const alerts = parseActionRegistryAlerts(value);
         if (alerts.length > 0) showRegistryAlert(alerts);
       })
-      .catch(() => undefined);
+      .catch(() => { if (!disposed) dispatchChannel({ type: 'failed', attempt, channel: 'boot-read' }); });
 
     track(
       listen<unknown>('action-registry://alerts', (event) => {
@@ -69,7 +74,7 @@ export function useAppSignals() {
         } catch {
           /* a malformed payload is not an alert */
         }
-      }),
+      }), 'registry-events',
     );
 
     track(
@@ -83,7 +88,7 @@ export function useAppSignals() {
           undefined,
           { label: 'Go to Cron View', onClick: () => navigateRef.current('cron') },
         );
-      }),
+      }), 'missed-cron-events',
     );
 
     track(listen<unknown>('goal://notifications', event => {
@@ -105,5 +110,6 @@ export function useAppSignals() {
       disposed = true;
       unsubs.splice(0).forEach((unlisten) => unlisten());
     };
-  }, []);
+  }, [attempt]);
+  return { alertChannelView: projectAlertChannel(channel), alertChannelState: channel, retrySignals: () => setAttempt(current => current + 1) };
 }

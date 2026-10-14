@@ -1,3 +1,4 @@
+import { decideCreateReadback, createFailureSentence, type CreateFailure } from '../../domain/create-readback';
 // Hooks — event hooks (get_hooks / register_hook / unregister_hook).
 //
 // Behaviour is ported unchanged from the legacy HooksView: guarded register
@@ -59,7 +60,7 @@ export default function HooksPage() {
   const [script, setScript] = useState('');
   const [pendingDelete, setPendingDelete] = useState<Hook | null>(null);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [operations, setOperations] = useState<Record<string, RemovalOperation<Hook>>>({});
   const createPending = useRef(false);
@@ -80,13 +81,14 @@ export default function HooksPage() {
     setError(null);
     try {
       const snapshot = await invoke<Hook[]>('get_hooks');
-      if (request !== requestId.current) return;
+      if (request !== requestId.current) return null;
       const result = reconcileRemovals(snapshot, operationsRef.current, request);
       publishOperations(result.operations);
       setHooks(result.rows);
       setLoaded(true);
-    } catch (e) {
-      if (request !== requestId.current) return;
+      return snapshot;
+    } catch {
+      if (request !== requestId.current) return null;
       const next = { ...operationsRef.current };
       let removalFailure = false;
       for (const [id, operation] of Object.entries(next)) {
@@ -96,7 +98,8 @@ export default function HooksPage() {
         }
       }
       publishOperations(next);
-      if (!opts?.removalRead || !removalFailure) setError(String(e));
+      if (!opts?.removalRead || !removalFailure) setError('Could not read hooks. Retry the read.');
+      return null;
     } finally {
       if (request === requestId.current) {
         reading.current = false;
@@ -118,19 +121,20 @@ export default function HooksPage() {
     if (createPending.current || !name.trim()) return;
     createPending.current = true;
     setCreating(true);
-    setCreateError(false);
+    setCreateFailure(null);
     try {
-      await invoke<Hook>('register_hook', {
+      const returned = await invoke<Hook>('register_hook', {
         name: name.trim(),
         event,
         script: script.trim() || null,
       });
-      success(`Registered hook ${name}`);
+      const verdict = decideCreateReadback<Hook>(returned, await fetchHooks());
+      if (verdict.status !== 'confirmed') { setCreateFailure(verdict.status); return; }
+      success(`Registered hook ${verdict.row.name}`);
       setName('');
       setScript('');
-      await fetchHooks();
     } catch {
-      setCreateError(true);
+      setCreateFailure('write-failed');
     } finally {
       createPending.current = false;
       setCreating(false);
@@ -203,13 +207,13 @@ export default function HooksPage() {
           title="Register a hook"
           description="Bind a handler to one event. The handler is optional — a hook without one only records that the event fired."
         />
-        {createError && (
+        {createFailure && (
           <AlertLine
             className="mb-3"
-            onRetry={() => void register()}
+            onRetry={createFailure === 'write-failed' ? () => void register() : undefined}
             retryDisabled={creating || !name.trim()}
           >
-            Could not register the hook. Your draft was kept.
+            {createFailureSentence('hook', createFailure)}
           </AlertLine>
         )}
         <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_200px]">

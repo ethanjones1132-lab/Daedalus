@@ -1,3 +1,4 @@
+import { decideCreateReadback, createFailureSentence, type CreateFailure } from '../../domain/create-readback';
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '../../design';
@@ -27,7 +28,7 @@ export function useRemovableList<T extends RemovableRow>({ listCommand, removeCo
   const [loaded, setLoaded] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<T | null>(null);
   const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState(false);
+  const [createFailure, setCreateFailure] = useState<CreateFailure | null>(null);
   const [operations, setOperations] = useState<Record<string, RemovalOperation<T>>>({});
   const createPending = useRef(false);
   const operationsRef = useRef(operations);
@@ -48,13 +49,14 @@ export function useRemovableList<T extends RemovableRow>({ listCommand, removeCo
       setError(null);
       try {
         const snapshot = await invoke<T[]>(listCommand);
-        if (request !== requestId.current) return;
+        if (request !== requestId.current) return null;
         const result = reconcileRemovals(snapshot, operationsRef.current, request);
         publishOperations(result.operations);
         setRows(result.rows);
         setLoaded(true);
-      } catch (e) {
-        if (request !== requestId.current) return;
+        return snapshot;
+      } catch {
+        if (request !== requestId.current) return null;
         const next = { ...operationsRef.current };
         let removalFailure = false;
         for (const [id, operation] of Object.entries(next)) {
@@ -64,7 +66,8 @@ export function useRemovableList<T extends RemovableRow>({ listCommand, removeCo
           }
         }
         publishOperations(next);
-        if (!opts?.removalRead || !removalFailure) setError(String(e));
+        if (!opts?.removalRead || !removalFailure) setError('Could not read records. Retry the read.');
+        return null;
       } finally {
         if (request === requestId.current) {
           reading.current = false;
@@ -86,22 +89,22 @@ export function useRemovableList<T extends RemovableRow>({ listCommand, removeCo
 
   /**
    * Run one creation. `perform` issues the native write; `reset` clears the
-   * draft after a confirmed write (before the readback, so a failed readback
-   * never reads as a failed creation).
+   * draft only after a fresh list confirms the returned record identity.
    */
   const create = useCallback(
-    async (perform: () => Promise<unknown>, successMessage: string, reset: () => void) => {
+    async (perform: () => Promise<unknown>, successMessage: (confirmed: T) => string, reset: () => void) => {
       if (createPending.current) return;
       createPending.current = true;
       setCreating(true);
-      setCreateError(false);
+      setCreateFailure(null);
       try {
-        await perform();
-        success(successMessage);
+        const returned = await perform();
+        const verdict = decideCreateReadback<T>(returned, await fetchRows());
+        if (verdict.status !== 'confirmed') { setCreateFailure(verdict.status); return; }
+        success(successMessage(verdict.row));
         reset();
-        await fetchRows();
       } catch {
-        setCreateError(true);
+        setCreateFailure('write-failed');
       } finally {
         createPending.current = false;
         setCreating(false);
@@ -160,7 +163,9 @@ export function useRemovableList<T extends RemovableRow>({ listCommand, removeCo
     pendingDelete,
     deleting,
     creating,
-    createError,
+    createError: createFailure !== null,
+    createCanRetry: createFailure === 'write-failed',
+    createMessage: createFailure ? createFailureSentence(listCommand === 'get_devices' ? 'device' : 'node', createFailure) : null,
     fetchRows,
     retryRead,
     create,

@@ -63,13 +63,13 @@ describe('Channel row mutation coordination', () => {
     expect(writes()).toEqual([['login_channel', { id: 'a' }]]);
     expect(row().getByRole('button', { name: 'Verifying…' })).toBeDisabled();
     expect(row().getByRole('button', { name: 'Remove' })).toBeDisabled();
-    expect(screen.getByText('0 connected')).toBeInTheDocument();
+    expect(screen.getByText('0 stored login flags')).toBeInTheDocument();
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
     await act(async () => { write.resolve(true); });
     expect(row().getByRole('button', { name: 'Verify & connect' })).toBeDisabled();
     await act(async () => { read.resolve([connected(), beta]); });
     expect(row().getByRole('button', { name: 'Disconnect' })).toBeEnabled();
-    expect(screen.getByText('1 connected')).toBeInTheDocument();
+    expect(screen.getByText('1 stored login flags')).toBeInTheDocument();
   });
 
   it.each(['login_channel', 'logout_channel', 'remove_channel'])('treats false and rejected %s writes as fixed recoverable failures', async (command) => {

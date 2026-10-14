@@ -9,6 +9,7 @@ import CommandPalette, { type PaletteItem } from './CommandPalette';
 import HealthBanner from '../features/system/HealthBanner';
 import SystemStatusBar from '../features/system/SystemStatusBar';
 import BuildBadge from '../features/system/BuildBadge';
+import ActionRegistryAlertBanner from '../features/system/ActionRegistryAlertBanner';
 import { useAppSignals } from './useAppSignals';
 
 const RAIL_KEY = 'jarvis-rail-collapsed';
@@ -35,10 +36,10 @@ function readCollapsed() {
  */
 export function Shell() {
   const { route, navigate } = useNavigation();
-  const { theme, toggle } = useTheme();
+  const { theme, toggle, choice } = useTheme();
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  useAppSignals();
+  const signals = useAppSignals();
 
   const current = routeById(route);
   const Page = current.component;
@@ -121,6 +122,8 @@ export function Shell() {
           </div>
         </header>
 
+        {choice.message && <div role={choice.status === 'saving' ? 'status' : 'alert'} className="border-b border-line px-4 py-2 text-xs text-ink-3">{choice.message}</div>}
+        <ActionRegistryAlertBanner view={signals.alertChannelView} onRetry={signals.retrySignals} />
         <HealthBanner />
 
         <main

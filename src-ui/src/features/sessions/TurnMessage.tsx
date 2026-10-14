@@ -1,4 +1,5 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { useCopyOutcome } from '../../hooks/useCopyOutcome';
+import { memo, useState } from 'react';
 import { Check, ChevronRight, Copy, Wrench } from 'lucide-react';
 import { Badge, Mark, Spinner, cn, toneOf } from '../../design';
 import type { JarvisMessage } from '../../domain/types';
@@ -51,7 +52,7 @@ const MessageBody = memo(function MessageBody({
   isToolEcho: boolean;
   streamStatus?: string;
 }) {
-  if (isCancelled) return <p className="text-[13.5px] italic text-ink-3">(stopped)</p>;
+  if (isCancelled) return <div><MarkdownView content={content} /><p className="text-[13.5px] italic text-ink-3">(stopped)</p></div>;
   if (streamStatus) {
     return (
       <p className="flex items-center gap-2 font-mono text-[11.5px] text-ink-3">
@@ -70,28 +71,13 @@ const MessageBody = memo(function MessageBody({
 });
 
 function CopyButton({ text, index }: { text: string; index: number }) {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(
-    () => () => {
-      if (timer.current) clearTimeout(timer.current);
-    },
-    [],
-  );
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      if (timer.current) clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      console.error('Failed to copy:', e);
-    }
-  }, [text]);
+  const { view, copy } = useCopyOutcome(text);
+  const copied = view.copied;
   return (
-    <button
+    <span className="inline-flex items-center gap-2"><button
       type="button"
-      onClick={handleCopy}
+      disabled={view.phase === 'copying'}
+      onClick={copy}
       aria-label={`Copy message ${index + 1}`}
       className={cn(
         'inline-flex h-6 items-center gap-1 rounded-[5px] px-1.5 font-mono text-[10.5px] transition-colors',
@@ -100,7 +86,7 @@ function CopyButton({ text, index }: { text: string; index: number }) {
     >
       {copied ? <Check aria-hidden="true" className="size-3" /> : <Copy aria-hidden="true" className="size-3" />}
       <span aria-hidden="true">{copied ? 'Copied' : 'Copy'}</span>
-    </button>
+    </button>{view.failed && <span role="alert" className="text-err">{view.message}</span>}</span>
   );
 }
 

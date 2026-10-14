@@ -1,3 +1,5 @@
+import { decodeSkillScore } from '../../lib/skill-score-reading';
+import { sectionCount, listRead, projectListTally, tallyNumber } from '../../lib/list-tally';
 import { useFeatureMode } from '../workflows/FeatureModes';
 // ═══════════════════════════════════════════════════════════════
 // ── SkillsView — Browse, toggle, inspect, and revision-restore skills
@@ -757,8 +759,8 @@ function SkillDetail({
         limit: 50,
       });
       setRevisions(revs);
-    } catch (e) {
-      setRevError(String(e));
+    } catch {
+      setRevError('Could not read skill revisions. Retry the read.');
     } finally {
       setLoadingRevs(false);
     }
@@ -775,8 +777,8 @@ function SkillDetail({
         success(`Restored ${skill.name} to v${rev.version}`, 'Revision restored');
         await loadRevisions();
         onChanged();
-      } catch (e) {
-        toastError(String(e), 'Restore failed');
+      } catch {
+        toastError('The skill revision could not be restored. Retry the same revision.', 'Restore failed');
       }
     },
     [skill.name, loadRevisions, onChanged, success, toastError],
@@ -974,15 +976,16 @@ function SkillDetail({
           {!candidateCurrent && <p className="text-amber-200">Previous lifecycle observation; it may be stale. Actions are unavailable.</p>}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-ink/50">Confidence</span>
-            <Pill variant="default">{candidateDetail.confidence.toFixed(2)}</Pill>
+            <Pill variant="default">{decodeSkillScore(candidateDetail.confidence, 'confidence').label}</Pill>
             {candidateDetail.eval_score !== undefined && (
               <>
                 <span className="text-ink/50">Eval score</span>
                 <Pill variant={candidateDetail.eval_score >= 0.75 ? 'success' : 'warn'}>
-                  {candidateDetail.eval_score.toFixed(2)}
+                  {decodeSkillScore(candidateDetail.eval_score, 'eval_score').label}
                 </Pill>
               </>
             )}
+            {decodeSkillScore(candidateDetail.confidence, 'confidence').basis && <p className="text-xs text-ink-3">{decodeSkillScore(candidateDetail.confidence, 'confidence').basis}</p>}
             {candidateDetail.status === 'rejected' && candidateDetail.rejection_reason && (
               <>
                 <span className="text-ink/50">Rejected</span>
@@ -1360,8 +1363,8 @@ export function SkillsView() {
       protections.current = reconciled.protections;
       setSkills(reconciled.skills);
 
-    } catch (e) {
-      if (readId === listReadId.current) setError(String(e));
+    } catch {
+      if (readId === listReadId.current) setError('Could not read skill revisions. Retry the read.');
     } finally {
       if (readId === listReadId.current) setLoading(false);
     }
@@ -1462,7 +1465,7 @@ export function SkillsView() {
      if (selectedCandidateId) void loadCandidateEvaluation(selectedCandidateId);
    }, [selectedCandidateId, loadCandidateEvaluation]);
 
-   const enabledCount = skills.filter((s) => s.enabled).length;
+   const enabledCount = tallyNumber(skills, projectListTally(skills, listRead(skills, { loading, failed: error !== null })), (row) => row.enabled);
 
   const runCandidateAction = useCallback(
     async (
@@ -1721,11 +1724,11 @@ export function SkillsView() {
       <SectionHeader
         title="Skills"
         subtitle="Browse, toggle, inspect, and restore skill revisions"
-        count={skills.length}
+        count={sectionCount(skills, { loading: loading, failed: error !== null })}
         action={
-          <Pill variant={enabledCount > 0 ? 'success' : 'default'}>
+          enabledCount !== null ? <Pill variant={enabledCount > 0 ? 'success' : 'default'}>
             {enabledCount} enabled
-          </Pill>
+          </Pill> : null
         }
       />
 
@@ -1898,8 +1901,8 @@ export function SkillsView() {
                       )}
                       <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-ink/30">
                         <span>v{s.version}</span>
-                        {s.improvement_score > 0 && (
-                          <span>score {s.improvement_score.toFixed(2)}</span>
+                        {(s.improvement_score > 0 || decodeSkillScore(s.improvement_score, 'improvement_score').kind === 'unavailable') && (
+                          <span>score {decodeSkillScore(s.improvement_score, 'improvement_score').label}</span>
                         )}
                         <span className="ml-auto">{formatDate(s.updated_at)}</span>
                       </div>

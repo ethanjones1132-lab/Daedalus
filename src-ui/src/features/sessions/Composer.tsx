@@ -87,6 +87,8 @@ export function Composer({ turn }: { turn: SessionTurn }) {
     <div data-owns-mod-k="" className="shrink-0 px-8 pb-4 pt-1">
       <div className="mx-auto w-full max-w-[760px]">
         <LiveWire turn={turn} />
+        {turn.stopView.status && <div role="status" aria-label="Stop request" className="mb-2 text-xs text-ink-3">{turn.stopView.status}</div>}
+        {turn.stopView.alert && <div role="alert" aria-label="Stop request" className="mb-2 text-xs text-err">{turn.stopView.alert} <button type="button" onClick={() => void turn.handleStop()}>Retry stop</button></div>}
         <div
           className={cn(
             'rounded-xl border bg-surface shadow-card transition-[border-color,box-shadow] duration-200',
@@ -132,7 +134,7 @@ export function Composer({ turn }: { turn: SessionTurn }) {
             <button
               type="button"
               onClick={isStreaming ? handleStop : handleSend}
-              disabled={!isStreaming && !canSend}
+              disabled={isStreaming ? turn.stopView.stopDisabled : !canSend}
               aria-label={isStreaming ? 'Stop streaming' : 'Send message'}
               className={cn(
                 'relative flex size-8 shrink-0 items-center justify-center rounded-lg border transition-all duration-150',

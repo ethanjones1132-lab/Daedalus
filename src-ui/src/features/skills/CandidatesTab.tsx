@@ -1,3 +1,4 @@
+import { decodeSkillScore } from '../../lib/skill-score-reading';
 import { ArrowUpRight } from 'lucide-react';
 import { Badge, Button, Chip, EmptyState, Meter, Panel, StatusLine } from '../../design';
 import type { SkillCandidateAction, SkillCandidateMutation } from '../../domain/skill-candidate-operation-state';
@@ -44,7 +45,9 @@ function CandidateRow({
   onOpenSkill: () => void;
 }) {
   const locked = skillCandidateMutationLocked(mutation);
-  const evalScore = candidate.eval_score;
+  const confidenceReading = decodeSkillScore(candidate.confidence, 'confidence');
+  const evalReading = decodeSkillScore(candidate.eval_score, 'eval_score');
+  const evalScore = evalReading.value;
   return (
     <Panel as="li" className="flex flex-col gap-3 p-4" aria-label={`Candidate: ${candidate.name}`}>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -67,18 +70,20 @@ function CandidateRow({
           )}
         </div>
         <div className="flex items-start gap-5">
-          <Numeral label="Confidence" value={candidate.confidence.toFixed(2)} />
+          <Numeral label="Confidence" value={confidenceReading.label} />
           <div className="flex w-[104px] flex-col gap-1.5">
-            <Numeral label="Eval" value={evalScore === undefined ? '—' : evalScore.toFixed(2)} />
+            <Numeral label="Eval" value={evalReading.reason === 'no-record' ? '—' : evalReading.label} />
             <Meter
-              value={evalScore === undefined ? null : evalScore * 100}
-              tone={evalScore !== undefined && evalScore >= PROMOTE_EVAL_GATE ? 'ok' : 'warn'}
-              label={evalScore === undefined ? 'Eval not run' : `Eval score ${Math.round(evalScore * 100)} of 100, gate 75`}
+              value={evalScore === null ? null : evalScore * 100}
+              tone={evalScore !== null && evalScore >= PROMOTE_EVAL_GATE ? 'ok' : 'warn'}
+              label={evalScore === null ? 'Eval not run' : `Eval score ${Math.round(evalScore * 100)} of 100, gate 75`}
             />
           </div>
         </div>
       </div>
 
+      {confidenceReading.basis && <p className="text-xs text-ink-3">{confidenceReading.basis}</p>}
+      {evalReading.reason === 'unreadable' && <p className="text-xs text-ink-3">{evalReading.basis}</p>}
       {candidate.status === 'promoted' && <PromotedPerformance candidateId={candidate.id} />}
       {candidate.status === 'rejected' && candidate.rejection_reason && (
         <p className="text-[12px] text-ink-3">
