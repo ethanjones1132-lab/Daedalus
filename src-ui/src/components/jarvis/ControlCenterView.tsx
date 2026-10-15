@@ -10,7 +10,15 @@
 //   • Overview    — active profile + a consolidated health glance
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { initialRegistryState, reduceRegistryState } from './action-registry-state';
+import { initialRegistryState, reduceRegistryState, type RegistrySnapshotState } from './action-registry-state';
+import { sectionCount } from '../../lib/list-tally';
+import {
+  LOG_RAW_CONTENT_NOTICE,
+  logLevelTone,
+  logTailBound,
+  parseDiagnosticsLogTail,
+  type DiagnosticsLogTail,
+} from './diagnostics-log-state';
 import { profileOperationLocked, reduceProfileOperation, type ProfileOperationPhase } from './profile-operation-state';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -37,6 +45,12 @@ import {
   type CreateProfileArgs,
   type ModelProfileDraft,
 } from './model-profile-creation-state';
+
+// The same Bun server four other mounted surfaces already call directly
+// (SkillsView, JarvisView, SystemStatusBar, ChannelsView). The log read is HTTP
+// because the log is a file the server owns: `SystemStore.logs` is written by
+// nothing, so there is no Native read to take and no Rust to build one.
+const BUN_URL = 'http://127.0.0.1:19877';
 
 // ── Types (mirror the Rust command return shapes) ──────────────
 
@@ -188,6 +202,47 @@ function useControlResource<S>(command: string) {
     setState((prev) => ({ ...prev, requestId, loading: false }));
   }, []);
   return { ...state, load, loadDetailed, invalidate };
+}
+
+// The log read is HTTP rather than a Tauri command, so it cannot go through
+// `useControlResource` — that hook's one contract is `invoke<S>(command)` with no
+// argument, and three call sites depend on it staying exactly that. This is the
+// same hook's lifetime for a read the caller supplies: the same state module, so
+// the same three facts (attempted, settled, confirmed) and the same request fence,
+// and the same shape `ObservationFeedback` already reads. One failure means the
+// same thing in both places: no rows on screen, one fixed sentence, one Retry.
+function useFetchedResource<S>(read: () => Promise<S | null>) {
+  const [state, setState] = useState<RegistrySnapshotState<S>>(() => initialRegistryState<S>());
+  const request = useRef(0);
+  const pending = useRef(false);
+  const load = useCallback(async (supersede = false) => {
+    if (pending.current && !supersede) return null;
+    pending.current = true;
+    const requestId = ++request.current;
+    setState((prev) => reduceRegistryState(prev, { type: 'pending', requestId }));
+    try {
+      // `null` is how this read says it failed: a transport refusal, a non-ok
+      // status, and a payload this build cannot read are all the same fact to the
+      // operator, and none of them is an empty answer. `useControlResource` gets
+      // the same effect by throwing on a null snapshot; there is nothing to throw
+      // here because the refusal was already turned into a null.
+      const snapshot = await read();
+      if (request.current !== requestId) return null;
+      if (snapshot === null) {
+        setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
+        return null;
+      }
+      setState((prev) => reduceRegistryState(prev, { type: 'success', requestId, snapshot }));
+      return snapshot;
+    } catch {
+      if (request.current !== requestId) return null;
+      setState((prev) => reduceRegistryState(prev, { type: 'failure', requestId }));
+      return null;
+    } finally {
+      if (request.current === requestId) pending.current = false;
+    }
+  }, [read]);
+  return { ...state, load };
 }
 
 function ObservationFeedback({ label, resource }: {
@@ -508,6 +563,31 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
   }, [restartState, restartSubsystem, subsystemRows]);
 
   const restartRow = restartState.key ? subsystemRows.find((row) => row.key === restartState.key) : undefined;
+
+  // ── Server log ───────────────────────────────────────────────
+  // The log the app actually writes, read by the process that owns it. Decision
+  // (a): this is the read-error rule's one deliberate exception, and the exception
+  // is stated on screen in `LOG_RAW_CONTENT_NOTICE` rather than assumed — a log
+  // line is raw server output and can carry the store paths and session ids the
+  // rule otherwise withholds. Decision (b): a file that could not be opened is a
+  // failed read, never a confirmed empty log, which is why a non-ok response and
+  // an undecodable payload are both `null` here and never an empty tail. Decision
+  // (d): nothing polls this. It is read when the operator opens the tab and when
+  // they press this section's own Refresh.
+  const readServerLog = useCallback(async (): Promise<DiagnosticsLogTail | null> => {
+    if (typeof globalThis.fetch !== 'function') return null;
+    const response = await globalThis.fetch(`${BUN_URL}/diagnostics/log`);
+    if (!response.ok) return null;
+    return parseDiagnosticsLogTail(await response.json());
+  }, []);
+  const logResource = useFetchedResource<DiagnosticsLogTail>(readServerLog);
+  const { load: loadLog } = logResource;
+  const logTail = logResource.snapshot;
+  const logLines = logTail?.lines ?? [];
+  useEffect(() => {
+    if (tab !== 'diagnostics') return;
+    void loadLog(true);
+  }, [tab, loadLog]);
 
   const activeProfile = profiles.find((p) => p.is_active) ?? null;
 
@@ -872,6 +952,10 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
                 onRetryHealth={() => { void retryRestartHealth(); }}
               />
             )}
+            {/* The log's own announcement sits with the section it announces, and
+                only while that section is on screen — unlike the two reads above,
+                this one is not taken on mount. */}
+            <ObservationFeedback label="Server log" resource={logResource} />
             {health ? (
               <GlassCard className="p-4 space-y-3">
                 <div className="flex items-center gap-2">
@@ -971,6 +1055,58 @@ export default function ControlCenterView({ initialTab = 'overview' }: ControlCe
                 </ul>
               </GlassCard>
             )}
+
+            <GlassCard className="p-4">
+              <SectionHeader
+                title="Server log"
+                subtitle={LOG_RAW_CONTENT_NOTICE}
+                count={sectionCount(logLines, { loading: logResource.loading, failed: logResource.error })}
+                action={
+                  <button
+                    type="button"
+                    onClick={() => { if (!logResource.loading) void loadLog(true); }}
+                    disabled={logResource.loading}
+                    className="px-2 py-1 text-[10px] rounded-md border border-white/10 text-bone/60 hover:text-bone hover:border-white/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Refresh log
+                  </button>
+                }
+              />
+              {logTail === null ? (
+                <p className="text-xs text-bone/50">Nothing confirmed from this log yet.</p>
+              ) : logLines.length === 0 ? (
+                // A read that did not reach the start of the file says nothing
+                // about how many lines the file holds, so it must not borrow the
+                // confirmed-empty reading even when it brought back no lines.
+                logTail.truncated ? (
+                  <p className="text-[10px] font-mono text-bone/40">{logTailBound(logTail)}</p>
+                ) : (
+                  <EmptyState message="The log file exists and holds no lines yet." />
+                )
+              ) : (
+                <>
+                  <p className="mb-1 text-[10px] font-mono text-bone/40">{logTail.source}</p>
+                  <p className="mb-2 text-[10px] font-mono text-bone/40">{logTailBound(logTail)}</p>
+                  <ul className="max-h-80 space-y-1 overflow-y-auto">
+                    {logLines.map((line, index) => {
+                      const tone = logLevelTone(line.level);
+                      return (
+                        <li key={index} className="flex items-start gap-2 text-[11px]">
+                          {tone !== null && <Pill variant={tone}>{line.level}</Pill>}
+                          {line.timestamp !== null && (
+                            <span className="shrink-0 font-mono text-[10px] text-bone/30">
+                              {line.timestamp}
+                            </span>
+                          )}
+                          {/* Raw server output. Rendered as text, never as markup. */}
+                          <span className="min-w-0 break-words font-mono text-bone/70">{line.text}</span>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </>
+              )}
+            </GlassCard>
           </div>
         ) : (
           <McpPanel />

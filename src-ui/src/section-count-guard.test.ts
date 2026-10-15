@@ -187,6 +187,13 @@ const ALLOWLIST: SectionCountAllowlistEntry[] = [
       'The Channels `delivery verified` pill, the strongest claim in that slot: only a probe that delivered a message adds a channel to it, so `0 delivery verified` reads as "nothing has been proven to deliver" rather than as "no channel exists". It is counted over the same confirmed `list_channels` rows as the two numbers beside it, which is why it disappears with them on a read that failed and why a confirmed zero stays stated.',
   },
   {
+    file: './components/jarvis/ControlCenterView.tsx',
+    text: 'count={sectionCount(logLines, { loading: logResource.loading, failed: logResource.error })}',
+    kind: 'confirmed-read',
+    reason:
+      'The Server log header, over the lines `GET /diagnostics/log` returned. This surface is the one place a count answers a read over HTTP rather than a Tauri command, because the log is a file the Bun server owns and `SystemStore.logs` is written by nothing — so the flag pair is the same two booleans every other site passes, and the count is absent while the read is unanswered and absent after a failed first read. The case the rule exists for is the empty one: a file that could not be opened is answered as a failed read, so `Server log(0)` can only ever mean a file that was read and held no lines.',
+  },
+  {
     file: './components/jarvis/PluginsView.tsx',
     text: '{tally.enabled} enabled',
     kind: 'confirmed-read',

@@ -7,7 +7,7 @@
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
-import { installSelfLog } from "./self-log";
+import { installSelfLog, selfLogPath } from "./self-log";
 installSelfLog();
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
@@ -26,6 +26,7 @@ import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
+import { logReadResponse, readLogTail } from "./log-read";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
 import { buildClaudeCliChatArgs, streamClaudeCli, isClaudeCliAvailable, compactTurnHistoryForCli } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
@@ -5258,6 +5259,20 @@ export async function baseFetch(req: Request): Promise<Response> {
     }
     if (path === "/health/conductor-cache") {
       return Response.json(conductorCacheSnapshot());
+    }
+    if (path === "/diagnostics/log" && req.method === "GET") {
+      // The log the app really writes, read by the process that owns it.
+      // `server-jarvis.self.log` is the only log guaranteed to exist whichever way
+      // this process was started, because the tee creates its directory before any
+      // other module logs. The `SystemStore.logs` vector that looked like this
+      // app's log is written by nothing, so there is no Native read to route here
+      // and four mounted surfaces already call this server directly over HTTP.
+      //
+      // The cap is the server's (`resolveLogLimit`), not the client's, and a file
+      // that is not there or cannot be opened is answered as a non-2xx with no
+      // `lines` — never as an empty list, which would be the app reporting an
+      // empty log for a file it never opened.
+      return logReadResponse(readLogTail(selfLogPath(), new URL(req.url).searchParams.get("limit")));
     }
     if (path === "/health/conductor-directives") {
       return Response.json(conductorDirectiveSnapshot());

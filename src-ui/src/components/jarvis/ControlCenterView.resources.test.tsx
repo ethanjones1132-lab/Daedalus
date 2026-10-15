@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ControlCenterView from './ControlCenterView';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -25,6 +25,29 @@ const doctor = { checks: [{ name: 'Synthetic check', status: 'ok', detail: 'Obse
 const fixtures: Record<string, unknown> = { list_model_profiles: profiles, get_system_health: health, get_doctor_report: doctor };
 const calls = (command: string) => invokeMock.mock.calls.filter(([name]) => name === command).length;
 beforeEach(() => { invokeMock.mockReset(); invokeMock.mockImplementation((command: string) => Promise.resolve(fixtures[command] ?? true)); });
+
+// The Diagnostics tab also reads the server's log over HTTP, and this suite's
+// assertion at the bottom is that the surface carries no `role="alert"` at all
+// once the native reads have recovered. Without a stub that read is a real
+// request to 127.0.0.1:19877, so the assertion would be measuring whether this
+// machine happens to be running a server. A successful log read is the honest
+// completion of this suite's own intent — the log has its own suite
+// (ControlCenterView.log.test.tsx), and no assertion here is changed by this.
+beforeEach(() => {
+  vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve({
+      ok: true,
+      source: 'server-jarvis.self.log',
+      format: 'self-log',
+      limit: 200,
+      truncated: false,
+      lines: [{ text: 'synthetic server log line', timestamp: '2026-09-26T09:12:33.123Z', level: 'INFO' }],
+    }),
+  })));
+});
+afterEach(() => { vi.unstubAllGlobals(); });
 
 function diagnostics() { fireEvent.click(screen.getByRole('button', { name: 'Diagnostics' })); }
 
