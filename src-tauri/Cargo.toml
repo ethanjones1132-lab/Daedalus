@@ -1,6 +1,6 @@
 [package]
 name = "home-base"
-version = "0.1.0"
+version = "1.0.0"
 description = "Home Base — OpenClaw agent command center"
 authors = ["Ethan"]
 license = "MIT"

@@ -50,6 +50,9 @@ import {
 } from "./memory-derived-state";
 import { NFL_2025_PLAYERS, NFL_2025_DEFENSES } from "./football";
 import { PRIZEPICKS_SYSTEM_PROMPT, buildPrizePicksContext, buildFullDatabaseContext, normalizeStatType, findPlayerName, generateWeeklyPicks } from "./prizepicks";
+// Single source for the app version reported by /health and /. Kept in sync
+// with src-tauri/Cargo.toml, src-tauri/tauri.conf.json, and src-ui/package.json.
+import jarvisPackage from "../package.json";
 
 import { serve } from "bun";
 import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync } from "fs";
@@ -781,12 +784,12 @@ if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
   throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
 }
 const BRIDGE_PORT = 19876;
-const JARVIS_VERSION = "3.0.0";
+const JARVIS_VERSION = jarvisPackage.version;
 
 // Build identity for /health — lets us tell which build is actually serving
 // a request (2026-07 incident: a stale deployed bundle silently served
 // leaked-JSON bugs for days because /health only reported the static
-// version string "3.0.0", identical across every build). build-and-deploy.ps1
+// version string, identical across every build). build-and-deploy.ps1
 // injects these via `bun build --define` from `git rev-parse HEAD`; running
 // from source (bun run / bunx bun test) never gets --define, so these fall
 // back to reading the real env var and finally to the "dev" sentinel.
