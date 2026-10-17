@@ -233,7 +233,7 @@ Daedalus/
 
 This tree began as `home-base-recovered` after a **2026-06 WSL disk wipe** destroyed the original. It was reconstructed — partly from backups, partly from agent transcripts — and rebuilt well past where it had been. The first two commits, both dated 2026-06-18, are that recovery.
 
-The Rust crate is `home-base`, the Bun package is `server-jarvis` v3.0.0, the app bundle is `com.jarvis.desktop`, and the remote is `Daedalus`. Four names, one system. `RECOVERY_STATUS.md` has the provenance.
+The Rust crate is `home-base`, the Bun package is `server-jarvis` v1.0.0, the app bundle is `com.jarvis.desktop`, and the remote is `Daedalus`. Four names, one system. `RECOVERY_STATUS.md` has the provenance.
 
 ---
 

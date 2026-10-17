@@ -13,6 +13,7 @@ import {
   registerDelegateMcpBundles,
   runMcpStdioLoop,
 } from "./mcp-adapter";
+import jarvisPackage from "../package.json";
 import { PassThrough } from "stream";
 
 function makeEchoRuntime() {
@@ -49,7 +50,7 @@ describe("MCP adapter", () => {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "Jarvis", version: "3.0.0" },
+        serverInfo: { name: "Jarvis", version: jarvisPackage.version },
       },
     });
   });

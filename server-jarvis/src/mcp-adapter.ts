@@ -13,6 +13,10 @@
 import { createInterface } from "readline";
 import { existsSync } from "fs";
 import { dirname, join } from "path";
+// Single source for the app version reported in MCP `initialize` serverInfo.
+// Kept in sync with src-tauri/Cargo.toml, src-tauri/tauri.conf.json,
+// src-ui/package.json, and index.ts.
+import jarvisPackage from "../package.json";
 import { defaultConfig, type JarvisConfig } from "./config";
 import { registerFilesystemBundle } from "./filesystem-bundle";
 import { registerGitMetadataBundle } from "./git-metadata-bundle";
@@ -168,7 +172,7 @@ export function createMcpAdapter(
           return success(req, {
             protocolVersion: MCP_PROTOCOL_VERSION,
             capabilities: { tools: {} },
-            serverInfo: { name: "Jarvis", version: "3.0.0" },
+            serverInfo: { name: "Jarvis", version: jarvisPackage.version },
           } satisfies McpInitializeResult);
 
         case "ping":
