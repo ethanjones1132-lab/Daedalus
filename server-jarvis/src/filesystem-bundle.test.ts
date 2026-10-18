@@ -661,7 +661,7 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     expect(glob.output).toContain("inside.txt");
   });
 
-  test.skipIf(process.platform === "win32")("grep and glob can inspect an explicitly granted outside directory link", async () => {
+  test("grep and glob can inspect an explicitly granted outside directory link", async () => {
     const workspace = makeTempWorkspace();
     const outside = makeTempWorkspace();
     writeFileSync(join(outside, "secret.txt"), "SECRET outside");
@@ -673,8 +673,15 @@ describe("FilesystemBundle > grep + glob + list_directory", () => {
     const grep = await rt.execute(call("grep", { pattern: "SECRET", path: "." }), ctx);
     const glob = await rt.execute(call("glob", { pattern: "**/*.txt", path: "." }), ctx);
 
-    expect(grep.output).toContain("escape/secret.txt");
-    expect(glob.output).toContain("escape/secret.txt");
+    // Output contract: grep emits a workspace-relative path and glob emits the
+    // resolved display path; both use the host's native separators. Build the
+    // expected path with `join` so the assertion follows that contract on both
+    // POSIX and Windows instead of hard-coding "/".
+    const linkedFile = join("escape", "secret.txt");
+    expect(grep.is_error).toBe(false);
+    expect(glob.is_error).toBe(false);
+    expect(grep.output).toContain(linkedFile);
+    expect(glob.output).toContain(linkedFile);
   });
 
   test("list_directory does not inspect an outside directory link target", async () => {
