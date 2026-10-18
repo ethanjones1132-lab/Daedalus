@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════
 // The `bash` tool registered into the ToolRuntime. Dangerous + approval-required.
 
-import { spawn, type ChildProcess } from "child_process";
+import { execFile, spawn, type ChildProcess } from "child_process";
 import { existsSync, statSync } from "fs";
 import { TOOL_TIMEOUT_REASON, type ToolRuntime, type ExecutionContext } from "./tool-runtime";
 import { ToolExecutionError, type ToolDefinition } from "./tool-types";
@@ -98,15 +98,35 @@ function boundedShellText(value: string): string {
   return `${value.slice(0, MAX_SHELL_OUTPUT_CHARS)}… [truncated]`;
 }
 
-function terminateProcess(proc: ChildProcess, signal: "SIGTERM" | "SIGKILL" = "SIGTERM"): void {
-  try {
-    if (process.platform !== "win32" && proc.pid) {
-      process.kill(-proc.pid, signal);
-    } else {
-      proc.kill(signal);
+function terminateProcess(proc: ChildProcess, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+  const pid = proc.pid;
+  if (pid && process.platform === "win32") {
+    const args = ["/PID", String(pid), "/T"];
+    // Node's SIGTERM is forceful on Windows too, so signal the whole tree at
+    // once. A direct-child exit cannot confirm that descendants have stopped.
+    args.push("/F");
+    return new Promise((resolve, reject) => {
+      execFile("taskkill", args, { encoding: "utf8", windowsHide: true }, (error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+  if (pid) {
+    try {
+      process.kill(-pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return Promise.reject(error);
     }
-  } catch {
-    try { proc.kill(signal); } catch {}
+    return Promise.resolve();
+  }
+
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  try {
+    if (proc.kill(signal)) return Promise.resolve();
+    return Promise.reject(new Error("Could not signal the shell child before its process ID was available"));
+  } catch (error) {
+    return Promise.reject(error);
   }
 }
 
@@ -165,11 +185,28 @@ async function handleShell(
     let stdout = "";
     let stderr = "";
     let closed = false;
+    let closeResult: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+    let finishingClose = false;
     let stopReason: "cancelled" | "timeout" | undefined;
     let spawnError: Error | undefined;
     let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
     let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: () => void = () => {};
+    let forcedTerminationRequested = false;
+    let terminationError: unknown;
+    let terminationWork: Promise<void> = Promise.resolve();
+
+    const requestTermination = (signal: "SIGTERM" | "SIGKILL"): Promise<void> => {
+      terminationWork = terminationWork.then(async () => {
+        try {
+          await terminateProcess(proc, signal);
+          terminationError = undefined;
+        } catch (error) {
+          terminationError = error;
+        }
+      });
+      return terminationWork;
+    };
 
     const cleanup = (): void => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
@@ -177,13 +214,69 @@ async function handleShell(
       ctx.signal?.removeEventListener("abort", onAbort);
     };
     const requestStop = (reason: "cancelled" | "timeout"): void => {
-      if (closed || stopReason) return;
+      if (closed || closeResult || stopReason) return;
       stopReason = reason;
-      terminateProcess(proc);
+      void requestTermination("SIGTERM");
       hardKillTimer = setTimeout(() => {
-        if (!closed) terminateProcess(proc, "SIGKILL");
+        if (closed || forcedTerminationRequested) return;
+        forcedTerminationRequested = true;
+        void requestTermination("SIGKILL").then(() => finishClose());
       }, 500);
       hardKillTimer.unref?.();
+    };
+
+    const finishClose = async (): Promise<void> => {
+      if (!closeResult || closed || finishingClose) return;
+      finishingClose = true;
+
+      while (true) {
+        const currentWork = terminationWork;
+        await currentWork;
+        if (currentWork === terminationWork) break;
+      }
+
+      if (stopReason && terminationError && !forcedTerminationRequested) {
+        forcedTerminationRequested = true;
+        await requestTermination("SIGKILL");
+      }
+
+      closed = true;
+      cleanup();
+      const output = stdout.trim();
+      const err = stderr.trim();
+      if (stopReason) {
+        const message = stopReason === "timeout"
+          ? `Shell execution timed out after ${timeout}ms`
+          : "Shell execution cancelled";
+        const cleanupDetail = terminationError
+          ? `Process tree termination could not be confirmed: ${terminationError instanceof Error ? terminationError.message : String(terminationError)}`
+          : undefined;
+        const fullMessage = cleanupDetail ? `${message}\n${cleanupDetail}` : message;
+        const failureOutput = [output || err, cleanupDetail].filter(Boolean).join("\n") || fullMessage;
+        reject(shellFailure(stopReason, fullMessage, failureOutput, terminationError));
+        return;
+      }
+      if (spawnError) {
+        reject(shellFailure("spawn_error", `Failed to spawn shell: ${spawnError.message}`, `Failed to spawn shell: ${spawnError.message}`, spawnError));
+        return;
+      }
+      const { code, signal } = closeResult;
+      if (code === 0) {
+        resolve(output || "(no output)");
+        return;
+      }
+      if (signal) {
+        reject(shellFailure("execution_error", `Shell command terminated by ${signal}`, `Shell command terminated by ${signal}\nPartial output: ${output}`));
+        return;
+      }
+      let message = `Command failed with exit code ${code}`;
+      if (err) message += `\nError: ${err}`;
+      if (output) message += `\nPartial output: ${output}`;
+      if (code === 127) message += "\nHint: Command not found. Check if the tool is installed or use the full path.";
+      else if (code === 1 && err.includes("Permission denied")) message += "\nHint: Permission denied. Try checking file permissions with ls -la, or use a different approach.";
+      else if (code === 1 && err.includes("No such file")) message += "\nHint: File or directory not found. Use glob to find the correct path.";
+      else if (err.includes("already exists")) message += "\nHint: Target already exists. Use read_file to check current content, or use a different filename.";
+      reject(shellFailure("execution_error", message, message));
     };
 
     onAbort = (): void => requestStop(ctx.signal?.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled");
@@ -209,38 +302,9 @@ async function handleShell(
       }
     });
     proc.once("close", (code, signal) => {
-      if (closed) return;
-      closed = true;
-      cleanup();
-      const output = stdout.trim();
-      const err = stderr.trim();
-      if (stopReason) {
-        const message = stopReason === "timeout"
-          ? `Shell execution timed out after ${timeout}ms`
-          : "Shell execution cancelled";
-        reject(shellFailure(stopReason, message, output || err || message));
-        return;
-      }
-      if (spawnError) {
-        reject(shellFailure("spawn_error", `Failed to spawn shell: ${spawnError.message}`, `Failed to spawn shell: ${spawnError.message}`, spawnError));
-        return;
-      }
-      if (code === 0) {
-        resolve(output || "(no output)");
-        return;
-      }
-      if (signal) {
-        reject(shellFailure("execution_error", `Shell command terminated by ${signal}`, `Shell command terminated by ${signal}\nPartial output: ${output}`));
-        return;
-      }
-      let message = `Command failed with exit code ${code}`;
-      if (err) message += `\nError: ${err}`;
-      if (output) message += `\nPartial output: ${output}`;
-      if (code === 127) message += "\nHint: Command not found. Check if the tool is installed or use the full path.";
-      else if (code === 1 && err.includes("Permission denied")) message += "\nHint: Permission denied. Try checking file permissions with ls -la, or use a different approach.";
-      else if (code === 1 && err.includes("No such file")) message += "\nHint: File or directory not found. Use glob to find the correct path.";
-      else if (err.includes("already exists")) message += "\nHint: Target already exists. Use read_file to check current content, or use a different filename.";
-      reject(shellFailure("execution_error", message, message));
+      if (closed || closeResult) return;
+      closeResult = { code, signal };
+      void finishClose();
     });
   });
 }

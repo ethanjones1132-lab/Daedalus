@@ -61,6 +61,52 @@ function writeMcpConfig(workspace: string, server: Record<string, unknown>): voi
   );
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function powerShellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function delayedMarkerCommand(ready: string, marker: string, delayMs: number): string {
+  if (process.platform === "win32") {
+    const childScript = [
+      `Set-Content -LiteralPath ${powerShellQuote(ready)} -Value ready -NoNewline`,
+      `Start-Sleep -Milliseconds ${delayMs}`,
+      `Set-Content -LiteralPath ${powerShellQuote(marker)} -Value late -NoNewline`,
+    ].join("; ");
+    const encodedScript = Buffer.from(childScript, "utf16le").toString("base64");
+    return [
+      `$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -NonInteractive -EncodedCommand ${encodedScript}' -PassThru -WindowStyle Hidden`,
+      `$readyPath = ${powerShellQuote(ready)}`,
+      `$deadline = [DateTime]::UtcNow.AddSeconds(5)`,
+      `while (-not (Test-Path -LiteralPath $readyPath)) { if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for descendant readiness' }; Start-Sleep -Milliseconds 10 }`,
+      `Wait-Process -Id $child.Id`,
+    ].join("; ");
+  }
+
+  return [
+    `(`,
+    `  printf ready > ${shellQuote(ready)}`,
+    `  sleep ${delayMs / 1000}`,
+    `  printf late > ${shellQuote(marker)}`,
+    `) &`,
+    `child=$!`,
+    `for ((i = 0; i < 500; i++)); do [ -e ${shellQuote(ready)} ] && break; sleep 0.01; done`,
+    `[ -e ${shellQuote(ready)} ] || { kill "$child" 2>/dev/null || true; exit 73; }`,
+    `wait "$child"`,
+  ].join("\n");
+}
+
+async function waitForPath(path: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return existsSync(path);
+}
+
 describe("foreground shell outcomes", () => {
   test("non-zero exit is an error rather than successful output", async () => {
     const result = await makeShellRuntime().execute(
@@ -130,25 +176,69 @@ describe("foreground shell outcomes", () => {
     expect(result.error_code).toBe("cancelled");
   }, 2_000);
 
-  test.skipIf(process.platform === "win32")("cancelled shell work leaves no delayed side effect", async () => {
+  test("cancelled shell work leaves no delayed side effect", async () => {
     const workspace = makeWorkspace();
+    const shellTool = process.platform === "win32" ? "powershell" : "bash";
+    const runtime = makeShellRuntime();
+    const controlReady = join(workspace, "control-ready");
+    const controlMarker = join(workspace, "control-side-effect");
+    const control = await runtime.execute(
+      {
+        id: "shell-no-late-control",
+        name: shellTool,
+        arguments: { command: delayedMarkerCommand(controlReady, controlMarker, 300) },
+      },
+      makeShellContext({ workspace_path: workspace }),
+    );
+    expect(control.is_error).toBe(false);
+    expect(existsSync(controlMarker)).toBe(true);
+
+    const ready = join(workspace, "cancel-ready");
     const marker = join(workspace, "late-side-effect");
     const controller = new AbortController();
-    const pending = makeShellRuntime().execute(
+    const pending = runtime.execute(
       {
         id: "shell-no-late",
-        name: "bash",
-        arguments: { command: `sleep 0.1; printf late > '${marker}'` },
+        name: shellTool,
+        arguments: { command: delayedMarkerCommand(ready, marker, 1_200) },
       },
       makeShellContext({ workspace_path: workspace, signal: controller.signal }),
     );
-    setTimeout(() => controller.abort("operator cancelled"), 20);
+
+    expect(await waitForPath(ready, 5_000)).toBe(true);
+    controller.abort("operator cancelled");
     const result = await pending;
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await waitForPath(marker, 1_500);
 
     expect(result.error_code).toBe("cancelled");
     expect(existsSync(marker)).toBe(false);
-  }, 2_000);
+  }, 8_000);
+
+  test("shell timeout terminates descendant work before delayed side effects", async () => {
+    const workspace = makeWorkspace();
+    const shellTool = process.platform === "win32" ? "powershell" : "bash";
+    const ready = join(workspace, "timeout-ready");
+    const marker = join(workspace, "timeout-side-effect");
+    const pending = makeShellRuntime().execute(
+      {
+        id: "shell-timeout-no-late",
+        name: shellTool,
+        arguments: { command: delayedMarkerCommand(ready, marker, 3_000), timeout_ms: 1_000 },
+      },
+      makeShellContext({ workspace_path: workspace }),
+    );
+
+    const startup = await Promise.race([
+      waitForPath(ready, 5_000).then((found) => ({ ready: found })),
+      pending.then((result) => ({ result })),
+    ]);
+    expect(startup).toEqual({ ready: true });
+    const result = await pending;
+    await waitForPath(marker, 3_300);
+
+    expect(result.error_code).toBe("timeout");
+    expect(existsSync(marker)).toBe(false);
+  }, 9_000);
 
   test("successful empty output remains successful", async () => {
     const result = await makeShellRuntime().execute(
