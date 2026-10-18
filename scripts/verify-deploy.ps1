@@ -2,7 +2,8 @@
 .SYNOPSIS
     Verifies that the deployed Jarvis runtime matches the repo HEAD.
     Checks git SHA, index.js/proxy hashes, prompts/ directory, manifest existence,
-    and (if a server is actually listening) that the RUNNING process is
+    the NSIS installer hash when an installer is present (skipped cleanly when
+    absent), and (if a server is actually listening) that the RUNNING process is
     serving that same build — not just that the files on disk look right.
 #>
 param(
@@ -108,6 +109,43 @@ if (-not (Test-Path (Join-Path $deployDir 'prompts'))) {
     exit 1
 } else {
     Write-Host "prompts/ directory exists." -ForegroundColor Green
+}
+
+# ── NSIS installer provenance (optional) ──
+# A release may also ship an NSIS installer next to the runtime
+# (build-windows.ps1 / build-and-deploy.ps1 copy it as Jarvis-installer.exe;
+# Tauri's default bundle name is Jarvis_<version>_x64-setup.exe). When one is
+# present, verify its SHA-256 against the manifest and confirm it belongs to
+# the same git SHA the rest of the deploy came from. When no installer exists,
+# skip with a clear message instead of failing — the runtime checks above
+# still stand.
+$installerCandidates = @(
+    (Join-Path $deployDir 'Jarvis-installer.exe'),
+    (Join-Path $deployDir 'Jarvis-installer.msi')
+)
+$installerCandidates += @(
+    Get-ChildItem -Path $deployDir -Filter 'Jarvis_*_x64-setup.exe' -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName }
+)
+$installerPath = $installerCandidates |
+    Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+    Select-Object -First 1
+
+if (-not $installerPath) {
+    Write-Host "No NSIS installer present in $deployDir - skipping installer provenance check." -ForegroundColor Yellow
+} elseif ([string]::IsNullOrWhiteSpace($manifest.installer_sha256)) {
+    # Older manifests predate installer provenance. Don't fail a deploy whose
+    # runtime is otherwise verified just because it shipped an unrecorded
+    # installer; say so plainly instead.
+    Write-Host "[WARN] Installer $([IO.Path]::GetFileName($installerPath)) is present but the manifest has no installer_sha256 - cannot verify it." -ForegroundColor Yellow
+} else {
+    $installerSha = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash
+    if ($installerSha -ne $manifest.installer_sha256) {
+        Write-Error "DEPLOY INCOMPLETE: installer $([IO.Path]::GetFileName($installerPath)) SHA-256 $installerSha != manifest installer_sha256 $($manifest.installer_sha256)."
+        exit 1
+    } else {
+        Write-Host "NSIS installer hash matches manifest (git_sha $($manifest.git_sha))." -ForegroundColor Green
+    }
 }
 
 Write-Host "Deploy verification passed." -ForegroundColor Green

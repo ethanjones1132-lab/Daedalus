@@ -215,6 +215,29 @@ if (Test-Path $promptsDst) {
 Copy-Item $promptsSrc $promptsDst -Recurse -Force
 Write-Ok 'prompts/'
 
+# ── Installer provenance (NSIS) ──
+# `cargo build --release` alone does NOT bundle an installer; only a prior
+# `cargo tauri build` writes one under src-tauri\target\release\bundle\nsis.
+# When that bundle exists, ship it next to the runtime and record its SHA-256
+# in the deploy manifest, so verify-deploy.ps1 can cross-check the exact
+# installer that belongs to this git_sha. When no installer exists the
+# installer_* manifest fields stay $null and verification skips cleanly.
+$installerName = $null
+$installerSha256 = $null
+# Honor CARGO_TARGET_DIR (set by build-windows.ps1); otherwise cargo's default.
+$cargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $tauriDir 'target' }
+$nsisDir = Join-Path $cargoTargetRoot 'release\bundle\nsis'
+$installer = Get-ChildItem -Path $nsisDir -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+if ($installer) {
+    Deploy-File $installer.FullName 'Jarvis-installer.exe'
+    $installerName = 'Jarvis-installer.exe'
+    $installerSha256 = (Get-FileHash (Join-Path $desktop 'Jarvis-installer.exe') -Algorithm SHA256).Hash
+    Write-Ok "installer provenance: $installerName $installerSha256"
+} else {
+    Write-Host "  [SKIP] no NSIS installer bundle under $nsisDir - installer provenance not recorded." -ForegroundColor Yellow
+}
+
 # ── Deploy manifest ──
 # Reuse $buildGitSha (captured before Stage 1) rather than re-running
 # `git rev-parse HEAD` here, so the manifest's git_sha is guaranteed to match
@@ -230,6 +253,8 @@ $manifest = @{
     opencode_go_models_sha256 = (Get-FileHash "$desktop\resources\opencode_go_openai_models.json" -Algorithm SHA256).Hash
     exe_mtime = (Get-Item "$desktop\Jarvis.exe" -ErrorAction SilentlyContinue).LastWriteTimeUtc.ToString("o")
     prompts_tree_sha256 = (git -C $repo ls-tree HEAD server-jarvis/src/prompts | Select-Object -First 1).Split()[2]
+    installer_name = $installerName
+    installer_sha256 = $installerSha256
     deployed_at = (Get-Date -Format "o")
 } | ConvertTo-Json -Depth 2
 $manifest | Out-File "$desktop\.jarvis-deploy-manifest.json" -Encoding utf8
