@@ -259,7 +259,7 @@ describe("snapshot failure preserves the underlying exception", () => {
 });
 
 describe("Claude executor delegate", () => {
-  test.skipIf(process.platform === "win32")("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
+  test("aborts a repeated api_retry stream instead of waiting for provider backoff", async () => {
     const config = testConfig();
     let kills = 0;
     let signalTreeCalls = 0;
@@ -275,8 +275,8 @@ describe("Claude executor delegate", () => {
       writeEffectRequired: true,
       nativeNoWrite: false,
       health: new DelegateHealth(),
-      terminationGraceMs: 1,
-      cleanupTimeoutMs: 30,
+      terminationGraceMs: 5,
+      cleanupTimeoutMs: 50,
       snapshotFactory: { capture: async () => [{
         root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
       }] },
@@ -306,7 +306,11 @@ describe("Claude executor delegate", () => {
     expect(output.narrative).toContain("api_retry");
     expect(kills).toBe(0);
     expect(signalTreeCalls).toBeGreaterThanOrEqual(2);
-  }, 500);
+  }, 3_000); // 2026-10-18 DD-005: was win32-skipped; the stream, process, snapshot and
+  // tree-killer are all injected mocks, so the abort is platform-independent. The
+  // fixture teardown budgets (grace 5ms + cleanup 50ms) and this 500ms test budget
+  // were the only Windows-sensitive part; widened 500→3000ms to match the
+  // established wall-clock-budget-vs-real-work de-flake pattern in this file.
 
   test("filesystem snapshots use content hashes instead of mtime/size identity", async () => {
     const root = await mkdtemp(join(tmpdir(), "jarvis-delegate-"));

@@ -265,7 +265,7 @@ describe("executor delegate pipeline integration", () => {
     }));
   }, 250);
 
-  test.skipIf(process.platform === "win32")("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
+  test("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = process.platform === "win32" ? resolve(root, "claimed.ts").toLowerCase() : resolve(root, "claimed.ts");
@@ -295,8 +295,8 @@ describe("executor delegate pipeline integration", () => {
         run: (input) => runClaudeDelegate({
           ...input,
           health,
-          terminationGraceMs: 1,
-          cleanupTimeoutMs: 10,
+          terminationGraceMs: 5,
+          cleanupTimeoutMs: 50,
           verificationTimeoutMs: 30,
           treeKiller: { signalTree: async () => {} },
           snapshotFactory: { capture: async () => [snapshot] },
@@ -341,9 +341,12 @@ describe("executor delegate pipeline integration", () => {
       errorCode: "delegate_cleanup_unconfirmed",
     });
     expect(health.snapshot().lastReason).toBe("termination_unconfirmed");
-  }, 300);
+  }, 3_000); // 2026-10-18 DD-005: was win32-skipped; delegate process/snapshot/tree-killer
+  // are injected mocks, so the unconfirmed-cleanup contract is platform-independent.
+  // Widened the fixture budgets (grace 1→5ms, cleanup 10→50ms) and 300→3000ms test
+  // budget so the mocked deadline never races Windows timer jitter under suite load.
 
-  test.skipIf(process.platform === "win32")("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
+  test("late-factory cleanup uncertainty is terminal across the full replan wrapper", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;
@@ -377,8 +380,8 @@ describe("executor delegate pipeline integration", () => {
         run: (input) => runClaudeDelegate({
           ...input,
           health,
-          terminationGraceMs: 1,
-          cleanupTimeoutMs: 10,
+          terminationGraceMs: 5,
+          cleanupTimeoutMs: 50,
           snapshotFactory: { capture: async () => [snapshot] },
           processFactory: async () => new Promise(() => {}),
         }),
@@ -438,9 +441,12 @@ describe("executor delegate pipeline integration", () => {
       had_error: 1,
       fallback_used: 0,
     }));
-  }, 300);
+  }, 3_000); // 2026-10-18 DD-005: was win32-skipped; the factory never settles and every
+  // boundary is injected, so the late-factory contract is platform-independent.
+  // Widened the fixture budgets (grace 1→5ms, cleanup 10→50ms) and 300→3000ms test
+  // budget so the mocked cleanup deadline never races Windows timer jitter.
 
-  test.skipIf(process.platform === "win32")("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
+  test("aborted late-factory cleanup uncertainty is failed rather than routine cancellation", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     config.jarvis_path = root;
@@ -474,8 +480,8 @@ describe("executor delegate pipeline integration", () => {
         run: (input) => runClaudeDelegate({
           ...input,
           health,
-          terminationGraceMs: 1,
-          cleanupTimeoutMs: 10,
+          terminationGraceMs: 5,
+          cleanupTimeoutMs: 50,
           snapshotFactory: { capture: async () => [snapshot] },
           processFactory: async () => {
             queueMicrotask(() => turnAbort.abort("user_stop"));
@@ -529,7 +535,10 @@ describe("executor delegate pipeline integration", () => {
       had_error: 1,
       fallback_used: 0,
     }));
-  }, 300);
+  }, 3_000); // 2026-10-18 DD-005: was win32-skipped; the abort fires from an injected
+  // microtask and the factory never settles, so the contract is platform-independent.
+  // Widened the fixture budgets (grace 1→5ms, cleanup 10→50ms) and 300→3000ms test
+  // budget so the mocked cleanup deadline never races Windows timer jitter.
 
   test("escalation invokes the delegate only after a native executor pass produces no write", async () => {
     const config = delegateTestConfig();
