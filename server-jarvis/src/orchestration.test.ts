@@ -1199,7 +1199,7 @@ describe("Orchestration & Routing Tests", () => {
     expect(executorStart!).toBeLessThan(plannerEnd!);
   });
 
-  test.skipIf(process.platform === "win32")("M3 keeps the planner-seeded TaskPlan authoritative after overlap", async () => {
+  test("M3 keeps the planner-seeded TaskPlan authoritative after overlap", async () => {
     const runtime = createToolRuntime();
     runtime.register(
       {
@@ -1341,7 +1341,13 @@ describe("Orchestration & Routing Tests", () => {
     expect(updates[updates.length - 1]).toEqual(persisted);
     expect(liveConductor.getPlanContext()).toEqual(persisted);
     expect(segment.state.reviewer?.ok).toBe(true);
-  });
+  }); // 2026-10-18 DD-005: was win32-skipped by the blanket "parallel execution
+  // tests" commit (f7592a8). Nothing here is OS-sensitive: both model stages are
+  // driven by in-process deferred gates (no wall-clock timers), write_file is a
+  // stub handler that never touches disk, and the syntax/run/build gates only
+  // target .py files under a fresh mkdtemp workspace with no project markers, so
+  // they all decline before spawning. The overlap ordering and the
+  // planner-seeded TaskPlan authority assertions reproduce identically on Windows.
 
   test("M3 does not let an out-of-order executor copy overwrite a newer plan", async () => {
     const runtime = createToolRuntime();
