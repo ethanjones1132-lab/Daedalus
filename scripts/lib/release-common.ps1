@@ -700,7 +700,22 @@ function Resolve-JarvisSigningConfiguration {
         Pure decision function, kept separate from the side effects so it
         can be unit tested without a certificate store.
 
-        Returns a configuration object describing the certificate source.
+        Two routes are supported, because two kinds of code-signing service
+        exist and they do not hand you the same thing:
+
+          * A CERTIFICATE (a PFX, or a certificate already in the Windows
+            store). The signing is done by signtool against a thumbprint.
+            This is the classic OV/EV certificate route.
+
+          * A SIGNING SERVICE (Azure Artifact Signing, SignPath, and
+            similar). The provider never gives you a private key: it signs
+            the artifact itself, or gives you a short-lived signing
+            command. The operator supplies that command and the pipeline
+            runs it with the artifact path.
+
+        A custom command wins when both are present, because it is the
+        more specific instruction.
+
         Throws with an actionable message when the inputs cannot produce a
         signature -- the message names the environment variables to set,
         because the failure will otherwise happen on a CI runner with
@@ -710,8 +725,19 @@ function Resolve-JarvisSigningConfiguration {
     param(
         [string]$Thumbprint,
         [string]$PfxPath,
-        [string]$TimestampUrl
+        [string]$TimestampUrl,
+        [string]$Command = ''
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($Command)) {
+        return [pscustomobject]@{
+            mode          = 'command'
+            command       = $Command
+            thumbprint    = $null
+            pfx_path      = $null
+            timestamp_url = $TimestampUrl
+        }
+    }
 
     $hasThumbprint = -not [string]::IsNullOrWhiteSpace($Thumbprint)
     $hasPfx = (-not [string]::IsNullOrWhiteSpace($PfxPath)) -and (Test-Path -LiteralPath $PfxPath -PathType Leaf)
@@ -719,8 +745,9 @@ function Resolve-JarvisSigningConfiguration {
     if (-not $hasThumbprint -and -not $hasPfx) {
         throw ("no_signing_certificate: set JARVIS_SIGNING_THUMBPRINT for a certificate already " +
                "in the Windows certificate store, or JARVIS_SIGNING_PFX_PATH (plus " +
-               "JARVIS_SIGNING_PFX_PASSWORD) for a .pfx to import. Refusing to publish an " +
-               "unsigned installer.")
+               "JARVIS_SIGNING_PFX_PASSWORD) for a .pfx to import, or JARVIS_SIGNING_COMMAND for a " +
+               "signing service (Azure Artifact Signing, SignPath) that signs the artifact itself. " +
+               "Refusing to publish an unsigned installer.")
     }
 
     if (-not $hasThumbprint -and $hasPfx) {
@@ -735,6 +762,8 @@ function Resolve-JarvisSigningConfiguration {
     }
 
     return [pscustomobject]@{
+        mode          = 'certificate'
+        command       = $null
         thumbprint    = $Thumbprint.Replace(' ', '').ToUpperInvariant()
         pfx_path      = $(if ($hasPfx) { $PfxPath } else { $null })
         timestamp_url = $TimestampUrl
@@ -779,12 +808,18 @@ function Import-JarvisSigningCertificate {
 function Invoke-JarvisInstallerSigning {
     <#
     .SYNOPSIS
-        Sign the installer with signtool and verify the signature.
+        Sign the installer and verify the signature.
 
     .DESCRIPTION
-        Signs, then verifies twice: with signtool against the chain, and
-        with Get-AuthenticodeSignature. A sign step that does not verify
-        is a sign step that can silently do nothing.
+        Two routes (see Resolve-JarvisSigningConfiguration):
+
+          * 'certificate' - signtool against a thumbprint, then verify
+            with signtool and with Get-AuthenticodeSignature.
+          * 'command' - the operator's signing-service command, invoked
+            with the artifact path, then verified the same way.
+
+        A sign step that does not verify is a sign step that can silently
+        do nothing, so both routes verify.
     #>
     [CmdletBinding()]
     param(
@@ -798,21 +833,32 @@ function Invoke-JarvisInstallerSigning {
     if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
         throw "installer_missing:$InstallerPath"
     }
-    if ([string]::IsNullOrWhiteSpace($SignToolPath)) {
-        $SignToolPath = Find-JarvisSignTool
-    }
-    if (-not $SignToolPath) {
-        throw 'signtool_not_found: install the Windows SDK, or put signtool.exe on PATH.'
-    }
 
-    & $SignToolPath sign /sha1 $Configuration.thumbprint /fd SHA256 /tr $Configuration.timestamp_url /td SHA256 $InstallerPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool_sign_failed:exit_$LASTEXITCODE"
-    }
+    if ($Configuration.mode -eq 'command') {
+        # The command receives the artifact path as its single argument,
+        # which is the shape Tauri uses for bundle.windows.signCommand and
+        # the shape the Azure Artifact Signing and SignPath CLIs expect.
+        & $Configuration.command $InstallerPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "sign_command_failed:exit_$LASTEXITCODE"
+        }
+    } else {
+        if ([string]::IsNullOrWhiteSpace($SignToolPath)) {
+            $SignToolPath = Find-JarvisSignTool
+        }
+        if (-not $SignToolPath) {
+            throw 'signtool_not_found: install the Windows SDK, or put signtool.exe on PATH.'
+        }
 
-    & $SignToolPath verify /pa /v $InstallerPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "signtool_verify_failed:exit_$LASTEXITCODE"
+        & $SignToolPath sign /sha1 $Configuration.thumbprint /fd SHA256 /tr $Configuration.timestamp_url /td SHA256 $InstallerPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool_sign_failed:exit_$LASTEXITCODE"
+        }
+
+        & $SignToolPath verify /pa /v $InstallerPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "signtool_verify_failed:exit_$LASTEXITCODE"
+        }
     }
 
     $status = Get-JarvisAuthenticodeStatus -Path $InstallerPath

@@ -34,6 +34,11 @@ on:
         required: false
         default: 'false'
         type: string
+      draft:
+        description: 'Publish as a DRAFT release. Use this to validate the pipeline without making the release public.'
+        required: false
+        default: 'false'
+        type: string
 
 permissions:
   contents: write
@@ -82,15 +87,29 @@ jobs:
       # The certificate never appears in a command line or in the release
       # artifacts: it is written to the runner's temp directory and the
       # path is handed to the build through the environment.
-      - name: Stage the signing certificate
+      #
+      # Two routes are supported. A SIGNING SERVICE (Azure Artifact
+      # Signing, SignPath) never gives the runner a private key - it signs
+      # the artifact itself - so the operator provides a command in the
+      # WINDOWS_SIGNING_COMMAND repository variable and the credentials it
+      # needs in secrets. A CLASSIC CERTIFICATE arrives as a base64 PFX in
+      # the WINDOWS_SIGNING_CERT_PFX_BASE64 secret.
+      - name: Stage the signing credential
         id: certificate
         shell: pwsh
         env:
           PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
           PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          SIGNING_COMMAND: ${{ vars.WINDOWS_SIGNING_COMMAND }}
         run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:SIGNING_COMMAND)) {
+            Write-Host "Using the signing service command: $env:SIGNING_COMMAND"
+            "JARVIS_SIGNING_COMMAND=$($env:SIGNING_COMMAND)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            'available=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
           if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64)) {
-            Write-Host "::warning::No signing certificate configured (WINDOWS_SIGNING_CERT_PFX_BASE64 is empty)."
+            Write-Host "::warning::No signing certificate configured (WINDOWS_SIGNING_CERT_PFX_BASE64 is empty and WINDOWS_SIGNING_COMMAND is not set)."
             'available=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             exit 0
           }
@@ -105,9 +124,9 @@ jobs:
         shell: pwsh
         run: |
           $arguments = @('-ExecutionPolicy', 'Bypass', '-File', 'scripts\release-build.ps1')
-          if (-not [string]::IsNullOrWhiteSpace($env:JARVIS_SIGNING_PFX_PATH)) {
-            $arguments += '-Sign'
-          }
+          $hasCredential = -not [string]::IsNullOrWhiteSpace($env:JARVIS_SIGNING_PFX_PATH) -or
+                           -not [string]::IsNullOrWhiteSpace($env:JARVIS_SIGNING_COMMAND)
+          if ($hasCredential) { $arguments += '-Sign' }
           & powershell @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -157,6 +176,7 @@ jobs:
           VERSION: ${{ steps.build.outputs.version }}
           TAG: ${{ github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
+          DRAFT: ${{ inputs.draft }}
         run: |
           # A tag push already names the tag. A manual run has to derive
           # one from the version the build recorded.
@@ -180,8 +200,13 @@ jobs:
           if ($assets.Count -eq 0) { throw "no release assets found in $env:RELEASE_DIR" }
           $assets | ForEach-Object { Write-Host "publishing $_" }
 
-          gh release create $tag `
-              --title "Jarvis $($env:VERSION)" `
-              --notes-file (Join-Path $env:RUNNER_TEMP 'release-notes.md') `
-              @assets
+          $arguments = @('release', 'create', $tag,
+              '--title', "Jarvis $($env:VERSION)",
+              '--notes-file', (Join-Path $env:RUNNER_TEMP 'release-notes.md'))
+          # A draft release is how the publish path gets validated without
+          # putting an unverified artifact in front of the public.
+          if ($env:DRAFT -eq 'true') { $arguments += '--draft' }
+          $arguments += $assets
+
+          gh @arguments
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

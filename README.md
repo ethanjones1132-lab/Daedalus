@@ -174,6 +174,13 @@ The release pipeline refuses to build a version the surfaces disagree on, and
 refuses to publish an unsigned installer under a release that implies a
 signature. See [`docs/release-pipeline.md`](docs/release-pipeline.md).
 
+**Code signing policy** — <https://github.com/ethanjones1132-lab/Daedalus/blob/master/docs/code-signing-policy.md>
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
+
+Choosing a certificate and wiring it up: [`docs/release-signing.md`](docs/release-signing.md).
+
 ---
 
 ## Verification

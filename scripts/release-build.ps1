@@ -64,6 +64,10 @@ param(
     [switch]$Sign,
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
 
+    # A signing-service command (Azure Artifact Signing, SignPath, ...).
+    # Invoked with the artifact path as its only argument.
+    [string]$SigningCommand = $env:JARVIS_SIGNING_COMMAND,
+
     # Budget for the silent install the build runs to read the shipped
     # app binary out of the installer.
     [int]$TimeoutSeconds = 120
@@ -214,7 +218,13 @@ if ($Sign) {
         $configuration = Resolve-JarvisSigningConfiguration `
             -Thumbprint $env:JARVIS_SIGNING_THUMBPRINT `
             -PfxPath $env:JARVIS_SIGNING_PFX_PATH `
-            -TimestampUrl $TimestampUrl
+            -TimestampUrl $TimestampUrl `
+            -Command $SigningCommand
+        if ($configuration.mode -eq 'command') {
+            Write-Ok "signing service command: $($configuration.command)"
+        } else {
+            Write-Ok "thumbprint $($configuration.thumbprint)"
+        }
         if ($configuration.pfx_path) {
             $imported = Import-JarvisSigningCertificate -PfxPath $configuration.pfx_path -Password $env:JARVIS_SIGNING_PFX_PASSWORD
             $configuration.thumbprint = $imported.Thumbprint.ToUpperInvariant()

@@ -63,6 +63,11 @@ param(
 
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
 
+    # A signing-service command (Azure Artifact Signing, SignPath, ...).
+    # Invoked with the artifact path as its only argument. The provider
+    # signs the artifact itself; no private key ever reaches this machine.
+    [string]$Command = $env:JARVIS_SIGNING_COMMAND,
+
     # Verify an existing signature without attempting to sign.
     [switch]$VerifyOnly
 )
@@ -103,8 +108,13 @@ try {
     $configuration = Resolve-JarvisSigningConfiguration `
         -Thumbprint $Thumbprint `
         -PfxPath $PfxPath `
-        -TimestampUrl $TimestampUrl
-    Write-Ok "thumbprint $($configuration.thumbprint)"
+        -TimestampUrl $TimestampUrl `
+        -Command $Command
+    if ($configuration.mode -eq 'command') {
+        Write-Ok "signing service command: $($configuration.command)"
+    } else {
+        Write-Ok "thumbprint $($configuration.thumbprint)"
+    }
 
     if ($configuration.pfx_path) {
         Write-Step 'Importing the signing certificate'

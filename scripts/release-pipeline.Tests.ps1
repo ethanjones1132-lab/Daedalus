@@ -261,6 +261,7 @@ Describe 'signing configuration' {
     It 'normalizes a thumbprint' {
         $config = Resolve-JarvisSigningConfiguration -Thumbprint 'ab cd ef' -PfxPath '' -TimestampUrl 'http://ts'
         $config.thumbprint | Should Be 'ABCDEF'
+        $config.mode | Should Be 'certificate'
     }
 
     It 'names the environment variables to set when there is no certificate' {
@@ -274,6 +275,24 @@ Describe 'signing configuration' {
         }
         $message | Should Match 'JARVIS_SIGNING_THUMBPRINT'
         $message | Should Match 'JARVIS_SIGNING_PFX_PATH'
+        $message | Should Match 'JARVIS_SIGNING_COMMAND'
+    }
+
+    It 'accepts a signing-service command instead of a certificate' {
+        # Azure Artifact Signing and SignPath never hand over a private key;
+        # the provider signs the artifact itself. The pipeline has to work
+        # with the provider's command, not only with a PFX.
+        $config = Resolve-JarvisSigningConfiguration -Thumbprint '' -PfxPath '' `
+            -TimestampUrl 'http://ts' -Command 'C:\tools\azure-sign.cmd'
+        $config.mode | Should Be 'command'
+        $config.command | Should Be 'C:\tools\azure-sign.cmd'
+    }
+
+    It 'prefers the command when both a command and a certificate are given' {
+        # The command is the more specific instruction.
+        $config = Resolve-JarvisSigningConfiguration -Thumbprint 'ABC123' -PfxPath '' `
+            -TimestampUrl 'http://ts' -Command 'C:\tools\azure-sign.cmd'
+        $config.mode | Should Be 'command'
     }
 }
 
