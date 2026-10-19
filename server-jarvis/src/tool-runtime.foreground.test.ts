@@ -61,6 +61,24 @@ function writeMcpConfig(workspace: string, server: Record<string, unknown>): voi
   );
 }
 
+/**
+ * A stdio MCP server command that exists on every platform the suite runs on.
+ *
+ * The stdio cases below used `sh -c`, which is only true where a POSIX shell
+ * is on PATH. On Windows that is Git Bash's `usr\bin`, which is NOT on the
+ * default PATH (only `Git\cmd` is), so the client spawned nothing and the
+ * cases failed with `spawn_error` instead of exercising their contract. The
+ * MCP client executes the configured command directly, so the test has to
+ * name a command the platform actually has.
+ *
+ * `process.execPath` is the Bun binary running this suite: present on every
+ * platform, and `-e` lets it act as the child without a file on disk. That
+ * makes the child independent of the developer's shell and of `sh`.
+ */
+function stdioServer(script: string): { command: string; args: string[] } {
+  return { command: process.execPath, args: ["-e", script] };
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
@@ -371,7 +389,7 @@ describe("foreground MCP outcomes", () => {
 
   test("stdio child exit is an error", async () => {
     const workspace = makeWorkspace();
-    writeMcpConfig(workspace, { command: "sh", args: ["-c", "exit 7"] });
+    writeMcpConfig(workspace, stdioServer("process.exit(7)"));
     const result = await makeMcpRuntime(workspace).execute(
       { id: "mcp-stdio-exit", name: "mcp_call_tool", arguments: { server: "alpha", tool: "ping" } },
       makeExecutionContext("chat", makeConfig(workspace), { requestApproval: async () => true }),
@@ -386,7 +404,7 @@ describe("foreground MCP outcomes", () => {
     const cfg = makeConfig(workspace);
     const result = await mcpRequest(
       "alpha",
-      { command: "sh", args: ["-c", "sleep 1"] },
+      stdioServer("setInterval(() => {}, 1000)"),
       "tools/call",
       {},
       cfg,
@@ -399,7 +417,7 @@ describe("foreground MCP outcomes", () => {
 
   test("a valid empty stdio result is successful", async () => {
     const workspace = makeWorkspace();
-    writeMcpConfig(workspace, { command: "sh", args: ["-c", "cat"] });
+    writeMcpConfig(workspace, stdioServer("process.stdin.pipe(process.stdout)"));
     const result = await makeMcpRuntime(workspace).execute(
       { id: "mcp-stdio-success", name: "mcp_call_tool", arguments: { server: "alpha", tool: "ping" } },
       makeExecutionContext("chat", makeConfig(workspace), { requestApproval: async () => true }),

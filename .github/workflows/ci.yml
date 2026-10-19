@@ -138,3 +138,25 @@ jobs:
 
       - name: Test
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # The release scripts are the only code path that produces the north star's
+  # artifact (signed installer -> release record -> published release), and
+  # until this job existed their 72 Pester tests ran nowhere in CI. A regression
+  # in them could therefore reach a tag, where it fails inside the release
+  # workflow and is indistinguishable from a build failure. Run the same
+  # command a developer runs locally so the gate and the pipeline agree.
+  release-scripts:
+    name: Release scripts (Pester)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tests target Pester 3.4 (Should Be / Should Throw / -Script).
+      # windows-latest ships Pester 5, whose syntax is incompatible, so the
+      # script pins 3.4 instead of silently changing the assertion semantics
+      # under the tests.
+      - name: Run release pipeline tests
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-release-tests.ps1
