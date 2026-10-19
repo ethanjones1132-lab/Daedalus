@@ -1,0 +1,823 @@
+<#
+.SYNOPSIS
+    Shared helpers for the Jarvis release pipeline (build, provenance, signing, smoke).
+
+.DESCRIPTION
+    Dot-source this file. It has no top-level side effects:
+
+        . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+
+    The release pipeline is spread over three scripts (release-build.ps1,
+    sign-installer.ps1, release-smoke.ps1) plus the older
+    build-and-deploy.ps1 / verify-deploy.ps1 pair. Before this file existed
+    each of them carried its own copy of the provenance rules, which is how
+    the 2026-07 "the running server is a different build than the one on
+    disk" incident got in: the producer and the verifier could disagree
+    without anybody noticing. Everything below is the single implementation;
+    the scripts call it.
+
+    The bundle build itself is not here -- it lives in
+    server-jarvis/src/build-frontend.ts, because Tauri's beforeBuildCommand
+    needs it as a cross-platform script.
+
+    Two properties are load-bearing and are covered by
+    scripts/release-pipeline.Tests.ps1:
+
+      * Get-JarvisSourceTreeSha256 reproduces the digest algorithm that
+        build-and-deploy.ps1 and verify-deploy.ps1 already used, byte for
+        byte. Changing it would silently invalidate every deploy manifest
+        ever written, so it is asserted against a frozen vector.
+
+      * The build identity has to actually reach the bundle. The bake
+        folds it in with `bun build --define`, and Test-JarvisBundleProvenance
+        then checks the built FILE for the commit and the source-tree
+        digest, and for the absence of the runtime environment lookup. The
+        check exists because bun build exits 0 even when a define folds to
+        a bare JS identifier -- a bundle that throws a ReferenceError at
+        module load, so the deployed server cannot boot.
+#>
+
+# ── Provenance primitives ─────────────────────────────────────────────────────
+
+function Get-JarvisFileSha256 {
+    <#
+    .SYNOPSIS
+        SHA-256 of a single file, uppercase hex.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "file_not_found:$Path"
+    }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+function Get-JarvisSourceTreeSha256 {
+    <#
+    .SYNOPSIS
+        Digest over the source tree that a build is claimed to come from.
+
+    .DESCRIPTION
+        SHA-256 over every file under server-jarvis/src, src-tauri/src,
+        src-ui/src and scripts, as `<relative-path>:<file-hash>` joined by
+        "\n". This is the value the server bakes in via
+        `process.env.JARVIS_SOURCE_TREE_SHA256` and reports from /health,
+        and the value verify-deploy.ps1 recomputes to decide whether the
+        running build matches the tree on disk.
+
+        The algorithm is frozen: changing the roots, the ordering, the
+        per-file format or the join separator changes the digest of every
+        existing manifest. Extend it only deliberately.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+    $sourceRoots = @(
+        (Join-Path $RepoRoot 'server-jarvis\src'),
+        (Join-Path $RepoRoot 'src-tauri\src'),
+        (Join-Path $RepoRoot 'src-ui\src'),
+        (Join-Path $RepoRoot 'scripts')
+    )
+    $sourceFiles = Get-ChildItem -LiteralPath $sourceRoots -Recurse -File | Sort-Object FullName
+    $sourceTreeText = foreach ($file in $sourceFiles) {
+        $relative = $file.FullName.Substring($RepoRoot.Length).TrimStart('\')
+        "${relative}:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
+    }
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sourceTreeBytes = [Text.Encoding]::UTF8.GetBytes(($sourceTreeText -join "`n"))
+        return ([BitConverter]::ToString($sha256.ComputeHash($sourceTreeBytes))).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Get-JarvisBuildIdentity {
+    <#
+    .SYNOPSIS
+        The identity of the tree a build is taken from.
+
+    .DESCRIPTION
+        Captured ONCE, before the build starts, and then reused for the
+        bundle defines, the Rust build and the release manifest. That is
+        deliberate: build-and-deploy.ps1 re-used its pre-build
+        `git rev-parse HEAD` for the manifest for exactly this reason --
+        re-reading HEAD later would let the manifest disagree with the SHA
+        actually baked into the binary if HEAD moved mid-run.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $sha = (& git -C $RepoRoot rev-parse HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') {
+        throw "git_head_unavailable:$RepoRoot (got '$sha')"
+    }
+    $porcelain = (& git -C $RepoRoot status --porcelain 2>$null | Out-String)
+    $dirty = -not [string]::IsNullOrWhiteSpace($porcelain)
+
+    return [pscustomobject]@{
+        git_sha             = $sha
+        git_dirty           = $dirty
+        built_at            = (Get-Date -Format 'o')
+        source_tree_sha256  = (Get-JarvisSourceTreeSha256 -RepoRoot $RepoRoot)
+    }
+}
+
+# ── Version consistency ──────────────────────────────────────────────────────
+
+function Get-CargoPackageVersion {
+    <#
+    .SYNOPSIS
+        The `version` key of the [package] table in a Cargo.toml.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CargoTomlPath
+    )
+    if (-not (Test-Path -LiteralPath $CargoTomlPath -PathType Leaf)) {
+        throw "file_not_found:$CargoTomlPath"
+    }
+    $inPackage = $false
+    foreach ($line in ([IO.File]::ReadAllText($CargoTomlPath) -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[') {
+            $inPackage = ($trimmed -eq '[package]')
+            continue
+        }
+        if (-not $inPackage) { continue }
+        if ($trimmed -match '^version\s*=\s*"([^"]+)"') { return $Matches[1] }
+    }
+    return $null
+}
+
+function Get-JarvisMainBinaryName {
+    <#
+    .SYNOPSIS
+        The name of the app binary the installer lays down.
+
+    .DESCRIPTION
+        The NSIS installer installs the binary under the CRATE name
+        (home-base.exe), not the product name (Jarvis.exe), because that is
+        what Cargo produces and what Tauri's bundler picks up. The product
+        name is used for display, shortcuts and the install directory.
+
+        Read from Cargo.toml: the [[bin]] name when one is declared, and
+        the package name otherwise (Cargo's default).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+    $cargoToml = Join-Path $RepoRoot 'src-tauri\Cargo.toml'
+    if (-not (Test-Path -LiteralPath $cargoToml -PathType Leaf)) {
+        throw "file_not_found:$cargoToml"
+    }
+    $text = [IO.File]::ReadAllText($cargoToml)
+    if ($text -match '(?ms)^\[\[bin\]\]\s*\r?\n(?:.*\r?\n)*?^\s*name\s*=\s*"([^"]+)"') {
+        return $Matches[1]
+    }
+    if ($text -match '(?m)^\s*name\s*=\s*"([^"]+)"') { return $Matches[1] }
+    throw 'cargo_binary_name_unreadable'
+}
+
+function Get-JarvisReleaseVersion {
+    <#
+    .SYNOPSIS
+        The single version every shipped surface must agree on.
+
+    .DESCRIPTION
+        Reads the version from all five places it is declared and returns it
+        only if they agree. The north star is a "v1.0" release; a release
+        whose frontend, backend, sidecar and installer disagree on the
+        version is mislabelled, and the release record would then attest to
+        a version that no shipped artifact actually carries. The DD-003
+        work made these agree once; this keeps them agreeing.
+
+        Throws with every disagreeing source named, so the fix is obvious.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $sources = @(
+        @{ name = 'src-tauri/Cargo.toml';       value = (Get-CargoPackageVersion -CargoTomlPath (Join-Path $RepoRoot 'src-tauri\Cargo.toml')) }
+        @{ name = 'src-tauri/tauri.conf.json';  value = ((Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src-tauri\tauri.conf.json') | ConvertFrom-Json).version) }
+        @{ name = 'server-jarvis/package.json';  value = ((Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'server-jarvis\package.json') | ConvertFrom-Json).version) }
+        @{ name = 'src-ui/package.json';         value = ((Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'src-ui\package.json') | ConvertFrom-Json).version) }
+        @{ name = 'package.json';                value = ((Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'package.json') | ConvertFrom-Json).version) }
+    )
+
+    $missing = $sources | Where-Object { [string]::IsNullOrWhiteSpace($_.value) }
+    if ($missing) {
+        throw ("version_source_missing:" + (($missing | ForEach-Object { $_.name }) -join ','))
+    }
+
+    $distinct = @($sources | ForEach-Object { $_.value } | Sort-Object -Unique)
+    if ($distinct.Count -ne 1) {
+        $detail = ($sources | ForEach-Object { "$($_.name)=$($_.value)" }) -join ' '
+        throw "version_mismatch:$detail"
+    }
+    return $distinct[0]
+}
+
+# ── Server bundle ────────────────────────────────────────────────────────────
+# The bundle build itself is NOT here. It lives in
+# server-jarvis/src/build-frontend.ts, because Tauri's beforeBuildCommand
+# needs it as a cross-platform script and because running it from bun
+# removes the PowerShell native-argument quoting trap entirely (the inner
+# quotes of a `bun build --define` value must survive PowerShell 5.1's
+# rebuild of the command line, or bun folds the value as a BARE JS
+# identifier -- `var SHA = abc123 ?? "dev"` -> ReferenceError at module load
+# -> the deployed server cannot boot, with bun build still exiting 0).
+# This file owns the identity that gets folded in and the check that it
+# actually folded.
+
+function Test-JarvisBundleProvenance {
+    <#
+    .SYNOPSIS
+        Assert that a built bundle really carries the build identity.
+
+    .DESCRIPTION
+        Two failure modes are checked, and both are silent otherwise:
+
+          * the defines did not fold, so the bundle still reads the
+            environment at runtime and the deployed server reports "dev"
+            instead of a commit -- this is the 2026-07 incident shape;
+
+          * the defines folded but with a bare JS identifier, so the bundle
+            throws a ReferenceError at module load and the server cannot
+            boot at all. bun build still exits 0 here, so an exit-code gate
+            cannot see it.
+
+        Returns an object with `ok` and, on failure, `reason`.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BundlePath,
+        [Parameter(Mandatory = $true)]
+        $Identity
+    )
+
+    if (-not (Test-Path -LiteralPath $BundlePath -PathType Leaf)) {
+        return [pscustomobject]@{ ok = $false; reason = "bundle_missing:$BundlePath" }
+    }
+    $text = [IO.File]::ReadAllText($BundlePath)
+
+    if ($text -match 'process\.env\.JARVIS_GIT_SHA') {
+        return [pscustomobject]@{
+            ok     = $false
+            reason = 'define_not_folded:JARVIS_GIT_SHA is still a runtime env lookup in the bundle'
+        }
+    }
+    if ($text -notmatch [regex]::Escape([string]$Identity.git_sha)) {
+        return [pscustomobject]@{
+            ok     = $false
+            reason = "sha_not_folded:expected $($Identity.git_sha) in the bundle"
+        }
+    }
+    if ($text -notmatch [regex]::Escape([string]$Identity.source_tree_sha256)) {
+        return [pscustomobject]@{
+            ok     = $false
+            reason = "source_tree_not_folded:expected $($Identity.source_tree_sha256) in the bundle"
+        }
+    }
+    return [pscustomobject]@{ ok = $true; reason = $null }
+}
+
+# ── Release manifest ─────────────────────────────────────────────────────────
+
+function Get-JarvisReleaseSchema {
+    return 'jarvis.release/1'
+}
+
+function New-JarvisReleaseManifest {
+    <#
+    .SYNOPSIS
+        Build the single inspectable release record.
+
+    .DESCRIPTION
+        One record covering the frontend (UI bundle), the backend (server
+        bundle), the sidecars (Claude proxy, MCP stdio server, OpenCode Go
+        model list) and the installer, each with its SHA-256. This is the
+        "make frontend, backend, sidecar and installer provenance one
+        inspectable release record" item from the release gap report: before
+        this, the installer, the runtime and the deploy manifest each
+        carried a partial, separately-maintained view of the same facts.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Version,
+        [Parameter(Mandatory = $true)]
+        $Identity,
+        [Parameter(Mandatory = $true)]
+        [object[]]$Artifacts,
+        # The release directory. Artifacts inside it are recorded with a
+        # path relative to it, so the record stays portable and does not
+        # leak the build machine's directory layout into a published
+        # release.
+        [string]$Root = '',
+        # Extra top-level fields (prompts tree id, signature status, ...).
+        [hashtable]$Extra = @{}
+    )
+
+    $rootPrefix = ''
+    if (-not [string]::IsNullOrWhiteSpace($Root)) {
+        $rootPrefix = ([IO.Path]::GetFullPath($Root)).TrimEnd('\') + '\'
+    }
+
+    $files = @()
+    foreach ($artifact in $Artifacts) {
+        if (-not $artifact.path) { continue }
+        if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) {
+            throw "release_artifact_missing:$($artifact.path)"
+        }
+        $item = Get-Item -LiteralPath $artifact.path
+        $full = [IO.Path]::GetFullPath($artifact.path)
+        $recorded = $full
+        if ($rootPrefix -and $full.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            $recorded = $full.Substring($rootPrefix.Length)
+        }
+        $files += [pscustomobject]@{
+            role        = $artifact.role
+            name        = $item.Name
+            path        = $recorded
+            sha256      = (Get-JarvisFileSha256 -Path $artifact.path)
+            size_bytes  = [int64]$item.Length
+        }
+    }
+
+    $manifest = [pscustomobject]@{
+        schema             = (Get-JarvisReleaseSchema)
+        product            = 'Jarvis'
+        version            = $Version
+        git_sha            = $Identity.git_sha
+        git_dirty          = [bool]$Identity.git_dirty
+        built_at           = $Identity.built_at
+        source_tree_sha256 = $Identity.source_tree_sha256
+        files              = $files
+    }
+    foreach ($key in $Extra.Keys) {
+        $manifest | Add-Member -NotePropertyName $key -NotePropertyValue $Extra[$key]
+    }
+    return $manifest
+}
+
+function Write-JarvisReleaseManifest {
+    <#
+    .SYNOPSIS
+        Write the release manifest and a SHA256SUMS.txt beside it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+
+    $Manifest | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $Path -Encoding utf8
+
+    $sumsPath = Join-Path $dir 'SHA256SUMS.txt'
+    $lines = foreach ($file in $Manifest.files) {
+        "$($file.sha256.ToLowerInvariant())  $($file.name)"
+    }
+    $lines | Out-File -LiteralPath $sumsPath -Encoding ascii
+
+    return [pscustomobject]@{
+        manifest = $Path
+        sums     = $sumsPath
+    }
+}
+
+function Read-JarvisReleaseManifest {
+    <#
+    .SYNOPSIS
+        Read a release manifest written by Write-JarvisReleaseManifest.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "release_manifest_missing:$Path"
+    }
+    return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json)
+}
+
+function Resolve-JarvisManifestPath {
+    <#
+    .SYNOPSIS
+        The absolute path of an artifact named by a release record.
+
+    .DESCRIPTION
+        The record stores paths relative to the release directory so it stays
+        portable; this resolves one back to an absolute path against the
+        directory the record itself lives in.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ManifestPath,
+        [Parameter(Mandatory = $true)][string]$ArtifactPath
+    )
+    if ([IO.Path]::IsPathRooted($ArtifactPath)) { return $ArtifactPath }
+    $root = Split-Path -Parent ([IO.Path]::GetFullPath($ManifestPath))
+    return (Join-Path $root $ArtifactPath)
+}
+
+# ── Release smoke decisions ──────────────────────────────────────────────────
+# The interesting rules of the release smoke, kept here so they can be
+# tested without an installer, a certificate or an inference backend. The
+# smoke script is the CLI over these.
+
+function Test-JarvisArtifactHash {
+    <#
+    .SYNOPSIS
+        Does a file's SHA-256 equal the expected value?
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$ExpectedSha256
+    )
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        return [pscustomobject]@{ ok = $false; reason = 'no_expected_hash'; actual = $null; expected = $ExpectedSha256 }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{ ok = $false; reason = "artifact_missing:$Path"; actual = $null; expected = $ExpectedSha256 }
+    }
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    if ($actual -ne $ExpectedSha256.ToUpperInvariant()) {
+        return [pscustomobject]@{
+            ok       = $false
+            reason   = "hash_mismatch:actual=$actual expected=$ExpectedSha256"
+            actual   = $actual
+            expected = $ExpectedSha256
+        }
+    }
+    return [pscustomobject]@{ ok = $true; reason = $null; actual = $actual; expected = $ExpectedSha256 }
+}
+
+function Install-JarvisRelease {
+    <#
+    .SYNOPSIS
+        Run the NSIS installer silently into a scratch directory.
+
+    .DESCRIPTION
+        NSIS takes /S for silent and /D=<dir> for the install directory.
+        /D must be the LAST argument and must not be quoted.
+
+        The install is deterministic: the same installer always lays down
+        the same bytes. That is what makes it possible to record the hash
+        of the INSTALLED binary in the release record and have the smoke
+        reproduce it from a second install.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallerPath,
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [int]$TimeoutSeconds = 120
+    )
+    if (Test-Path -LiteralPath $InstallRoot) {
+        Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+
+    # NSIS takes /D=<dir> unquoted, and it must be the LAST argument. A path
+    # with a space in it cannot be expressed that way, so say so rather than
+    # installing to a directory the caller did not ask for.
+    if ($InstallRoot -match '\s') {
+        throw "install_root_has_spaces:$InstallRoot (NSIS /D= cannot be quoted)"
+    }
+
+    $process = Start-Process -FilePath $InstallerPath -ArgumentList @('/S', "/D=$InstallRoot") -PassThru
+    $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
+    if (-not $process.HasExited) { throw "install_timeout:$InstallRoot" }
+    if ($process.ExitCode -ne 0) { throw "install_failed:exit_$($process.ExitCode)" }
+    return $InstallRoot
+}
+
+function Remove-JarvisReleaseInstall {
+    <#
+    .SYNOPSIS
+        Uninstall a scratch install and clean up after it.
+
+    .DESCRIPTION
+        A silent install leaves an uninstall registry entry pointing at the
+        scratch directory. Left behind, it shows up in Apps and Features as
+        a broken install. The uninstaller is part of the install, so it
+        can remove itself.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [int]$TimeoutSeconds = 60
+    )
+    $uninstaller = Join-Path $InstallRoot 'uninstall.exe'
+    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { return $false }
+    try {
+        $process = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -PassThru
+        $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
+    } catch {
+        return $false
+    }
+    return $true
+}
+
+function Find-JarvisInstalledBinary {
+    <#
+    .SYNOPSIS
+        The installed binary whose hash matches the release record.
+
+    .DESCRIPTION
+        Matched by hash, not by name alone. The NSIS installer lays the
+        binary down under the crate name (home-base.exe), while the
+        release directory stages it as Jarvis.exe, so a name comparison
+        would miss a perfectly good install. The hash is the thing the
+        record actually asserts, so that is what is compared.
+
+        Returns the path, or $null when nothing in the tree matches.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        # Narrow the candidates by file name when it is known.
+        [string]$BinaryName = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) { return $null }
+    $candidates = Get-ChildItem -LiteralPath $InstallRoot -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'uninstall.exe' }
+    if (-not [string]::IsNullOrWhiteSpace($BinaryName)) {
+        $named = $candidates | Where-Object { $_.Name -ieq $BinaryName }
+        if ($named) { $candidates = $named }
+    }
+    foreach ($candidate in $candidates) {
+        $hash = (Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256).Hash
+        if ($hash -eq $ExpectedSha256.ToUpperInvariant()) { return $candidate.FullName }
+    }
+    return $null
+}
+
+function Test-JarvisHealthProvenance {
+    <#
+    .SYNOPSIS
+        Does /health describe the build the release record claims?
+
+    .DESCRIPTION
+        The stale-binary check. A running server whose git_sha differs from
+        the record is a different build serving requests; a server that
+        reports "dev" is running from source and describes no build at all.
+        Both are failures, and neither is a warning.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Health,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    $runningSha = [string]$Health.git_sha
+    if ([string]::IsNullOrWhiteSpace($runningSha)) {
+        return [pscustomobject]@{ ok = $false; reason = 'health_reports_no_git_sha' }
+    }
+    if ($runningSha -eq 'dev') {
+        return [pscustomobject]@{ ok = $false; reason = 'health_reports_dev_build' }
+    }
+    if ($runningSha -ne ([string]$Manifest.git_sha).ToUpperInvariant()) {
+        return [pscustomobject]@{
+            ok     = $false
+            reason = "git_sha_mismatch:running=$runningSha expected=$($Manifest.git_sha)"
+        }
+    }
+    $runningTree = [string]$Health.source_tree_sha256
+    if (-not [string]::IsNullOrWhiteSpace($runningTree) -and
+        $runningTree -ne ([string]$Manifest.source_tree_sha256).ToUpperInvariant()) {
+        return [pscustomobject]@{
+            ok     = $false
+            reason = "source_tree_mismatch:running=$runningTree expected=$($Manifest.source_tree_sha256)"
+        }
+    }
+    return [pscustomobject]@{ ok = $true; reason = $null }
+}
+
+function Get-JarvisSseOutcome {
+    <#
+    .SYNOPSIS
+        The terminal frame of a /chat/stream response, if there is one.
+    #>
+    [CmdletBinding()]
+    param(
+        [object[]]$Events
+    )
+    $terminal = @($Events | Where-Object { $_.type -in @('result', 'error', 'cancelled') })
+    if ($terminal.Count -eq 0) {
+        return [pscustomobject]@{ ok = $false; reason = 'no_terminal_event'; type = $null; text = $null }
+    }
+    $last = $terminal[-1]
+    $text = if ($null -ne $last.result) { [string]$last.result }
+            elseif ($null -ne $last.error) { [string]$last.error }
+            else { '' }
+    $isResult = ([string]$last.type -eq 'result')
+    return [pscustomobject]@{
+        ok     = $isResult
+        reason = $(if ($isResult) { $null } else { "terminal_$($last.type)" })
+        type   = [string]$last.type
+        text   = $text
+    }
+}
+
+# ── Authenticode signing ─────────────────────────────────────────────────────
+# The north star is a SIGNED installer and nothing in the tree signed, so
+# the signing logic lives here rather than in the CLI wrapper: both
+# scripts/sign-installer.ps1 and scripts/release-build.ps1 need it, and
+# dot-sourcing a script with a mandatory param block would prompt.
+
+function Find-JarvisSignTool {
+    <#
+    .SYNOPSIS
+        Locate signtool.exe: on PATH, else under the Windows Kits bin tree.
+    #>
+    $onPath = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($onPath) { return $onPath.Source }
+
+    $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+    if (Test-Path -LiteralPath $kitsRoot) {
+        $found = Get-ChildItem -LiteralPath $kitsRoot -Filter 'signtool.exe' -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+        if ($found) { return $found.FullName }
+    }
+    return $null
+}
+
+function Get-JarvisPfxThumbprint {
+    <#
+    .SYNOPSIS
+        The SHA-1 thumbprint of a .pfx, without importing it permanently.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PfxPath,
+        [string]$Password
+    )
+    $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    $collection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    try {
+        $collection.Import($PfxPath, $secure, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+    } catch {
+        throw "pfx_import_failed:$($_.Exception.Message)"
+    }
+    if ($collection.Count -eq 0) { throw 'pfx_import_empty' }
+    return $collection[0].Thumbprint
+}
+
+function Resolve-JarvisSigningConfiguration {
+    <#
+    .SYNOPSIS
+        Decide how (or whether) the installer can be signed.
+
+    .DESCRIPTION
+        Pure decision function, kept separate from the side effects so it
+        can be unit tested without a certificate store.
+
+        Returns a configuration object describing the certificate source.
+        Throws with an actionable message when the inputs cannot produce a
+        signature -- the message names the environment variables to set,
+        because the failure will otherwise happen on a CI runner with
+        nobody watching.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Thumbprint,
+        [string]$PfxPath,
+        [string]$TimestampUrl
+    )
+
+    $hasThumbprint = -not [string]::IsNullOrWhiteSpace($Thumbprint)
+    $hasPfx = (-not [string]::IsNullOrWhiteSpace($PfxPath)) -and (Test-Path -LiteralPath $PfxPath -PathType Leaf)
+
+    if (-not $hasThumbprint -and -not $hasPfx) {
+        throw ("no_signing_certificate: set JARVIS_SIGNING_THUMBPRINT for a certificate already " +
+               "in the Windows certificate store, or JARVIS_SIGNING_PFX_PATH (plus " +
+               "JARVIS_SIGNING_PFX_PASSWORD) for a .pfx to import. Refusing to publish an " +
+               "unsigned installer.")
+    }
+
+    if (-not $hasThumbprint -and $hasPfx) {
+        # A .pfx still has to yield a usable thumbprint. Read it from the file
+        # rather than requiring the caller to know it.
+        $Thumbprint = Get-JarvisPfxThumbprint -PfxPath $PfxPath
+        $hasThumbprint = $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace($TimestampUrl)) {
+        throw 'no_timestamp_url: an Authenticode signature without a timestamp stops being valid when the certificate expires.'
+    }
+
+    return [pscustomobject]@{
+        thumbprint    = $Thumbprint.Replace(' ', '').ToUpperInvariant()
+        pfx_path      = $(if ($hasPfx) { $PfxPath } else { $null })
+        timestamp_url = $TimestampUrl
+    }
+}
+
+function Get-JarvisAuthenticodeStatus {
+    <#
+    .SYNOPSIS
+        The Authenticode signature status of a file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    return [pscustomobject]@{
+        status     = [string]$signature.Status
+        subject    = [string]$signature.SignerCertificate.Subject
+        issuer     = [string]$signature.SignerCertificate.Issuer
+        thumbprint = [string]$signature.SignerCertificate.Thumbprint
+        timestamp  = [string]$signature.TimeStamperCertificate.Subject
+    }
+}
+
+function Import-JarvisSigningCertificate {
+    <#
+    .SYNOPSIS
+        Import a .pfx into the current user's certificate store.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PfxPath,
+        [string]$Password
+    )
+    $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    return Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure -Exportable -ErrorAction Stop
+}
+
+function Invoke-JarvisInstallerSigning {
+    <#
+    .SYNOPSIS
+        Sign the installer with signtool and verify the signature.
+
+    .DESCRIPTION
+        Signs, then verifies twice: with signtool against the chain, and
+        with Get-AuthenticodeSignature. A sign step that does not verify
+        is a sign step that can silently do nothing.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallerPath,
+        [Parameter(Mandatory = $true)]
+        $Configuration,
+        [string]$SignToolPath
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        throw "installer_missing:$InstallerPath"
+    }
+    if ([string]::IsNullOrWhiteSpace($SignToolPath)) {
+        $SignToolPath = Find-JarvisSignTool
+    }
+    if (-not $SignToolPath) {
+        throw 'signtool_not_found: install the Windows SDK, or put signtool.exe on PATH.'
+    }
+
+    & $SignToolPath sign /sha1 $Configuration.thumbprint /fd SHA256 /tr $Configuration.timestamp_url /td SHA256 $InstallerPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool_sign_failed:exit_$LASTEXITCODE"
+    }
+
+    & $SignToolPath verify /pa /v $InstallerPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool_verify_failed:exit_$LASTEXITCODE"
+    }
+
+    $status = Get-JarvisAuthenticodeStatus -Path $InstallerPath
+    if ($status.status -ne 'Valid') {
+        throw "signature_not_valid:$($status.status)"
+    }
+    return $status
+}

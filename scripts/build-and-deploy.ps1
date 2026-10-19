@@ -42,6 +42,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $startedAt = Get-Date
 
+. (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg"     -ForegroundColor Green }
 function Die($msg)        { Write-Host "`n[FAILED] $msg" -ForegroundColor Red; exit 1 }
@@ -74,79 +76,62 @@ Write-Host "  repo : $repo"
 Write-Host "  bun  : $bun"
 Write-Host "  cargo: $cargo"
 
-# ── Stage 1: server bundle ───────────────────────────────────────────────────
-Write-Step 'Stage 1/4 - Building server bundle (bun)'
+# ── Stage 1: frontend artifacts ──────────────────────────────────────────────
+Write-Step 'Stage 1/3 - Building server bundle and UI (bun)'
 # Bake the build identity into the bundle so /health can report WHICH build is
 # actually serving (2026-07 incident: a stale deploy silently served
 # leaked-JSON bugs for days because /health only ever returned the static
 # "3.0.0" version string). bun's --define replaces process.env.<NAME> member
-# expressions at bundle time (verified: `bun build --define
-# "process.env.X=\"...\""` folds the literal into the output, and running the
-# unbundled source with `bun run` still reads the live env var / "dev"
-# fallback, so source runs are unaffected).
+# expressions at bundle time.
 #
-# QUOTING TRAP (PS 5.1 native-arg passing): the inner quotes around the value
-# MUST be backslash-escaped (\`") not merely backtick-escaped (`"). A bare
-# backtick-escaped quote puts a literal " in the PowerShell string, but PS 5.1
-# does not re-escape embedded quotes when it rebuilds the command line for a
-# native exe, so bun's argv loses them and folds the value as a BARE JS
-# identifier: `var SHA = abc123 ?? "dev"` -> ReferenceError at module load ->
-# the deployed server fails to boot. bun build still exits 0, so the error
-# gate below cannot catch it. \`" survives to bun as \" and folds correctly
-# to a quoted string literal (verified both ways via scratch repro 2026-07-04).
+# The bake itself lives in server-jarvis/src/build-frontend.ts and is the
+# SINGLE implementation of it, shared with the Tauri release build
+# (scripts/release-build.ps1 -> `cargo tauri build` -> the same
+# beforeBuildCommand). Two copies of this recipe is how the deploy path and
+# the release path end up reporting different builds.
+#
+# The QUOTING TRAP that used to live here is now gone rather than
+# documented: the inner quotes around a --define value must survive
+# PowerShell 5.1's native-argument rebuild, and a bare backtick-escaped
+# quote loses them, so bun folds the value as a BARE JS identifier
+# (`var SHA = abc123 ?? "dev"` -> ReferenceError at module load -> the
+# deployed server fails to boot, with bun build still exiting 0). Running
+# the bake from bun instead of PowerShell removes the failure mode: bun
+# receives its argv directly, with no shell in between to eat the quotes.
 $buildGitSha = (git -C $repo rev-parse HEAD)
 $buildBuiltAt = (Get-Date -Format 'o')
 $buildGitDirty = -not [string]::IsNullOrWhiteSpace((git -C $repo status --porcelain))
-$sourceRoots = @(
-    (Join-Path $repo 'server-jarvis\src'),
-    (Join-Path $repo 'src-tauri\src'),
-    (Join-Path $repo 'src-ui\src'),
-    (Join-Path $repo 'scripts')
-)
-$sourceFiles = Get-ChildItem -LiteralPath $sourceRoots -Recurse -File | Sort-Object FullName
-$sourceTreeText = foreach ($file in $sourceFiles) {
-    $relative = $file.FullName.Substring($repo.Length).TrimStart('\')
-    "${relative}:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash)"
-}
-$sha256 = [Security.Cryptography.SHA256]::Create()
+$sourceTreeSha256 = Get-JarvisSourceTreeSha256 -RepoRoot $repo
+$env:JARVIS_BUILD_GIT_SHA = $buildGitSha
+$env:JARVIS_BUILD_BUILT_AT = $buildBuiltAt
+$env:JARVIS_BUILD_GIT_DIRTY = $buildGitDirty.ToString().ToLowerInvariant()
+$env:JARVIS_BUILD_SOURCE_TREE_SHA256 = $sourceTreeSha256
 try {
-    $sourceTreeBytes = [Text.Encoding]::UTF8.GetBytes(($sourceTreeText -join "`n"))
-    $sourceTreeSha256 = ([BitConverter]::ToString($sha256.ComputeHash($sourceTreeBytes))).Replace('-', '')
+    & $bun run (Join-Path $repo 'server-jarvis\src\build-frontend.ts')
+    if ($LASTEXITCODE -ne 0) { Die 'frontend build failed' }
 } finally {
-    $sha256.Dispose()
+    Remove-Item Env:\JARVIS_BUILD_GIT_SHA -ErrorAction SilentlyContinue
+    Remove-Item Env:\JARVIS_BUILD_BUILT_AT -ErrorAction SilentlyContinue
+    Remove-Item Env:\JARVIS_BUILD_GIT_DIRTY -ErrorAction SilentlyContinue
+    Remove-Item Env:\JARVIS_BUILD_SOURCE_TREE_SHA256 -ErrorAction SilentlyContinue
 }
-Push-Location $serverDir
-try {
-    & $bun build ./src/index.ts --outdir ./dist --target bun `
-        --define "process.env.JARVIS_GIT_SHA=\`"$buildGitSha\`"" `
-        --define "process.env.JARVIS_BUILT_AT=\`"$buildBuiltAt\`"" `
-        --define "process.env.JARVIS_GIT_DIRTY=\`"$($buildGitDirty.ToString().ToLowerInvariant())\`"" `
-        --define "process.env.JARVIS_SOURCE_TREE_SHA256=\`"$sourceTreeSha256\`""
-    if ($LASTEXITCODE -ne 0) { Die 'server bundle build failed' }
-    # Standalone MCP stdio server for the Claude delegate. Deployed next to
-    # index.js so Claude's --mcp-config can launch it after Desktop deploy
-    # (live 2026-08-04: mcp_servers jarvis status=failed because the entry
-    # path only existed under server-jarvis/src in the repo).
-    & $bun build ./src/mcp-stdio-server.ts --outdir ./dist --target bun --outfile ./dist/mcp-stdio-server.js
-    if ($LASTEXITCODE -ne 0) { Die 'mcp-stdio-server bundle build failed' }
-} finally { Pop-Location }
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
 $distMcp = Join-Path $serverDir 'dist\mcp-stdio-server.js'
 if (-not (Test-Path $distMcp)) { Die "mcp-stdio-server bundle not produced at $distMcp" }
-Write-Ok "server bundle -> $distJs"
+# The bake must have folded the identity in. A bundle that still reads the
+# environment at runtime reports git_sha "dev" and /health can no longer
+# tell which build is answering - so this is checked, not assumed.
+$bundleProvenance = Test-JarvisBundleProvenance -BundlePath $distJs -Identity ([pscustomobject]@{
+    git_sha            = $buildGitSha
+    source_tree_sha256 = $sourceTreeSha256
+})
+if (-not $bundleProvenance.ok) { Die "server bundle provenance check failed: $($bundleProvenance.reason)" }
+Write-Ok "server bundle -> $distJs (git_sha $buildGitSha)"
 Write-Ok "mcp-stdio-server -> $distMcp"
-
-# ── Stage 2: UI ──────────────────────────────────────────────────────────────
-Write-Step 'Stage 2/4 - Building UI (bun run build)'
-Push-Location $uiDir
-try {
-    & $bun run build
-    if ($LASTEXITCODE -ne 0) { Die 'UI build failed' }
-} finally { Pop-Location }
 Write-Ok 'UI -> src-ui/dist'
 
 # ── Stage 3: Rust app ────────────────────────────────────────────────────────
-Write-Step 'Stage 3/4 - Building Rust app (cargo build --release)'
+Write-Step 'Stage 2/3 - Building Rust app (cargo build --release)'
 Push-Location $tauriDir
 try {
     & $cargo build --release
@@ -162,7 +147,7 @@ if ($SkipDeploy) {
     exit 0
 }
 
-Write-Step "Stage 4/4 - Deploying to $desktop"
+Write-Step "Stage 3/3 - Deploying to $desktop"
 if (-not (Test-Path $desktop)) { Die "OneDrive Desktop not found: $desktop" }
 if (-not (Test-Path $promptsSrc -PathType Container)) {
     Die "Jarvis prompt source not found: $promptsSrc"

@@ -1,0 +1,187 @@
+name: Release
+
+# The north star is a SIGNED Windows installer of Jarvis v1.0 on GitHub
+# Releases. Nothing in the tree produced one: there was no release job, the
+# only workflow was a Linux CI matrix, and `cargo build --release` does not
+# write an installer at all - only `cargo tauri build` does.
+#
+# This workflow closes that gap:
+#
+#   build -> package -> sign -> hash -> install -> launch -> health -> chat
+#            -> publish
+#
+# Every step is a script in this repository, so the pipeline that publishes
+# a release is the same code a developer runs locally. The workflow does
+# not reimplement the build; it calls scripts/release-build.ps1 and
+# scripts/release-smoke.ps1.
+#
+# Publishing a signed release needs two things only the owner can supply:
+#   * a code-signing certificate, as the WINDOWS_SIGNING_CERT_PFX_BASE64
+#     and WINDOWS_SIGNING_PFX_PASSWORD repository secrets, and
+#   * a v* tag.
+#
+# Creating the tag IS the release approval. The workflow refuses to publish
+# an UNSIGNED build unless it is run with allow_unsigned=true, which exists
+# for validating the pipeline itself and is not a way to ship a v1.0.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      allow_unsigned:
+        description: 'Publish without an Authenticode signature. Unsigned builds are not a v1.0 release.'
+        required: false
+        default: 'false'
+        type: string
+
+permissions:
+  contents: write
+
+# Never cancel a release half-published.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign and publish the Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install the Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Install server dependencies
+        working-directory: server-jarvis
+        run: bun install --frozen-lockfile
+
+      - name: Install UI dependencies
+        working-directory: src-ui
+        run: npm ci
+
+      # The certificate never appears in a command line or in the release
+      # artifacts: it is written to the runner's temp directory and the
+      # path is handed to the build through the environment.
+      - name: Stage the signing certificate
+        id: certificate
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PFX_BASE64)) {
+            Write-Host "::warning::No signing certificate configured (WINDOWS_SIGNING_CERT_PFX_BASE64 is empty)."
+            'available=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'jarvis-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:PFX_BASE64))
+          "JARVIS_SIGNING_PFX_PATH=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "JARVIS_SIGNING_PFX_PASSWORD=$($env:PFX_PASSWORD)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          'available=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build the release
+        id: build
+        shell: pwsh
+        run: |
+          $arguments = @('-ExecutionPolicy', 'Bypass', '-File', 'scripts\release-build.ps1')
+          if (-not [string]::IsNullOrWhiteSpace($env:JARVIS_SIGNING_PFX_PATH)) {
+            $arguments += '-Sign'
+          }
+          & powershell @arguments
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The signing gate. An unsigned installer published under a release
+      # titled "signed" manufactures trust the artifact does not have, so
+      # this fails rather than warning.
+      - name: Require a signature
+        shell: pwsh
+        env:
+          MANIFEST_PATH: ${{ steps.build.outputs.manifest_path }}
+          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
+        run: |
+          $record = Get-Content -Raw -LiteralPath $env:MANIFEST_PATH | ConvertFrom-Json
+          if ($record.signed) {
+            Write-Host "Installer is signed: $($record.signature_status) - $($record.signature_subject)"
+            exit 0
+          }
+          if ($env:ALLOW_UNSIGNED -eq 'true') {
+            Write-Host "::warning::Publishing an UNSIGNED build. This is not a v1.0 release."
+            exit 0
+          }
+          Write-Host "::error::The release is unsigned and allow_unsigned is not set. Configure the WINDOWS_SIGNING_CERT_PFX_BASE64 secret, or re-run with allow_unsigned=true to validate the pipeline."
+          exit 1
+
+      # build -> package -> install -> hash -> launch -> health -> chat.
+      # The chat error is tolerated here because inference credentials are a
+      # separate concern with a separate owner; what the release has to
+      # prove is that the packaged artifact starts, reports its own build
+      # identity, and answers a request with a terminal frame.
+      - name: Smoke the release
+        shell: pwsh
+        env:
+          MANIFEST_PATH: ${{ steps.build.outputs.manifest_path }}
+          INSTALLER_PATH: ${{ steps.build.outputs.installer_path }}
+        run: |
+          & powershell -ExecutionPolicy Bypass -File scripts\release-smoke.ps1 `
+              -ManifestPath $env:MANIFEST_PATH `
+              -InstallerPath $env:INSTALLER_PATH `
+              -AllowChatError
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish to GitHub Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_DIR: ${{ steps.build.outputs.release_dir }}
+          VERSION: ${{ steps.build.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # A tag push already names the tag. A manual run has to derive
+          # one from the version the build recorded.
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') { "v$($env:VERSION)" } else { $env:TAG }
+          $notes = @(
+            "Jarvis $($env:VERSION) - built from $($env:GITHUB_SHA).",
+            "",
+            "The release record (jarvis-release.json) names every shipped artifact with its SHA-256,",
+            "and SHA256SUMS.txt carries the same hashes in the usual format.",
+            ""
+          ) -join [Environment]::NewLine
+          $notes | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'release-notes.md') -Encoding utf8
+
+          # Enumerate the assets in PowerShell: gh does not expand globs, and
+          # a quoted "*.exe" would be passed through as a literal.
+          $assets = @(
+            Get-ChildItem -Path $env:RELEASE_DIR -File |
+                Where-Object { $_.Extension -eq '.exe' -or $_.Name -in @('SHA256SUMS.txt', 'jarvis-release.json') } |
+                ForEach-Object { $_.FullName }
+          )
+          if ($assets.Count -eq 0) { throw "no release assets found in $env:RELEASE_DIR" }
+          $assets | ForEach-Object { Write-Host "publishing $_" }
+
+          gh release create $tag `
+              --title "Jarvis $($env:VERSION)" `
+              --notes-file (Join-Path $env:RUNNER_TEMP 'release-notes.md') `
+              @assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
