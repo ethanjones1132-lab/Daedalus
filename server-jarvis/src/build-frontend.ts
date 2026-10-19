@@ -170,5 +170,5 @@ try {
   console.log("\nFrontend artifacts built.");
 } catch (error) {
   console.error(`\n[FAILED] ${(error as Error).message}`);
-  process.exit(1);
+  process.exitCode = 1;
 }

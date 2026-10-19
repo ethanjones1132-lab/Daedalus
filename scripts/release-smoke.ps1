@@ -57,7 +57,7 @@ param(
 
     [string]$InstallerPath = '',
 
-    [string]$InstallRoot = (Join-Path $env:TEMP 'jarvis-release-smoke'),
+    [string]$InstallRoot = (Join-Path $env:TEMP ('jarvis-release-smoke-' + [guid]::NewGuid().ToString('N'))),
 
     # Not the default 19877: a live Jarvis may own that port, and the
     # smoke must not disturb it or read its /health.
@@ -96,6 +96,9 @@ function Read-JarvisSseStream {
     Add-Type -AssemblyName System.Net.Http
     $client = [System.Net.Http.HttpClient]::new()
     $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
+    $deadline = [datetime]::UtcNow.AddSeconds($Timeout)
+    $response = $null
+    $request = $null
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new(
             [System.Net.Http.HttpMethod]::Post, $Url)
@@ -113,7 +116,7 @@ function Read-JarvisSseStream {
             $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
         $events = [System.Collections.Generic.List[object]]::new()
         try {
-            while (($line = $reader.ReadLine()) -ne $null) {
+            while (($line = Read-JarvisLineWithDeadline -Reader $reader -Deadline $deadline) -ne $null) {
                 if (-not $line.StartsWith('data: ')) { continue }
                 $payload = $line.Substring(6).Trim()
                 if (-not $payload -or $payload -eq '[DONE]') { continue }
@@ -125,6 +128,8 @@ function Read-JarvisSseStream {
         }
         return $events.ToArray()
     } finally {
+        if ($response) { $response.Dispose() }
+        if ($request) { $request.Dispose() }
         $client.Dispose()
     }
 }
@@ -178,9 +183,11 @@ function Start-JarvisServerBundle {
         New-Item -ItemType Directory -Force -Path $logDir | Out-Null
         $stdout = Join-Path $logDir 'server.out.log'
         $stderr = Join-Path $logDir 'server.err.log'
-        return Start-Process -FilePath $bunPath -ArgumentList @($BundlePath) `
+        $startedProcess = Start-Process -FilePath $bunPath -ArgumentList @('"' + $BundlePath + '"') `
             -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $startedProcess | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $startedProcess.StartTime
+        return $startedProcess
     } finally {
         $env:JARVIS_SERVER_PORT = $previousPort
     }
@@ -215,6 +222,9 @@ $installerEntry = $manifest.files | Where-Object { $_.role -eq 'installer' } | S
 $appBinaryEntry = $manifest.files | Where-Object { $_.role -eq 'app_binary' } | Select-Object -First 1
 $serverEntry = $manifest.files | Where-Object { $_.role -eq 'server_bundle' } | Select-Object -First 1
 if (-not $installerEntry) { Die 'the release record names no installer' }
+if (-not $appBinaryEntry) { Die 'the release record names no app binary' }
+if (-not $serverEntry) { Die 'the release record names no server bundle' }
+if ($SkipInstall -and -not $SkipLaunch) { Die 'skip_install_requires_skip_launch: runtime provenance requires installed resources' }
 
 # The record stores paths relative to the release directory so it stays
 # portable; resolve them against the directory the record lives in.
@@ -231,10 +241,15 @@ if (-not $hash.ok) { Add-Result 'hash' $false $hash.reason; Die "installer hash 
 Add-Result 'hash' $true "installer sha256 $($hash.actual)"
 
 # ── 3. Install ───────────────────────────────────────────────────────────────
+$installOwned = $false
+$serverProcess = $null
+try {
+if (-not $SkipLaunch) { Assert-JarvisPortAvailable -Port $Port }
 if (-not $SkipInstall) {
     Write-Step 'Installing the release'
     try {
-        Install-JarvisRelease -InstallerPath $InstallerPath -InstallRoot $InstallRoot -TimeoutSeconds $TimeoutSeconds | Out-Null
+        $InstallRoot = Install-JarvisRelease -InstallerPath $InstallerPath -InstallRoot $InstallRoot -TimeoutSeconds $TimeoutSeconds
+        $installOwned = $true
     } catch {
         Add-Result 'install' $false $_.Exception.Message
         Die "install failed: $($_.Exception.Message)"
@@ -254,15 +269,17 @@ if (-not $SkipInstall) {
         }
         Add-Result 'installed_binary_hash' $true "installed binary matches the release record ($([IO.Path]::GetFileName($installedExe)))"
     }
+    $resources = Test-JarvisInstalledResources -InstallRoot $InstallRoot -Manifest $manifest
+    if (-not $resources.ok) { Die "installed resources do not match the release record: $($resources.reason)" }
+    Add-Result 'installed_resources' $true 'installed server bundle and sidecars match the record'
 } else {
     Write-Warn 'skipping install (-SkipInstall)'
 }
 
 # ── 4. Launch and health ─────────────────────────────────────────────────────
-$serverProcess = $null
 if (-not $SkipLaunch) {
     Write-Step 'Launching the packaged server'
-    $bundlePath = $serverEntryPath
+    $bundlePath = Join-Path $InstallRoot 'index.js'
     if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
         Die "packaged server bundle missing: $bundlePath"
     }
@@ -320,16 +337,15 @@ if (-not $SkipLaunch) {
     Write-Warn 'skipping launch (-SkipLaunch)'
 }
 
-if ($serverProcess -and -not $serverProcess.HasExited) {
-    Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
-}
-
-# A silent install leaves an uninstall registry entry pointing at the
-# scratch directory. Left behind it shows up in Apps and Features as a
-# broken install.
-if (-not $SkipInstall) {
-    Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
-    Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+} finally {
+    try {
+        if ($serverProcess) { Stop-JarvisOwnedProcesses -Process $serverProcess }
+    } finally {
+        if ($installOwned) {
+            Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
+            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $summary = [pscustomobject]@{

@@ -504,23 +504,143 @@ function Install-JarvisRelease {
         [Parameter(Mandatory = $true)][string]$InstallRoot,
         [int]$TimeoutSeconds = 120
     )
-    if (Test-Path -LiteralPath $InstallRoot) {
+    # Never delete a caller-owned path. Only a new absolute child of TEMP
+    # can become an install owned by this invocation.
+    if ($InstallRoot -notmatch '^[A-Za-z]:[\\/]') { throw "install_root_not_absolute:$InstallRoot" }
+    $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+    $scratchPrefix = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') + '\'
+    if (-not $InstallRoot.StartsWith($scratchPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "install_root_not_scratch:$InstallRoot"
+    }
+    if (Test-Path -LiteralPath $InstallRoot) { throw "install_root_exists:$InstallRoot" }
+    $parent = Split-Path -Parent $InstallRoot
+    while ($parent -and $parent.StartsWith($scratchPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        if ((Test-Path -LiteralPath $parent) -and
+            ((Get-Item -LiteralPath $parent -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "install_root_reparse_parent:$parent"
+        }
+        $parent = Split-Path -Parent $parent
+    }
+    New-Item -ItemType Directory -Path $InstallRoot | Out-Null
+    $process = $null
+    try {
+        # /D must be last and unquoted, including when the directory has spaces.
+        $process = Start-Process -FilePath $InstallerPath -ArgumentList @('/S', "/D=$InstallRoot") -PassThru -WindowStyle Hidden
+        $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
+        if (-not $process.HasExited) { throw "install_timeout:$InstallRoot" }
+        if ($process.ExitCode -ne 0) { throw "install_failed:exit_$($process.ExitCode)" }
+    } catch {
+        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        # This path was validated and created above; it did not exist on entry.
         Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        throw
     }
-    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-
-    # NSIS takes /D=<dir> unquoted, and it must be the LAST argument. A path
-    # with a space in it cannot be expressed that way, so say so rather than
-    # installing to a directory the caller did not ask for.
-    if ($InstallRoot -match '\s') {
-        throw "install_root_has_spaces:$InstallRoot (NSIS /D= cannot be quoted)"
-    }
-
-    $process = Start-Process -FilePath $InstallerPath -ArgumentList @('/S', "/D=$InstallRoot") -PassThru
-    $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
-    if (-not $process.HasExited) { throw "install_timeout:$InstallRoot" }
-    if ($process.ExitCode -ne 0) { throw "install_failed:exit_$($process.ExitCode)" }
     return $InstallRoot
+}
+
+function Assert-JarvisPortAvailable {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$Port)
+    if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+        throw "port_already_in_use:$Port (close the existing listener before probing)"
+    }
+}
+
+function Read-JarvisLineWithDeadline {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][IO.TextReader]$Reader,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+    $remainingMs = [Math]::Ceiling(($Deadline - [datetime]::UtcNow).TotalMilliseconds)
+    if ($remainingMs -le 0) { throw 'stream_body_timeout' }
+    $lineTask = $Reader.ReadLineAsync()
+    if (-not $lineTask.Wait([int][Math]::Min($remainingMs, [int]::MaxValue))) {
+        throw 'stream_body_timeout'
+    }
+    return $lineTask.GetAwaiter().GetResult()
+}
+
+function Stop-JarvisOwnedProcesses {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Process)
+    # The root start is cached immediately after spawn: StartTime can no
+    # longer be queried once an already-exited process has been collected.
+    $rootStart = if ($Process.PSObject.Properties['JarvisOwnedStartTime']) {
+        $Process.JarvisOwnedStartTime
+    } else { $Process.StartTime }
+    $rootEnd = if ($Process.HasExited) { $Process.ExitTime } else { Get-Date }
+    if (-not $rootStart -or -not $rootEnd) { throw 'owned_process_lifetime_unavailable: uncertain descendants preserved' }
+
+    # A child's creation must fall inside its parent's known lifetime.
+    # This also handles a dead root while excluding children of a reused
+    # PID. Grandchildren require an unbroken chain through this snapshot;
+    # unknown orphan ancestry is deliberately preserved, never guessed.
+    $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $parents = [System.Collections.Generic.List[object]]::new()
+    $parents.Add([pscustomobject]@{ id = $Process.Id; start = $rootStart; end = $rootEnd })
+    $owned = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    $seen[[string]$Process.Id] = $true
+    for ($index = 0; $index -lt $parents.Count; $index++) {
+        $parent = $parents[$index]
+        foreach ($child in $snapshot) {
+            if ($child.ParentProcessId -eq $parent.id -and $child.CreationDate -ge $parent.start -and
+                $child.CreationDate -le $parent.end -and -not $seen.ContainsKey([string]$child.ProcessId)) {
+                $seen[[string]$child.ProcessId] = $true
+                $owned.Add($child)
+                $parents.Add([pscustomobject]@{ id = $child.ProcessId; start = $child.CreationDate; end = (Get-Date) })
+            }
+        }
+    }
+    for ($index = $owned.Count - 1; $index -ge 0; $index--) {
+        $child = $owned[$index]
+        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)" -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessId -eq $child.ProcessId -and $_.CreationDate -eq $child.CreationDate }
+        if ($current) { Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue }
+        else { Write-Warning "Owned child $($child.ProcessId) exited or changed identity; no termination attempted." }
+    }
+    if (-not $Process.HasExited) { Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue }
+}
+
+function Test-JarvisInstalledResources {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    $resources = [ordered]@{
+        server_bundle = 'index.js'
+        mcp_stdio = 'mcp-stdio-server.js'
+        claude_proxy = 'resources\claude_cli_proxy.py'
+        go_models = 'resources\opencode_go_openai_models.json'
+    }
+    foreach ($role in $resources.Keys) {
+        $entry = @($Manifest.files | Where-Object { $_.role -eq $role })
+        if ($entry.Count -ne 1) {
+            return [pscustomobject]@{ ok = $false; reason = "installed_resource_record_missing:$role" }
+        }
+        $result = Test-JarvisArtifactHash -Path (Join-Path $InstallRoot $resources[$role]) -ExpectedSha256 $entry[0].sha256
+        if (-not $result.ok) {
+            return [pscustomobject]@{ ok = $false; reason = "installed_resource_mismatch:${role}:$($result.reason)" }
+        }
+    }
+    return [pscustomobject]@{ ok = $true; reason = $null }
+}
+
+function Resolve-JarvisReleasePublication {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$BuildSha,
+        [string]$RequestedTag = '',
+        [string]$ExistingTagSha = ''
+    )
+    if ($BuildSha -notmatch '^[0-9a-fA-F]{40}$') { throw 'release_build_sha_invalid' }
+    $tag = "v$Version"
+    if ($RequestedTag -and $RequestedTag -cne $tag) { throw "release_tag_version_mismatch:$RequestedTag expected=$tag" }
+    if ($ExistingTagSha -and $ExistingTagSha -ne $BuildSha) { throw "release_tag_sha_mismatch:$tag" }
+    return [pscustomobject]@{ tag = $tag; target = $BuildSha }
 }
 
 function Remove-JarvisReleaseInstall {
@@ -687,7 +807,7 @@ function Get-JarvisPfxThumbprint {
         [string]$PfxPath,
         [string]$Password
     )
-    $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    $secure = ConvertTo-JarvisPfxPassword -Password $Password
     $collection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
     try {
         $collection.Import($PfxPath, $secure, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
@@ -732,6 +852,7 @@ function Resolve-JarvisSigningConfiguration {
     param(
         [string]$Thumbprint,
         [string]$PfxPath,
+        [string]$PfxPassword,
         [string]$TimestampUrl,
         [string]$Command = ''
     )
@@ -760,7 +881,7 @@ function Resolve-JarvisSigningConfiguration {
     if (-not $hasThumbprint -and $hasPfx) {
         # A .pfx still has to yield a usable thumbprint. Read it from the file
         # rather than requiring the caller to know it.
-        $Thumbprint = Get-JarvisPfxThumbprint -PfxPath $PfxPath
+        $Thumbprint = Get-JarvisPfxThumbprint -PfxPath $PfxPath -Password $PfxPassword
         $hasThumbprint = $true
     }
 
@@ -808,8 +929,15 @@ function Import-JarvisSigningCertificate {
         [string]$PfxPath,
         [string]$Password
     )
-    $secure = ConvertTo-SecureString -String $Password -AsPlainText -Force
+    $secure = ConvertTo-JarvisPfxPassword -Password $Password
     return Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure -Exportable -ErrorAction Stop
+}
+
+function ConvertTo-JarvisPfxPassword {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Password = '')
+    if ([string]::IsNullOrEmpty($Password)) { return [Security.SecureString]::new() }
+    return (ConvertTo-SecureString -String $Password -AsPlainText -Force)
 }
 
 function Invoke-JarvisInstallerSigning {

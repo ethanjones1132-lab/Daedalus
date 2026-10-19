@@ -39,8 +39,8 @@
     Where the release record is written. Defaults to <repo>/dist/release.
 
 .PARAMETER SkipTauriBuild
-    Skip `cargo tauri build` and only assemble the record from artifacts
-    that already exist. Used to re-issue a record for an existing build.
+    Retained only to reject old invocations explicitly. Reusing an old
+    installer while rebuilding frontend artifacts cannot attest provenance.
 
 .PARAMETER AllowDirty
     Do not warn about a dirty worktree.
@@ -74,6 +74,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($SkipTauriBuild) {
+    throw 'skip_tauri_build_unsupported: rebuild the installer from this source; use sign-installer.ps1 only to inspect/sign an existing artifact.'
+}
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
@@ -124,29 +128,15 @@ $env:JARVIS_BUILD_BUILT_AT = $identity.built_at
 $env:JARVIS_BUILD_GIT_DIRTY = $identity.git_dirty.ToString().ToLowerInvariant()
 $env:JARVIS_BUILD_SOURCE_TREE_SHA256 = $identity.source_tree_sha256
 
-if (-not $SkipTauriBuild) {
-    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-    if (-not $cargo) { Die 'cargo not found on PATH' }
-    Push-Location (Join-Path $RepoRoot 'src-tauri')
-    try {
-        # `cargo tauri build` runs the shared frontend build as its
-        # beforeBuildCommand, so the server bundle and the UI are produced
-        # here.
-        & $cargo.Source tauri build
-        if ($LASTEXITCODE -ne 0) { Die "cargo tauri build failed with exit code $LASTEXITCODE" }
-    } finally {
-        Pop-Location
-    }
-} else {
-    Write-Warn 'skipping cargo tauri build (-SkipTauriBuild)'
-    # The frontend artifacts still have to be built. They are what the
-    # release record describes, and the provenance check below refuses a
-    # bundle that does not carry the current identity - so skipping the
-    # Rust compile must not mean shipping a stale server bundle.
-    $bun = Get-Command bun -ErrorAction SilentlyContinue
-    if (-not $bun) { Die 'bun not found on PATH' }
-    & $bun.Source run (Join-Path $RepoRoot 'server-jarvis\src\build-frontend.ts')
-    if ($LASTEXITCODE -ne 0) { Die 'frontend build failed' }
+$cargo = Get-Command cargo -ErrorAction SilentlyContinue
+if (-not $cargo) { Die 'cargo not found on PATH' }
+Push-Location (Join-Path $RepoRoot 'src-tauri')
+try {
+    # The beforeBuildCommand builds the frontend from the same identity.
+    & $cargo.Source tauri build
+    if ($LASTEXITCODE -ne 0) { Die "cargo tauri build failed with exit code $LASTEXITCODE" }
+} finally {
+    Pop-Location
 }
 
 # ── Verify the bundle carries the identity ───────────────────────────────────
@@ -167,7 +157,7 @@ $installer = Get-ChildItem -Path $nsisDir -Filter '*.exe' -Recurse -File -ErrorA
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1
 if (-not $installer) {
-    Die "no NSIS installer found under $nsisDir. Run without -SkipTauriBuild, or check that the bundle target is 'nsis'."
+    Die "no NSIS installer found under $nsisDir. Check that the bundle target is 'nsis'."
 }
 Write-Ok "installer $($installer.Name)"
 
@@ -200,10 +190,12 @@ Write-Ok "staged -> $versionDir"
 # describe a file no user ever runs. The install is deterministic, so the
 # smoke reproduces these exact bytes from a second install.
 Write-Step 'Reading the app binary from a real install'
-$probeRoot = Join-Path $env:TEMP 'jarvis-release-probe'
+$probeRoot = Join-Path $env:TEMP ('jarvis-release-probe-' + [guid]::NewGuid().ToString('N'))
 $mainBinaryName = Get-JarvisMainBinaryName -RepoRoot $RepoRoot
+$probeOwned = $false
 try {
-    Install-JarvisRelease -InstallerPath $stagedInstaller -InstallRoot $probeRoot -TimeoutSeconds $TimeoutSeconds | Out-Null
+    $probeRoot = Install-JarvisRelease -InstallerPath $stagedInstaller -InstallRoot $probeRoot -TimeoutSeconds $TimeoutSeconds
+    $probeOwned = $true
     $probeBinary = Join-Path $probeRoot "$mainBinaryName.exe"
     if (-not (Test-Path -LiteralPath $probeBinary -PathType Leaf)) {
         throw "installed_binary_missing:$probeBinary"
@@ -212,8 +204,10 @@ try {
     Copy-Item -LiteralPath $probeBinary -Destination $stagedExe -Force
     Write-Ok "app binary read from the install ($mainBinaryName.exe)"
 } finally {
-    Remove-JarvisReleaseInstall -InstallRoot $probeRoot | Out-Null
-    Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if ($probeOwned) {
+        Remove-JarvisReleaseInstall -InstallRoot $probeRoot | Out-Null
+        Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # ── Sign ─────────────────────────────────────────────────────────────────────
@@ -229,6 +223,7 @@ if ($Sign) {
         $configuration = Resolve-JarvisSigningConfiguration `
             -Thumbprint $env:JARVIS_SIGNING_THUMBPRINT `
             -PfxPath $env:JARVIS_SIGNING_PFX_PATH `
+            -PfxPassword $env:JARVIS_SIGNING_PFX_PASSWORD `
             -TimestampUrl $TimestampUrl `
             -Command $SigningCommand
         if ($configuration.mode -eq 'command') {

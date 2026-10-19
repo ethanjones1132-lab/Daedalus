@@ -134,6 +134,7 @@ cd src-tauri     && cargo tauri dev # terminal 3 — desktop shell
 |---|---|---|
 | [Rust](https://rustup.rs/) | native shell | 1.85+ |
 | [Bun](https://bun.sh/) | server + UI build | 1.2+ |
+| [Node.js / npm](https://nodejs.org/) | UI production build | 20+ |
 | [Ollama](https://ollama.com/) *(optional)* | local models, Phase-D rollouts | — |
 | OpenRouter / OpenCode key *(optional)* | cloud models | — |
 
@@ -163,7 +164,7 @@ every shipped artifact with its SHA-256.
 powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1
 
 # sign it (needs a code-signing certificate)
-powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1 -SkipTauriBuild -Sign
+powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1 -Sign
 
 # check it end to end
 powershell -ExecutionPolicy Bypass -File scripts\release-smoke.ps1 `

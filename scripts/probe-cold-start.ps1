@@ -7,8 +7,9 @@
     not been reproduced and ruled out." This script is the thing that
     reproduces or rules it out.
 
-    It installs the real NSIS installer into a scratch directory, launches
-    the installed app with no prior state, and watches four things:
+    It installs the real NSIS installer into a new scratch directory,
+    launches a fresh app process using the current user's configuration,
+    and watches four things. This is not a clean-profile or clean-VM test:
 
       1. does the process stay alive, or die during boot;
       2. does a GUI window ever appear (MainWindowHandle);
@@ -45,7 +46,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
 
-    [string]$InstallRoot = (Join-Path $env:TEMP 'jarvis-cold-start'),
+    [string]$InstallRoot = (Join-Path $env:TEMP ('jarvis-cold-start-' + [guid]::NewGuid().ToString('N'))),
 
     [int]$TimeoutSeconds = 120,
 
@@ -111,8 +112,13 @@ function Mark([string]$event, [hashtable]$data) {
 }
 
 # ── Install ──────────────────────────────────────────────────────────────────
+$installOwned = $false
+$process = $null
+try {
+Assert-JarvisPortAvailable -Port 19877
 Write-Step 'Installing the packaged app (cold)'
-Install-JarvisRelease -InstallerPath $InstallerPath -InstallRoot $InstallRoot -TimeoutSeconds 120 | Out-Null
+$InstallRoot = Install-JarvisRelease -InstallerPath $InstallerPath -InstallRoot $InstallRoot -TimeoutSeconds 120
+$installOwned = $true
 $mainBinaryName = Get-JarvisMainBinaryName -RepoRoot (Split-Path -Parent $PSScriptRoot)
 $appPath = Join-Path $InstallRoot "$mainBinaryName.exe"
 if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
@@ -130,12 +136,12 @@ Write-Step 'Launching the app cold'
 $before = @(Get-Process -Name $mainBinaryName -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
 $process = Start-Process -FilePath $appPath -WorkingDirectory $InstallRoot -PassThru `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$process | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $process.StartTime
 Mark 'launched' @{ pid = $process.Id }
 
 $windowSeen = $false
 $healthSeen = $false
 $healthAt = $null
-$serverPid = $null
 $verdict = 'TIMEOUT'
 $lastDetail = ''
 
@@ -169,10 +175,12 @@ while ((Get-Date) -lt $deadline) {
         $listener = Get-NetTCPConnection -State Listen -LocalPort 19877 -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if ($listener) {
-            $healthSeen = $true
-            $healthAt = (Get-Date)
-            $serverPid = $listener.OwningProcess
-            Mark 'server_listening' @{ pid = $serverPid }
+            $candidate = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+            if ($candidate.ParentProcessId -eq $process.Id -and $candidate.CreationDate -ge $process.JarvisOwnedStartTime) {
+                $healthSeen = $true
+                $healthAt = (Get-Date)
+                Mark 'server_listening' @{ pid = $candidate.ProcessId }
+            }
         }
     }
 
@@ -183,6 +191,7 @@ if ($verdict -eq 'TIMEOUT') {
     $verdict = if ($windowSeen) { 'RESPONSIVE' } else { 'NO_WINDOW' }
     $lastDetail = if ($windowSeen) { 'window appeared but the server never came up' } else { 'no window appeared within the budget' }
 }
+if ($verdict -eq 'RESPONSIVE' -and -not $healthSeen) { $verdict = 'SERVER_UNAVAILABLE' }
 
 # ── Health ───────────────────────────────────────────────────────────────────
 Write-Step 'Health'
@@ -193,6 +202,7 @@ if ($healthSeen) {
         Write-Ok "health: version=$($healthPayload.version) git_sha=$($healthPayload.git_sha)"
     } catch {
         Write-Warn "health endpoint did not answer: $($_.Exception.Message)"
+        if ($verdict -eq 'RESPONSIVE') { $verdict = 'SERVER_UNHEALTHY' }
     }
 }
 
@@ -221,17 +231,6 @@ if (Test-Path $stderr) { $stderrTail = [string[]]@(Get-Content $stderr -Tail 25 
 $stdoutTail = [string[]]@()
 if (Test-Path $stdout) { $stdoutTail = [string[]]@(Get-Content $stdout -Tail 25 -ErrorAction SilentlyContinue) }
 
-# ── Teardown ─────────────────────────────────────────────────────────────────
-try {
-    if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
-    if ($serverPid) { Stop-Process -Id $serverPid -Force -ErrorAction SilentlyContinue }
-} catch { }
-Start-Sleep -Milliseconds 800
-if (-not $KeepInstall) {
-    Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
-    Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
-}
-
 # ── Verdict ──────────────────────────────────────────────────────────────────
 $summary = [pscustomobject]@{
     verdict        = $verdict
@@ -251,3 +250,13 @@ $summary | ConvertTo-Json -Depth 6 | Write-Output
 
 Write-Host "`nVERDICT: $verdict - $lastDetail" -ForegroundColor $(if ($verdict -eq 'RESPONSIVE') { 'Green' } else { 'Red' })
 exit $(if ($verdict -eq 'RESPONSIVE') { 0 } else { 1 })
+} finally {
+    try {
+        if ($process) { Stop-JarvisOwnedProcesses -Process $process }
+    } finally {
+        if ($installOwned -and -not $KeepInstall) {
+            Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
+            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}

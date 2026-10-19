@@ -20,7 +20,7 @@ build ──► package ──► sign ──► hash ──► install ──�
 | sign | `scripts/release-build.ps1 -Sign`, `scripts/sign-installer.ps1` | The installer carries a valid Authenticode signature. |
 | hash | `scripts/release-smoke.ps1` | The installer on disk is the one the record describes. |
 | install | `scripts/release-smoke.ps1` | The installer really installs, and the installed binary is the recorded one. |
-| launch | `scripts/release-smoke.ps1` | The packaged server starts. |
+| launch | `scripts/release-smoke.ps1` | The installed server resource starts. |
 | health | `scripts/release-smoke.ps1` | The running build is the recorded build. |
 | chat | `scripts/release-smoke.ps1` | The packaged runtime answers a request with a terminal frame. |
 
@@ -35,7 +35,7 @@ the same code a developer runs locally.
 powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1
 
 # ... and sign it (needs a certificate, see below)
-powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1 -SkipTauriBuild -Sign
+powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1 -Sign
 
 # check the result end to end
 powershell -ExecutionPolicy Bypass -File scripts\release-smoke.ps1 `
@@ -117,6 +117,19 @@ Both the build and the smoke uninstall their scratch install afterwards: a
 silent install leaves an uninstall registry entry behind, and a stale one
 shows up in Apps and Features as a broken install.
 
+Scratch installs use a new unique directory under `%TEMP%`. An existing
+path, a relative path, or a path outside that temporary tree is rejected
+before the installer runs. Caller-owned directories are never deleted.
+The smoke checks the installed server and sidecar hashes against the
+record, then starts **the installed `index.js`**, rather than a separate
+copy staged beside the installer. It refuses an occupied smoke port and
+cleans up its own process and install even when a later check fails. Its
+SSE deadline also covers body reads after response headers arrive.
+
+`-SkipTauriBuild` is rejected. An old installer cannot be relabelled as a
+current build while its separately staged frontend is rebuilt. A signed
+release record is produced by a complete `release-build.ps1 -Sign` run.
+
 This is a different record from `.jarvis-deploy-manifest.json`, which
 `scripts/build-and-deploy.ps1` writes for a **local deploy** onto the
 Desktop. The deploy manifest describes a developer's machine; the release
@@ -174,6 +187,10 @@ powershell -ExecutionPolicy Bypass -File scripts\sign-installer.ps1 `
     -InstallerPath dist\release\1.0.0\Jarvis_1.0.0_x64-setup.exe
 ```
 
+Standalone signing changes the file hash and invalidates any earlier
+release record. It does not regenerate that record. Use the complete
+`release-build.ps1 -Sign` path when preparing a publishable release.
+
 Both sign with SHA-256 and an RFC 3161 timestamp, then verify twice —
 with `signtool verify /pa` and with `Get-AuthenticodeSignature` — because
 a sign step that does not verify is a sign step that can silently do
@@ -209,33 +226,56 @@ It needs two repository secrets:
 **Creating the tag is the release approval.** The workflow publishes what
 the tag asks for; it does not decide what to release.
 
+The tag must equal `v<artifact version>`. Manual runs target their exact
+source SHA when creating a new tag, and reject an existing version tag
+that points at another commit.
+
+A signing-service command is an adapter to an operator-provided executable
+or wrapper. Azure/SignPath tools, wrapper installation and credential
+injection are not implemented by setting `WINDOWS_SIGNING_COMMAND` alone.
+The classic PFX route passes its supplied password through both inspection
+and import, and supports an empty password for passwordless PFX files.
+
 ## What is verified, and what is not
+
+This table describes enforcement in the scripts. The review repair ran
+isolated helper/script regressions, not a new real installer, signed build,
+packaged runtime, or GUI launch. The revised installed-resource path still
+needs an operator-approved packaged run before its runtime claims are proven.
 
 | Claim | Status |
 |---|---|
-| The build identity is folded into the server bundle | verified — the build asserts it against the built file |
-| The installer's hash matches the record | verified — the smoke re-hashes the file, and a tampered file fails |
-| The installed binary matches the record | verified — the record's binary is read from a real install, and the smoke reproduces it from a second one |
-| The running build matches the record | verified — the smoke compares `/health` against the record |
-| The packaged runtime answers a request | verified — the smoke requires a terminal SSE frame |
-| The installer is signed | verified when a certificate is supplied; **not applicable** otherwise, and the release is refused |
-| The installer installs on a clean machine | partially — the smoke installs into a scratch directory, not a clean machine image |
+| The build identity is folded into the server bundle | enforced by build-time checks; helper fixtures tested |
+| The installer's hash matches the record | enforced by the smoke; matching/tampered-file fixtures tested |
+| The installed binary matches the record | enforced by the smoke; binary matching tested with fixtures; real revised installer run pending |
+| The running installed server matches the record | installed-resource hash helpers tested; actual installed runtime `/health` proof pending |
+| The packaged runtime answers a request | terminal SSE frame required; stream outcome/deadline helpers tested; real inference pending |
+| The installer is signed | signature checks implemented; real credential/signing verification pending |
+| The installer installs on a clean machine | **not verified** — a scratch directory is not a clean machine image |
 | The signed installer passes SmartScreen | **not verified** — that needs a real download and a real certificate, and the signature's reputation depends on the CA |
 | The GUI starts cold on real hardware | **not verified** — the smoke launches the server bundle, not the desktop window. This is tracked separately (DD-EO5) |
 
+`probe-cold-start.ps1` measures a fresh GUI process using the current user's
+existing state. It refuses a preexisting listener, checks ownership before
+crediting the Bun server, and terminates only its own proven process tree.
+It is not a clean-profile test; uncertain orphan ancestry is preserved.
+
 ## Tests
 
-`scripts/release-pipeline.Tests.ps1` covers the decisions the pipeline
+`scripts/release-pipeline.Tests.ps1` and `scripts/release-review.Tests.ps1` cover the decisions the pipeline
 makes, without needing an installer, a certificate or an inference
 backend:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command `
-    "Invoke-Pester -Script scripts\release-pipeline.Tests.ps1 -EnableExit"
+    "Invoke-Pester -Script scripts\release-pipeline.Tests.ps1,scripts\release-review.Tests.ps1 -EnableExit"
 ```
 
-It is a behavioural suite, not a source-text suite: it calls the same
-functions the pipeline calls and asserts on what they return. The
+The suites combine behavioral helper/script tests with source-text wiring
+checks. They do not execute a real installer or sign a real certificate.
+The review regressions cover password propagation, scratch preservation,
+process ownership, stale-installer refusal, installed sidecars, publication
+source selection, failure cleanup and SSE body deadlines. The
 source-tree digest test pins the algorithm to the original implementation
 rather than to itself, because that digest is what every deploy manifest
 ever written is verified against.

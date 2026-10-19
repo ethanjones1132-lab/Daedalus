@@ -108,6 +108,7 @@ try {
     $configuration = Resolve-JarvisSigningConfiguration `
         -Thumbprint $Thumbprint `
         -PfxPath $PfxPath `
+        -PfxPassword $PfxPassword `
         -TimestampUrl $TimestampUrl `
         -Command $Command
     if ($configuration.mode -eq 'command') {

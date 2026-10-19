@@ -5,7 +5,10 @@ signs, and this note is the decision that unblocks it, with the facts and
 the exact steps for each route.
 
 The pipeline supports both kinds of code-signing service, so the choice
-below is about which certificate to obtain, not about code changes.
+below is about which certificate to obtain. A signing-service route still
+needs an installed executable/wrapper on the runner and explicit credential
+injection; the current workflow does not install Azure/SignPath tooling or
+map arbitrary service secrets automatically.
 
 ## The two routes
 
