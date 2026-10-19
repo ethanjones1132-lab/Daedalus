@@ -357,6 +357,11 @@ function New-JarvisReleaseManifest {
             path        = $recorded
             sha256      = (Get-JarvisFileSha256 -Path $artifact.path)
             size_bytes  = [int64]$item.Length
+            # Whether this artifact is offered to the public as a release
+            # asset. The record lists every artifact either way; only the
+            # published ones go into SHA256SUMS.txt, because that file is
+            # what a downloader can actually check.
+            published   = [bool]$artifact.published
         }
     }
 
@@ -396,9 +401,11 @@ function Write-JarvisReleaseManifest {
 
     $Manifest | ConvertTo-Json -Depth 6 | Out-File -LiteralPath $Path -Encoding utf8
 
+    # SHA256SUMS.txt covers the PUBLISHED artifacts only: the ones a
+    # downloader can fetch and check. The record lists the rest.
     $sumsPath = Join-Path $dir 'SHA256SUMS.txt'
     $lines = foreach ($file in $Manifest.files) {
-        "$($file.sha256.ToLowerInvariant())  $($file.name)"
+        if ($file.published) { "$($file.sha256.ToLowerInvariant())  $($file.name)" }
     }
     $lines | Out-File -LiteralPath $sumsPath -Encoding ascii
 

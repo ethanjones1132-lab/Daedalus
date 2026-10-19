@@ -328,7 +328,7 @@ Describe 'release record' {
 
     It 'round-trips through disk and writes checksums' {
         $manifest = New-JarvisReleaseManifest -Version '1.0.0' -Identity $script:identity -Artifacts @(
-            @{ role = 'installer'; path = $script:artifact }
+            @{ role = 'installer'; path = $script:artifact; published = $true }
         )
         $path = Join-Path $TestDrive 'jarvis-release.json'
         $written = Write-JarvisReleaseManifest -Manifest $manifest -Path $path
@@ -341,6 +341,29 @@ Describe 'release record' {
 
         $sums = Get-Content -Raw -LiteralPath $written.sums
         $sums | Should Match ([regex]::Escape($manifest.files[0].sha256.ToLowerInvariant()))
+    }
+
+    It 'lists every artifact in the record but only the published ones in the checksums' {
+        # SHA256SUMS.txt is what a downloader can actually check, so it must
+        # not name files that were not published.
+        $other = Join-Path $TestDrive 'server-bundle.js'
+        'bundle' | Out-File $other -Encoding utf8
+        $manifest = New-JarvisReleaseManifest -Version '1.0.0' -Identity $script:identity -Artifacts @(
+            @{ role = 'installer'; path = $script:artifact; published = $true }
+            @{ role = 'server_bundle'; path = $other }
+        )
+        $written = Write-JarvisReleaseManifest -Manifest $manifest -Path (Join-Path $TestDrive 'jarvis-release.json')
+
+        $manifest.files.Count | Should Be 2
+        $manifest.files[0].published | Should Be $true
+        $manifest.files[1].published | Should Be $false
+
+        # @() because Get-Content returns a bare string for a single line,
+        # and $sums[0] on a string is its first CHARACTER, not its first line.
+        $sums = @(Get-Content -LiteralPath $written.sums)
+        $sums.Count | Should Be 1
+        $sums[0] | Should Match ([regex]::Escape($manifest.files[0].sha256.ToLowerInvariant()))
+        $sums[0] | Should Not Match 'server-bundle'
     }
 }
 

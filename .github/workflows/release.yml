@@ -190,15 +190,25 @@ jobs:
           ) -join [Environment]::NewLine
           $notes | Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'release-notes.md') -Encoding utf8
 
-          # Enumerate the assets in PowerShell: gh does not expand globs, and
-          # a quoted "*.exe" would be passed through as a literal.
+          # Attach exactly the artifacts the release record marks as
+          # published. Deliberately NOT every .exe in the release directory:
+          # the standalone app binary is not the signed artifact, and
+          # publishing an unsigned executable next to a signed installer
+          # would undercut the signature. It also cannot run on its own --
+          # it needs the server bundle and resources beside it.
+          $record = Get-Content -Raw -LiteralPath (Join-Path $env:RELEASE_DIR 'jarvis-release.json') | ConvertFrom-Json
           $assets = @(
-            Get-ChildItem -Path $env:RELEASE_DIR -File |
-                Where-Object { $_.Extension -eq '.exe' -or $_.Name -in @('SHA256SUMS.txt', 'jarvis-release.json') } |
-                ForEach-Object { $_.FullName }
+            $record.files |
+                Where-Object { $_.published } |
+                ForEach-Object { Join-Path $env:RELEASE_DIR $_.name }
+            (Join-Path $env:RELEASE_DIR 'SHA256SUMS.txt')
+            (Join-Path $env:RELEASE_DIR 'jarvis-release.json')
           )
-          if ($assets.Count -eq 0) { throw "no release assets found in $env:RELEASE_DIR" }
-          $assets | ForEach-Object { Write-Host "publishing $_" }
+          if ($assets.Count -eq 0) { throw "the release record names no published artifacts" }
+          $assets | ForEach-Object {
+              if (-not (Test-Path -LiteralPath $_ -PathType Leaf)) { throw "published asset missing: $_" }
+              Write-Host "publishing $_"
+          }
 
           $arguments = @('release', 'create', $tag,
               '--title', "Jarvis $($env:VERSION)",

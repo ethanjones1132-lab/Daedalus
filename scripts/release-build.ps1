@@ -129,6 +129,9 @@ if (-not $SkipTauriBuild) {
     if (-not $cargo) { Die 'cargo not found on PATH' }
     Push-Location (Join-Path $RepoRoot 'src-tauri')
     try {
+        # `cargo tauri build` runs the shared frontend build as its
+        # beforeBuildCommand, so the server bundle and the UI are produced
+        # here.
         & $cargo.Source tauri build
         if ($LASTEXITCODE -ne 0) { Die "cargo tauri build failed with exit code $LASTEXITCODE" }
     } finally {
@@ -136,6 +139,14 @@ if (-not $SkipTauriBuild) {
     }
 } else {
     Write-Warn 'skipping cargo tauri build (-SkipTauriBuild)'
+    # The frontend artifacts still have to be built. They are what the
+    # release record describes, and the provenance check below refuses a
+    # bundle that does not carry the current identity - so skipping the
+    # Rust compile must not mean shipping a stale server bundle.
+    $bun = Get-Command bun -ErrorAction SilentlyContinue
+    if (-not $bun) { Die 'bun not found on PATH' }
+    & $bun.Source run (Join-Path $RepoRoot 'server-jarvis\src\build-frontend.ts')
+    if ($LASTEXITCODE -ne 0) { Die 'frontend build failed' }
 }
 
 # ── Verify the bundle carries the identity ───────────────────────────────────
@@ -249,7 +260,7 @@ Write-Step 'Writing the release record'
 $manifestPath = Join-Path $versionDir 'jarvis-release.json'
 
 $artifacts = @(
-    @{ role = 'installer';     path = $stagedInstaller }
+    @{ role = 'installer';     path = $stagedInstaller; published = $true }
     @{ role = 'app_binary';    path = $stagedExe }
     @{ role = 'server_bundle'; path = (Join-Path $versionDir 'index.js') }
     @{ role = 'mcp_stdio';     path = (Join-Path $versionDir 'mcp-stdio-server.js') }
