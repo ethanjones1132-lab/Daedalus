@@ -111,7 +111,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
 
       - name: Build server bundle (tauri resource)
-        run: bun install --frozen-lockfile && bun build ./src/index.ts --outdir ./dist --target bun
+        run: bun install --frozen-lockfile && bun build ./src/index.ts --outdir ./dist --target bun && bun build ./src/mcp-stdio-server.ts --outfile ./dist/mcp-stdio-server.js --target bun
         working-directory: server-jarvis
 
       # tauri.conf.json's frontendDist points at ../src-ui/dist, and

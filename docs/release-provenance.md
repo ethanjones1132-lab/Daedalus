@@ -3,6 +3,28 @@
 How a built Jarvis release proves **what** shipped and **which commit** it came
 from, and how `scripts/verify-deploy.ps1` checks that on disk.
 
+For the shipped-release pipeline (build → package → sign → hash → install →
+launch → health → chat) and the `jarvis-release.json` record, see
+[`release-pipeline.md`](release-pipeline.md). This document is about the
+provenance *rules*; that one is about the pipeline that applies them.
+
+## Two records, two jobs
+
+| Record | Written by | Describes | Checked by |
+|---|---|---|---|
+| `.jarvis-deploy-manifest.json` | `scripts/build-and-deploy.ps1` | a developer's local deploy onto the Desktop | `scripts/verify-deploy.ps1` |
+| `jarvis-release.json` | `scripts/release-build.ps1` | a shipped release: the installer and everything packaged with it | `scripts/release-smoke.ps1` |
+
+Both are built from the same primitives, which now live in one place:
+`scripts/lib/release-common.ps1`. Before that file existed, the source-tree
+digest was implemented separately in `build-and-deploy.ps1` and
+`verify-deploy.ps1`, and the build bake separately in a third place — which
+is how a `cargo tauri build` came to silently replace the identity-baked
+server bundle with an ordinary one. The digest algorithm is frozen, and
+`scripts/release-pipeline.Tests.ps1` pins it to the original implementation
+rather than to itself, because every deploy manifest ever written is
+verified against it.
+
 ## What is recorded
 
 `scripts/build-and-deploy.ps1` writes a deploy manifest,
@@ -35,6 +57,21 @@ the manifest:
 
 That is what lets verification tell an on-disk build apart from the one actually
 answering requests (the 2026-07 stale-bundle incident).
+
+The bake itself is implemented once, in
+`server-jarvis/src/build-frontend.ts`, and is called by both the deploy build
+(`scripts/build-and-deploy.ps1`) and the Tauri release build (through
+`beforeBuildCommand` in `src-tauri/tauri.conf.json`). The build identity reaches
+it through the environment (`JARVIS_BUILD_GIT_SHA` and friends) and is folded
+in with `bun build --define`.
+
+The fold is *checked*, not assumed. `bun build` exits 0 even when a define
+folds to a bare JS identifier, which yields a bundle that throws a
+ReferenceError at module load; and a bundle that never folded reads the
+environment at runtime and reports `git_sha: "dev"`. Both are caught by
+`Test-JarvisBundleProvenance` in `scripts/lib/release-common.ps1`, which looks
+for the commit and the source-tree digest in the built file and for the
+absence of the runtime environment lookup.
 
 ## Installer provenance (NSIS)
 

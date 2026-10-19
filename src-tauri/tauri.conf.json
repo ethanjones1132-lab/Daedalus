@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../src-ui/dist",
     "beforeDevCommand": "cd src-ui && bun run dev",
-    "beforeBuildCommand": "cd server-jarvis && bun build ./src/index.ts --outdir ./dist --target bun && cd ../src-ui && bun run build",
+    "beforeBuildCommand": "bun server-jarvis/src/build-frontend.ts",
     "devUrl": "http://localhost:5173"
   },
   "app": {
@@ -29,6 +29,10 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -38,6 +42,7 @@
     ],
     "resources": {
       "../server-jarvis/dist/index.js": "index.js",
+      "../server-jarvis/dist/mcp-stdio-server.js": "mcp-stdio-server.js",
       "../scripts/claude_cli_proxy.py": "resources/claude_cli_proxy.py",
       "../scripts/opencode_go_openai_models.json": "resources/opencode_go_openai_models.json",
       "../automate_inference_metrics.py": "automate_inference_metrics.py",

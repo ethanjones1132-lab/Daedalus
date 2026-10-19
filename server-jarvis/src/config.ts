@@ -8,6 +8,7 @@ import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
+import jarvisPackage from "../package.json";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
 import {
@@ -16,6 +17,17 @@ import {
   isValidTrajectoryRetention,
   normalizeTrajectoryRetention,
 } from "./self-tuning/trajectory-retention";
+
+/**
+ * Schema marker written into the persisted config file.
+ *
+ * Derived from the app version rather than typed out, so the marker in
+ * every config file this build writes names the build that wrote it and
+ * cannot drift. The native side carries the same value
+ * (src-tauri/src/jarvis/types.rs); config-version.test.ts fails when the
+ * two disagree.
+ */
+export const CONFIG_SCHEMA_VERSION: string = jarvisPackage.version;
 
 // ── Types ──
 
@@ -460,6 +472,19 @@ export interface OrchestratorConfig {
 }
 
 export interface JarvisConfig {
+  /**
+   * Schema marker for the persisted config file, NOT the app version.
+   *
+   * The app version is read from `package.json` (see JARVIS_VERSION in
+   * index.ts) and must never be duplicated here. This field is written
+   * into the user's `config.json` and into the native settings table, and
+   * it tracks the app version so that a config file always names the
+   * build that wrote it. Nothing branches on it -- there is no config
+   * migration keyed on this value -- so it is a label, not a switch.
+   *
+   * The native side writes the same marker (src-tauri/src/jarvis/types.rs),
+   * and config-version.test.ts fails if the two ever disagree.
+   */
   version: string;
   active_backend: BackendType;
   ollama: OllamaConfig;
@@ -536,7 +561,11 @@ export const LOGS_DIR = join(CONFIG_DIR, "logs");
 
 export function defaultConfig(): JarvisConfig {
   return {
-    version: "3.0.0",
+    // Schema marker for the persisted config, not the app version. It
+    // tracks the app version so a config file names the build that wrote
+    // it; the app version itself comes from package.json. See the
+    // JarvisConfig.version doc comment.
+    version: CONFIG_SCHEMA_VERSION,
     active_backend: "llama_cpp",
     ollama: {
       base_url: "http://localhost:11434/v1",

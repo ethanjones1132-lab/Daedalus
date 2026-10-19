@@ -7,7 +7,7 @@
 # is a handful of lines and a red run shows exactly what broke and nothing else.
 #
 # Usage:
-#   ./scripts/verify.sh                    fast: proxy, server build+test, ui typecheck, rust check
+#   ./scripts/verify.sh                    fast: proxy, server build+test+typecheck+eval gate, ui typecheck, rust check
 #   ./scripts/verify.sh --only rust        one subsystem: proxy | server | ui | rust
 #   ./scripts/verify.sh --test             also compile+run the Rust tests
 #   ./scripts/verify.sh --clippy           also run cargo clippy -D warnings
@@ -94,6 +94,10 @@ if want server; then
     run "server build" "$ROOT/server-jarvis" bun build ./src/index.ts --outdir "$tmp" --target bun
     rm -rf "$tmp"
     run "server test" "$ROOT/server-jarvis" bun test
+    run "server typecheck" "$ROOT/server-jarvis" bun run typecheck
+    # Same deterministic regression acceptance CI runs: harness.test.ts plus
+    # the harness CLI against baseline.json (no provider or network calls).
+    run "server test:gate" "$ROOT/server-jarvis" bun run test:gate
   else skip "server (bun not found)"; fi
 fi
 

@@ -120,7 +120,7 @@ defineCommands({
 // Other slices (Settings, Models) own the full config; only fill the gap when
 // nobody else has, so this fixture never clobbers a richer one.
 if (!commands.has('jarvis_get_config')) {
-  defineCommands({ jarvis_get_config: () => ({ version: '3.0.0', active_backend: 'llama_cpp' }) });
+  defineCommands({ jarvis_get_config: () => ({ version: '1.0.0', active_backend: 'llama_cpp' }) });
 }
 
 const inferenceMetrics = () => ({
@@ -157,7 +157,7 @@ const bun = (build: () => unknown) => () => (state.bunUp ? json(build()) : json(
 defineHttp({
   'GET /health/inference': bun(inferenceMetrics),
   'GET /health': bun(() => ({
-    version: '3.0.0',
+    version: '1.0.0',
     model: 'gemma-4-26B-A4B-it-IQ2_M.gguf',
     model_resolved: true,
     git_sha: '7fe0d1c2b3a49586776655443322110099887766',

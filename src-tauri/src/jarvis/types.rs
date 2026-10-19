@@ -29,9 +29,20 @@ impl std::fmt::Display for JarvisBackend {
     }
 }
 
-// The full v3.1 config schema that the Native settings UI persists into
-// SQLite. Each "compound" sub-config is serialized as its own JSON blob
-// in the settings table; see commands/settings.rs for the loader.
+// The config schema the Native settings UI persists into SQLite. Each
+// "compound" sub-config is serialized as its own JSON blob in the settings
+// table; see commands/settings.rs for the loader.
+//
+// `version` is a schema marker, NOT the app version. The app version comes
+// from Cargo.toml (CARGO_PKG_VERSION). The marker tracks the app version so
+// a persisted config names the build that wrote it, and nothing branches on
+// it - there is no config migration keyed on this value.
+//
+// The Bun side carries the same marker (server-jarvis/src/config.ts,
+// CONFIG_SCHEMA_VERSION). The two used to disagree - 3.1.0 here, 3.0.0
+// there, neither matching the 1.0.0 app - so the value a user's config
+// file ended up with depended on which side wrote last.
+// server-jarvis/src/config-version.test.ts fails if they ever diverge.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JarvisConfig {
     pub version: String,
@@ -71,7 +82,8 @@ pub struct JarvisConfig {
 impl Default for JarvisConfig {
     fn default() -> Self {
         JarvisConfig {
-            version: "3.1.0".to_string(),
+            // Schema marker, not the app version. See the struct comment.
+            version: env!("CARGO_PKG_VERSION").to_string(),
             active_backend: JarvisBackend::LlamaCpp,
             ollama: OllamaConfig::default(),
             openrouter: OpenRouterConfig::default(),

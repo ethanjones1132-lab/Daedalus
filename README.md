@@ -134,6 +134,7 @@ cd src-tauri     && cargo tauri dev # terminal 3 — desktop shell
 |---|---|---|
 | [Rust](https://rustup.rs/) | native shell | 1.85+ |
 | [Bun](https://bun.sh/) | server + UI build | 1.2+ |
+| [Node.js / npm](https://nodejs.org/) | UI production build | 20+ |
 | [Ollama](https://ollama.com/) *(optional)* | local models, Phase-D rollouts | — |
 | OpenRouter / OpenCode key *(optional)* | cloud models | — |
 
@@ -149,6 +150,37 @@ cd src-tauri && cargo tauri build   # → target/release/bundle/nsis/Jarvis_*_x6
 # Linux / WSL
 bash build-wsl.sh
 ```
+
+### Release
+
+The shipped-release pipeline — build → package → sign → hash → install →
+launch → health → chat — lives in `scripts/release-build.ps1` and
+`scripts/release-smoke.ps1`, and is what `.github/workflows/release.yml`
+runs on a `v*` tag. It writes one record, `jarvis-release.json`, naming
+every shipped artifact with its SHA-256.
+
+```powershell
+# build + package + write the release record
+powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1
+
+# sign it (needs a code-signing certificate)
+powershell -ExecutionPolicy Bypass -File scripts\release-build.ps1 -Sign
+
+# check it end to end
+powershell -ExecutionPolicy Bypass -File scripts\release-smoke.ps1 `
+    -ManifestPath dist\release\1.0.0\jarvis-release.json
+```
+
+The release pipeline refuses to build a version the surfaces disagree on, and
+refuses to publish an unsigned installer under a release that implies a
+signature. See [`docs/release-pipeline.md`](docs/release-pipeline.md).
+
+**Code signing policy** — <https://github.com/ethanjones1132-lab/Daedalus/blob/master/docs/code-signing-policy.md>
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
+
+Choosing a certificate and wiring it up: [`docs/release-signing.md`](docs/release-signing.md).
 
 ---
 
@@ -218,7 +250,7 @@ Daedalus/
 │       ├── eval/            conductor-replay — offline trace invariants
 │       └── self-tuning/     cma-es/ (sep-CMA-ES, campaigns) · rollout/ (runner, pool, Ollama)
 ├── src-ui/           React + Vite — chat, dashboard, agent manager
-├── scripts/          verify.sh, build-and-deploy.ps1, benchmark-tier2b/, replay-conductor.ts
+├── scripts/          verify.sh, build-and-deploy.ps1, release-build.ps1, release-smoke.ps1, sign-installer.ps1, benchmark-tier2b/, replay-conductor.ts
 ├── docs/             ADRs, plans, incident reports
 ├── CONTEXT.md        Vocabulary for the native surface + flagged ambiguities
 ├── AGENTS.md         Working rules for autonomous coding agents in this repo
