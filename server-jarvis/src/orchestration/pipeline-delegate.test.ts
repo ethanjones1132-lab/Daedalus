@@ -166,7 +166,16 @@ describe("executor delegate pipeline integration", () => {
     });
   });
 
-  test.skipIf(process.platform === "win32")("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
+  // 2026-10-19 DD-005: was win32-skipped. The fixture previously gave the
+  // delegate only 15ms of stage budget, which raced Windows timer granularity:
+  // the timeout could fire before the pre-launch snapshot, launch, and the two
+  // stream frames completed, leaving one capture and no write to verify. Give
+  // the real core enough time to reach the hung stream and let its own timeout
+  // fire. The causal sequence stays bounded: stage budget (250ms) -> timeout ->
+  // termination + event-stream close (<=50ms) -> independent write verification
+  // (<=30ms); the outer 3000ms test budget is strictly larger than that 330ms
+  // sequence, so Windows timer jitter cannot mask the timeout path.
+  test("real delegate core verifies a write after timeout and pipeline never enters native fallback", async () => {
     const config = delegateTestConfig();
     const root = process.cwd();
     const claimedPath = process.platform === "win32" ? resolve(root, "claimed.ts").toLowerCase() : resolve(root, "claimed.ts");
@@ -233,8 +242,8 @@ describe("executor delegate pipeline integration", () => {
           health,
           snapshotFactory,
           processFactory,
-          terminationGraceMs: 1,
-          cleanupTimeoutMs: 20,
+          terminationGraceMs: 5,
+          cleanupTimeoutMs: 50,
           verificationTimeoutMs: 30,
         }),
       },
@@ -250,7 +259,7 @@ describe("executor delegate pipeline integration", () => {
         rawMessage: "Change claimed.ts",
         turnRequirement: "full_execution",
         turnBudget: {
-          stageRemainingMs: () => 15,
+          stageRemainingMs: () => 250,
           extendStageOnProgress: () => 0,
         } as any,
       },
@@ -263,7 +272,7 @@ describe("executor delegate pipeline integration", () => {
       name: "write_file",
       is_error: false,
     }));
-  }, 250);
+  }, 3_000);
 
   test("unconfirmed delegate cleanup after a claimed write is terminal and never launches native", async () => {
     const config = delegateTestConfig();
