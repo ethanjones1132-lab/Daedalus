@@ -1117,7 +1117,17 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         // interpolated into the shell command.
         forward_env_to_wsl(&mut command, &[cap_name, app_name]);
         crate::wsl::hide_windows_console(&mut command);
-        command.spawn()
+        let spawn_started = std::time::Instant::now();
+        log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        let result = command.spawn();
+        let spawn_returned = std::time::Instant::now();
+        log::info!(
+            target: "jarvis::startup",
+            "Bun Command::spawn returned; monotonic={:?}, elapsed_ms={}",
+            spawn_returned,
+            spawn_returned.duration_since(spawn_started).as_millis()
+        );
+        result
     } else if looks_like_local_bun {
         // NEW: Native Windows execution using bundled/portable bun.exe + bundled server .js .
         // This path is taken for installers on new hardware (no WSL checkout needed).
@@ -1132,17 +1142,38 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         if should_hide_jarvis_server_console(is_windows, looks_like_local_bun) {
             crate::wsl::hide_windows_console(&mut command);
         }
-        command.spawn()
+        let spawn_started = std::time::Instant::now();
+        log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        let result = command.spawn();
+        let spawn_returned = std::time::Instant::now();
+        log::info!(
+            target: "jarvis::startup",
+            "Bun Command::spawn returned; monotonic={:?}, elapsed_ms={}",
+            spawn_returned,
+            spawn_returned.duration_since(spawn_started).as_millis()
+        );
+        result
     } else {
         let bun = find_bun_executable();
-        std::process::Command::new(&bun)
+        let mut command = std::process::Command::new(&bun);
+        command
             .arg(entry)
             .env("JARVIS_HOME", wsl_home())
             .env(cap_name, &cap_value)
             .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
-            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"))
-            .spawn()
+            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+        let spawn_started = std::time::Instant::now();
+        log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        let result = command.spawn();
+        let spawn_returned = std::time::Instant::now();
+        log::info!(
+            target: "jarvis::startup",
+            "Bun Command::spawn returned; monotonic={:?}, elapsed_ms={}",
+            spawn_returned,
+            spawn_returned.duration_since(spawn_started).as_millis()
+        );
+        result
     };
     let child = match spawn_result {
         Ok(c) => c,

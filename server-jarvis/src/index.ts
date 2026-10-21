@@ -4,6 +4,7 @@
 // WSL-side HTTP server on port 19877.
 // Uses OpenAI-compatible APIs for llama.cpp, Ollama, and OpenRouter.
 // Qwen3.6 keep96 via llama.cpp is the default local chat and persistent-conductor backend.
+console.log(`[Jarvis startup] process entry uptime=${process.uptime()}s timeOrigin=${performance.timeOrigin}`);
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
