@@ -124,7 +124,9 @@ export type ToolErrorCode =
   | "timeout"
   | "delegate_write_unverified"
   | "delegate_cleanup_unconfirmed"
-  | "delegate_cleanup_signal_error";
+  | "delegate_cleanup_signal_error"
+  /** Rejected by a pre-flight check before execution; carries repair guidance. */
+  | "preflight_blocked";
 
 export class ToolExecutionError extends Error {
   readonly code: ToolErrorCode;

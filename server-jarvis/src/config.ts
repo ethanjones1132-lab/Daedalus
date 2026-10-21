@@ -228,6 +228,16 @@ export interface ToolConfig {
   shell_timeout_max_ms: number;
   /** Run a bounded direct-argv verification target after successful writes. */
   run_gate: boolean;
+  /**
+   * Reject tool calls that cannot succeed before running them, returning repair
+   * guidance instead of a failed handler call plus a model round trip.
+   *
+   * Off by default: the checks replace handler-level error text that existing
+   * flows and tests pin (e.g. filesystem-bundle guidance messages), so enabling
+   * it is an explicit opt-in. Turn on to measure the no-tool / failed-call
+   * volume reduction; turn off to diagnose a suspected false block.
+   */
+  preflight_checks: boolean;
 }
 
 export interface ReasoningConfig {
@@ -681,6 +691,9 @@ export function defaultConfig(): JarvisConfig {
       bash_path: "",
       shell_timeout_max_ms: 120_000,
       run_gate: true,
+      // Opt-in: the checks supersede handler-level error text that current
+      // tests and flows pin, so they stay dormant until a config enables them.
+      preflight_checks: false,
     },
     reasoning: {
       enabled: true,

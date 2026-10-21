@@ -10,6 +10,7 @@
 
 import type { JarvisConfig } from "./config";
 import { WorkspaceSandboxDeniedError } from "./fs-scope";
+import { preflightCheck } from "./preflight-checks";
 import { ToolExecutionError } from "./tool-types";
 import type { ToolDefinition, ToolCall, ToolResult, ToolErrorCode } from "./tool-types";
 import type { WriteEffectObservation } from "./orchestration/content-fingerprint";
@@ -389,6 +390,35 @@ export function createToolRuntime(): ToolRuntime {
         error_code: "missing_args" satisfies ToolErrorCode,
         duration_ms: Date.now() - start,
       };
+    }
+
+    // Pre-flight — reject calls that cannot succeed, with repair guidance.
+    // Placed after required-argument validation (so the checks can assume the
+    // required args exist) and before permission policy (so a doomed call never
+    // prompts the user for approval it does not need). Opt-in: the checks
+    // replace handler-level error text that existing flows pin, so an absent or
+    // false toggle leaves the pipeline byte-for-byte unchanged.
+    if (ctx.config?.tools?.preflight_checks === true) {
+      const preflight = preflightCheck(
+        { ...call, arguments: callArguments },
+        {
+          // ExecutionContext uses snake_case (workspace_path); PreflightContext
+          // uses camelCase. Map explicitly rather than renaming either one.
+          workspacePath: ctx.workspace_path,
+        },
+      );
+      if (!preflight.ok) {
+        const msg = `${preflight.reason}\n\n${preflight.repair}`;
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: msg,
+          is_error: true,
+          error: msg,
+          error_code: "preflight_blocked" satisfies ToolErrorCode,
+          duration_ms: Date.now() - start,
+        };
+      }
     }
 
     // Permission policy — evaluated after input validation, before handler invocation
