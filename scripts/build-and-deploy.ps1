@@ -45,6 +45,7 @@ $ErrorActionPreference = 'Stop'
 $startedAt = Get-Date
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+. (Join-Path $PSScriptRoot 'lib\installer-selection.ps1')
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg"     -ForegroundColor Green }
@@ -63,6 +64,7 @@ $tauriDir   = Join-Path $repo 'src-tauri'
 # redirected dir would ship - and record the provenance of - a stale binary
 # that this build never produced, or find no exe at all.
 $cargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $tauriDir 'target' }
+$nsisDir    = Join-Path $cargoTargetRoot 'release\bundle\nsis'
 $exeOut     = Join-Path $cargoTargetRoot 'release\home-base.exe'
 $distJs     = Join-Path $repo 'server-jarvis\dist\index.js'
 $promptsSrc = Join-Path $repo 'server-jarvis\src\prompts'
@@ -70,6 +72,20 @@ $metricsScript = Join-Path $repo 'automate_inference_metrics.py'
 $proxyScript = Join-Path $repo 'scripts\claude_cli_proxy.py'
 $proxyModelsJson = Join-Path $repo 'scripts\opencode_go_openai_models.json'
 $desktop    = Join-Path $env:USERPROFILE 'OneDrive\Desktop'
+$runStartedAtUtc = $startedAt.ToUniversalTime()
+
+# Preserve the NSIS state from before this run starts building. Stage 3 below
+# runs `cargo build --release`, which does not invoke Tauri's NSIS bundler.
+$preRunInstallerFingerprints = @(
+    Get-ChildItem -LiteralPath $nsisDir -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            [pscustomobject]@{
+                FullName         = [IO.Path]::GetFullPath($_.FullName)
+                LastWriteTimeUtc = $_.LastWriteTimeUtc
+                Sha256           = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+            }
+        }
+)
 
 # ── Locate toolchain (prefer PATH, fall back to standard install dirs) ────────
 function Resolve-Tool($name, $fallback) {
@@ -213,18 +229,21 @@ Write-Ok 'prompts/'
 # ── Installer provenance (NSIS) ──
 # `cargo build --release` alone does NOT bundle an installer; only a prior
 # `cargo tauri build` writes one under <cargo target root>\release\bundle\nsis.
-# When that bundle exists, ship it next to the runtime and record its SHA-256
-# in the deploy manifest, so verify-deploy.ps1 can cross-check the exact
-# installer that belongs to this git_sha. When no installer exists the
-# installer_* manifest fields stay $null and verification skips cleanly.
+# This script never runs the bundler, so any exe already sitting in that
+# directory belongs to some other build and must not be recorded as this
+# run's installer: the manifest's installer_* fields stay $null (and
+# verify-deploy.ps1 skips the check) unless this run actually built one.
 $installerName = $null
 $installerSha256 = $null
 # The NSIS bundle sits under the SAME cargo target root as the exe above
-# ($cargoTargetRoot, resolved in the Paths block): when CARGO_TARGET_DIR is
-# set, the bundle is there and not under src-tauri\target.
-$nsisDir = Join-Path $cargoTargetRoot 'release\bundle\nsis'
-$installer = Get-ChildItem -Path $nsisDir -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+# ($cargoTargetRoot and $nsisDir, resolved in the Paths block): when
+# CARGO_TARGET_DIR is set, the bundle is there and not under src-tauri\target.
+# This script runs `cargo build --release`, not `cargo tauri build`; this run
+# therefore did not produce an installer. The selector also rejects outputs
+# whose fingerprints or timestamps show they predate this run.
+$installer = Select-JarvisRunInstaller -Directory $nsisDir `
+    -RunStartedAtUtc $runStartedAtUtc -PreRunFingerprints $preRunInstallerFingerprints `
+    -InstallerBuildRan $false
 if ($installer) {
     Deploy-File $installer.FullName 'Jarvis-installer.exe'
     $installerName = 'Jarvis-installer.exe'
