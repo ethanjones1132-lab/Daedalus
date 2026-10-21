@@ -86,6 +86,13 @@ jobs:
         working-directory: src-ui
         run: npm ci
 
+      # The release scripts are what produce this artifact. Run their tests
+      # before spending the build time, so a broken release script fails here
+      # with a specific assertion instead of failing mid-build or, worse,
+      # publishing a release record that no longer describes the artifact.
+      - name: Run release pipeline tests
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-release-tests.ps1
+
       # The certificate never appears in a command line or in the release
       # artifacts: it is written to the runner's temp directory and the
       # path is handed to the build through the environment.
