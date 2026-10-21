@@ -261,6 +261,11 @@ function Test-JarvisBundleProvenance {
             boot at all. bun build still exits 0 here, so an exit-code gate
             cannot see it.
 
+        A bare substring is not proof of the fold: the identity can appear
+        in a comment or inside a longer token without any define having
+        replaced the runtime lookup. Each value must therefore occur as a
+        complete double-quoted JS string literal (`"<value>"`).
+
         Returns an object with `ok` and, on failure, `reason`.
     #>
     [CmdletBinding()]
@@ -282,16 +287,16 @@ function Test-JarvisBundleProvenance {
             reason = 'define_not_folded:JARVIS_GIT_SHA is still a runtime env lookup in the bundle'
         }
     }
-    if ($text -notmatch [regex]::Escape([string]$Identity.git_sha)) {
+    if ($text -notmatch ('"' + [regex]::Escape([string]$Identity.git_sha) + '"')) {
         return [pscustomobject]@{
             ok     = $false
-            reason = "sha_not_folded:expected $($Identity.git_sha) in the bundle"
+            reason = "sha_not_folded:expected double-quoted literal `"$($Identity.git_sha)`" in the bundle"
         }
     }
-    if ($text -notmatch [regex]::Escape([string]$Identity.source_tree_sha256)) {
+    if ($text -notmatch ('"' + [regex]::Escape([string]$Identity.source_tree_sha256) + '"')) {
         return [pscustomobject]@{
             ok     = $false
-            reason = "source_tree_not_folded:expected $($Identity.source_tree_sha256) in the bundle"
+            reason = "source_tree_not_folded:expected double-quoted literal `"$($Identity.source_tree_sha256)`" in the bundle"
         }
     }
     return [pscustomobject]@{ ok = $true; reason = $null }

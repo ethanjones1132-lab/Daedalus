@@ -245,6 +245,31 @@ Describe 'bundle provenance' {
         $result.ok | Should Be $false
         $result.reason | Should Match 'source_tree_not_folded'
     }
+
+    It 'rejects identity that only appears as bare substrings' {
+        # A comment or a longer token can contain the hex strings without any
+        # define having folded. Unanchored substring matching accepted this.
+        $bundle = Join-Path $TestDrive 'substring.js'
+        @(
+            "// provenance comment: sha $($script:identity.git_sha) tree $($script:identity.source_tree_sha256)"
+            "var SHA = 'x$($script:identity.git_sha)x';"
+            "var TREE = 'x$($script:identity.source_tree_sha256)x';"
+        ) | Out-File $bundle -Encoding utf8
+        $result = Test-JarvisBundleProvenance -BundlePath $bundle -Identity $script:identity
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'sha_not_folded'
+    }
+
+    It 'rejects a source tree digest that is only an unquoted substring' {
+        $bundle = Join-Path $TestDrive 'tree-substring.js'
+        @(
+            "var SHA = `"$($script:identity.git_sha)`";"
+            "// tree digest only as a longer token: x$($script:identity.source_tree_sha256)x"
+        ) | Out-File $bundle -Encoding utf8
+        $result = Test-JarvisBundleProvenance -BundlePath $bundle -Identity $script:identity
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'source_tree_not_folded'
+    }
 }
 
 Describe 'signing configuration' {
