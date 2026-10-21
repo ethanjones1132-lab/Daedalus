@@ -25,6 +25,11 @@
     about the GUI freezing, and a server that is up does not by itself mean
     the app is not hanging.
 
+    The observation budget is a hard bound. Every OS query runs in its own
+    runspace and is waited on for at most the remaining budget; a query that
+    outlives it is reported as unavailable and abandoned rather than joined,
+    so a stalled query cannot turn a 120s observation into an unbounded run.
+
 .PARAMETER InstallerPath
     The NSIS installer to test. Required.
 
@@ -56,6 +61,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+. (Join-Path $PSScriptRoot 'lib\probe-bounded-queries.ps1')
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
@@ -144,44 +150,60 @@ $healthSeen = $false
 $healthAt = $null
 $verdict = 'TIMEOUT'
 $lastDetail = ''
+$listenerStatus = 'not_queried'
+$serverOwnership = ''
+$serverPid = $null
 
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
 
-    if ($process.HasExited) {
+    # Every OS query in this loop runs in its own runspace with at most the
+    # remaining observation budget. A query that outlives it is reported as
+    # unavailable and contributes no evidence; it is never waited on, so a
+    # stalled query cannot stretch the probe past its stated budget.
+    $observation = Get-JarvisColdStartObservation `
+        -Process $process `
+        -ProbeStartedAt $process.JarvisOwnedStartTime `
+        -Deadline $deadline `
+        -Port 19877 `
+        -WindowState { param($app) Get-JarvisWindowState -Process $app }
+
+    if ($observation.exited) {
         $verdict = 'DIED'
-        $lastDetail = "exited with code $($process.ExitCode)"
-        Mark 'process_exited' @{ exit_code = $process.ExitCode }
+        $lastDetail = "exited with code $($observation.exit_code)"
+        Mark 'process_exited' @{ exit_code = $observation.exit_code }
         break
     }
 
-    $state = Get-JarvisWindowState -process $process
-    if ($state.has_window -and -not $windowSeen) {
+    if ($observation.has_window -and -not $windowSeen) {
         $windowSeen = $true
-        Mark 'window_appeared' @{ title = $state.main_window; responsive = $state.responsive }
+        Mark 'window_appeared' @{ title = $observation.main_window; responsive = $observation.responsive }
     }
-    if ($state.has_window -and $state.responsive -eq $false) {
+    if ($observation.has_window -and $observation.responsive -eq $false) {
         $verdict = 'HUNG'
         $lastDetail = 'the main window stopped pumping messages (SMTO_ABORTIFHUNG)'
         Mark 'window_hung' @{}
         break
     }
-    if ($state.has_window -and $state.responsive -eq $true -and $verdict -eq 'TIMEOUT') {
+    if ($observation.has_window -and $observation.responsive -eq $true -and $verdict -eq 'TIMEOUT') {
         $verdict = 'RESPONSIVE'
     }
 
-    if (-not $healthSeen) {
-        $listener = Get-NetTCPConnection -State Listen -LocalPort 19877 -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($listener) {
-            $candidate = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
-            if ($candidate.ParentProcessId -eq $process.Id -and $candidate.CreationDate -ge $process.JarvisOwnedStartTime) {
-                $healthSeen = $true
-                $healthAt = (Get-Date)
-                Mark 'server_listening' @{ pid = $candidate.ProcessId }
-            }
+    if ($observation.listener_status -ne $listenerStatus) {
+        $listenerStatus = $observation.listener_status
+        if ($listenerStatus -in @('timed_out', 'failed')) {
+            $detail = if ($listenerStatus -eq 'timed_out') { 'the port query outlived the observation budget' } else { 'the port query failed' }
+            Mark 'listener_query_unavailable' @{ status = $listenerStatus; detail = $detail }
         }
+    }
+    $serverOwnership = $observation.reason
+
+    if (-not $healthSeen -and $observation.server_listening) {
+        $healthSeen = $true
+        $healthAt = (Get-Date)
+        $serverPid = $observation.server_pid
+        Mark 'server_listening' @{ pid = $serverPid }
     }
 
     if ($verdict -eq 'RESPONSIVE' -and $healthSeen) { break }
@@ -190,6 +212,7 @@ while ((Get-Date) -lt $deadline) {
 if ($verdict -eq 'TIMEOUT') {
     $verdict = if ($windowSeen) { 'RESPONSIVE' } else { 'NO_WINDOW' }
     $lastDetail = if ($windowSeen) { 'window appeared but the server never came up' } else { 'no window appeared within the budget' }
+    if (-not $healthSeen -and $serverOwnership) { $lastDetail = "$lastDetail (last server check: $serverOwnership)" }
 }
 if ($verdict -eq 'RESPONSIVE' -and -not $healthSeen) { $verdict = 'SERVER_UNAVAILABLE' }
 
@@ -207,12 +230,11 @@ if ($healthSeen) {
 }
 
 # ── Evidence ─────────────────────────────────────────────────────────────────
-$childProcesses = @()
-try {
-    $childProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ParentProcessId -eq $process.Id } |
-        Select-Object ProcessId, Name, CommandLine
-} catch { }
+$childrenEvidence = Get-JarvisProbeChildProcessEvidence -ProbeProcessId $process.Id
+$childProcesses = @($childrenEvidence.children)
+if ($childrenEvidence.status -ne 'result') {
+    Mark 'children_evidence_unavailable' @{ status = $childrenEvidence.status; error = $childrenEvidence.error }
+}
 
 $appLog = $null
 if (Test-Path $logDir) {
@@ -241,6 +263,9 @@ $summary = [pscustomobject]@{
     server_healthy = ($null -ne $healthPayload)
     health         = $healthPayload
     children       = @($childProcesses)
+    children_query = $childrenEvidence.status
+    listener_query = $listenerStatus
+    server_ownership = $serverOwnership
     timeline       = $timeline.ToArray()
     stdout_tail    = $stdoutTail
     stderr_tail    = $stderrTail
