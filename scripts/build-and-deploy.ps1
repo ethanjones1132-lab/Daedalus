@@ -7,9 +7,11 @@
     Stages, fail-fast (stops on the first error):
       1. Server  -> bun build server-jarvis/src/index.ts  -> server-jarvis/dist/index.js
       2. UI      -> bun run build (tsc -b && vite build)   -> src-ui/dist
-      3. Rust    -> cargo build --release                  -> src-tauri/target/release/home-base.exe
-                    (Tauri embeds src-ui/dist into the binary at compile time, so
-                     the UI MUST be built before this step — stage 2 guarantees it.)
+      3. Rust    -> cargo build --release                  -> <cargo target root>\release\home-base.exe
+                    (the cargo target root is $env:CARGO_TARGET_DIR when it is
+                     set, src-tauri\target otherwise; Tauri embeds src-ui/dist
+                     into the binary at compile time, so the UI MUST be built
+                     before this step — stage 2 guarantees it.)
       4. Deploy  -> copy the freshly built artifacts to the OneDrive Desktop:
                       home-base.exe  -> <Desktop>\Jarvis.exe   (and \home-base.exe)
                       dist/index.js  -> <Desktop>\index.js
@@ -53,7 +55,15 @@ $repo       = Split-Path -Parent $PSScriptRoot
 $serverDir  = Join-Path $repo 'server-jarvis'
 $uiDir      = Join-Path $repo 'src-ui'
 $tauriDir   = Join-Path $repo 'src-tauri'
-$exeOut     = Join-Path $repo 'src-tauri\target\release\home-base.exe'
+# The cargo target root is where cargo actually puts the build, and it is NOT
+# always src-tauri\target: build-windows.ps1 (and any job that redirects the
+# target dir) sets CARGO_TARGET_DIR. The built exe AND the NSIS bundle both
+# live under it, so both are derived from this ONE value. A script that looked
+# for the exe under a hardcoded src-tauri\target while cargo built into the
+# redirected dir would ship - and record the provenance of - a stale binary
+# that this build never produced, or find no exe at all.
+$cargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $tauriDir 'target' }
+$exeOut     = Join-Path $cargoTargetRoot 'release\home-base.exe'
 $distJs     = Join-Path $repo 'server-jarvis\dist\index.js'
 $promptsSrc = Join-Path $repo 'server-jarvis\src\prompts'
 $metricsScript = Join-Path $repo 'automate_inference_metrics.py'
@@ -202,15 +212,16 @@ Write-Ok 'prompts/'
 
 # ── Installer provenance (NSIS) ──
 # `cargo build --release` alone does NOT bundle an installer; only a prior
-# `cargo tauri build` writes one under src-tauri\target\release\bundle\nsis.
+# `cargo tauri build` writes one under <cargo target root>\release\bundle\nsis.
 # When that bundle exists, ship it next to the runtime and record its SHA-256
 # in the deploy manifest, so verify-deploy.ps1 can cross-check the exact
 # installer that belongs to this git_sha. When no installer exists the
 # installer_* manifest fields stay $null and verification skips cleanly.
 $installerName = $null
 $installerSha256 = $null
-# Honor CARGO_TARGET_DIR (set by build-windows.ps1); otherwise cargo's default.
-$cargoTargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $tauriDir 'target' }
+# The NSIS bundle sits under the SAME cargo target root as the exe above
+# ($cargoTargetRoot, resolved in the Paths block): when CARGO_TARGET_DIR is
+# set, the bundle is there and not under src-tauri\target.
 $nsisDir = Join-Path $cargoTargetRoot 'release\bundle\nsis'
 $installer = Get-ChildItem -Path $nsisDir -Filter '*.exe' -Recurse -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
