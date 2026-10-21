@@ -8,12 +8,25 @@
 #>
 param(
     [string]$deployDir = "$env:USERPROFILE\OneDrive\Desktop",
-    [string]$repoRoot = "C:\Projects\home-base-recovered",
+    [string]$repoRoot,
     [string]$healthUrl = "http://localhost:19877/health",
     [string]$ExpectSha = ""
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ── repoRoot default ──
+# There is no hardcoded repo root: a copied verifier (e.g. a worktree copy of
+# scripts/) must inspect the worktree it ships in, so the default is the fully
+# resolved absolute parent directory of this script's location. It is resolved
+# here in the body rather than as a param default because Windows PowerShell
+# 5.1 does not populate $PSScriptRoot inside a parameter default when the
+# script is invoked via `powershell -File` (PowerShell/PowerShell#4688), and
+# `powershell -File scripts\verify-deploy.ps1` is the documented invocation.
+# An explicit -repoRoot always overrides the derived default.
+if ([string]::IsNullOrWhiteSpace($repoRoot)) {
+    $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 
 $manifestPath = Join-Path $deployDir '.jarvis-deploy-manifest.json'
 
