@@ -367,6 +367,178 @@ Describe 'release record' {
     }
 }
 
+Describe 'refreshing the release record after a standalone signature' {
+    # sign-installer.ps1 signs an installer that release-build.ps1 already
+    # recorded. Signing changes the bytes, so the record and the downloadable
+    # SHA256SUMS.txt would otherwise keep pointing at the unsigned artifact.
+    # Everything here is a temporary dummy installer and a fabricated record:
+    # no signer, certificate, timestamp service or network is touched.
+    BeforeEach {
+        $script:signedReleaseDir = Join-Path $TestDrive 'signed-release'
+        New-Item -ItemType Directory -Force -Path $script:signedReleaseDir | Out-Null
+        $script:signedInstaller = Join-Path $script:signedReleaseDir 'Jarvis_1.0.0_x64-setup.exe'
+        'unsigned installer bytes' | Out-File -LiteralPath $script:signedInstaller -Encoding utf8
+        $script:signedBundle = Join-Path $script:signedReleaseDir 'index.js'
+        'server bundle bytes' | Out-File -LiteralPath $script:signedBundle -Encoding utf8
+        $script:signedSums = Join-Path $script:signedReleaseDir 'SHA256SUMS.txt'
+        $script:signedManifest = Join-Path $script:signedReleaseDir 'jarvis-release.json'
+        $script:signedIdentity = [pscustomobject]@{
+            git_sha            = '0123456789ABCDEF0123456789ABCDEF01234567'
+            git_dirty          = $false
+            built_at           = '2026-10-19T12:00:00Z'
+            source_tree_sha256 = 'AABBCCDDEEFF00112233445566778899AABBCCDD'
+        }
+        $manifest = New-JarvisReleaseManifest -Version '1.0.0' -Identity $script:signedIdentity `
+            -Root $script:signedReleaseDir -Artifacts @(
+                @{ role = 'installer'; path = $script:signedInstaller; published = $true }
+                @{ role = 'server_bundle'; path = $script:signedBundle }
+            ) -Extra @{
+                signed           = $false
+                signature_status = $null
+            }
+        Write-JarvisReleaseManifest -Manifest $manifest -Path $script:signedManifest | Out-Null
+        $script:signedUnsignedSha = Get-JarvisFileSha256 -Path $script:signedInstaller
+        $script:signedBundleSha = Get-JarvisFileSha256 -Path $script:signedBundle
+    }
+
+    It 'recalculates the signed installer hash, size and checksum' {
+        # The byte change stands in for a signature, without any signer.
+        'signed installer bytes, longer than the unsigned ones' |
+            Out-File -LiteralPath $script:signedInstaller -Encoding utf8
+
+        $refresh = Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller `
+            -Signature ([pscustomobject]@{ status = 'Valid'; subject = 'CN=Jarvis Release' })
+
+        $refresh.refreshed | Should Be $true
+        $refresh.entries | Should Be 1
+        $refresh.sha256 | Should Be (Get-JarvisFileSha256 -Path $script:signedInstaller)
+
+        $record = Read-JarvisReleaseManifest -Path $script:signedManifest
+        $entry = @($record.files) | Where-Object { $_.role -eq 'installer' }
+        $signedLength = (Get-Item -LiteralPath $script:signedInstaller).Length
+        $entry.sha256 | Should Be (Get-JarvisFileSha256 -Path $script:signedInstaller)
+        $entry.sha256 | Should Not Be $script:signedUnsignedSha
+        $entry.size_bytes | Should Be $signedLength
+        $entry.name | Should Be 'Jarvis_1.0.0_x64-setup.exe'
+        $entry.published | Should Be $true
+
+        $sums = @(Get-Content -LiteralPath $script:signedSums)
+        $sums.Count | Should Be 1
+        $sums[0] | Should Match ([regex]::Escape($entry.sha256.ToLowerInvariant()))
+        $sums[0] | Should Not Match ([regex]::Escape($script:signedUnsignedSha.ToLowerInvariant()))
+    }
+
+    It 'keeps identity, version and every unrelated artifact' {
+        'signed installer bytes, longer than the unsigned ones' |
+            Out-File -LiteralPath $script:signedInstaller -Encoding utf8
+
+        $refresh = Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller `
+            -Signature ([pscustomobject]@{ status = 'Valid'; subject = 'CN=Jarvis Release' })
+        $refresh.refreshed | Should Be $true
+
+        $record = Read-JarvisReleaseManifest -Path $script:signedManifest
+        # A standalone signature is not a new build: the commit and source
+        # tree are facts signing cannot know better than the record did.
+        $record.version | Should Be '1.0.0'
+        $record.git_sha | Should Be $script:signedIdentity.git_sha
+        $record.git_dirty | Should Be $false
+        $record.built_at | Should Be $script:signedIdentity.built_at
+        $record.source_tree_sha256 | Should Be $script:signedIdentity.source_tree_sha256
+
+        $bundle = @($record.files) | Where-Object { $_.role -eq 'server_bundle' }
+        $bundleLength = (Get-Item -LiteralPath $script:signedBundle).Length
+        $bundle.sha256 | Should Be $script:signedBundleSha
+        $bundle.size_bytes | Should Be $bundleLength
+        $bundle.path | Should Be 'index.js'
+        $bundle.published | Should Be $false
+
+        # The signature is now what the record says happened, because the
+        # record already carried those fields.
+        $record.signed | Should Be $true
+        $record.signature_status | Should Be 'Valid'
+
+        # The unpublished bundle still stays out of the download checksums.
+        @(Get-Content -LiteralPath $script:signedSums).Count | Should Be 1
+    }
+
+    It 'reports a missing record instead of inventing one' {
+        Remove-Item -LiteralPath $script:signedManifest -Force
+        Remove-Item -LiteralPath $script:signedSums -Force
+
+        $refresh = Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller
+
+        $refresh.refreshed | Should Be $false
+        $refresh.reason | Should Match 'release_manifest_missing'
+        $refresh.sha256 | Should BeNullOrEmpty
+        $script:signedManifest | Should Not Exist
+        $script:signedSums | Should Not Exist
+    }
+
+    It 'writes nothing for a bare installer with no record at all' {
+        $bareDir = Join-Path $TestDrive 'bare'
+        New-Item -ItemType Directory -Force -Path $bareDir | Out-Null
+        $bare = Join-Path $bareDir 'Jarvis_1.0.0_x64-setup.exe'
+        'bare installer bytes' | Out-File -LiteralPath $bare -Encoding utf8
+
+        $refresh = Update-JarvisReleaseInstallerRecord -InstallerPath $bare
+
+        $refresh.refreshed | Should Be $false
+        $refresh.reason | Should Match 'release_manifest_missing'
+        (Join-Path $bareDir 'jarvis-release.json') | Should Not Exist
+        (Join-Path $bareDir 'SHA256SUMS.txt') | Should Not Exist
+    }
+
+    It 'refuses a malformed record' {
+        'this is not a release record' | Out-File -LiteralPath $script:signedManifest -Encoding utf8
+
+        { Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller } |
+            Should Throw 'release_manifest_malformed'
+    }
+
+    It 'refuses a record with an unexpected schema' {
+        '{ "schema": "jarvis.release/99", "files": [] }' |
+            Out-File -LiteralPath $script:signedManifest -Encoding utf8
+
+        { Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller } |
+            Should Throw 'release_manifest_malformed'
+    }
+
+    It 'refuses a record that names a different installer' {
+        $other = Join-Path $script:signedReleaseDir 'Jarvis_2.0.0_x64-setup.exe'
+        'other installer bytes' | Out-File -LiteralPath $other -Encoding utf8
+        $otherManifest = New-JarvisReleaseManifest -Version '2.0.0' -Identity $script:signedIdentity `
+            -Root $script:signedReleaseDir -Artifacts @(
+                @{ role = 'installer'; path = $other; published = $true }
+            )
+        Write-JarvisReleaseManifest -Manifest $otherManifest -Path $script:signedManifest | Out-Null
+        $before = Get-Content -Raw -LiteralPath $script:signedManifest
+
+        { Update-JarvisReleaseInstallerRecord -InstallerPath $script:signedInstaller } |
+            Should Throw 'release_manifest_installer_mismatch'
+
+        # The other installer's record was not rewritten either.
+        (Get-Content -Raw -LiteralPath $script:signedManifest) | Should Be $before
+    }
+
+    It 'refreshes the record after signing, not before' {
+        $source = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\sign-installer.ps1')
+        $signIndex = $source.IndexOf('Invoke-JarvisInstallerSigning')
+        $refreshIndex = $source.IndexOf('Update-JarvisReleaseInstallerRecord')
+        $signIndex | Should BeGreaterThan 0
+        $refreshIndex | Should BeGreaterThan $signIndex
+    }
+
+    It 'leaves VerifyOnly read-only' {
+        $source = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\sign-installer.ps1')
+        $verifyIndex = $source.IndexOf('if ($VerifyOnly) {')
+        $verifyExit = $source.IndexOf('Signature verification passed.')
+        $refreshIndex = $source.IndexOf('Update-JarvisReleaseInstallerRecord')
+        $verifyIndex | Should BeGreaterThan 0
+        $verifyExit | Should BeGreaterThan $verifyIndex
+        $refreshIndex | Should BeGreaterThan $verifyExit
+    }
+}
+
 Describe 'installed binary matching' {
     BeforeEach {
         $script:installRoot = Join-Path $TestDrive 'install'

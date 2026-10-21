@@ -451,6 +451,144 @@ function Resolve-JarvisManifestPath {
     return (Join-Path $root $ArtifactPath)
 }
 
+function Update-JarvisReleaseInstallerRecord {
+    <#
+    .SYNOPSIS
+        Recalculate an existing release record's entry for an installer that
+        was signed after the record was written.
+
+    .DESCRIPTION
+        release-build.ps1 signs before it writes the record, because signing
+        changes the bytes. sign-installer.ps1 signs an installer that already
+        has a record, so without this its "sha256: ..." line describes an
+        artifact whose recorded hash and downloadable SHA256SUMS.txt entry
+        still point at the unsigned bytes.
+
+        Only the entry that resolves to exactly this installer is touched:
+        its hash, size and name are recalculated, the checksums are rewritten
+        through Write-JarvisReleaseManifest (so unrelated published artifacts
+        keep their lines and unpublished ones stay out), and identity,
+        version and every other artifact are carried over untouched. A
+        standalone signature does not make this commit a different build, so
+        git_sha / source_tree_sha256 are never rewritten here.
+
+        It will not invent a record for a bare installer: with no adjacent
+        record it returns refreshed = $false and writes nothing. A record that
+        IS present but cannot be trusted -- unparsable, wrong schema, or
+        naming a different installer -- throws, because leaving stale
+        provenance in place is the failure this exists to prevent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallerPath,
+        # Defaults to jarvis-release.json beside the installer.
+        [string]$ManifestPath,
+        # Signature status from the signing step. Only folded into fields the
+        # record already carries; nothing is added to a record that omits them.
+        $Signature
+    )
+
+    # ConvertFrom-Json reports invalid JSON as a non-terminating error, which
+    # would otherwise leave a null record here and read as "nothing to do".
+    # A record that cannot be parsed must fail, not pass silently.
+    $ErrorActionPreference = 'Stop'
+
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        throw "installer_missing:$InstallerPath"
+    }
+    $installer = Get-Item -LiteralPath $InstallerPath
+    $installerFull = [IO.Path]::GetFullPath($installer.FullName)
+
+    if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+        $ManifestPath = Join-Path (Split-Path -Parent $installerFull) 'jarvis-release.json'
+    }
+    $ManifestPath = [IO.Path]::GetFullPath($ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            refreshed  = $false
+            reason     = "release_manifest_missing:$ManifestPath"
+            manifest   = $ManifestPath
+            sums       = $null
+            installer  = $installerFull
+            sha256     = $null
+            size_bytes = $null
+            entries    = 0
+        }
+    }
+
+    try {
+        $manifest = Read-JarvisReleaseManifest -Path $ManifestPath
+    } catch {
+        throw "release_manifest_malformed:${ManifestPath}:$($_.Exception.Message)"
+    }
+    if (-not $manifest -or -not $manifest.PSObject.Properties['schema']) {
+        throw "release_manifest_malformed:${ManifestPath}:schema"
+    }
+    if ([string]$manifest.schema -ne (Get-JarvisReleaseSchema)) {
+        throw "release_manifest_malformed:${ManifestPath}:schema=$($manifest.schema)"
+    }
+    if (-not $manifest.PSObject.Properties['files']) {
+        throw "release_manifest_malformed:${ManifestPath}:files"
+    }
+    $entries = @($manifest.files)
+    if ($entries.Count -eq 0) {
+        throw "release_manifest_malformed:${ManifestPath}:files"
+    }
+
+    $matched = @()
+    foreach ($entry in $entries) {
+        if (-not $entry -or [string]::IsNullOrWhiteSpace($entry.path)) { continue }
+        try {
+            $resolved = Resolve-JarvisManifestPath -ManifestPath $ManifestPath -ArtifactPath ([string]$entry.path)
+            $resolvedFull = [IO.Path]::GetFullPath($resolved)
+        } catch {
+            throw "release_manifest_malformed:${ManifestPath}:path=$($entry.path)"
+        }
+        if ($resolvedFull -eq $installerFull) { $matched += $entry }
+    }
+    if ($matched.Count -eq 0) {
+        throw "release_manifest_installer_mismatch:${ManifestPath}:$installerFull"
+    }
+
+    $sha256 = Get-JarvisFileSha256 -Path $installerFull
+    $size = [int64]$installer.Length
+    foreach ($entry in $matched) {
+        $entry.sha256 = $sha256
+        $entry.size_bytes = $size
+        $entry.name = $installer.Name
+    }
+
+    if ($Signature) {
+        $signatureFields = @([pscustomobject]@{ name = 'signed'; value = $true })
+        if ($Signature.status) {
+            $signatureFields += [pscustomobject]@{ name = 'signature_status'; value = $Signature.status }
+        }
+        if ($Signature.subject) {
+            $signatureFields += [pscustomobject]@{ name = 'signature_subject'; value = $Signature.subject }
+        }
+        foreach ($field in $signatureFields) {
+            $existing = $manifest.PSObject.Properties[$field.name]
+            if ($existing) { $existing.Value = $field.value }
+        }
+    }
+
+    # Keep the record's files a JSON array even when there is only one.
+    $manifest.files = $entries
+
+    $written = Write-JarvisReleaseManifest -Manifest $manifest -Path $ManifestPath
+    return [pscustomobject]@{
+        refreshed  = $true
+        reason     = $null
+        manifest   = $written.manifest
+        sums       = $written.sums
+        installer  = $installerFull
+        sha256     = $sha256
+        size_bytes = $size
+        entries    = $matched.Count
+    }
+}
+
 # ── Release smoke decisions ──────────────────────────────────────────────────
 # The interesting rules of the release smoke, kept here so they can be
 # tested without an installer, a certificate or an inference backend. The

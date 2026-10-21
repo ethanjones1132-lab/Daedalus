@@ -24,6 +24,16 @@
     record is written -- signing changes the bytes, so a record written
     before signing would describe an installer that no longer exists.
 
+    The same fact applies to an installer that was built first and signed
+    here afterwards: it already has a release record, written while the
+    bytes were unsigned. After signing, this script refreshes the record
+    entry that names this installer and regenerates SHA256SUMS.txt through
+    the shared writer, so the published hash and the downloadable checksums
+    describe the artifact that actually ships. The record's version, commit
+    and every unrelated artifact are left alone, and a record that is
+    missing, malformed or about a different installer is never silently
+    reported as healthy.
+
 .PARAMETER InstallerPath
     The NSIS installer to sign.
 
@@ -78,6 +88,7 @@ $ErrorActionPreference = 'Stop'
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Warn($msg) { Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
 function Die($msg)        { Write-Host "`n[FAILED] $msg" -ForegroundColor Red; exit 1 }
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -131,6 +142,25 @@ try {
     Write-Ok "signature status: $($status.status)"
     Write-Ok "subject: $($status.subject)"
     Write-Ok "issuer:  $($status.issuer)"
+
+    Write-Step 'Refreshing the release record'
+    try {
+        $refresh = Update-JarvisReleaseInstallerRecord `
+            -InstallerPath $resolvedInstaller.Path `
+            -Signature $status
+    } catch {
+        Die "the installer was signed, but its release record could not be refreshed: $($_.Exception.Message)"
+    }
+    if ($refresh.refreshed) {
+        Write-Ok "release record: $($refresh.manifest)"
+        Write-Ok "checksums:      $($refresh.sums)"
+        Write-Ok "sha256:         $($refresh.sha256)"
+    } else {
+        # A bare installer signed on its own has no record to refresh, and
+        # inventing one would claim a build identity this script cannot know.
+        Write-Warn "no release record to refresh: $($refresh.reason)"
+        Write-Warn 'signing did not create one; run release-build.ps1 for a recorded release'
+    }
 
     Write-Host "`nInstaller signed and verified." -ForegroundColor Green
     Write-Ok "sha256: $((Get-JarvisFileSha256 -Path $resolvedInstaller.Path))"
