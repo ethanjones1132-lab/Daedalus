@@ -5,6 +5,7 @@ pub mod jarvis;
 pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
+mod bun_startup_policy;
 pub mod supervisor;
 pub mod types;
 pub mod wsl;
@@ -1266,6 +1267,104 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
     Err("Bun server did not become healthy within 20s of restart".to_string())
 }
 
+/// Why a startup attempt failed. `TimedOut` is kept distinct so the caller can
+/// attach host-specific diagnostics (Windows ghost sockets) without the driver
+/// knowing about ports or processes.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupFailure {
+    Spawn(String),
+    TimedOut,
+}
+
+/// The owned-child startup sequence with every out-of-process effect injected.
+///
+/// Ordering is the point: when the native listener is closed and no configured
+/// endpoint can live outside it, an HTTP probe cannot succeed, so the owned
+/// child is spawned before any probe budget is spent. An open listener, a
+/// configured remote/WSL endpoint, or a WSL-launched Bun keeps the probe-first
+/// path and the open-listener second chance. The child is always verified
+/// healthy afterwards; spawning alone is not success.
+async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, M>(
+    remote_endpoint_requires_probe: bool,
+    probe_healthy: P,
+    delay: D,
+    listener_present: L,
+    spawn_owned_child: S,
+    elapsed_since_spawn: E,
+    mark_healthy: M,
+) -> Result<(), StartupFailure>
+where
+    P: Fn() -> PF,
+    PF: std::future::Future<Output = bool>,
+    D: Fn(u64) -> DF,
+    DF: std::future::Future<Output = ()>,
+    L: Fn() -> bool,
+    S: Fn() -> SF,
+    SF: std::future::Future<Output = Result<(), String>>,
+    E: Fn() -> u64,
+    M: Fn(),
+{
+    const SPAWN_HEALTH_BUDGET_MS: u64 = 20_000;
+
+    // Remote/WSL endpoints keep their probe-first order: a closed native
+    // listener says nothing about them, and a reachable remote endpoint must
+    // not even pay a native/WSL listener probe.
+    if remote_endpoint_requires_probe && probe_healthy().await {
+        mark_healthy();
+        return Ok(());
+    }
+
+    let listener_open = listener_present();
+    if !remote_endpoint_requires_probe && listener_open && probe_healthy().await {
+        mark_healthy();
+        return Ok(());
+    }
+
+    if listener_open {
+        // Second chance: TCP is up but the first HTTP probe failed. A single
+        // overloaded event-loop tick can miss a 2s budget; killing a live server
+        // mid-turn is far worse than waiting one more second.
+        log::info!(
+            target: "jarvis::startup",
+            "Bun port :{BUN_SERVER_PORT} is open but /health missed the first probe; retrying once"
+        );
+        delay(750).await;
+        if probe_healthy().await {
+            mark_healthy();
+            return Ok(());
+        }
+        log::warn!(
+            target: "jarvis::startup",
+            "Bun port open but /health still failing — replacing the tracked child"
+        );
+    } else if !remote_endpoint_requires_probe {
+        // Closed native listener and nothing to reach outside it: the probe is
+        // a guaranteed miss, so go straight to the owned-child start.
+        log::info!(
+            target: "jarvis::startup",
+            "Bun port :{BUN_SERVER_PORT} is closed with no remote/WSL endpoint configured; \
+             spawning the owned child without a pre-spawn HTTP probe"
+        );
+    }
+
+    // Replace the tracked child once. Port listeners without an owned Child
+    // handle are never terminated by startup recovery.
+    spawn_owned_child()
+        .await
+        .map_err(StartupFailure::Spawn)?;
+    log::info!(target: "jarvis::startup", "Bun child spawn returned");
+
+    // Wait (off the main thread) for the freshly spawned server to come up.
+    while elapsed_since_spawn() < SPAWN_HEALTH_BUDGET_MS {
+        if probe_healthy().await {
+            mark_healthy();
+            return Ok(());
+        }
+        delay(500).await;
+    }
+    Err(StartupFailure::TimedOut)
+}
+
 pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     use std::sync::atomic::{AtomicI64, Ordering};
     // Last time the server was confirmed healthy (epoch ms). A short TTL lets the
@@ -1291,60 +1390,67 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
         return Ok(());
     }
 
-    // Already reachable? (2s timeout tolerates WSL2 localhost-forward latency.)
-    if probe_jarvis_healthy().await {
-        LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-        return Ok(());
-    }
+    // A closed native listener only proves the server absent when every
+    // candidate endpoint is that listener. A configured remote endpoint, a
+    // cached WSL URL, or a WSL-launched Bun is still probed first.
+    let remote_endpoint_requires_probe = bun_startup_policy::pre_spawn_probe_required(
+        bun_uses_wsl(),
+        &crate::wsl::local_jarvis_api_candidates(),
+        BUN_SERVER_PORT,
+    );
 
-    // Second chance: TCP is up but the first HTTP probe failed. A single
-    // overloaded event-loop tick can miss a 2s budget; killing a live server
-    // mid-turn is far worse than waiting one more second. If the port is
-    // closed, fall through to spawn immediately.
-    if bun_server_is_listening() {
-        log::info!(
-            target: "jarvis::startup",
-            "Bun port :{BUN_SERVER_PORT} is open but /health missed the first probe; retrying once"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        if probe_jarvis_healthy().await {
+    let spawned_at = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let spawn_clock = Arc::clone(&spawned_at);
+
+    match drive_jarvis_server_start(
+        remote_endpoint_requires_probe,
+        probe_jarvis_healthy,
+        |millis: u64| tokio::time::sleep(std::time::Duration::from_millis(millis)),
+        bun_server_is_listening,
+        move || {
+            let spawn_clock = Arc::clone(&spawn_clock);
+            async move {
+                let server_entry = find_jarvis_server()
+                    .ok_or_else(|| "server-jarvis index.ts not found".to_string())?;
+                log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
+                spawn_blocking_on_current_runtime(move || {
+                    start_jarvis_server(&server_entry, true)
+                })
+                .await
+                .map_err(|e| format!("Task join error: {}", e))??;
+                *spawn_clock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
+                Ok::<(), String>(())
+            }
+        },
+        move || {
+            spawned_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .elapsed()
+                .as_millis() as u64
+        },
+        || {
             LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-            return Ok(());
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(StartupFailure::Spawn(error)) => Err(error),
+        Err(StartupFailure::TimedOut) => {
+            // Surface the ghost-socket case explicitly — a generic timeout leaves the
+            // operator hunting EADDRINUSE in err logs with no recovery path.
+            let ghosts = ghost_pids_holding_port(BUN_SERVER_PORT);
+            if !ghosts.is_empty() {
+                let diagnostic = bun_port_ghost_diagnostic(BUN_SERVER_PORT, &ghosts);
+                log::error!(target: "jarvis::startup", "{diagnostic}");
+                return Err(diagnostic);
+            }
+            Err("Bun server did not become healthy within timeout".to_string())
         }
-        log::warn!(
-            target: "jarvis::startup",
-            "Bun port open but /health still failing — replacing the tracked child"
-        );
     }
-
-    // Not reachable — replace the tracked child once. Port listeners without
-    // an owned Child handle are never terminated by startup recovery.
-    log::info!(target: "jarvis::startup", "Bun health probe failed; locating server entry");
-    let server_entry = find_jarvis_server().ok_or("server-jarvis index.ts not found")?;
-    log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
-    spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
-        .await
-        .map_err(|e| format!("Task join error: {}", e))??;
-    log::info!(target: "jarvis::startup", "Bun child spawn returned");
-
-    // Wait (off the main thread) for the freshly spawned server to come up.
-    let start = std::time::Instant::now();
-    while start.elapsed() < std::time::Duration::from_secs(20) {
-        if probe_jarvis_healthy().await {
-            LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    // Surface the ghost-socket case explicitly — a generic timeout leaves the
-    // operator hunting EADDRINUSE in err logs with no recovery path.
-    let ghosts = ghost_pids_holding_port(BUN_SERVER_PORT);
-    if !ghosts.is_empty() {
-        let diagnostic = bun_port_ghost_diagnostic(BUN_SERVER_PORT, &ghosts);
-        log::error!(target: "jarvis::startup", "{diagnostic}");
-        return Err(diagnostic);
-    }
-    Err("Bun server did not become healthy within timeout".to_string())
 }
 
 pub fn is_port_listening(port: u16) -> bool {
@@ -2121,5 +2227,235 @@ mod startup_thread_tests {
         assert!(should_hide_jarvis_server_console(true, true));
         assert!(should_hide_jarvis_server_console(true, false));
         assert!(!should_hide_jarvis_server_console(false, true));
+    }
+}
+
+/// Behavioral regressions for the ordered startup gate. Every effect (probe,
+/// listener check, spawn, delay, clock) is injected, so the tests pin ordering
+/// without ports, sleeps, WSL state or real child processes.
+#[cfg(test)]
+mod bun_startup_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    #[derive(Clone, Default)]
+    struct Effects {
+        trace: Rc<RefCell<Vec<String>>>,
+        probe_script: Rc<RefCell<VecDeque<bool>>>,
+        elapsed_script: Rc<RefCell<VecDeque<u64>>>,
+        healthy: Rc<Cell<bool>>,
+    }
+
+    impl Effects {
+        fn note(&self, event: &str) {
+            self.trace.borrow_mut().push(event.to_string());
+        }
+
+        fn set_healthy(&self, healthy: bool) {
+            self.healthy.set(healthy);
+        }
+
+        fn push_probe(&self, healthy: bool) {
+            self.probe_script.borrow_mut().push_back(healthy);
+        }
+
+        fn push_elapsed(&self, millis: u64) {
+            self.elapsed_script.borrow_mut().push_back(millis);
+        }
+
+        fn probe(&self) -> impl std::future::Future<Output = bool> + 'static {
+            let effects = self.clone();
+            async move {
+                effects.note("probe");
+                match effects.probe_script.borrow_mut().pop_front() {
+                    Some(scripted) => scripted,
+                    None => effects.healthy.get(),
+                }
+            }
+        }
+
+        fn delay(&self, millis: u64) -> impl std::future::Future<Output = ()> + 'static {
+            let effects = self.clone();
+            async move {
+                effects.note(&format!("delay:{millis}"));
+            }
+        }
+
+        fn elapsed_ms(&self) -> u64 {
+            // Default past the budget so a scripted failure cannot loop forever.
+            self.elapsed_script
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(20_001)
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.trace.borrow().clone()
+        }
+    }
+
+    async fn run_driver(
+        effects: &Effects,
+        remote_endpoint_requires_probe: bool,
+        listener_open: bool,
+        spawn_succeeds: bool,
+    ) -> Result<(), StartupFailure> {
+        drive_jarvis_server_start(
+            remote_endpoint_requires_probe,
+            {
+                let effects = effects.clone();
+                move || effects.probe()
+            },
+            {
+                let effects = effects.clone();
+                move |millis: u64| effects.delay(millis)
+            },
+            {
+                let effects = effects.clone();
+                move || {
+                    effects.note("listen");
+                    listener_open
+                }
+            },
+            {
+                let effects = effects.clone();
+                move || {
+                    let effects = effects.clone();
+                    async move {
+                        effects.note("spawn");
+                        if spawn_succeeds {
+                            effects.set_healthy(true);
+                            Ok(())
+                        } else {
+                            Err("spawn failed".to_string())
+                        }
+                    }
+                }
+            },
+            {
+                let effects = effects.clone();
+                move || effects.elapsed_ms()
+            },
+            {
+                let effects = effects.clone();
+                move || effects.note("healthy")
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn closed_native_listener_spawns_before_any_pre_spawn_http_probe() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+        let outcome = run_driver(&effects, false, false, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "spawn", "probe", "healthy"],
+            "a closed local listener must reach the owned-child spawn before any HTTP probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_open_listener_is_reused_without_spawning() {
+        let effects = Effects::default();
+        effects.set_healthy(true);
+        let outcome = run_driver(&effects, false, true, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(effects.snapshot(), vec!["listen", "probe", "healthy"]);
+    }
+
+    #[tokio::test]
+    async fn open_but_unhealthy_listener_gets_a_second_health_chance() {
+        let effects = Effects::default();
+        effects.push_probe(false);
+        effects.push_probe(true);
+        let outcome = run_driver(&effects, false, true, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "probe", "delay:750", "probe", "healthy"],
+            "an open listener must not be replaced on a single missed probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_listener_that_stays_unhealthy_is_replaced_by_the_owned_child() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+        effects.push_probe(false);
+        effects.push_probe(false);
+        let outcome = run_driver(&effects, false, true, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec![
+                "listen", "probe", "delay:750", "probe", "spawn", "probe", "healthy"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_port_with_a_healthy_remote_endpoint_never_spawns() {
+        let effects = Effects::default();
+        effects.push_probe(true);
+        let outcome = run_driver(&effects, true, false, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["probe", "healthy"],
+            "a reachable configured endpoint must be trusted before any local listener check or spawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_port_with_an_unreachable_remote_endpoint_still_probes_then_spawns() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+        effects.push_probe(false);
+        let outcome = run_driver(&effects, true, false, true).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["probe", "listen", "spawn", "probe", "healthy"],
+            "remote/WSL endpoints are not assumed absent from a closed local port"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawned_child_must_still_become_healthy() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+        effects.push_elapsed(20_001);
+        effects.push_probe(false);
+        let outcome = run_driver(&effects, false, false, true).await;
+
+        assert_eq!(outcome, Err(StartupFailure::TimedOut));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "spawn", "probe", "delay:500"],
+            "a successful spawn is not success until health is confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_child_spawn_failure_is_reported() {
+        let effects = Effects::default();
+        let outcome = run_driver(&effects, false, false, false).await;
+
+        assert_eq!(
+            outcome,
+            Err(StartupFailure::Spawn("spawn failed".to_string()))
+        );
+        assert_eq!(effects.snapshot(), vec!["listen", "spawn"]);
     }
 }
