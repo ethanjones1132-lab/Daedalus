@@ -1524,6 +1524,61 @@ where
         .map_err(|error| format!("blocking boot task join error: {error}"))
 }
 
+/// Start the active backend's own local dependency.
+///
+/// Only the configured backend's service is started: an OpenRouter or Claude CLI
+/// session must not spawn a local model server it will never use.
+async fn start_backend_dependency(cfg: &crate::jarvis::types::JarvisConfig) {
+    match &cfg.active_backend {
+        crate::jarvis::types::JarvisBackend::Ollama => {
+            crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
+        }
+        crate::jarvis::types::JarvisBackend::LlamaCpp => {
+            if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
+                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
+            }
+        }
+        crate::jarvis::types::JarvisBackend::OpenRouter => {
+            if cfg.openrouter.api_key.trim().is_empty() {
+                eprintln!(
+                    "[Jarvis] OpenRouter is the active backend but no API key is set \
+                     — chats will fail until a key is configured in Control."
+                );
+            }
+            println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
+        }
+        crate::jarvis::types::JarvisBackend::ClaudeCli => {
+            println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
+        }
+    }
+}
+
+/// Boot the Bun server and the backend dependency in the order the desktop
+/// needs them (DS-01).
+///
+/// Bun is the UI's only data source and is required by every backend, while no
+/// Bun path needs the inference backend. `join!` with `biased;` polls the Bun
+/// future first, so its first poll reaches the owned-child startup path
+/// (`ensure_jarvis_server_started` → resolve entry → `spawn_blocking`) before
+/// the backend dependency is polled at all; the two then converge
+/// concurrently. Polling first *initiates* startup, it does not prove the child
+/// exists yet: `spawn_blocking` hands the real spawn to a blocking thread and
+/// returns `Pending` before that thread has necessarily spawned anything, and
+/// the readiness gate still has to observe `/health`. The point is that the
+/// backend's own local startup can no longer queue in front of that
+/// initiation. A failed Bun start is reported back to the caller; the backend
+/// dependency is best-effort and never fails boot.
+async fn start_bun_and_backend<U, B>(start_bun: U, start_backend: B) -> Result<(), String>
+where
+    U: std::future::Future<Output = Result<(), String>>,
+    B: std::future::Future<Output = ()>,
+{
+    // `biased;` makes the polling order deterministic and Bun-first; unbiased
+    // `join!` rotates which branch is polled first on every wake.
+    let (bun_result, ()) = tokio::join!(biased; start_bun, start_backend);
+    bun_result
+}
+
 async fn bootstrap_services(handle: tauri::AppHandle) {
     log::info!(target: "jarvis::startup", "bootstrap thread entered");
     // Hydrate the in-memory config from SQLite — the single source of truth
@@ -1575,37 +1630,21 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
     let backend = cfg.active_backend.clone();
     println!("[Jarvis] Boot backend = {}", backend);
 
-    // Backend-specific local dependency: only start Ollama when it's active.
-    match backend {
-        crate::jarvis::types::JarvisBackend::Ollama => {
-            crate::start_ollama_and_warm(cfg.ollama.model.clone()).await;
-        }
-        crate::jarvis::types::JarvisBackend::LlamaCpp => {
-            if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
-                eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
-            }
-        }
-        crate::jarvis::types::JarvisBackend::OpenRouter => {
-            if cfg.openrouter.api_key.trim().is_empty() {
-                eprintln!(
-                    "[Jarvis] OpenRouter is the active backend but no API key is set \
-                     — chats will fail until a key is configured in Control."
-                );
-            }
-            println!("[Jarvis] OpenRouter backend — skipping local Ollama startup.");
-        }
-        crate::jarvis::types::JarvisBackend::ClaudeCli => {
-            println!("[Jarvis] Claude CLI backend — skipping local Ollama startup.");
-        }
-    }
+    // Backend-specific local dependency, started together with Bun below: only
+    // the active backend's service is brought up.
+    let backend_dependency = start_backend_dependency(&cfg);
 
-    // Bun is required by every backend and must become healthy before optional
-    // Claude-proxy discovery touches WSL. A cold/misconfigured WSL install must
-    // not prevent the desktop's core HTTP runtime from starting.
-    if let Err(e) = crate::ensure_jarvis_server_started().await {
-        log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}");
-    } else {
-        log::info!(target: "jarvis::startup", "Bun server healthy at boot");
+    // DS-01: Bun is required by every backend and is the UI's only data source,
+    // so its cold startup must not queue behind the backend's local dependency.
+    // Bun is polled first and the two converge concurrently; a cold/misconfigured
+    // WSL install must still not prevent the desktop's core HTTP runtime from
+    // starting, and the Claude-proxy discovery below still waits for Bun to be
+    // settled.
+    match start_bun_and_backend(crate::ensure_jarvis_server_started(), backend_dependency).await {
+        Ok(()) => log::info!(target: "jarvis::startup", "Bun server healthy at boot"),
+        Err(e) => {
+            log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}")
+        }
     }
 
     // Proxy auth requires the compatibility listener. Subscription auth uses
@@ -2457,5 +2496,235 @@ mod bun_startup_tests {
             Err(StartupFailure::Spawn("spawn failed".to_string()))
         );
         assert_eq!(effects.snapshot(), vec!["listen", "spawn"]);
+    }
+}
+
+/// DS-01 boot-order regressions: Bun (the UI's only data source) must begin its
+/// cold startup before the backend's local dependency is polled, and both must
+/// converge concurrently. The ordering test runs the production startup gate
+/// (`drive_jarvis_server_start`) with every effect injected, so it fails if the
+/// boot order reverts to backend-first *or* to awaiting Bun to completion
+/// before the backend starts. The wiring test fails if `bootstrap_services`
+/// stops using the tested scheduler — the ordering test alone only exercises
+/// the helper.
+#[cfg(test)]
+mod bun_boot_order_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct BootTrace {
+        events: RefCell<Vec<&'static str>>,
+        probe_calls: Cell<u32>,
+    }
+
+    impl BootTrace {
+        fn note(&self, event: &'static str) {
+            self.events.borrow_mut().push(event);
+        }
+
+        fn snapshot(&self) -> Vec<&'static str> {
+            self.events.borrow().clone()
+        }
+
+        /// First health probe misses so the readiness gate awaits; the retry
+        /// succeeds. That keeps the gate pending long enough for the backend
+        /// dependency to be polled, instead of completing in one poll.
+        fn probe(&self) -> bool {
+            self.note("bun:probe");
+            let calls = self.probe_calls.get() + 1;
+            self.probe_calls.set(calls);
+            calls > 1
+        }
+    }
+
+    fn position(events: &[&'static str], event: &str) -> usize {
+        events
+            .iter()
+            .position(|candidate| *candidate == event)
+            .unwrap_or_else(|| panic!("{event} missing from boot trace {events:?}"))
+    }
+
+    /// The Bun side of the trace, driven through the production startup gate.
+    ///
+    /// `bun:spawn` is noted when the injected spawn future is first polled,
+    /// i.e. when the owned-child startup is *initiated*. In production that
+    /// point starts a `spawn_blocking` hop, and the blocking thread may not
+    /// have spawned the child yet when the backend dependency is polled.
+    async fn drive_traced_bun_start(
+        trace: Rc<BootTrace>,
+        spawn_succeeds: bool,
+    ) -> Result<(), String> {
+        drive_jarvis_server_start(
+            // Local-only candidates: the closed native listener proves the cold
+            // path, so startup must not wait on a pre-spawn HTTP probe.
+            false,
+            {
+                let trace = Rc::clone(&trace);
+                move || {
+                    let trace = Rc::clone(&trace);
+                    async move { trace.probe() }
+                }
+            },
+            {
+                let trace = Rc::clone(&trace);
+                move |_millis: u64| {
+                    let trace = Rc::clone(&trace);
+                    async move {
+                        // Yields the task, which is where the backend gets its
+                        // first poll.
+                        trace.note("bun:wait");
+                        tokio::task::yield_now().await;
+                    }
+                }
+            },
+            || false,
+            {
+                let trace = Rc::clone(&trace);
+                move || {
+                    let trace = Rc::clone(&trace);
+                    async move {
+                        trace.note("bun:spawn");
+                        if spawn_succeeds {
+                            Ok::<(), String>(())
+                        } else {
+                            Err("spawn failed".to_string())
+                        }
+                    }
+                }
+            },
+            || 0u64,
+            {
+                let trace = Rc::clone(&trace);
+                move || trace.note("bun:healthy")
+            },
+        )
+        .await
+        .map_err(|failure| match failure {
+            StartupFailure::Spawn(error) => error,
+            StartupFailure::TimedOut => "Bun startup timed out".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn bun_starts_before_the_backend_dependency_and_runs_concurrently() {
+        let trace = Rc::new(BootTrace::default());
+
+        let bun = drive_traced_bun_start(Rc::clone(&trace), true);
+        let backend = {
+            let trace = Rc::clone(&trace);
+            async move {
+                trace.note("backend:started");
+            }
+        };
+
+        let outcome = start_bun_and_backend(bun, backend).await;
+        assert_eq!(outcome, Ok(()));
+
+        let events = trace.snapshot();
+        assert!(
+            position(&events, "bun:spawn") < position(&events, "backend:started"),
+            "the Bun startup must be initiated before the backend dependency \
+             begins: {events:?}"
+        );
+        assert!(
+            position(&events, "backend:started") < position(&events, "bun:healthy"),
+            "the backend dependency must run while Bun is still becoming healthy, \
+             not after it: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bun_start_failure_is_returned_without_cancelling_the_backend_dependency() {
+        let trace = Rc::new(BootTrace::default());
+
+        let bun = drive_traced_bun_start(Rc::clone(&trace), false);
+        let backend = {
+            let trace = Rc::clone(&trace);
+            async move {
+                trace.note("backend:started");
+            }
+        };
+
+        let outcome = start_bun_and_backend(bun, backend).await;
+        assert_eq!(outcome, Err("spawn failed".to_string()));
+        assert_eq!(
+            trace.snapshot(),
+            vec!["bun:spawn", "backend:started"],
+            "a failed Bun spawn must be reported, and the best-effort backend \
+             dependency must still be polled"
+        );
+    }
+
+    /// `bootstrap_services` is the production wiring: it must hand both real
+    /// boot steps to `start_bun_and_backend`, with the Bun future first. The
+    /// body is read from this file because that function performs the real boot
+    /// (SQLite, migrations, child processes, HTTP probes) and cannot be invoked
+    /// from a unit test. This fails if the call is replaced by sequential
+    /// awaits, by backend-first ordering, or by an inline backend match.
+    #[test]
+    fn bootstrap_services_boots_through_the_tested_scheduler() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("async fn bootstrap_services(")
+            .expect("bootstrap_services must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("\nfn spawn_bootstrap_services(")
+            .map(|offset| start + offset)
+            .expect("spawn_bootstrap_services must follow bootstrap_services in lib.rs");
+        let body = &SOURCE[start..end];
+
+        assert_eq!(
+            body.matches("start_bun_and_backend(").count(),
+            1,
+            "bootstrap_services must call the tested scheduler exactly once:\n{body}"
+        );
+        let scheduler = body
+            .find("start_bun_and_backend(")
+            .expect("scheduler call present");
+        assert!(
+            body[..scheduler].contains("let backend_dependency = start_backend_dependency(&cfg);"),
+            "the backend future must be built before the scheduler runs:\n{body}"
+        );
+        // The first `start_backend_dependency(&cfg)` is that let binding, which
+        // sits above the call. Argument order has to be read from the call
+        // itself, or the let binding makes Bun look second.
+        let call_statement = &body[scheduler..];
+        let statement_end = call_statement
+            .find(';')
+            .expect("the scheduler call must be part of a statement");
+        let call = &call_statement[..statement_end];
+        let bun = call
+            .find("ensure_jarvis_server_started()")
+            .expect("the real Bun starter must be handed to the scheduler");
+        let backend_arg = call
+            .find("backend_dependency")
+            .expect("the backend future must be the scheduler's second argument");
+        assert!(
+            bun < backend_arg,
+            "the Bun future must be the scheduler's first argument so `biased;` \
+             polls it first:\n{call}"
+        );
+        // A dropped `start_bun_and_backend(..)` would satisfy the checks above
+        // while never booting or polling either step.
+        assert!(
+            call.contains(".await"),
+            "the scheduler must be awaited, not merely constructed:\n{call}"
+        );
+        assert!(
+            !body.contains("ensure_jarvis_server_started().await"),
+            "bootstrap_services must not await the Bun starter outside the \
+             scheduler:\n{body}"
+        );
+        assert!(
+            !body.contains("start_backend_dependency(&cfg).await"),
+            "bootstrap_services must not await the backend dependency on its own:\n{body}"
+        );
+        assert!(
+            !body.contains("JarvisBackend::"),
+            "the backend dependency must start through start_backend_dependency, \
+             not an inline match in bootstrap_services:\n{body}"
+        );
     }
 }
