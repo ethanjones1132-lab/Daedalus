@@ -280,8 +280,7 @@ exit $(if ($verdict -eq 'RESPONSIVE') { 0 } else { 1 })
         if ($process) { Stop-JarvisOwnedProcesses -Process $process }
     } finally {
         if ($installOwned -and -not $KeepInstall) {
-            Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
-            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-JarvisReleaseScratchInstall -InstallRoot $InstallRoot
         }
     }
 }

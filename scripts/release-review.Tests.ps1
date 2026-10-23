@@ -383,3 +383,84 @@ Describe 'release publication source selection' {
         { Resolve-JarvisReleasePublication -Version '1.0.0' -BuildSha ('a' * 40) -RequestedTag 'v2.0.0' } | Should Throw 'release_tag_version_mismatch'
     }
 }
+
+Describe 'cold-start scratch cleanup when uninstall throws' {
+    It 'removes the scratch install and keeps the probe exit code when uninstall throws' {
+        $root = Join-Path $TestDrive 'probe-throwing-uninstall'
+        $runner = Join-Path $TestDrive 'probe-throwing-uninstall-runner.ps1'
+        @"
+function global:Get-NetTCPConnection { }
+function global:Start-Process {
+    param(`$FilePath, `$ArgumentList, [switch]`$PassThru, `$WindowStyle, `$RedirectStandardOutput, `$RedirectStandardError, `$WorkingDirectory)
+    `$installRoot = `$null
+    if (`$ArgumentList) {
+        foreach (`$a in @(`$ArgumentList)) {
+            if (`$a -is [string] -and `$a -like '/D=*') { `$installRoot = `$a.Substring(3) }
+        }
+    }
+    if (`$installRoot) {
+        if (-not (Test-Path -LiteralPath `$installRoot)) { New-Item -ItemType Directory -Force -Path `$installRoot | Out-Null }
+        'x' | Set-Content -LiteralPath (Join-Path `$installRoot 'uninstall.exe')
+    }
+    if (`$FilePath -like '*uninstall.exe') {
+        return [pscustomobject]@{ HasExited = `$false; ExitCode = `$null; Id = 999; StartTime = [datetime]::Now }
+    }
+    return [pscustomobject]@{ HasExited = `$true; ExitCode = 0; Id = 123; StartTime = [datetime]::Now }
+}
+function global:Wait-Process { param(`$Timeout, [switch]`$ErrorAction) }
+& '$PSScriptRoot\probe-cold-start.ps1' -InstallerPath 'fake.exe' -InstallRoot '$root'
+exit `$LASTEXITCODE
+"@ | Set-Content -LiteralPath $runner
+        $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $runner 2>&1 | Out-String
+        $LASTEXITCODE | Should Be 1
+        $output | Should Match 'installed app not found'
+        $output | Should Match 'scratch uninstall failed'
+        (Test-Path -LiteralPath $root) | Should Be $false
+    }
+}
+
+Describe 'smoke scratch cleanup when uninstall throws' {
+    It 'removes the scratch install and keeps the smoke exit code when uninstall throws' {
+        $root = Join-Path $TestDrive 'smoke-throwing-uninstall'
+        $installer = Join-Path $TestDrive 'throwing-uninstall-installer.exe'
+        'dummy installer bytes' | Set-Content -LiteralPath $installer
+        $manifestPath = Join-Path $TestDrive 'throwing-uninstall-record.json'
+        @{
+            schema = 'jarvis.release/1'; version = '1.0.0'; git_sha = ('a' * 40)
+            files = @(
+                @{ role = 'installer'; path = $installer; sha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash },
+                @{ role = 'app_binary'; path = 'app.exe'; sha256 = ('b' * 64) },
+                @{ role = 'server_bundle'; path = 'index.js'; sha256 = ('c' * 64) }
+            )
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath
+        $runner = Join-Path $TestDrive 'smoke-throwing-uninstall-runner.ps1'
+        @"
+function global:Get-NetTCPConnection { }
+function global:Start-Process {
+    param(`$FilePath, `$ArgumentList, [switch]`$PassThru, `$WindowStyle, `$RedirectStandardOutput, `$RedirectStandardError, `$WorkingDirectory)
+    `$installRoot = `$null
+    if (`$ArgumentList) {
+        foreach (`$a in @(`$ArgumentList)) {
+            if (`$a -is [string] -and `$a -like '/D=*') { `$installRoot = `$a.Substring(3) }
+        }
+    }
+    if (`$installRoot) {
+        if (-not (Test-Path -LiteralPath `$installRoot)) { New-Item -ItemType Directory -Force -Path `$installRoot | Out-Null }
+        'x' | Set-Content -LiteralPath (Join-Path `$installRoot 'uninstall.exe')
+    }
+    if (`$FilePath -like '*uninstall.exe') {
+        return [pscustomobject]@{ HasExited = `$false; ExitCode = `$null; Id = 999; StartTime = [datetime]::Now }
+    }
+    return [pscustomobject]@{ HasExited = `$true; ExitCode = 0; Id = 123; StartTime = [datetime]::Now }
+}
+function global:Wait-Process { param(`$Timeout, [switch]`$ErrorAction) }
+& '$PSScriptRoot\release-smoke.ps1' -ManifestPath '$manifestPath' -InstallRoot '$root' -SkipLaunch -SkipChat
+exit `$LASTEXITCODE
+"@ | Set-Content -LiteralPath $runner
+        $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $runner 2>&1 | Out-String
+        $LASTEXITCODE | Should Be 1
+        $output | Should Match 'does not contain the binary'
+        $output | Should Match 'scratch uninstall failed'
+        (Test-Path -LiteralPath $root) | Should Be $false
+    }
+}

@@ -342,8 +342,7 @@ if (-not $SkipLaunch) {
         if ($serverProcess) { Stop-JarvisOwnedProcesses -Process $serverProcess }
     } finally {
         if ($installOwned) {
-            Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
-            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-JarvisReleaseScratchInstall -InstallRoot $InstallRoot
         }
     }
 }
