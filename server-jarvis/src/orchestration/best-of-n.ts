@@ -97,3 +97,35 @@ export function bestOfNForStage(cfg: BestOfNConfig | undefined, stage: string): 
   if (!cfg.stages.includes(stage)) return 1;
   return Math.max(1, cfg.n);
 }
+
+export interface SamplingSummary {
+  samples: number;
+  emptyTurns: number;
+  fatalCandidates: number;
+  /** Score of the first sample — what a single call would have produced. */
+  firstScore: number;
+  selectedScore: number;
+  /** True when sampling produced a better call than the first attempt. */
+  improvedOverFirst: boolean;
+}
+
+/**
+ * Condense a sampling result for logging. `improvedOverFirst` is the number
+ * that justifies the token spend — if it is rarely true, turn sampling off
+ * for that stage.
+ */
+export function summarizeSampling(result: SampleBestToolCallResult): SamplingSummary {
+  const first = result.candidates[0];
+  const firstScore = first && !first.score.fatal ? first.score.score : 0;
+  const selected = result.candidates
+    .filter((c) => !c.score.fatal)
+    .reduce<number>((best, c) => Math.max(best, c.score.score), 0);
+  return {
+    samples: result.candidates.length + result.emptyTurns,
+    emptyTurns: result.emptyTurns,
+    fatalCandidates: result.candidates.filter((c) => c.score.fatal).length,
+    firstScore,
+    selectedScore: selected,
+    improvedOverFirst: selected > firstScore,
+  };
+}

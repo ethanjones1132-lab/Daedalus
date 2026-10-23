@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { loadConfig } from "../config";
-import { bestOfNForStage, sampleBestToolCall } from "./best-of-n";
+import { bestOfNForStage, sampleBestToolCall, summarizeSampling } from "./best-of-n";
 import type { ToolDefinition } from "../tool-types";
 
 const READ_FILE: ToolDefinition = {
@@ -121,5 +121,29 @@ describe("best-of-n config gate", () => {
     const c = { enabled: true, n: 4, stages: ["executor"] };
     expect(bestOfNForStage(c, "executor")).toBe(4);
     expect(bestOfNForStage(c, "planner")).toBe(1);
+  });
+});
+
+describe("sampling telemetry", () => {
+  test("reports the gain the extra samples bought", async () => {
+    const { fn } = stubModel([
+      { path: "path/to/your/file.ts" },
+      { path: "src/index.ts" },
+    ]);
+    const result = await sampleBestToolCall({
+      callModel: fn, messages: [], tools: [READ_FILE], n: 2, seedBase: 1,
+    });
+    const summary = summarizeSampling(result);
+    expect(summary.samples).toBe(2);
+    expect(summary.selectedScore).toBeGreaterThan(summary.firstScore);
+    expect(summary.improvedOverFirst).toBe(true);
+  });
+
+  test("reports no gain when the first sample already won", async () => {
+    const { fn } = stubModel([{ path: "src/a.ts" }]);
+    const result = await sampleBestToolCall({
+      callModel: fn, messages: [], tools: [READ_FILE], n: 3, seedBase: 1,
+    });
+    expect(summarizeSampling(result).improvedOverFirst).toBe(false);
   });
 });
