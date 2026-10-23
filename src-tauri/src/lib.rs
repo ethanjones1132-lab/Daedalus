@@ -20,7 +20,7 @@ pub use jarvis::types as jarvis_types;
 use crate::jarvis::hermes::commands::{
     hermes_interrupt, hermes_invoke, hermes_restart, hermes_shutdown, hermes_spawn, hermes_status,
 };
-use crate::jarvis::hermes::state::HermesAppState;
+use crate::jarvis::hermes::state::{HermesAppState, InterpreterResolver};
 use jarvis::types::JarvisState;
 use std::sync::Arc;
 use tauri::Manager;
@@ -79,9 +79,9 @@ fn find_ollama_binary() -> Option<String> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PythonInvocation {
-    program: std::path::PathBuf,
-    prefix_args: Vec<String>,
+pub(crate) struct PythonInvocation {
+    pub(crate) program: std::path::PathBuf,
+    pub(crate) prefix_args: Vec<String>,
 }
 
 fn find_jarvis_python_with(
@@ -122,26 +122,84 @@ fn find_jarvis_python_with(
     candidates.into_iter().find(|candidate| works(candidate))
 }
 
+/// Upper bound for a single interpreter discovery probe. A hung `py` launcher
+/// must not hold the first Hermes start open indefinitely.
+const PYTHON_DISCOVERY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(test)]
+static PYTHON_DISCOVERY_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn note_python_discovery_probe() {
+    #[cfg(test)]
+    PYTHON_DISCOVERY_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Run one interpreter probe with a deadline. On timeout only the child created
+/// here is killed and reaped; callers never touch a process they do not own.
+/// Returning `false` lets discovery continue with the next candidate.
+fn probe_python_command(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> bool {
+    use std::time::Instant;
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 fn find_jarvis_python() -> Option<PythonInvocation> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(std::path::PathBuf::from);
     find_jarvis_python_with(home.as_deref(), |candidate| {
+        note_python_discovery_probe();
         let mut command = std::process::Command::new(&candidate.program);
         command
             .args(&candidate.prefix_args)
             .arg("--version")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         crate::wsl::hide_windows_console(&mut command);
-        command
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        probe_python_command(&mut command, PYTHON_DISCOVERY_PROBE_TIMEOUT)
     })
 }
 
-fn apply_python_invocation_to_hermes(
+/// Deferred resolver used by the managed Hermes state. Discovery happens on the
+/// first Hermes process start, never before the window exists.
+fn resolve_hermes_python() -> Result<PythonInvocation, String> {
+    find_jarvis_python().ok_or_else(|| {
+        format!(
+            "Python interpreter not found for Hermes: none of the Hermes venv, `py -3`, `python`, \
+             or `python3` answered `--version` within {}ms. Install Python 3 or repair the Hermes venv.",
+            PYTHON_DISCOVERY_PROBE_TIMEOUT.as_millis()
+        )
+    })
+}
+
+pub(crate) fn apply_python_invocation_to_hermes(
     config: &mut crate::jarvis::hermes::process::HermesConfig,
     invocation: PythonInvocation,
 ) {
@@ -149,12 +207,11 @@ fn apply_python_invocation_to_hermes(
     config.python_prefix_args = invocation.prefix_args;
 }
 
+/// Pre-window Hermes configuration. Interpreter discovery is deliberately not
+/// part of this: it is resolved lazily by `HermesAppState` on first spawn.
 fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
     use std::path::PathBuf;
     let mut config = crate::jarvis::hermes::process::HermesConfig::default();
-    if let Some(py) = find_jarvis_python() {
-        apply_python_invocation_to_hermes(&mut config, py);
-    }
     if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         config.hermes_home = PathBuf::from(home)
             .join(".openclaw")
@@ -162,6 +219,13 @@ fn build_hermes_config() -> crate::jarvis::hermes::process::HermesConfig {
             .join("hermes");
     }
     config
+}
+
+/// Production wiring for the managed Hermes state. Constructing it must not
+/// spawn interpreter probes (DD-034, DS-03).
+fn build_hermes_app_state() -> HermesAppState {
+    let resolver: InterpreterResolver = Arc::new(resolve_hermes_python);
+    HermesAppState::with_lazy_interpreter(build_hermes_config(), resolver)
 }
 
 fn spawn_ollama() -> Option<std::process::Child> {
@@ -1746,7 +1810,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(jarvis_state)
         .manage(db)
-        .manage(HermesAppState::with_config(build_hermes_config()))
+        .manage(build_hermes_app_state())
         .setup(|app| {
             let handle = app.handle().clone();
             if let Err(e) = spawn_bootstrap_services(handle) {
@@ -2023,6 +2087,100 @@ mod startup_thread_tests {
 
         assert_eq!(config.python, PathBuf::from("py"));
         assert_eq!(config.python_prefix_args, vec!["-3"]);
+    }
+
+    fn hanging_command() -> std::process::Command {
+        let mut command = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "ping -n 6 -w 1000 127.0.0.1 >NUL"]);
+            command
+        } else {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", "sleep 5"]);
+            command
+        };
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[test]
+    fn hermes_config_construction_probes_no_python() {
+        let before = PYTHON_DISCOVERY_PROBES.load(std::sync::atomic::Ordering::SeqCst);
+        let config = build_hermes_config();
+        let after = PYTHON_DISCOVERY_PROBES.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            before, after,
+            "build_hermes_config must not run interpreter probes before the window exists"
+        );
+        assert_eq!(
+            config.python,
+            PathBuf::from("python3"),
+            "no interpreter may be claimed until one has actually been probed"
+        );
+    }
+
+    #[test]
+    fn production_hermes_state_wiring_defers_python_discovery() {
+        let before = PYTHON_DISCOVERY_PROBES.load(std::sync::atomic::Ordering::SeqCst);
+        let state = build_hermes_app_state();
+        let after = PYTHON_DISCOVERY_PROBES.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(
+            before, after,
+            "constructing the managed Hermes state must not probe for a Python interpreter"
+        );
+        assert!(
+            state.has_pending_interpreter(),
+            "production wiring must keep interpreter discovery deferred until the first Hermes start"
+        );
+        assert_eq!(
+            state.config.python,
+            PathBuf::from("python3"),
+            "the managed state must not arrive with a pre-resolved interpreter"
+        );
+    }
+
+    #[test]
+    fn python_discovery_falls_back_after_a_timed_out_candidate() {
+        let home = test_dir("python-timeout-fallback");
+        let venv = home.join(".openclaw/jarvis/hermes/.venv/Scripts/python.exe");
+        touch(&venv);
+
+        let selected = find_jarvis_python_with(Some(&home), |candidate| {
+            if candidate.program == venv {
+                let mut command = hanging_command();
+                assert!(
+                    !probe_python_command(&mut command, std::time::Duration::from_millis(150)),
+                    "a probe that outlives its deadline must not count as working"
+                );
+                return false;
+            }
+            candidate.program == PathBuf::from("py")
+                && candidate.prefix_args == vec!["-3".to_string()]
+        })
+        .expect("discovery continues past a timed-out candidate");
+
+        assert_eq!(selected.program, PathBuf::from("py"));
+        assert_eq!(selected.prefix_args, vec!["-3"]);
+
+        std::fs::remove_dir_all(home).expect("remove test directory");
+    }
+
+    #[test]
+    fn python_probe_is_bounded_and_reaps_only_its_own_child() {
+        let mut command = hanging_command();
+        let started = std::time::Instant::now();
+        assert!(!probe_python_command(
+            &mut command,
+            std::time::Duration::from_millis(200)
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "a hung candidate must be stopped at its deadline, not waited out"
+        );
     }
 
     #[test]
