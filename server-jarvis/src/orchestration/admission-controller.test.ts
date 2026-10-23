@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { OrchestratorAgent } from "./agent-pool";
 import {
   OrchestrationAdmissionAbortedError,
+  OrchestrationAdmissionAgentInvalidError,
   OrchestrationAdmissionController,
   OrchestrationAdmissionDeadlineExceededError,
   type AdmissionTimeoutScheduler,
@@ -70,6 +74,18 @@ async function captureRejection(
     return error as Error;
   }
   throw new Error("expected promise to reject");
+}
+
+function agent(over: Partial<OrchestratorAgent> = {}): OrchestratorAgent {
+  return {
+    id: "agent-a",
+    provider: "openrouter",
+    model_id: "test/model",
+    capabilities: { code: 0.8, reasoning: 0.8, speed: 0.8, cost: 0.5, json_reliability: 0.9 },
+    default_for: [],
+    enabled: true,
+    ...over,
+  };
 }
 
 describe("OrchestrationAdmissionController", () => {
@@ -299,5 +315,80 @@ describe("OrchestrationAdmissionController", () => {
     expect(scheduler.pending).toBe(0);
     first.release();
     (await waiting).release();
+  });
+
+  test("refuses admission when an agent has error-level validation issues", async () => {
+    const controller = new OrchestrationAdmissionController({ interactive: 2, background: 1 });
+    const invalid = agent({
+      id: "agent-bad",
+      provider: "ollama",
+      system_prompt: "x".repeat(4001),
+    });
+
+    const error = (await captureRejection(
+      controller.acquire({ workClass: "interactive", agents: [agent(), invalid] }),
+      OrchestrationAdmissionAgentInvalidError,
+    )) as OrchestrationAdmissionAgentInvalidError;
+
+    expect(error.agentId).toBe("agent-bad");
+    expect(error.fields).toEqual(expect.arrayContaining(["provider", "system_prompt"]));
+    expect(error.message).toContain("agent-bad");
+    expect(error.message).toContain("provider");
+    expect(error.message).toContain("system_prompt");
+    expect(controller.snapshot()).toEqual({
+      active_interactive: 0,
+      active_background: 0,
+      queued_interactive: 0,
+      queued_background: 0,
+    });
+  });
+
+  test("unused invalid orchestration agents do not block ordinary turns", async () => {
+    const controller = new OrchestrationAdmissionController({ interactive: 1, background: 1 });
+    const invalid = agent({ provider: "ollama" });
+    const lease = await controller.acquire({
+      workClass: "interactive",
+      agents: [invalid],
+      validateAgents: false,
+    });
+    expect(controller.snapshot().active_interactive).toBe(1);
+    lease.release();
+    expect(controller.snapshot().active_interactive).toBe(0);
+    await captureRejection(
+      controller.acquire({ workClass: "interactive", agents: [invalid], validateAgents: true }),
+      OrchestrationAdmissionAgentInvalidError,
+    );
+  });
+
+  test("a warning-level validation issue does not block admission", async () => {
+    const controller = new OrchestrationAdmissionController({ interactive: 1, background: 1 });
+    const warned = agent({
+      id: "agent-warn",
+      default_for: ["coordinator"],
+      capabilities: { code: 0.8, reasoning: 0.8, speed: 0.8, cost: 0.5, json_reliability: 0.5 },
+    });
+
+    const lease = await controller.acquire({ workClass: "interactive", agents: [warned] });
+    expect(lease.work_class).toBe("interactive");
+    expect(controller.snapshot().active_interactive).toBe(1);
+    lease.release();
+    expect(controller.snapshot().active_interactive).toBe(0);
+  });
+});
+
+/**
+ * DD-015 acceptance: the controller only refuses an invalid agent if the
+ * production admit call actually hands it the pool. This source tripwire is
+ * the only way a unit test can observe that wiring; reverting the `agents:`
+ * argument in index.ts makes it fail.
+ */
+describe("DD-015 admission wiring", () => {
+  test("the stream admit call passes the configured agent pool to validation", () => {
+    const source = readFileSync(join(import.meta.dir, "..", "index.ts"), "utf8");
+    const callIndex = source.indexOf("orchestrationAdmission.acquire(");
+    expect(callIndex).toBeGreaterThan(-1);
+    const call = source.slice(callIndex, callIndex + 500);
+    expect(call).toContain("agents: cfg.orchestrator.agents");
+    expect(call).toContain('validateAgents: cfg.orchestrator.enabled && cfg.active_backend !== "claude_cli"');
   });
 });

@@ -1,3 +1,6 @@
+import type { OrchestratorAgent } from "./agent-pool";
+import { validateOrchestratorAgents, type AgentValidationIssue } from "./agent-validation";
+
 export type OrchestrationWorkClass = "interactive" | "background";
 
 export interface AdmissionLease {
@@ -29,6 +32,31 @@ export class OrchestrationAdmissionAbortedError extends Error {
   }
 }
 
+/**
+ * DD-015: an agent the run could route to has at least one error-level
+ * validation issue, so the run is refused instead of silently admitting it.
+ * Warning-level issues never produce this error.
+ */
+export class OrchestrationAdmissionAgentInvalidError extends Error {
+  readonly code = "agent_validation_failed";
+
+  constructor(
+    readonly agentId: string,
+    readonly issues: AgentValidationIssue[],
+  ) {
+    super(
+      `orchestration admission refused for agent "${agentId}": ` +
+        issues.map((issue) => `${issue.field}: ${issue.message}`).join("; "),
+    );
+    this.name = "OrchestrationAdmissionAgentInvalidError";
+  }
+
+  /** Failing field paths, deduplicated, in issue order. */
+  get fields(): string[] {
+    return [...new Set(this.issues.map((issue) => issue.field))];
+  }
+}
+
 interface Waiter {
   workClass: OrchestrationWorkClass;
   queuedAt: number;
@@ -47,6 +75,24 @@ const defaultScheduler: AdmissionTimeoutScheduler = {
   clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+/**
+ * First agent in the pool with error-level validation issues, grouped so the
+ * refusal names every failing field for that agent.
+ */
+function validateAgentPoolForAdmission(
+  agents: OrchestratorAgent[],
+): { agentId: string; issues: AgentValidationIssue[] } | undefined {
+  const byAgent = new Map<string, AgentValidationIssue[]>();
+  for (const issue of validateOrchestratorAgents(agents)) {
+    if (issue.level !== "error") continue;
+    const existing = byAgent.get(issue.agentId);
+    if (existing) existing.push(issue);
+    else byAgent.set(issue.agentId, [issue]);
+  }
+  const first = byAgent.entries().next().value as [string, AgentValidationIssue[]] | undefined;
+  return first ? { agentId: first[0], issues: first[1] } : undefined;
+}
+
 export class OrchestrationAdmissionController {
   private readonly active = { interactive: 0, background: 0 };
   private readonly queues: Record<OrchestrationWorkClass, Waiter[]> = {
@@ -64,6 +110,13 @@ export class OrchestrationAdmissionController {
     workClass: OrchestrationWorkClass;
     signal?: AbortSignal;
     deadlineAt?: number;
+    /**
+     * DD-015: the agent pool this run may route to. Any error-level validation
+     * issue refuses admission; warning-level issues do not block.
+     */
+    agents?: OrchestratorAgent[];
+    /** Capacity admission is shared by ordinary turns; validate only an active orchestration route. */
+    validateAgents?: boolean;
   }): Promise<AdmissionLease> {
     return new Promise<AdmissionLease>((resolve, reject) => {
       const queuedAt = this.now();
@@ -74,6 +127,13 @@ export class OrchestrationAdmissionController {
       if (input.deadlineAt !== undefined && input.deadlineAt <= queuedAt) {
         reject(new OrchestrationAdmissionDeadlineExceededError(input.deadlineAt));
         return;
+      }
+      if (input.agents && input.validateAgents !== false) {
+        const invalid = validateAgentPoolForAdmission(input.agents);
+        if (invalid) {
+          reject(new OrchestrationAdmissionAgentInvalidError(invalid.agentId, invalid.issues));
+          return;
+        }
       }
 
       const waiter: Waiter = {

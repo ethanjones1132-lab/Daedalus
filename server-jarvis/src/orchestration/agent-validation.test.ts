@@ -49,6 +49,18 @@ describe("validateOrchestratorAgent (T3.1)", () => {
     expect(issues.some((i) => i.message.includes("system_prompt"))).toBe(true);
   });
 
+  test("issues name the failing field", () => {
+    expect(validateOrchestratorAgent(base({ provider: "ollama" }))).toContainEqual(
+      expect.objectContaining({ level: "error", field: "provider" }),
+    );
+    expect(validateOrchestratorAgent(base({ default_for: ["wizard"] }))).toContainEqual(
+      expect.objectContaining({ level: "error", field: "default_for" }),
+    );
+    expect(validateOrchestratorAgent(base({ system_prompt: "x".repeat(4001) }))).toContainEqual(
+      expect.objectContaining({ level: "error", field: "system_prompt" }),
+    );
+  });
+
   test("detects duplicate ids across the pool", () => {
     const a = base({ id: "dup" });
     const b = base({ id: "dup", model_id: "other" });

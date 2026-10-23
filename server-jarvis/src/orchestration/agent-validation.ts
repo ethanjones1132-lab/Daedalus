@@ -10,6 +10,8 @@ const CAP_KEYS = ["code", "reasoning", "speed", "cost", "json_reliability"] as c
 export interface AgentValidationIssue {
   agentId: string;
   level: "error" | "warn";
+  /** Field path that failed, e.g. "provider" or "capabilities.code". */
+  field: string;
   message: string;
 }
 
@@ -21,16 +23,17 @@ export function validateOrchestratorAgent(
   const id = agent.id || "<missing-id>";
 
   if (!agent.id?.trim()) {
-    issues.push({ agentId: id, level: "error", message: "id is required" });
+    issues.push({ agentId: id, level: "error", field: "id", message: "id is required" });
   }
   if (peers.some((p) => p.id === agent.id && p !== agent)) {
-    issues.push({ agentId: id, level: "error", message: `duplicate id "${agent.id}"` });
+    issues.push({ agentId: id, level: "error", field: "id", message: `duplicate id "${agent.id}"` });
   }
 
   if (!ROUTABLE_PROVIDERS.has(agent.provider)) {
     issues.push({
       agentId: id,
       level: "error",
+      field: "provider",
       message: `provider "${agent.provider}" is not routable (must be openrouter|opencode_zen|opencode_go)`,
     });
   }
@@ -41,6 +44,7 @@ export function validateOrchestratorAgent(
       issues.push({
         agentId: id,
         level: "error",
+        field: `capabilities.${key}`,
         message: `capabilities.${key} must be in [0,1] (got ${v})`,
       });
     }
@@ -51,6 +55,7 @@ export function validateOrchestratorAgent(
       issues.push({
         agentId: id,
         level: "error",
+        field: "default_for",
         message: `default_for includes unknown stage "${stage}"`,
       });
     }
@@ -66,6 +71,7 @@ export function validateOrchestratorAgent(
       issues.push({
         agentId: id,
         level: "error",
+        field: "first_token_timeout_ms",
         message: `first_token_timeout_ms must be 1000–60000 (got ${ms})`,
       });
     }
@@ -75,6 +81,7 @@ export function validateOrchestratorAgent(
     issues.push({
       agentId: id,
       level: "warn",
+      field: "capabilities.json_reliability",
       message: `coordinator pin requires json_reliability ≥ 0.85 (got ${agent.capabilities?.json_reliability})`,
     });
   }
@@ -84,6 +91,7 @@ export function validateOrchestratorAgent(
     issues.push({
       agentId: id,
       level: "error",
+      field: "system_prompt",
       message: `system_prompt exceeds 4000 chars (${sp.length})`,
     });
   }

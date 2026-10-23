@@ -2139,6 +2139,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           workClass: surface === "cron" ? "background" : "interactive",
           signal: streamAbort.signal,
           deadlineAt: turnBudget.deadlineAt,
+          agents: cfg.orchestrator.agents,
+          validateAgents: cfg.orchestrator.enabled && cfg.active_backend !== "claude_cli",
         }),
         onDeadline: async () => {
           if (!turnInvalidated() && !continuityLocalTaskRun && sessionMemory.getTaskRun(sessionId) === activeTaskRun) {
