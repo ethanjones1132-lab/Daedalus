@@ -438,6 +438,18 @@ export interface VerificationConfig {
   thrift: { dead_tool_suppression: boolean; achieved_effect_early_stop: boolean };
 }
 
+/**
+ * Best-of-N tool call sampling. OFF by default: it multiplies token spend on
+ * every gated stage, so switching it on is an explicit cost decision.
+ */
+export interface BestOfNConfig {
+  enabled: boolean;
+  /** Samples per gated call. 1 disables sampling for that stage. */
+  n: number;
+  /** Stage labels this applies to. Empty means none. */
+  stages: string[];
+}
+
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
@@ -479,6 +491,7 @@ export interface OrchestratorConfig {
   skill_distillation: SkillDistillationConfig;
   /** Verification-gated conductor checks (Phase 0; default OFF). */
   verification: VerificationConfig;
+  best_of_n: BestOfNConfig;
 }
 
 export interface JarvisConfig {
@@ -714,6 +727,11 @@ export function defaultConfig(): JarvisConfig {
     orchestrator: {
       enabled: true,
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
+      best_of_n: {
+        enabled: false,
+        n: 3,
+        stages: ["executor"],
+      },
       max_recursion_depth: 2,
       max_conductor_replans: 2,
       max_conductor_replans_per_session: 6,
