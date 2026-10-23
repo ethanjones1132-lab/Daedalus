@@ -103,6 +103,7 @@ if (-not $resolvedInstaller) {
 
 if ($VerifyOnly) {
     $status = Get-JarvisAuthenticodeStatus -Path $resolvedInstaller.Path
+    Assert-JarvisSignatureTimestamp -Status $status | Out-Null
     Write-Ok "status:     $($status.status)"
     Write-Ok "subject:    $($status.subject)"
     Write-Ok "issuer:     $($status.issuer)"
@@ -114,6 +115,7 @@ if ($VerifyOnly) {
     exit 0
 }
 
+$importedCertificate = $null
 try {
     Write-Step 'Resolving the signing configuration'
     $configuration = Resolve-JarvisSigningConfiguration `
@@ -128,11 +130,11 @@ try {
         Write-Ok "thumbprint $($configuration.thumbprint)"
     }
 
-    if ($configuration.pfx_path) {
+    if ($configuration.thumbprint_source -eq 'pfx' -and $configuration.pfx_path) {
         Write-Step 'Importing the signing certificate'
-        $imported = Import-JarvisSigningCertificate -PfxPath $configuration.pfx_path -Password $PfxPassword
-        Write-Ok "imported $($imported.Thumbprint) into Cert:\CurrentUser\My"
-        $configuration.thumbprint = $imported.Thumbprint.ToUpperInvariant()
+        $importedCertificate = Import-JarvisSigningCertificate -PfxPath $configuration.pfx_path -Password $PfxPassword
+        Write-Ok "imported $($importedCertificate.Thumbprint) into Cert:\CurrentUser\My"
+        $configuration.thumbprint = $importedCertificate.Thumbprint.ToUpperInvariant()
     }
 
     Write-Step "Signing $($resolvedInstaller.Path)"
@@ -167,4 +169,12 @@ try {
     exit 0
 } catch {
     Die $_.Exception.Message
+} finally {
+    if ($importedCertificate -and $importedCertificate.JarvisImportedByRun) {
+        try {
+            Remove-JarvisSigningCertificate -Thumbprint $importedCertificate.Thumbprint | Out-Null
+        } catch {
+            Write-Warn "temporary signing certificate cleanup failed: $($_.Exception.Message)"
+        }
+    }
 }

@@ -83,6 +83,42 @@ its SHA-256 as `installer_sha256`, so the installer is tied to the same
 `git_sha` as the runtime it accompanies. When no installer exists, the
 `installer_*` fields are `null`.
 
+## Release-script guarantees
+
+The shared implementation is `scripts/lib/release-common.ps1`; the two CLI
+callers are `scripts/release-build.ps1` and `scripts/sign-installer.ps1`.
+These rules keep the signing and provenance path honest before an installer
+can be treated as a release artifact:
+
+1. `Remove-JarvisReleaseInstall` checks the process after its bounded wait. A
+   still-running uninstaller throws `uninstall_timeout:<root>`, a nonzero exit
+   throws `uninstall_failed:exit_<n>`, and a zero exit returns `$true`; a
+   missing uninstaller still returns `$false`. The release build's scratch
+   cleanup warns on uninstall failure and force-removes the scratch directory
+   in a `finally` block.
+2. `Import-JarvisSigningCertificate` imports without `-Exportable` and marks
+   whether the thumbprint was already present. Both CLI callers remove only a
+   certificate newly imported by that run, by its exact thumbprint from
+   `Cert:\CurrentUser\My`, in `finally`; an operator-installed certificate
+   remains in place.
+3. `Invoke-JarvisInstallerSigning` tokenizes the configured command once.
+   Whitespace separates arguments, quoted spans preserve embedded whitespace
+   and lose their quotes, and no command text is evaluated. The installer
+   path is appended after the command's own arguments.
+4. `Get-JarvisBuildIdentity` checks the exit status from
+   `git status --porcelain`. A failed status query throws
+   `git_status_unavailable:<root> (exit_<n>)` instead of recording a clean
+   worktree.
+5. `Get-JarvisPromptsTreeSha256` returns the prompts tree id from `HEAD` only
+   when the prompts path exists there and the worktree path is clean. It throws
+   `prompts_tree_unavailable` when the committed tree cannot be read and
+   `prompts_tree_dirty` when worktree prompts differ from `HEAD`.
+6. `Assert-JarvisSignatureTimestamp` rejects a valid-looking signature with
+   no timestamp using `signature_no_timestamp`. The post-sign helper and
+   `sign-installer.ps1 -VerifyOnly` both call it. Certificate configuration
+   records `thumbprint_source` as `operator` or `pfx`; only the PFX-sourced
+   route imports and replaces the configured thumbprint.
+
 ## How it is verified
 
 `scripts/verify-deploy.ps1` re-reads the manifest and re-hashes the artifacts on

@@ -1,6 +1,32 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
+function New-JarvisGitFixture {
+    param([Parameter(Mandatory = $true)][string]$Name, [switch]$WithPrompts)
+
+    $root = Join-Path $TestDrive $Name
+    foreach ($relative in @('server-jarvis\src', 'src-tauri\src', 'src-ui\src', 'scripts')) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $root $relative) | Out-Null
+    }
+    'fixture source bytes' | Set-Content -LiteralPath (Join-Path $root 'server-jarvis\src\fixture.ts')
+    if ($WithPrompts) {
+        $prompts = Join-Path $root 'server-jarvis\src\prompts'
+        New-Item -ItemType Directory -Force -Path $prompts | Out-Null
+        'fixture prompt' | Set-Content -LiteralPath (Join-Path $prompts 'system.md')
+    }
+    & git -C $root init --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_init_failed' }
+    & git -C $root config user.name 'Pester Fixture'
+    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_config_failed' }
+    & git -C $root config user.email 'pester-fixture@example.invalid'
+    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_config_failed' }
+    & git -C $root add --all
+    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_add_failed' }
+    & git -C $root commit --quiet -m 'fixture'
+    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_commit_failed' }
+    return $root
+}
+
 Describe 'source tree digest' {
     It 'produces a 64 character uppercase hex digest' {
         $digest = Get-JarvisSourceTreeSha256 -RepoRoot $repoRoot
@@ -38,6 +64,34 @@ Describe 'source tree digest' {
             $sha256.Dispose()
         }
         (Get-JarvisSourceTreeSha256 -RepoRoot $repoRoot) | Should Be $expected
+    }
+}
+
+Describe 'build and prompts tree identity' {
+    It 'fails build identity when git status cannot read the repository index' {
+        $fake = New-JarvisGitFixture -Name 'broken-index-repo'
+        [IO.File]::WriteAllText((Join-Path $fake '.git\index'), 'garbage index bytes')
+
+        $null = & git -C $fake status --porcelain 2>&1
+        $LASTEXITCODE | Should Not Be 0
+        { Get-JarvisBuildIdentity -RepoRoot $fake } | Should Throw 'git_status_unavailable'
+    }
+
+    It 'returns the HEAD prompts tree only when the worktree prompts match it' {
+        $fake = New-JarvisGitFixture -Name 'clean-prompts-repo' -WithPrompts
+        $expected = (& git -C $fake rev-parse 'HEAD:server-jarvis/src/prompts' | Out-String).Trim()
+        $tree = Get-JarvisPromptsTreeSha256 -RepoRoot $fake
+        $tree | Should Be $expected
+
+        'changed prompt bytes' | Set-Content -LiteralPath (Join-Path $fake 'server-jarvis\src\prompts\system.md')
+        { Get-JarvisPromptsTreeSha256 -RepoRoot $fake } | Should Throw 'prompts_tree_dirty'
+    }
+
+    It 'rejects a prompts directory that is not present in HEAD' {
+        $fake = New-JarvisGitFixture -Name 'missing-head-prompts-repo'
+        New-Item -ItemType Directory -Force -Path (Join-Path $fake 'server-jarvis\src\prompts') | Out-Null
+        'uncommitted prompt' | Set-Content -LiteralPath (Join-Path $fake 'server-jarvis\src\prompts\system.md')
+        { Get-JarvisPromptsTreeSha256 -RepoRoot $fake } | Should Throw 'prompts_tree_unavailable'
     }
 }
 
@@ -287,6 +341,16 @@ Describe 'signing configuration' {
         $config = Resolve-JarvisSigningConfiguration -Thumbprint 'ab cd ef' -PfxPath '' -TimestampUrl 'http://ts'
         $config.thumbprint | Should Be 'ABCDEF'
         $config.mode | Should Be 'certificate'
+        $config.thumbprint_source | Should Be 'operator'
+    }
+
+    It 'keeps an operator thumbprint authoritative when a PFX is also configured' {
+        $pfx = Join-Path $TestDrive 'operator-configured.pfx'
+        'fabricated pfx bytes' | Set-Content -LiteralPath $pfx
+        $config = Resolve-JarvisSigningConfiguration -Thumbprint 'operator-123' -PfxPath $pfx -TimestampUrl 'http://ts'
+        $config.thumbprint | Should Be 'OPERATOR-123'
+        $config.thumbprint_source | Should Be 'operator'
+        $config.pfx_path | Should BeNullOrEmpty
     }
 
     It 'names the environment variables to set when there is no certificate' {
@@ -311,6 +375,17 @@ Describe 'signing configuration' {
             -TimestampUrl 'http://ts' -Command 'C:\tools\azure-sign.cmd'
         $config.mode | Should Be 'command'
         $config.command | Should Be 'C:\tools\azure-sign.cmd'
+    }
+
+    It 'marks the thumbprint as PFX sourced when no operator thumbprint is given' {
+        $pfx = Join-Path $TestDrive 'pfx-configured.pfx'
+        'fabricated pfx bytes' | Set-Content -LiteralPath $pfx
+        Mock Get-JarvisPfxThumbprint { 'PFX-123' }
+        $config = Resolve-JarvisSigningConfiguration -Thumbprint '' -PfxPath $pfx `
+            -PfxPassword '' -TimestampUrl 'http://ts'
+        $config.thumbprint_source | Should Be 'pfx'
+        $config.thumbprint | Should Be 'PFX-123'
+        $config.pfx_path | Should Be $pfx
     }
 
     It 'prefers the command when both a command and a certificate are given' {

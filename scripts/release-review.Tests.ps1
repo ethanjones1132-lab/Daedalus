@@ -19,6 +19,182 @@ Describe 'PFX password propagation' {
         $password.GetType().FullName | Should Be 'System.Security.SecureString'
         $password.Length | Should Be 0
     }
+
+    It 'imports the PFX without making its private key exportable' {
+        $pfx = Join-Path $TestDrive 'fabricated-import.pfx'
+        'fabricated pfx fixture' | Set-Content -LiteralPath $pfx
+        Mock Get-JarvisPfxThumbprint { 'ABC123' }
+        Mock Get-ChildItem { @() } -ParameterFilter { $LiteralPath -eq 'Cert:\CurrentUser\My' }
+        Mock Import-PfxCertificate {
+            [pscustomobject]@{ Thumbprint = 'ABC123'; PSPath = 'Cert:\CurrentUser\My\ABC123' }
+        }
+
+        $imported = Import-JarvisSigningCertificate -PfxPath $pfx -Password 'fixture-password'
+
+        $imported.JarvisImportedByRun | Should Be $true
+        Assert-MockCalled Import-PfxCertificate -Scope It -Times 1 -Exactly -ParameterFilter {
+            $FilePath -eq $pfx -and $CertStoreLocation -eq 'Cert:\CurrentUser\My' -and -not $Exportable
+        }
+    }
+
+    It 'does not claim an operator-installed certificate as owned by the run' {
+        $pfx = Join-Path $TestDrive 'already-installed.pfx'
+        'fabricated pfx fixture' | Set-Content -LiteralPath $pfx
+        $script:existingSigningCertificate = [pscustomobject]@{
+            Thumbprint = 'ABC123'; PSPath = 'Cert:\CurrentUser\My\ABC123'
+        }
+        Mock Get-JarvisPfxThumbprint { 'ABC123' }
+        Mock Get-ChildItem { @($script:existingSigningCertificate) } -ParameterFilter { $LiteralPath -eq 'Cert:\CurrentUser\My' }
+        Mock Import-PfxCertificate { $script:existingSigningCertificate }
+
+        $imported = Import-JarvisSigningCertificate -PfxPath $pfx -Password 'fixture-password'
+        $imported.JarvisImportedByRun | Should Be $false
+    }
+
+    It 'removes only the exact requested thumbprint from the current user store' {
+        $script:signingCertificates = @(
+            [pscustomobject]@{ Thumbprint = 'ABC123'; PSPath = 'Cert:\CurrentUser\My\ABC123' },
+            [pscustomobject]@{ Thumbprint = 'DEF456'; PSPath = 'Cert:\CurrentUser\My\DEF456' }
+        )
+        Mock Get-ChildItem { $script:signingCertificates } -ParameterFilter { $LiteralPath -eq 'Cert:\CurrentUser\My' }
+        Mock Remove-Item { }
+
+        (Remove-JarvisSigningCertificate -Thumbprint 'ab c123') | Should Be $true
+        Assert-MockCalled Remove-Item -Scope It -Times 1 -Exactly -ParameterFilter {
+            $LiteralPath -eq 'Cert:\CurrentUser\My\ABC123'
+        }
+        Assert-MockCalled Remove-Item -Scope It -Times 0 -Exactly -ParameterFilter {
+            $LiteralPath -eq 'Cert:\CurrentUser\My\DEF456'
+        }
+    }
+}
+
+Describe 'release install teardown' {
+    It 'throws with the scratch root when the uninstaller is still running after its timeout' {
+        $root = Join-Path $TestDrive 'hung-uninstall'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
+        Mock Start-Process { [pscustomobject]@{ HasExited = $false; ExitCode = $null } }
+        Mock Wait-Process { }
+
+        $message = ''
+        try { Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1 | Out-Null }
+        catch { $message = $_.Exception.Message }
+        $message | Should Match 'uninstall_timeout'
+        $message | Should Match ([regex]::Escape($root))
+    }
+
+    It 'distinguishes a nonzero uninstaller exit code' {
+        $root = Join-Path $TestDrive 'failed-uninstall'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
+        Mock Start-Process { [pscustomobject]@{ HasExited = $true; ExitCode = 17 } }
+        Mock Wait-Process { }
+
+        { Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1 } | Should Throw 'uninstall_failed:exit_17'
+    }
+
+    It 'returns true after a clean zero-exit uninstall' {
+        $root = Join-Path $TestDrive 'clean-uninstall'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
+        Mock Start-Process { [pscustomobject]@{ HasExited = $true; ExitCode = 0 } }
+        Mock Wait-Process { }
+
+        (Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1) | Should Be $true
+    }
+
+    It 'keeps the missing-uninstaller false path' {
+        $root = Join-Path $TestDrive 'missing-uninstaller'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        (Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1) | Should Be $false
+    }
+
+    It 'warns and still force-removes a scratch directory when uninstall throws' {
+        $root = Join-Path $TestDrive 'throwing-uninstall'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        'owned scratch data' | Set-Content -LiteralPath (Join-Path $root 'sentinel.txt')
+        Mock Remove-JarvisReleaseInstall { throw "uninstall_timeout:$InstallRoot" }
+
+        Remove-JarvisReleaseScratchInstall -InstallRoot $root -WarningVariable warnings
+
+        ($warnings -join "`n") | Should Match 'scratch uninstall failed'
+        (Test-Path -LiteralPath $root) | Should Be $false
+    }
+}
+
+Describe 'signing command arguments and timestamp validation' {
+    It 'splits quoted command arguments and appends the installer path without evaluating text' {
+        $fixtureDir = New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'quoted signing command')
+        $captureScript = Join-Path $fixtureDir.FullName 'capture arguments.ps1'
+        $capturePath = Join-Path $fixtureDir.FullName 'captured.json'
+        $installerPath = Join-Path $fixtureDir.FullName 'installer with spaces.exe'
+        @'
+param([string]$ServiceProfile, [string]$Marker, [string]$CapturePath, [string]$ArtifactPath)
+[pscustomobject]@{ profile = $ServiceProfile; marker = $Marker; artifact = $ArtifactPath } |
+    ConvertTo-Json -Compress | Set-Content -LiteralPath $CapturePath
+exit 0
+'@ | Set-Content -LiteralPath $captureScript
+        'fabricated installer bytes' | Set-Content -LiteralPath $installerPath
+        $powershellPath = (Get-Command powershell.exe).Source
+        $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" "provider profile with spaces" "$env:TEMP remains literal" "{2}"' -f `
+            $powershellPath, $captureScript, $capturePath
+        $configuration = [pscustomobject]@{ mode = 'command'; command = $command }
+        Mock Get-JarvisAuthenticodeStatus {
+            [pscustomobject]@{ status = 'Valid'; subject = 'fixture signer'; issuer = 'fixture issuer'; thumbprint = 'ABC123'; timestamp = 'fixture timestamp' }
+        }
+
+        $status = Invoke-JarvisInstallerSigning -InstallerPath $installerPath -Configuration $configuration
+
+        $status.status | Should Be 'Valid'
+        $received = Get-Content -Raw -LiteralPath $capturePath | ConvertFrom-Json
+        $received.profile | Should Be 'provider profile with spaces'
+        $received.marker | Should Be '$env:TEMP remains literal'
+        $received.artifact | Should Be $installerPath
+    }
+
+    It 'rejects a signature without a timestamp after the signing command succeeds' {
+        $fixtureDir = New-Item -ItemType Directory -Force -Path (Join-Path $TestDrive 'timestamp check')
+        $exitScript = Join-Path $fixtureDir.FullName 'exit cleanly.ps1'
+        $installerPath = Join-Path $fixtureDir.FullName 'unsigned fixture.exe'
+        'exit 0' | Set-Content -LiteralPath $exitScript
+        'fabricated installer bytes' | Set-Content -LiteralPath $installerPath
+        $powershellPath = (Get-Command powershell.exe).Source
+        $configuration = [pscustomobject]@{
+            mode = 'command'
+            command = '"{0}" -NoProfile -File "{1}"' -f $powershellPath, $exitScript
+        }
+        Mock Get-JarvisAuthenticodeStatus {
+            [pscustomobject]@{ status = 'Valid'; subject = 'fixture signer'; issuer = 'fixture issuer'; thumbprint = 'ABC123'; timestamp = '' }
+        }
+
+        { Invoke-JarvisInstallerSigning -InstallerPath $installerPath -Configuration $configuration } |
+            Should Throw 'signature_no_timestamp'
+    }
+
+    It 'checks a timestamp in VerifyOnly and removes temporary certificates in both CLI finally blocks' {
+        $verifyScript = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'sign-installer.ps1')
+        $verifyStart = $verifyScript.IndexOf('if ($VerifyOnly)')
+        $verifyEnd = $verifyScript.IndexOf("`n`$importedCertificate = `$null", $verifyStart)
+        $verifyBlock = $verifyScript.Substring($verifyStart, $verifyEnd - $verifyStart)
+        $verifyBlock | Should Match ([regex]::Escape('Assert-JarvisSignatureTimestamp -Status $status'))
+
+        foreach ($scriptName in @('release-build.ps1', 'sign-installer.ps1')) {
+            $tokens = $null
+            $parseErrors = $null
+            $path = Join-Path $PSScriptRoot $scriptName
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
+            $parseErrors | Should BeNullOrEmpty
+            $finallyBlocks = @($ast.FindAll({
+                param($node)
+                ($node -is [System.Management.Automation.Language.TryStatementAst]) -and ($null -ne $node.Finally)
+            }, $true) | Where-Object {
+                $_.Finally.Extent.Text.Contains('Remove-JarvisSigningCertificate') -and
+                $_.Finally.Extent.Text.Contains('JarvisImportedByRun')
+            })
+            $finallyBlocks.Count | Should BeGreaterThan 0
+        }
+    }
 }
 
 Describe 'scratch install ownership' {

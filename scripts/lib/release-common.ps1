@@ -121,6 +121,10 @@ function Get-JarvisBuildIdentity {
         throw "git_head_unavailable:$RepoRoot (got '$sha')"
     }
     $porcelain = (& git -C $RepoRoot status --porcelain 2>$null | Out-String)
+    $statusExitCode = $LASTEXITCODE
+    if ($statusExitCode -ne 0) {
+        throw "git_status_unavailable:$RepoRoot (exit_$statusExitCode)"
+    }
     $dirty = -not [string]::IsNullOrWhiteSpace($porcelain)
 
     return [pscustomobject]@{
@@ -129,6 +133,37 @@ function Get-JarvisBuildIdentity {
         built_at            = (Get-Date -Format 'o')
         source_tree_sha256  = (Get-JarvisSourceTreeSha256 -RepoRoot $RepoRoot)
     }
+}
+
+function Get-JarvisPromptsTreeSha256 {
+    <#
+    .SYNOPSIS
+        Return the committed prompts tree only when the build inputs match it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RepoRoot
+    )
+
+    $path = 'server-jarvis/src/prompts'
+    $treeOutput = (& git -C $RepoRoot ls-tree -d HEAD -- $path 2>$null | Out-String).Trim()
+    $treeExitCode = $LASTEXITCODE
+    $treeMatch = [regex]::Match($treeOutput, '^040000 tree ([0-9a-f]{40,64})\tserver-jarvis/src/prompts$')
+    if ($treeExitCode -ne 0 -or -not $treeMatch.Success) {
+        throw "prompts_tree_unavailable:$RepoRoot"
+    }
+
+    $status = (& git -C $RepoRoot status --porcelain --untracked-files=all -- $path 2>$null | Out-String)
+    $statusExitCode = $LASTEXITCODE
+    if ($statusExitCode -ne 0) {
+        throw "prompts_tree_unavailable:$RepoRoot (status_exit_$statusExitCode)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        throw "prompts_tree_dirty:$RepoRoot"
+    }
+
+    return $treeMatch.Groups[1].Value
 }
 
 # ── Version consistency ──────────────────────────────────────────────────────
@@ -804,13 +839,36 @@ function Remove-JarvisReleaseInstall {
     )
     $uninstaller = Join-Path $InstallRoot 'uninstall.exe'
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { return $false }
-    try {
-        $process = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -PassThru
-        $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
-    } catch {
-        return $false
+    $process = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -PassThru
+    $process | Wait-Process -Timeout $TimeoutSeconds -ErrorAction SilentlyContinue
+    if (-not $process.HasExited) {
+        throw "uninstall_timeout:$InstallRoot (after_${TimeoutSeconds}s)"
+    }
+    if ($process.ExitCode -ne 0) {
+        throw "uninstall_failed:exit_$($process.ExitCode)"
     }
     return $true
+}
+
+function Remove-JarvisReleaseScratchInstall {
+    <#
+    .SYNOPSIS
+        Best-effort uninstall, followed by unconditional scratch-directory removal.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$InstallRoot)
+
+    try {
+        Remove-JarvisReleaseInstall -InstallRoot $InstallRoot | Out-Null
+    } catch {
+        Write-Warning "scratch uninstall failed: $($_.Exception.Message)"
+    } finally {
+        try {
+            Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning "scratch directory removal failed: $($_.Exception.Message)"
+        }
+    }
 }
 
 function Find-JarvisInstalledBinary {
@@ -1005,6 +1063,7 @@ function Resolve-JarvisSigningConfiguration {
             mode          = 'command'
             command       = $Command
             thumbprint    = $null
+            thumbprint_source = $null
             pfx_path      = $null
             timestamp_url = $TimestampUrl
         }
@@ -1021,6 +1080,7 @@ function Resolve-JarvisSigningConfiguration {
                "Refusing to publish an unsigned installer.")
     }
 
+    $thumbprintSource = if ($hasThumbprint) { 'operator' } else { 'pfx' }
     if (-not $hasThumbprint -and $hasPfx) {
         # A .pfx still has to yield a usable thumbprint. Read it from the file
         # rather than requiring the caller to know it.
@@ -1033,11 +1093,12 @@ function Resolve-JarvisSigningConfiguration {
     }
 
     return [pscustomobject]@{
-        mode          = 'certificate'
-        command       = $null
-        thumbprint    = $Thumbprint.Replace(' ', '').ToUpperInvariant()
-        pfx_path      = $(if ($hasPfx) { $PfxPath } else { $null })
-        timestamp_url = $TimestampUrl
+        mode              = 'certificate'
+        command           = $null
+        thumbprint        = $Thumbprint.Replace(' ', '').ToUpperInvariant()
+        thumbprint_source = $thumbprintSource
+        pfx_path          = $(if ($thumbprintSource -eq 'pfx') { $PfxPath } else { $null })
+        timestamp_url     = $TimestampUrl
     }
 }
 
@@ -1073,7 +1134,38 @@ function Import-JarvisSigningCertificate {
         [string]$Password
     )
     $secure = ConvertTo-JarvisPfxPassword -Password $Password
-    return Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure -Exportable -ErrorAction Stop
+    $thumbprint = (Get-JarvisPfxThumbprint -PfxPath $PfxPath -Password $Password).Replace(' ', '').ToUpperInvariant()
+    $existing = @(Get-ChildItem -LiteralPath 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+        Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToUpperInvariant() -eq $thumbprint })
+    $imported = @(Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation 'Cert:\CurrentUser\My' -Password $secure -ErrorAction Stop |
+        Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToUpperInvariant() -eq $thumbprint } |
+        Select-Object -First 1)
+    if ($imported.Count -eq 0) {
+        $imported = @(Get-ChildItem -LiteralPath 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+            Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToUpperInvariant() -eq $thumbprint } |
+            Select-Object -First 1)
+    }
+    if ($imported.Count -eq 0) { throw 'pfx_import_empty' }
+    $imported[0] | Add-Member -MemberType NoteProperty -Name JarvisImportedByRun -Value ($existing.Count -eq 0) -Force
+    return $imported[0]
+}
+
+function Remove-JarvisSigningCertificate {
+    <#
+    .SYNOPSIS
+        Remove the exact temporary signing certificate from the current user's personal store.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Thumbprint)
+
+    $normalized = $Thumbprint.Replace(' ', '').ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($normalized)) { return $false }
+    $matches = @(Get-ChildItem -LiteralPath 'Cert:\CurrentUser\My' -ErrorAction SilentlyContinue |
+        Where-Object { ([string]$_.Thumbprint).Replace(' ', '').ToUpperInvariant() -eq $normalized })
+    foreach ($certificate in $matches) {
+        Remove-Item -LiteralPath $certificate.PSPath -Force -ErrorAction Stop
+    }
+    return ($matches.Count -gt 0)
 }
 
 function ConvertTo-JarvisPfxPassword {
@@ -1113,10 +1205,12 @@ function Invoke-JarvisInstallerSigning {
     }
 
     if ($Configuration.mode -eq 'command') {
-        # The command receives the artifact path as its single argument,
-        # which is the shape Tauri uses for bundle.windows.signCommand and
-        # the shape the Azure Artifact Signing and SignPath CLIs expect.
-        & $Configuration.command $InstallerPath
+        $tokens = ConvertFrom-JarvisSigningCommand -Command $Configuration.command
+        $program = $tokens[0]
+        $commandArguments = @()
+        if ($tokens.Count -gt 1) { $commandArguments = @($tokens | Select-Object -Skip 1) }
+        $invokeArguments = @($commandArguments) + @($InstallerPath)
+        & $program @invokeArguments
         if ($LASTEXITCODE -ne 0) {
             throw "sign_command_failed:exit_$LASTEXITCODE"
         }
@@ -1143,5 +1237,57 @@ function Invoke-JarvisInstallerSigning {
     if ($status.status -ne 'Valid') {
         throw "signature_not_valid:$($status.status)"
     }
+    Assert-JarvisSignatureTimestamp -Status $status
     return $status
+}
+
+function ConvertFrom-JarvisSigningCommand {
+    <#
+    .SYNOPSIS
+        Split an operator command into literal executable and argument tokens.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Command)
+
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    $builder = New-Object System.Text.StringBuilder
+    $quote = [char]0
+    $tokenStarted = $false
+    foreach ($character in $Command.ToCharArray()) {
+        if ($quote -ne [char]0) {
+            if ($character -eq $quote) { $quote = [char]0 }
+            else { [void]$builder.Append($character) }
+            $tokenStarted = $true
+            continue
+        }
+        if ($character -eq [char]34 -or $character -eq [char]39) {
+            $quote = $character
+            $tokenStarted = $true
+            continue
+        }
+        if ([char]::IsWhiteSpace($character)) {
+            if ($tokenStarted) {
+                $tokens.Add($builder.ToString())
+                [void]$builder.Clear()
+                $tokenStarted = $false
+            }
+            continue
+        }
+        [void]$builder.Append($character)
+        $tokenStarted = $true
+    }
+    if ($quote -ne [char]0) { throw 'sign_command_unterminated_quote' }
+    if ($tokenStarted) { $tokens.Add($builder.ToString()) }
+    if ($tokens.Count -eq 0) { throw 'sign_command_empty' }
+    return ,$tokens.ToArray()
+}
+
+function Assert-JarvisSignatureTimestamp {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Status)
+
+    if ([string]::IsNullOrWhiteSpace([string]$Status.timestamp)) {
+        throw 'signature_no_timestamp'
+    }
+    return $Status
 }

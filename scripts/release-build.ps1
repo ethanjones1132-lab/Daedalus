@@ -205,8 +205,7 @@ try {
     Write-Ok "app binary read from the install ($mainBinaryName.exe)"
 } finally {
     if ($probeOwned) {
-        Remove-JarvisReleaseInstall -InstallRoot $probeRoot | Out-Null
-        Remove-Item -LiteralPath $probeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-JarvisReleaseScratchInstall -InstallRoot $probeRoot
     }
 }
 
@@ -219,6 +218,7 @@ $signatureStatus = $null
 $signed = $false
 if ($Sign) {
     Write-Step 'Signing the installer'
+    $importedCertificate = $null
     try {
         $configuration = Resolve-JarvisSigningConfiguration `
             -Thumbprint $env:JARVIS_SIGNING_THUMBPRINT `
@@ -231,9 +231,9 @@ if ($Sign) {
         } else {
             Write-Ok "thumbprint $($configuration.thumbprint)"
         }
-        if ($configuration.pfx_path) {
-            $imported = Import-JarvisSigningCertificate -PfxPath $configuration.pfx_path -Password $env:JARVIS_SIGNING_PFX_PASSWORD
-            $configuration.thumbprint = $imported.Thumbprint.ToUpperInvariant()
+        if ($configuration.thumbprint_source -eq 'pfx' -and $configuration.pfx_path) {
+            $importedCertificate = Import-JarvisSigningCertificate -PfxPath $configuration.pfx_path -Password $env:JARVIS_SIGNING_PFX_PASSWORD
+            $configuration.thumbprint = $importedCertificate.Thumbprint.ToUpperInvariant()
             Write-Ok "imported certificate $($configuration.thumbprint)"
         }
         $signatureStatus = Invoke-JarvisInstallerSigning -InstallerPath $stagedInstaller -Configuration $configuration
@@ -241,14 +241,20 @@ if ($Sign) {
         Write-Ok "signature status: $($signatureStatus.status)"
     } catch {
         Die "signing failed: $($_.Exception.Message)"
+    } finally {
+        if ($importedCertificate -and $importedCertificate.JarvisImportedByRun) {
+            try {
+                Remove-JarvisSigningCertificate -Thumbprint $importedCertificate.Thumbprint | Out-Null
+            } catch {
+                Write-Warn "temporary signing certificate cleanup failed: $($_.Exception.Message)"
+            }
+        }
     }
 } else {
     Write-Warn 'not signing (-Sign not supplied); the release record will say so'
 }
 
-$promptsTree = (& git -C $RepoRoot ls-tree HEAD server-jarvis/src/prompts 2>$null | Out-String).Trim()
-$promptsTreeSha = $null
-if ($promptsTree) { $promptsTreeSha = ($promptsTree -split '\s+')[2] }
+$promptsTreeSha = Get-JarvisPromptsTreeSha256 -RepoRoot $RepoRoot
 
 # ── Release record ───────────────────────────────────────────────────────────
 Write-Step 'Writing the release record'
