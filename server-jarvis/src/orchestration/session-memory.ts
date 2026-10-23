@@ -4,6 +4,7 @@ import { join } from "path";
 import type { SharedContextHints } from "./coordinator";
 import type { SessionMemoryConfig } from "../config";
 import { SESSIONS_DIR } from "../config";
+import { compressToolOutput } from "./tool-output-compression";
 import type { ToolResult } from "../tool-types";
 import {
   applyGoalLink,
@@ -644,7 +645,10 @@ export class SessionMemory {
     if (!omitWorkspaceHistory) {
       for (const entry of Object.values(session.toolResults)) {
         if (activeWorkspace && entry.workspacePath !== activeWorkspace) continue;
-        prior_tool_results[entry.displayKey] = truncateSnippet(entry.output);
+        prior_tool_results[entry.displayKey] = compressToolOutput(entry.output, {
+          toolName: entry.toolName,
+          maxChars: MAX_SNIPPET_CHARS,
+        });
       }
     }
 
@@ -701,7 +705,7 @@ export class SessionMemory {
       key,
       displayKey,
       toolName: input.toolName,
-      output: truncateSnippet(output, 4000),
+      output: compressToolOutput(output, { toolName: input.toolName, maxChars: 4000 }),
       timestamp: now,
       ttlMs: cfg.tool_result_ttl_ms,
       isError: input.result.is_error,
@@ -717,7 +721,7 @@ export class SessionMemory {
         const normalized = normalizePath(path, input.workspacePath);
         session.fileSnapshots[normalized] = {
           path: normalized,
-          content: truncateSnippet(output, 8000),
+          content: compressToolOutput(output, { toolName: input.toolName, maxChars: 8000 }),
           timestamp: now,
         };
         session.discoveredFacts[`file:${normalized}`] = {

@@ -575,4 +575,87 @@ describe("session-memory", () => {
       rmSyncRetry(tempRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   });
+
+  // DD-010: the three long-output call sites record compressed, whole-line
+  // tool output instead of the old mid-sentence `slice(0, max)` cut, so the
+  // line that answers "what actually happened" survives into later turns.
+  describe("tool output compression call sites", () => {
+    test("a recorded tool result keeps its trailing error at both budget stages", () => {
+      const memory = new SessionMemory(() => makeConfig());
+      const long = Array.from({ length: 2000 }, (_, i) => `noise line ${i}`).join("\n")
+        + "\nERROR: the actual thing that went wrong";
+
+      memory.recordToolResult({
+        sessionId: "compress-s1",
+        toolName: "run_shell",
+        args: { command: "bun test" },
+        workspacePath: "/w",
+        result: { output: long, is_error: false },
+      });
+
+      // Cached tool result budget: 4000.
+      const cached = memory.lookupCachedToolResult(
+        "compress-s1",
+        "run_shell",
+        { command: "bun test" },
+        "/w",
+      );
+      expect(cached).toBeDefined();
+      expect(cached?.length).toBeLessThanOrEqual(4000);
+      expect(cached).toContain("ERROR: the actual thing that went wrong");
+      expect(cached).toMatch(/\[\.\.\. \d+ lines? omitted \(/);
+
+      // Shared-context hint budget: MAX_SNIPPET_CHARS (1500).
+      const hints = memory.toSharedContextHints("compress-s1", "/w");
+      const prior = Object.values(hints?.prior_tool_results ?? {});
+      expect(prior.length).toBeGreaterThan(0);
+      for (const value of prior) {
+        expect(value.length).toBeLessThanOrEqual(1500);
+      }
+      expect(prior.join("\n")).toContain("ERROR: the actual thing that went wrong");
+    });
+
+    test("a read_file snapshot keeps its tail within the 8000-char snapshot budget", () => {
+      const memory = new SessionMemory(() => makeConfig());
+      const lines = Array.from(
+        { length: 300 },
+        (_, i) => `content row ${i} of a long configuration file`,
+      );
+      lines.push("export const version = 'v1.0.0';");
+      const output = lines.join("\n");
+
+      memory.recordToolResult({
+        sessionId: "compress-s2",
+        toolName: "read_file",
+        args: { path: "src/version.ts" },
+        result: { output, is_error: false },
+        workspacePath: "/w",
+      });
+
+      const state = memory.getSessionState("compress-s2")!;
+      const snapshot = state.fileSnapshots["/w/src/version.ts"];
+      expect(snapshot).toBeDefined();
+      expect(snapshot!.content.length).toBeLessThanOrEqual(8000);
+      expect(snapshot!.content).toContain("export const version = 'v1.0.0';");
+      expect(snapshot!.content).toMatch(/\[\.\.\. \d+ lines? omitted \(/);
+      // Middle rows are honestly elided, not silently kept or half-kept.
+      expect(snapshot!.content).not.toContain("content row 100 ");
+    });
+
+    test("short failure labels keep the head-slice label form, not an elision marker", () => {
+      const memory = new SessionMemory(() => makeConfig());
+      const long = Array.from({ length: 100 }, (_, i) => `stack frame ${i} in the trace`).join("\n");
+      memory.recordToolResult({
+        sessionId: "compress-s3",
+        toolName: "run_shell",
+        args: { command: "bun test" },
+        result: { output: long, is_error: true },
+      });
+
+      const state = memory.getSessionState("compress-s3")!;
+      const pattern = state.failureHistory[0]?.pattern ?? "";
+      expect(pattern).toBe(`run_shell failed: ${long.slice(0, 200)}...`);
+      expect(pattern).not.toContain("omitted");
+    });
+  });
 });
