@@ -15,7 +15,8 @@
     "campaign:preflight": "bun run src/self-tuning/cma-es/campaign-cli.ts --preflight",
     "campaign:smoke": "bun run src/self-tuning/cma-es/campaign-cli.ts --smoke",
     "campaign": "bun run src/self-tuning/cma-es/campaign-cli.ts",
-    "test:gate": "bun test src/eval/harness.test.ts && bun run src/eval/harness.ts"
+    "test:gate": "bun test src/eval/harness.test.ts && bun run src/eval/harness.ts",
+    "benchmark:best-of-n": "bun run scripts/benchmark-best-of-n-offline.ts"
   },
   "dependencies": {
     "diff": "^9.0.0",
