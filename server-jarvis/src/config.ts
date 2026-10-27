@@ -7,7 +7,6 @@
 import { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } from "fs";
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
-import { execSync } from "child_process";
 import jarvisPackage from "../package.json";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
@@ -548,30 +547,92 @@ export interface JarvisConfig {
   agents_root: string;
 }
 
-function getWindowsHome(): string | null {
-  try {
-    const raw = execSync("cmd.exe /c \"echo %USERPROFILE%\"", { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-    const trimmed = raw.trim();
-    if (trimmed && trimmed.match(/^[a-zA-Z]:\\/)) {
-      const drive = trimmed[0].toLowerCase();
-      const path = trimmed.slice(2).replace(/\\/g, "/");
-      return `/mnt/${drive}${path}`;
-    }
-  } catch (e) {
-    // Fail silently
+/**
+ * A Windows profile path as seen from a drive letter: `C:\Users\example`.
+ * Group 1 is the drive, group 2 is the remainder (in either separator form).
+ */
+const WINDOWS_DRIVE_PATH = /^([a-zA-Z]):[\\/](.*)$/;
+
+/** An already-WSL profile path: `/mnt/c/Users/example`. */
+const WSL_MOUNT_PATH = /^\/mnt\/[a-zA-Z](\/|$)/;
+
+/**
+ * Resolve the Windows home directory in the WSL `/mnt/<drive>/...` form that
+ * `locateConfigDir()` compares against, from the environment alone.
+ *
+ * DS-26: this used to shell out (`execSync` of a Windows shell echoing
+ * `%USERPROFILE%`) from module scope, so every server start paid a blocking
+ * child-process spawn during import evaluation — before the self-log, the
+ * SQLite open, and `serve()`. Reading the environment instead is pure,
+ * synchronous in-process work.
+ *
+ * Sources, in order:
+ *   1. `%USERPROFILE%` when it names a Windows path (the normal case), or a
+ *      path that is already in `/mnt/<drive>` form (a WSL-spawned server can
+ *      inherit either shape);
+ *   2. `%HOMEDRIVE%%HOMEPATH%`, the older Windows profile pair.
+ *
+ * Returns null when no Windows profile is visible (e.g. a plain Linux or
+ * interop-less WSL process); the caller then falls back to `homedir()`.
+ */
+export function resolveWindowsHome(
+  env: Record<string, string | undefined> = process.env,
+): string | null {
+  const userProfile = env.USERPROFILE?.trim();
+  const homeDrive = env.HOMEDRIVE?.trim();
+  const homePath = env.HOMEPATH?.trim();
+  const fromDrivePair =
+    homeDrive && homePath
+      ? `${homeDrive}${/^[\\/]/.test(homePath) ? "" : "\\"}${homePath}`
+      : undefined;
+
+  for (const candidate of [userProfile, fromDrivePair]) {
+    if (!candidate) continue;
+    if (WSL_MOUNT_PATH.test(candidate)) return candidate.replace(/\/+$/, "");
+    const match = WINDOWS_DRIVE_PATH.exec(candidate);
+    if (!match) continue;
+    const drive = match[1].toLowerCase();
+    const rest = match[2].replace(/\\/g, "/");
+    return `/mnt/${drive}/${rest}`;
   }
   return null;
 }
 
-function locateConfigDir(): string {
-  const winHome = getWindowsHome();
+let cachedWindowsHome: { value: string | null } | null = null;
+
+/**
+ * Windows home for this process's environment, resolved once.
+ *
+ * Memoised so repeated lookups do no work and cannot disagree with the
+ * `CONFIG_DIR` computed at import. Never spawns a process (DS-26).
+ */
+function getWindowsHome(): string | null {
+  if (cachedWindowsHome === null) {
+    cachedWindowsHome = { value: resolveWindowsHome() };
+  }
+  return cachedWindowsHome.value;
+}
+
+/**
+ * Resolve the Jarvis config directory.
+ *
+ * Defaults read this process's environment (memoised Windows home) and
+ * `homedir()`. The parameters exist so tests can pin the Windows-profile and
+ * no-profile paths without mutating `process.env` or the import-time cache.
+ */
+export function locateConfigDir(
+  env?: Record<string, string | undefined>,
+  home: string = homedir(),
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const winHome = env === undefined ? getWindowsHome() : resolveWindowsHome(env);
   if (winHome) {
     const winDir = join(winHome, ".openclaw", "jarvis");
-    if (existsSync(winDir) && existsSync(join(winDir, "config.json"))) {
+    if (exists(winDir) && exists(join(winDir, "config.json"))) {
       return winDir;
     }
   }
-  return join(homedir(), ".openclaw", "jarvis");
+  return join(home, ".openclaw", "jarvis");
 }
 
 export const CONFIG_DIR = locateConfigDir();
