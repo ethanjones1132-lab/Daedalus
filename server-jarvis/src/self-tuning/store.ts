@@ -613,7 +613,185 @@ const SELF_TUNING_SCHEMA = `
   );
 `;
 
+/**
+ * Persistent schema version for the dedicated telemetry DB (DS-29, 2026-10-21
+ * startup audit).
+ *
+ * `SELF_TUNING_SCHEMA` is `CREATE ... IF NOT EXISTS`, so it can never widen a
+ * table that already exists. The 25 additive columns those tables gained over
+ * time therefore needed `ALTER TABLE ... ADD COLUMN` on every pre-existing DB,
+ * and every one of those statements was wrapped in `catch {}` — on an
+ * already-current DB all 25 threw "duplicate column name" and were swallowed,
+ * so the 25 failing statements ran on *every* boot and a genuine migration
+ * failure (locked DB, full disk, corrupt schema) was indistinguishable from
+ * "already there".
+ *
+ * The version lives in SQLite's own header (`PRAGMA user_version`), so it is
+ * transactional and survives process restarts. Nothing else writes that field
+ * for this file (verified: zero `user_version` uses in `src-tauri/src` and
+ * `server-jarvis/src` before this change), so a value at or above this
+ * constant is treated as already-current — or as belonging to a newer/foreign
+ * writer — and is never overwritten.
+ *
+ * Bump this constant (and extend `ADDITIVE_COLUMN_MIGRATIONS`) whenever a
+ * column is added to `SELF_TUNING_SCHEMA`; existing v1+ files are skipped, so
+ * an unbumped add would never reach them.
+ */
+export const SELF_TUNING_SCHEMA_VERSION = 1;
+
+/** One additive column the v0 → v1 telemetry migration must guarantee. */
+interface AdditiveColumnMigration {
+  table: string;
+  column: string;
+  /** SQLite type as declared by the legacy `ALTER TABLE ... ADD COLUMN`. */
+  type: string;
+}
+
+/**
+ * The 25 additive columns, in the exact order the old unconditional ALTERs
+ * used. Order is preserved because it is the order SQLite would report in
+ * `PRAGMA table_info` for upgraded DBs; the set is what matters, not the order.
+ */
+const ADDITIVE_COLUMN_MIGRATIONS: readonly AdditiveColumnMigration[] = [
+  // Run truthfulness: outcome, how it was verified, and the verification tier.
+  { table: "agent_runs", column: "outcome", type: "TEXT" },
+  { table: "agent_runs", column: "verified_via", type: "TEXT" },
+  { table: "agent_runs", column: "check_tier", type: "TEXT" },
+  // Theme 1 / Task 3: why verification declined (tier none).
+  { table: "agent_runs", column: "check_declined_reason", type: "TEXT" },
+  // Phase B: scalar ground-truth run reward (B1–B3).
+  { table: "agent_runs", column: "reward_score", type: "REAL" },
+  { table: "agent_runs", column: "reward_json", type: "TEXT" },
+  // Model attribution detail.
+  { table: "model_attributions", column: "first_token_ms", type: "INTEGER" },
+  { table: "model_attributions", column: "escalation_id", type: "TEXT" },
+  // Theme 1 / Task 1: join attributions to the exact stage_runs row.
+  { table: "model_attributions", column: "stage_run_id", type: "TEXT" },
+  // Conductor directive provenance.
+  { table: "conductor_directives", column: "decision_source", type: "TEXT" },
+  { table: "conductor_directives", column: "escalation_id", type: "TEXT" },
+  // T0.2: truncation honesty columns on stage_runs.
+  { table: "stage_runs", column: "stop_reason", type: "TEXT" },
+  { table: "stage_runs", column: "partial_error_code", type: "TEXT" },
+  // Task 5: delegate process diagnostics (request id / stderr tail).
+  { table: "stage_runs", column: "diagnostic_json", type: "TEXT" },
+  // Theme 1 / Task 2: exception text behind a typed stage error code.
+  { table: "stage_runs", column: "failure_detail", type: "TEXT" },
+  // P5.1: conductor routing latency was only ever a console.log line.
+  { table: "conductor_runs", column: "latency_ms", type: "INTEGER" },
+  // M7: self-tuning outcome loop — baseline snapshot on apply.
+  { table: "tuning_proposals", column: "applied_at", type: "TEXT" },
+  { table: "tuning_proposals", column: "baseline_success_rate", type: "REAL" },
+  { table: "tuning_proposals", column: "pre_apply_run_count", type: "INTEGER" },
+  { table: "tuning_proposals", column: "pre_apply_run_ids", type: "TEXT" },
+  // M7: rich measured outcomes.
+  { table: "tuning_outcomes", column: "measured", type: "REAL" },
+  { table: "tuning_outcomes", column: "baseline", type: "REAL" },
+  { table: "tuning_outcomes", column: "improved", type: "INTEGER" },
+  { table: "tuning_outcomes", column: "sample_n", type: "INTEGER" },
+  { table: "tuning_outcomes", column: "notes", type: "TEXT" },
+];
+
+/**
+ * Index on the newest additive column. It is deliberately NOT part of
+ * `SELF_TUNING_SCHEMA` (that block runs before the migration and would throw
+ * `no such column: stage_run_id` on a pre-existing table — see the 2026-08-05
+ * incident note above); the migration creates it only once the column exists.
+ */
+const MODEL_ATTRIBUTIONS_STAGE_RUN_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_model_attributions_stage_run_id
+  ON model_attributions(stage_run_id)
+`;
+
 const schemaEnsuredPaths = new Set<string>();
+
+/** Read `PRAGMA user_version` (0 when unset, which is every pre-v1 DB). */
+function readSchemaVersion(db: Database): number {
+  const row = db.query("PRAGMA user_version").get() as { user_version?: number } | null;
+  const version = Number(row?.user_version ?? 0);
+  return Number.isFinite(version) && version >= 0 ? version : 0;
+}
+
+/** Column names of one telemetry table, via SQLite's own schema introspection. */
+function existingColumns(db: Database, table: string): Set<string> {
+  // The table name is interpolated, not bound: `PRAGMA table_info(...)` takes an
+  // identifier, and every caller passes a literal from our own migrations list.
+  const rows = db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+interface SchemaEnsureResult {
+  /** Version in force after this call (ours, or a newer foreign version). */
+  version: number;
+  /** Additive `ALTER TABLE ... ADD COLUMN` statements actually executed. */
+  applied: number;
+}
+
+/**
+ * Bring one telemetry DB connection to `SELF_TUNING_SCHEMA_VERSION`.
+ *
+ * - Version already at/above ours: nothing is written at all (no ALTERs, no
+ *   marker rewrite). A newer/foreign `user_version` is left untouched.
+ * - Unversioned DB (fresh file, partially migrated legacy file, or a fully
+ *   migrated file from before this marker existed): the additive columns that
+ *   are genuinely missing are added from introspection, never from "an ALTER
+ *   threw, so the column must already exist". Anything unexpected propagates.
+ * - The DDL and the version stamp share one `BEGIN IMMEDIATE` transaction, so
+ *   either every required column + the stage_run_id index is applied and the
+ *   marker lands, or nothing does — a failed migration leaves version 0 and
+ *   the next open retries from the untouched schema.
+ *
+ * Throws on any genuine SQLite failure; callers own fail-closed handling.
+ */
+function ensureSelfTuningSchema(db: Database): SchemaEnsureResult {
+  const current = readSchemaVersion(db);
+  if (current >= SELF_TUNING_SCHEMA_VERSION) return { version: current, applied: 0 };
+
+  // Take the write lock before deciding the file is unversioned, so two
+  // concurrent openers cannot both run the ALTER set.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const version = readSchemaVersion(db);
+    if (version >= SELF_TUNING_SCHEMA_VERSION) {
+      db.exec("COMMIT");
+      return { version, applied: 0 };
+    }
+
+    // Base tables and additive columns must roll back together. A failed
+    // upgrade must not leave newly created telemetry tables behind.
+    db.exec(SELF_TUNING_SCHEMA);
+
+    const columnsByTable = new Map<string, Set<string>>();
+    let applied = 0;
+    for (const migration of ADDITIVE_COLUMN_MIGRATIONS) {
+      let columns = columnsByTable.get(migration.table);
+      if (!columns) {
+        columns = existingColumns(db, migration.table);
+        columnsByTable.set(migration.table, columns);
+      }
+      // Introspection, not a caught error: an ALTER is only attempted when the
+      // column is genuinely absent.
+      if (columns.has(migration.column)) continue;
+      db.exec(`ALTER TABLE ${migration.table} ADD COLUMN ${migration.column} ${migration.type}`);
+      columns.add(migration.column);
+      applied += 1;
+    }
+
+    // Every column this index covers is now either pre-existing or just added.
+    db.exec(MODEL_ATTRIBUTIONS_STAGE_RUN_INDEX_SQL);
+
+    // Same transaction as the DDL: rolled back together on any failure above,
+    // so a later open sees the pre-migration version and retries.
+    db.exec(`PRAGMA user_version = ${SELF_TUNING_SCHEMA_VERSION}`);
+    db.exec("COMMIT");
+    return { version: SELF_TUNING_SCHEMA_VERSION, applied };
+  } catch (e) {
+    try {
+      db.exec("ROLLBACK");
+    } catch { /* transaction already unwound by SQLite */ }
+    throw e;
+  }
+}
 
 class RunFinalizationAbort extends Error {
   constructor(readonly status: "already_terminal") {
@@ -744,96 +922,25 @@ export class SelfTuningStore {
         // production telemetry actually lives here. One log line makes the
         // real sink discoverable from the server log instead of forensics.
         console.log(`[SelfTuningStore] telemetry sink: ${dbPath}`);
-        db.exec(SELF_TUNING_SCHEMA);
-        // Guarded migration: add the `outcome` column to pre-existing agent_runs
-        // tables (CREATE TABLE IF NOT EXISTS won't ALTER an existing table). The
-        // duplicate-column error on an already-migrated DB is expected and ignored.
         try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN outcome TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN verified_via TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN check_tier TEXT`);
-        } catch { /* column already exists */ }
-        // Theme 1 / Task 3: why verification declined (tier none).
-        try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN check_declined_reason TEXT`);
-        } catch { /* column already exists */ }
-        // Phase B: scalar ground-truth run reward (B1–B3).
-        try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN reward_score REAL`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE agent_runs ADD COLUMN reward_json TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE model_attributions ADD COLUMN first_token_ms INTEGER`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE model_attributions ADD COLUMN escalation_id TEXT`);
-        } catch { /* column already exists */ }
-        // Theme 1 / Task 1: join attributions to the exact stage_runs row.
-        try {
-          db.exec(`ALTER TABLE model_attributions ADD COLUMN stage_run_id TEXT`);
-        } catch { /* column already exists */ }
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_model_attributions_stage_run_id
-                 ON model_attributions(stage_run_id)`);
-        try {
-          db.exec(`ALTER TABLE conductor_directives ADD COLUMN decision_source TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE conductor_directives ADD COLUMN escalation_id TEXT`);
-        } catch { /* column already exists */ }
-        // T0.2: truncation honesty columns on stage_runs.
-        try {
-          db.exec(`ALTER TABLE stage_runs ADD COLUMN stop_reason TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE stage_runs ADD COLUMN partial_error_code TEXT`);
-        } catch { /* column already exists */ }
-        // Task 5: delegate process diagnostics (request id / stderr tail).
-        try {
-          db.exec(`ALTER TABLE stage_runs ADD COLUMN diagnostic_json TEXT`);
-        } catch { /* column already exists */ }
-        // Theme 1 / Task 2: exception text behind a typed stage error code.
-        try {
-          db.exec(`ALTER TABLE stage_runs ADD COLUMN failure_detail TEXT`);
-        } catch { /* column already exists */ }
-        // P5.1: conductor routing latency was only ever a console.log line —
-        // querying "how long did routing take" always meant grepping logs.
-        try {
-          db.exec(`ALTER TABLE conductor_runs ADD COLUMN latency_ms INTEGER`);
-        } catch { /* column already exists */ }
-        // M7: self-tuning outcome loop — baseline snapshot on apply + rich outcomes.
-        try {
-          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN applied_at TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN baseline_success_rate REAL`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN pre_apply_run_count INTEGER`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_proposals ADD COLUMN pre_apply_run_ids TEXT`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN measured REAL`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN baseline REAL`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN improved INTEGER`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN sample_n INTEGER`);
-        } catch { /* column already exists */ }
-        try {
-          db.exec(`ALTER TABLE tuning_outcomes ADD COLUMN notes TEXT`);
-        } catch { /* column already exists */ }
+          // DS-29: versioned additive migration. An already-current file does
+          // no schema work at all; a legacy file is introspected and upgraded
+          // in one transaction. Genuine failures propagate to the outer catch.
+          const schema = ensureSelfTuningSchema(db);
+          // `applied=0` is the cold-start evidence DS-29 asked for: the 25
+          // failing ALTERs no longer run on every boot.
+          console.log(
+            `[SelfTuningStore] schema ready: version=${schema.version} applied=${schema.applied}`,
+          );
+        } catch (e) {
+          // Fail closed (the caller still gets `null`) but never leak the
+          // connection the failed migration abandoned, and never memoize the
+          // path: the rolled-back file is retried by the next open.
+          try {
+            db.close();
+          } catch { /* connection already unusable */ }
+          throw e;
+        }
         schemaEnsuredPaths.add(dbPath);
       }
       return db;
