@@ -9,7 +9,14 @@ console.log(`[Jarvis startup] process entry uptime=${process.uptime()}s timeOrig
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
 import { installSelfLog, selfLogPath } from "./self-log";
+import { guardServerBind, installRejectionGuard, resolveBindTarget } from "./server-guards";
 installSelfLog();
+// DD-035 / DS-30: installed right after the self-log tee (so the line is
+// captured no matter how this process was spawned) and before any async startup
+// work. Bun exits the process on an unhandled rejection by default, and this
+// entrypoint has many floating promises; a stray rejection must become one
+// bounded log line with the server still running, never a mid-turn shutdown.
+installRejectionGuard();
 // Native memory bootstrap must capture and strip the owned capability from
 // `process.env` before any tool runtime or child subprocess can clone it.
 import {
@@ -6763,18 +6770,31 @@ export async function baseFetch(req: Request): Promise<Response> {
 // ═══════════════════════════════════════════════════════════════
 // ── HTTP Server ──
 // ═══════════════════════════════════════════════════════════════
-serve({
-  port: PORT,
-  // Disable Bun's idle-connection timeout (default 10s). Chat is a long-lived
-  // SSE stream: during a single model call the server sends no frames, and a
-  // slow local/free model can idle well past 10s — Bun would close the socket
-  // mid-turn and the user would see a silent stall. Bun's max finite idleTimeout
-  // is 255s, which is still under MODEL_REQUEST_TIMEOUT_MS (300s), so the only
-  // safe choice is to disable it here and rely on the per-request abort timeout
-  // (300s) and the Rust relay's own 900s ceiling to bound a genuinely hung turn.
-  idleTimeout: 0,
-  fetch: baseFetch,
-});
+// DD-035 / DS-31: `serve()` throws synchronously at bind time, so a taken port
+// used to kill the process with a raw stack — the competing-spawn / ghost-socket
+// state recorded in the /health comment above. The guard names the host and port
+// and exits 1 on EADDRINUSE, and rethrows every other bind failure untouched.
+// The options below are unchanged; hostname is stated explicitly at Bun's
+// default (all interfaces) so the diagnostic can never name a host we did not
+// actually bind.
+const BIND_TARGET = resolveBindTarget(PORT);
+
+guardServerBind(
+  () => serve({
+    hostname: BIND_TARGET.hostname,
+    port: PORT,
+    // Disable Bun's idle-connection timeout (default 10s). Chat is a long-lived
+    // SSE stream: during a single model call the server sends no frames, and a
+    // slow local/free model can idle well past 10s — Bun would close the socket
+    // mid-turn and the user would see a silent stall. Bun's max finite idleTimeout
+    // is 255s, which is still under MODEL_REQUEST_TIMEOUT_MS (300s), so the only
+    // safe choice is to disable it here and rely on the per-request abort timeout
+    // (300s) and the Rust relay's own 900s ceiling to bound a genuinely hung turn.
+    idleTimeout: 0,
+    fetch: baseFetch,
+  }),
+  BIND_TARGET,
+);
 
 console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
 
