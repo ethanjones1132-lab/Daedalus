@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Compass, Plus, RefreshCw, Settings2 } from 'lucide-react';
+import { Compass, Globe, Plus, RefreshCw, Server, Settings2 } from 'lucide-react';
 import {
   AlertLine,
   Button,
@@ -19,6 +19,12 @@ import {
 } from '../../domain/model-profile-creation-state';
 import { profileOperationLocked, reduceProfileOperation, type ProfileOperationPhase } from '../../domain/profile-operation-state';
 import { useNavigation } from '../../shell/navigation';
+import {
+  DISCOVERY_COMMANDS,
+  decodeDiscoveredModels,
+  mergeDiscoveredModels,
+  type DiscoverySource,
+} from './discovery';
 import { DiscoveredModels } from './DiscoveredModels';
 import { ProfileCreateDialog } from './ProfileCreateDialog';
 import { ActiveProfileHero, ProfileCard } from './ProfileViews';
@@ -26,18 +32,21 @@ import type { DiscoveredModel, EffectiveRuntimeConfig, ModelProfile } from './ty
 import { useObservedResource } from './useObservedResource';
 
 type CreationError = 'validation' | 'write' | 'reconciliation' | null;
-type DiscoveryState =
-  | { phase: 'idle' }
-  | { phase: 'pending' }
-  | { phase: 'failed' }
-  | { phase: 'done'; models: DiscoveredModel[] };
+type DiscoveryRun = 'idle' | 'pending' | 'failed';
+type SourceDiscoveryState = 'idle' | 'pending' | 'failed';
+/** Where the OpenRouter key stands. The key itself is held only to forward it to the discovery command. */
+type OpenRouterCredential =
+  | { phase: 'loading' }
+  | { phase: 'ready'; apiKey: string }
+  | { phase: 'missing' }
+  | { phase: 'unavailable' };
 
 const RECONCILIATION_MESSAGE = 'Profile created, but the profile list did not confirm it. Retry reloads the list only.';
 
-function isDiscoveredModel(value: unknown): value is DiscoveredModel {
-  if (!value || typeof value !== 'object') return false;
-  const v = value as Record<string, unknown>;
-  return typeof v.id === 'string' && typeof v.name === 'string' && typeof v.provider === 'string';
+function readConfigSection(config: unknown, key: 'ollama' | 'openrouter'): Record<string, unknown> {
+  if (!config || typeof config !== 'object') return {};
+  const section = (config as Record<string, unknown>)[key];
+  return section && typeof section === 'object' ? (section as Record<string, unknown>) : {};
 }
 
 /** Inference: saved model profiles, the active one, and model discovery. */
@@ -75,8 +84,43 @@ export default function ModelsPage() {
   const mutationLocked = profileOperationLocked(phase) || creatingProfile || profileCreationError === 'reconciliation';
 
   // ── Discovery ──────────────────────────────────────────────
-  const [discovery, setDiscovery] = useState<DiscoveryState>({ phase: 'idle' });
+  // Every discovery path is an explicit action: nothing here runs on load.
+  const discoveryReasonId = useId();
+  const [discovery, setDiscovery] = useState<DiscoveryRun>('idle');
   const discoveryRequest = useRef(0);
+  const [sources, setSources] = useState<Record<DiscoverySource, SourceDiscoveryState>>({
+    ollama: 'idle',
+    openrouter: 'idle',
+  });
+  const sourceRequests = useRef<Record<DiscoverySource, number>>({ ollama: 0, openrouter: 0 });
+  const sourcePending = useRef<Record<DiscoverySource, boolean>>({ ollama: false, openrouter: false });
+  const [discovered, setDiscovered] = useState<DiscoveredModel[]>([]);
+  const [discoverySucceeded, setDiscoverySucceeded] = useState(false);
+  const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string | null>(null);
+  const [openRouterCredential, setOpenRouterCredential] = useState<OpenRouterCredential>({ phase: 'loading' });
+
+  // Read the Inference settings so OpenRouter discovery can pass its key. The key
+  // is never rendered; it is held only long enough to reach the native command.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const config = await invoke<unknown>('jarvis_get_config');
+        if (cancelled) return;
+        const ollama = readConfigSection(config, 'ollama');
+        const ollamaUrl = typeof ollama.base_url === 'string' ? ollama.base_url.trim() : '';
+        setOllamaBaseUrl(ollamaUrl || null);
+        const openrouter = readConfigSection(config, 'openrouter');
+        const apiKey = typeof openrouter.api_key === 'string' ? openrouter.api_key.trim() : '';
+        setOpenRouterCredential(apiKey ? { phase: 'ready', apiKey } : { phase: 'missing' });
+      } catch {
+        if (!cancelled) setOpenRouterCredential({ phase: 'unavailable' });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refreshProfiles = useCallback(
     async (supersede = false) => {
@@ -249,20 +293,62 @@ export default function ModelsPage() {
   // ── Discovery ──────────────────────────────────────────────
   const discover = useCallback(async () => {
     const requestId = ++discoveryRequest.current;
-    setDiscovery({ phase: 'pending' });
+    setDiscovery('pending');
     try {
       const result = await invoke<unknown>('jarvis_discover_models');
       if (discoveryRequest.current !== requestId) return;
-      if (!Array.isArray(result)) throw new Error('Unexpected discovery payload');
-      setDiscovery({ phase: 'done', models: result.filter(isDiscoveredModel) });
+      const models = decodeDiscoveredModels(result);
+      setDiscovered((current) => mergeDiscoveredModels(current, models));
+      setDiscoverySucceeded(true);
+      setDiscovery('idle');
     } catch {
       if (discoveryRequest.current !== requestId) return;
       // Native errors may carry endpoint details; show a fixed sentence.
-      setDiscovery({ phase: 'failed' });
+      setDiscovery('failed');
     }
   }, []);
 
-  const discovering = discovery.phase === 'pending';
+  const discoverFrom = useCallback(
+    async (source: DiscoverySource) => {
+      if (sourcePending.current[source]) return;
+      const apiKey = openRouterCredential.phase === 'ready' ? openRouterCredential.apiKey : '';
+      if (source === 'openrouter' && !apiKey) return;
+      sourcePending.current[source] = true;
+      const requestId = ++sourceRequests.current[source];
+      setSources((current) => ({ ...current, [source]: 'pending' }));
+      try {
+        let result: unknown;
+        if (source === 'ollama') {
+          // `base_url` is optional: omit it and the native side falls back to OLLAMA_BASE_URL.
+          result = await invoke<unknown>(DISCOVERY_COMMANDS.ollama, ollamaBaseUrl ? { baseUrl: ollamaBaseUrl } : {});
+        } else {
+          result = await invoke<unknown>(DISCOVERY_COMMANDS.openrouter, { apiKey });
+        }
+        if (sourceRequests.current[source] !== requestId) return;
+        const models = decodeDiscoveredModels(result);
+        setDiscovered((current) => mergeDiscoveredModels(current, models));
+        setDiscoverySucceeded(true);
+        setSources((current) => ({ ...current, [source]: 'idle' }));
+      } catch {
+        if (sourceRequests.current[source] !== requestId) return;
+        // Native errors may carry endpoint or key details; show a fixed sentence.
+        setSources((current) => ({ ...current, [source]: 'failed' }));
+      } finally {
+        if (sourceRequests.current[source] === requestId) sourcePending.current[source] = false;
+      }
+    },
+    [ollamaBaseUrl, openRouterCredential],
+  );
+
+  const discovering = discovery === 'pending';
+  const openRouterReason =
+    openRouterCredential.phase === 'loading'
+      ? 'Checking whether an OpenRouter key is configured…'
+      : openRouterCredential.phase === 'missing'
+        ? 'Add an OpenRouter API key in Settings to discover OpenRouter models.'
+        : openRouterCredential.phase === 'unavailable'
+          ? 'Could not read the OpenRouter key from Settings. Reload to try again.'
+          : null;
 
   // ── Feedback ───────────────────────────────────────────────
   const creationFeedbackActive = creatingProfile || profileCreationError !== null;
@@ -385,6 +471,68 @@ export default function ModelsPage() {
         )}
       </div>
 
+      <section aria-label="Model discovery" className="mt-6 space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="secondary"
+            icon={<Server />}
+            busy={sources.ollama === 'pending'}
+            disabled={sources.ollama === 'pending'}
+            onClick={() => void discoverFrom('ollama')}
+          >
+            {sources.ollama === 'pending' ? 'Discovering from Ollama…' : 'Discover from Ollama'}
+          </Button>
+          <Button
+            variant="secondary"
+            icon={<Globe />}
+            busy={sources.openrouter === 'pending'}
+            disabled={sources.openrouter === 'pending' || openRouterReason !== null}
+            aria-describedby={openRouterReason !== null ? discoveryReasonId : undefined}
+            onClick={() => void discoverFrom('openrouter')}
+          >
+            {sources.openrouter === 'pending' ? 'Discovering from OpenRouter…' : 'Discover from OpenRouter'}
+          </Button>
+          {openRouterReason !== null && (
+            <p id={discoveryReasonId} className="text-[11.5px] text-ink-3">
+              {openRouterReason}
+            </p>
+          )}
+        </div>
+        {discovery === 'pending' && <StatusLine label="Model discovery">Discovering models…</StatusLine>}
+        {discovery === 'failed' && (
+          <AlertLine label="Model discovery" onRetry={() => void discover()} retryText="Retry discovery">
+            Could not discover models. Check that an Inference backend is running.
+          </AlertLine>
+        )}
+        {sources.ollama === 'pending' && (
+          <StatusLine label="Ollama discovery">Contacting Ollama for its model list…</StatusLine>
+        )}
+        {sources.ollama === 'failed' && (
+          <AlertLine label="Ollama discovery" onRetry={() => void discoverFrom('ollama')} retryText="Retry Ollama discovery">
+            Could not discover models from Ollama. Check that Ollama is running.
+          </AlertLine>
+        )}
+        {sources.openrouter === 'pending' && (
+          <StatusLine label="OpenRouter discovery">Contacting OpenRouter for its model list…</StatusLine>
+        )}
+        {sources.openrouter === 'failed' && (
+          <AlertLine
+            label="OpenRouter discovery"
+            onRetry={() => void discoverFrom('openrouter')}
+            retryText="Retry OpenRouter discovery"
+          >
+            Could not discover models from OpenRouter. Check the OpenRouter key in Settings.
+          </AlertLine>
+        )}
+        {discoverySucceeded && (
+          <DiscoveredModels
+            models={discovered}
+            disabled={mutationLocked}
+            onCreate={(m) => openCreateDialog({ name: m.name, backend: m.provider, model: m.id })}
+          />
+        )}
+      </section>
+
       <div className="mt-6 space-y-8">
         {observed && profiles.length === 0 ? (
           <EmptyState
@@ -414,24 +562,6 @@ export default function ModelsPage() {
               </section>
             )}
           </>
-        )}
-
-        {discovery.phase !== 'idle' && (
-          <section aria-label="Model discovery" className="space-y-2">
-            {discovery.phase === 'pending' && <StatusLine label="Model discovery">Discovering models…</StatusLine>}
-            {discovery.phase === 'failed' && (
-              <AlertLine label="Model discovery" onRetry={() => void discover()} retryText="Retry discovery">
-                Could not discover models. Check that an Inference backend is running.
-              </AlertLine>
-            )}
-            {discovery.phase === 'done' && (
-              <DiscoveredModels
-                models={discovery.models}
-                disabled={mutationLocked}
-                onCreate={(m) => openCreateDialog({ name: m.name, backend: m.provider, model: m.id })}
-              />
-            )}
-          </section>
         )}
       </div>
     </Page>
