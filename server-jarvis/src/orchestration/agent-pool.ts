@@ -26,7 +26,7 @@ export interface AgentCapabilities {
 
 export interface OrchestratorAgent {
   id: string;
-  provider: "openrouter" | "ollama" | "claude_cli" | "opencode_zen" | "opencode_go";
+  provider: "openrouter" | "ollama" | "claude_cli" | "opencode_zen" | "opencode_go" | "vllm";
   model_id: string;
   capabilities: AgentCapabilities;
   default_for: string[];

@@ -142,6 +142,16 @@ export interface OpenCodeProviderConfig {
   first_token_timeout_ms: number;
 }
 
+/** Explicit self-hosted vLLM endpoint. Secrets stay in the named environment variable. */
+export interface VllmConfig {
+  enabled: boolean;
+  base_url: string;
+  model: string;
+  api_key_env: string;
+  /** First-token watchdog; large models can spend over a minute loading. */
+  first_token_timeout_ms: number;
+}
+
 export interface ClaudeCliConfig {
   enabled: boolean;
   /** Proxy uses Jarvis' local Anthropic-compatible endpoint; subscription uses Claude OAuth/keychain auth. */
@@ -516,6 +526,8 @@ export interface JarvisConfig {
   opencode_zen: OpenCodeProviderConfig;
   /** OpenCode Go — OpenAI-compatible secondary provider for pool agents. */
   opencode_go: OpenCodeProviderConfig;
+  /** Self-hosted vLLM — off until explicitly enabled and configured. */
+  vllm: VllmConfig;
   claude_cli: ClaudeCliConfig;
   tools: ToolConfig;
   reasoning: ReasoningConfig;
@@ -712,6 +724,13 @@ export function defaultConfig(): JarvisConfig {
       base_url: "https://opencode.ai/zen/go/v1",
       api_key: "",
       first_token_timeout_ms: 45_000,
+    },
+    vllm: {
+      enabled: false,
+      base_url: "",
+      model: "",
+      api_key_env: "",
+      first_token_timeout_ms: 120_000,
     },
     claude_cli: {
       enabled: true,
@@ -972,6 +991,19 @@ export interface NormalizeConfigOptions {
   healInvalidTrajectorySnapshots?: boolean;
 }
 
+/** Parse the public vLLM settings while dropping unsupported secret fields. */
+export function normalizeVllmConfig(raw: unknown): VllmConfig {
+  const value = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const timeout = Number(value.first_token_timeout_ms);
+  return {
+    enabled: value.enabled === true,
+    base_url: typeof value.base_url === "string" ? value.base_url.trim() : "",
+    model: typeof value.model === "string" ? value.model.trim() : "",
+    api_key_env: typeof value.api_key_env === "string" ? value.api_key_env.trim() : "",
+    first_token_timeout_ms: Number.isFinite(timeout) && timeout > 0 ? timeout : 120_000,
+  };
+}
+
 /** True when a configured jarvis_path is unusable on this platform. */
 export function isInvalidWorkspacePath(
   path: string,
@@ -1025,6 +1057,7 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const merged = deepMerge(defaultConfig(), raw);
+  merged.vllm = normalizeVllmConfig(merged.vllm);
   const configuredTrajectoryRetention = merged.orchestrator?.conductor_learning?.max_trajectory_snapshots;
   if (!isValidTrajectoryRetention(configuredTrajectoryRetention)) {
     if (options.healInvalidTrajectorySnapshots !== false) {
@@ -1241,6 +1274,39 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
 
+  const vllm = cfg.vllm as VllmConfig & { api_key?: unknown };
+  if (Object.prototype.hasOwnProperty.call(vllm ?? {}, "api_key")) {
+    errors.push("vllm.api_key is not supported; use vllm.api_key_env for an environment variable name");
+  }
+  if (vllm?.api_key_env && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(vllm.api_key_env)) {
+    errors.push("vllm.api_key_env must be an environment variable name");
+  }
+  if (vllm?.enabled) {
+    if (!vllm.base_url?.trim()) {
+      errors.push("vllm.base_url is required when vLLM is enabled");
+    } else {
+      let endpoint: URL | undefined;
+      try {
+        endpoint = new URL(vllm.base_url);
+      } catch {
+        errors.push("vllm.base_url must be an absolute HTTP URL");
+      }
+      if (endpoint && (
+        (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") ||
+        endpoint.username.length > 0 || endpoint.password.length > 0
+      )) {
+        errors.push("vllm.base_url must use HTTP or HTTPS without embedded credentials");
+      }
+      if (endpoint && (
+        endpoint.search.length > 0 || endpoint.hash.length > 0 ||
+        vllm.base_url.includes("?") || vllm.base_url.includes("#")
+      )) {
+        errors.push("vllm.base_url must not contain a query string or fragment");
+      }
+    }
+    if (!vllm.model?.trim()) errors.push("vllm.model is required when vLLM is enabled");
+  }
+
   // Backend validation
   if (cfg.active_backend === "ollama") {
     if (!cfg.ollama.model) errors.push("Ollama model is required");
@@ -1332,6 +1398,7 @@ const KNOWN_SETTING_KEYS = new Set([
   "openrouter",
   "opencode_zen",
   "opencode_go",
+  "vllm",
   "claude_cli",
   "tools",
   "reasoning",
@@ -1368,6 +1435,30 @@ export interface SettingMutation {
 export function normalizeSettingMutation(mutation: SettingMutation): { key: string; value: string } {
   if (!KNOWN_SETTING_KEYS.has(mutation.key)) {
     throw new Error(`unknown_setting: ${mutation.key}`);
+  }
+  if (mutation.key === "vllm") {
+    if (mutation.value === null || mutation.value === undefined || mutation.value === "") {
+      return { key: mutation.key, value: "" };
+    }
+    let raw: unknown = mutation.value;
+    if (typeof raw === "string") {
+      try {
+        raw = JSON.parse(raw);
+      } catch {
+        throw new Error("vllm setting must be a JSON object");
+      }
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("vllm setting must be a JSON object");
+    }
+    if (Object.prototype.hasOwnProperty.call(raw, "api_key")) {
+      throw new Error("vllm.api_key is not supported; use vllm.api_key_env for an environment variable name");
+    }
+    const normalized = normalizeVllmConfig(raw);
+    const validation = validateConfig({ ...defaultConfig(), vllm: normalized });
+    const vllmErrors = validation.errors.filter((error) => error.startsWith("vllm."));
+    if (vllmErrors.length > 0) throw new Error(vllmErrors.join("; "));
+    return { key: mutation.key, value: JSON.stringify(normalized) };
   }
   const value =
     mutation.value === null || mutation.value === undefined

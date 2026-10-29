@@ -1,5 +1,6 @@
 import type { BackendType, JarvisConfig } from "./config";
 import type { OrchestratorAgent } from "./orchestration/agent-pool";
+import { resolveProviderTarget } from "./providers";
 
 type RoutedProvider = OrchestratorAgent["provider"];
 
@@ -8,7 +9,11 @@ function hasCredential(value: string | undefined): boolean {
 }
 
 /** True only when Jarvis can make a request to this provider right now. */
-export function isProviderAvailable(cfg: JarvisConfig, provider: RoutedProvider): boolean {
+export function isProviderAvailable(
+  cfg: JarvisConfig,
+  provider: RoutedProvider,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   switch (provider) {
     case "openrouter":
       return hasCredential(cfg.openrouter.api_key);
@@ -16,6 +21,13 @@ export function isProviderAvailable(cfg: JarvisConfig, provider: RoutedProvider)
       return hasCredential(cfg.opencode_zen?.api_key);
     case "opencode_go":
       return hasCredential(cfg.opencode_go?.api_key);
+    case "vllm":
+      try {
+        resolveProviderTarget(cfg, "vllm", env);
+        return true;
+      } catch {
+        return false;
+      }
     case "ollama":
       // Local, no credential to check, no per-request cost. A pool-selected
       // ollama agent resolves its own reachability at call time (with
@@ -34,21 +46,54 @@ export function isProviderAvailable(cfg: JarvisConfig, provider: RoutedProvider)
  * OpenRouter retarget). 2026-07-31: the stage-dispatch path in index.ts now
  * routes ollama-provider agents through resolveOllamaChatTarget instead of
  * resolveProviderTarget, so ollama is a real routable target again — only
- * claude_cli remains genuinely unwired for stage dispatch.
+ * claude_cli remains genuinely unwired for stage dispatch. An explicitly
+ * configured vLLM model is projected here so /agents/pool and stage routing
+ * use the same availability gate.
  */
-export function routableOrchestratorAgents(cfg: JarvisConfig): OrchestratorAgent[] {
-  const ROUTABLE = new Set(["openrouter", "opencode_zen", "opencode_go", "ollama"]);
-  return (cfg.orchestrator?.agents ?? []).filter((agent) => {
+export function routableOrchestratorAgents(
+  cfg: JarvisConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): OrchestratorAgent[] {
+  const ROUTABLE = new Set(["openrouter", "opencode_zen", "opencode_go", "ollama", "vllm"]);
+  const configured = cfg.orchestrator?.agents ?? [];
+  const configuredVllm = configured.find((agent) =>
+    agent.provider === "vllm" && agent.model_id === cfg.vllm?.model,
+  );
+  const vllmAgents: OrchestratorAgent[] = [];
+  if (isProviderAvailable(cfg, "vllm", env)) {
+    if (configuredVllm) {
+      vllmAgents.push({
+        ...configuredVllm,
+        first_token_timeout_ms: configuredVllm.first_token_timeout_ms ?? cfg.vllm.first_token_timeout_ms,
+      });
+    } else {
+      const explicitlyDisabled = configured.some((agent) =>
+        agent.provider === "vllm" && agent.model_id === cfg.vllm.model && agent.enabled === false,
+      );
+      if (!explicitlyDisabled) {
+        vllmAgents.push({
+          id: "configured-vllm",
+          provider: "vllm",
+          model_id: cfg.vllm.model,
+          capabilities: { code: 0.7, reasoning: 0.7, speed: 0.65, cost: 0.5, json_reliability: 0.7 },
+          default_for: [],
+          enabled: true,
+          first_token_timeout_ms: cfg.vllm.first_token_timeout_ms,
+        });
+      }
+    }
+  }
+  return [...configured.filter((agent) => agent.provider !== "vllm"), ...vllmAgents].filter((agent) => {
     if (!ROUTABLE.has(agent.provider)) {
       if (agent.enabled !== false) {
         console.warn(
           `[providers] filtering unroutable pool agent id=${agent.id} provider=${agent.provider} ` +
-          `(only openrouter/opencode_zen/opencode_go/ollama are served over HTTP/local)`,
+          `(only openrouter/opencode_zen/opencode_go/vllm/ollama are served over HTTP/local)`,
         );
       }
       return false;
     }
-    return isProviderAvailable(cfg, agent.provider);
+    return isProviderAvailable(cfg, agent.provider, env);
   });
 }
 

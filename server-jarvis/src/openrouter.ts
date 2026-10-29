@@ -10,8 +10,12 @@ import {
   resolveProviderTarget,
   providerChatUrl,
   providerHeaders,
+  providerSupportsNativeTools,
+  redactProviderSecret,
+  VllmProviderRequestError,
   type HttpProviderId,
 } from "./providers";
+import { routableOrchestratorAgents } from "./provider-availability";
 import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall, recordSuccess } from "./model-failure-memory";
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
@@ -335,11 +339,12 @@ export async function resolveEffectiveOpenRouterRequestConfig(
     requestedTemperature?: unknown;
     requestedTopP?: unknown;
     surface?: SurfaceType;
+    fetcher?: typeof fetch;
   } = {},
 ): Promise<EffectiveOpenRouterRequestConfig> {
   let model: OpenRouterModel | undefined;
   try {
-    const models = await listOpenRouterModels(cfg);
+    const models = await listOpenRouterModels(cfg, false, options.fetcher);
     model = models.find((candidate) => candidate.id === modelId);
   } catch (error) {
     console.warn("[OpenRouter] Failed to resolve model catalog metadata:", error);
@@ -403,6 +408,7 @@ export async function applyOpenRouterRequestConfig(
     requestedTemperature?: unknown;
     requestedTopP?: unknown;
     surface?: SurfaceType;
+    fetcher?: typeof fetch;
   } = {},
 ): Promise<EffectiveOpenRouterRequestConfig> {
   const effective = await resolveEffectiveOpenRouterRequestConfig(cfg, modelId, messages, options);
@@ -592,6 +598,10 @@ interface FallbackResolveOptions {
   excludeModels?: ReadonlySet<string>;
   /** Absolute wall-clock deadline shared by the whole server turn. */
   deadlineAt?: number;
+  /** Injectable transport for isolated tests and controlled callers. */
+  fetcher?: typeof fetch;
+  /** Environment map used only for provider credential references. */
+  env?: NodeJS.ProcessEnv;
   /** Original turn budget, retained for actionable timeout metadata. */
   turnBudgetMs?: number;
   /**
@@ -637,6 +647,7 @@ const SUPPORTED_HTTP_PROVIDERS: ReadonlySet<string> = new Set([
   "openrouter",
   "opencode_zen",
   "opencode_go",
+  "vllm",
 ]);
 
 /**
@@ -647,7 +658,7 @@ const SUPPORTED_HTTP_PROVIDERS: ReadonlySet<string> = new Set([
  */
 function resolvePoolAgents(cfg: JarvisConfig, options: FallbackResolveOptions = {}): CascadeEntry[] {
   if (!options.stage) return [];
-  const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
+  const pool = new AgentPool(routableOrchestratorAgents(cfg, options.env));
   let agents;
   if (options.cascadeTier) {
     const cascade = pool.cascadeChain(options.stage, options.taskType ?? "general", options.excludeModels);
@@ -696,7 +707,7 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
 
   // 2. OpenRouter free/configured tail (catalog-aware).
   try {
-    const catalog = await listOpenRouterModels(cfg);
+    const catalog = await listOpenRouterModels(cfg, false, options.fetcher);
     const byId = new Map(catalog.map((model) => [model.id, model]));
     const paidFallbacksAllowed = Boolean((cfg.openrouter as any).enable_paid_fallbacks);
     if (byId.has(requested) || requested === "openrouter/free") {
@@ -939,12 +950,14 @@ async function buildAttemptBody(
   provider: HttpProviderId,
   requestBody: any,
   model: string,
+  fetcher: typeof fetch,
 ): Promise<BuiltAttemptBody> {
   const body: Record<string, any> = { ...requestBody, model };
   if (provider === "openrouter") {
     const effective = await applyOpenRouterRequestConfig(body, cfg, model, body.messages ?? [], {
       requestedTemperature: requestBody.temperature,
       requestedTopP: requestBody.top_p,
+      fetcher,
     });
     // Sanitize tool message fields for OpenRouter models that resolved to
     // text-tool-protocol (body.tools was already deleted by the config step).
@@ -953,16 +966,22 @@ async function buildAttemptBody(
     }
     return { body, effective };
   }
-  delete body.tools;
-  delete body.tool_choice;
-  // Always sanitize for non-OpenRouter providers (OpenCode Zen/Go) — they
-  // use the text tool protocol and cannot process native tool message fields.
-  if (Array.isArray(body.messages)) {
-    body.messages = sanitizeToolMessages(body.messages);
-  }
-  if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
-    // No OpenCode catalog context metadata exists here; remains conservative.
-    return { body: buildAnthropicAttemptBody(body, model) };
+  if (providerSupportsNativeTools(provider)) {
+    if (!body.tools && Array.isArray(body.messages)) {
+      body.messages = sanitizeToolMessages(body.messages);
+    }
+  } else {
+    delete body.tools;
+    delete body.tool_choice;
+    // OpenCode Zen/Go use the text tool protocol and cannot process native
+    // tool message fields.
+    if (Array.isArray(body.messages)) {
+      body.messages = sanitizeToolMessages(body.messages);
+    }
+    if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
+      // No OpenCode catalog context metadata exists here; remains conservative.
+      return { body: buildAnthropicAttemptBody(body, model) };
+    }
   }
   return { body };
 }
@@ -1046,8 +1065,10 @@ export async function chatCompletionWithFallback(
   }
 
   let lastError = "";
+  let lastVllmFailure: { model: string; detail: string } | undefined;
   let totalAttempts = 0;
   let fallbackReason: string | undefined;
+  const fetcher = options.fetcher ?? fetch;
   // `max_retries` is the configured ceiling on per-model attempts. The 2-strike
   // rate-limit rule and the single-retry transient policy are clamped to it, so
   // setting max_retries=0 disables all same-model retries (immediate advance).
@@ -1063,9 +1084,9 @@ export async function chatCompletionWithFallback(
   for (let modelIdx = 0; modelIdx < effectiveCascade.length; modelIdx++) {
     assertFallbackDeadline(options);
     const { provider, model_id: model } = effectiveCascade[modelIdx];
-    const target = resolveProviderTarget(cfg, provider);
+    const target = resolveProviderTarget(cfg, provider, options.env);
     const firstTokenTimeoutMs = Math.max(1_000, target.first_token_timeout_ms);
-    if (!target.api_key) {
+    if (!target.api_key && provider !== "vllm") {
       lastError = `No API key configured for provider "${provider}" (model ${model}) — skipping`;
       console.warn(`[Fallback] ${lastError}`);
       continue;
@@ -1089,7 +1110,13 @@ export async function chatCompletionWithFallback(
       let headersTimer: ReturnType<typeof setTimeout> | undefined;
       try {
         totalAttempts += 1;
-        const { body: attemptBody, effective: attemptEffective } = await buildAttemptBody(cfg, provider, requestBody, model);
+        const { body: attemptBody, effective: attemptEffective } = await buildAttemptBody(
+          cfg,
+          provider,
+          requestBody,
+          model,
+          fetcher,
+        );
         // Refit memory against THIS candidate's complete assembled request
         // (top-level system + messages + tools + output reserve + the
         // candidate's own known context) and attach exactly one carrier.
@@ -1153,7 +1180,7 @@ export async function chatCompletionWithFallback(
         // Bound the pre-header phase by the same per-provider first-token
         // window and advance the cascade instead.
         const HEADERS_STALL_REASON = `headers-timeout:${provider}:${model}`;
-        const fetchPromise = fetch(providerChatUrl(target, model), {
+        const fetchPromise = fetcher(providerChatUrl(target, model), {
           method: "POST",
           signal: attemptCtrl.signal,
           headers: providerHeaders(cfg, target, model),
@@ -1173,6 +1200,7 @@ export async function chatCompletionWithFallback(
         if (headersOutcome.kind === "headers-timeout") {
           attemptCtrl.abort(HEADERS_STALL_REASON);
           lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
+          if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           console.warn(`[Fallback] ${lastError} — advancing to next model`);
           fallbackReason = "first_token_timeout";
           recordStall(provider, model);
@@ -1216,6 +1244,7 @@ export async function chatCompletionWithFallback(
             attemptCtrl.abort(STALL_REASON);
             try { await bodyReader.cancel().catch(() => {}); } catch {}
             lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
+            if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
             fallbackReason = "first_token_timeout";
             recordStall(provider, model);
@@ -1261,6 +1290,7 @@ export async function chatCompletionWithFallback(
           recordRateLimit(provider, model);
           fallbackReason = "rate_limited";
           lastError = `Model ${model} (${provider}) rate limited (429) [strike ${rateLimitStrikes}/${RATE_LIMIT_MAX_ATTEMPTS}]`;
+          if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           if (rateLimitStrikes >= RATE_LIMIT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next optimal pool model`);
             break attemptLoop;
@@ -1277,6 +1307,7 @@ export async function chatCompletionWithFallback(
           transientRetries++;
           fallbackReason = `http_${res.status}`;
           lastError = `Model ${model} (${provider}) returned ${res.status} [retry ${transientRetries}/${OTHER_TRANSIENT_MAX_ATTEMPTS}]`;
+          if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
             break attemptLoop;
@@ -1287,7 +1318,9 @@ export async function chatCompletionWithFallback(
 
         // ── Non-retryable HTTP error: advance, don't kill the turn ──
         const body = await res.text().catch(() => "");
-        lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${body.slice(0, 160)}`;
+        const safeBody = redactProviderSecret(body.slice(0, 160), target.api_key);
+        lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${safeBody}`;
+        if (provider === "vllm") lastVllmFailure = { model, detail: `HTTP ${res.status}: ${safeBody}` };
         console.warn(`[Fallback] ${lastError} — advancing to next model`);
         // Cross-turn memory: this is a hard, non-retryable failure (never a
         // 429, never a retried transient 5xx, never a first-token stall —
@@ -1306,13 +1339,15 @@ export async function chatCompletionWithFallback(
           throw e; // Don't retry user-aborted requests
         }
         if (isStall) {
-          lastError = e.message || lastError;
+          lastError = redactProviderSecret(e.message || lastError, target.api_key);
+          if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           break attemptLoop;
         }
         // Network/transport error — one short retry, then advance.
         transientRetries++;
         fallbackReason = "network_error";
-        lastError = e.message || String(e);
+        lastError = redactProviderSecret(e.message || String(e), target.api_key);
+        if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
         if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
           console.warn(`[Fallback] Model ${model} (${provider}) network error: ${lastError} — advancing to next model`);
           break attemptLoop;
@@ -1327,6 +1362,9 @@ export async function chatCompletionWithFallback(
     }
   }
 
+  if (lastVllmFailure) {
+    throw new VllmProviderRequestError(lastVllmFailure.model, lastVllmFailure.detail);
+  }
   throw new Error(`All provider models exhausted. Last error: ${lastError}`);
 }
 
@@ -1422,11 +1460,16 @@ export async function checkOpenRouterHealth(cfg: JarvisConfig, forceRefresh = fa
 // Model Discovery
 // ═══════════════════════════════════════════════════════════════
 
-export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = false): Promise<OpenRouterModel[]> {
+export async function listOpenRouterModels(
+  cfg: JarvisConfig,
+  forceRefresh = false,
+  fetcher: typeof fetch = fetch,
+): Promise<OpenRouterModel[]> {
   checkKeyChange(cfg.openrouter.api_key);
   const now = Date.now();
+  const injectedFetcher = fetcher !== fetch;
 
-  if (!forceRefresh && cachedModels && (now - lastFetchTime < CACHE_TTL_MS)) {
+  if (!injectedFetcher && !forceRefresh && cachedModels && (now - lastFetchTime < CACHE_TTL_MS)) {
     return cachedModels;
   }
 
@@ -1434,7 +1477,7 @@ export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = fal
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 10000);
 
-    const res = await fetch(`${cfg.openrouter.base_url}/models`, {
+    const res = await fetcher(`${cfg.openrouter.base_url}/models`, {
       signal: ctrl.signal,
       headers: {
         "Authorization": `Bearer ${cfg.openrouter.api_key}`,
@@ -1448,8 +1491,10 @@ export async function listOpenRouterModels(cfg: JarvisConfig, forceRefresh = fal
     const json = await res.json();
     const models = (json.data || []).map(normalizeOpenRouterModel).sort(compareOpenRouterModels);
 
-    cachedModels = models;
-    lastFetchTime = now;
+    if (!injectedFetcher) {
+      cachedModels = models;
+      lastFetchTime = now;
+    }
     return models;
   } catch (e) {
     console.error("[OpenRouter] Model listing failed:", e);

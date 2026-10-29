@@ -98,7 +98,15 @@ import {
   applyOpenRouterRequestConfig,
 } from "./openrouter";
 import type { OpenRouterCostInfo } from "./openrouter";
-import { resolveProviderTarget, providerChatUrl, providerHeaders } from "./providers";
+import {
+  checkVllmHealth,
+  fetchVllmChat,
+  isHttpProviderId,
+  providerChatUrl,
+  providerHeaders,
+  providerSupportsNativeTools,
+  resolveProviderTarget,
+} from "./providers";
 import { routableOrchestratorAgents, runtimeFactsSystemMessage } from "./provider-availability";
 import {
   recordInference,
@@ -2564,7 +2572,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let poolModel: string | null = null;
           // Provider of the pool-selected agent. Drives endpoint + key routing
           // for the primary request (the fallback cascade routes per-attempt).
-          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | "ollama" | null = null;
+          let poolProvider: "openrouter" | "opencode_zen" | "opencode_go" | "vllm" | "ollama" | null = null;
           let poolResolvedAgent: import("./orchestration/agent-pool").OrchestratorAgent | undefined;
           const stageLabel = callOptions?.stageLabel as string | undefined;
           const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
@@ -2659,7 +2667,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               } else {
                 agent = pool.pickFor(stageLabel, orchestratorTaskType, poolExcludeModels, modelSelection);
               }
-              if (agent && (agent.provider === "openrouter" || agent.provider === "opencode_zen" || agent.provider === "opencode_go" || agent.provider === "ollama")) {
+              if (agent && (agent.provider === "ollama" || isHttpProviderId(agent.provider))) {
                 poolModel = agent.model_id;
                 poolProvider = agent.provider;
                 poolResolvedAgent = agent;
@@ -2670,7 +2678,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
-          const resolvedOpenRouterModel = cfg.active_backend === "openrouter"
+          const resolvedOpenRouterModel = cfg.active_backend === "openrouter" && !poolProvider
             ? await resolveOpenRouterModel(cfg)
             : null;
           // A pool-selected "ollama" agent (e.g. a local reviewer lane) pins
@@ -2698,9 +2706,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           attemptProvider = isLlamaCpp ? "llama_cpp" : effectiveProvider;
           const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
           const providerTarget = !isLocalInference ? resolveProviderTarget(cfg, effectiveProvider) : null;
-          // Only the OpenRouter catalog can describe OpenRouter models; skip it
-          // for OpenCode (its models aren't in that catalog).
-          const openRouterEffective = (!isLocalInference && !isOpenCodeProvider)
+          // Only OpenRouter models are described by the OpenRouter catalog;
+          // OpenCode and self-hosted vLLM use their own provider capabilities.
+          const openRouterEffective = (!isLocalInference && effectiveProvider === "openrouter")
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
           const baseUrl = isLocalInference
@@ -2711,7 +2719,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? (localTarget?.supportsNativeTools ?? false)
             : isOpenCodeProvider
               ? supportsNativeToolsForProvider(effectiveProvider, modelName)
-              : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
+              : effectiveProvider === "vllm"
+                ? providerSupportsNativeTools(providerTarget!.provider)
+                : (openRouterEffective?.supports_tools ?? isOpenRouterModelSupportsTools(modelName));
           // Use text tool protocol if native tools are disabled/unsupported and tools are requested
           const useTextTools = !modelSupportsNativeTools && callOptions?.tools && callOptions.tools.length > 0;
 
@@ -2774,9 +2784,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               requestBody.reasoning_effort = "none";
             }
             }
-          } else if (isOpenCodeProvider) {
-            // OpenCode (Zen/Go): OpenAI-compatible but not in the OpenRouter
-            // catalog. Apply a lean config from callOptions/cfg directly.
+          } else if (isOpenCodeProvider || effectiveProvider === "vllm") {
+            // OpenCode and self-hosted vLLM are OpenAI-compatible but outside
+            // the OpenRouter catalog. Apply request settings directly.
             if (callOptions?.max_tokens !== undefined) requestBody.max_tokens = callOptions.max_tokens;
             else if (typeof cfg.max_tokens === "number" && cfg.max_tokens > 0) requestBody.max_tokens = cfg.max_tokens;
             if (callOptions?.temperature !== undefined) requestBody.temperature = callOptions.temperature;
@@ -2793,7 +2803,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (cfg.tools.enabled && !useTextTools && callOptions?.tools && callOptions.tools.length > 0) {
             requestBody.tools = toApiTools(callOptions.tools);
-            if (!isLocalInference && !isOpenCodeProvider) {
+            if (!isLocalInference && effectiveProvider === "openrouter") {
               await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
                 requestedMaxTokens: callOptions?.max_tokens,
                 requestedTemperature: callOptions?.temperature,
@@ -2876,7 +2886,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? cfg.llama_cpp.context_window
             : isOllama
               ? (cfg.profiles?.[cfg.active_profile]?.context_window ?? cfg.ollama.options?.num_ctx ?? 8192)
-              : isOpenCodeProvider
+              : isOpenCodeProvider || effectiveProvider === "vllm"
                 ? null
                 : (openRouterEffective?.context_length ?? null);
           const stageContextCeiling = typeof callOptions?.contextCeilingTokens === "number"
@@ -2962,7 +2972,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 })}\n\n`));
               }
             } else {
-              fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+              fetchRes = effectiveProvider === "vllm"
+                ? await fetchVllmChat(cfg, providerTarget!, modelName, requestBody, { signal: ctrl.signal })
+                : await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
             }
           } catch (fetchErr: any) {
             clearTimeout(timeout);
@@ -6198,6 +6210,7 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
   const cfg = resolveConfig(configOverride);
 
   const ollamaHealth = await checkOllamaHealth(cfg.ollama);
+  const vllmHealth = await checkVllmHealth(cfg.vllm);
   let llamaCppRunning = false;
   let llamaCppModelAvailable = false;
   let llamaCppLatencyMs = 0;
@@ -6305,6 +6318,11 @@ async function checkStatus(configOverride?: Partial<JarvisConfig> | null) {
     llama_cpp_latency_ms: llamaCppLatencyMs,
     openrouter_ok: openrouterOk,
     openrouter_latency_ms: openrouterLatencyMs,
+    vllm_enabled: vllmHealth.enabled,
+    vllm_reachable: vllmHealth.reachable,
+    vllm_latency_ms: vllmHealth.latency_ms,
+    vllm_models: vllmHealth.models,
+    vllm_error: vllmHealth.error,
     claude_cli_available: claudeCliAvailable,
     bridge_active: bridgeActive,
     bridge_port: BRIDGE_PORT,
