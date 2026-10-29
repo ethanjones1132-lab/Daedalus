@@ -237,7 +237,7 @@ fn spawn_ollama() -> Option<std::process::Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::wsl::hide_windows_console(&mut command);
-    let child = command.spawn().ok()?;
+    let child = process_lifecycle::spawn_managed(&mut command).ok()?;
     println!("[Jarvis] Ollama started (PID {}, bin {})", child.id(), bin);
     Some(child)
 }
@@ -407,7 +407,7 @@ pub(crate) async fn start_llama_cpp_server(
                 .map_err(|error| format!("could not duplicate llama.cpp log handle: {error}"))?;
             command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
             crate::wsl::hide_windows_console(&mut command);
-            command.spawn().map_err(|error| {
+            process_lifecycle::spawn_managed(&mut command).map_err(|error| {
                 format!("failed to spawn llama-server {}: {error}", server_path.display())
             })
         },
@@ -753,7 +753,7 @@ fn spawn_claude_cli_proxy_child(
         through_wsl,
     );
     crate::wsl::hide_windows_console(&mut command);
-    let child = match command.spawn() {
+    let child = match process_lifecycle::spawn_managed(&mut command) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -1184,7 +1184,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         crate::wsl::hide_windows_console(&mut command);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
-        let result = command.spawn();
+        let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
             target: "jarvis::startup",
@@ -1209,7 +1209,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         }
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
-        let result = command.spawn();
+        let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
             target: "jarvis::startup",
@@ -1230,7 +1230,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
             .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
-        let result = command.spawn();
+        let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
             target: "jarvis::startup",

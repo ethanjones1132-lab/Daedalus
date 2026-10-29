@@ -49,3 +49,11 @@ serde_yaml = "0.9"
 thiserror = "1"
 # cron expression parsing for the cron scheduler (src/cron_scheduler.rs: `use cron::Schedule;`)
 cron = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_Security",
+] }

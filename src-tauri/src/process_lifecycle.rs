@@ -60,6 +60,28 @@ static OLLAMA_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static LLAMA_CPP_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CHILDREN: OnceLock<Mutex<Children>> = OnceLock::new();
 
+#[cfg(windows)]
+struct JobObject(usize);
+
+#[cfg(windows)]
+impl JobObject {
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0 as windows_sys::Win32::Foundation::HANDLE
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobObject {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle());
+        }
+    }
+}
+
+#[cfg(windows)]
+static PROCESS_JOB: OnceLock<Result<JobObject, u32>> = OnceLock::new();
+
 /// Monotonic owned-Bun generation. Bumped on every successful spawn and every
 /// tracked stop so a mutation coordinator can detect replacement across an
 /// HTTP request without holding any lock across the network.
@@ -67,6 +89,84 @@ static BUN_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Set when the owned Bun child could not be confirmed dead. While set,
 /// `bun_ownership` reports `Unknown` so no mutation may bypass invalidation.
 static BUN_TERMINATION_UNCONFIRMED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+fn create_kill_on_close_job() -> Result<JobObject, u32> {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        return Err(unsafe { GetLastError() });
+    }
+
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        let error = unsafe { GetLastError() };
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+        return Err(error);
+    }
+
+    Ok(JobObject(handle as HANDLE as usize))
+}
+
+#[cfg(windows)]
+fn process_job() -> std::io::Result<&'static JobObject> {
+    let job = PROCESS_JOB.get_or_init(create_kill_on_close_job);
+    match job {
+        Ok(job) => Ok(job),
+        Err(error) => Err(std::io::Error::from_raw_os_error(*error as i32)),
+    }
+}
+
+/// Spawn a managed child and assign it to its Windows Job Object immediately.
+/// The non-Windows path preserves the existing child-spawn behavior.
+pub(crate) fn spawn_managed(command: &mut std::process::Command) -> std::io::Result<Child> {
+    #[cfg(windows)]
+    {
+        return spawn_assigned(command, process_job()?);
+    }
+
+    #[cfg(not(windows))]
+    {
+        command.spawn()
+    }
+}
+
+#[cfg(windows)]
+fn spawn_assigned(command: &mut std::process::Command, job: &JobObject) -> std::io::Result<Child> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    let mut child = command.spawn()?;
+    let assigned =
+        unsafe { AssignProcessToJobObject(job.handle(), child.as_raw_handle() as HANDLE) };
+    if assigned == 0 {
+        let error = unsafe { GetLastError() };
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::from_raw_os_error(error as i32));
+    }
+
+    Ok(child)
+}
 
 pub(crate) fn bun_generation() -> u64 {
     BUN_GENERATION.load(Ordering::SeqCst)
@@ -237,5 +337,82 @@ pub(crate) fn stop_all() {
         bump_bun_generation();
     } else {
         BUN_TERMINATION_UNCONFIRMED.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_job_tests {
+    use super::{create_kill_on_close_job, spawn_assigned, JobObject};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{GetLastError, BOOL, HANDLE};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+
+    fn spawn_ping(job: &JobObject) -> Child {
+        let mut command = Command::new("cmd");
+        command
+            .args(["/c", "ping -n 30 127.0.0.1 > NUL"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_assigned(&mut command, job).expect("spawn and assign dummy child")
+    }
+
+    fn is_process_in_job(child: &Child, job: &JobObject) -> bool {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut in_job: BOOL = 0;
+        let succeeded =
+            unsafe { IsProcessInJob(child.as_raw_handle() as HANDLE, job.handle(), &mut in_job) };
+        assert_ne!(
+            succeeded,
+            0,
+            "IsProcessInJob failed with Win32 error {}",
+            unsafe { GetLastError() }
+        );
+        in_job != 0
+    }
+
+    #[test]
+    fn managed_child_is_assigned_to_its_job() {
+        let job = create_kill_on_close_job()
+            .unwrap_or_else(|error| panic!("create job failed with Win32 error {error}"));
+        let mut child = spawn_ping(&job);
+        let assigned = is_process_in_job(&child, &job);
+
+        drop(job);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(assigned, "managed child was not assigned to its job");
+    }
+
+    #[test]
+    fn closing_job_terminates_managed_child() {
+        let job = create_kill_on_close_job()
+            .unwrap_or_else(|error| panic!("create job failed with Win32 error {error}"));
+        let mut child = spawn_ping(&job);
+        drop(job);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "closing the job did not terminate the managed child"
+        );
     }
 }
