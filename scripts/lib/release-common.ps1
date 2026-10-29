@@ -803,6 +803,19 @@ function Test-JarvisInstalledResources {
             return [pscustomobject]@{ ok = $false; reason = "installed_resource_mismatch:${role}:$($result.reason)" }
         }
     }
+    # The offline tokenizer is optional in the record: manifests written before
+    # the artifact existed have no tokenizer entry and must still verify. When
+    # exactly one entry is recorded, the installed copy must match it.
+    $tokenizerRecords = @($Manifest.files | Where-Object { $_.role -eq 'tokenizer' })
+    if ($tokenizerRecords.Count -gt 1) {
+        return [pscustomobject]@{ ok = $false; reason = 'installed_resource_record_ambiguous:tokenizer' }
+    }
+    if ($tokenizerRecords.Count -eq 1) {
+        $result = Test-JarvisArtifactHash -Path (Join-Path $InstallRoot 'tokenizer.cjs') -ExpectedSha256 $tokenizerRecords[0].sha256
+        if (-not $result.ok) {
+            return [pscustomobject]@{ ok = $false; reason = "installed_resource_mismatch:tokenizer:$($result.reason)" }
+        }
+    }
     return [pscustomobject]@{ ok = $true; reason = $null }
 }
 

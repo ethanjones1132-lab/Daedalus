@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Verifies that the deployed Jarvis runtime matches the repo HEAD.
-    Checks git SHA, index.js/proxy hashes, prompts/ directory, manifest existence,
+    Checks git SHA, index.js/tokenizer/proxy hashes, prompts/ directory, manifest existence,
     the NSIS installer hash when an installer is present (skipped cleanly when
     absent), and (if a server is actually listening) that the RUNNING process is
     serving that same build — not just that the files on disk look right.
@@ -75,6 +75,19 @@ if ((Get-FileHash "$deployDir\index.js" -Algorithm SHA256).Hash -ne $manifest.in
 } else {
     Write-Host "index.js hash matches manifest." -ForegroundColor Green
 }
+
+# The offline tokenizer is a shipped artifact in its own right: the server
+# lazily requires it, so a missing or substituted copy breaks token counting
+# without failing index.js. Verify it exactly like the server bundle.
+$tokenizerPath = Join-Path $deployDir 'tokenizer.cjs'
+if (-not (Test-Path $tokenizerPath) -or
+    (Get-FileHash $tokenizerPath -Algorithm SHA256).Hash -ne $manifest.tokenizer_js_sha256) {
+    Write-Error "DEPLOY INCOMPLETE: offline tokenizer bundle tokenizer.cjs is missing or its hash differs from the manifest."
+    exit 1
+} else {
+    Write-Host "tokenizer.cjs hash matches manifest." -ForegroundColor Green
+}
+
 if ([bool]$manifest.git_dirty -ne $gitDirty) {
     Write-Error "DEPLOY STALE: manifest git_dirty $($manifest.git_dirty) != current worktree dirty state $gitDirty"
     exit 1

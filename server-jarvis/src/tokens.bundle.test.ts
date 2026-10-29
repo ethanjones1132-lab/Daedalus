@@ -216,12 +216,16 @@ describe("tokenizer production bundle", () => {
       tauriText,
       deployScript,
       releaseBuild,
+      verifyDeploy,
+      releaseCommon,
     ] = await Promise.all([
       readFile(join(serverDir, "src", "build-frontend.ts"), "utf8"),
       readFile(join(serverDir, "package.json"), "utf8"),
       readFile(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8"),
       readFile(join(repoRoot, "scripts", "build-and-deploy.ps1"), "utf8"),
       readFile(join(repoRoot, "scripts", "release-build.ps1"), "utf8"),
+      readFile(join(repoRoot, "scripts", "verify-deploy.ps1"), "utf8"),
+      readFile(join(repoRoot, "scripts", "lib", "release-common.ps1"), "utf8"),
     ]);
     const packageJson = JSON.parse(packageJsonText);
     const tauri = JSON.parse(tauriText);
@@ -234,5 +238,15 @@ describe("tokenizer production bundle", () => {
     expect(deployScript).toContain("tokenizer_js_sha256");
     expect(releaseBuild).toContain("dist\\tokenizer.cjs");
     expect(releaseBuild).toContain("role = 'tokenizer'");
+
+    // DD-036: the offline tokenizer must be hash-checked by the deploy verifier
+    // and by the installed-resource smoke, or a substituted artifact ships clean.
+    expect(verifyDeploy).toContain("$tokenizerPath = Join-Path $deployDir 'tokenizer.cjs'");
+    expect(verifyDeploy).toContain(
+      "(Get-FileHash $tokenizerPath -Algorithm SHA256).Hash -ne $manifest.tokenizer_js_sha256",
+    );
+    expect(releaseCommon).toContain("$_.role -eq 'tokenizer'");
+    expect(releaseCommon).toContain("Join-Path $InstallRoot 'tokenizer.cjs'");
+    expect(releaseCommon).toContain("installed_resource_mismatch:tokenizer:");
   });
 });
