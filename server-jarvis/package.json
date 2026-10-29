@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "bun --hot ./src/index.ts",
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "build": "bun run src/build-frontend.ts --server-only",
     "start": "bun ./src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",

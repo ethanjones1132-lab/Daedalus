@@ -144,6 +144,8 @@ try {
 if (-not (Test-Path $distJs)) { Die "server bundle not produced at $distJs" }
 $distMcp = Join-Path $serverDir 'dist\mcp-stdio-server.js'
 if (-not (Test-Path $distMcp)) { Die "mcp-stdio-server bundle not produced at $distMcp" }
+$distTokenizer = Join-Path $serverDir 'dist\tokenizer.cjs'
+if (-not (Test-Path $distTokenizer)) { Die "tokenizer bundle not produced at $distTokenizer" }
 # The bake must have folded the identity in. A bundle that still reads the
 # environment at runtime reports git_sha "dev" and /health can no longer
 # tell which build is answering - so this is checked, not assumed.
@@ -212,6 +214,7 @@ function Deploy-File($src, $dstName) {
 Deploy-File $exeOut 'Jarvis.exe'
 Deploy-File $exeOut 'home-base.exe'
 Deploy-File $distJs 'index.js'
+Deploy-File $distTokenizer 'tokenizer.cjs'
 $distMcpJs = Join-Path $serverDir 'dist\mcp-stdio-server.js'
 Deploy-File $distMcpJs 'mcp-stdio-server.js'
 Deploy-File $metricsScript 'automate_inference_metrics.py'
@@ -263,6 +266,7 @@ $manifest = @{
     git_dirty = $buildGitDirty
     source_tree_sha256 = $sourceTreeSha256
     index_js_sha256 = (Get-FileHash "$desktop\index.js" -Algorithm SHA256).Hash
+    tokenizer_js_sha256 = (Get-FileHash "$desktop\tokenizer.cjs" -Algorithm SHA256).Hash
     inference_metrics_sha256 = (Get-FileHash "$desktop\automate_inference_metrics.py" -Algorithm SHA256).Hash
     claude_proxy_sha256 = (Get-FileHash "$desktop\resources\claude_cli_proxy.py" -Algorithm SHA256).Hash
     opencode_go_models_sha256 = (Get-FileHash "$desktop\resources\opencode_go_openai_models.json" -Algorithm SHA256).Hash

@@ -176,6 +176,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $versionDir 'resources') | 
 $stagedInstaller = Join-Path $versionDir $installer.Name
 Copy-Item -LiteralPath $installer.FullName -Destination $stagedInstaller -Force
 Copy-Item -LiteralPath $indexJs -Destination (Join-Path $versionDir 'index.js') -Force
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'server-jarvis\dist\tokenizer.cjs') -Destination (Join-Path $versionDir 'tokenizer.cjs') -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'server-jarvis\dist\mcp-stdio-server.js') -Destination (Join-Path $versionDir 'mcp-stdio-server.js') -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\claude_cli_proxy.py') -Destination (Join-Path $versionDir 'resources\claude_cli_proxy.py') -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\opencode_go_openai_models.json') -Destination (Join-Path $versionDir 'resources\opencode_go_openai_models.json') -Force
@@ -264,6 +265,7 @@ $artifacts = @(
     @{ role = 'installer';     path = $stagedInstaller; published = $true }
     @{ role = 'app_binary';    path = $stagedExe }
     @{ role = 'server_bundle'; path = (Join-Path $versionDir 'index.js') }
+    @{ role = 'tokenizer';     path = (Join-Path $versionDir 'tokenizer.cjs') }
     @{ role = 'mcp_stdio';     path = (Join-Path $versionDir 'mcp-stdio-server.js') }
     @{ role = 'claude_proxy';  path = (Join-Path $versionDir 'resources\claude_cli_proxy.py') }
     @{ role = 'go_models';     path = (Join-Path $versionDir 'resources\opencode_go_openai_models.json') }

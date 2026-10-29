@@ -42,6 +42,7 @@
     ],
     "resources": {
       "../server-jarvis/dist/index.js": "index.js",
+      "../server-jarvis/dist/tokenizer.cjs": "tokenizer.cjs",
       "../server-jarvis/dist/mcp-stdio-server.js": "mcp-stdio-server.js",
       "../scripts/claude_cli_proxy.py": "resources/claude_cli_proxy.py",
       "../scripts/opencode_go_openai_models.json": "resources/opencode_go_openai_models.json",

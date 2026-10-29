@@ -46,7 +46,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -105,10 +105,35 @@ function buildServerBundle(): void {
     }
   }
 
+  run(
+    "bun",
+    [
+      "build",
+      "./src/tokenizer-entry.ts",
+      "--outfile",
+      "./dist/tokenizer.cjs",
+      "--target",
+      "bun",
+      "--format",
+      "cjs",
+    ],
+    serverDir,
+  );
+
   const defineArgs = defines.flatMap((define) => ["--define", define]);
   run(
     "bun",
-    ["build", "./src/index.ts", "--outdir", "./dist", "--target", "bun", ...defineArgs],
+    [
+      "build",
+      "./src/index.ts",
+      "--outdir",
+      "./dist",
+      "--target",
+      "bun",
+      ...defineArgs,
+      "--define",
+      'process.env.JARVIS_TOKENIZER_PACKAGED="true"',
+    ],
     serverDir,
   );
   run(
@@ -127,10 +152,17 @@ function buildServerBundle(): void {
   );
 
   const indexJs = join(serverDir, "dist", "index.js");
+  const tokenizerCjs = join(serverDir, "dist", "tokenizer.cjs");
   const mcpJs = join(serverDir, "dist", "mcp-stdio-server.js");
-  if (!existsSync(indexJs)) throw new Error(`server bundle not produced at ${indexJs}`);
-  if (!existsSync(mcpJs)) throw new Error(`mcp-stdio-server bundle not produced at ${mcpJs}`);
-  console.log("  [OK] server bundle -> server-jarvis/dist/index.js");
+  if (!existsSync(indexJs)) throw new Error("server bundle not produced at " + indexJs);
+  if (!existsSync(tokenizerCjs)) throw new Error("tokenizer bundle not produced at " + tokenizerCjs);
+  if (!existsSync(mcpJs)) throw new Error("mcp-stdio-server bundle not produced at " + mcpJs);
+  const indexBytes = statSync(indexJs).size;
+  if (indexBytes >= 2_000_000) {
+    throw new Error("server entry is " + indexBytes + " bytes; expected less than 2,000,000");
+  }
+  console.log("  [OK] server bundle -> server-jarvis/dist/index.js (" + indexBytes + " bytes)");
+  console.log("  [OK] lazy tokenizer -> server-jarvis/dist/tokenizer.cjs");
   console.log("  [OK] mcp-stdio-server -> server-jarvis/dist/mcp-stdio-server.js");
 }
 
@@ -166,8 +198,12 @@ function buildUi(): void {
 
 try {
   buildServerBundle();
-  buildUi();
-  console.log("\nFrontend artifacts built.");
+  if (!process.argv.includes("--server-only")) {
+    buildUi();
+    console.log("\nFrontend artifacts built.");
+  } else {
+    console.log("\nServer artifacts built.");
+  }
 } catch (error) {
   console.error(`\n[FAILED] ${(error as Error).message}`);
   process.exitCode = 1;
