@@ -14,6 +14,13 @@ export interface ActionRegistryAlert {
   action_id?: string | null;
   count?: number | null;
   created_at: string;
+  /**
+   * Read-time verdict from the authoritative buckets: the action this alert
+   * names is no longer pending approval. Set by the native read, never by the
+   * client; a bucket read failure leaves it unset, so its absence means
+   * "unknown", not "active".
+   */
+  superseded?: boolean | null;
 }
 
 export type RegistrySnapshotAction<S> =
@@ -57,10 +64,47 @@ export function parseActionRegistryAlerts(value: unknown): ActionRegistryAlert[]
       !(alert.action_id === undefined || alert.action_id === null || typeof alert.action_id === 'string') ||
       !(alert.count === undefined || alert.count === null || (
         typeof alert.count === 'number' && Number.isInteger(alert.count) && alert.count >= 0
-      ))
+      )) ||
+      !(alert.superseded === undefined || alert.superseded === null || typeof alert.superseded === 'boolean')
     ) {
       throw new Error('Invalid Action Registry alert');
     }
   }
   return value as ActionRegistryAlert[];
+}
+
+/**
+ * Whether the operator can still act on this alert: the native read marked it
+ * superseded when the authoritative buckets no longer show a pending approval.
+ * Absent (`undefined`/`null`) means the verdict is unknown — treat as active,
+ * never silently hidden.
+ */
+export function alertIsActive(alert: ActionRegistryAlert): boolean {
+  return alert.superseded !== true;
+}
+
+export interface ApprovalUpdateOutcome {
+  approved: boolean;
+  /** The automatic ledger refresh after the approval failed; the approval did not. */
+  refresh_failed: boolean;
+}
+
+/**
+ * The native command may answer with the historical bare `true` (an older
+ * surface) or the current `{ approved, refresh_failed }` outcome. Anything that
+ * does not prove approval is a refusal, whether it errored, returned `false`,
+ * or returned an object that withholds it.
+ */
+export function parseApprovalUpdateOutcome(value: unknown): ApprovalUpdateOutcome {
+  if (typeof value === 'object' && value !== null) {
+    if ((value as Record<string, unknown>).approved !== true) {
+      throw new Error('Approval was not confirmed');
+    }
+    return {
+      approved: true,
+      refresh_failed: (value as Record<string, unknown>).refresh_failed === true,
+    };
+  }
+  if (value === true) return { approved: true, refresh_failed: false };
+  throw new Error('Approval was not confirmed');
 }

@@ -3,7 +3,7 @@ import { useEffect, useRef, useReducer, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useToast } from '../design';
-import { parseActionRegistryAlerts, type ActionRegistryAlert } from '../domain/action-registry-state';
+import { alertIsActive, parseActionRegistryAlerts, type ActionRegistryAlert } from '../domain/action-registry-state';
 import { useWorkflow } from '../features/workflows/WorkflowContext';
 import type { GoalNotificationSelector } from '../domain/types';
 import { useNavigation } from './navigation';
@@ -83,7 +83,10 @@ export function useAppSignals() {
 
     /** Announce only registry alerts never announced this session. */
     const deliverAlerts = (alerts: ActionRegistryAlert[]) => {
-      const fresh = alerts.filter((alert) => !notifiedAlertIds.current.has(alert.id));
+      // Superseded alerts are history, not something to act on: the native read
+      // proved their approval no longer pends, so they are never toasted. An
+      // unknown verdict (no flag) stays active — absence is not clearance.
+      const fresh = alerts.filter((alert) => alertIsActive(alert) && !notifiedAlertIds.current.has(alert.id));
       for (const alert of fresh) notifiedAlertIds.current.add(alert.id);
       if (fresh.length > 0) showRegistryAlert(fresh);
     };

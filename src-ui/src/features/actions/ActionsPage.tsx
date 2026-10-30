@@ -17,6 +17,7 @@ import {
 import {
   initialRegistryState,
   parseActionRegistryAlerts,
+  parseApprovalUpdateOutcome,
   reduceRegistryState,
   type ActionRegistryAlert,
 } from '../../domain/action-registry-state';
@@ -106,7 +107,7 @@ function ActionsPage() {
   const active = snapshot?.active ?? [];
   const blocked = snapshot?.blocked ?? [];
   const mutationLocked = registryMutationLocked(mutation);
-  const { success } = useToast();
+  const { success, warn } = useToast();
   const publishMutation = useCallback((next: RegistryMutation | null) => {
     mutationRef.current = next;
     setMutation(next);
@@ -197,11 +198,19 @@ function ActionsPage() {
         const result = await invoke<unknown>('sync_action_registry');
         if (result === false || result == null) throw new Error('Sync was not confirmed');
       } else if (kind === 'approve' || kind === 'waive') {
-        const result = await invoke<boolean>('update_action_approval', {
+        // The outcome object proves approval and reports whether the automatic
+        // ledger refresh survived; the historical bare `true` is still read.
+        // A failed refresh does not undo the approval — it is warned about.
+        const outcome = parseApprovalUpdateOutcome(await invoke<unknown>('update_action_approval', {
           actionId: id,
           status: kind === 'approve' ? 'approved' : 'waived',
-        });
-        if (result !== true) throw new Error('Approval was not confirmed');
+        }));
+        if (outcome.refresh_failed) {
+          warn(
+            'The action is approved, but the alert ledger could not be refreshed; it may not reflect this approval until the next sync.',
+            'Ledger refresh failed',
+          );
+        }
       } else {
         const result = await invoke<unknown>('dispatch_action', { actionId: id });
         if (result === false || result == null) throw new Error('Dispatch was not confirmed');
@@ -221,7 +230,7 @@ function ActionsPage() {
       publishMutation(reconciling);
       await reconcileMutation(reconciling, dispatchEvidence);
     }
-  }, [active, publishMutation, reconcileMutation]);
+  }, [active, publishMutation, reconcileMutation, warn]);
 
   const retryMutation = useCallback(() => {
     const operation = mutationRef.current;

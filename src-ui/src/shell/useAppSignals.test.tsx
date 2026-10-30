@@ -74,8 +74,7 @@ describe('useAppSignals', () => {
     expect(screen.queryByText('Invalid Action Registry alert')).not.toBeInTheDocument();
   });
 
-  it('warns about missed cron jobs and navigates to Cron; an empty payload stays silent', async () => {
-    mount();
+  it('warns about missed cron jobs and navigates to Cron; an empty payload stays silent', async () => {    mount();
     await waitFor(() => expect(handlers.has('cron://missed-jobs')).toBe(true));
     await emit('cron://missed-jobs', []);
     expect(screen.queryByText('Missed Cron Jobs Detected')).not.toBeInTheDocument();
@@ -91,6 +90,19 @@ describe('useAppSignals', () => {
     await waitFor(() => expect(handlers.has('cron://missed-jobs')).toBe(true));
     await emit('cron://missed-jobs', [{ id: 'a' }]);
     expect(await screen.findByText('You have 1 missed cron job pending review in the Cron tab.')).toBeInTheDocument();
+  });
+
+  it('never toasts an alert the native read marked superseded', async () => {
+    mount();
+    await waitFor(() => expect(handlers.has('action-registry://alerts')).toBe(true));
+    // A settled condition: the still-active sibling proves the read ran, so the
+    // absence of the superseded one is a verdict, not a slow render.
+    await emit('action-registry://alerts', [
+      alert({ id: 'live-one', severity: 'medium', message: 'Still pending.' }),
+      alert({ id: 'stale-one', severity: 'high', message: 'Already approved.', superseded: true }),
+    ]);
+    expect(await screen.findByText('Still pending.')).toBeInTheDocument();
+    expect(screen.queryByText('Already approved.')).not.toBeInTheDocument();
   });
 
   it('releases all listeners on unmount, including one that resolved after teardown', async () => {

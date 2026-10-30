@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  alertIsActive,
   initialRegistryState,
   parseActionRegistryAlerts,
+  parseApprovalUpdateOutcome,
   reduceRegistryState,
   type ActionRegistryAlert,
 } from './action-registry-state';
@@ -73,8 +75,7 @@ describe('Action Registry alert resource state', () => {
     expect(() => parseActionRegistryAlerts([{ ...alert, action_id: 7 }])).toThrow();
   });
 
-  it('distinguishes pending, successful empty, failure, and read-only retry', () => {
-    const pending = reduceRegistryState(
+  it('distinguishes pending, successful empty, failure, and read-only retry', () => {    const pending = reduceRegistryState(
       initialRegistryState<ActionRegistryAlert[]>(),
       { type: 'pending', requestId: 1 },
     );
@@ -107,5 +108,39 @@ describe('Action Registry alert resource state', () => {
       snapshot: [{ ...alert, id: 'obsolete', title: 'Obsolete alert' }],
     })).toBe(latest);
     expect(reduceRegistryState(latest, { type: 'failure', requestId: 1 })).toBe(latest);
+  });
+
+  it('never rejects the native superseded flag it does not understand as malformed', () => {
+    expect(parseActionRegistryAlerts([{ ...alert, superseded: true, severity: 'medium', kind: 'approval_required' }]))
+      .toEqual([{ ...alert, superseded: true, severity: 'medium', kind: 'approval_required' }]);
+    expect(() => parseActionRegistryAlerts([{ ...alert, superseded: 'yes' }])).toThrow();
+  });
+});
+
+describe('superseded-at-read verdict', () => {
+  it('treats only an explicit true as superseded — absence is unknown, never clearance', () => {
+    expect(alertIsActive({ ...alert, superseded: true })).toBe(false);
+    expect(alertIsActive({ ...alert })).toBe(true);
+    expect(alertIsActive({ ...alert, superseded: null })).toBe(true);
+  });
+});
+
+describe('approval update outcome', () => {
+  it('reads the outcome object and keeps a failed ledger refresh distinct from a refused approval', () => {
+    expect(parseApprovalUpdateOutcome({ approved: true, refresh_failed: true })).toEqual({
+      approved: true,
+      refresh_failed: true,
+    });
+    expect(parseApprovalUpdateOutcome({ approved: true, refresh_failed: false }))
+      .toEqual({ approved: true, refresh_failed: false });
+  });
+
+  it('reads the historical bare true and refuses everything that does not prove approval', () => {
+    expect(parseApprovalUpdateOutcome(true)).toEqual({ approved: true, refresh_failed: false });
+    expect(() => parseApprovalUpdateOutcome(false)).toThrow('Approval was not confirmed');
+    expect(() => parseApprovalUpdateOutcome({ approved: false })).toThrow('Approval was not confirmed');
+    expect(() => parseApprovalUpdateOutcome({})).toThrow('Approval was not confirmed');
+    expect(() => parseApprovalUpdateOutcome(null)).toThrow('Approval was not confirmed');
+    expect(() => parseApprovalUpdateOutcome(undefined)).toThrow('Approval was not confirmed');
   });
 });
