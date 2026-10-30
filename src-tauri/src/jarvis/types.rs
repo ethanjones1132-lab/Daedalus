@@ -591,7 +591,7 @@ fn default_sandbox() -> String {
     "permissive".to_string()
 }
 
-fn default_true() -> bool {
+pub(crate) fn default_true() -> bool {
     true
 }
 
@@ -762,6 +762,10 @@ pub struct JarvisStatus {
     // Bridge
     pub bridge_active: bool,
     pub bridge_port: u16,
+    /// The operator's Enable Bridge setting. Health surfaces must treat a
+    /// stopped-but-disabled bridge as a settings state, not a fault.
+    #[serde(default = "default_true")]
+    pub bridge_enabled: bool,
     // General availability indicator
     pub bun_available: bool,
     // Active backend + model (for the status chip row)

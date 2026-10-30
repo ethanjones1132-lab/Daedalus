@@ -46,6 +46,7 @@ const STATE_WORDS: Record<ServiceState, string> = {
 const REQUIREMENT_MARKS: Record<ServiceRequirement, string> = {
   required: '',
   not_required: ' · NR',
+  disabled: ' · OFF',
   unknown: ' · REQ?',
 };
 
@@ -70,8 +71,9 @@ const DOWN_TONE: Record<TelemetryServiceKey, Tone> = {
   proxy: 'warn',
 };
 
-function serviceLabel(label: string, state: ServiceState, stale: boolean): string {
-  const suffix = state === 'up' ? 'UP' : state === 'down' ? 'DOWN' : '?';
+function serviceLabel(label: string, state: ServiceState, stale: boolean, requirement: ServiceRequirement): string {
+  // OFF: the operator turned the bridge off. It is not down and not a fault.
+  const suffix = state === 'up' ? 'UP' : state === 'down' ? (requirement === 'disabled' ? 'OFF' : 'DOWN') : '?';
   return `${label} ${suffix}${stale ? ' (stale)' : ''}`;
 }
 
@@ -140,6 +142,10 @@ function Chip({ tone, label, name }: { tone: Tone; label: string; name?: string 
 export default function SystemStatusBar() {
   const [state, dispatch] = useReducer(reduceSystemTelemetryState, undefined, initialSystemTelemetryState);
   const [activeBackend, setActiveBackend] = useState<string | null>(null);
+  // The bridge requirement follows the operator's Enable Bridge setting. Only
+  // an explicit false disables it; an unreadable config keeps the last value
+  // rather than guessing.
+  const [bridgeEnabled, setBridgeEnabled] = useState<boolean>(true);
   const healthRequestId = useRef(0);
   const inferenceRequestId = useRef(0);
   const verdictRef = useRef<HTMLSpanElement | null>(null);
@@ -188,11 +194,12 @@ export default function SystemStatusBar() {
   // failed read keeps the last confirmed backend; it never invents one.
   const fetchBackend = useCallback(async () => {
     try {
-      const config = await invoke<{ active_backend?: unknown } | null>('jarvis_get_config');
+      const config = await invoke<{ active_backend?: unknown; bridge_enabled?: unknown } | null>('jarvis_get_config');
       const backend = config?.active_backend;
       setActiveBackend(typeof backend === 'string' ? backend : null);
+      if (typeof config?.bridge_enabled === 'boolean') setBridgeEnabled(config.bridge_enabled);
     } catch {
-      /* keep the last confirmed backend */
+      /* keep the last confirmed backend and bridge setting */
     }
   }, []);
 
@@ -202,7 +209,7 @@ export default function SystemStatusBar() {
 
   usePolling(fetchTelemetry, POLL_MS, [fetchTelemetry]);
 
-  const view = deriveSystemTelemetryView(state, activeBackend);
+  const view = deriveSystemTelemetryView(state, activeBackend, bridgeEnabled);
   const healthStale = view.health.stale;
   const inferenceStale = view.inference.stale;
   const inferenceStatus = view.inference.status;
@@ -212,7 +219,7 @@ export default function SystemStatusBar() {
 
   const serviceTone = (key: TelemetryServiceKey): Tone => {
     const serviceState = view.health.services[key];
-    if (view.health.requirements[key] === 'not_required') return 'muted';
+    if (view.health.requirements[key] === 'not_required' || view.health.requirements[key] === 'disabled') return 'muted';
     if (serviceState === 'up') return 'ok';
     if (serviceState === 'down') return DOWN_TONE[key];
     return 'warn';
@@ -244,7 +251,7 @@ export default function SystemStatusBar() {
           key={key}
           tone={serviceTone(key)}
           name={serviceAnnouncement(key, view.health.services[key], healthStale, view.health.requirements[key], view.health.backend)}
-          label={`${serviceLabel(key === 'ollama' && llama ? 'GEM' : CHIP_LABELS[key], view.health.services[key], healthStale)}${REQUIREMENT_MARKS[view.health.requirements[key]]}`}
+          label={`${serviceLabel(key === 'ollama' && llama ? 'GEM' : CHIP_LABELS[key], view.health.services[key], healthStale, view.health.requirements[key])}${REQUIREMENT_MARKS[view.health.requirements[key]]}`}
         />
       ))}
 

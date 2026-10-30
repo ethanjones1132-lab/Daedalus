@@ -20,6 +20,8 @@ export interface BunHealth {
 export interface BridgeHealth {
   running: boolean;
   port: number;
+  /** The operator's Enable Bridge setting; absent on older native surfaces. */
+  enabled?: boolean;
 }
 
 export interface ClaudeProxyHealth {
@@ -138,7 +140,7 @@ function isHealthData(value: unknown): value is HealthData {
   const { ollama, bun_server: bunServer, bridge, claude_proxy: claudeProxy, disk, memory } = value;
   if (!isRecord(ollama) || typeof ollama.running !== 'boolean' || (ollama.model !== null && typeof ollama.model !== 'string') || typeof ollama.url !== 'string') return false;
   if (!isRecord(bunServer) || typeof bunServer.running !== 'boolean' || typeof bunServer.url !== 'string') return false;
-  if (!isRecord(bridge) || typeof bridge.running !== 'boolean' || !isValidPort(bridge.port)) return false;
+  if (!isRecord(bridge) || typeof bridge.running !== 'boolean' || !isValidPort(bridge.port) || (bridge.enabled !== undefined && typeof bridge.enabled !== 'boolean')) return false;
   if (!isRecord(claudeProxy) || typeof claudeProxy.running !== 'boolean' || !isValidPort(claudeProxy.port)) return false;
   if (!isRecord(disk) || typeof disk.total !== 'string' || typeof disk.used !== 'string' || typeof disk.available !== 'string' || typeof disk.use_percent !== 'string') return false;
   if (!isRecord(memory) || !isNonNegativeNumber(memory.total_mb) || !isNonNegativeNumber(memory.available_mb) || !isNonNegativeNumber(memory.used_mb) || !isFiniteNumber(memory.used_percent)) return false;
@@ -227,7 +229,7 @@ export function reduceSystemTelemetryState(state: SystemTelemetryState, action: 
 export type SystemTelemetryOverall = 'pending' | 'unavailable' | 'stale' | 'healthy' | 'degraded' | 'stopped';
 export type ServiceState = 'up' | 'down' | 'unknown';
 export type TelemetryServiceKey = 'bun' | 'bridge' | 'ollama' | 'proxy';
-export type ServiceRequirement = 'required' | 'not_required' | 'unknown';
+export type ServiceRequirement = 'required' | 'not_required' | 'disabled' | 'unknown';
 export type InferenceBackend = 'ollama' | 'openrouter' | 'llama_cpp' | 'claude_cli';
 export type OverallReason =
   | 'backend_unconfirmed'
@@ -250,9 +252,8 @@ export interface ServiceRequirementProjection {
   requirements: Record<TelemetryServiceKey, ServiceRequirement>;
 }
 
-const ALWAYS_REQUIRED: Record<TelemetryServiceKey, ServiceRequirement> = {
+const ALWAYS_REQUIRED: Record<'bun' | 'ollama' | 'proxy', ServiceRequirement> = {
   bun: 'required',
-  bridge: 'required',
   ollama: 'unknown',
   proxy: 'unknown',
 };
@@ -267,19 +268,28 @@ function normalizeBackend(value: unknown): InferenceBackend | null {
  *
  * `ollama` and `claude_cli_proxy` are the two services that only one
  * inference backend depends on, so a service that is simply not running is
- * only a fault when the active backend requires it. The Bun server and the
- * bridge carry every inference turn, so they are required unconditionally.
- * An unrecognised or absent `active_backend` yields `unknown` for the
+ * only a fault when the active backend requires it. The Bun server carries
+ * every inference turn and is required unconditionally. The bridge is NOT
+ * part of the per-turn path: it is the local TCP ingress for external Agent
+ * connections (server-jarvis/src/bridge.ts), so its requirement follows the
+ * operator's own Enable Bridge setting, never the active Inference backend
+ * and never the local llama.cpp selection. A disabled bridge is a settings
+ * state — reported as `disabled`, never as a fault and never as "stopped".
+ * An unrecognised or absent `active_backend` still yields `unknown` for the
  * backend-dependent pair: the required set is not guessed, and an
  * unconfirmed required set can never certify the system as healthy.
  */
-export function projectServiceRequirements(activeBackend: unknown): ServiceRequirementProjection {
+export function projectServiceRequirements(activeBackend: unknown, bridgeEnabled: unknown = true): ServiceRequirementProjection {
   const backend = normalizeBackend(activeBackend);
-  if (backend === null) return { backend: 'unknown', requirements: { ...ALWAYS_REQUIRED } };
+  const bridge: ServiceRequirement = bridgeEnabled === false ? 'disabled' : 'required';
+  if (backend === null) {
+    return { backend: 'unknown', requirements: { ...ALWAYS_REQUIRED, bridge } };
+  }
   return {
     backend,
     requirements: {
       ...ALWAYS_REQUIRED,
+      bridge,
       ollama: backend === 'ollama' || backend === 'llama_cpp' ? 'required' : 'not_required',
       proxy: backend === 'claude_cli' ? 'required' : 'not_required',
     },
@@ -349,7 +359,12 @@ const SERVICE_REASON: Record<TelemetryServiceKey, OverallReason> = {
   proxy: 'proxy_down',
 };
 
-export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBackend: unknown): SystemTelemetryView {
+/**
+ * Whether the operator's Enable Bridge setting is on decides how a stopped
+ * bridge reads. The flag comes from the persisted configuration the same way
+ * the active backend does, so a disabled bridge is never a fault here.
+ */
+export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBackend: unknown, bridgeEnabled: unknown = true): SystemTelemetryView {
   const healthData = state.health.data;
   const healthStale = isStale(state.health.status, healthData !== null);
   const inferenceData = state.inference.data;
@@ -362,7 +377,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const memoryReading = healthData ? decodeMemoryReading(healthData.memory) : null;
   const memoryPercent = memoryReading === null ? null : memoryReading.percent;
   const diskPercent = healthData ? parsePercent(healthData.disk.use_percent) : null;
-  const { backend, requirements } = projectServiceRequirements(activeBackend);
+  const { backend, requirements } = projectServiceRequirements(activeBackend, bridgeEnabled);
   const services = {
     bun: serviceState(healthData, 'bun_server'),
     bridge: serviceState(healthData, 'bridge'),
@@ -414,7 +429,11 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     overall = healthStatus === 'unavailable' ? 'unavailable' : 'pending';
   } else if (healthStale) {
     overall = 'stale';
-  } else if (services.bun === 'down' || services.bridge === 'down') {
+  } else if (services.bun === 'down') {
+    // Only the Bun server is part of every Session turn, so only its absence
+    // is "stopped". A stopped-but-enabled bridge degrades the verdict through
+    // its own `bridge_down` reason; a disabled bridge is not a fault and here
+    // yields no reason at all.
     overall = 'stopped';
   } else if (reasons.length > 0) {
     overall = 'degraded';
@@ -505,6 +524,7 @@ export { listNames };
 export const REQUIREMENT_WORDS: Record<ServiceRequirement, string> = {
   required: ' and required by the active inference backend',
   not_required: ' and not required by the active inference backend',
+  disabled: ' and disabled by the Enable Bridge setting',
   unknown: ' and whether it is required is unknown because the active inference backend is not confirmed',
 };
 

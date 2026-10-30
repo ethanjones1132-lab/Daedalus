@@ -39,7 +39,7 @@ import {
   type ServiceRestartState,
 } from '../../domain/service-restart-state';
 import type { JarvisStatus } from '../../domain/types';
-import { deriveHealthPresentation, healthGraceAnchor, type HealthLevel } from '../system/health-derivation';
+import { deriveHealthPresentation, healthGraceAnchor, markStalePresentation, type HealthLevel } from '../system/health-derivation';
 import { defaultCopy, Observation, type ObservationCopy } from './Observation';
 import { buildSubsystemRows, RestartFeedback, SubsystemGauges, type SubsystemRow } from './SubsystemGauges';
 import { ResourceHero } from './ResourceHero';
@@ -97,7 +97,8 @@ function Verdict({
       </p>
     );
   }
-  const presentation = deriveHealthPresentation(status, null, Date.now() - mountedAt);
+  const freshPresentation = deriveHealthPresentation(status, null, Date.now() - mountedAt);
+  const presentation = statusError ? markStalePresentation(freshPresentation) : freshPresentation;
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
       <Badge tone={LEVEL_TONE[presentation.level]} dot>{presentation.label}</Badge>
@@ -150,7 +151,7 @@ export default function HealthPage() {
     void fetchAll();
   }, [fetchAll]);
 
-  const subsystemRows = health ? buildSubsystemRows(health, status?.active_backend) : [];
+  const subsystemRows = health ? buildSubsystemRows(health, status?.active_backend, status?.bridge_enabled) : [];
 
   const confirmRestartReadback = useCallback(
     async (row: SubsystemRow, operationId: number) => {

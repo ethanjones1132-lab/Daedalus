@@ -2018,6 +2018,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         claude_proxy_running,
         bridge_active,
         bridge_port: config.bridge_port,
+        bridge_enabled: config.bridge_enabled,
         bun_available,
         active_backend,
         model,

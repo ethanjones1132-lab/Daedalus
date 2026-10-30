@@ -124,6 +124,24 @@ describe('system telemetry observation state', () => {
     expect(deriveSystemTelemetryView(optionalUnavailable, 'ollama').overall).toBe('degraded');
     expect(deriveSystemTelemetryView(optionalUnavailable, 'ollama').inference.status).toBe('unavailable');
   });
+
+  it('degrades — never stops — when an enabled bridge is down, and never blames a disabled bridge', () => {
+    const bridgeDown = { ...health, bridge: { ...health.bridge, running: false } };
+    const enabledView = deriveSystemTelemetryView(readyWith(bridgeDown), 'openrouter');
+    expect(enabledView.overall).toBe('degraded');
+    expect(enabledView.overallReasons).toContain('bridge_down');
+
+    // The operator turned the bridge off: the same observation is not a fault.
+    const disabledView = deriveSystemTelemetryView(readyWith(bridgeDown), 'openrouter', false);
+    expect(disabledView.overall).toBe('healthy');
+    expect(disabledView.overallReasons).not.toContain('bridge_down');
+    expect(disabledView.health.requirements.bridge).toBe('disabled');
+  });
+
+  it('still reports a stopped verdict only through the Bun server', () => {
+    const bunDown = { ...health, bun_server: { ...health.bun_server, running: false } };
+    expect(deriveSystemTelemetryView(readyWith(bunDown), 'openrouter', false).overall).toBe('stopped');
+  });
 });
 
 const loaded = (snapshot: HealthData) => reduceSystemTelemetryState(
@@ -162,6 +180,15 @@ describe('inference-backend service requirements', () => {
       backend: 'claude_cli',
       requirements: { bun: 'required', bridge: 'required', ollama: 'not_required', proxy: 'required' },
     });
+  });
+
+  it('binds the bridge requirement to the Enable Bridge setting, never to the backend', () => {
+    for (const backendValue of ['ollama', 'openrouter', 'llama_cpp', 'claude_cli', null]) {
+      expect(projectServiceRequirements(backendValue, false).requirements.bridge).toBe('disabled');
+      expect(projectServiceRequirements(backendValue, true).requirements.bridge).toBe('required');
+      // An older surface that omits the flag reads as enabled.
+      expect(projectServiceRequirements(backendValue, undefined).requirements.bridge).toBe('required');
+    }
   });
 
   it('fails an unknown, absent, or unrecognised active backend to unknown rather than to a required set', () => {
@@ -235,7 +262,7 @@ describe('required-set aware system telemetry', () => {
     expect(underOllama.overall).toBe('degraded');
   });
 
-  it('keeps the always-required Bun server and bridge, and the supervisor give-up hints, authoritative', () => {
+  it('keeps the always-required Bun server authoritative and the bridge factored but not stopping', () => {
     const openRouter = deriveSystemTelemetryView(stockReady(), 'openrouter');
     expect(openRouter.health.requirements.bun).toBe('required');
     expect(openRouter.health.requirements.bridge).toBe('required');
@@ -247,12 +274,24 @@ describe('required-set aware system telemetry', () => {
     expect(stopped.overall).toBe('stopped');
     expect(stopped.overallReasons).toEqual(['bun_down']);
 
+    // The bridge carries external Agent ingress, never a Session turn, so its
+    // absence degrades the verdict and names itself instead of claiming that
+    // the transport is stopped.
     const bridgeDown = deriveSystemTelemetryView(
       readyWith({ ...stockReadyHealth, bridge: { ...health.bridge, running: false } }),
       'openrouter',
     );
-    expect(bridgeDown.overall).toBe('stopped');
+    expect(bridgeDown.overall).toBe('degraded');
     expect(bridgeDown.overallReasons).toEqual(['bridge_down']);
+    // But the operator's own Enable Bridge off switch removes it even as a
+    // reason: a disabled bridge is a settings state, not an observation fault.
+    const bridgeDisabled = deriveSystemTelemetryView(
+      readyWith({ ...stockReadyHealth, bridge: { ...health.bridge, running: false, enabled: false } }),
+      'openrouter',
+      false,
+    );
+    expect(bridgeDisabled.overall).toBe('healthy');
+    expect(bridgeDisabled.overallReasons).toEqual([]);
 
     const givenUp = deriveSystemTelemetryView(
       readyWith({ ...stockReadyHealth, supervisor: { bun_give_up: false, proxy_give_up: true, ollama_give_up: true } }),

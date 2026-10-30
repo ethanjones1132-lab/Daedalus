@@ -83,6 +83,7 @@ function openrouterKeyRequirement(backend: InferenceBackend | 'unknown'): Servic
 const REQUIREMENT_LABELS: Record<ServiceRequirement, string> = {
   required: 'required',
   not_required: 'not required',
+  disabled: 'disabled',
   unknown: 'requirement unknown',
 };
 
@@ -111,7 +112,7 @@ function row(
 }
 
 export function projectHealthSubsystems(status: JarvisStatus | null, stale = false): HealthSubsystems {
-  const { backend, requirements } = projectServiceRequirements(status?.active_backend);
+  const { backend, requirements } = projectServiceRequirements(status?.active_backend, status?.bridge_enabled);
   const modelId = nonEmptyString(status?.model);
   // A local model is only ever measured by Ollama. For every other backend
   // Native reports `model_available` as `!is_ollama`, and under the Ollama

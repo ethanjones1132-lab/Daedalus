@@ -28,13 +28,22 @@ export interface SubsystemRow {
    */
   giveUp: boolean;
   requirement: ServiceRequirement;
+  /**
+   * A row-specific requirement sentence when the generic backend wording
+   * would be false. Only the bridge uses it today: its requirement follows
+   * the Enable Bridge setting and external Agent ingress, never the backend.
+   */
+  requirementCopy?: string;
 }
 
-export function buildSubsystemRows(health: HealthData, activeBackend: unknown): SubsystemRow[] {
-  const { backend, requirements } = projectServiceRequirements(activeBackend);
+export function buildSubsystemRows(health: HealthData, activeBackend: unknown, bridgeEnabled: unknown = true): SubsystemRow[] {
+  const { backend, requirements } = projectServiceRequirements(activeBackend, bridgeEnabled);
+  const bridgeCopy = requirements.bridge === 'disabled'
+    ? 'Disabled by the Enable Bridge setting — not a fault'
+    : 'Required for external Agent bridge connections, not for Session turns';
   const rows: SubsystemRow[] = [
     { key: 'bun', name: 'Bun server', up: health.bun_server.running, detail: health.bun_server.url, command: 'jarvis_restart_server', giveUp: health.supervisor?.bun_give_up === true, requirement: requirements.bun },
-    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge', giveUp: false, requirement: requirements.bridge },
+    { key: 'bridge', name: 'Bridge', up: health.bridge.running, detail: `:${health.bridge.port}`, command: 'restart_bridge', giveUp: false, requirement: requirements.bridge, requirementCopy: bridgeCopy },
   ];
   const ollama: SubsystemRow = {
     key: 'ollama',
@@ -66,12 +75,13 @@ export function buildSubsystemRows(health: HealthData, activeBackend: unknown): 
 const REQUIREMENT_TEXT: Record<ServiceRequirement, string> = {
   required: 'Required by the active Inference backend',
   not_required: 'Not required by the active Inference backend',
+  disabled: 'Disabled (not a fault)',
   unknown: 'Requirement unknown — the active Inference backend is not confirmed',
 };
 
 function gaugeTone(row: SubsystemRow): Tone {
   if (row.up) return 'ok';
-  if (row.requirement === 'not_required') return 'muted';
+  if (row.requirement === 'not_required' || row.requirement === 'disabled') return 'muted';
   if (row.requirement === 'required') return 'error';
   return 'warn';
 }
@@ -128,7 +138,7 @@ export function SubsystemGauges({
                 {row.up ? 'Running' : 'Stopped'}
               </span>
               <h3 className="-mt-1 text-[15px] font-semibold leading-tight tracking-[-0.005em] text-ink">{row.name}</h3>
-              <p className="text-[12px] leading-snug text-ink-3">{REQUIREMENT_TEXT[row.requirement]}</p>
+              <p className="text-[12px] leading-snug text-ink-3">{row.requirementCopy ?? REQUIREMENT_TEXT[row.requirement]}</p>
               <p className="truncate font-mono text-[11.5px] text-ink-2" title={row.detail}>
                 {row.detail}
               </p>

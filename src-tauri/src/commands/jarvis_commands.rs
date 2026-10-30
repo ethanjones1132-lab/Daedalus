@@ -1175,8 +1175,11 @@ where
 
 #[tauri::command]
 pub async fn jarvis_start_bridge(state: State<'_, JarvisState>) -> Result<(), String> {
+    // The bridge listens on the configured port, the same value every health
+    // probe reports, so configuration and observation cannot disagree.
+    let port = state.config.lock().await.clone().bridge_port;
     let queue = state.queue.clone();
-    start_bridge(19876, queue).map(|_| ())
+    start_bridge(port, queue).map(|_| ())
 }
 
 #[tauri::command]

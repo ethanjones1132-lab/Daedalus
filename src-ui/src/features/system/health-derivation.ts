@@ -53,6 +53,14 @@ function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: 
   if (fetchError) return 'unavailable';
   if (!backendOk(s)) return 'down';
   if (!(s.bun_server_running ?? false)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
+  /*
+   * The bridge serves external Agent ingress only (server-jarvis/src/bridge.ts);
+   * a Session turn never passes through it. So a stopped bridge is a warning
+   * that names it, never "All systems ready", and never "Offline" — but only
+   * while the operator's Enable Bridge setting is on. An older native surface
+   * that omits the flag reads as enabled, matching how the gauges relay it.
+   */
+  if (s.bridge_enabled !== false && s.bridge_active === false) return 'warn';
   return 'ok';
 }
 
@@ -63,7 +71,12 @@ function summaryFor(s: JarvisStatus, level: HealthLevel, fetchError: string | nu
     return 'Status check failed';
   }
   if (level === 'starting') return 'Starting Bun server — tools and skills are warming up';
-  if (!(s.bun_server_running ?? false)) return 'Bun server is not running — tools and skills unavailable';
+  if (level === 'warn') {
+    if (!(s.bun_server_running ?? false)) return 'Bun server is not running — tools and skills unavailable';
+    if (s.bridge_enabled !== false && s.bridge_active === false) {
+      return 'External Agent bridge is not running — Session turns and inference are unaffected';
+    }
+  }
   return 'Inference is responding slowly';
 }
 
@@ -90,5 +103,18 @@ export function deriveHealthPresentation(
     level,
     label: level === 'ok' ? 'Ready' : LABELS[level],
     summary: level === 'ok' ? 'All systems ready' : summaryFor(status, level, fetchError),
+  };
+}
+
+/**
+ * A snapshot that failed its most recent refresh must never read as current.
+ * The verdict keeps its content but loses its plain "Ready" label and gains
+ * an explicit staleness sentence, matching the observation panels' copy.
+ */
+export function markStalePresentation(presentation: HealthPresentation): HealthPresentation {
+  return {
+    level: presentation.level === 'ok' ? 'warn' : presentation.level,
+    label: `${presentation.label} (stale)`,
+    summary: `${presentation.summary} Showing the last observed status; it may be stale.`,
   };
 }

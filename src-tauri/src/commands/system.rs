@@ -174,6 +174,10 @@ pub struct BunHealth {
 pub struct BridgeHealth {
     pub running: bool,
     pub port: u16,
+    /// The operator's Enable Bridge setting. A stopped-but-disabled bridge is
+    /// a settings state, reported as such instead of a bare "not running".
+    #[serde(default = "crate::jarvis::types::default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +381,18 @@ pub fn get_build_info() -> BuildInfo {
 
 // ── Health & Doctor ─────────────────────────────────────────
 
+/// One bridge projection for every health surface: the port that is probed,
+/// the port that is reported, and the Enable Bridge flag all come from the
+/// same configuration value, so the probe and the status read can never
+/// disagree about where the bridge is or whether it is wanted.
+fn bridge_health_for(config: &crate::jarvis::types::JarvisConfig, probe: impl Fn(u16) -> bool) -> BridgeHealth {
+    BridgeHealth {
+        running: probe(config.bridge_port),
+        port: config.bridge_port,
+        enabled: config.bridge_enabled,
+    }
+}
+
 #[tauri::command]
 pub async fn get_system_health(
     app: tauri::AppHandle,
@@ -403,10 +419,9 @@ pub async fn get_system_health(
         None
     };
 
+    let config = state.config.lock().await.clone();
     // Bun server: probe the cached health URL via crate helper if available
     let bun_running = crate::bun_server_is_listening();
-    let bridge_running = crate::is_port_listening(19876);
-    let config = state.config.lock().await.clone();
     let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
     let proxy_required = crate::claude_proxy_enabled(&config);
     let proxy_running = proxy_required && crate::claude_proxy_is_listening();
@@ -436,10 +451,7 @@ pub async fn get_system_health(
             running: bun_running,
             url: "http://127.0.0.1:19877".to_string(),
         },
-        bridge: BridgeHealth {
-            running: bridge_running,
-            port: 19876,
-        },
+        bridge: bridge_health_for(&config, crate::is_port_listening),
         claude_proxy: ClaudeProxyHealth {
             running: proxy_running,
             port: 19878,
@@ -600,13 +612,14 @@ pub async fn get_doctor_report(
     });
 
     // Bridge
-    let bridge = crate::is_port_listening(19876);
+    let bridge = crate::is_port_listening(config.bridge_port);
     checks.push(DoctorCheck {
         name: "bridge".into(),
         status: if bridge { "ok".into() } else { "warn".into() },
         detail: format!(
-            "Agent bridge {} on port 19876",
-            if bridge { "listening" } else { "not listening" }
+            "Agent bridge {} on port {}",
+            if bridge { "listening" } else { "not listening" },
+            config.bridge_port
         ),
     });
 
@@ -1199,14 +1212,15 @@ pub async fn check_updates() -> Result<UpdateInfo, String> {
 }
 
 #[tauri::command]
-pub fn restart_bridge() -> Result<bool, String> {
-    // Restart the bridge listener using a default queue. The bridge is a
-    // local-only service; the queue consumer task is spawned from the
-    // synchronous command path, so we use the same construction pattern as
-    // `jarvis_start_bridge` but without requiring Tauri state.
-    let config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
-    let queue = Arc::new(crate::jarvis::queue::MessageQueue::new(config));
-    let status = restart_bridge_service(19876, queue)?;
+pub async fn restart_bridge(state: State<'_, crate::jarvis::types::JarvisState>) -> Result<bool, String> {
+    // Restart the bridge listener on the configured port, the same value
+    // `get_system_health` and `jarvis_check_status` probe, using the real
+    // queue so the restarted service keeps its plumbing.
+    let port = state.config.lock().await.clone().bridge_port;
+    let queue = state.queue.clone();
+    let status = tokio::task::spawn_blocking(move || restart_bridge_service(port, queue))
+        .await
+        .map_err(|e| e.to_string())??;
     Ok(status.running)
 }
 
@@ -1218,6 +1232,27 @@ mod bridge_restart_tests {
     fn test_queue() -> Arc<crate::jarvis::queue::MessageQueue> {
         let config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
         Arc::new(crate::jarvis::queue::MessageQueue::new(config))
+    }
+
+    #[test]
+    fn bridge_health_reports_the_configured_port_and_enabled_flag() {
+        // A non-default port must be both probed and reported, and the
+        // Enable Bridge setting must flow through as its own state.
+        let mut config = crate::jarvis::types::JarvisConfig::default();
+        config.bridge_port = 19800;
+        config.bridge_enabled = false;
+        let health = bridge_health_for(&config, |p| p == 19800);
+        assert_eq!(health.port, 19800);
+        assert!(health.running);
+        assert!(!health.enabled);
+
+        // A bridge that is not listening is reported on the same port, so the
+        // health read and jarvis_check_status cannot disagree about where to
+        // look for it.
+        let down = bridge_health_for(&config, |p| p == 19876);
+        assert!(!down.running);
+        assert_eq!(down.port, 19800);
+        assert!(!down.enabled);
     }
 
     #[test]

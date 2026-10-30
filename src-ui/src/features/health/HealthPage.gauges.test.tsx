@@ -99,7 +99,7 @@ describe('Health page verdict and gauges', () => {
     expect(within(gauge('Bun server')).getByText('auto-restart paused')).toBeInTheDocument();
     expect(within(gauge('Claude proxy')).getByText('Required by the active Inference backend')).toBeInTheDocument();
     expect(within(gauge('Ollama')).getByText('Not required by the active Inference backend')).toBeInTheDocument();
-    expect(within(gauge('Bridge')).getByText('Required by the active Inference backend')).toBeInTheDocument();
+    expect(within(gauge('Bridge')).getByText('Required for external Agent bridge connections, not for Session turns')).toBeInTheDocument();
   });
 
   it('does not guess the required set while the status read has not answered', async () => {

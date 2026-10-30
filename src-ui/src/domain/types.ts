@@ -331,6 +331,8 @@ export interface JarvisStatus {
   // Bridge
   bridge_active: boolean;
   bridge_port: number;
+  /** The operator's Enable Bridge setting; absent on older native surfaces. */
+  bridge_enabled?: boolean;
   // General availability
   bun_available: boolean;
   // Active backend descriptor
