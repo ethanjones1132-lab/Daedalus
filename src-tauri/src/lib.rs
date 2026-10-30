@@ -1936,6 +1936,7 @@ pub fn run() {
             skill_revisions_list,
             skill_restore_revision,
             sync_distilled_skill_candidates,
+            bun_server_origin,
             list_channels,
             add_channel,
             remove_channel,

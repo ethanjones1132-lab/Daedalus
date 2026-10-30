@@ -24,6 +24,7 @@ import { useSkillsController } from './useSkillsController';
 import {
   candidateIdOf,
   isDistilledCandidate,
+  projectSkillLifecycle,
   skillMeta,
   type Skill,
   type SkillFilter,
@@ -154,43 +155,64 @@ export function SkillsPage() {
                   </div>
                 ) : ctl.error ? (
                   <AlertLine onRetry={() => void ctl.fetchSkills()}>{ctl.error}</AlertLine>
-                ) : filtered.length === 0 ? (
-                  <EmptyState title="No skills match the current filter." />
                 ) : (
+                  <>
+                    {ctl.mirrorStale && (
+                      <div role="status" className="text-[12px] text-ink-3">
+                        The distilled-candidate mirror could not refresh; native rows may be stale.{' '}
+                        <button type="button" onClick={() => void ctl.fetchSkills()} className="underline underline-offset-2">
+                          Resync
+                        </button>
+                      </div>
+                    )}
+                    {filtered.length === 0 ? (
+                      <EmptyState title="No skills match the current filter." />
+                    ) : (
                   <ul className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(290px,1fr))]">
-                    {filtered.map((s) => {
-                      const cid = candidateIdOf(s);
-                      const candidate = cid ? (candidates?.[cid] ?? null) : null;
-                      const mutation = cid ? (candidateMutations[cid] ?? null) : null;
-                      return (
-                        <SkillCard
-                          key={s.id}
-                          skill={s}
-                          selected={selectedId === s.id}
-                          detailRegionId={`${detailId}-${s.id}`}
-                          inspectRef={(node) => {
-                            if (node) inspectionButtons.current.set(s.id, node);
-                            else inspectionButtons.current.delete(s.id);
-                          }}
-                          onSelect={() => setSelectedId(s.id)}
-                          candidate={candidate}
-                          candidateCurrent={candidateCurrent}
-                          candidateMutation={mutation}
-                          candidateLocked={skillCandidateMutationLocked(mutation)}
-                          onCandidateAction={(action) => {
-                            if (cid) void ctl.runCandidateAction(s.name, cid, action);
-                          }}
-                          onRetryCandidate={() => {
-                            if (cid) void ctl.retryCandidateMutation(s.name, cid);
-                          }}
-                          togglePending={ctl.togglePending[s.id] === true}
-                          toggleError={ctl.toggleError[s.id] === true}
-                          onToggle={() => void ctl.toggle(s)}
-                        />
-                      );
-                    })}
+                     {filtered.map((s) => {
+                       const cid = candidateIdOf(s);
+                       const candidate = cid ? (candidates?.[cid] ?? null) : null;
+                       const mutation = cid ? (candidateMutations[cid] ?? null) : null;
+                       const lifecycle = projectSkillLifecycle({
+                         skill: s,
+                         candidates,
+                         candidateCurrent,
+                         loading: ctl.candidateState.loading,
+                         error: ctl.candidateState.error,
+                       });
+                       return (
+                         <SkillCard
+                           key={s.id}
+                           skill={s}
+                           selected={selectedId === s.id}
+                           detailRegionId={`${detailId}-${s.id}`}
+                           inspectRef={(node) => {
+                             if (node) inspectionButtons.current.set(s.id, node);
+                             else inspectionButtons.current.delete(s.id);
+                           }}
+                           onSelect={() => setSelectedId(s.id)}
+                           candidate={candidate}
+                           candidateCurrent={candidateCurrent}
+                           lifecycle={lifecycle}
+                           candidateMutation={mutation}
+                           candidateLocked={skillCandidateMutationLocked(mutation)}
+                           onCandidateAction={(action) => {
+                             if (cid) void ctl.runCandidateAction(s.name, cid, action);
+                           }}
+                           onRetryCandidate={() => {
+                             if (cid) void ctl.retryCandidateMutation(s.name, cid);
+                           }}
+                           onResync={() => void ctl.fetchSkills()}
+                           togglePending={ctl.togglePending[s.id] === true}
+                           toggleError={ctl.toggleError[s.id] === true}
+                           onToggle={() => void ctl.toggle(s)}
+                         />
+                       );
+                     })}
                   </ul>
-                )}
+                     )}
+                   </>
+                 )}
               </div>
 
               {selected && (
@@ -201,6 +223,13 @@ export function SkillsPage() {
                     regionId={`${detailId}-${selected.id}`}
                     candidateDetail={selectedCandidate}
                     candidateCurrent={candidateCurrent}
+                    lifecycle={projectSkillLifecycle({
+                      skill: selected,
+                      candidates,
+                      candidateCurrent,
+                      loading: ctl.candidateState.loading,
+                      error: ctl.candidateState.error,
+                    })}
                     candidateMutation={selectedCandidateMutation}
                     onCandidateAction={(action) => {
                       if (selectedCandidate) void ctl.runCandidateAction(selected.name, selectedCandidate.id, action);
@@ -208,6 +237,7 @@ export function SkillsPage() {
                     onRetryCandidate={() => {
                       if (selectedCandidateId) void ctl.retryCandidateMutation(selected.name, selectedCandidateId);
                     }}
+                    onResync={() => void ctl.fetchSkills()}
                     onClose={closeInspection}
                     onToggle={(skill) => void ctl.toggle(skill)}
                     togglePending={ctl.togglePending[selected.id] === true}

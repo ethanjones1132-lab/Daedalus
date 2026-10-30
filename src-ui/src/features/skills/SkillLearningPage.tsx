@@ -1,6 +1,7 @@
 import { decodeSkillScore } from '../../lib/skill-score-reading';
-import { sectionCount, listRead, projectListTally, tallyNumber } from '../../lib/list-tally';
-import { useFeatureMode } from '../workflows/FeatureModes';
+import { bunOrigin } from '../../lib/bun-origin';
+import { projectSkillLifecycle } from './skill-model';
+import { sectionCount, listRead, projectListTally, tallyNumber } from '../../lib/list-tally';import { useFeatureMode } from '../workflows/FeatureModes';
 // ═══════════════════════════════════════════════════════════════
 // ── SkillsView — Browse, toggle, inspect, and revision-restore skills
 // ═══════════════════════════════════════════════════════════════
@@ -103,8 +104,6 @@ interface SkillCandidateDetail {
 }
 
 type Filter = 'all' | 'enabled' | 'disabled' | 'candidates';
-
-const BUN_URL = 'http://127.0.0.1:19877';
 
 type RollbackReasonCode = 'regression_detected' | 'superseded_by_newer_evidence' | 'manual_rollback';
 
@@ -222,7 +221,8 @@ async function postSkillCandidateAction(
     payload = { expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) };
   }
   try {
-    const res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
+    const origin = await bunOrigin();
+    const res = await fetch(`${origin}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -249,7 +249,7 @@ async function postSkillCandidateAction(
 async function readCandidatePerformance(candidateId: string): Promise<CandidatePerformanceResponse> {
   let res: Response;
   try {
-    res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
+    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
   } catch {
     return { kind: 'transport' };
   }
@@ -529,7 +529,7 @@ export function decodeSkillCandidateEvaluation(body: unknown): SkillCandidateEva
 export async function readCandidateEvaluation(candidateId: string): Promise<SkillCandidateEvaluationReadResult> {
   let res: Response;
   try {
-    res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/evaluation`);
+    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/evaluation`);
   } catch {
     return { kind: 'transport' };
   }
@@ -1253,7 +1253,7 @@ async function readRuntimeTools() {
 }
 
 async function readCandidates() {
-  const res = await fetch(`${BUN_URL}/skills/candidates`);
+  const res = await fetch(`${await bunOrigin()}/skills/candidates`);
   if (!res.ok) throw new Error('Candidate observation unavailable');
   const body = await res.json();
   if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');
@@ -1311,6 +1311,8 @@ export function SkillsView() {
   const candidates = candidateState.snapshot;
   const candidateCurrent = candidates !== null && !candidateState.loading && !candidateState.error;
   const canUseCandidate = useCallback(() => candidatesCurrent.current, [candidatesCurrent]);
+  /** The native candidate mirror could not refresh on the latest read. */
+  const [mirrorStale, setMirrorStale] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
@@ -1355,13 +1357,17 @@ export function SkillsView() {
       try {
         await invoke<number>('sync_distilled_skill_candidates');
       } catch {
-        /* Bun may not have written candidates yet */
+        // The native candidate mirror could not refresh; its rows may be stale
+        // until the next sync. Non-fatal — the original read continues, and the
+        // lifecycle chips label mirror-only states accordingly.
+        setMirrorStale(true);
       }
       const list = await invoke<Skill[]>('list_skills');
       if (readId !== listReadId.current) return;
       const reconciled = applySkillListRead(list, protections.current, readId);
       protections.current = reconciled.protections;
       setSkills(reconciled.skills);
+      setMirrorStale(false);
 
     } catch {
       if (readId === listReadId.current) setError('Could not read skill revisions. Retry the read.');
@@ -1798,6 +1804,13 @@ export function SkillsView() {
                 const distilled = isDistilledSkill(s);
                 const candidateId = candidateIdOf(s);
                 const candidate = candidateId ? candidates?.[candidateId] : null;
+                 const lifecycle = projectSkillLifecycle({
+                   skill: s,
+                   candidates,
+                   candidateCurrent,
+                   loading: candidateState.loading,
+                   error: candidateState.error,
+                 });
                  const candidateStatus = candidate?.status;
                  const candidateMutation = candidateId ? candidateMutations[candidateId] ?? null : null;
                  const candidateActionLocked = skillCandidateMutationLocked(candidateMutation);
@@ -1838,9 +1851,19 @@ export function SkillsView() {
                           </span>
                         )}
                         {distilled && (
-                          <span className="text-[10px] rounded-full bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 text-amber-200/80">
-                            {candidateStatus ? `${candidateStatus}${candidateCurrent ? '' : ' (previous observation; may be stale)'}` : 'Lifecycle observation unavailable.'}
-                          </span>
+                          lifecycle.verdict === 'known' ? (
+                            <span className="text-[10px] rounded-full bg-emerald-500/10 border border-emerald-500/30 px-1.5 py-0.5 text-emerald-200">{lifecycle.label}</span>
+                          ) : (
+                            <span
+                              role={lifecycle.verdict === 'failed' ? 'alert' : lifecycle.verdict === 'pending' ? 'status' : undefined}
+                              className="text-[10px] rounded-full bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 text-amber-200/80"
+                            >
+                              {lifecycle.label}
+                            </span>
+                          )
+                        )}
+                        {distilled && mirrorStale && (
+                          <span className="text-[10px] text-amber-200/60">mirror may be stale</span>
                         )}
                         {distilled && candidateId ? (
                           <div className="ml-auto flex gap-1">

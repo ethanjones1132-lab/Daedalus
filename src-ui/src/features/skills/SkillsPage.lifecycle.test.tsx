@@ -142,7 +142,9 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
 
     fireEvent.click(alphaRow.getByRole('button', { name: 'Reject' }));
     fireEvent.click(detail.getByRole('button', { name: 'Reject' }));
-    expect(posts(alpha.id, 'reject')).toHaveLength(1);
+    await waitFor(() => expect(posts(alpha.id, 'reject')).toHaveLength(1));
+    // One extra tick: the duplicate click must not have queued a second write.
+    await act(async () => {});
     expect(posts(alpha.id, 'reject')).toHaveLength(1);
     for (const button of [alphaRow.getByRole('button', { name: 'Reject' }), alphaRow.getByRole('button', { name: 'Reject' }), detail.getByRole('button', { name: 'Reject' }), detail.getByRole('button', { name: 'Reject' })]) {
       expect(button).toBeDisabled();
@@ -168,7 +170,7 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
     expect(candidates[alpha.id].status).toBe('candidate');
 
     fireEvent.click(alphaRow.getByRole('button', { name: 'Retry' }));
-    expect(posts(alpha.id, 'reject')).toHaveLength(2);
+    await waitFor(() => expect(posts(alpha.id, 'reject')).toHaveLength(2));
     candidates[alpha.id] = { ...candidates[alpha.id], status: 'rejected', lifecycle_version: 1 };
     await act(async () => retry.resolve(response({ id: alpha.id, status: 'rejected', lifecycle_version: 1 })));
     await waitFor(() => expect(screen.getByText('Rejected distilled-alpha')).toBeInTheDocument());
@@ -206,8 +208,8 @@ describe('SkillsPage distilled candidate lifecycle coordination', () => {
 
     fireEvent.click(alphaRow.getByRole('button', { name: 'Reject' }));
     fireEvent.click(betaRow.getByRole('button', { name: 'Reject' }));
-    expect(posts(alpha.id, 'reject')).toHaveLength(1);
-    expect(posts(beta.id, 'reject')).toHaveLength(1);
+    await waitFor(() => expect(posts(alpha.id, 'reject')).toHaveLength(1));
+    await waitFor(() => expect(posts(beta.id, 'reject')).toHaveLength(1));
     expect(alphaRow.getByRole('button', { name: 'Reject' })).toBeDisabled();
     expect(betaRow.getByRole('button', { name: 'Reject' })).toBeDisabled();
 

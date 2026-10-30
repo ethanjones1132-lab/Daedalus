@@ -74,7 +74,9 @@ describe('SkillsPage optional observations', () => {
     }
     const row = screen.getByRole('button', { name: 'Inspect skill: distilled-debug' }).closest('li')!;
     expect(within(row).queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
-    expect(within(row).getByText('Lifecycle observation unavailable.')).toBeInTheDocument();
+    // Pending is claimed as checking, never as unavailable: the read may still answer.
+    expect(within(row).getByText('Checking lifecycle…')).toBeInTheDocument();
+    expect(within(row).queryByText('Lifecycle observation unavailable.')).not.toBeInTheDocument();
   });
 
   it('recovers only a failed capability read without replaying sync or other reads', async () => {
@@ -178,5 +180,30 @@ describe('SkillsPage optional observations', () => {
     expect(region('Skill candidates').getByText('No skill candidates observed.')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
     expect(screen.queryByText('obsolete-runtime')).not.toBeInTheDocument();
+  });
+
+  it('shows a known-lockless lifecycle once the read settles, distinct from pending and failure', async () => {
+    fetchMock.mockImplementationOnce(async () => { throw new Error('private transport detail'); });
+    render(<SkillsPage />);
+    await screen.findByRole('button', { name: 'Inspect skill: distilled-debug' });
+    // Settled failure, not pending: "unavailable" is only for a real failure,
+    // and the native mirror is offered as an explicitly stale fallback.
+    const row = screen.getByRole('button', { name: 'Inspect skill: distilled-debug' }).closest('li')!;
+    expect(within(row).getByText('Lifecycle observation unavailable.')).toBeInTheDocument();
+    expect(within(row).getByText('mirrored: candidate (may be stale)')).toBeInTheDocument();
+    expect(within(row).queryByText('Checking lifecycle…')).not.toBeInTheDocument();
+
+    // A successful resync that answers without the row makes it "absent",
+    // not failed — and never removes the distilled row itself.
+    fetchMock.mockResolvedValue(response([]));
+    await act(async () => {
+      fireEvent.click(region('Skill candidates').getByRole('button', { name: 'Retry' }));
+    });
+    await waitFor(() =>
+      expect(within(row).getByText('Candidate record not found.')).toBeInTheDocument(),
+    );
+    expect(screen.getByRole('button', { name: 'Resync candidates' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Inspect skill: distilled-debug' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Inspect skill: review' })).toBeEnabled();
   });
 });

@@ -31,6 +31,7 @@ import {
   skillMeta,
   type Skill,
   type SkillCandidateDetail,
+  type SkillLifecycleView,
   type SkillRevision,
 } from './skill-model';
 
@@ -80,9 +81,11 @@ export function SkillDetail({
   regionId,
   candidateDetail,
   candidateCurrent,
+  lifecycle,
   candidateMutation,
   onCandidateAction,
   onRetryCandidate,
+  onResync,
   onClose,
   onToggle,
   togglePending,
@@ -93,9 +96,11 @@ export function SkillDetail({
   regionId: string;
   candidateDetail: SkillCandidateDetail | null;
   candidateCurrent: boolean;
+  lifecycle: SkillLifecycleView;
   candidateMutation: SkillCandidateMutation | null;
   onCandidateAction: (action: SkillCandidateAction) => void;
   onRetryCandidate: () => void;
+  onResync: () => void;
   onClose: () => void;
   onToggle: (skill: Skill) => void;
   togglePending: boolean;
@@ -211,43 +216,43 @@ export function SkillDetail({
 
       <Requirements skill={skill} />
 
-      {candidateDetail && (
+      {lifecycle.detail ? (
         <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunken/60 px-3 py-2.5 text-[12.5px]">
-          {!candidateCurrent && (
-            <p className="text-warn">Previous lifecycle observation; it may be stale. Actions are unavailable.</p>
+          {lifecycle.verdict !== 'known' && (
+            <p className="text-warn">{lifecycle.label}. Actions are unavailable.</p>
           )}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <span className="d-label">Confidence</span>
-            <Badge tone="neutral">{decodeSkillScore(candidateDetail.confidence, 'confidence').label}</Badge>
-            {candidateDetail.eval_score !== undefined && (
+            <Badge tone="neutral">{decodeSkillScore(lifecycle.detail.confidence, 'confidence').label}</Badge>
+            {lifecycle.detail.eval_score !== undefined && (
               <>
                 <span className="d-label">Eval score</span>
-                <Badge tone={candidateDetail.eval_score >= 0.75 ? 'ok' : 'warn'}>{decodeSkillScore(candidateDetail.eval_score, 'eval_score').label}</Badge>
+                <Badge tone={lifecycle.detail.eval_score >= 0.75 ? 'ok' : 'warn'}>{decodeSkillScore(lifecycle.detail.eval_score, 'eval_score').label}</Badge>
               </>
             )}
-            {decodeSkillScore(candidateDetail.confidence, 'confidence').basis && <p className="text-xs text-ink-3">{decodeSkillScore(candidateDetail.confidence, 'confidence').basis}</p>}
-            {candidateDetail.status === 'rejected' && candidateDetail.rejection_reason && (
+            {decodeSkillScore(lifecycle.detail.confidence, 'confidence').basis && <p className="text-xs text-ink-3">{decodeSkillScore(lifecycle.detail.confidence, 'confidence').basis}</p>}
+            {lifecycle.detail.status === 'rejected' && lifecycle.detail.rejection_reason && (
               <>
                 <span className="d-label">Rejected</span>
-                <Badge tone="error">{candidateDetail.rejection_reason}</Badge>
+                <Badge tone="error">{lifecycle.detail.rejection_reason}</Badge>
               </>
             )}
-            {candidateDetail.promoted_at && (
+            {lifecycle.detail.promoted_at && (
               <>
                 <span className="d-label">Promoted</span>
-                <span className="text-ink-2">{formatDate(candidateDetail.promoted_at)}</span>
+                <span className="text-ink-2">{formatDate(lifecycle.detail.promoted_at)}</span>
               </>
             )}
           </div>
-          {candidateDetail.rejection_detail && <p className="text-ink-3">{candidateDetail.rejection_detail}</p>}
-          {candidateDetail.eval_missed && candidateDetail.eval_missed.length > 0 && (
-            <p className="text-ink-3">Missed: {candidateDetail.eval_missed.join('; ')}</p>
+          {lifecycle.detail.rejection_detail && <p className="text-ink-3">{lifecycle.detail.rejection_detail}</p>}
+          {lifecycle.detail.eval_missed && lifecycle.detail.eval_missed.length > 0 && (
+            <p className="text-ink-3">Missed: {lifecycle.detail.eval_missed.join('; ')}</p>
           )}
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10.5px] text-ink-3">
-            {candidateDetail.source_session_id && <span>session {candidateDetail.source_session_id}</span>}
-            {candidateDetail.source_run_ids.length > 0 && <span>runs {candidateDetail.source_run_ids.join(', ')}</span>}
+            {lifecycle.detail.source_session_id && <span>session {lifecycle.detail.source_session_id}</span>}
+            {lifecycle.detail.source_run_ids.length > 0 && <span>runs {lifecycle.detail.source_run_ids.join(', ')}</span>}
           </div>
-          {candidateDetail.status === 'promoted' && performance.view && (
+          {lifecycle.detail.status === 'promoted' && performance.view && (
             <PerformanceReadout
               view={performance.view}
               performance={performance.performance}
@@ -256,7 +261,24 @@ export function SkillDetail({
             />
           )}
         </div>
-      )}
+      ) : distilled ? (
+        <div
+          role={lifecycle.verdict === 'failed' ? 'alert' : 'status'}
+          className="flex flex-col items-start gap-1 rounded-lg border border-line bg-sunken/60 px-3 py-2.5 text-[12.5px]"
+        >
+          <p className={lifecycle.verdict === 'pending' ? 'text-ink-3' : 'text-warn'}>{lifecycle.label}</p>
+          {lifecycle.verdict === 'failed' && lifecycle.status !== null && (
+            <p className="font-mono text-[10.5px] text-ink-3">
+              Mirrored in the native skill row: {lifecycle.status} (may be stale; never used to authorise actions here)
+            </p>
+          )}
+          {lifecycle.verdict === 'absent' && (
+            <button type="button" onClick={onResync} className="text-[11.5px] underline underline-offset-2">
+              Resync candidates
+            </button>
+          )}
+        </div>
+      ) : null}
 
       <div>
         <Tabs<DetailTab>

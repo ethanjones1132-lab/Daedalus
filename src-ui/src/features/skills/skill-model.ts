@@ -4,8 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { SkillCandidateAction } from '../../domain/skill-candidate-operation-state';
 import type { CandidatePerformanceResponse } from '../../domain/skill-candidate-performance';
-
-export const BUN_URL = 'http://127.0.0.1:19877';
+import { bunOrigin } from '../../lib/bun-origin';
 
 /** Skill relevance gate: promotion requires a passing judge decision. */
 export const PROMOTE_EVAL_GATE = 0.75;
@@ -164,6 +163,92 @@ export function candidateIdOf(skill: Skill): string | null {
   return skillMeta(skill).candidateId;
 }
 
+// ── Distilled-skill lifecycle observation ────────────────────────────────────
+
+/**
+ * What the surfaces can honestly claim about one distilled skill's candidate
+ * lifecycle. The old render sites conflated "the read has not answered yet"
+ * and "the read failed" into a single "Lifecycle observation unavailable."
+ * shown while pending — these five verdicts separate them. A failed read
+ * never removes the distilled-row semantics, and the native mirror's
+ * `metadata.status` may be surfaced as an explicitly stale fallback but never
+ * authorises an action (`current` is false for everything but a fresh read).
+ */
+export type SkillLifecycleVerdict =
+  /** The read succeeded and names this skill's candidate: fresh. */
+  | 'known'
+  /** An earlier read's row is still in hand; the fresh read has not replaced it. */
+  | 'stale'
+  /** The read succeeded, but no candidate row exists for this skill's id. */
+  | 'absent'
+  /** The read has not answered yet. */
+  | 'pending'
+  /** The read failed, and no earlier row is in hand. */
+  | 'failed';
+
+export interface SkillLifecycleView {
+  verdict: SkillLifecycleVerdict;
+  /** The fixed sentence the surface shows. No error text is ever interpolated. */
+  label: string;
+  /**
+   * The lifecycle status in evidence: the candidate row's for `known`/`stale`,
+   * the native mirror's for `failed` (authoritative for nothing — it may be
+   * stale), and null while nothing is known.
+   */
+  status: string | null;
+  /** Actions gate on this; only a fresh, successful read sets it true. */
+  current: boolean;
+  detail: SkillCandidateDetail | null;
+}
+
+export function projectSkillLifecycle(input: {
+  skill: Skill;
+  candidates: Record<string, SkillCandidateDetail> | null;
+  candidateCurrent: boolean;
+  loading: boolean;
+  error: boolean;
+}): SkillLifecycleView {
+  const candidateId = candidateIdOf(input.skill);
+  const detail =
+    candidateId && input.candidates ? (input.candidates[candidateId] ?? null) : null;
+
+  if (detail !== null && input.candidateCurrent) {
+    return { verdict: 'known', label: detail.status, status: detail.status, current: true, detail };
+  }
+  if (detail !== null) {
+    return {
+      verdict: 'stale',
+      label: `${detail.status} (previous observation; may be stale)`,
+      status: detail.status,
+      current: false,
+      detail,
+    };
+  }
+  if (input.error || input.loading) {
+    // With nothing in hand, a pending read is still "checking"; only a settled
+    // failure is unavailable. An in-flight retry after an earlier failure also
+    // reads as checking — the retry may still answer.
+    const loading = input.loading;
+    return {
+      verdict: loading ? 'pending' : 'failed',
+      label: loading ? 'Checking lifecycle…' : 'Lifecycle observation unavailable.',
+      // The native mirror's status is the only stale fallback in evidence.
+      status: skillMeta(input.skill).status,
+      current: false,
+      detail: null,
+    };
+  }
+  // A settled, successful read that names no row for this candidate id: the
+  // record is gone from the store — never treated as a failure, never hidden.
+  return {
+    verdict: 'absent',
+    label: 'Candidate record not found.',
+    status: null,
+    current: false,
+    detail: null,
+  };
+}
+
 export function formatDate(ts?: string | null): string {
   if (!ts) return '—';
   const d = new Date(ts);
@@ -188,7 +273,8 @@ export async function postSkillCandidateAction(
   reason?: string,
 ): Promise<SkillCandidateActionResponse> {
   try {
-    const res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
+    const origin = await bunOrigin();
+    const res = await fetch(`${origin}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) }),
@@ -215,7 +301,7 @@ export async function postSkillCandidateAction(
 export async function readCandidatePerformance(candidateId: string): Promise<CandidatePerformanceResponse> {
   let res: Response;
   try {
-    res = await fetch(`${BUN_URL}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
+    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
   } catch {
     return { kind: 'transport' };
   }
@@ -246,7 +332,7 @@ export function runtimeEntryLabel(entry: RuntimeEntry): string {
 }
 
 export async function readCandidates() {
-  const res = await fetch(`${BUN_URL}/skills/candidates`);
+  const res = await fetch(`${await bunOrigin()}/skills/candidates`);
   if (!res.ok) throw new Error('Candidate observation unavailable');
   const body = await res.json();
   if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');

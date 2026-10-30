@@ -43,6 +43,8 @@ export function useSkillsController() {
   const canUseCandidate = useCallback(() => candidatesCurrent.current, [candidatesCurrent]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  /** The native candidate mirror could not refresh on the latest read. */
+  const [mirrorStale, setMirrorStale] = useState(false);
   const { success } = useToast();
 
   const publishCandidateMutation = useCallback((candidateId: string, mutation: SkillCandidateMutation | null) => {
@@ -66,8 +68,12 @@ export function useSkillsController() {
       try {
         try {
           await invoke<number>('sync_distilled_skill_candidates');
+          setMirrorStale(false);
         } catch {
-          /* Bun may not have written candidates yet */
+          // The native candidate mirror could not refresh, so its rows may be
+          // stale until the next sync. Non-fatal: the original read continues,
+          // and the lifecycle surfaces label mirrored rows "may be stale".
+          setMirrorStale(true);
         }
         const list = await invoke<Skill[]>('list_skills');
         if (readId !== listReadId.current) return;
@@ -205,6 +211,8 @@ export function useSkillsController() {
     candidateState,
     candidates,
     candidateCurrent,
+    /** The native candidate mirror could not refresh on the latest read. */
+    mirrorStale,
     candidateMutations,
     refreshRuntimeSkills,
     refreshRuntimeTools,

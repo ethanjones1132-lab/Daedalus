@@ -1224,6 +1224,26 @@ pub async fn restart_bridge(state: State<'_, crate::jarvis::types::JarvisState>)
     Ok(status.running)
 }
 
+/// Trigger a re-read of the Bun server's URL, using the same runtime discovery
+/// the status payload reports as `bun_server_url` (cached WSL URL with the
+/// documented default). Read-only; no state is created or changed.
+#[tauri::command]
+pub fn bun_server_origin() -> String {
+    bun_origin_from(crate::wsl::get_cached_bun_url())
+}
+
+/// The documented default origin, shared with the status payload's fallback.
+pub const DEFAULT_BUN_ORIGIN: &str = "http://127.0.0.1:19877";
+
+/// Final origin resolution: a non-empty discovered URL wins (trailing slashes
+/// trimmed); otherwise the documented default stands in. Pure; tested below.
+pub fn bun_origin_from(discovered: Option<String>) -> String {
+    discovered
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| DEFAULT_BUN_ORIGIN.to_string())
+}
+
 #[cfg(test)]
 mod bridge_restart_tests {
     use super::*;
@@ -1253,6 +1273,24 @@ mod bridge_restart_tests {
         assert!(!down.running);
         assert_eq!(down.port, 19800);
         assert!(!down.enabled);
+    }
+
+    #[test]
+    fn bun_origin_prefers_the_discovered_url_and_falls_back_to_the_default() {
+        // The documented default: dev without WSL discovery, or a cold cache.
+        assert_eq!(bun_origin_from(None), DEFAULT_BUN_ORIGIN);
+        assert_eq!(bun_origin_from(Some(String::new())), DEFAULT_BUN_ORIGIN);
+        assert_eq!(bun_origin_from(Some("   ".to_string())), DEFAULT_BUN_ORIGIN);
+        // A discovered URL wins, and a trailing slash is trimmed so path
+        // appends stay single-slashed.
+        assert_eq!(
+            bun_origin_from(Some("http://192.168.1.20:19877/".to_string())),
+            "http://192.168.1.20:19877"
+        );
+        assert_eq!(
+            bun_origin_from(Some("http://127.0.0.1:19999".to_string())),
+            "http://127.0.0.1:19999"
+        );
     }
 
     #[test]

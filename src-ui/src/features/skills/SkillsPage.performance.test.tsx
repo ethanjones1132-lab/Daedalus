@@ -169,8 +169,10 @@ describe('promoted-skill performance read', () => {
     const button = region().getByRole('button', { name: 'Retry' });
     fireEvent.click(button);
     fireEvent.click(button);
+    // The Retry read now resolves its origin (one microtask hop) before the
+    // fetch fires; wait for the read to land instead of asserting mid-tick.
+    await waitFor(() => expect(performanceCalls()).toHaveLength(2));
     expect(button).toBeDisabled();
-    expect(performanceCalls()).toHaveLength(2);
     await act(async () => retry.resolve(json(measured())));
     await waitFor(() => expect(region().queryByRole('alert')).not.toBeInTheDocument());
     expect(region().getByText(/^67% → 100%$/)).toBeInTheDocument();

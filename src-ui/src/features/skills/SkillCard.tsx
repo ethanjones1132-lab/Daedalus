@@ -13,6 +13,7 @@ import {
   skillMeta,
   type Skill,
   type SkillCandidateDetail,
+  type SkillLifecycleView,
 } from './skill-model';
 
 /** Emoji in a hairline tile; a monogram when the skill declares none. */
@@ -71,10 +72,12 @@ export function SkillCard({
   onSelect,
   candidate,
   candidateCurrent,
+  lifecycle,
   candidateMutation,
   candidateLocked,
   onCandidateAction,
   onRetryCandidate,
+  onResync,
   togglePending,
   toggleError,
   onToggle,
@@ -86,10 +89,12 @@ export function SkillCard({
   onSelect: () => void;
   candidate: SkillCandidateDetail | null;
   candidateCurrent: boolean;
+  lifecycle: SkillLifecycleView;
   candidateMutation: SkillCandidateMutation | null;
   candidateLocked: boolean;
   onCandidateAction: (action: SkillCandidateAction) => void;
   onRetryCandidate: () => void;
+  onResync: () => void;
   togglePending: boolean;
   toggleError: boolean;
   onToggle: () => void;
@@ -157,15 +162,37 @@ export function SkillCard({
         {sourceLabel && <Chip>{sourceLabel}</Chip>}
         <Eligibility skill={skill} />
         {distilled &&
-          (candidate?.status && candidateCurrent ? (
-            <Badge tone={candidate.status === 'promoted' ? 'ok' : candidate.status === 'rejected' ? 'error' : 'accent'} dot>
-              {candidate.status}
+          (lifecycle.verdict === 'known' ? (
+            <Badge tone={lifecycle.status === 'promoted' ? 'ok' : lifecycle.status === 'rejected' ? 'error' : 'accent'} dot>
+              {lifecycle.status}
             </Badge>
+          ) : lifecycle.verdict === 'stale' ? (
+            <span className="text-[11.5px] text-warn">{lifecycle.label}</span>
           ) : (
-            <span className="text-[11.5px] text-warn">
-              {candidate?.status
-                ? `${candidate.status} (previous observation; may be stale)`
-                : 'Lifecycle observation unavailable.'}
+            <span className="flex flex-col items-start gap-0.5">
+              <span
+                role={lifecycle.verdict === 'pending' ? 'status' : undefined}
+                className={lifecycle.verdict === 'pending' ? 'text-[11.5px] text-ink-3' : 'text-[11.5px] text-warn'}
+              >
+                {lifecycle.label}
+              </span>
+              {lifecycle.verdict === 'failed' && lifecycle.status !== null && (
+                <span className="font-mono text-[10px] text-ink-3">
+                  mirrored: {lifecycle.status} (may be stale)
+                </span>
+              )}
+              {lifecycle.verdict === 'absent' && (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onResync();
+                  }}
+                  className="text-[11px] underline underline-offset-2"
+                >
+                  Resync candidates
+                </button>
+              )}
             </span>
           ))}
       </div>
