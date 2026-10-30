@@ -31,6 +31,8 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 5. Distinguish source implementation, automated checks, live runtime behavior, and packaged behavior. State which was verified.
 6. Keep maintenance automation aligned with this sequence. Commit counts, test counts, and a clean defect queue are supporting indicators; accepted user outcomes determine progress.
 
+**2026-10-29–30 reliability interruption:** Ethan directed an inference and daily-use walkthrough followed by sequential remediation planning. The walkthrough tested an older packaged build, not the current source. In the `codex/jarvis-daily-stability` worktree, source checkpoints `8ed52f5` and `ce38625` improve Session routing disclosure and partial-result reason/timing diagnostics. Item 2's observed latency remains unproven and unresolved; items 3–12 are not started. Ethan directed a stop and handoff on 2026-10-30. See the [stability campaign](audits/2026-10-29-stability-campaign.md) and [desktop audit](audits/2026-10-29-desktop-daily-use-audit.md) for evidence and limitations. This interruption does not change priority ordering or close any runtime, packaged, real-task, or empirical acceptance gate; return to priority #3 afterward.
+
 ## 1. Make memory change how Jarvis behaves
 
 ### Current implementation checkpoint
