@@ -28,6 +28,7 @@ import {
   initialReceiptState,
   parseDiscordSendResponse,
   parseReceipts,
+  RECEIPT_FAILURE_COPY,
   reduceReceiptState,
   type DeliveryReceipt,
 } from '../../domain/channel-receipt-state';
@@ -230,10 +231,19 @@ export default function ChannelsPage() {
     dispatchReceipts({ type: 'pending' });
     try {
       const response = await globalThis.fetch(`${BUN_URL}/channels/discord/receipts`);
-      if (!response.ok) throw new Error('Delivery telemetry unavailable');
-      dispatchReceipts({ type: 'success', receipts: parseReceipts(await response.json()) });
+      if (!response.ok) {
+        // Refusal with a status: fixed code, fixed copy — the raw status is a
+        // server fact, not the operator's failure message.
+        dispatchReceipts({ type: 'failure', reason: 'http_status' });
+        return;
+      }
+      try {
+        dispatchReceipts({ type: 'success', receipts: parseReceipts(await response.json()) });
+      } catch {
+        dispatchReceipts({ type: 'failure', reason: 'malformed' });
+      }
     } catch {
-      dispatchReceipts({ type: 'failure' });
+      dispatchReceipts({ type: 'failure', reason: 'bun_unreachable' });
     } finally {
       receiptPending.current = false;
     }
@@ -604,8 +614,8 @@ export default function ChannelsPage() {
                 <AlertLine tone="warn">
                   {receiptState.receipts !== null
                     ? 'Delivery telemetry is stale. Showing previously loaded receipts.'
-                    : 'Delivery telemetry is unavailable.'}
-                  {' This does not affect native channel loading.'}
+                    : `Delivery telemetry is unavailable. ${RECEIPT_FAILURE_COPY[receiptState.reason ?? 'bun_unreachable']}`}
+                  {' This is a telemetry-read state, not a delivery verdict: it says nothing about what was delivered, and native channel rows are unaffected.'}
                 </AlertLine>
               )}
               {receiptState.phase === 'ready' && receiptState.receipts?.length === 0 && <p>No delivery receipts yet.</p>}

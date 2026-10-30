@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { initialReceiptState, parseDiscordSendResponse, parseReceipts, reduceReceiptState } from './channel-receipt-state';
+import { initialReceiptState, parseDiscordSendResponse, parseReceipts, RECEIPT_FAILURE_COPY, reduceReceiptState } from './channel-receipt-state';
 
 const receipt = {
   message_id: 'm1', channel: 'discord', status: 'delivered' as const, retry_count: 0,
@@ -8,16 +8,28 @@ const receipt = {
 
 describe('receipt response state', () => {
   it('keeps unavailable distinct from successful empty telemetry', () => {
-    expect(reduceReceiptState(initialReceiptState, { type: 'failure' })).toEqual({ phase: 'failed', receipts: null });
-    expect(reduceReceiptState(initialReceiptState, { type: 'success', receipts: [] })).toEqual({ phase: 'ready', receipts: [] });
+    expect(reduceReceiptState(initialReceiptState, { type: 'failure', reason: 'bun_unreachable' }))
+      .toEqual({ phase: 'failed', receipts: null, reason: 'bun_unreachable' });
+    expect(reduceReceiptState(initialReceiptState, { type: 'success', receipts: [] }))
+      .toEqual({ phase: 'ready', receipts: [], reason: null });
   });
 
   it('retains the last snapshot during refresh and failure, replacing it only on success', () => {
     const ready = reduceReceiptState(initialReceiptState, { type: 'success', receipts: [receipt] });
     const pending = reduceReceiptState(ready, { type: 'pending' });
-    expect(pending).toEqual({ phase: 'loading', receipts: [receipt] });
-    expect(reduceReceiptState(pending, { type: 'failure' })).toEqual({ phase: 'failed', receipts: [receipt] });
-    expect(reduceReceiptState(pending, { type: 'success', receipts: [] })).toEqual({ phase: 'ready', receipts: [] });
+    expect(pending).toEqual({ phase: 'loading', receipts: [receipt], reason: null });
+    expect(reduceReceiptState(pending, { type: 'failure', reason: 'http_status' }))
+      .toEqual({ phase: 'failed', receipts: [receipt], reason: 'http_status' });
+    expect(reduceReceiptState(pending, { type: 'success', receipts: [] }))
+      .toEqual({ phase: 'ready', receipts: [], reason: null });
+  });
+
+  it('carries a fixed reason code whose copy never claims delivery facts', () => {
+    for (const reason of ['bun_unreachable', 'http_status', 'malformed'] as const) {
+      expect(RECEIPT_FAILURE_COPY[reason]).toMatch(/telemetry|request|payload/);
+      expect(RECEIPT_FAILURE_COPY[reason]).not.toMatch(/undelivered|failed to deliver|disconnected/);
+      expect(RECEIPT_FAILURE_COPY[reason]).not.toMatch(/private detail|503|http_\d/);
+    }
   });
 
   it('accepts the endpoint envelope without inventing receipt data or channel mappings', () => {

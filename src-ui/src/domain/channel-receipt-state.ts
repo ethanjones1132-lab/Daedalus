@@ -17,19 +17,34 @@ export interface DiscordSendResponse {
 interface ReceiptState {
   phase: 'loading' | 'ready' | 'failed';
   receipts: DeliveryReceipt[] | null;
+  /**
+   * Why the telemetry read failed, as a fixed code the UI can translate.
+   * A telemetry-read failure is never evidence that a message went undelivered
+   * and never marks a channel disconnected: telemetry and delivery are
+   * different facts.
+   */
+  reason: ReceiptFailureReason | null;
 }
+export type ReceiptFailureReason = 'bun_unreachable' | 'http_status' | 'malformed';
+
+export const RECEIPT_FAILURE_COPY: Record<ReceiptFailureReason, string> = {
+  bun_unreachable: 'The Bun server did not answer the telemetry request.',
+  http_status: 'The Bun server refused the telemetry request.',
+  malformed: 'The delivery telemetry payload was not readable.',
+};
+
 type ReceiptAction =
   | { type: 'pending' }
-  | { type: 'failure' }
+  | { type: 'failure'; reason?: ReceiptFailureReason }
   | { type: 'success'; receipts: DeliveryReceipt[] };
 
-export const initialReceiptState: ReceiptState = { phase: 'loading', receipts: null };
+export const initialReceiptState: ReceiptState = { phase: 'loading', receipts: null, reason: null };
 
 export function reduceReceiptState(state: ReceiptState, action: ReceiptAction): ReceiptState {
   switch (action.type) {
     case 'pending': return { ...state, phase: 'loading' };
-    case 'failure': return { ...state, phase: 'failed' };
-    case 'success': return { phase: 'ready', receipts: action.receipts };
+    case 'failure': return { ...state, phase: 'failed', reason: action.reason ?? null };
+    case 'success': return { phase: 'ready', receipts: action.receipts, reason: null };
   }
 }
 
