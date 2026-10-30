@@ -78,13 +78,25 @@ pub fn set_setting_value(db: &AppDb, key: &str, value: &str) -> Result<(), Strin
     if !KNOWN_SETTING_KEYS.contains(&key) {
         return Err(format!("unknown_setting: {key}"));
     }
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    conn.execute(
-        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        [key, value],
-    )
-    .map_err(|e| e.to_string())?;
+    {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            [key, value],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Project the canonical config onto the Bun-readable file. A single-key
+    // write used to touch SQLite only, so a root or port set from the Advanced
+    // panel never reached the Bun server that reads this file — agent discovery
+    // kept scanning the old root and the bridge the old port until an unrelated
+    // full-config save happened to run. The projection is the same deep-merge
+    // `persist_jarvis_config_conn` performs, so Bun-only nested keys survive,
+    // and the value reloaded here is the one just written (SQLite is canonical).
+    // In unit-test mode we skip the filesystem side effect, as elsewhere.
+    #[cfg(not(test))]
+    crate::jarvis::save_jarvis_config(&load_jarvis_config(db)?);
     Ok(())
 }
 
@@ -288,8 +300,8 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
 /// Bun-only nested keys in the file (e.g. `compaction.ollama_url`) survive.
 ///
 /// This is the one canonical write path; every command that mutates config
-/// (`save_jarvis_config`, `jarvis_save_config`, `jarvis_switch_backend`) routes
-/// through it.
+/// (`save_jarvis_config`, `jarvis_save_config`, `jarvis_switch_backend`, and
+/// the single-key `set_setting`) projects through the same deep-merge.
 pub fn persist_jarvis_config(db: &AppDb, config: &JarvisConfig) -> Result<(), String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     persist_jarvis_config_conn(&conn, config)
@@ -497,6 +509,18 @@ mod tests {
         let err =
             set_setting_value(&db, "unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.contains("unknown_setting"));
+    }
+
+    #[test]
+    fn single_setting_write_is_visible_to_the_canonical_config_loader() {
+        // The Advanced panel writes one key at a time. Agent discovery reads
+        // the root through the full config, so a bare `agents_root` write must
+        // be readable there without any separate full-config save.
+        let db = mem_db();
+        set_setting_value(&db, "agents_root", r"C:\Agents\Root")
+            .expect("agents_root should be accepted");
+        let cfg = load_jarvis_config(&db).expect("load config");
+        assert_eq!(cfg.agents_root, r"C:\Agents\Root");
     }
 
     #[test]

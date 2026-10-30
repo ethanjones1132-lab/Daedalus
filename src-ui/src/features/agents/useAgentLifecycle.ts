@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
-import { initialDiscoveryState, reduceDiscoveryState, type LifecycleAgent } from '../../domain/agent-discovery-state';
+import { initialDiscoveryState, parseDiscoveryPayload, reduceDiscoveryState, type LifecycleAgent } from '../../domain/agent-discovery-state';
 import { canActivateLifecycle, canDeactivateLifecycle, type AgentProjection } from '../../domain/agent-lifecycle-state';
 import { useToast } from '../../design';
 import { BUN_URL, type LifecycleMutationResponse, type LifecycleOperation } from './types';
@@ -37,9 +37,11 @@ export function useAgentLifecycle() {
     try {
       const res = await fetch(`${BUN_URL}/agents`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as LifecycleAgent[];
-      dispatchDiscovery({ type: 'success', agents: data });
-      return data;
+      // Both server shapes are accepted: the bare array (older surface) and
+      // the object that also states what the Agents root is.
+      const { agents, rootVerdict, rootResolvedPath } = parseDiscoveryPayload(await res.json());
+      dispatchDiscovery({ type: 'success', agents, rootVerdict, rootResolvedPath });
+      return agents;
     } catch {
       dispatchDiscovery({ type: 'failure' });
       return null;

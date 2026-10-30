@@ -9,7 +9,7 @@
 // Projection is represented here as a lean runtime result; persistent
 // projection writes remain owned by the native Rust store.
 
-import { existsSync, readdirSync } from "fs";
+import { existsSync, readdirSync, statSync } from "fs";
 import { join } from "path";
 import { parseSoulFile } from "./agent-schema";
 
@@ -40,6 +40,14 @@ export interface LifecycleScanEntry {
 export interface LifecycleRunResult {
   /** The agents root that was scanned. */
   agents_root: string;
+  /**
+   * Typed statement of what the scan could establish about the root itself.
+   * A missing or unreadable root used to be indistinguishable from an empty
+   * root (all read as a bare `[]`), or — for a permission failure — crashed
+   * the route with the raw Node message. Neither is acceptable: an operator
+   * cannot tell "no agents" from "cannot read agents" without this code.
+   */
+  root_state: AgentsRootState;
   /** Total agent directories with a soul.md found. */
   scanned: number;
   /** Directories that produced a valid projection. */
@@ -51,6 +59,13 @@ export interface LifecycleRunResult {
   /** Per-agent detail for every scanned directory. */
   results: LifecycleScanEntry[];
 }
+
+/**
+ * What the scan could establish about the agents root itself. `missing`
+ * covers both an absent path and a non-directory; a permission failure on
+ * `readdir` is `unreadable`, never a silent empty root.
+ */
+export type AgentsRootState = "ok" | "missing" | "unreadable";
 
 export interface ProjectionWriteResult {
   active: boolean;
@@ -115,9 +130,10 @@ export type LifecycleSnapshotValidation =
   | { ok: true; entry: LifecycleScanEntry }
   | { ok: false; code: "projection_missing" | "projection_invalid" | "projection_inactive" | "projection_stale"; message: string };
 
-function emptyResult(agentsRoot: string): LifecycleRunResult {
+function emptyResult(agentsRoot: string, rootState: AgentsRootState): LifecycleRunResult {
   return {
     agents_root: agentsRoot,
+    root_state: rootState,
     scanned: 0,
     valid: 0,
     invalid: 0,
@@ -188,12 +204,39 @@ export function createLifecycleService(
   agentsRoot: string,
   store?: ProjectionStore,
 ): LifecycleService {
+  /**
+   * One typed statement about the root, decided by probing, never by inferring
+   * from an empty scan result. A missing directory is a distinct state and an
+   * unreadable one is its own: neither is "no agents found".
+   */
+  function probeRoot(): AgentsRootState {
+    try {
+      if (!existsSync(agentsRoot)) return "missing";
+      if (!statSync(agentsRoot).isDirectory()) return "missing";
+      return "ok";
+    } catch {
+      // existsSync lies on permission errors in some setups; if even the stat
+      // fails, the root cannot be read and no scan result is trustworthy.
+      return "unreadable";
+    }
+  }
+
   function scan(): LifecycleRunResult {
-    if (!existsSync(agentsRoot)) {
-      return emptyResult(agentsRoot);
+    const rootState = probeRoot();
+    if (rootState !== "ok") {
+      return emptyResult(agentsRoot, rootState);
     }
 
-    const entries = readdirSync(agentsRoot, { withFileTypes: true })
+    let directories: Array<import("fs").Dirent>;
+    try {
+      directories = readdirSync(agentsRoot, { withFileTypes: true });
+    } catch {
+      // A present-but-unreadable root is a configuration or permission fault,
+      // not an empty directory, and it must never surface as a raw 500.
+      return emptyResult(agentsRoot, "unreadable");
+    }
+
+    const entries = directories
       .filter((entry) => entry.isDirectory())
       .map((entry) => {
         const soulPath = join(agentsRoot, entry.name, "soul.md");
@@ -217,6 +260,7 @@ export function createLifecycleService(
 
     return {
       agents_root: agentsRoot,
+      root_state: "ok",
       scanned: withProjection.length,
       valid,
       invalid: withProjection.length - valid,

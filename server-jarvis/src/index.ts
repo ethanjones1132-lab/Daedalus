@@ -67,13 +67,13 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpa
 import { join, isAbsolute, relative, resolve } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, resolveAgentsRoot, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
-import { createLifecycleService, validateLifecycleSnapshot, type LifecycleSnapshot } from "./agent-lifecycle";
+import { createLifecycleService, validateLifecycleSnapshot, type LifecycleService, type LifecycleSnapshot } from "./agent-lifecycle";
 import { createBoundaryProjectionStore } from "./activation-boundary";
-import { handleAgentRequest } from "./agent-routes";
+import { handleAgentRequest, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { logReadResponse, readLogTail } from "./log-read";
@@ -893,18 +893,24 @@ function agentsDbPath(): string {
   return join(CONFIG_DIR, "agent_projections.db");
 }
 
-function agentsRootPath(): string {
-  const cfg = loadConfig();
-  return cfg.agents_root;
-}
-
 const cliSessionMap = new Map<string, string>(); // appSessionId → Claude CLI session ID for --resume
 
-/** Process-wide agent lifecycle service. Scans the configured agents root on demand. */
-const agentLifecycle = createLifecycleService(
-  agentsRootPath(),
-  createBoundaryProjectionStore(CONFIG_DIR),
-);
+/**
+ * The agents root is resolved per request: the frozen module-level service
+ * used to bake in whatever `config.json` held at first boot, so a root fixed
+ * through Settings never took effect until the Bun server was restarted.
+ * Loading the config and building the (cheap, closure-only) service here also
+ * lets `resolveAgentsRoot` own the empty-string fallback instead of scanning
+ * `""` silently.
+ */
+const agentProjectionStore = createBoundaryProjectionStore(CONFIG_DIR);
+
+function currentAgentLifecycle(): { service: LifecycleService; declared: boolean; resolved_path: string } {
+  const cfg = loadConfig();
+  const raw = (cfg.agents_root ?? "").trim();
+  const resolved = resolveAgentsRoot(cfg);
+  return { service: createLifecycleService(resolved, agentProjectionStore), declared: raw !== "", resolved_path: resolved };
+}
 
 function resolveConfig(configOverride?: Partial<JarvisConfig> | null): JarvisConfig {
   return configOverride ? normalizeConfig(configOverride) : loadConfig();
@@ -6574,7 +6580,8 @@ export async function baseFetch(req: Request): Promise<Response> {
       );
       return Response.json(perf);
     }
-    const agentResponse = await handleAgentRequest(req, agentLifecycle);
+    const agentsLifecycle = currentAgentLifecycle();
+    const agentResponse = await handleAgentRequest(req, agentsLifecycle.service, reportAgentsRoot(agentsLifecycle.service, agentsLifecycle.resolved_path, agentsLifecycle.declared));
     if (agentResponse) {
       return agentResponse;
     }
@@ -6642,7 +6649,7 @@ export async function baseFetch(req: Request): Promise<Response> {
           });
           return { response, completion };
         },
-        validateProjection: (snapshot) => validateLifecycleSnapshot(agentLifecycle, snapshot as LifecycleSnapshot),
+        validateProjection: (snapshot) => validateLifecycleSnapshot(currentAgentLifecycle().service, snapshot as LifecycleSnapshot),
         refreshInferenceFeedback,
         feedbackJobId: INFERENCE_FEEDBACK_CRON_JOB_ID,
       }, {

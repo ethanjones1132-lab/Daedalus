@@ -1,4 +1,4 @@
-import type { LifecycleAgent } from '../../domain/agent-discovery-state';
+import { type DiscoveryRootVerdict, type LifecycleAgent } from '../../domain/agent-discovery-state';
 import { effectiveLifecycleState, type AgentProjection } from '../../domain/agent-lifecycle-state';
 import type { LifecycleOperation } from './types';
 
@@ -83,11 +83,23 @@ export function directoryStations(
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
+/**
+ * What an empty-or-rootless scan means. A bare "no agents" is only honest when
+ * the root was read; unconfigured, missing and unreadable are distinct states
+ * with their own fixed copy, and the resolved path is never part of the copy.
+ */
+const EMPTY_ROOT_RESULTS: Record<DiscoveryRootVerdict, { discover: StationState; result: string }> = {
+  ok: { discover: 'pending', result: 'No Agent directories found.' },
+  unconfigured: { discover: 'pending', result: 'No Agents root is configured.' },
+  missing: { discover: 'failed', result: 'The configured Agents root does not exist.' },
+  unreadable: { discover: 'failed', result: 'The Agents root cannot be read.' },
+};
+
 /** One track for the whole Agents root: each station summarises every directory. */
 export function aggregateStations(
   agents: LifecycleAgent[] | null,
   projections: AgentProjection[] | null,
-  flags: { loading: boolean; error: boolean },
+  flags: { loading: boolean; error: boolean; rootVerdict?: DiscoveryRootVerdict | null },
 ): Station[] {
   if (agents === null) {
     return [
@@ -101,8 +113,11 @@ export function aggregateStations(
   }
   const total = agents.length;
   if (total === 0) {
+    // A successful scan of nothing is only "no directories" when the root
+    // itself was read; the server's verdict names every other cause.
+    const empty = EMPTY_ROOT_RESULTS[flags.rootVerdict ?? 'ok'];
     return [
-      station('discover', 'pending', 'No Agent directories found.'),
+      station('discover', empty.discover, empty.result),
       station('validate', 'pending', 'Nothing to validate.'),
       station('project', 'pending', 'Nothing to project.'),
       station('activate', 'pending', 'Nothing to activate.'),

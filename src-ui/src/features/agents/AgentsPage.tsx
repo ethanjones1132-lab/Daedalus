@@ -1,5 +1,6 @@
 import { sectionCount } from '../../lib/list-tally';
 import { AGENT_RECORD_SCOPE } from '../../domain/agent-routing-scope';
+import { type DiscoveryRootVerdict } from '../../domain/agent-discovery-state';
 import { Plus, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { agentOperationLocked } from '../../domain/agent-operation-state';
@@ -29,6 +30,35 @@ import { useAgentRecords } from './useAgentRecords';
 import { useChannelList } from './useChannelList';
 
 type Selection = { kind: 'agent' | 'directory'; id: string } | null;
+
+/** Fixed empty-root copy per verdict; "no agents" is only said after a read. */
+function emptyRootCopy(rootVerdict: DiscoveryRootVerdict | null): string {
+  switch (rootVerdict) {
+    case 'missing': return 'The configured Agents root does not exist.';
+    case 'unreadable': return 'The Agents root cannot be read.';
+    case 'unconfigured': return 'No Agents root is configured. Set agents_root under Advanced settings to discover Agent directories.';
+    default: return 'No agents discovered in agents root.';
+  }
+}
+
+/**
+ * The honest empty state. The resolved root is never part of the statement;
+ * it appears only after the operator clicks "Show resolved path".
+ */
+function EmptyRootStatement({ rootVerdict, rootResolvedPath }: { rootVerdict: DiscoveryRootVerdict | null; rootResolvedPath: string | null }) {
+  const [pathShown, setPathShown] = useState(false);
+  const needsContext = rootVerdict !== null && rootVerdict !== 'ok';
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-4 text-[12.5px] text-ink-3">
+      <p>{emptyRootCopy(rootVerdict)}</p>
+      {needsContext && rootResolvedPath && (
+        pathShown
+          ? <code className="font-mono text-[11px]">{rootResolvedPath}</code>
+          : <Button size="xs" variant="ghost" onClick={() => setPathShown(true)}>Show resolved path</Button>
+      )}
+    </div>
+  );
+}
 
 function SectionHeader({ title, count, children }: { title: string; count?: number; children?: ReactNode }) {
   return (
@@ -65,8 +95,8 @@ export default function AgentsPage() {
     : (selection?.kind === 'agent' ? agents.find((a) => a.id === selection.id) : undefined) ?? agents[0];
 
   const stations = useMemo(
-    () => aggregateStations(directories, projections, { loading: discovery.loading, error: discovery.error }),
-    [directories, projections, discovery.loading, discovery.error],
+    () => aggregateStations(directories, projections, { loading: discovery.loading, error: discovery.error, rootVerdict: discovery.rootVerdict }),
+    [directories, projections, discovery.loading, discovery.error, discovery.rootVerdict],
   );
 
   const editingAgent = records.editingId ? agents.find((a) => a.id === records.editingId) : undefined;
@@ -181,7 +211,7 @@ export default function AgentsPage() {
               </div>
             )}
             {!discovery.loading && !discovery.error && directories?.length === 0 && (
-              <p className="px-4 py-4 text-[12.5px] text-ink-3">No agents discovered in agents root.</p>
+              <EmptyRootStatement rootVerdict={discovery.rootVerdict} rootResolvedPath={discovery.rootResolvedPath} />
             )}
             {directories !== null && directories.length > 0 && (
               <ul className="divide-y divide-line">

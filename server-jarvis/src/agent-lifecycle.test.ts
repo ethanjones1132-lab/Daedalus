@@ -12,7 +12,8 @@
 // the source.
 // ═══════════════════════════════════════════════════════════════
 
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
+import { execSync } from "child_process";
 import { tmpdir } from "os";
 import { join } from "path";
 import { describe, expect, test, afterEach } from "bun:test";
@@ -35,6 +36,22 @@ function makeFixtureRoot(name: string) {
       writeFileSync(filePath, contents, "utf-8");
       return filePath;
     },
+    /** Deny read access to the root so a scan hits a real permission fault. */
+    denyRead() {
+      if (process.platform === "win32") {
+        // (NP) keeps the deny off children; the list itself is what must fail.
+        execSync(`icacls "${root}" /deny "Everyone:(NP)(OI)(CI)(RD)"`);
+      } else {
+        chmodSync(root, 0o000);
+      }
+    },
+    restoreRead() {
+      if (process.platform === "win32") {
+        execSync(`icacls "${root}" /reset`);
+      } else {
+        chmodSync(root, 0o700);
+      }
+    },
     cleanup() {
       rmSyncRetry(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     },
@@ -54,12 +71,13 @@ afterEach(() => {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("createLifecycleService — empty / missing root", () => {
-  test("scan() returns zeroed result with the requested root when the directory does not exist", () => {
+  test("scan() reports a missing root instead of a silent empty run when the directory does not exist", () => {
     const missing = join(tmpdir(), "jarvis-lifecycle-definitely-missing-xyz");
     const service = createLifecycleService(missing);
     const result = service.scan();
     expect(result).toEqual({
       agents_root: missing,
+      root_state: "missing",
       scanned: 0,
       valid: 0,
       invalid: 0,
@@ -68,16 +86,47 @@ describe("createLifecycleService — empty / missing root", () => {
     });
   });
 
-  test("scan() returns zeroed result with the requested root when the directory is empty", () => {
+  test("scan() reports a root that is a file as missing, not as an empty root", () => {
+    fixture = makeFixtureRoot("not-a-directory");
+    const filePath = join(fixture.root, "not-agent-root.md");
+    writeFileSync(filePath, "a file where the root should be", "utf-8");
+    const service = createLifecycleService(filePath);
+    const result = service.scan();
+    expect(result.root_state).toBe("missing");
+    expect(result.results).toEqual([]);
+  });
+
+  test("scan() returns a zeroed result with root_state ok when the directory is empty", () => {
     fixture = makeFixtureRoot("empty");
     const service = createLifecycleService(fixture.root);
     const result = service.scan();
     expect(result.agents_root).toBe(fixture.root);
+    expect(result.root_state).toBe("ok");
     expect(result.scanned).toBe(0);
     expect(result.valid).toBe(0);
     expect(result.invalid).toBe(0);
     expect(result.removed).toBe(0);
     expect(result.results).toEqual([]);
+  });
+
+  test("scan() fails open with root_state unreadable — it never throws and never claims an empty root — when the directory cannot be listed", () => {
+    // A permission failure on a present directory is a distinct fault; the
+    // empty-result path must carry that fact, not a bare zeroed run. The
+    // unreadable state is produced for real: the fixtures deny read access to
+    // the directory (icacls on Windows, chmod elsewhere) so the production
+    // try/catch — not a simulated fs — answers the scan.
+    fixture = makeFixtureRoot("unreadable");
+    fixture.denyRead();
+    try {
+      const service = createLifecycleService(fixture.root);
+      const result = service.scan();
+      expect(result.root_state).toBe("unreadable");
+      expect(result.scanned).toBe(0);
+      expect(result.valid).toBe(0);
+      expect(result.results).toEqual([]);
+    } finally {
+      fixture.restoreRead();
+    }
   });
 
   test("activate() returns false when the root does not exist", () => {

@@ -15,7 +15,7 @@ const agent = {
   system_prompt: '', enabled: true, config: null, created_at: '', updated_at: '',
 };
 const discovered = [{ id: 'coder', slug: 'coder', status: 'valid' }];
-const response = (rows = discovered) => ({ ok: true, json: async () => rows }) as Response;
+const response = (rows = discovered, root?: unknown) => ({ ok: true, json: async () => root ?? rows }) as Response;
 const fetchMock = vi.fn();
 const emptyMessage = 'No agents discovered in agents root.';
 let readAgents: () => Promise<typeof agent[]>;
@@ -109,8 +109,45 @@ describe('Agent lifecycle discovery', () => {
     expect(screen.getByText(emptyMessage)).toBeInTheDocument();
   });
 
-  it('guards concurrent discovery entry points so no older request can overwrite a newer snapshot', async () => {
-    readAgents = () => Promise.reject(new Error('native list unavailable'));
+  it('names a non-ok root verdict from the object response and hides the resolved path until asked', async () => {
+    fetchMock.mockResolvedValue(response([], {
+      agents: [],
+      root_state: 'missing',
+      reason_code: 'agents_root_missing',
+      resolved_path: 'C:\\private-root\\agents',
+    }));
+    render(<AgentsPage />);
+    // Both views render the same fixed statement: the lifecycle track and the
+    // empty state agree with each other.
+    expect((await screen.findAllByText('The configured Agents root does not exist.')).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/private-root/)).not.toBeInTheDocument();
+    expect(screen.queryByText('No agents discovered in agents root.')).not.toBeInTheDocument();
+    // The path is the operator's, shown only through an explicit action.
+    fireEvent.click(screen.getByRole('button', { name: 'Show resolved path' }));
+    expect(screen.getByText('C:\\private-root\\agents')).toBeInTheDocument();
+  });
+
+  it('reads an unconfigured-root response as its own statement, not a scan failure', async () => {
+    fetchMock.mockResolvedValue(response([], {
+      agents: [],
+      root_state: 'unconfigured',
+      reason_code: 'agents_root_unconfigured',
+      resolved_path: 'C:\\Users\\me\\.openclaw\\jarvis\\agents',
+    }));
+    render(<AgentsPage />);
+    expect(await screen.findByText('No Agents root is configured. Set agents_root under Advanced settings to discover Agent directories.')).toBeInTheDocument();
+    expect(refresh()).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Retry discovery' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the legacy bare-array response on the plain empty message with no path disclosure', async () => {
+    fetchMock.mockResolvedValue(response([]));
+    render(<AgentsPage />);
+    expect(await screen.findByText(emptyMessage)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Show resolved path' })).not.toBeInTheDocument();
+  });
+
+  it('guards concurrent discovery entry points so no older request can overwrite a newer snapshot', async () => {    readAgents = () => Promise.reject(new Error('native list unavailable'));
     const first = deferred<Response>();
     fetchMock.mockReturnValue(first.promise);
     render(<AgentsPage />);

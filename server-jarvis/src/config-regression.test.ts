@@ -44,6 +44,14 @@ describe("configuration regression coverage retained during Task 6", () => {
     expect(validateAgentsRootPath("../../etc").valid).toBe(false);
   });
 
+  test("an unconfigured agents_root resolves to the shared default instead of scanning ''", () => {
+    // The per-request lifecycle resolution relies on this healing so an empty
+    // setting never becomes a readdir of the workspace root.
+    expect(resolveAgentsRoot(normalizeConfig({ agents_root: "" }))).toBe(
+      resolveAgentsRoot(defaultConfig())
+    );
+  });
+
   test("preserves sampling defaults and explicit overrides", () => {
     expect(defaultConfig().top_k).toBe(40);
     expect(normalizeConfig({}).top_k).toBe(40);

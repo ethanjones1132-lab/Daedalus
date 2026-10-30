@@ -1,4 +1,4 @@
-import type { LifecycleScanEntry, LifecycleService } from "./agent-lifecycle";
+import type { AgentsRootState, LifecycleScanEntry, LifecycleService } from "./agent-lifecycle";
 
 function findAgent(lifecycle: LifecycleService, id: string): LifecycleScanEntry | undefined {
   return lifecycle.scan().results.find((entry) => entry.slug === id || entry.source_path.endsWith(`/${id}/soul.md`));
@@ -19,10 +19,68 @@ function publicEntry(entry: LifecycleScanEntry) {
   };
 }
 
+/**
+ * What the configured root was, from the server's point of view. The raw
+ * config value decides "unconfigured"; the scan decides ok/missing/unreadable.
+ * Reason codes are fixed strings so the UI can translate them without ever
+ * seeing (or leaking) a raw filesystem or Node error.
+ */
+export type AgentsRootReasonCode =
+  | "agents_root_ok"
+  | "agents_root_missing"
+  | "agents_root_unreadable"
+  | "agents_root_unconfigured";
+
+export type AgentsRootReport = {
+  root_state: AgentsRootState | "unconfigured";
+  reason_code: AgentsRootReasonCode;
+  resolved_path: string;
+};
+
+export function reportAgentsRoot(
+  lifecycle: LifecycleService,
+  resolvedPath: string,
+  declared: boolean,
+): AgentsRootReport {
+  // `root_state` is what the scan could establish today. `reason_code` carries
+  // the configuration context the scan cannot see: an empty `agents_root`
+  // setting means the operator never chose a root, which is actionable on its
+  // own even if the default directory happens to exist.
+  const state = lifecycle.scan().root_state;
+  const reason: AgentsRootReasonCode = !declared
+    ? "agents_root_unconfigured"
+    : state === "ok"
+      ? "agents_root_ok"
+      : state === "missing"
+        ? "agents_root_missing"
+        : "agents_root_unreadable";
+  return { root_state: state, reason_code: reason, resolved_path: resolvedPath };
+}
+
+export interface AgentsListResponse {
+  agents: Array<ReturnType<typeof publicEntry>>;
+  root_state: AgentsRootReport["root_state"];
+  reason_code: AgentsRootReport["reason_code"];
+  /** The configured root. Rendered only through the UI's "Show resolved path" action, never as failure copy. */
+  resolved_path: string;
+}
+
 export function handleListAgents(
-  lifecycle: LifecycleService
-): Array<ReturnType<typeof publicEntry>> {
-  return lifecycle.scan().results.map(publicEntry);
+  lifecycle: LifecycleService,
+  root?: AgentsRootReport,
+): AgentsListResponse | Array<ReturnType<typeof publicEntry>> {
+  const result = lifecycle.scan();
+  const agents = result.results.map(publicEntry);
+  if (!root) {
+    // Direct callers without root context keep the historical array shape.
+    return agents;
+  }
+  return {
+    agents,
+    root_state: root.root_state,
+    reason_code: root.reason_code,
+    resolved_path: root.resolved_path,
+  };
 }
 
 export function handleGetAgent(
@@ -98,12 +156,13 @@ export function handleDeactivateAgent(
 
 export function handleScanAgents(
   lifecycle: LifecycleService
-): { scanned: number; valid: number; invalid: number } {
+): { scanned: number; valid: number; invalid: number; root_state: AgentsRootReport["root_state"] } {
   const result = lifecycle.scan();
   return {
     scanned: result.scanned,
     valid: result.valid,
     invalid: result.invalid,
+    root_state: result.root_state,
   };
 }
 
@@ -124,13 +183,15 @@ function responseForActivation(result: ReturnType<typeof handleActivateAgent>): 
 
 export async function handleAgentRequest(
   req: Request,
-  lifecycle: LifecycleService
+  lifecycle: LifecycleService,
+  /** Root context; present on the live server so /agents can report its state. */
+  root?: AgentsRootReport
 ): Promise<Response | null> {
   const url = new URL(req.url, "http://local");
   const path = url.pathname;
 
   if (path === "/agents" && req.method === "GET") {
-    return Response.json(handleListAgents(lifecycle));
+    return Response.json(handleListAgents(lifecycle, root));
   }
 
   if (path === "/agents/scan" && req.method === "POST") {

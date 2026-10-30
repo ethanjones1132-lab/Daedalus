@@ -62,9 +62,19 @@ describe('aggregateStations', () => {
   });
 
   it('reports an empty root only from a successful empty scan', () => {
-    const stations = aggregateStations([], [], { loading: false, error: false });
+    const stations = aggregateStations([], [], { loading: false, error: false, rootVerdict: 'ok' });
     expect(states(stations)).toEqual(['pending', 'pending', 'pending', 'pending']);
     expect(stations[0].result).toBe('No Agent directories found.');
+  });
+
+  it.each([
+    ['unconfigured', 'pending', 'No Agents root is configured.'],
+    ['missing', 'failed', 'The configured Agents root does not exist.'],
+    ['unreadable', 'failed', 'The Agents root cannot be read.'],
+  ] as const)('names each non-ok root verdict with its own state and copy (%s)', (verdict, discoverState, copy) => {
+    const stations = aggregateStations([], [], { loading: false, error: false, rootVerdict: verdict });
+    expect(stations[0]).toMatchObject({ state: discoverState, result: copy });
+    expect(stations.slice(1).every((s) => s.state === 'pending')).toBe(true);
   });
 
   it('summarises validation failures and active counts across directories', () => {

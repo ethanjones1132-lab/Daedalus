@@ -9,6 +9,7 @@ import {
   handleGetAgent,
   handleListAgents,
   handleScanAgents,
+  reportAgentsRoot,
 } from "./agent-routes";
 
 function makeAgentRoot(name: string) {
@@ -65,7 +66,7 @@ describe("agent routes", () => {
       code: "activated",
       message: "Agent coder activated",
     });
-    expect(handleScanAgents(lifecycle)).toEqual({ scanned: 1, valid: 1, invalid: 0 });
+    expect(handleScanAgents(lifecycle)).toEqual({ scanned: 1, valid: 1, invalid: 0, root_state: "ok" });
     expect(handleDeactivateAgent(lifecycle, "coder")).toMatchObject({
       success: true,
       code: "deactivated",
@@ -87,6 +88,57 @@ describe("agent routes", () => {
     expect(await response!.json()).toMatchObject([
       { id: "coder", slug: "coder", status: "valid", active: false },
     ]);
+  });
+
+  test("GET /agents without root context keeps the historical array shape", async () => {
+    fixture = makeAgentRoot("array-shape");
+    writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
+    const response = await handleListAgents(createLifecycleService(fixture.root));
+    expect(Array.isArray(response)).toBe(true);
+    expect(response).toMatchObject([{ id: "coder" }]);
+  });
+
+  test("reportAgentsRoot maps the scan's root state and configuration context to fixed reason codes", () => {
+    fixture = makeAgentRoot("root-report");
+    writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
+    const ok = createLifecycleService(fixture.root);
+    expect(reportAgentsRoot(ok, fixture.root, true)).toEqual({
+      root_state: "ok",
+      reason_code: "agents_root_ok",
+      resolved_path: fixture.root,
+    });
+    // The scan observes the default path exists, but no root was ever chosen;
+    // the reason code names that so the UI can ask for configuration instead
+    // of showing a green "found agents" panel against a directory the operator
+    // never pointed at.
+    expect(reportAgentsRoot(ok, fixture.root, false).reason_code).toBe("agents_root_unconfigured");
+
+    const missing = join(tmpdir(), "jarvis-routes-definitely-missing-xyz");
+    expect(reportAgentsRoot(createLifecycleService(missing), missing, true)).toEqual({
+      root_state: "missing",
+      reason_code: "agents_root_missing",
+      resolved_path: missing,
+    });
+  });
+
+  test("GET /agents with root context returns the list with a typed root statement", async () => {
+    fixture = makeAgentRoot("object-shape");
+    writeSoul(fixture.root, "coder", `slug: coder\nname: Coder\n`);
+    const lifecycle = createLifecycleService(fixture.root);
+    const response = await handleAgentRequest(
+      new Request("http://local/agents", { method: "GET" }),
+      lifecycle,
+      reportAgentsRoot(lifecycle, fixture.root, true),
+    );
+    expect(response).not.toBeNull();
+    expect(await response!.json()).toEqual({
+      agents: [
+        expect.objectContaining({ id: "coder", slug: "coder", status: "valid", active: false }),
+      ],
+      root_state: "ok",
+      reason_code: "agents_root_ok",
+      resolved_path: fixture.root,
+    });
   });
 
   test("handleAgentRequest returns null for non-agent paths", async () => {
