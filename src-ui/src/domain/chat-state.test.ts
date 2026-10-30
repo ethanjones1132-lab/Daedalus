@@ -314,6 +314,8 @@ describe('orchestration status formatting', () => {
       .toBe('OpenCode Go · minimax-m3');
     expect(formatInferenceRoute('openrouter', 'openrouter/free'))
       .toBe('OpenRouter · openrouter/free');
+    expect(formatInferenceRoute('llama_cpp', 'qwen-local'))
+      .toBe('llama.cpp · qwen-local');
   });
 
   it('falls back cleanly when only a provider or model is known', () => {

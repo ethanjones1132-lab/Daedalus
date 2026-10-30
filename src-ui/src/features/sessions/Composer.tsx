@@ -78,6 +78,7 @@ export function Composer({ turn }: { turn: SessionTurn }) {
     turnCost,
     sentCount,
     displayedRoute,
+    inferenceRoutingNotice,
   } = turn;
   const canSend = Boolean(input.trim());
 
@@ -87,6 +88,11 @@ export function Composer({ turn }: { turn: SessionTurn }) {
     <div data-owns-mod-k="" className="shrink-0 px-8 pb-4 pt-1">
       <div className="mx-auto w-full max-w-[760px]">
         <LiveWire turn={turn} />
+        {inferenceRoutingNotice && (
+          <p role="note" aria-label="Inference routing notice" className="mb-2 text-[11px] leading-relaxed text-warn">
+            {inferenceRoutingNotice}
+          </p>
+        )}
         {turn.stopView.status && <div role="status" aria-label="Stop request" className="mb-2 text-xs text-ink-3">{turn.stopView.status}</div>}
         {turn.stopView.alert && <div role="alert" aria-label="Stop request" className="mb-2 text-xs text-err">{turn.stopView.alert} <button type="button" onClick={() => void turn.handleStop()}>Retry stop</button></div>}
         <div
@@ -167,7 +173,7 @@ export function Composer({ turn }: { turn: SessionTurn }) {
                 <span aria-hidden="true">·</span>
               </>
             )}
-            <span className="truncate">via {displayedRoute}</span>
+            <span className="truncate" aria-label="Inference route">{displayedRoute}</span>
           </span>
         </div>
       </div>

@@ -92,6 +92,7 @@ import {
   type SessionRunRead,
   type SessionRunWrite,
 } from '../../domain/session-run-telemetry';
+import { sessionRoutingNotice } from './outcome';
 import type { MemorySourceMessage } from '../memory/MemoryTurnStatus';
 
 export type ToolApprovalRequest = {
@@ -595,6 +596,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     model?: string;
     firstVisibleTokenMs?: number;
   } | null>(null);
+  const [stageRoutes, setStageRoutes] = useState<Array<{ stage: string; provider: string; model: string }>>([]);
 
   // Per-session cumulative rollup for the chat header Session Stats pill.
   // Accumulates the `runMetrics.tokens` from every completed turn in the
@@ -992,6 +994,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setTurnCost(null);
       setScopeNotice(null);
       setRunMetrics(null);
+      setStageRoutes([]);
       setTurnElapsedMs(0);
       turnStartedAtRef.current = null;
       clearPendingApproval();
@@ -1015,6 +1018,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setTurnCost(null);
       setScopeNotice(null);
       setRunMetrics(null);
+      setStageRoutes([]);
       setTurnElapsedMs(0);
       turnStartedAtRef.current = null;
       setError(null);
@@ -2137,6 +2141,20 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         });
         return;
       }
+      if (frame.type === 'stage_route') {
+        const stage = typeof frame.stage === 'string' ? frame.stage.trim() : '';
+        const provider = typeof frame.actual_provider === 'string' ? frame.actual_provider.trim() : '';
+        const model = typeof frame.actual_model === 'string' ? frame.actual_model.trim() : '';
+        if (stage && provider && model) {
+          setStageRoutes(previous => {
+            const last = previous[previous.length - 1];
+            return last?.stage === stage && last.provider === provider && last.model === model
+              ? previous
+              : [...previous, { stage, provider, model }];
+          });
+        }
+        return;
+      }
       if (frame.type === 'orchestration_metrics') {
         const durationMs = Math.max(0, Number(frame.duration_ms ?? 0));
         const tokens = Math.max(0, Number(frame.tokens_total ?? 0));
@@ -2605,6 +2623,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     setTurnCost(null);
     setScopeNotice(null);
     setRunMetrics(null);
+    setStageRoutes([]);
     setUserPinnedToBottom(true);
     // Client-side identity for the optimistic user bubble (Task 7 / incident
     // 1d4727cf). Upgraded to the DB row id once `append_message` resolves
@@ -2919,6 +2938,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
      setTurnCost(null);
     setScopeNotice(null);
     setRunMetrics(null);
+    setStageRoutes([]);
     setTurnElapsedMs(0);
     turnStartedAtRef.current = null;
     setSessionStats({ tokens: 0, turnCount: 0 });
@@ -2964,13 +2984,16 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     !messages[messages.length - 1].isStreaming &&
     !isStreaming;
 
-  const displayedProvider = runMetrics?.provider
-    ? formatInferenceRoute(runMetrics.provider)
-    : backendLabel;
-  const displayedModel = runMetrics?.model ?? modelLabel;
-  const displayedRoute = runMetrics?.provider || runMetrics?.model
-    ? formatInferenceRoute(runMetrics.provider, runMetrics.model)
-    : formatInferenceRoute(config?.active_backend, modelLabel);
+  const displayedProvider = backendLabel;
+  const displayedModel = modelLabel;
+  const displayedRoute = stageRoutes.length > 0
+    ? `Observed provider responses: ${stageRoutes.map(route => `${route.stage} · ${formatInferenceRoute(route.provider, route.model)}`).join(' → ')}`
+    : runMetrics?.provider || runMetrics?.model
+      ? `Reported last-stage route only: ${formatInferenceRoute(runMetrics.provider, runMetrics.model)}`
+      : config
+        ? `Configured backend: ${backendLabel}${modelLabel ? ` · ${modelLabel}` : ''}`
+        : 'Inference route unavailable';
+  const inferenceRoutingNotice = sessionRoutingNotice(config);
   // Concrete, honest memory-turn status. Counts come only from the native
   // diagnostic; while the turn is live a transient status may be shown without
   // counts.
@@ -3087,6 +3110,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     displayedProvider,
     displayedModel,
     displayedRoute,
+    inferenceRoutingNotice,
     // approvals
     pendingApproval,
     approvalError,

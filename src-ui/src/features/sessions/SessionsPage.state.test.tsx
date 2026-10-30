@@ -51,6 +51,83 @@ beforeEach(() => {
 });
 
 describe('ChatPanel state machine', () => {
+  it('warns before send that orchestration can route local turns through configured cloud providers', async () => {
+    render(<ChatPanel
+      {...props}
+      config={{
+        active_backend: 'llama_cpp',
+        llama_cpp: { model: 'qwen-local' },
+        orchestrator: { enabled: true },
+      } as any}
+      backendLabel="llama.cpp"
+      modelLabel="qwen-local"
+    />);
+
+    expect(screen.getByText('Configured backend: llama.cpp')).toBeInTheDocument();
+    const notice = await screen.findByRole('note', { name: 'Inference routing notice' });
+    expect(notice).toHaveTextContent('Local backend selected.');
+    expect(notice).toHaveTextContent('OpenRouter or OpenCode Agent');
+    expect(notice).toHaveTextContent('fallback attempts may not all be listed');
+    expect(notice).toHaveTextContent('not a local-only guarantee');
+  });
+
+  it('shows a stage route as soon as a provider response is observed', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+        type: 'stage_route',
+        stage: 'planner',
+        actual_provider: 'opencode_go',
+        actual_model: 'deepseek-v4-flash',
+      })}\n\n`));
+    });
+
+    expect(screen.getByLabelText('Inference route')).toHaveTextContent('planner');
+    expect(screen.getByLabelText('Inference route')).toHaveTextContent('OpenCode Go · deepseek-v4-flash');
+  });
+
+  it('keeps the newest route when a later stage returns to an earlier provider', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'inspect the workspace' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+
+    const emitRoute = async (stage: string, provider: string, model: string) => {
+      await act(async () => {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({
+          type: 'stage_route',
+          stage,
+          actual_provider: provider,
+          actual_model: model,
+        })}\n\n`));
+      });
+    };
+
+    await emitRoute('planner', 'openrouter', 'model-a');
+    await emitRoute('reviewer', 'opencode_go', 'model-b');
+    await emitRoute('planner', 'openrouter', 'model-a');
+
+    expect(screen.getByLabelText('Inference route')).toHaveTextContent(
+      'planner · OpenRouter · model-a → reviewer · OpenCode Go · model-b → planner · OpenRouter · model-a',
+    );
+  });
+
   it('keeps observed stage progress visible before tokens and with Activity collapsed', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
@@ -185,6 +262,7 @@ describe('ChatPanel state machine', () => {
     fireEvent.keyDown(composer, { key: 'Enter' });
 
     const metrics = await screen.findByLabelText('Orchestration run metrics');
+    expect(metrics).toHaveTextContent('Last reported stage only:');
     expect(metrics).toHaveTextContent('OpenCode Zen · deepseek-v4-flash-free');
     expect(metrics).toHaveTextContent('TTFT 3.2s');
   });

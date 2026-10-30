@@ -43,7 +43,7 @@ export function backendLabels(config: JarvisConfig | null): { backendLabel: stri
     backend === 'openrouter'
       ? 'OpenRouter'
       : backend === 'llama_cpp'
-        ? 'Gemma 4 · llama.cpp'
+        ? 'llama.cpp'
         : backend === 'claude_cli'
           ? 'Claude CLI'
           : 'Ollama';
@@ -57,6 +57,20 @@ export function backendLabels(config: JarvisConfig | null): { backendLabel: stri
           ? (config.claude_cli?.model ?? '')
           : config.openrouter?.model;
   return { backendLabel, modelLabel: typeof modelLabel === 'string' ? modelLabel : '' };
+}
+
+/** Disclose when a configured local backend does not constrain orchestration stages. */
+export function sessionRoutingNotice(config: JarvisConfig | null): string | null {
+  if (!config) {
+    return 'Inference routing is unavailable in this view; the configured backend cannot be confirmed before sending.';
+  }
+  if (
+    (config.active_backend !== 'ollama' && config.active_backend !== 'llama_cpp') ||
+    !config.orchestrator?.enabled
+  ) {
+    return null;
+  }
+  return 'Local backend selected. If an OpenRouter or OpenCode Agent is enabled, orchestration may route stages there. The last known stage route is shown when reported; fallback attempts may not all be listed. This is not a local-only guarantee.';
 }
 
 /** "14:02" for a message timestamp; empty when the value is unparsable. */

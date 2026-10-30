@@ -251,6 +251,8 @@ describe("backendForProvider", () => {
     expect(backendForProvider("ollama")).toBe("ollama");
     expect(backendForProvider("openrouter")).toBe("openrouter");
     expect(backendForProvider("claude_cli")).toBe("claude_cli");
+    expect(backendForProvider("llama_cpp")).toBe("llama_cpp");
+    expect(backendForProvider("vllm")).toBe("vllm");
     expect(backendForProvider("opencode_zen")).toBe("opencode_zen");
     expect(backendForProvider("opencode_go")).toBe("opencode_go");
   });
@@ -268,6 +270,7 @@ describe("backendForProvider", () => {
     // Simulates the orchestrator failing before it ever recorded a provider
     // (e.g. network unreachable on the first attempt, config not loaded).
     expect(backendForProvider(undefined, "ollama")).toBe("ollama");
+    expect(backendForProvider(undefined, "llama_cpp")).toBe("llama_cpp");
     expect(backendForProvider(undefined, "claude_cli")).toBe("claude_cli");
     expect(backendForProvider(undefined, "openrouter")).toBe("openrouter");
   });
@@ -284,8 +287,8 @@ describe("backendForProvider", () => {
   it("never returns a backend value that recordInference cannot accept", () => {
     // Compile-time check: the function is typed to return Backend, but at
     // runtime verify that no unknown provider leaks through.
-    const knownBackends = new Set(["ollama", "openrouter", "claude_cli", "opencode_zen", "opencode_go"]);
-    for (const provider of [undefined, "", "ollama", "openrouter", "claude_cli", "opencode_zen", "opencode_go", "future_x"]) {
+    const knownBackends = new Set(["ollama", "llama_cpp", "openrouter", "claude_cli", "vllm", "opencode_zen", "opencode_go"]);
+    for (const provider of [undefined, "", "ollama", "llama_cpp", "openrouter", "claude_cli", "vllm", "opencode_zen", "opencode_go", "future_x"]) {
       for (const fallback of [undefined, "ollama", "openrouter", "claude_cli", "future_x"]) {
         const result = backendForProvider(provider, fallback);
         expect(knownBackends.has(result)).toBe(true);

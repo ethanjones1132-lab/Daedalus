@@ -16,13 +16,13 @@ const EXAMPLE_PROMPTS: Array<{ prompt: string; detail: string; Icon: LucideIcon 
 function backendLine(config: JarvisConfig | null): string | null {
   switch (config?.active_backend) {
     case 'openrouter':
-      return `Powered by OpenRouter · ${config.openrouter?.model ?? ''}`;
+      return `Configured backend · OpenRouter · ${config.openrouter?.model ?? ''}`;
     case 'ollama':
-      return `Powered by Ollama · ${config.ollama?.model ?? ''}`;
+      return `Configured backend · Ollama · ${config.ollama?.model ?? ''}`;
     case 'llama_cpp':
-      return `Powered by llama.cpp · ${config.llama_cpp?.model ?? ''}`;
+      return `Configured backend · llama.cpp · ${config.llama_cpp?.model ?? ''}`;
     case 'claude_cli':
-      return `Powered by Claude CLI · ${config.claude_cli?.model ?? 'default'}`;
+      return `Configured backend · Claude CLI · ${config.claude_cli?.model ?? 'default'}`;
     default:
       return null;
   }
@@ -38,7 +38,7 @@ function EmptySession({ config, onPick }: { config: JarvisConfig | null; onPick:
         What are we <em className="text-accent-hot">building</em> today?
       </h2>
       <p className="mt-3 max-w-md text-[13.5px] leading-relaxed text-ink-3">
-        Your local AI coding assistant. Ask me to build, debug, or explore code.
+        Your AI coding assistant for building, debugging, and exploring code.
       </p>
       {line && <p className="mt-2 font-mono text-[11px] text-ink-4">{line}</p>}
       <div className="mt-9 grid w-full max-w-[640px] grid-cols-3 gap-3 text-left">

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Brain, ChevronRight } from 'lucide-react';
 import { EmptyState, KeyValue, Tabs, cn } from '../../design';
-import { formatInferenceRoute, formatRunDuration } from '../../domain/chat-state';
+import { formatRunDuration } from '../../domain/chat-state';
 import { formatSessionStatsLine, shouldShowSessionStats } from '../../domain/session-stats';
 import { ActivityFeed, RunMetricsBar } from './ActivityFeed';
 import SessionRunsView from './SessionRunsView';
@@ -46,7 +46,7 @@ function RunPanel({ turn }: { turn: SessionTurn }) {
     );
   }
   const items: Array<[string, string]> = [
-    ['Route', runMetrics?.provider || runMetrics?.model ? formatInferenceRoute(runMetrics.provider, runMetrics.model) : displayedRoute],
+    ['Route', displayedRoute],
     ['Duration', runMetrics ? formatRunDuration(runMetrics.durationMs) : formatRunDuration(turnElapsedMs)],
   ];
   if (runMetrics?.firstVisibleTokenMs !== undefined) items.push(['TTFT', formatRunDuration(runMetrics.firstVisibleTokenMs)]);

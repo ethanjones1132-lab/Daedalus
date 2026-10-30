@@ -171,7 +171,7 @@ export function ChatPanel({ recentSessions = [], title, onStreamingChange, ...pr
               <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[10.5px] text-ink-3">
                 {config && (
                   <>
-                    <span title="Inference backend" className="text-accent">{displayedProvider}</span>
+                    <span title="Configured Inference backend" className="text-accent">Configured backend: {displayedProvider}</span>
                     {displayedModel && (
                       <>
                         <span aria-hidden="true" className="text-ink-4">/</span>

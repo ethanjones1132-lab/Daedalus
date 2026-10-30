@@ -260,7 +260,7 @@ export function RunMetricsBar({ metrics }: { metrics: RunMetrics }) {
       <span>
         {metrics.tools} tool{metrics.tools === 1 ? '' : 's'}
       </span>
-      {(metrics.provider || metrics.model) && <span className="text-ink">{formatInferenceRoute(metrics.provider, metrics.model)}</span>}
+      {(metrics.provider || metrics.model) && <span className="text-ink">Last reported stage only: {formatInferenceRoute(metrics.provider, metrics.model)}</span>}
       {metrics.firstVisibleTokenMs !== undefined && <span>TTFT {formatRunDuration(metrics.firstVisibleTokenMs)}</span>}
       {metrics.fallbackRetries > 0 && (
         <span className="text-warn">

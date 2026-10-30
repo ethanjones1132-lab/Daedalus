@@ -17,7 +17,7 @@ const sessions = ['Alpha', 'Beta'].map((name) => ({
   id: name, name, model: 'test-model', message_count: 2, created_at: '2026-09-16T00:00:00Z',
 }));
 const row = (content: string) => ({ id: content, role: 'user', content, created_at: '2026-09-16T00:00:00Z' });
-const splash = 'Your local AI coding assistant. Ask me to build, debug, or explore code.';
+const splash = 'Your AI coding assistant for building, debugging, and exploring code.';
 function mockHistory(load: (id: string) => Promise<unknown>) {
   invokeMock.mockImplementation((command: string, args?: { sessionId: string }) => {
     if (command === 'jarvis_list_sessions') return Promise.resolve(sessions);

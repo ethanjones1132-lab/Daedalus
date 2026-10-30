@@ -17,35 +17,25 @@
 // dependency-safe: conductor-metrics does not import inference-metrics
 // (verified — the dependency graph is one-way).
 
-// The set of backends the inference observability layer tracks. OpenCode Zen
-// and OpenCode Go were added to the orchestrator's pool on 2026-06-24 — the
-// `Backend` type must enumerate them so `recordInference` can attribute the
-// actual provider used for each turn (instead of falling back to
-// `cfg.active_backend`, which is the user's *selected* backend, not the
-// provider the orchestrator's pool routed through). The CLI agent-loop path
-// still only emits "ollama" / "openrouter" / "claude_cli" — those are the
-// three the legacy `cfg.active_backend` value can be.
+// The set of backends the inference observability layer tracks. It includes
+// every routable AgentPool provider (OpenRouter, OpenCode, Ollama, llama.cpp,
+// vLLM) plus the direct Claude CLI path so per-turn metrics can preserve the
+// provider that handled the request instead of collapsing it into a selected
+// default.
 import {
   conductorCacheSnapshot,
   type ConductorCacheRecord,
 } from "./orchestration/conductor-metrics";
 
-export type Backend = "ollama" | "openrouter" | "claude_cli" | "opencode_zen" | "opencode_go";
+export type Backend = "ollama" | "llama_cpp" | "openrouter" | "claude_cli" | "opencode_zen" | "opencode_go" | "vllm";
 
 /**
  * Map a provider string from the orchestrator's pool (`poolProvider`,
  * `actualProviderUsed`) to the `Backend` enum used by `recordInference`. The
- * pool emits provider names from `OrchestratorAgent.provider` (openrouter,
- * opencode_zen, opencode_go); `cfg.active_backend` emits the three legacy
- * "selected backend" values (ollama, openrouter, claude_cli). The two sets
- * overlap on "openrouter" and "ollama" but the opencode providers are pool-
- * only and would otherwise be silently re-bucketed to "openrouter" by an
- * unguarded cast.
- *
- * The optional `fallback` covers the case where the orchestrator failed
- * before it ever recorded a provider (network unreachable on the first
- * attempt, config not loaded, etc.) — we fall back to the user's selected
- * backend rather than fabricating a value.
+ * pool emits provider names from `OrchestratorAgent.provider`; the configured
+ * `active_backend` can be used only when the orchestrator failed before it
+ * recorded a provider. Unknown provider strings fall back to the selected
+ * backend so a future provider does not create an invalid metrics bucket.
  */
 export function backendForProvider(
   provider: string | undefined,
@@ -53,13 +43,16 @@ export function backendForProvider(
 ): Backend {
   switch (provider) {
     case "ollama":
+    case "llama_cpp":
     case "openrouter":
     case "claude_cli":
     case "opencode_zen":
     case "opencode_go":
+    case "vllm":
       return provider;
     default:
       if (fallback === "ollama") return "ollama";
+      if (fallback === "llama_cpp") return "llama_cpp";
       if (fallback === "claude_cli") return "claude_cli";
       return "openrouter";
   }

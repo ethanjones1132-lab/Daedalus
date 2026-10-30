@@ -459,6 +459,7 @@ const INFERENCE_PROVIDER_LABELS: Record<string, string> = {
   opencode_go: 'OpenCode Go',
   openrouter: 'OpenRouter',
   ollama: 'Ollama',
+  llama_cpp: 'llama.cpp',
   claude_cli: 'Claude CLI',
 };
 

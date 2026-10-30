@@ -121,7 +121,10 @@ import {
 import { createApprovalRegistry } from "./approval-registry";
 import { createDiscordSendHandler, SqliteDeliveryReceiptStore } from "./channels/discord";
 import { summarizeTurnMetrics } from "./orchestration/turn-metrics";
-import { actualInferenceRouteTelemetry } from "./orchestration/inference-route-telemetry";
+import {
+  actualInferenceRouteTelemetry,
+  observedStageRouteSseFrame,
+} from "./orchestration/inference-route-telemetry";
 
 // One process-level approval registry: the chat surface emits
 // `tool_approval_request` SSE events and awaits decisions here.
@@ -3004,6 +3007,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
             throw fetchErr;
           }
+
+          // A returned HTTP response confirms which provider handled this
+          // stage attempt. Publish that observation while the turn is live;
+          // the terminal metrics frame remains for older clients and only
+          // summarizes the final published stage.
+          const stageRouteFrame = observedStageRouteSseFrame({
+            response: fetchRes,
+            stage: stageLabel,
+            provider: actualProviderUsed,
+            model: actualModelUsed,
+            sessionId,
+          });
+          if (stageRouteFrame) await writer.write(encoder.encode(stageRouteFrame));
 
           if (!fetchRes.ok) {
             const errText = await fetchRes.text();
