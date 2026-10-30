@@ -178,7 +178,9 @@ export function TurnMessage({ message, index, streamStatus }: { message: JarvisM
           {isPartialBubble && (
             <span aria-label="Partial result" className="inline-flex items-center gap-1.5">
               <Badge tone="warn" dot>partial</Badge>
-              {message.errorCode && <span className="text-warn">{message.errorCode}</span>}
+              {message.errorCode
+                ? <span className="text-warn">{message.errorCode}</span>
+                : <span className="text-ink-3">reason not reported</span>}
             </span>
           )}
           {isTimedOutBubble && (

@@ -307,11 +307,12 @@ import {
   resolveDeepReadIntent,
   resolveGoalExecutionState,
   recordWriteTargets,
-  terminalSubtypeForRunOutcome,
   unfinishedPlanItemInputs,
   type TaskRunContract,
   type TaskRunGoalLink,
 } from "./orchestration/task-run";
+import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
+import { createTurnTiming } from "./orchestration/turn-timing";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
 import { handleCronRunRequest } from "./cron-inference";
@@ -4558,6 +4559,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           await emitCancelled();
         }
 
+        // Audit item 2 latency diagnosis: monotonic timings for the work that
+        // runs after the answer streamed and before the terminal SSE frame.
+        // Diagnostic only — ordering and outcome semantics below are unchanged.
+        const turnTiming = createTurnTiming(agentRunId);
+
         // Record metrics and propose tuning options
         const duration = Date.now() - runStartTime;
         let turnMetrics = {
@@ -4768,7 +4774,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
              completion_reason: decision.reason,
            });
          }
-        const terminalStatus = runFinalizer.finalize({
+        const terminalStatus = turnTiming.measure("run_finalize", () => runFinalizer.finalize({
           finalOutput: finalOutputForLog,
           durationMs: duration,
           toolCallsCount: turnMetrics.tool_calls,
@@ -4782,7 +4788,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           stageRuns,
           modelAttributions,
           instructionVariants: instructionSelection,
-        });
+        }));
         if (conductorRunId && terminalStatus === "claimed") {
           // Staged policy lifecycle on the live request path:
           // - canary arm → noteCanaryPolicyOutcome (may auto-promote/rollback)
@@ -4834,10 +4840,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               );
             }
           }
-          const heuristic = await conductorLearning.optimizeAndApply(
-            agentRunId,
-            route.task_type,
-            cfg.orchestrator.agents ?? [],
+          const heuristic = await turnTiming.measureAsync("optimize_and_apply", () =>
+            conductorLearning.optimizeAndApply(
+              agentRunId,
+              route.task_type,
+              cfg.orchestrator.agents ?? [],
+            ),
           );
           if (heuristic.proposals.length > 0) {
             console.log(
@@ -4890,10 +4898,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
         if (terminalStatus === "claimed") {
-          await selfTuningProposer.proposeAndApply(agentRunId, route.task_type);
+          await turnTiming.measureAsync("self_tuning_proposals", () =>
+            selfTuningProposer.proposeAndApply(agentRunId, route.task_type),
+          );
         }
 
         // Write final done messages
+        await turnTiming.measureAsync("pre_terminal_frames", async () => {
         await writer.write(encoder.encode(`data: ${JSON.stringify({
           type: "orchestration_metrics",
           run_id: agentRunId,
@@ -4928,6 +4939,13 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           session_id: sessionId,
         })}\n\n`));
         await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "agent_run_id", agent_run_id: agentRunId, session_id: sessionId })}\n\n`));
+        });
+        // `tail_before_terminal` is pipeline-return → immediately before the
+        // branch-specific terminal work below (inference bookkeeping,
+        // recordMemoryTerminal, terminal send). It is NOT last-token →
+        // terminal: the answer streamed during the synthesizer stage, inside
+        // the recorded run duration, before this timing started.
+        turnTiming.markTotal("tail_before_terminal");
         if (terminalPipelineFailure) {
           console.error(`[Jarvis Orchestrator] session=${sessionId} failed: ${result.error_code}`);
           recordInference({
@@ -4947,7 +4965,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
           repetitionStore.recordOutcome(sessionId, message, result.error_code);
           recordMemoryTerminal("failed", result.error_code ?? null);
-          await session.finish("", { isError: true, code: result.error_code });
+          await turnTiming.measureAsync("terminal_send", () =>
+            session.finish("", { isError: true, code: result.error_code }),
+          );
         } else if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
           // real error frame so the UI shows a banner instead of dropping the
@@ -4982,7 +5002,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // could see a turn failed but never WHY — the same information
           // the short-circuit memo already tracks server-side.
           recordMemoryTerminal("failed", result.error_code ?? null);
-          await session.finish(result.error, { isError: true, code: result.error_code });
+          const errorText = result.error;
+          await turnTiming.measureAsync("terminal_send", () =>
+            session.finish(errorText, { isError: true, code: result.error_code }),
+          );
         } else if (!trimmedAnswer) {
           // Empty (non-fatal) completion: show the friendly retry notice, but
           // record the inference as a FAILURE so telemetry is truthful (the run
@@ -5015,7 +5038,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? "The turn ran out of time before producing an answer, and no workspace evidence was gathered to summarize. A narrower request (name a specific file or directory) fits the budget better."
             : "The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.";
           recordMemoryTerminal(terminalStatusForRunOutcome(verifiedRunOutcome), result.error_code ?? null);
-          await session.finish(noOutputNotice);
+          await turnTiming.measureAsync("terminal_send", () =>
+            session.finish(noOutputNotice),
+          );
         } else {
           // Success path. The orchestrator runs many model calls per user
           // turn (planner, executor, reviewer, synthesizer, recursion_critique,
@@ -5088,12 +5113,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             terminalStatusForRunOutcome(verifiedRunOutcome),
             repetitionVerdict.repeated ? "no_progress_repetition" : (result.error_code ?? null),
           );
-          await session.finish(finalAnswer, {
-            subtype: terminalSubtypeForRunOutcome(verifiedRunOutcome),
-            ...(repetitionVerdict.repeated
-              ? { code: "no_progress_repetition" }
-              : (verifiedRunOutcome === "partial" ? { code: result.error_code } : {})),
-          });
+          // Audit item 2: keep the run's real reason on every non-success
+          // terminal. Previously only `partial` forwarded `result.error_code`,
+          // so a `degraded` run emitted `subtype: "partial"` with no code and
+          // the client invented `inference_partial`. `success` still reports
+          // no code and an unreported reason is still reported as unreported.
+          await turnTiming.measureAsync("terminal_send", () => finishWithRunOutcome(session, {
+            result: finalAnswer,
+            outcome: verifiedRunOutcome,
+            errorCode: result.error_code,
+            repeated: repetitionVerdict.repeated,
+          }));
         }
         return;
       }

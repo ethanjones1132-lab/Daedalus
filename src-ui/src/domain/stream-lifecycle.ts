@@ -52,7 +52,10 @@ export function decodeResultFrame(frame: unknown): DecodedStreamTerminal {
     return { frame: 'result', outcome: 'success', text, hardError: false };
   }
   if (subtype === 'partial') {
-    return { frame: 'result', outcome: 'partial', code: code ?? 'inference_partial', text, hardError: false };
+    // Audit item 2: never invent a reason. A partial result that reported no
+    // code keeps its partial outcome and its absence of a recorded reason, so
+    // the surface cannot present a fabricated code as server evidence.
+    return { frame: 'result', outcome: 'partial', code, text, hardError: false };
   }
   if (subtype === 'error') {
     return { frame: 'result', outcome: 'failed', code: code ?? 'inference_failed', text, hardError: true };

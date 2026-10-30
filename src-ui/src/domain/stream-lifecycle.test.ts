@@ -68,19 +68,38 @@ describe('Session stream terminal lifecycle', () => {
     });
   });
 
-  it('decodes partial and timeout results with stable fallback codes', () => {
-    expect(decodeResultFrame({ type: 'result', subtype: 'partial', result: 'useful' })).toMatchObject({
-      outcome: 'partial',
-      code: 'inference_partial',
-      text: 'useful',
-      hardError: false,
-    });
+  it('decodes timeout results with their server-reported code', () => {
     expect(decodeResultFrame({ type: 'result', code: 'stage_timeout', content: 'slow' })).toMatchObject({
       outcome: 'timed_out',
       code: 'stage_timeout',
       text: 'slow',
       hardError: false,
     });
+  });
+
+  it('keeps a reported partial reason and never invents one', () => {
+    // Audit item 2: the client used to synthesise `inference_partial` for every
+    // partial result that carried no code, then render it as if the server had
+    // recorded that reason. A partial turn stays partial; an unreported reason
+    // stays unreported.
+    expect(decodeResultFrame({
+      type: 'result',
+      subtype: 'partial',
+      code: 'upstream_stage_failed',
+      result: 'useful',
+    })).toEqual({
+      frame: 'result',
+      outcome: 'partial',
+      code: 'upstream_stage_failed',
+      text: 'useful',
+      hardError: false,
+    });
+
+    const unreported = decodeResultFrame({ type: 'result', subtype: 'partial', result: 'useful' });
+    expect(unreported.outcome).toBe('partial');
+    expect(unreported.text).toBe('useful');
+    expect(unreported.hardError).toBe(false);
+    expect(unreported.code).toBeUndefined();
   });
 
   it('gives is_error precedence and rejects explicit unknown result subtypes', () => {
