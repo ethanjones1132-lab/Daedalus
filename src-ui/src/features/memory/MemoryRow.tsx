@@ -2,12 +2,14 @@ import type { Ref } from 'react';
 import { Chip, cn, Meter } from '../../design';
 import { getMemoryTier, type MemoryEntry } from '../../domain/memory-recall-state';
 import { fmtConfidence, fmtDate, safeTags, type RecallMeta } from './memory-format';
+import { INJECTION_BASIS, injectionLabel, type InjectionVerdict } from './memory-injectability';
 
 export function MemoryRow({
   memory,
   selected,
   regionId,
   recall,
+  injection = null,
   inspectRef,
   onSelect,
 }: {
@@ -15,6 +17,8 @@ export function MemoryRow({
   selected: boolean;
   regionId: string;
   recall: RecallMeta | null;
+  /** Read-only admission verdict for a chosen Session scope; null when not observed. */
+  injection?: InjectionVerdict | null;
   inspectRef: Ref<HTMLButtonElement>;
   onSelect: () => void;
 }) {
@@ -64,6 +68,21 @@ export function MemoryRow({
           </span>
         )}
         <span className="ml-auto flex items-center gap-3 font-mono text-[10.5px] text-ink-3">
+          {injection && (
+            <span
+              role="status"
+              aria-label={`Injectability: ${injectionLabel(injection)}`}
+              title={INJECTION_BASIS}
+              className={cn(
+                'rounded-full border px-2 py-0.5 text-[10px] tracking-[0.02em]',
+                injection.admitted
+                  ? 'border-ok/40 bg-ok-wash text-ok'
+                  : 'border-line-strong bg-sunken text-ink-4',
+              )}
+            >
+              {injectionLabel(injection)}
+            </span>
+          )}
           {relevance !== null && (
             <span className="flex items-center gap-2">
               <Meter className="w-16" tone="accent" value={relevance} label={`Relevance ${relevance}%`} />

@@ -78,6 +78,11 @@ const FRAME_SUFFIX: &str = "\n[/Jarvis recalled data]";
 pub enum MemoryRecallStatus {
     Ready,
     Empty,
+    /// The query found candidate rows inside the Session scope, but none
+    /// survived strict lifecycle admission (expired or unreadable timestamps
+    /// within the coarse SQL filter). Distinct from `Empty`, where no row
+    /// matched the query at all.
+    Filtered,
     Unavailable,
     RetrievalFailed,
     RegistrationFailed,
@@ -633,6 +638,7 @@ fn recall_status_str(status: MemoryRecallStatus) -> &'static str {
     match status {
         MemoryRecallStatus::Ready => "ready",
         MemoryRecallStatus::Empty => "empty",
+        MemoryRecallStatus::Filtered => "filtered",
         MemoryRecallStatus::Unavailable => "unavailable",
         MemoryRecallStatus::RetrievalFailed => "retrieval_failed",
         MemoryRecallStatus::RegistrationFailed => "registration_failed",
@@ -884,7 +890,7 @@ fn preparation_from_turn(
     let eligible = matches!(turn.state, MemoryTurnState::Registered)
         && matches!(
             turn.recall_status,
-            MemoryRecallStatus::Ready | MemoryRecallStatus::Empty
+            MemoryRecallStatus::Ready | MemoryRecallStatus::Empty | MemoryRecallStatus::Filtered
         )
         && !expired;
     MemoryTurnPreparation {
@@ -937,6 +943,7 @@ pub fn prepare_memory_turn_record(
         let options = RecallOptions {
             limit: MAX_PREPARED_ITEMS,
             include_user_scope: request.include_user_scope,
+            min_confidence: None,
         };
 
         // Pure/ephemeral continuity preview from the exact saved user source and
@@ -953,6 +960,10 @@ pub fn prepare_memory_turn_record(
         let (turn_state, recall_status, error_code, selected, block) =
             match scoped::recall_scoped_memories(conn, &scope, &user_message, &options, now) {
                 Ok(preview) => {
+                    // Candidates existed inside the scope but none survived
+                    // admission, versus no candidate at all. The count is the
+                    // only distinction the frozen turn record can carry.
+                    let recall_filtered = preview.considered > 0 && preview.admitted == 0;
                     let items = build_prepared_memory_items(&preview);
                     match &continuity_preview {
                         // An accepted active objective renders even with zero
@@ -982,7 +993,11 @@ pub fn prepare_memory_turn_record(
                         }
                         _ if items.is_empty() => (
                             MemoryTurnState::Prepared,
-                            MemoryRecallStatus::Empty,
+                            if recall_filtered {
+                                MemoryRecallStatus::Filtered
+                            } else {
+                                MemoryRecallStatus::Empty
+                            },
                             None,
                             Vec::new(),
                             String::new(),

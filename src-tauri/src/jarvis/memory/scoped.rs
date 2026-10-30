@@ -606,40 +606,133 @@ fn escape_like(input: &str) -> String {
     out
 }
 
+/// One admission decision for a stored memory against a recall scope. This is
+/// the exact predicate `recall_scoped_memories` applies, shared with the
+/// read-only injectability projection so the two cannot disagree.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdmissionVerdict {
+    pub admitted: bool,
+    /// The row passed admission but its review window has passed. Recall still
+    /// admits it and flags it; it is never silently dropped.
+    pub stale: bool,
+    /// Fixed reason code when `admitted` is false; never memory content.
+    pub reason: Option<String>,
+}
+
+fn excluded(reason: &str) -> AdmissionVerdict {
+    AdmissionVerdict {
+        admitted: false,
+        stale: false,
+        reason: Some(reason.to_string()),
+    }
+}
+
+/// Mirror of `recall_scope_predicate` at the row level. The SQL predicate and
+/// this function must stay in lockstep; the recall path applies SQL first and
+/// this predicate again during admission, while the injectability projection
+/// applies only this function to rows fetched by id.
+fn entry_scope_matches(entry: &ScopedMemoryEntry, scope: &MemoryScope, include_user: bool) -> bool {
+    let entry_scope = &entry.scope;
+    let user_match = include_user
+        && scope.kind != MemoryScopeKind::User
+        && entry_scope.kind == MemoryScopeKind::User
+        && entry_scope.agent_id.is_empty();
+    match scope.kind {
+        MemoryScopeKind::Project => {
+            (entry_scope.kind == MemoryScopeKind::Project
+                && entry_scope.agent_id == scope.agent_id
+                && entry_scope.project_root == scope.project_root)
+                || (entry_scope.kind == MemoryScopeKind::Agent
+                    && entry_scope.agent_id == scope.agent_id)
+                || user_match
+        }
+        MemoryScopeKind::Agent => {
+            (entry_scope.kind == MemoryScopeKind::Agent
+                && entry_scope.agent_id == scope.agent_id)
+                || user_match
+        }
+        MemoryScopeKind::User => {
+            entry_scope.kind == MemoryScopeKind::User && entry_scope.agent_id.is_empty()
+        }
+        MemoryScopeKind::LegacyUnscoped => entry_scope.kind == MemoryScopeKind::LegacyUnscoped,
+    }
+}
+
+/// The one admission predicate. Reason codes are fixed strings for display:
+/// `status_not_active`, `tier_filtered`, `authority_filtered`,
+/// `malformed_timestamp`, `out_of_scope`, `expired`.
+pub fn admit_scoped_entry(
+    entry: &ScopedMemoryEntry,
+    scope: &MemoryScope,
+    include_user: bool,
+    now: &DateTime<Utc>,
+) -> AdmissionVerdict {
+    if entry.entry.status != "active" {
+        return excluded("status_not_active");
+    }
+    if entry.entry.tier != "hot" && entry.entry.tier != "warm" {
+        return excluded("tier_filtered");
+    }
+    match entry.authority_kind {
+        AuthorityKind::Manual
+        | AuthorityKind::UserStatement
+        | AuthorityKind::VerifiedObservation => {}
+        _ => return excluded("authority_filtered"),
+    }
+    let expires_at = match parse_recall_timestamp(&entry.entry.expires_at, &entry.entry.id, "expires_at")
+    {
+        Ok(value) => value,
+        Err(()) => return excluded("malformed_timestamp"),
+    };
+    let review_after =
+        match parse_recall_timestamp(&entry.entry.review_after, &entry.entry.id, "review_after") {
+            Ok(value) => value,
+            Err(()) => return excluded("malformed_timestamp"),
+        };
+    if !entry_scope_matches(entry, scope, include_user) {
+        return excluded("out_of_scope");
+    }
+    if expires_at.map(|expires| expires <= *now).unwrap_or(false) {
+        return excluded("expired");
+    }
+    let stale = review_after
+        .map(|review| review <= *now)
+        .unwrap_or(false);
+    AdmissionVerdict {
+        admitted: true,
+        stale,
+        reason: None,
+    }
+}
+
 /// Stream a scoped result set, applying strict lifecycle admission. Each row is
 /// parsed and compared in Rust before it may consume a candidate slot, and
 /// iteration stops as soon as `limit` genuinely eligible entries exist. This
 /// keeps matching rows from being materialized and prevents malformed/expired
 /// rows (which SQL cannot judge precisely) from displacing valid candidates.
+///
+/// Returns `(considered, admitted)` where `considered` counts inspected rows
+/// (a lower bound when the limit is reached early).
 fn admit_lifecycle(
     rows: impl Iterator<Item = rusqlite::Result<ScopedMemoryEntry>>,
+    scope: &MemoryScope,
+    include_user: bool,
     now: &DateTime<Utc>,
     limit: usize,
-) -> Result<Vec<(ScopedMemoryEntry, bool)>, MemoryError> {
+) -> Result<(usize, Vec<(ScopedMemoryEntry, bool)>), MemoryError> {
     let mut admitted: Vec<(ScopedMemoryEntry, bool)> = Vec::new();
+    let mut considered = 0usize;
     let mut rows = rows;
     while admitted.len() < limit {
         let Some(row) = rows.next() else { break };
+        considered += 1;
         let memory = row.map_err(MemoryError::from)?;
-        let id = memory.entry.id.clone();
-        let expires_at = match parse_recall_timestamp(&memory.entry.expires_at, &id, "expires_at") {
-            Ok(value) => value,
-            Err(()) => continue,
-        };
-        let review_after =
-            match parse_recall_timestamp(&memory.entry.review_after, &id, "review_after") {
-                Ok(value) => value,
-                Err(()) => continue,
-            };
-        if expires_at.map(|expires| expires <= *now).unwrap_or(false) {
-            continue;
+        let verdict = admit_scoped_entry(&memory, scope, include_user, now);
+        if verdict.admitted {
+            admitted.push((memory, verdict.stale));
         }
-        let stale = review_after
-            .map(|review| review <= *now)
-            .unwrap_or(false);
-        admitted.push((memory, stale));
     }
-    Ok(admitted)
+    Ok((considered, admitted))
 }
 
 /// Parse one persisted lifecycle timestamp. Returns `Err(())` for a present but
@@ -683,12 +776,15 @@ pub fn recall_scoped_memories(
             scope: scope.clone(),
             store_revision,
             entries: Vec::new(),
+            considered: 0,
+            admitted: 0,
         });
     }
 
     let (scope_clause, scope_params) = recall_scope_predicate(scope, options.include_user_scope);
 
     let mut candidates: Vec<(ScopedMemoryEntry, bool)> = Vec::new();
+    let mut considered = 0usize;
 
     if let Some(expr) = engine::fts_expr(query) {
         let sql = format!(
@@ -698,17 +794,26 @@ pub fn recall_scoped_memories(
             LIFECYCLE_FILTER,
             scope_clause
         );
-        let attempt = (|| -> Result<Vec<(ScopedMemoryEntry, bool)>, MemoryError> {
+        let attempt = (|| -> Result<(usize, Vec<(ScopedMemoryEntry, bool)>), MemoryError> {
             let mut stmt = conn.prepare(&sql).map_err(MemoryError::from)?;
             let mut values: Vec<Value> = vec![Value::from(expr.clone())];
             values.extend(scope_params.clone());
             let rows = stmt
                 .query_map(rusqlite::params_from_iter(values), scoped_from_row)
                 .map_err(MemoryError::from)?;
-            admit_lifecycle(rows, &now, CANDIDATE_LIMIT)
+            admit_lifecycle(
+                rows,
+                scope,
+                options.include_user_scope,
+                &now,
+                CANDIDATE_LIMIT,
+            )
         })();
         match attempt {
-            Ok(rows) => candidates = rows,
+            Ok((count, rows)) => {
+                considered = count;
+                candidates = rows;
+            }
             Err(err) => {
                 // A missing or broken FTS index is not fatal; fall through to
                 // the scoped literal fallback below. Genuine storage failure
@@ -741,15 +846,32 @@ pub fn recall_scoped_memories(
         let rows = stmt
             .query_map(rusqlite::params_from_iter(values), scoped_from_row)
             .map_err(MemoryError::from)?;
-        candidates = admit_lifecycle(rows, &now, CANDIDATE_LIMIT)?;
+        let (count, rows) = admit_lifecycle(
+            rows,
+            scope,
+            options.include_user_scope,
+            &now,
+            CANDIDATE_LIMIT,
+        )?;
+        considered += count;
+        candidates = rows;
     }
 
+    let admitted = candidates.len();
     let mut recalls: Vec<ScopedMemoryRecall> = candidates
         .into_iter()
         .filter_map(|(memory, stale)| {
             let (score, matched_terms) = engine::score_memory(&memory.entry, &terms);
             if matched_terms.is_empty() || score <= 0.05 {
                 return None;
+            }
+            // Opt-in floor only: `None` preserves the historical admission of
+            // every confidence. A set floor narrows this result and writes
+            // nothing.
+            if let Some(floor) = options.min_confidence {
+                if !(memory.entry.confidence >= floor) {
+                    return None;
+                }
             }
             Some(ScopedMemoryRecall {
                 memory,
@@ -772,7 +894,72 @@ pub fn recall_scoped_memories(
         scope: scope.clone(),
         store_revision,
         entries: recalls,
+        considered,
+        admitted,
     })
+}
+
+/// The largest id list the read-only injectability projection will evaluate.
+pub const INJECTABILITY_LIMIT: usize = 100;
+
+/// One stored memory's admission verdict against a chosen Session scope.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryInjectability {
+    pub id: String,
+    pub admitted: bool,
+    /// Admitted but past its review window; recall still admits and flags it.
+    pub stale: bool,
+    /// Fixed reason code when not admitted (`status_not_active`, `tier_filtered`,
+    /// `authority_filtered`, `malformed_timestamp`, `out_of_scope`, `expired`,
+    /// `not_found`); never memory content or a raw error.
+    pub reason: Option<String>,
+}
+
+/// Read-only projection: evaluate the recall admission predicate for up to
+/// `INJECTABILITY_LIMIT` visible memories against one resolved Session scope.
+/// This says whether a row would survive admission for a matching query — it is
+/// not a claim that the current turn's query matches it. Nothing is written.
+pub fn injectability_for_ids(
+    conn: &Connection,
+    scope: &MemoryScope,
+    ids: &[String],
+    include_user: bool,
+    now: DateTime<Utc>,
+) -> Result<Vec<MemoryInjectability>, MemoryError> {
+    let sql = format!(
+        "SELECT {} FROM memory m WHERE m.id = ?1",
+        scoped_select_columns()
+    );
+    let mut stmt = conn.prepare(&sql).map_err(MemoryError::from)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in ids.iter().take(INJECTABILITY_LIMIT) {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let row = stmt
+            .query_row([id], scoped_from_row)
+            .optional()
+            .map_err(MemoryError::from)?;
+        match row {
+            None => out.push(MemoryInjectability {
+                id: id.clone(),
+                admitted: false,
+                stale: false,
+                reason: Some("not_found".to_string()),
+            }),
+            Some(entry) => {
+                let verdict = admit_scoped_entry(&entry, scope, include_user, &now);
+                out.push(MemoryInjectability {
+                    id: entry.entry.id,
+                    admitted: verdict.admitted,
+                    stale: verdict.stale,
+                    reason: verdict.reason,
+                });
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Deliberately adopt one legacy quarantined record into an explicit scope.
@@ -1081,4 +1268,176 @@ pub fn restore_scoped_memory(
         store_revision,
         changed,
     })
+}
+
+#[cfg(test)]
+mod injectability_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use rusqlite::Connection;
+
+    fn db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::run_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        conn: &Connection,
+        id: &str,
+        scope_kind: &str,
+        agent_id: &str,
+        project_root: Option<&str>,
+        authority: &str,
+        tier: &str,
+        status: &str,
+        confidence: f64,
+        expires_at: Option<&str>,
+        content: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO memory
+             (id, title, content, tags, category, agent_id, source, source_message_ids,
+              confidence, expires_at, review_after, status, tier, scope_kind, project_root,
+              authority_kind, revision, statement_kind, created_at, updated_at, updated_at_ms)
+             VALUES (?, ?, ?, '[]', 'project', ?, 'manual', '[]', ?, ?, NULL, ?, ?, ?, ?, ?, 1,
+                     'unknown', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0)",
+            rusqlite::params![
+                id,
+                id,
+                content,
+                agent_id,
+                confidence,
+                expires_at,
+                status,
+                tier,
+                scope_kind,
+                project_root,
+                authority,
+            ],
+        )
+        .unwrap();
+    }
+
+    fn seeded() -> Connection {
+        let conn = db();
+        // Admitted: in scope, manual, hot, active, low confidence on purpose.
+        insert(&conn, "ok", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.2, None, "recallable memory");
+        insert(&conn, "legacy", "legacy_unscoped", "", None, "legacy_unknown", "hot", "active", 0.9, None, "recallable memory");
+        insert(&conn, "out", "project", "agent-a", Some("/projects/two"), "manual", "hot", "active", 0.9, None, "recallable memory");
+        insert(&conn, "cold", "project", "agent-a", Some("/projects/one"), "manual", "cold", "active", 0.6, None, "recallable memory");
+        insert(&conn, "expired", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.9, Some("2000-01-01T00:00:00Z"), "recallable memory");
+        conn
+    }
+
+    fn ids() -> Vec<String> {
+        ["ok", "legacy", "out", "cold", "expired", "missing"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn injectability_reports_the_exact_blocker_for_each_row() {
+        let conn = seeded();
+        let scope = MemoryScope::project("agent-a", "/projects/one");
+        let rows = injectability_for_ids(&conn, &scope, &ids(), false, now()).unwrap();
+        let verdict = |id: &str| {
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap_or_else(|| panic!("missing verdict for {id}"))
+        };
+        assert!(verdict("ok").admitted);
+        assert_eq!(verdict("ok").reason, None);
+        assert_eq!(verdict("legacy").reason.as_deref(), Some("authority_filtered"));
+        assert_eq!(verdict("out").reason.as_deref(), Some("out_of_scope"));
+        assert_eq!(verdict("cold").reason.as_deref(), Some("tier_filtered"));
+        assert_eq!(verdict("expired").reason.as_deref(), Some("expired"));
+        assert_eq!(verdict("missing").reason.as_deref(), Some("not_found"));
+    }
+
+    #[test]
+    fn default_recall_includes_a_low_confidence_row_and_an_opt_in_floor_excludes_it() {
+        let conn = seeded();
+        let scope = MemoryScope::project("agent-a", "/projects/one");
+        let options = RecallOptions {
+            limit: 5,
+            include_user_scope: false,
+            min_confidence: None,
+        };
+        let baseline = recall_scoped_memories(&conn, &scope, "recallable", &options, now()).unwrap();
+        assert!(baseline
+            .entries
+            .iter()
+            .any(|entry| entry.memory.entry.id == "ok"));
+        assert_eq!(baseline.admitted, 1);
+
+        let floored = recall_scoped_memories(
+            &conn,
+            &scope,
+            "recallable",
+            &RecallOptions {
+                min_confidence: Some(0.5),
+                ..options
+            },
+            now(),
+        )
+        .unwrap();
+        assert!(floored.entries.is_empty());
+        assert_eq!(floored.admitted, 1, "the floor filters results, not admission");
+    }
+
+    #[test]
+    fn considered_versus_admitted_distinguishes_no_candidate_from_filtered_out() {
+        let conn = seeded();
+        let scope = MemoryScope::project("agent-a", "/projects/one");
+        let options = RecallOptions {
+            limit: 5,
+            include_user_scope: false,
+            min_confidence: None,
+        };
+
+        // The only in-scope row matching this query is expired: a candidate was
+        // found, but admission rejected all of them.
+        let filtered = recall_scoped_memories(&conn, &scope, "recallable memory", &options, now()).unwrap();
+        assert_eq!(filtered.considered, 2, "ok + expired inspected");
+        assert_eq!(filtered.admitted, 1);
+
+        insert(&conn, "expired-only", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.9, Some("2000-01-01T00:00:00Z"), "solelyexpired token");
+        let only_expired = recall_scoped_memories(&conn, &scope, "solelyexpired", &options, now()).unwrap();
+        // The FTS attempt finds the expired row, admission rejects it, and the
+        // literal fallback inspects it again; `considered` counts inspections.
+        assert!(only_expired.considered >= 1);
+        assert_eq!(only_expired.admitted, 0);
+        assert!(only_expired.entries.is_empty());
+
+        let absent = recall_scoped_memories(&conn, &scope, "nomatchendtoken", &options, now()).unwrap();
+        assert_eq!(absent.considered, 0);
+        assert_eq!(absent.admitted, 0);
+    }
+
+    #[test]
+    fn injectability_agrees_with_recall_for_the_same_fixture() {
+        let conn = seeded();
+        let scope = MemoryScope::project("agent-a", "/projects/one");
+        let options = RecallOptions {
+            limit: 5,
+            include_user_scope: false,
+            min_confidence: None,
+        };
+        let preview = recall_scoped_memories(&conn, &scope, "recallable", &options, now()).unwrap();
+        let rows = injectability_for_ids(&conn, &scope, &ids(), false, now()).unwrap();
+        for row in rows.iter().filter(|row| row.reason.as_deref() != Some("not_found")) {
+            let recalled = preview
+                .entries
+                .iter()
+                .any(|entry| entry.memory.entry.id == row.id);
+            assert_eq!(row.admitted, recalled, "disagreement for {}", row.id);
+        }
+    }
 }

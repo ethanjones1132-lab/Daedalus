@@ -232,6 +232,7 @@ export const DEFAULT_RECALL_OPTIONS: RecallOptions = {
 export type MemoryRecallStatus =
   | "ready"
   | "empty"
+  | "filtered"
   | "unavailable"
   | "retrieval_failed"
   | "registration_failed"

@@ -18,6 +18,7 @@ import type {
 export type MemoryRecallStatus =
   | 'ready'
   | 'empty'
+  | 'filtered'
   | 'unavailable'
   | 'retrieval_failed'
   | 'registration_failed'
@@ -64,6 +65,7 @@ const REVALIDATION_STATES: ReadonlySet<string> = new Set<MemoryRevalidationState
 const RECALL_STATUSES: ReadonlySet<string> = new Set<MemoryRecallStatus>([
   'ready',
   'empty',
+  'filtered',
   'unavailable',
   'retrieval_failed',
   'registration_failed',
@@ -454,7 +456,8 @@ export function decodeMemoryTurnDiagnostic(value: unknown): MemoryTurnDiagnostic
 
 const RECALL_STATUS_LABELS: Record<MemoryRecallStatus, string> = {
   ready: 'ready',
-  empty: 'no matches',
+  empty: 'no candidates matched',
+  filtered: 'filtered out (expired / unreadable)',
   unavailable: 'unavailable',
   retrieval_failed: 'retrieval failed',
   registration_failed: 'registration failed',

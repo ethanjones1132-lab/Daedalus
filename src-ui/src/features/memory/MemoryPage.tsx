@@ -27,6 +27,13 @@ import {
 import { MemoryDetail } from './MemoryDetail';
 import { MemoryRow } from './MemoryRow';
 import { BUCKET_ORDER, dateBucket, recallMetaById, type DateBucket, type RecallMeta } from './memory-format';
+import {
+  INJECTION_BASIS,
+  decodeInjectability,
+  type InjectionVerdict,
+} from './memory-injectability';
+
+type InjectionState = 'idle' | 'loading' | 'ready' | 'unavailable';
 
 function MemoryPage() {
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
@@ -41,6 +48,12 @@ function MemoryPage() {
   const inspectionButtons = useRef(new Map<string, HTMLButtonElement>());
   const searchInput = useRef<HTMLInputElement>(null);
   const requestId = useRef(0);
+  // Read-only injectability for a chosen Session scope. The Overview is an
+  // inspection list; without a scope no per-row verdict is claimed.
+  const [scopeSessionId, setScopeSessionId] = useState('');
+  const [sessionOptions, setSessionOptions] = useState<Array<{ id: string; label: string }>>([]);
+  const [injection, setInjection] = useState<Record<string, InjectionVerdict> | null>(null);
+  const [injectionState, setInjectionState] = useState<InjectionState>('idle');
 
   // List and recall share one boundary: neither may overwrite a newer request.
   const load = useCallback(async (requestedQuery: string) => {
@@ -78,11 +91,75 @@ function MemoryPage() {
     };
   }, [load]);
 
+  // The scope chooser is optional: an unreadable Session list leaves the
+  // Overview fully usable and simply offers no injectability verdicts.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await invoke<unknown>('jarvis_list_sessions');
+        if (cancelled || !Array.isArray(list)) return;
+        const options: Array<{ id: string; label: string }> = [];
+        for (const row of list) {
+          if (!row || typeof row !== 'object') continue;
+          const id = (row as { id?: unknown }).id;
+          if (typeof id !== 'string' || !id) continue;
+          const name = (row as { name?: unknown }).name;
+          options.push({ id, label: typeof name === 'string' && name.trim() ? name : id });
+        }
+        setSessionOptions(options);
+      } catch {
+        /* no chooser; the stored-memory list remains readable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const search = () => {
     void load(query);
   };
 
   const filtered = useMemo(() => filterMemoriesByTier(memories, tier), [memories, tier]);
+  const visibleIds = useMemo(() => filtered.slice(0, 100).map((memory) => memory.id), [filtered]);
+  const recalling = submittedQuery !== '';
+
+  // Evaluate admission only for the visible rows, only in the stored-memory
+  // view, and only when an exact Session scope is chosen. The read is bounded
+  // to 100 ids natively.
+  useEffect(() => {
+    if (recalling || !scopeSessionId || visibleIds.length === 0) {
+      setInjection(null);
+      setInjectionState('idle');
+      return;
+    }
+    let cancelled = false;
+    setInjectionState('loading');
+    setInjection(null);
+    void (async () => {
+      try {
+        const result = await invoke<unknown>('memory_injectability', {
+          request: {
+            session_id: scopeSessionId,
+            ids: visibleIds,
+            include_user_scope: false,
+          },
+        });
+        if (cancelled) return;
+        const decoded = decodeInjectability(result);
+        setInjection(decoded);
+        setInjectionState(decoded ? 'ready' : 'unavailable');
+      } catch {
+        if (cancelled) return;
+        setInjection(null);
+        setInjectionState('unavailable');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [scopeSessionId, visibleIds, recalling]);
   const selected = selectedId ? (filtered.find((memory) => memory.id === selectedId) ?? null) : null;
 
   useEffect(() => {
@@ -100,7 +177,6 @@ function MemoryPage() {
   };
 
   // Recall results keep the server's relevance order; recent memories group by day.
-  const recalling = submittedQuery !== '';
   const groups = useMemo(() => {
     if (recalling) return [{ label: null as DateBucket | null, items: filtered }];
     const buckets = new Map<DateBucket, MemoryEntry[]>();
@@ -167,6 +243,21 @@ function MemoryPage() {
             <option value="warm">Warm</option>
             <option value="cold">Cold</option>
           </Select>
+          <Select
+            aria-label="Recall scope Session"
+            value={scopeSessionId}
+            onChange={(e) => setScopeSessionId(e.target.value)}
+            className="h-12 w-auto max-w-[240px] rounded-[9px]"
+            disabled={recalling}
+            title="Evaluate which stored rows this Session could recall"
+          >
+            <option value="">No recall scope</option>
+            {sessionOptions.map((session) => (
+              <option key={session.id} value={session.id}>
+                {session.label}
+              </option>
+            ))}
+          </Select>
           <Button variant="primary" size="md" className="h-12 px-6 text-[14px]" onClick={search}>
             Search
           </Button>
@@ -177,9 +268,25 @@ function MemoryPage() {
       <div className={cn(selected && 'grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_460px]')}>
         <div className="min-w-0">
           {!loading && !error && (
-            <div className="mb-4 flex items-baseline justify-between gap-3">
-              <p className="d-label">{submittedQuery ? `Results for "${submittedQuery}"` : 'Recent memories'}</p>
-              {filtered.length > 0 && <span className="font-mono text-[11px] text-ink-3 tabular">{filtered.length} shown</span>}
+            <div className="mb-4 flex flex-col gap-1.5">
+              <div className="flex items-baseline justify-between gap-3">
+                <p className="d-label">{submittedQuery ? `Results for "${submittedQuery}"` : 'Recent memories'}</p>
+                {filtered.length > 0 && <span className="font-mono text-[11px] text-ink-3 tabular">{filtered.length} shown</span>}
+              </div>
+              {!submittedQuery && (
+                <p className="text-[11.5px] text-ink-3">
+                  All stored memories — not necessarily what will be recalled.
+                </p>
+              )}
+              {!submittedQuery && scopeSessionId && (
+                <p className="text-[11px] text-ink-4">
+                  {injectionState === 'loading'
+                    ? 'Checking injectability for this Session…'
+                    : injectionState === 'unavailable'
+                      ? 'Injectability is unavailable for this Session; no per-row verdict is claimed.'
+                      : INJECTION_BASIS}
+                </p>
+              )}
             </div>
           )}
           {loading ? (
@@ -214,6 +321,7 @@ function MemoryPage() {
                           selected={selectedId === m.id}
                           regionId={`${detailId}-${m.id}`}
                           recall={recalling ? (recallMeta[m.id] ?? null) : null}
+                          injection={!recalling ? (injection?.[m.id] ?? null) : null}
                           inspectRef={(node) => {
                             if (node) inspectionButtons.current.set(m.id, node);
                             else inspectionButtons.current.delete(m.id);

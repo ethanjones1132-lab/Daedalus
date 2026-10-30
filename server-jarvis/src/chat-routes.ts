@@ -37,6 +37,7 @@ export interface ChatStreamOptions {
 const MEMORY_RECALL_STATUSES: ReadonlySet<string> = new Set<MemoryRecallStatus>([
   "ready",
   "empty",
+  "filtered",
   "unavailable",
   "retrieval_failed",
   "registration_failed",

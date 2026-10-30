@@ -284,6 +284,11 @@ pub struct ScopedMemoryRecall {
 pub struct RecallOptions {
     pub limit: usize,
     pub include_user_scope: bool,
+    /// Opt-in relevance floor. `None` (the default) preserves the historical
+    /// behaviour of admitting any confidence; an operator-set value only narrows
+    /// the result, it never rewrites existing rows.
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
 }
 
 impl Default for RecallOptions {
@@ -291,6 +296,7 @@ impl Default for RecallOptions {
         Self {
             limit: 5,
             include_user_scope: false,
+            min_confidence: None,
         }
     }
 }
@@ -300,6 +306,15 @@ pub struct RecallPreview {
     pub scope: MemoryScope,
     pub store_revision: i64,
     pub entries: Vec<ScopedMemoryRecall>,
+    /// Rows the coarse SQL filter returned before strict admission. Zero means
+    /// no stored row matched the query inside this scope at all; a positive
+    /// value with no entries means rows existed but none survived admission or
+    /// scoring. This is a count, not a cause.
+    #[serde(default)]
+    pub considered: usize,
+    /// Rows that passed strict scope/lifecycle admission.
+    #[serde(default)]
+    pub admitted: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

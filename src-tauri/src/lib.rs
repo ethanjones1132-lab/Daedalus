@@ -1892,6 +1892,7 @@ pub fn run() {
             memory_scoped_delete,
             memory_scoped_restore,
             memory_scoped_recall_preview,
+            memory_injectability,
             memory_scoped_classify,
             memory_adopt_legacy,
             memory_prepare_turn,

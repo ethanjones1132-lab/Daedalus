@@ -65,6 +65,7 @@ beforeEach(() => {
     if (command === 'list_recent_memories') return Promise.resolve([firstMemory, secondMemory]);
     if (command === 'memory_recall_preview') return Promise.resolve([]);
     if (command === 'jarvis_get_tier_stats') return Promise.resolve({ hot: 2, warm: 0, cold: 0 });
+    if (command === 'jarvis_list_sessions') return Promise.resolve([]);
     throw new Error(`Unexpected command: ${command}`);
   });
 });
@@ -144,6 +145,7 @@ describe('Memory keyboard inspection', () => {
       if (command === 'list_recent_memories') return Promise.resolve([minimalMemory]);
       if (command === 'memory_recall_preview') return Promise.resolve([]);
       if (command === 'jarvis_get_tier_stats') return Promise.resolve({ hot: 1, warm: 0, cold: 0 });
+      if (command === 'jarvis_list_sessions') return Promise.resolve([]);
       throw new Error(`Unexpected command: ${command}`);
     });
     const user = userEvent.setup();
@@ -159,6 +161,7 @@ describe('Memory keyboard inspection', () => {
     expect(details).not.toHaveTextContent('private_note');
     expect(invokeMock.mock.calls.map(([command]) => command).sort()).toEqual([
       'jarvis_get_tier_stats',
+      'jarvis_list_sessions',
       'list_recent_memories',
     ]);
   });
@@ -187,6 +190,7 @@ describe('Memory keyboard inspection', () => {
 
     expect(invokeMock.mock.calls.map(([command]) => command).sort()).toEqual([
       'jarvis_get_tier_stats',
+      'jarvis_list_sessions',
       'list_recent_memories',
     ]);
   });

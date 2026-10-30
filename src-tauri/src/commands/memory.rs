@@ -769,6 +769,16 @@ pub async fn memory_scoped_restore(
     .await
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct MemoryInjectabilityRequest {
+    pub session_id: String,
+    /// Visible memory ids to evaluate; capped natively at 100.
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub include_user_scope: bool,
+}
+
 #[tauri::command]
 pub fn memory_scoped_recall_preview(
     db: State<AppDb>,
@@ -776,6 +786,25 @@ pub fn memory_scoped_recall_preview(
 ) -> Result<RecallPreview, MemoryError> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     execute_scoped_recall_preview(&conn, request, Utc::now())
+}
+
+/// Read-only: evaluate the recall admission predicate for the visible Overview
+/// rows against one exact Session scope. It never writes, never marks usage, and
+/// never becomes a second authority for what a turn recalls.
+#[tauri::command]
+pub fn memory_injectability(
+    db: State<AppDb>,
+    request: MemoryInjectabilityRequest,
+) -> Result<Vec<scoped::MemoryInjectability>, MemoryError> {
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let scope = scope::resolve_session_memory_scope(&conn, &request.session_id)?;
+    scoped::injectability_for_ids(
+        &conn,
+        &scope,
+        &request.ids,
+        request.include_user_scope,
+        Utc::now(),
+    )
 }
 
 /// Phase 4: deliberately reclassify one scoped record without rewriting its
