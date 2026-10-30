@@ -126,12 +126,12 @@ export function projectHealthSubsystems(status: JarvisStatus | null, stale = fal
   // is the one case where naming the model would read as blaming it.
   const modelDetail = localBackend && localServerRunning === false ? null : modelId;
   const ollamaRequirement = backend === 'llama_cpp' ? 'not_required' : requirements.ollama;
-  const gemmaRequirement: ServiceRequirement = backend === 'unknown' ? 'unknown' : backend === 'llama_cpp' ? 'required' : 'not_required';
+  const llamaCppRequirement: ServiceRequirement = backend === 'unknown' ? 'unknown' : backend === 'llama_cpp' ? 'required' : 'not_required';
   const rows: HealthSubsystemRow[] = [
     row('bun', 'process', flagState(status?.bun_server_running), requirements.bun, nonEmptyString(status?.bun_server_url)),
     row('bridge', 'process', flagState(status?.bridge_active), requirements.bridge, portDetail(status?.bridge_port)),
     row('ollama', 'process', flagState(status?.ollama_running), ollamaRequirement),
-    row('llama_cpp', 'process', flagState(status?.llama_cpp_running), gemmaRequirement, ':8080'),
+    row('llama_cpp', 'process', flagState(status?.llama_cpp_running), llamaCppRequirement, ':8080'),
     // A local model is only ever required by the Ollama backend, so it shares
     // that requirement rather than inventing a second opinion about it.
     row('model', 'model', modelState, localBackend ? 'required' : requirements.ollama, modelDetail),

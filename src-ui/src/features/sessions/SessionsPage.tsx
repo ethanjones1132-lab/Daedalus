@@ -15,7 +15,7 @@ import { useNavigation } from '../../shell/navigation';
 import { ChatPanel } from './ChatPanel';
 import { SessionIndex, type IndexTab } from './SessionIndex';
 import { FeedTranscript, useFeedReader } from './SessionFeeds';
-import { backendLabels } from './outcome';
+import { backendLabels } from '../../lib/backend-identity';
 
 const INDEX_COLLAPSED_KEY = 'jarvis-session-index-collapsed';
 

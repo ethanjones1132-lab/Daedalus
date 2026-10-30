@@ -65,12 +65,12 @@ describe('Health page verdict and gauges', () => {
     expect(await screen.findByText('All systems ready')).toBeInTheDocument();
     expect(screen.queryByText('Offline')).not.toBeInTheDocument();
 
-    const gemma = gauge('Gemma llama.cpp');
-    expect(within(gemma).getByText('Running')).toBeInTheDocument();
-    expect(within(gemma).getByText('Required by the active Inference backend')).toBeInTheDocument();
-    expect(within(gemma).getByText('http://127.0.0.1:8080')).toBeInTheDocument();
+    const llamaGauge = gauge('llama.cpp');
+    expect(within(llamaGauge).getByText('Running')).toBeInTheDocument();
+    expect(within(llamaGauge).getByText('Required by the active Inference backend')).toBeInTheDocument();
+    expect(within(llamaGauge).getByText('http://127.0.0.1:8080')).toBeInTheDocument();
     // The Bun server owns the llama.cpp process lifecycle: no restart command to call.
-    expect(screen.queryByRole('button', { name: 'Restart Gemma llama.cpp' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Restart llama.cpp' })).not.toBeInTheDocument();
 
     const ollama = gauge('Ollama');
     expect(within(ollama).getByText('Stopped')).toBeInTheDocument();
@@ -85,7 +85,7 @@ describe('Health page verdict and gauges', () => {
     });
     render(<HealthPage />);
     expect(await screen.findByText('Backend "llama_cpp" is unreachable')).toBeInTheDocument();
-    expect(within(gauge('Gemma llama.cpp')).getByText('Stopped')).toBeInTheDocument();
+    expect(within(gauge('llama.cpp')).getByText('Stopped')).toBeInTheDocument();
   });
 
   it('prints the requirement for every gauge and flags a paused supervisor on a stopped service', async () => {

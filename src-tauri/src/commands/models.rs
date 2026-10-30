@@ -138,6 +138,16 @@ fn apply_profile_to_config(config: &mut JarvisConfig, profile: &ModelProfile) {
     }
 
     match profile.provider.as_str() {
+        "llama_cpp" => {
+            config.active_backend = JarvisBackend::LlamaCpp;
+            config.llama_cpp.model = profile.model.clone();
+            // An empty `api_base` on a local profile means "keep the configured
+            // llama-server endpoint"; a custom one is projected like the other
+            // provider arms.
+            if !profile.api_base.is_empty() {
+                config.llama_cpp.base_url = profile.api_base.clone();
+            }
+        }
         "openrouter" => {
             config.active_backend = JarvisBackend::OpenRouter;
             config.openrouter.model = profile.model.clone();
@@ -666,5 +676,25 @@ mod tests {
         let config = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
         assert!(matches!(config.active_backend, JarvisBackend::Ollama));
         assert_eq!(config.ollama.model, "qwen3:8b");
+    }
+
+    #[test]
+    fn activating_llama_cpp_profile_never_produces_an_ollama_backend() {
+        // Regression: the profile arms had no llama.cpp case, so `_` coerced the
+        // local backend to Ollama and wrote the GGUF name into the Ollama model
+        // slot, destroying the engine identity the config had.
+        let db = mem_db();
+        let pid = insert_profile(&db, "local-gguf", "llama_cpp", "Qwen3.6-local.gguf");
+
+        let effective = set_active_profile_and_reconcile(&db, &pid).expect("activate");
+
+        assert_eq!(effective.provider, "llama_cpp");
+        assert_eq!(effective.model, "Qwen3.6-local.gguf");
+
+        let config = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
+        assert!(matches!(config.active_backend, JarvisBackend::LlamaCpp));
+        assert_eq!(config.llama_cpp.model, "Qwen3.6-local.gguf");
+        // An empty profile api_base means "keep the configured endpoint".
+        assert_eq!(config.llama_cpp.base_url, "http://127.0.0.1:8080/v1");
     }
 }

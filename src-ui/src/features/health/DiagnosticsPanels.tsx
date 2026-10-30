@@ -82,7 +82,7 @@ export function ResourceDetailPanel({ health }: { health: HealthData | null }) {
                 supervisor.bun_give_up && 'Bun server',
                 supervisor.proxy_give_up && 'Claude proxy',
                 supervisor.ollama_give_up && 'Ollama',
-                supervisor.llama_cpp_give_up && 'Gemma llama.cpp',
+                supervisor.llama_cpp_give_up && 'llama.cpp',
               ].filter(Boolean).join(', ') || 'auto-restart active for every service'
             : 'not reported by this build'],
           ['Observed', health.timestamp],

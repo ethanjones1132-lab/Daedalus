@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../../design';
+import { AGENT_RECORD_FIELD_BASIS } from '../../domain/agent-routing-scope';
 import AgentsPage from './AgentsPage';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -85,6 +86,7 @@ describe('Agent CRUD coordination', () => {
     renderView();
     await screen.findByRole('heading', { name: 'Atlas' });
     await openEditor();
+    expect(screen.getByText(AGENT_RECORD_FIELD_BASIS)).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText('Name *'), { target: { value: '  Created  ' } });
     fireEvent.change(screen.getByPlaceholderText('Model * (e.g. qwen2.5-coder:7b)'), { target: { value: '  created-model  ' } });
     fireEvent.change(screen.getByPlaceholderText('Description'), { target: { value: '  created description  ' } });

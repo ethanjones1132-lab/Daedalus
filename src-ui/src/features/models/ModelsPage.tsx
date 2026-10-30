@@ -18,6 +18,7 @@ import {
   type ModelProfileDraft,
 } from '../../domain/model-profile-creation-state';
 import { profileOperationLocked, reduceProfileOperation, type ProfileOperationPhase } from '../../domain/profile-operation-state';
+import type { JarvisConfig } from '../../domain/types';
 import { useNavigation } from '../../shell/navigation';
 import {
   DISCOVERY_COMMANDS,
@@ -26,6 +27,7 @@ import {
   type DiscoverySource,
 } from './discovery';
 import { DiscoveredModels } from './DiscoveredModels';
+import { projectRoutingIdentity } from './profile-routing';
 import { ProfileCreateDialog } from './ProfileCreateDialog';
 import { ActiveProfileHero, ProfileCard } from './ProfileViews';
 import type { DiscoveredModel, EffectiveRuntimeConfig, ModelProfile } from './types';
@@ -98,6 +100,8 @@ export default function ModelsPage() {
   const [discoverySucceeded, setDiscoverySucceeded] = useState(false);
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string | null>(null);
   const [openRouterCredential, setOpenRouterCredential] = useState<OpenRouterCredential>({ phase: 'loading' });
+  /** The configured route (`jarvis_get_config`) as last confirmed; never inferred from the profile row. */
+  const [routingConfig, setRoutingConfig] = useState<JarvisConfig | null>(null);
 
   // Read the Inference settings so OpenRouter discovery can pass its key. The key
   // is never rendered; it is held only long enough to reach the native command.
@@ -107,6 +111,7 @@ export default function ModelsPage() {
       try {
         const config = await invoke<unknown>('jarvis_get_config');
         if (cancelled) return;
+        setRoutingConfig(config && typeof config === 'object' ? (config as JarvisConfig) : null);
         const ollama = readConfigSection(config, 'ollama');
         const ollamaUrl = typeof ollama.base_url === 'string' ? ollama.base_url.trim() : '';
         setOllamaBaseUrl(ollamaUrl || null);
@@ -248,6 +253,15 @@ export default function ModelsPage() {
         if (kind === 'activate') {
           const effective = await invoke<EffectiveRuntimeConfig>('set_active_profile', { id: profile.id });
           success(`Activated ${profile.name} · ${effective.provider}/${effective.model}`);
+          // Activation projects the profile onto the canonical config. Re-read it
+          // so the hero's "Routing backend" describes what was just written; a
+          // failed read keeps the last confirmed route rather than inventing one.
+          try {
+            const config = await invoke<unknown>('jarvis_get_config');
+            if (config && typeof config === 'object') setRoutingConfig(config as JarvisConfig);
+          } catch {
+            /* keep the last confirmed routing identity */
+          }
         } else {
           const deleted = await invoke<boolean>('delete_profile', { id: profile.id });
           if (deleted !== true) throw new Error('Deletion not confirmed');
@@ -546,7 +560,13 @@ export default function ModelsPage() {
           />
         ) : (
           <>
-            <ActiveProfileHero profile={activeProfile} observed={observed} locked={mutationLocked} onDelete={remove} />
+            <ActiveProfileHero
+              profile={activeProfile}
+              observed={observed}
+              routing={projectRoutingIdentity(routingConfig, activeProfile)}
+              locked={mutationLocked}
+              onDelete={remove}
+            />
 
             {otherProfiles.length > 0 && (
               <section aria-label="Other profiles">

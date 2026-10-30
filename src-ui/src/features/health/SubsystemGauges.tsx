@@ -57,7 +57,7 @@ export function buildSubsystemRows(health: HealthData, activeBackend: unknown, b
   if (health.llama_cpp || backend === 'llama_cpp') {
     rows.push({
       key: 'llama_cpp',
-      name: 'Gemma llama.cpp',
+      name: 'llama.cpp',
       up: health.llama_cpp?.running === true,
       detail: health.llama_cpp?.url ?? ':8080',
       command: null,

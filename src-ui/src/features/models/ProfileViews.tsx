@@ -1,6 +1,7 @@
 import { Trash2, Zap } from 'lucide-react';
 import { Badge, Button, Chip, Panel, Skeleton, Stat, StatusDot, formatAge } from '../../design';
 import { backendInfo, backendLabel } from './backends';
+import type { RoutingIdentity } from './profile-routing';
 import type { ModelProfile } from './types';
 
 /** "34d ago" / "5h ago" — coarse on purpose; a profile's age needs no minutes. */
@@ -25,16 +26,45 @@ function BackendBadge({ provider }: { provider: string }) {
   );
 }
 
-/** The one hero panel of the page: the profile new Session turns use. */
+/**
+ * The configured route a turn actually uses, kept separate from the saved
+ * profile row. When the two disagree, both stay visible and the hero says so;
+ * nothing rewrites either store from the read.
+ */
+function RoutingBackend({ routing }: { routing: RoutingIdentity }) {
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 border-t border-line pt-3.5">
+      <span className="d-label">Routing backend</span>
+      {routing.observed ? (
+        <>
+          <Chip>{routing.backendLabel}</Chip>
+          {routing.modelLabel && <Chip>{routing.modelLabel}</Chip>}
+        </>
+      ) : (
+        <span className="text-[12px] text-ink-3">Not confirmed in this view.</span>
+      )}
+      {routing.disagrees && (
+        <p role="status" className="w-full text-[12px] leading-relaxed text-warn">
+          This saved profile does not match the configured routing backend. A turn uses the
+          configured backend; Activate writes this profile onto it.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The one hero panel of the page: the saved profile, and the configured route. */
 export function ActiveProfileHero({
   profile,
   observed,
+  routing,
   locked,
   onDelete,
 }: {
   profile: ModelProfile | null;
   /** Whether the profile list has ever been successfully observed. */
   observed: boolean;
+  routing: RoutingIdentity;
   locked: boolean;
   onDelete: (profile: ModelProfile) => void;
 }) {
@@ -58,12 +88,13 @@ export function ActiveProfileHero({
             <p className="mt-3 text-[12.5px] text-ink-3">Active profile not yet observed.</p>
           </>
         )}
+        <RoutingBackend routing={routing} />
       </Panel>
     );
   }
   return (
     <ul>
-      <Panel ticks as="li" className="d-rise">
+      <Panel ticks as="li" aria-label="Active profile" className="d-rise">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="d-label mb-2 flex items-center gap-2 text-accent">
@@ -71,6 +102,9 @@ export function ActiveProfileHero({
               Active profile
             </div>
             <h2 className="d-display text-[38px] leading-[1.05] text-ink">{profile.name}</h2>
+            <p className="mt-1 max-w-xl text-[12.5px] leading-relaxed text-ink-3">
+              Saved selection — a turn routes through the configured Inference backend shown below.
+            </p>
             <div className="mt-3 flex flex-wrap items-center gap-1.5">
               <BackendBadge provider={profile.provider} />
               <Chip>{profile.model}</Chip>
@@ -94,6 +128,7 @@ export function ActiveProfileHero({
             {profile.api_base}
           </p>
         )}
+        <RoutingBackend routing={routing} />
       </Panel>
     </ul>
   );

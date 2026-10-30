@@ -32,33 +32,6 @@ export function outcomeBadgeTone(outcome: string): Tone {
   }
 }
 
-/**
- * Human label of the configured Inference backend and its model. Defensive
- * against a partial or malformed config payload: the Session surface must
- * render even when `jarvis_get_config` returns something unexpected.
- */
-export function backendLabels(config: JarvisConfig | null): { backendLabel: string; modelLabel: string } {
-  const backend = config?.active_backend;
-  const backendLabel =
-    backend === 'openrouter'
-      ? 'OpenRouter'
-      : backend === 'llama_cpp'
-        ? 'llama.cpp'
-        : backend === 'claude_cli'
-          ? 'Claude CLI'
-          : 'Ollama';
-  if (!config) return { backendLabel, modelLabel: '' };
-  const modelLabel =
-    backend === 'ollama'
-      ? config.ollama?.model
-      : backend === 'llama_cpp'
-        ? config.llama_cpp?.model
-        : backend === 'claude_cli'
-          ? (config.claude_cli?.model ?? '')
-          : config.openrouter?.model;
-  return { backendLabel, modelLabel: typeof modelLabel === 'string' ? modelLabel : '' };
-}
-
 /** Disclose when a configured local backend does not constrain orchestration stages. */
 export function sessionRoutingNotice(config: JarvisConfig | null): string | null {
   if (!config) {

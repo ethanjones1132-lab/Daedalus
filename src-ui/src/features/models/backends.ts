@@ -12,7 +12,7 @@ export interface BackendInfo {
 }
 
 export const BACKENDS: BackendInfo[] = [
-  { id: 'llama_cpp', label: 'llama.cpp', description: 'Local Gemma through an owned llama-server process. The default.', local: true },
+  { id: 'llama_cpp', label: 'llama.cpp', description: 'Local GGUF models through an owned llama-server process. The default.', local: true },
   { id: 'ollama', label: 'Ollama', description: 'Local models served by an Ollama daemon.', local: true },
   { id: 'openrouter', label: 'OpenRouter', description: 'Cloud models, including a rotating free tier.', local: false },
   { id: 'claude_cli', label: 'Claude Code CLI', description: 'The local claude binary, through the proxy or your account.', local: true },

@@ -1,6 +1,7 @@
 import { X } from 'lucide-react';
 import { useRef, useState, type FormEvent } from 'react';
 import type { AgentOperationPhase } from '../../domain/agent-operation-state';
+import { AGENT_RECORD_FIELD_BASIS } from '../../domain/agent-routing-scope';
 import { AlertLine, Button, Dialog, Field, Input, StatusLine, Textarea } from '../../design';
 import type { AgentDraft } from './types';
 
@@ -101,7 +102,7 @@ export function AgentEditorDialog({
                 />
               )}
             </Field>
-            <Field label="Model" hint="The Inference backend model this Agent runs on.">
+            <Field label="Model" hint={AGENT_RECORD_FIELD_BASIS}>
               {(id) => (
                 <Input
                   id={id}

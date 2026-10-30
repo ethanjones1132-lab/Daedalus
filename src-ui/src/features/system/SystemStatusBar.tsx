@@ -84,7 +84,7 @@ function serviceAnnouncement(
   requirement: ServiceRequirement,
   backend: string,
 ): string {
-  const name = key === 'ollama' && backend === 'llama_cpp' ? 'Gemma llama.cpp server' : SERVICE_NAMES[key];
+  const name = key === 'ollama' && backend === 'llama_cpp' ? 'llama.cpp server' : SERVICE_NAMES[key];
   return `${name} ${STATE_WORDS[state]}${REQUIREMENT_WORDS[requirement]}.${stale ? ' This is a previously observed state.' : ''}`;
 }
 
@@ -251,7 +251,7 @@ export default function SystemStatusBar() {
           key={key}
           tone={serviceTone(key)}
           name={serviceAnnouncement(key, view.health.services[key], healthStale, view.health.requirements[key], view.health.backend)}
-          label={`${serviceLabel(key === 'ollama' && llama ? 'GEM' : CHIP_LABELS[key], view.health.services[key], healthStale, view.health.requirements[key])}${REQUIREMENT_MARKS[view.health.requirements[key]]}`}
+          label={`${serviceLabel(key === 'ollama' && llama ? 'LCP' : CHIP_LABELS[key], view.health.services[key], healthStale, view.health.requirements[key])}${REQUIREMENT_MARKS[view.health.requirements[key]]}`}
         />
       ))}
 
@@ -269,7 +269,7 @@ export default function SystemStatusBar() {
         <span className="inline-flex h-full shrink-0 items-center gap-1 px-2.5">
           {view.health.bunGiveUp && <Badge tone="error" size="xs">BUN GIVE-UP</Badge>}
           {view.health.proxyGiveUp && <Badge tone="error" size="xs">PRX GIVE-UP</Badge>}
-          {view.health.ollamaGiveUp && <Badge tone="error" size="xs">{llama ? 'GEM' : 'OLL'} GIVE-UP</Badge>}
+          {view.health.ollamaGiveUp && <Badge tone="error" size="xs">{llama ? 'LCP' : 'OLL'} GIVE-UP</Badge>}
         </span>
       )}
 

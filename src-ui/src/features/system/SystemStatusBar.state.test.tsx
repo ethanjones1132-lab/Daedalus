@@ -331,7 +331,7 @@ describe('SystemStatusBar self-contained backend and polling', () => {
     await settleInference(0);
     expect(invokeMock).toHaveBeenCalledWith('jarvis_get_config');
     expect(screen.getByText('SYS HEALTHY')).toBeInTheDocument();
-    expect(screen.getByText('GEM UP')).toHaveAccessibleName('Gemma llama.cpp server is up and required by the active inference backend.');
+    expect(screen.getByText('LCP UP')).toHaveAccessibleName('llama.cpp server is up and required by the active inference backend.');
     expect(screen.queryByText(/OLL/)).not.toBeInTheDocument();
   });
 

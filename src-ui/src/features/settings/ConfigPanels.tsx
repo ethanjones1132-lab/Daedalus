@@ -264,7 +264,7 @@ export function ConfigPanels({
                   mono
                   type="text"
                   value={draft.llama_cpp?.model ?? ''}
-                  placeholder="Gemma llama.cpp model alias"
+                  placeholder="llama.cpp model alias"
                   onChange={(e) => patch('llama_cpp', { model: e.target.value })}
                 />
               )}
@@ -288,7 +288,7 @@ export function ConfigPanels({
                   mono
                   type="text"
                   value={draft.llama_cpp?.model_path ?? ''}
-                  placeholder="/models/gemma-4-26B-A4B-it-IQ2_M.gguf"
+                  placeholder="/models/model.gguf"
                   onChange={(e) => patch('llama_cpp', { model_path: e.target.value })}
                 />
               )}
