@@ -1,3 +1,4 @@
+mod bun_startup_policy;
 pub mod commands;
 pub mod cron_scheduler;
 pub mod db;
@@ -5,7 +6,6 @@ pub mod jarvis;
 pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
-mod bun_startup_policy;
 pub mod supervisor;
 pub mod types;
 pub mod wsl;
@@ -138,10 +138,7 @@ fn note_python_discovery_probe() {
 /// Run one interpreter probe with a deadline. On timeout only the child created
 /// here is killed and reaped; callers never touch a process they do not own.
 /// Returning `false` lets discovery continue with the next candidate.
-fn probe_python_command(
-    command: &mut std::process::Command,
-    timeout: std::time::Duration,
-) -> bool {
+fn probe_python_command(command: &mut std::process::Command, timeout: std::time::Duration) -> bool {
     use std::time::Instant;
 
     let mut child = match command.spawn() {
@@ -360,16 +357,25 @@ pub(crate) async fn start_llama_cpp_server(
     let model_path = std::path::PathBuf::from(config.model_path.trim());
     let mtp_path = std::path::PathBuf::from(config.mtp_path.trim());
     if !server_path.is_file() {
-        return Err(format!("llama-server executable not found: {}", server_path.display()));
+        return Err(format!(
+            "llama-server executable not found: {}",
+            server_path.display()
+        ));
     }
     if !model_path.is_file() {
-        return Err(format!("llama.cpp model GGUF not found: {}", model_path.display()));
+        return Err(format!(
+            "llama.cpp model GGUF not found: {}",
+            model_path.display()
+        ));
     }
     let mtp_head_exists = mtp_path.is_file();
     if mtp_path.as_os_str().is_empty() {
         println!("[Daedalus] no separate MTP head configured; draft-mtp uses the model's embedded MTP layer");
     } else if !mtp_head_exists {
-        eprintln!("[Daedalus] MTP head not found at {}; starting without draft-mtp", mtp_path.display());
+        eprintln!(
+            "[Daedalus] MTP head not found at {}; starting without draft-mtp",
+            mtp_path.display()
+        );
     }
     let server_args = config.server_args(mtp_head_exists);
 
@@ -408,7 +414,10 @@ pub(crate) async fn start_llama_cpp_server(
             command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
             crate::wsl::hide_windows_console(&mut command);
             process_lifecycle::spawn_managed(&mut command).map_err(|error| {
-                format!("failed to spawn llama-server {}: {error}", server_path.display())
+                format!(
+                    "failed to spawn llama-server {}: {error}",
+                    server_path.display()
+                )
             })
         },
     )?;
@@ -487,7 +496,11 @@ fn forward_env_to_wsl(command: &mut std::process::Command, required: &[&str]) {
     let mut forwarded = Vec::new();
     for entry in staged.split(':').filter(|name| !name.is_empty()) {
         let base = entry.split('/').next().unwrap_or(entry);
-        let normalized = if required.contains(&base) { base } else { entry };
+        let normalized = if required.contains(&base) {
+            base
+        } else {
+            entry
+        };
         if !forwarded.iter().any(|existing| existing == normalized) {
             forwarded.push(normalized.to_owned());
         }
@@ -500,11 +513,7 @@ fn forward_env_to_wsl(command: &mut std::process::Command, required: &[&str]) {
     command.env("WSLENV", forwarded.join(":"));
 }
 
-fn configure_proxy_runtime(
-    command: &mut std::process::Command,
-    model: &str,
-    through_wsl: bool,
-) {
+fn configure_proxy_runtime(command: &mut std::process::Command, model: &str, through_wsl: bool) {
     const RUNTIME_ENV: [&str; 4] = [
         "JARVIS_CLAUDE_PROXY_PORT",
         "JARVIS_CLAUDE_PROXY_BIND",
@@ -524,8 +533,7 @@ fn configure_proxy_runtime(
 /// The port `claude_cli_proxy.py` binds. Shared with `supervisor.rs` so both
 /// sides agree on what "the proxy port" means.
 pub(crate) const CLAUDE_PROXY_PORT: u16 = 19878;
-static PROXY_USES_WSL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static PROXY_USES_WSL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn claude_proxy_is_listening() -> bool {
     local_port_is_listening(CLAUDE_PROXY_PORT)
@@ -546,7 +554,9 @@ fn parse_listening_pids(netstat_output: &str, port: u16) -> Vec<u32> {
         }
         let cols: Vec<&str> = line.split_whitespace().collect();
         // Expected shape: [Proto, LocalAddress, ForeignAddress, State, PID].
-        let Some(local_addr) = cols.get(1) else { continue };
+        let Some(local_addr) = cols.get(1) else {
+            continue;
+        };
         if !local_addr.ends_with(&local_suffix) {
             continue;
         }
@@ -561,7 +571,10 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
     if !cfg!(target_os = "windows") {
         return Vec::new();
     }
-    let Ok(output) = std::process::Command::new("netstat").args(["-ano"]).output() else {
+    let Ok(output) = std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+    else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -648,7 +661,9 @@ Active Connections
         // The TIME_WAIT row's Local Address is an ephemeral client port, not
         // :19878, and its state isn't LISTENING either -- verify neither
         // condition alone produces a false match.
-        assert!(!NETSTAT_FIXTURE.lines().any(|l| l.contains("53872") && l.contains("LISTENING")));
+        assert!(!NETSTAT_FIXTURE
+            .lines()
+            .any(|l| l.contains("53872") && l.contains("LISTENING")));
     }
 
     #[test]
@@ -658,7 +673,10 @@ Active Connections
 
     #[test]
     fn a_port_with_nothing_listening_yields_no_pids() {
-        assert_eq!(parse_listening_pids(NETSTAT_FIXTURE, 60000), Vec::<u32>::new());
+        assert_eq!(
+            parse_listening_pids(NETSTAT_FIXTURE, 60000),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
@@ -747,11 +765,7 @@ fn spawn_claude_cli_proxy_child(
     command
         .stdout(jarvis_server_log_stdio("claude-proxy.log"))
         .stderr(jarvis_server_log_stdio("claude-proxy.err.log"));
-    configure_proxy_credential(
-        &mut command,
-        &openrouter_api_key,
-        through_wsl,
-    );
+    configure_proxy_credential(&mut command, &openrouter_api_key, through_wsl);
     crate::wsl::hide_windows_console(&mut command);
     let child = match process_lifecycle::spawn_managed(&mut command) {
         Ok(c) => c,
@@ -1413,9 +1427,7 @@ where
 
     // Replace the tracked child once. Port listeners without an owned Child
     // handle are never terminated by startup recovery.
-    spawn_owned_child()
-        .await
-        .map_err(StartupFailure::Spawn)?;
+    spawn_owned_child().await.map_err(StartupFailure::Spawn)?;
     log::info!(target: "jarvis::startup", "Bun child spawn returned");
 
     // Wait (off the main thread) for the freshly spawned server to come up.
@@ -1477,11 +1489,9 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
                 let server_entry = find_jarvis_server()
                     .ok_or_else(|| "server-jarvis index.ts not found".to_string())?;
                 log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
-                spawn_blocking_on_current_runtime(move || {
-                    start_jarvis_server(&server_entry, true)
-                })
-                .await
-                .map_err(|e| format!("Task join error: {}", e))??;
+                spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
+                    .await
+                    .map_err(|e| format!("Task join error: {}", e))??;
                 *spawn_clock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
@@ -1783,8 +1793,7 @@ pub fn run() {
     };
 
     let home = crate::get_home_dir();
-    let app_data_dir =
-        std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop");
+    let app_data_dir = std::path::PathBuf::from(&home).join(".local/share/com.jarvis.desktop");
 
     // Both initialization paths go through `AppDb::new`, which retains the
     // app-data root handle and binds the opened `jarvis.db` to that same
@@ -1961,12 +1970,12 @@ pub fn run() {
             get_agent,
             add_agent,
             delete_agent,
-             set_agent_identity,
-             set_agent_enabled,
-             list_agent_projections,
-             activate_agent_projection,
-             deactivate_agent_projection,
-             bind_agent_channel,
+            set_agent_identity,
+            set_agent_enabled,
+            list_agent_projections,
+            activate_agent_projection,
+            deactivate_agent_projection,
+            bind_agent_channel,
             unbind_agent_channel,
             list_agent_channel_bindings,
             get_gateway_status,
@@ -2302,7 +2311,10 @@ mod startup_thread_tests {
     fn release_resource_staging_replaces_newer_stale_proxy() {
         let root = test_dir("release-resource-staging");
         let source = root.join("source").join("claude_cli_proxy.py");
-        let destination = root.join("release").join("resources").join("claude_cli_proxy.py");
+        let destination = root
+            .join("release")
+            .join("resources")
+            .join("claude_cli_proxy.py");
         std::fs::create_dir_all(source.parent().expect("source parent"))
             .expect("create source directory");
         std::fs::write(&source, b"current proxy\n").expect("write source proxy");
@@ -2348,9 +2360,8 @@ mod startup_thread_tests {
         let build = include_str!("../../scripts/build-and-deploy.ps1");
         assert!(build.contains("$proxyScript = Join-Path $repo 'scripts\\claude_cli_proxy.py'"));
         assert!(build.contains("Deploy-File $proxyScript 'resources\\claude_cli_proxy.py'"));
-        assert!(build.contains(
-            "Deploy-File $proxyModelsJson 'resources\\opencode_go_openai_models.json'"
-        ));
+        assert!(build
+            .contains("Deploy-File $proxyModelsJson 'resources\\opencode_go_openai_models.json'"));
         assert!(build.contains("claude_proxy_sha256 ="));
         assert!(build.contains("opencode_go_models_sha256 ="));
 
@@ -2361,13 +2372,13 @@ mod startup_thread_tests {
 
         let build_helper = include_str!("../build.rs").replace("\r\n", "\n");
         assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py"));
-        assert!(build_helper.contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
+        assert!(build_helper
+            .contains("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json"));
         assert!(build_helper.contains(
             "let proxy_dest = release_dir.join(\"resources\").join(\"claude_cli_proxy.py\")"
         ));
-        assert!(build_helper.contains(
-            "release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"
-        ));
+        assert!(build_helper
+            .contains("release_resource_staging::copy_if_different(&proxy_src, &proxy_dest)"));
         assert!(build_helper.contains(
             "let proxy_models_dest = release_dir\n        .join(\"resources\")\n        .join(\"opencode_go_openai_models.json\");"
         ));
@@ -2596,7 +2607,13 @@ mod bun_startup_tests {
         assert_eq!(
             effects.snapshot(),
             vec![
-                "listen", "probe", "delay:750", "probe", "spawn", "probe", "healthy"
+                "listen",
+                "probe",
+                "delay:750",
+                "probe",
+                "spawn",
+                "probe",
+                "healthy"
             ]
         );
     }

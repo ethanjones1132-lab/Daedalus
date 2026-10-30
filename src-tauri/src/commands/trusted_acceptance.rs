@@ -405,11 +405,9 @@ fn receipt_matches_expected(
         return false;
     }
     for expected in criteria {
-        let Some(row) = receipt
-            .criteria
-            .iter()
-            .find(|r| r.criterion_id == expected.criterion_id && r.check_index == expected.check_index)
-        else {
+        let Some(row) = receipt.criteria.iter().find(|r| {
+            r.criterion_id == expected.criterion_id && r.check_index == expected.check_index
+        }) else {
             return false;
         };
         if row.tool != expected.tool
@@ -524,12 +522,12 @@ fn validate_persisted_accepted(
 
     for check in checks {
         let key = (check.criterion_id.clone(), check.index as i64);
-        let row = rows
-            .get(&key)
-            .ok_or_else(|| "persisted acceptance criteria are missing a required check".to_string())?;
-        let entry = entries
-            .get(&key)
-            .ok_or_else(|| "persisted acceptance evidence is missing a required check".to_string())?;
+        let row = rows.get(&key).ok_or_else(|| {
+            "persisted acceptance criteria are missing a required check".to_string()
+        })?;
+        let entry = entries.get(&key).ok_or_else(|| {
+            "persisted acceptance evidence is missing a required check".to_string()
+        })?;
         if row.tool != check.tool
             || row.expected_sha256 != check.expect_sha256
             || !row.accepted
@@ -558,7 +556,9 @@ fn validate_persisted_accepted(
             || row_entry.output_bytes != entry.output_bytes
             || row_entry.matched != entry.matched
         {
-            return Err("persisted criterion evidence does not match the acceptance evidence".to_string());
+            return Err(
+                "persisted criterion evidence does not match the acceptance evidence".to_string(),
+            );
         }
     }
 
@@ -809,9 +809,7 @@ fn validate_execution(
         || runtime_started.trim().is_empty()
         || runtime_finished.trim().is_empty()
     {
-        return Err(
-            "execution receipt is missing runtime run identity or bounds".to_string()
-        );
+        return Err("execution receipt is missing runtime run identity or bounds".to_string());
     }
 
     let content = parse_content(&manifest)?;
@@ -841,7 +839,10 @@ fn validate_execution(
         if item.get("status").and_then(|v| v.as_str()) != Some("ok") {
             return Err("execution evidence contains a non-successful call".to_string());
         }
-        let output_sha = item.get("output_sha256").and_then(|v| v.as_str()).unwrap_or("");
+        let output_sha = item
+            .get("output_sha256")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !is_sha256_hex(output_sha) {
             return Err(format!(
                 "execution evidence at position {index} is missing a valid output hash"
@@ -880,7 +881,10 @@ fn content_acceptance_keys(manifest: &ManifestScope) -> Result<Vec<String>, Stri
 }
 
 fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Record a non-terminal delivery/reconciliation reason on an already-`accepted`
@@ -1083,9 +1087,8 @@ fn run_acceptance(
 
                 if !echo_ok {
                     status = STATUS_AMBIGUOUS;
-                    reason = Some(
-                        "acceptance response did not echo the requested identity".to_string(),
-                    );
+                    reason =
+                        Some("acceptance response did not echo the requested identity".to_string());
                 } else {
                     let mut seen: std::collections::BTreeSet<(String, usize)> =
                         std::collections::BTreeSet::new();
@@ -1150,11 +1153,9 @@ fn run_acceptance(
                         bun_instance_id = Some(resp.bun_instance_id.clone());
                         runtime_started = Some(resp.started_at.clone());
                         runtime_finished = Some(resp.finished_at.clone());
-                        evidence = Some(
-                            serde_json::to_value(&resp.calls).map_err(|e| {
-                                format!("failed to serialize acceptance evidence: {e}")
-                            })?,
-                        );
+                        evidence = Some(serde_json::to_value(&resp.calls).map_err(|e| {
+                            format!("failed to serialize acceptance evidence: {e}")
+                        })?);
                     }
                 }
             }

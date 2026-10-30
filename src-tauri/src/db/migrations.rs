@@ -1266,8 +1266,18 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
             "last_action_source_message_id",
             "last_action_source_message_id TEXT",
         )?;
-        add_column_if_missing(conn, "session_continuity", "last_action_created_at", "last_action_created_at TEXT")?;
-        add_column_if_missing(conn, "session_continuity", "last_action_rowid", "last_action_rowid INTEGER")?;
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "last_action_created_at",
+            "last_action_created_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "last_action_rowid",
+            "last_action_rowid INTEGER",
+        )?;
         // A manual operator set is a monotonic HIGHWATER boundary: every source
         // already recorded when the operator acted (including one numerically
         // equal to the chosen source) is protected from later automatic
@@ -1275,8 +1285,18 @@ pub fn apply_memory_capture_migrations(conn: &Connection) -> Result<(), rusqlite
         // highest-order message present at the manual call. Automatic
         // directives at or below this boundary are stale; only a source saved
         // strictly after the boundary may change the objective.
-        add_column_if_missing(conn, "session_continuity", "manual_boundary_created_at", "manual_boundary_created_at TEXT")?;
-        add_column_if_missing(conn, "session_continuity", "manual_boundary_rowid", "manual_boundary_rowid INTEGER")?;
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "manual_boundary_created_at",
+            "manual_boundary_created_at TEXT",
+        )?;
+        add_column_if_missing(
+            conn,
+            "session_continuity",
+            "manual_boundary_rowid",
+            "manual_boundary_rowid INTEGER",
+        )?;
 
         // Additive Part 3.2 outbox. Committed Part 3.1 already created
         // `memory_derived_invalidations` WITH a `REFERENCES sessions ON DELETE
@@ -1955,7 +1975,10 @@ mod tests {
             "last_validated_at",
             "deactivated_at",
         ] {
-            assert!(table_has_column(&conn, "agent_projections", column).unwrap(), "{column}");
+            assert!(
+                table_has_column(&conn, "agent_projections", column).unwrap(),
+                "{column}"
+            );
         }
         let index_count: i64 = conn
             .query_row(
@@ -1978,10 +2001,16 @@ mod tests {
     #[test]
     fn add_column_rejects_a_definition_without_the_column_name() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);").unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
 
         let error = add_column_if_missing(&conn, "t", "note", "TEXT").unwrap_err();
-        assert!(error.to_string().contains("must start with the column name"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("must start with the column name"),
+            "{error}"
+        );
         assert!(!table_has_column(&conn, "t", "TEXT").unwrap());
 
         add_column_if_missing(&conn, "t", "note", "note TEXT").unwrap();
@@ -1999,10 +2028,18 @@ mod tests {
             "manual_boundary_created_at",
             "manual_boundary_rowid",
         ] {
-            assert!(table_has_column(&conn, "session_continuity", column).unwrap(), "{column}");
+            assert!(
+                table_has_column(&conn, "session_continuity", column).unwrap(),
+                "{column}"
+            );
         }
         assert!(!table_has_column(&conn, "session_continuity", "TEXT").unwrap());
-        assert!(table_has_column(&conn, "memory_derived_invalidations", "source_message_ids_json").unwrap());
+        assert!(table_has_column(
+            &conn,
+            "memory_derived_invalidations",
+            "source_message_ids_json"
+        )
+        .unwrap());
     }
 
     #[test]

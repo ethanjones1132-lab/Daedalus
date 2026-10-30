@@ -22,8 +22,8 @@ use uuid::Uuid;
 use super::capture_contracts::{MemoryDerivedInvalidation, NativeDerivedMutationPlan};
 use super::contracts::MemoryError;
 use super::turn::{
-    self, mark_memory_turn_registered, mark_memory_turn_registration_failed,
-    MemoryRecallStatus, MemoryTurnDiagnostic, MemoryTurnIdentityRequest, MemoryTurnPreparation,
+    self, mark_memory_turn_registered, mark_memory_turn_registration_failed, MemoryRecallStatus,
+    MemoryTurnDiagnostic, MemoryTurnIdentityRequest, MemoryTurnPreparation,
     NativeMemoryRuntimeReceipt, PrepareMemoryTurnOutcome, PrepareMemoryTurnRequest,
     PreparedMemoryTurn,
 };
@@ -325,7 +325,10 @@ impl NativeMemoryTransport {
         state: &mut TransportState,
         envelope: &PreparedMemoryTurn,
     ) -> Result<RegistrationResult, HttpFailure> {
-        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        if !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        ) {
             return Err(HttpFailure::Unavailable);
         }
         let generation = crate::process_lifecycle::bun_generation();
@@ -337,7 +340,10 @@ impl NativeMemoryTransport {
         }
         // Reject a response whose owned child was replaced while in flight.
         if crate::process_lifecycle::bun_generation() != generation
-            || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+            || !matches!(
+                crate::process_lifecycle::bun_ownership(),
+                BunOwnership::Live
+            )
         {
             return Err(HttpFailure::Unavailable);
         }
@@ -425,7 +431,10 @@ impl NativeMemoryTransport {
         state: &mut TransportState,
         binding: &GoalRunBindingWire,
     ) -> Result<Option<GoalBindingResult>, HttpFailure> {
-        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        if !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        ) {
             return Ok(None);
         }
         let generation = crate::process_lifecycle::bun_generation();
@@ -436,7 +445,10 @@ impl NativeMemoryTransport {
             return Err(HttpFailure::Unavailable);
         }
         if crate::process_lifecycle::bun_generation() != generation
-            || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+            || !matches!(
+                crate::process_lifecycle::bun_ownership(),
+                BunOwnership::Live
+            )
         {
             return Err(HttpFailure::Unavailable);
         }
@@ -454,7 +466,10 @@ impl NativeMemoryTransport {
         &self,
         binding_id: &str,
     ) -> Result<Option<crate::commands::goals::GoalRunReceipt>, HttpFailure> {
-        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        if !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        ) {
             return Ok(None);
         }
         let path = format!("/internal/goals/run-bindings/{}/receipt", binding_id);
@@ -477,7 +492,10 @@ impl NativeMemoryTransport {
         binding_id: &str,
         task_run_id: &str,
     ) -> Result<Option<GoalCheckpointWire>, HttpFailure> {
-        if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+        if !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        ) {
             return Ok(None);
         }
         let path = format!(
@@ -541,13 +559,15 @@ pub fn execute_trusted_manifest(
     // minutes-long) HTTP request: that mutex also gates other native transport
     // operations. Capture the generation before the request, revalidate it after,
     // and only then briefly update the bound metadata.
-    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
         return Ok(None);
     }
     let generation = crate::process_lifecycle::bun_generation();
     let timeout = std::time::Duration::from_millis(
-        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS
-            + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
+        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
     );
     let body = transport
         .post_json_with_timeout("/internal/trusted/execute", request, 200, timeout)
@@ -559,7 +579,10 @@ pub fn execute_trusted_manifest(
         return Err("trusted execution response identity mismatch".to_string());
     }
     if crate::process_lifecycle::bun_generation() != generation
-        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
     {
         return Err("owned Bun child was replaced during trusted execution".to_string());
     }
@@ -580,13 +603,15 @@ pub fn execute_trusted_acceptance(
     transport: &NativeMemoryTransport,
     request: &crate::commands::trusted_acceptance::TrustedAcceptanceRequestWire,
 ) -> Result<Option<crate::commands::trusted_acceptance::TrustedAcceptanceResponseWire>, String> {
-    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
         return Ok(None);
     }
     let generation = crate::process_lifecycle::bun_generation();
     let timeout = std::time::Duration::from_millis(
-        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS
-            + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
+        crate::commands::trusted_execution::WHOLE_RUN_TIMEOUT_MS + TRUSTED_EXECUTION_HTTP_MARGIN_MS,
     );
     let body = transport
         .post_json_with_timeout("/internal/trusted/acceptance", request, 200, timeout)
@@ -598,7 +623,10 @@ pub fn execute_trusted_acceptance(
         return Err("trusted acceptance response identity mismatch".to_string());
     }
     if crate::process_lifecycle::bun_generation() != generation
-        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
     {
         return Err("owned Bun child was replaced during trusted acceptance".to_string());
     }
@@ -627,7 +655,10 @@ pub fn execute_learning_research(
     transport: &NativeMemoryTransport,
     request: &crate::jarvis::learning::LearningResearchRequest,
 ) -> Result<Option<crate::jarvis::learning::LearningResearchResponse>, String> {
-    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
         return Ok(None);
     }
     let generation = crate::process_lifecycle::bun_generation();
@@ -639,14 +670,16 @@ pub fn execute_learning_research(
             std::time::Duration::from_millis(LEARNING_RESEARCH_TIMEOUT_MS),
         )
         .map_err(|_| "learning research transport unavailable".to_string())?;
-    let parsed: crate::jarvis::learning::LearningResearchResponse =
-        serde_json::from_str(&body)
-            .map_err(|_| "learning research response could not be read".to_string())?;
+    let parsed: crate::jarvis::learning::LearningResearchResponse = serde_json::from_str(&body)
+        .map_err(|_| "learning research response could not be read".to_string())?;
     if parsed.request_id != request.request_id {
         return Err("learning research response identity mismatch".to_string());
     }
     if crate::process_lifecycle::bun_generation() != generation
-        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
     {
         return Err("owned Bun child was replaced during learning research".to_string());
     }
@@ -700,7 +733,10 @@ pub fn cancel_trusted_execution(
         #[serde(default)]
         bun_instance_id: String,
     }
-    if !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live) {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
         return TrustedCancelAcknowledgement::ambiguous("owned Bun runtime is not live");
     }
     // Require an already-bound live Bun instance BEFORE dispatching: without one
@@ -708,9 +744,7 @@ pub fn cancel_trusted_execution(
     // request rather than accepting an arbitrary response instance.
     let bound_instance = transport.lock_state().bound_bun_instance_id.clone();
     let Some(bound) = bound_instance.as_deref().filter(|v| !v.trim().is_empty()) else {
-        return TrustedCancelAcknowledgement::ambiguous(
-            "no live Bun instance is currently bound",
-        );
+        return TrustedCancelAcknowledgement::ambiguous("no live Bun instance is currently bound");
     };
     let bound = bound.to_string();
     let generation = crate::process_lifecycle::bun_generation();
@@ -748,7 +782,10 @@ pub fn cancel_trusted_execution(
         );
     }
     if crate::process_lifecycle::bun_generation() != generation
-        || !matches!(crate::process_lifecycle::bun_ownership(), BunOwnership::Live)
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
     {
         return TrustedCancelAcknowledgement::ambiguous(
             "owned Bun child was replaced during trusted cancel",
@@ -781,8 +818,7 @@ pub fn prepare_memory_turn(
     // (live owned child that cannot ACK durable cleanup) fails closed with a
     // typed unavailable error rather than serving stale derived context.
     let mut state = transport.lock_state();
-    drain_pending_locked(db, transport, &mut state, now)
-        .map_err(|_| map_invalidation_error())?;
+    drain_pending_locked(db, transport, &mut state, now).map_err(|_| map_invalidation_error())?;
 
     let preparation_id = Uuid::new_v4().to_string();
     let outcome = {
@@ -1130,7 +1166,9 @@ pub fn invalidate_unconsumed_memory_turns(
     transport
         .invalidate_registry(&mut state, reason, None)
         .map_err(|_| {
-            MemoryError::invalidation_unavailable("Memory registry did not acknowledge invalidation")
+            MemoryError::invalidation_unavailable(
+                "Memory registry did not acknowledge invalidation",
+            )
         })?;
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     turn::mark_pending_turns_invalidated(&conn, now)?;
@@ -1285,7 +1323,11 @@ where
 /// `global` audit namespace; production callers that reach the outbox always
 /// carry a real consumer Session.
 fn wire_operation_id(session_id: &str, operation_id: &str) -> String {
-    let namespace = if session_id.is_empty() { "global" } else { session_id };
+    let namespace = if session_id.is_empty() {
+        "global"
+    } else {
+        session_id
+    };
     format!("session/{}/operation/{}", namespace, operation_id)
 }
 
@@ -1536,7 +1578,11 @@ pub fn memory_context_revisions(
     let store_revision = scoped::memory_store_revision(&conn)?;
     let continuity_revision = continuity::read_session_continuity(&conn, session_id)?.revision;
     let session_binding_revision = continuity::session_binding_revision(&conn, session_id)?;
-    Ok((store_revision, continuity_revision, session_binding_revision))
+    Ok((
+        store_revision,
+        continuity_revision,
+        session_binding_revision,
+    ))
 }
 
 /// Build the capability/instance environment for an owned spawn. Never logs

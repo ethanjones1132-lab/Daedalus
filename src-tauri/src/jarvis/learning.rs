@@ -511,7 +511,9 @@ impl LearningResearchReceipt {
             }
         }
         if !is_sha256_digest(&self.tool_sequence_digest) {
-            return Err("research receipt tool-sequence digest is not a strict SHA-256 digest".to_string());
+            return Err(
+                "research receipt tool-sequence digest is not a strict SHA-256 digest".to_string(),
+            );
         }
 
         let started = chrono::DateTime::parse_from_rfc3339(self.started_at.trim())
@@ -528,9 +530,7 @@ impl LearningResearchReceipt {
                     return Err("a complete research receipt has no findings".to_string());
                 }
                 if !self.rejected_sources.is_empty() {
-                    return Err(
-                        "a complete research receipt carries rejected sources".to_string()
-                    );
+                    return Err("a complete research receipt carries rejected sources".to_string());
                 }
             }
             LearningOutcome::Partial => {
@@ -539,7 +539,13 @@ impl LearningResearchReceipt {
                 }
             }
             LearningOutcome::Blocked => {
-                if self.reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                if self
+                    .reason
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     return Err("a blocked research receipt has no policy reason".to_string());
                 }
             }
@@ -749,15 +755,17 @@ mod receipt_io {
             if error.kind() == std::io::ErrorKind::NotFound {
                 return ChildOpen::Missing;
             }
-            return ChildOpen::Refused(format!("research history directory is unavailable: {error}"));
+            return ChildOpen::Refused(format!(
+                "research history directory is unavailable: {error}"
+            ));
         }
         let dir = unsafe { File::from_raw_fd(fd) };
         match dir.metadata() {
             Ok(meta) if meta.file_type().is_dir() => ChildOpen::Opened(ReceiptDir { dir }),
             Ok(_) => ChildOpen::Refused("research history path is not a directory".to_string()),
-            Err(error) => {
-                ChildOpen::Refused(format!("research history directory is unavailable: {error}"))
-            }
+            Err(error) => ChildOpen::Refused(format!(
+                "research history directory is unavailable: {error}"
+            )),
         }
     }
 
@@ -814,7 +822,9 @@ mod receipt_io {
             if made < 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(format!("research history directory is unavailable: {error}"));
+                    return Err(format!(
+                        "research history directory is unavailable: {error}"
+                    ));
                 }
             }
 

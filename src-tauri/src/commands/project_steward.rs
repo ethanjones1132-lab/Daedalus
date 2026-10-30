@@ -178,7 +178,9 @@ fn load_verified_scope(
         run_outcome.as_str(),
         "success" | "partial" | "failed" | "timed_out" | "cancelled"
     ) {
-        return Err(format!("session run has a non-terminal outcome: {run_outcome}"));
+        return Err(format!(
+            "session run has a non-terminal outcome: {run_outcome}"
+        ));
     }
     // A terminal run must carry a concrete, parseable finish time. A missing,
     // empty, or malformed timestamp fails closed rather than being treated as a
@@ -244,8 +246,9 @@ fn load_verified_scope(
     if binding_task_run_id.is_empty() {
         return Err("native Goal-run binding has no task run identity".to_string());
     }
-    let binding_bun_instance_id = binding_bun_instance_id
-        .ok_or_else(|| "native Goal-run binding was not confirmed against a Bun instance".to_string())?;
+    let binding_bun_instance_id = binding_bun_instance_id.ok_or_else(|| {
+        "native Goal-run binding was not confirmed against a Bun instance".to_string()
+    })?;
     if binding_bun_instance_id.trim().is_empty() {
         return Err("native Goal-run binding has an empty Bun instance identity".to_string());
     }
@@ -678,7 +681,13 @@ fn run_reads(
     )?;
     let staged = run_git(
         root,
-        &["diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv"],
+        &[
+            "diff",
+            "--cached",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
         deadline,
         staged_budget,
     )?;
@@ -816,13 +825,19 @@ fn capture_snapshot(
         ));
     }
 
-    let head = String::from_utf8_lossy(&reads.head.stdout).trim().to_string();
+    let head = String::from_utf8_lossy(&reads.head.stdout)
+        .trim()
+        .to_string();
 
     let mut details: Vec<String> = Vec::new();
     let mut partial = false;
 
     let branch = if reads.branch.success {
-        Some(String::from_utf8_lossy(&reads.branch.stdout).trim().to_string())
+        Some(
+            String::from_utf8_lossy(&reads.branch.stdout)
+                .trim()
+                .to_string(),
+        )
     } else {
         partial = true;
         details.push("Git branch could not be read".to_string());

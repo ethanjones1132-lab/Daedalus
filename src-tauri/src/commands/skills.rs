@@ -631,10 +631,7 @@ fn distilled_candidate_id(metadata: Option<&str>) -> Option<String> {
     if value.get("source")?.as_str()? != "trajectory_distillation" {
         return None;
     }
-    value
-        .get("candidate_id")?
-        .as_str()
-        .map(ToOwned::to_owned)
+    value.get("candidate_id")?.as_str().map(ToOwned::to_owned)
 }
 
 fn is_distilled_metadata(metadata: Option<&str>) -> bool {
@@ -647,7 +644,10 @@ fn is_distilled_metadata(metadata: Option<&str>) -> bool {
     value.get("source").and_then(|v| v.as_str()) == Some("trajectory_distillation")
 }
 
-fn sync_distilled_skill_candidates_from_dir(db: &AppDb, dir: &std::path::Path) -> Result<usize, String> {
+fn sync_distilled_skill_candidates_from_dir(
+    db: &AppDb,
+    dir: &std::path::Path,
+) -> Result<usize, String> {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
@@ -693,7 +693,8 @@ fn sync_distilled_skill_candidates_from_dir(db: &AppDb, dir: &std::path::Path) -
                 ))
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
     };
     let mut by_candidate: HashMap<String, String> = HashMap::new();
     let mut by_name: HashMap<String, (String, Option<String>)> = HashMap::new();
@@ -712,12 +713,18 @@ fn sync_distilled_skill_candidates_from_dir(db: &AppDb, dir: &std::path::Path) -
         if let Some((name_id, name_metadata)) = &existing_name {
             let same_candidate = existing_id.as_deref() == Some(name_id.as_str());
             if !same_candidate && !is_distilled_metadata(name_metadata.as_deref()) {
-                return Err(format!("Candidate name conflicts with existing skill: {}", file.name));
+                return Err(format!(
+                    "Candidate name conflicts with existing skill: {}",
+                    file.name
+                ));
             }
         }
         if let (Some(candidate_id), Some((name_id, _))) = (&existing_id, &existing_name) {
             if candidate_id != name_id {
-                return Err(format!("Candidate name conflicts with another distilled skill: {}", file.name));
+                return Err(format!(
+                    "Candidate name conflicts with another distilled skill: {}",
+                    file.name
+                ));
             }
         }
 
@@ -800,7 +807,8 @@ mod tests {
     }
 
     fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!("jarvis-skills-sync-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("jarvis-skills-sync-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -846,7 +854,13 @@ mod tests {
     #[test]
     fn sync_removes_only_stale_distilled_rows() {
         let db = mem_db();
-        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        insert_skill(
+            &db,
+            "stale",
+            "stale-skill",
+            "trajectory_distillation",
+            Some("stale"),
+        );
         insert_skill(&db, "bundled", "bundled-skill", "bundled", None);
         let dir = temp_dir();
         fs::write(
@@ -855,7 +869,10 @@ mod tests {
         )
         .expect("write current candidate");
 
-        assert_eq!(sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(), 1);
+        assert_eq!(
+            sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(),
+            1
+        );
         assert!(skill_exists(&db, "current"));
         assert!(!skill_exists(&db, "stale"));
         assert!(skill_exists(&db, "bundled"));
@@ -865,21 +882,39 @@ mod tests {
     #[test]
     fn missing_directory_preserves_existing_distilled_rows() {
         let db = mem_db();
-        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        insert_skill(
+            &db,
+            "stale",
+            "stale-skill",
+            "trajectory_distillation",
+            Some("stale"),
+        );
         let dir = temp_dir();
         fs::remove_dir_all(&dir).expect("remove temp dir");
 
-        assert_eq!(sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(), 0);
+        assert_eq!(
+            sync_distilled_skill_candidates_from_dir(&db, &dir).unwrap(),
+            0
+        );
         assert!(skill_exists(&db, "stale"));
     }
 
     #[test]
     fn malformed_directory_does_not_partially_reconcile_rows() {
         let db = mem_db();
-        insert_skill(&db, "stale", "stale-skill", "trajectory_distillation", Some("stale"));
+        insert_skill(
+            &db,
+            "stale",
+            "stale-skill",
+            "trajectory_distillation",
+            Some("stale"),
+        );
         let dir = temp_dir();
-        fs::write(dir.join("valid.json"), candidate_json("valid", "valid-skill", "candidate"))
-            .expect("write valid candidate");
+        fs::write(
+            dir.join("valid.json"),
+            candidate_json("valid", "valid-skill", "candidate"),
+        )
+        .expect("write valid candidate");
         fs::write(dir.join("broken.json"), "{").expect("write broken candidate");
 
         assert!(sync_distilled_skill_candidates_from_dir(&db, &dir).is_err());

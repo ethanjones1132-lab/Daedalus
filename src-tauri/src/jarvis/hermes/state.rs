@@ -231,8 +231,14 @@ mod tests {
         });
         let deferred = DeferredInterpreter::new(resolver);
 
-        assert_eq!(deferred.resolve().expect("first lookup").program, PathBuf::from("py"));
-        assert_eq!(deferred.resolve().expect("second lookup").program, PathBuf::from("py"));
+        assert_eq!(
+            deferred.resolve().expect("first lookup").program,
+            PathBuf::from("py")
+        );
+        assert_eq!(
+            deferred.resolve().expect("second lookup").program,
+            PathBuf::from("py")
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,

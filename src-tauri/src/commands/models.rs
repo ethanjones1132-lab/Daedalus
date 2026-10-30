@@ -741,8 +741,15 @@ mod tests {
             .conn
             .lock()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM model_profiles WHERE is_active = 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM model_profiles WHERE is_active = 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(active, 0, "no profile is marked active on a rejected activation");
+        assert_eq!(
+            active, 0,
+            "no profile is marked active on a rejected activation"
+        );
     }
 }

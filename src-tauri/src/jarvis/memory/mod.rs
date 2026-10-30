@@ -1,7 +1,7 @@
 pub mod capture;
 pub mod capture_contracts;
-pub mod contracts;
 pub mod continuity;
+pub mod contracts;
 pub mod engine;
 pub mod frontmatter;
 pub mod paths;

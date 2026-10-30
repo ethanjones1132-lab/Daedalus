@@ -15,9 +15,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 
 use super::contracts::{
-    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope,
-    MemoryScopeKind, MemoryStatementKind, MutationResult, RecallOptions, RecallPreview,
-    ScopedMemoryEntry, ScopedMemoryRecall,
+    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MemoryScopeKind,
+    MemoryStatementKind, MutationResult, RecallOptions, RecallPreview, ScopedMemoryEntry,
+    ScopedMemoryRecall,
 };
 use super::engine;
 
@@ -34,7 +34,10 @@ pub(crate) fn with_memory_savepoint<T>(
     conn: &Connection,
     operation: impl FnOnce(&Connection) -> Result<T, MemoryError>,
 ) -> Result<T, MemoryError> {
-    let name = format!("memory_sp_{}", SAVEPOINT_SEQ.fetch_add(1, Ordering::Relaxed));
+    let name = format!(
+        "memory_sp_{}",
+        SAVEPOINT_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     conn.execute_batch(&format!("SAVEPOINT {}", name))
         .map_err(MemoryError::from)?;
     match operation(conn) {
@@ -221,9 +224,8 @@ fn validate_provenance_for_write(
                 )
                 .optional()
                 .map_err(MemoryError::from)?;
-            let owner = owner.ok_or_else(|| {
-                MemoryError::invalid_provenance("source Session does not exist")
-            })?;
+            let owner = owner
+                .ok_or_else(|| MemoryError::invalid_provenance("source Session does not exist"))?;
             if matches!(
                 scope.kind,
                 MemoryScopeKind::Project | MemoryScopeKind::Agent
@@ -275,9 +277,7 @@ fn scope_predicate(prefix: &str, scope: &MemoryScope) -> (String, Vec<Value>) {
     let p = prefix;
     match scope.kind {
         MemoryScopeKind::Project => (
-            format!(
-                "({p}.scope_kind = 'project' AND {p}.agent_id = ? AND {p}.project_root = ?)"
-            ),
+            format!("({p}.scope_kind = 'project' AND {p}.agent_id = ? AND {p}.project_root = ?)"),
             vec![
                 Value::from(scope.agent_id.clone()),
                 Value::from(scope.project_root.clone().unwrap_or_default()),
@@ -310,9 +310,7 @@ fn scoped_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopedMemoryEntr
         .get(25)
         .unwrap_or_else(|_| "legacy_unscoped".to_string());
     let memory_root: Option<String> = row.get(26).unwrap_or(None);
-    let authority: String = row
-        .get(27)
-        .unwrap_or_else(|_| "legacy_unknown".to_string());
+    let authority: String = row.get(27).unwrap_or_else(|_| "legacy_unknown".to_string());
     let source_run_id: Option<String> = row.get(28).unwrap_or(None);
     let verified_at: Option<String> = row.get(29).unwrap_or(None);
     let revision: i64 = row.get(30).unwrap_or(1);
@@ -381,7 +379,8 @@ pub fn list_scoped_memories(
     let rows = stmt
         .query_map(rusqlite::params_from_iter(scope_params), scoped_from_row)
         .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
 }
 
 pub fn save_scoped_memory(
@@ -417,8 +416,7 @@ pub fn save_scoped_memory_with_kind(
     let id = uuid::Uuid::new_v4().to_string();
     let stored = with_memory_savepoint(conn, |conn| {
         let now_str = now.to_rfc3339();
-        let tags_json =
-            serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
         let source_message_ids = serde_json::to_string(&provenance.source_message_ids)
             .unwrap_or_else(|_| "[]".to_string());
         let expires_at = normalize_optional_ts(draft.expires_at.as_deref())?;
@@ -576,10 +574,9 @@ fn recall_scope_predicate(scope: &MemoryScope, include_user: bool) -> (String, V
             "(m.scope_kind = 'user' AND m.agent_id = '')".to_string(),
             vec![],
         ),
-        MemoryScopeKind::LegacyUnscoped => (
-            "(m.scope_kind = 'legacy_unscoped')".to_string(),
-            vec![],
-        ),
+        MemoryScopeKind::LegacyUnscoped => {
+            ("(m.scope_kind = 'legacy_unscoped')".to_string(), vec![])
+        }
     };
 
     if include_user && scope.kind != MemoryScopeKind::User {
@@ -659,8 +656,7 @@ fn entry_scope_matches(entry: &ScopedMemoryEntry, scope: &MemoryScope, include_u
                 || user_match
         }
         MemoryScopeKind::Agent => {
-            (entry_scope.kind == MemoryScopeKind::Agent
-                && entry_scope.agent_id == scope.agent_id)
+            (entry_scope.kind == MemoryScopeKind::Agent && entry_scope.agent_id == scope.agent_id)
                 || user_match
         }
         MemoryScopeKind::User => {
@@ -691,11 +687,11 @@ pub fn admit_scoped_entry(
         | AuthorityKind::VerifiedObservation => {}
         _ => return excluded("authority_filtered"),
     }
-    let expires_at = match parse_recall_timestamp(&entry.entry.expires_at, &entry.entry.id, "expires_at")
-    {
-        Ok(value) => value,
-        Err(()) => return excluded("malformed_timestamp"),
-    };
+    let expires_at =
+        match parse_recall_timestamp(&entry.entry.expires_at, &entry.entry.id, "expires_at") {
+            Ok(value) => value,
+            Err(()) => return excluded("malformed_timestamp"),
+        };
     let review_after =
         match parse_recall_timestamp(&entry.entry.review_after, &entry.entry.id, "review_after") {
             Ok(value) => value,
@@ -707,9 +703,7 @@ pub fn admit_scoped_entry(
     if expires_at.map(|expires| expires <= *now).unwrap_or(false) {
         return excluded("expired");
     }
-    let stale = review_after
-        .map(|review| review <= *now)
-        .unwrap_or(false);
+    let stale = review_after.map(|review| review <= *now).unwrap_or(false);
     AdmissionVerdict {
         admitted: true,
         stale,
@@ -1046,8 +1040,6 @@ pub fn adopt_legacy_memory(
     })
 }
 
-
-
 #[allow(clippy::too_many_arguments)]
 pub fn update_scoped_memory(
     conn: &Connection,
@@ -1098,8 +1090,7 @@ pub fn update_scoped_memory_with_kind(
         // semantic statement-kind change.
         let resolved_kind = kind.unwrap_or(before.statement_kind);
         let now_str = now.to_rfc3339();
-        let tags_json =
-            serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
         let source_message_ids = serde_json::to_string(&provenance.source_message_ids)
             .unwrap_or_else(|_| "[]".to_string());
         let expires_at = normalize_optional_ts(draft.expires_at.as_deref())?;
@@ -1191,10 +1182,8 @@ pub fn tombstone_scoped_memory(
         if before.entry.status == "tombstoned" {
             return Ok((before, false));
         }
-        let mut values: Vec<Value> = vec![
-            Value::from(now.to_rfc3339()),
-            Value::from(id.to_string()),
-        ];
+        let mut values: Vec<Value> =
+            vec![Value::from(now.to_rfc3339()), Value::from(id.to_string())];
         values.extend(scope_params.clone());
         let sql = format!(
             "UPDATE memory SET status = 'tombstoned', revision = revision + 1, updated_at = ?
@@ -1246,10 +1235,8 @@ pub fn restore_scoped_memory(
         if before.entry.status == "active" {
             return Ok((before, false));
         }
-        let mut values: Vec<Value> = vec![
-            Value::from(now.to_rfc3339()),
-            Value::from(id.to_string()),
-        ];
+        let mut values: Vec<Value> =
+            vec![Value::from(now.to_rfc3339()), Value::from(id.to_string())];
         values.extend(scope_params.clone());
         let sql = format!(
             "UPDATE memory SET status = 'active', revision = revision + 1, updated_at = ?
@@ -1339,11 +1326,71 @@ mod injectability_tests {
     fn seeded() -> Connection {
         let conn = db();
         // Admitted: in scope, manual, hot, active, low confidence on purpose.
-        insert(&conn, "ok", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.2, None, "recallable memory");
-        insert(&conn, "legacy", "legacy_unscoped", "", None, "legacy_unknown", "hot", "active", 0.9, None, "recallable memory");
-        insert(&conn, "out", "project", "agent-a", Some("/projects/two"), "manual", "hot", "active", 0.9, None, "recallable memory");
-        insert(&conn, "cold", "project", "agent-a", Some("/projects/one"), "manual", "cold", "active", 0.6, None, "recallable memory");
-        insert(&conn, "expired", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.9, Some("2000-01-01T00:00:00Z"), "recallable memory");
+        insert(
+            &conn,
+            "ok",
+            "project",
+            "agent-a",
+            Some("/projects/one"),
+            "manual",
+            "hot",
+            "active",
+            0.2,
+            None,
+            "recallable memory",
+        );
+        insert(
+            &conn,
+            "legacy",
+            "legacy_unscoped",
+            "",
+            None,
+            "legacy_unknown",
+            "hot",
+            "active",
+            0.9,
+            None,
+            "recallable memory",
+        );
+        insert(
+            &conn,
+            "out",
+            "project",
+            "agent-a",
+            Some("/projects/two"),
+            "manual",
+            "hot",
+            "active",
+            0.9,
+            None,
+            "recallable memory",
+        );
+        insert(
+            &conn,
+            "cold",
+            "project",
+            "agent-a",
+            Some("/projects/one"),
+            "manual",
+            "cold",
+            "active",
+            0.6,
+            None,
+            "recallable memory",
+        );
+        insert(
+            &conn,
+            "expired",
+            "project",
+            "agent-a",
+            Some("/projects/one"),
+            "manual",
+            "hot",
+            "active",
+            0.9,
+            Some("2000-01-01T00:00:00Z"),
+            "recallable memory",
+        );
         conn
     }
 
@@ -1366,7 +1413,10 @@ mod injectability_tests {
         };
         assert!(verdict("ok").admitted);
         assert_eq!(verdict("ok").reason, None);
-        assert_eq!(verdict("legacy").reason.as_deref(), Some("authority_filtered"));
+        assert_eq!(
+            verdict("legacy").reason.as_deref(),
+            Some("authority_filtered")
+        );
         assert_eq!(verdict("out").reason.as_deref(), Some("out_of_scope"));
         assert_eq!(verdict("cold").reason.as_deref(), Some("tier_filtered"));
         assert_eq!(verdict("expired").reason.as_deref(), Some("expired"));
@@ -1382,7 +1432,8 @@ mod injectability_tests {
             include_user_scope: false,
             min_confidence: None,
         };
-        let baseline = recall_scoped_memories(&conn, &scope, "recallable", &options, now()).unwrap();
+        let baseline =
+            recall_scoped_memories(&conn, &scope, "recallable", &options, now()).unwrap();
         assert!(baseline
             .entries
             .iter()
@@ -1401,7 +1452,10 @@ mod injectability_tests {
         )
         .unwrap();
         assert!(floored.entries.is_empty());
-        assert_eq!(floored.admitted, 1, "the floor filters results, not admission");
+        assert_eq!(
+            floored.admitted, 1,
+            "the floor filters results, not admission"
+        );
     }
 
     #[test]
@@ -1416,19 +1470,34 @@ mod injectability_tests {
 
         // The only in-scope row matching this query is expired: a candidate was
         // found, but admission rejected all of them.
-        let filtered = recall_scoped_memories(&conn, &scope, "recallable memory", &options, now()).unwrap();
+        let filtered =
+            recall_scoped_memories(&conn, &scope, "recallable memory", &options, now()).unwrap();
         assert_eq!(filtered.considered, 2, "ok + expired inspected");
         assert_eq!(filtered.admitted, 1);
 
-        insert(&conn, "expired-only", "project", "agent-a", Some("/projects/one"), "manual", "hot", "active", 0.9, Some("2000-01-01T00:00:00Z"), "solelyexpired token");
-        let only_expired = recall_scoped_memories(&conn, &scope, "solelyexpired", &options, now()).unwrap();
+        insert(
+            &conn,
+            "expired-only",
+            "project",
+            "agent-a",
+            Some("/projects/one"),
+            "manual",
+            "hot",
+            "active",
+            0.9,
+            Some("2000-01-01T00:00:00Z"),
+            "solelyexpired token",
+        );
+        let only_expired =
+            recall_scoped_memories(&conn, &scope, "solelyexpired", &options, now()).unwrap();
         // The FTS attempt finds the expired row, admission rejects it, and the
         // literal fallback inspects it again; `considered` counts inspections.
         assert!(only_expired.considered >= 1);
         assert_eq!(only_expired.admitted, 0);
         assert!(only_expired.entries.is_empty());
 
-        let absent = recall_scoped_memories(&conn, &scope, "nomatchendtoken", &options, now()).unwrap();
+        let absent =
+            recall_scoped_memories(&conn, &scope, "nomatchendtoken", &options, now()).unwrap();
         assert_eq!(absent.considered, 0);
         assert_eq!(absent.admitted, 0);
     }
@@ -1444,7 +1513,10 @@ mod injectability_tests {
         };
         let preview = recall_scoped_memories(&conn, &scope, "recallable", &options, now()).unwrap();
         let rows = injectability_for_ids(&conn, &scope, &ids(), false, now()).unwrap();
-        for row in rows.iter().filter(|row| row.reason.as_deref() != Some("not_found")) {
+        for row in rows
+            .iter()
+            .filter(|row| row.reason.as_deref() != Some("not_found"))
+        {
             let recalled = preview
                 .entries
                 .iter()

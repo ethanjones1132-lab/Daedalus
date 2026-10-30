@@ -556,7 +556,9 @@ pub fn get_all_session_runs(db: State<AppDb>) -> Result<Vec<SessionRunRecord>, S
 pub fn list_learning_source_choices(
     db: &AppDb,
 ) -> Result<crate::jarvis::learning::LearningSourceChoices, String> {
-    use crate::jarvis::learning::{LearningRunChoice, LearningSessionChoice, LearningSourceChoices};
+    use crate::jarvis::learning::{
+        LearningRunChoice, LearningSessionChoice, LearningSourceChoices,
+    };
 
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
@@ -586,8 +588,16 @@ pub fn list_learning_source_choices(
 
     let mut sessions: Vec<LearningSessionChoice> = Vec::new();
     for row in rows {
-        let (session_id, agent_id, title, project_root, run_id, outcome, selected_model, finished_at) =
-            row.map_err(|e| format!("Failed to read learning source choices: {e}"))?;
+        let (
+            session_id,
+            agent_id,
+            title,
+            project_root,
+            run_id,
+            outcome,
+            selected_model,
+            finished_at,
+        ) = row.map_err(|e| format!("Failed to read learning source choices: {e}"))?;
         let run = LearningRunChoice {
             agent_run_id: run_id,
             outcome,
@@ -680,10 +690,7 @@ pub fn record_goal_terminal_run(
             let transport = crate::jarvis::memory::transport::native_memory_transport();
             let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
             crate::jarvis::memory::transport::resolve_goal_terminal_authority(
-                &conn,
-                transport,
-                binding_id,
-                &run_id,
+                &conn, transport, binding_id, &run_id,
             )
             .map_err(|error| error.message)?
         }
@@ -840,16 +847,18 @@ pub async fn delete_session(app: AppHandle, session_id: String) -> Result<bool, 
                 // before it disappears; the outbox row has no Session FK, so it
                 // survives that Session's deletion and the drain reuses the
                 // exact original initiating-Session wire key.
-                Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
-                    invalidation:
-                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
-                            operation_id: uuid::Uuid::new_v4().to_string(),
-                            affected_session_ids: vec![session_for_plan],
-                            memory_ids: Vec::new(),
-                            source_message_ids: Vec::new(),
-                        },
-                    scope: None,
-                })
+                Ok(
+                    crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                        invalidation:
+                            crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                                operation_id: uuid::Uuid::new_v4().to_string(),
+                                affected_session_ids: vec![session_for_plan],
+                                memory_ids: Vec::new(),
+                                source_message_ids: Vec::new(),
+                            },
+                        scope: None,
+                    },
+                )
             }
         },
         move |conn, _plan| {
@@ -999,9 +1008,7 @@ pub fn insert_message_row_conn(
                 {
                     Ok(existing_id)
                 }
-                _ => Err(
-                    "Memory turn already has a different assistant message".to_string(),
-                ),
+                _ => Err("Memory turn already has a different assistant message".to_string()),
             };
         }
 
@@ -1084,7 +1091,14 @@ pub fn append_assistant_message_for_turn(
     memory_turn_id: &str,
 ) -> Result<String, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    insert_message_row_conn(&conn, session_id, "assistant", content, 0, Some(memory_turn_id))
+    insert_message_row_conn(
+        &conn,
+        session_id,
+        "assistant",
+        content,
+        0,
+        Some(memory_turn_id),
+    )
 }
 
 #[tauri::command]

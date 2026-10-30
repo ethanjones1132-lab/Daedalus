@@ -157,7 +157,14 @@ fn proxy_heartbeat_status(proxy_required: bool, probe: impl FnOnce() -> bool) ->
 
 async fn tick(handle: &AppHandle) {
     // Read the active backend + model once per tick.
-    let (is_ollama, ollama_model, is_llama_cpp, llama_cpp_config, proxy_required, openrouter_api_key) = {
+    let (
+        is_ollama,
+        ollama_model,
+        is_llama_cpp,
+        llama_cpp_config,
+        proxy_required,
+        openrouter_api_key,
+    ) = {
         let state = handle.state::<JarvisState>();
         let cfg = state.config.lock().await;
         (

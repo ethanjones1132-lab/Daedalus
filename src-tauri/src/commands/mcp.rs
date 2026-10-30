@@ -8,9 +8,9 @@
 // at `<jarvis_path>/.mcp.json`. A missing file is treated as "no servers yet"
 // (not an error) on read, matching `loadMcpServers`'s existing behavior.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 use tauri::State;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq)]
@@ -53,14 +53,19 @@ pub(crate) fn mcp_config_path(jarvis_path: &str) -> PathBuf {
 /// yield an empty map, matching the TS reader's fail-open behavior (a broken
 /// `.mcp.json` should not crash config loading).
 pub(crate) fn parse_mcp_servers(raw: Option<&str>) -> McpServerMap {
-    let Some(text) = raw else { return HashMap::new() };
+    let Some(text) = raw else {
+        return HashMap::new();
+    };
     serde_json::from_str::<McpFile>(text)
         .map(|f| f.mcp_servers)
         .unwrap_or_default()
 }
 
 pub(crate) fn render_mcp_file(servers: &McpServerMap) -> Result<String, String> {
-    serde_json::to_string_pretty(&McpFile { mcp_servers: servers.clone() }).map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&McpFile {
+        mcp_servers: servers.clone(),
+    })
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -108,7 +113,10 @@ mod tests {
             "filesystem".to_string(),
             McpServerEntry {
                 command: Some("npx".to_string()),
-                args: vec!["-y".to_string(), "@modelcontextprotocol/server-filesystem".to_string()],
+                args: vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                ],
                 env: HashMap::new(),
                 cwd: None,
                 url: None,
@@ -128,7 +136,10 @@ mod tests {
         let mut servers = HashMap::new();
         servers.insert(
             "disabled_one".to_string(),
-            McpServerEntry { disabled: true, ..Default::default() },
+            McpServerEntry {
+                disabled: true,
+                ..Default::default()
+            },
         );
         let text = render_mcp_file(&servers).expect("render");
         let parsed = parse_mcp_servers(Some(&text));
@@ -154,6 +165,9 @@ mod tests {
     #[test]
     fn nonempty_path_joins_directly() {
         let path = mcp_config_path("C:\\Users\\ethan\\myproject");
-        assert_eq!(path, PathBuf::from("C:\\Users\\ethan\\myproject").join(".mcp.json"));
+        assert_eq!(
+            path,
+            PathBuf::from("C:\\Users\\ethan\\myproject").join(".mcp.json")
+        );
     }
 }

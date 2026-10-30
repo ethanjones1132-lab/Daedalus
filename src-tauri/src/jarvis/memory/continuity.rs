@@ -62,9 +62,10 @@ pub fn read_session_continuity(
 
     match row {
         Some((Some(objective_json), latest_turn_id, revision)) => {
-            let objective: ActiveObjective = serde_json::from_str(&objective_json).map_err(|_| {
-                MemoryError::storage_unavailable("Corrupt persisted continuity objective")
-            })?;
+            let objective: ActiveObjective =
+                serde_json::from_str(&objective_json).map_err(|_| {
+                    MemoryError::storage_unavailable("Corrupt persisted continuity objective")
+                })?;
             Ok(SessionContinuity {
                 session_id: session_id.to_string(),
                 active_objective: Some(objective),
@@ -220,9 +221,8 @@ fn read_highwater(
     created_col: &str,
     rowid_col: &str,
 ) -> Result<Option<(String, i64)>, MemoryError> {
-    let sql = format!(
-        "SELECT {created_col}, {rowid_col} FROM session_continuity WHERE session_id = ?"
-    );
+    let sql =
+        format!("SELECT {created_col}, {rowid_col} FROM session_continuity WHERE session_id = ?");
     let row: Option<(Option<String>, Option<i64>)> = conn
         .query_row(&sql, [session_id], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()
@@ -282,10 +282,7 @@ fn read_action_cursor(
 /// Monotonic maximum of two `(created_at, rowid)` order keys. `rowid` is only a
 /// tie-breaker within one timestamp, so lexicographic timestamp comparison (the
 /// same relation `directive_is_stale` uses) is authoritative.
-fn max_order_key(
-    a: Option<(String, i64)>,
-    b: Option<(String, i64)>,
-) -> Option<(String, i64)> {
+fn max_order_key(a: Option<(String, i64)>, b: Option<(String, i64)>) -> Option<(String, i64)> {
     match (a, b) {
         (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
         (Some(a), None) => Some(a),
@@ -1179,9 +1176,7 @@ pub fn clear_continuity_dependent_on(
 
 fn json_array(value: &str, field: &str) -> Result<Vec<String>, MemoryError> {
     serde_json::from_str::<Vec<String>>(value).map_err(|_| {
-        MemoryError::storage_unavailable(format!(
-            "Corrupt persisted derived-invalidation {field}"
-        ))
+        MemoryError::storage_unavailable(format!("Corrupt persisted derived-invalidation {field}"))
     })
 }
 
@@ -1278,13 +1273,14 @@ pub fn pending_memory_derived_invalidations(
         // be a legitimate None. Only the exact JSON literal `null` decodes to
         // no scope; anything else must parse strictly or fail as corrupt
         // storage. An empty/unknown value must never silently become `None`.
-        let scope: Option<MemoryScope> = if scope_json.trim() == "null" {
-            None
-        } else {
-            Some(serde_json::from_str(&scope_json).map_err(|_| {
-                MemoryError::storage_unavailable("Corrupt persisted derived scope")
-            })?)
-        };
+        let scope: Option<MemoryScope> =
+            if scope_json.trim() == "null" {
+                None
+            } else {
+                Some(serde_json::from_str(&scope_json).map_err(|_| {
+                    MemoryError::storage_unavailable("Corrupt persisted derived scope")
+                })?)
+            };
         out.push(PendingDerivedInvalidation {
             session_id,
             invalidation: MemoryDerivedInvalidation {
@@ -1318,10 +1314,10 @@ pub fn collect_memory_source_message_ids(
             Err(err) if err.code == super::contracts::MemoryErrorCode::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let source_message_ids: Vec<String> = serde_json::from_str(&memory.entry.source_message_ids)
-            .map_err(|_| {
-            MemoryError::storage_unavailable("Corrupt persisted memory source ids")
-        })?;
+        let source_message_ids: Vec<String> =
+            serde_json::from_str(&memory.entry.source_message_ids).map_err(|_| {
+                MemoryError::storage_unavailable("Corrupt persisted memory source ids")
+            })?;
         for message_id in source_message_ids {
             if !affected.contains(&message_id) {
                 affected.push(message_id);
@@ -1368,18 +1364,13 @@ pub fn collect_memory_source_message_ids(
 /// generation-loss row has no authenticated completion at all. While application
 /// remains unknown or nonterminal, callers must keep the conservative
 /// prepared-selection fallback.
-fn preparation_application_known(
-    finished_at: Option<&str>,
-    terminal_status: Option<&str>,
-) -> bool {
+fn preparation_application_known(finished_at: Option<&str>, terminal_status: Option<&str>) -> bool {
     if finished_at.is_some() {
         return true;
     }
     matches!(
         terminal_status,
-        Some(
-            "completed" | "partial" | "cancelled" | "failed"
-        )
+        Some("completed" | "partial" | "cancelled" | "failed")
     )
 }
 
@@ -1431,10 +1422,8 @@ fn collect_applied_assistant_message_ids(
         let applied: Vec<String> = serde_json::from_str(&applied_json).map_err(|_| {
             MemoryError::storage_unavailable("Corrupt persisted applied selection ids")
         })?;
-        let known = preparation_application_known(
-            finished_at.as_deref(),
-            terminal_status.as_deref(),
-        );
+        let known =
+            preparation_application_known(finished_at.as_deref(), terminal_status.as_deref());
         let touched = if known {
             // Authenticated completion: the applied union is authoritative.
             applied
@@ -1443,8 +1432,8 @@ fn collect_applied_assistant_message_ids(
         } else {
             // Unknown/nonterminal: conservatively include both the prepared
             // selection and whatever applied ids are currently known.
-            let selected: Vec<PreparedMemorySelection> =
-                serde_json::from_str(&selected_json).map_err(|_| {
+            let selected: Vec<PreparedMemorySelection> = serde_json::from_str(&selected_json)
+                .map_err(|_| {
                     MemoryError::storage_unavailable("Corrupt persisted prepared selection")
                 })?;
             selected
@@ -1476,10 +1465,7 @@ fn terminal_status_wire(status: MemoryTurnTerminalStatus) -> &'static str {
 /// the live status/revision recheck below, this neutralizes a late answer that
 /// selected a memory whose source was suppressed without a row mutation (for
 /// example a historically-tombstoned forget).
-fn memory_has_prompt_suppression(
-    conn: &Connection,
-    memory_id: &str,
-) -> Result<bool, MemoryError> {
+fn memory_has_prompt_suppression(conn: &Connection, memory_id: &str) -> Result<bool, MemoryError> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM memory_prompt_suppressions WHERE memory_id = ?)",
         [memory_id],
@@ -1652,9 +1638,7 @@ pub fn collect_affected_session_ids(
             MemoryScopeKind::Project => {
                 if let Some(root) = scope.project_root.as_deref() {
                     let mut stmt = conn
-                        .prepare(
-                            "SELECT id FROM sessions WHERE agent_id = ? AND project_root = ?",
-                        )
+                        .prepare("SELECT id FROM sessions WHERE agent_id = ? AND project_root = ?")
                         .map_err(MemoryError::from)?;
                     let rows = stmt
                         .query_map(params![&scope.agent_id, root], |row| {
@@ -1735,10 +1719,8 @@ pub fn collect_affected_session_ids(
         let prepared_target = selected
             .iter()
             .any(|item| memory_ids.iter().any(|memory_id| memory_id == &item.id));
-        let known = preparation_application_known(
-            finished_at.as_deref(),
-            terminal_status.as_deref(),
-        );
+        let known =
+            preparation_application_known(finished_at.as_deref(), terminal_status.as_deref());
         let touched = if known {
             applied
                 .iter()
@@ -1766,7 +1748,9 @@ pub fn collect_affected_session_ids(
         .prepare("SELECT session_id, active_objective_json FROM session_continuity WHERE active_objective_json IS NOT NULL")
         .map_err(MemoryError::from)?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(MemoryError::from)?;
     for row in rows {
         let (session_id, objective_json) = row.map_err(MemoryError::from)?;
@@ -1804,10 +1788,7 @@ fn ordered_sessions(set: BTreeSet<String>, initiating_session_id: &str) -> Vec<S
 /// `sessions.project_root` change (trigger-maintained), so a preparation can
 /// detect a pure rebind that changes the effective memory scope even when the
 /// global store revision and continuity revision are unchanged.
-pub fn session_binding_revision(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<i64, MemoryError> {
+pub fn session_binding_revision(conn: &Connection, session_id: &str) -> Result<i64, MemoryError> {
     let revision: Option<i64> = conn
         .query_row(
             "SELECT binding_revision FROM sessions WHERE id = ?",

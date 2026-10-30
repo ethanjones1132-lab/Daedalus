@@ -354,10 +354,7 @@ fn stable_commit_id(session_id: &str) -> String {
 }
 
 #[tauri::command]
-pub async fn jarvis_review_session(
-    app: AppHandle,
-    session_id: String,
-) -> Result<Value, String> {
+pub async fn jarvis_review_session(app: AppHandle, session_id: String) -> Result<Value, String> {
     crate::commands::memory_turn::run_gated_mutation(app, "session_review", move |conn| {
         crate::jarvis::memory::engine::review_session(conn, &session_id)
             .map_err(MemoryError::storage_unavailable)
@@ -444,7 +441,9 @@ pub struct SessionGrantsResponse {
 }
 
 #[tauri::command]
-pub async fn jarvis_get_session_grants(session_id: String) -> Result<SessionGrantsResponse, String> {
+pub async fn jarvis_get_session_grants(
+    session_id: String,
+) -> Result<SessionGrantsResponse, String> {
     let base = bun_base().await?;
     let client = http_client()?;
     let resp = client
@@ -459,7 +458,10 @@ pub async fn jarvis_get_session_grants(session_id: String) -> Result<SessionGran
 }
 
 #[tauri::command]
-pub async fn jarvis_revoke_session_grant(session_id: String, root: String) -> Result<SessionGrantsResponse, String> {
+pub async fn jarvis_revoke_session_grant(
+    session_id: String,
+    root: String,
+) -> Result<SessionGrantsResponse, String> {
     let base = bun_base().await?;
     let client = http_client()?;
     let body = serde_json::json!({ "session_id": session_id, "root": root });
@@ -548,9 +550,18 @@ mod tests {
             assert_eq!(result.get("reviewed").and_then(|v| v.as_bool()), Some(true));
             // Review reports durable capture receipts; a legacy summary alone
             // must not fabricate a new scoped memory.
-            assert_eq!(result.get("memories_created").and_then(|v| v.as_i64()), Some(0));
-            assert_eq!(result.get("capture_receipts").and_then(|v| v.as_i64()), Some(0));
-            assert_eq!(result.get("accepted_operations").and_then(|v| v.as_i64()), Some(0));
+            assert_eq!(
+                result.get("memories_created").and_then(|v| v.as_i64()),
+                Some(0)
+            );
+            assert_eq!(
+                result.get("capture_receipts").and_then(|v| v.as_i64()),
+                Some(0)
+            );
+            assert_eq!(
+                result.get("accepted_operations").and_then(|v| v.as_i64()),
+                Some(0)
+            );
         }
     }
 }

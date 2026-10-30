@@ -137,9 +137,7 @@ pub async fn memory_delete(app: AppHandle, id: String) -> Result<bool, String> {
     super::memory_turn::run_derived_gated_mutation(
         app,
         String::new(),
-        move |conn| {
-            plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id())
-        },
+        move |conn| plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id()),
         move |conn, _invalidation| {
             // Preflight: the legacy delete route may only tombstone a verified
             // legacy-unscoped row. A scoped fact must go through the scoped
@@ -164,9 +162,7 @@ pub async fn memory_restore(app: AppHandle, id: String) -> Result<bool, String> 
     super::memory_turn::run_derived_gated_mutation(
         app,
         String::new(),
-        move |conn| {
-            plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id())
-        },
+        move |conn| plan_legacy_invalidation(conn, "", vec![plan_id], fresh_operation_id()),
         move |conn, _invalidation| {
             // Preflight: restore preserves the legacy-scope guard that
             // `engine::restore_memory` only partially enforces (it returns
@@ -489,10 +485,11 @@ pub fn execute_scoped_save(
     request: ScopedSaveRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let write_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let write_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     let provenance = manual_provenance(&request.session_id);
-    let kind = request.statement_kind.unwrap_or(MemoryStatementKind::Unknown);
+    let kind = request
+        .statement_kind
+        .unwrap_or(MemoryStatementKind::Unknown);
     scoped::save_scoped_memory_with_kind(conn, &write_scope, request.draft, &provenance, kind, now)
 }
 
@@ -500,8 +497,7 @@ pub fn execute_scoped_read(
     conn: &Connection,
     request: ScopedReadRequest,
 ) -> Result<ScopedMemoryEntry, MemoryError> {
-    let read_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let read_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     scoped::read_scoped_memory(conn, &read_scope, &request.id)
 }
 
@@ -509,8 +505,7 @@ pub fn execute_scoped_list(
     conn: &Connection,
     request: ScopedListRequest,
 ) -> Result<Vec<ScopedMemoryEntry>, MemoryError> {
-    let read_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let read_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     scoped::list_scoped_memories(conn, &read_scope, request.include_inactive)
 }
 
@@ -519,8 +514,7 @@ pub fn execute_scoped_update(
     request: ScopedUpdateRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let write_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let write_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     let provenance = manual_provenance(&request.session_id);
     let kind = request.statement_kind;
     scoped::update_scoped_memory_with_kind(
@@ -540,8 +534,7 @@ pub fn execute_scoped_classify(
     request: ScopedClassifyRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let write_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let write_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     scoped::classify_scoped_memory(
         conn,
         &write_scope,
@@ -557,8 +550,7 @@ pub fn execute_scoped_delete(
     request: ScopedDeleteRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let write_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let write_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     scoped::tombstone_scoped_memory(
         conn,
         &write_scope,
@@ -574,8 +566,7 @@ pub fn execute_scoped_restore(
     request: ScopedRestoreRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let write_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    let write_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
     scoped::restore_scoped_memory(
         conn,
         &write_scope,
@@ -599,9 +590,14 @@ pub fn execute_adopt_legacy(
     request: AdoptLegacyRequest,
     now: DateTime<Utc>,
 ) -> Result<MutationResult, MemoryError> {
-    let target_scope =
-        scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
-    scoped::adopt_legacy_memory(conn, &request.id, request.expected_revision, &target_scope, now)
+    let target_scope = scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
+    scoped::adopt_legacy_memory(
+        conn,
+        &request.id,
+        request.expected_revision,
+        &target_scope,
+        now,
+    )
 }
 
 #[tauri::command]
@@ -735,8 +731,14 @@ pub async fn memory_scoped_delete(
         move |conn, _invalidation| {
             let write_scope =
                 scope::resolve_write_scope(conn, &request.session_id, &request.selector)?;
-            continuity::suppress_memory_sources(conn, &write_scope, &[request.id.clone()], Utc::now())?;
-            let _ = continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
+            continuity::suppress_memory_sources(
+                conn,
+                &write_scope,
+                &[request.id.clone()],
+                Utc::now(),
+            )?;
+            let _ =
+                continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
             execute_scoped_delete(conn, request, Utc::now())
         },
     )
@@ -862,7 +864,8 @@ pub async fn memory_adopt_legacy(
             // Adoption retains suppression of the source provenance and clears
             // any dependent objective with an audit event.
             continuity::suppress_legacy_memory_sources(conn, &[request.id.clone()], Utc::now())?;
-            let _ = continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
+            let _ =
+                continuity::clear_continuity_dependent_on(conn, &[request.id.clone()], Utc::now())?;
             execute_adopt_legacy(conn, request, Utc::now())
         },
     )

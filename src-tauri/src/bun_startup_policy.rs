@@ -87,8 +87,7 @@ mod tests {
         assert!(!pre_spawn_probe_required(false, &local, 19877));
         assert!(pre_spawn_probe_required(true, &local, 19877));
 
-        let forward_or_remote =
-            candidates(&["http://127.0.0.1:19877", "http://172.24.16.1:19877"]);
+        let forward_or_remote = candidates(&["http://127.0.0.1:19877", "http://172.24.16.1:19877"]);
         assert!(pre_spawn_probe_required(false, &forward_or_remote, 19877));
 
         let remote_configured = candidates(&["http://jarvis.example.com:19877"]);
