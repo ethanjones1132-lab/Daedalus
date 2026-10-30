@@ -418,8 +418,11 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     if (backend === 'llama_cpp' ? (healthData.supervisor?.llama_cpp_give_up ?? false) : (healthData.supervisor?.ollama_give_up ?? false)) {
       reasons.push(backend === 'llama_cpp' ? 'llama_cpp_give_up' : 'ollama_give_up');
     }
-    if (memoryPercent === null || memoryPercent >= 80) reasons.push('memory_pressure');
-    if (diskPercent === null || diskPercent >= 80) reasons.push('disk_pressure');
+    // Unknown is not pressure: a probe that could not report is not evidence of
+    // load, so an unmeasured reading never names high use and never degrades
+    // the verdict on its own. Pressure stays reserved for a measured reading.
+    if (memoryPercent !== null && memoryPercent >= 80) reasons.push('memory_pressure');
+    if (diskPercent !== null && diskPercent >= 80) reasons.push('disk_pressure');
     if (hasInferenceError) reasons.push('inference_error_rate');
   }
   if (inferenceReadFailed) reasons.push('inference_unavailable');

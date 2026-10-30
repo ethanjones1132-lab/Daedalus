@@ -1,4 +1,4 @@
-import { decodeMemoryReading } from '../../lib/memory-reading';
+import { decodeDiskReading, decodeMemoryReading } from '../../lib/memory-reading';
 import { useCallback, useReducer, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ArrowUpRight, RefreshCw } from 'lucide-react';
@@ -35,7 +35,6 @@ import {
   activeSessions,
   greetingFor,
   newestFirst,
-  parsePercent,
   systemVerdict,
   totalMessages,
   type AgentSummary,
@@ -158,7 +157,8 @@ function Pulse({ data }: { data: OverviewData }) {
   const recent = newestFirst(sessions).slice(0, RECENT_LIMIT);
   const memoryReading = decodeMemoryReading(health.memory);
   const memory = memoryReading.percent;
-  const disk = parsePercent(health.disk.use_percent);
+  const diskReading = decodeDiskReading(health.disk);
+  const disk = diskReading.percent;
 
   return (
     <div className="space-y-5">
@@ -257,7 +257,12 @@ function Pulse({ data }: { data: OverviewData }) {
                 text={memory === null ? 'Not measured' : `${memory.toFixed(1)}%`}
                 sub={memoryReading.basis ?? `${Math.round(health.memory.used_mb)} of ${Math.round(health.memory.total_mb)} MB`}
               />
-              <Gauge label="Disk" pct={disk} text={health.disk.use_percent || '—'} sub={`${health.disk.used || '—'} of ${health.disk.total || '—'}`} />
+              <Gauge
+                label="Disk"
+                pct={disk}
+                text={diskReading.label}
+                sub={diskReading.basis ?? `${diskReading.used} of ${diskReading.total}`}
+              />
             </div>
           </Panel>
         </div>

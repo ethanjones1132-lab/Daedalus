@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodeMemoryReading, MEMORY_UNMEASURED_LABEL } from './memory-reading';
+import { decodeDiskReading, decodeMemoryReading, DISK_UNMEASURED_LABEL, MEMORY_UNMEASURED_LABEL } from './memory-reading';
 
 // A key the record never returned, so a fixture can express absence that
 // object spread cannot: `{ ...base, total_mb: 0 }` carries the key.
@@ -158,5 +158,55 @@ describe('memory reading unreadable records', () => {
     expect(decodeMemoryReading(sentinel)).toEqual(decodeMemoryReading({ ...sentinel }));
     const measured = record({ used_percent: 42 });
     expect(decodeMemoryReading(measured).percent).toBe(42);
+  });
+});
+
+describe('disk reading sentinel', () => {
+  // The same command answers an unreadable `df` with '?' in every disk field;
+  // either that or an empty field means the probe did not report a total.
+  it.each([
+    ['the ? sentinel', { total: '?', used: '?', available: '?', use_percent: '?' }],
+    ['an empty total', { total: '', used: '20G', available: '80G', use_percent: '20%' }],
+    ['an empty used', { total: '100G', used: '', available: '80G', use_percent: '20%' }],
+    ['missing keys', {}],
+  ])('reads %s as unmeasured, never as a number', (_name, recordValue) => {
+    const reading = decodeDiskReading(recordValue);
+    expect(reading.kind).toBe('unmeasured');
+    expect(reading.percent).toBeNull();
+    expect(reading.label).toBe(DISK_UNMEASURED_LABEL);
+    expect(reading.label).not.toContain('%');
+    expect(reading.basis).toContain('cannot be measured');
+  });
+});
+
+describe('disk reading measurement', () => {
+  it('keeps a real reading, its percentage and its readable counts', () => {
+    const reading = decodeDiskReading({ total: '100G', used: '40G', available: '60G', use_percent: '40%' });
+    expect(reading.kind).toBe('measured');
+    expect(reading.percent).toBe(40);
+    expect(reading.label).toBe('40.0%');
+    expect(reading.used).toBe('40G');
+    expect(reading.total).toBe('100G');
+    expect(reading.available).toBe('60G');
+    expect(reading.basis).toBeNull();
+  });
+
+  it('keeps a genuine zero as a zero when the record carries real totals', () => {
+    const reading = decodeDiskReading({ total: '100G', used: '0G', available: '100G', use_percent: '0%' });
+    expect(reading.kind).toBe('measured');
+    expect(reading.percent).toBe(0);
+    expect(reading.label).toBe('0.0%');
+  });
+
+  it('rejects a percentage outside the shared window even with readable totals', () => {
+    const reading = decodeDiskReading({ total: '100G', used: '40G', available: '60G', use_percent: '250%' });
+    expect(reading.kind).toBe('unmeasured');
+    expect(reading.reason).toBe('unreadable');
+  });
+
+  it('reads a record that is not an object as carrying no disk reading', () => {
+    expect(decodeDiskReading(null).reason).toBe('no-record');
+    expect(decodeDiskReading(undefined).reason).toBe('no-record');
+    expect(decodeDiskReading('20%').reason).toBe('no-record');
   });
 });

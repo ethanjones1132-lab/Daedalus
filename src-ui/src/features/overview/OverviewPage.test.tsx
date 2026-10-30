@@ -52,7 +52,7 @@ describe('OverviewPage', () => {
   it('shows memory and disk as text beside the dials', async () => {
     await act(async () => { render(<OverviewPage />); });
     expect(screen.getByText('87.0%')).toBeInTheDocument();
-    expect(screen.getByText('60%')).toBeInTheDocument();
+    expect(screen.getByText('60.0%')).toBeInTheDocument();
   });
 
   it('opens a Session in the Sessions page when its row is chosen', async () => {

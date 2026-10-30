@@ -1,5 +1,6 @@
 import { Badge, EmptyState, KeyValue, Panel, PanelHeader, RowList, Skeleton, StatusDot } from '../../design';
 import type { HealthData } from '../../domain/system-telemetry-state';
+import { decodeDiskReading, decodeMemoryReading } from '../../lib/memory-reading';
 import { checkTone, type DoctorReport } from './health-format';
 
 /** The doctor checklist: every check with its state in words, not only colour. */
@@ -61,13 +62,21 @@ export function DoctorPanel({ doctor, pending }: { doctor: DoctorReport | null; 
 export function ResourceDetailPanel({ health }: { health: HealthData | null }) {
   if (!health) return null;
   const supervisor = health.supervisor;
+  // The same shared decoders the dials and the footer use, so a sentinel this
+  // read cannot vouch for is never rendered as `0 MB used of 0 MB`.
+  const memory = decodeMemoryReading(health.memory);
+  const disk = decodeDiskReading(health.disk);
   return (
     <Panel>
       <PanelHeader title="Resources" description="Observed by the native shell at the last health read." />
       <KeyValue
         items={[
-          ['Memory', `${health.memory.used_mb} MB used of ${health.memory.total_mb} MB · ${health.memory.available_mb} MB available`],
-          ['Disk', `${health.disk.used} used of ${health.disk.total} · ${health.disk.available} available`],
+          memory.kind === 'measured'
+            ? ['Memory', `${health.memory.used_mb} MB used of ${health.memory.total_mb} MB · ${health.memory.available_mb} MB available`]
+            : ['Memory', memory.basis],
+          disk.kind === 'measured'
+            ? ['Disk', `${disk.used} used of ${disk.total} · ${disk.available} available`]
+            : ['Disk', disk.basis],
           ['Supervisor', supervisor
             ? [
                 supervisor.bun_give_up && 'Bun server',

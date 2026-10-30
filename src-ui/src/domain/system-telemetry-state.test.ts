@@ -142,6 +142,32 @@ describe('system telemetry observation state', () => {
     const bunDown = { ...health, bun_server: { ...health.bun_server, running: false } };
     expect(deriveSystemTelemetryView(readyWith(bunDown), 'openrouter', false).overall).toBe('stopped');
   });
+
+  it('never reads an unmeasured resource as high use, even in a stopped verdict', () => {
+    // Native's zeroed memory record and '?' disk record: no measurements, no
+    // pressure reasons. A stopped verdict names only its real fault.
+    const sentinelHealth = {
+      ...health,
+      bun_server: { ...health.bun_server, running: false },
+      memory: { total_mb: 0, available_mb: 0, used_mb: 0, used_percent: 0 },
+      disk: { total: '?', used: '?', available: '?', use_percent: '?' },
+    };
+    const view = deriveSystemTelemetryView(readyWith(sentinelHealth), 'openrouter');
+    expect(view.overall).toBe('stopped');
+    expect(view.overallReasons).toEqual(['bun_down']);
+    expect(view.health.memoryPercent).toBeNull();
+    expect(view.health.diskPercent).toBeNull();
+    expect(summarizeVerdict(view)).not.toContain('high');
+  });
+
+  it('keeps pressure reasons reserved for measured readings', () => {
+    const pressured = deriveSystemTelemetryView(
+      readyWith({ ...health, memory: { ...health.memory, used_percent: 95 }, disk: { ...health.disk, use_percent: '99%' } }),
+      'openrouter',
+    );
+    expect(pressured.overall).toBe('degraded');
+    expect(pressured.overallReasons).toEqual(expect.arrayContaining(['memory_pressure', 'disk_pressure']));
+  });
 });
 
 const loaded = (snapshot: HealthData) => reduceSystemTelemetryState(
@@ -483,15 +509,18 @@ describe('memory reading sentinel in the shared verdict', () => {
   it('does not project a measurement for a record whose probe never reported', () => {
     const view = deriveSystemTelemetryView(readyWith({ ...health, memory: unprobed }), 'ollama');
     expect(view.health.memoryPercent).toBeNull();
-    expect(view.overall).toBe('degraded');
-    expect(view.overallReasons).toContain('memory_pressure');
+    // Unknown is not pressure: the probe did not report, so there is no load
+    // evidence and the verdict keeps it clean.
+    expect(view.overall).toBe('healthy');
+    expect(view.overallReasons).toEqual([]);
   });
 
   it('treats the unprobed sentinel the same way it treats an unreadable disk row', () => {
     const memory = deriveSystemTelemetryView(readyWith({ ...health, memory: unprobed }), 'ollama');
     const disk = deriveSystemTelemetryView(readyWith({ ...health, disk: { ...health.disk, use_percent: '?' } }), 'ollama');
-    expect(memory.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual(['memory_pressure']);
-    expect(disk.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual(['disk_pressure']);
+    // Both conventions resolve to "no measurement, no pressure reason".
+    expect(memory.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual([]);
+    expect(disk.overallReasons.filter((reason) => reason.endsWith('pressure'))).toEqual([]);
     // Disk keeps its own string convention; the two rows are one rule now.
     expect(disk.health.diskPercent).toBeNull();
   });

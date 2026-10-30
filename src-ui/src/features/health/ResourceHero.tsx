@@ -1,6 +1,7 @@
 import { Dial, loadTone, Panel, Skeleton, Stat } from '../../design';
 import type { HealthData } from '../../domain/system-telemetry-state';
-import { cacheTone, parsePercent, type DoctorReport, type InferenceMetrics } from './health-format';
+import { decodeDiskReading, decodeMemoryReading } from '../../lib/memory-reading';
+import { cacheTone, type DoctorReport, type InferenceMetrics } from './health-format';
 
 function Readout({
   label,
@@ -17,6 +18,26 @@ function Readout({
     <div className="flex items-center gap-4">
       <Dial value={percent} tone={loadTone(percent)} size={108}>
         <span className="d-display tabular text-[28px] leading-none text-ink">{display}</span>
+      </Dial>
+      <div className="min-w-0">
+        <div className="d-label">{label}</div>
+        <div className="mt-1 text-[12px] leading-snug text-ink-3">{sub}</div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One resource readout for a record this build cannot vouch for: the dial
+ * renders its muted "not measured" state (empty arc), the label is the shared
+ * sentinel and the sub-sentence names what could not be read. Never 0, never
+ * green-ok, never a number.
+ */
+function UnmeasuredReadout({ label, display, sub }: { label: string; display: string; sub: string }) {
+  return (
+    <div className="flex items-center gap-4">
+      <Dial value={null} tone={loadTone(null)} size={108}>
+        <span className="text-[13px] leading-tight text-ink-3">{display}</span>
       </Dial>
       <div className="min-w-0">
         <div className="d-label">{label}</div>
@@ -45,22 +66,32 @@ export function ResourceHero({
   const worstError = inference && inference.window_size > 0 && inference.backends.length > 0
     ? Math.max(...inference.backends.map((b) => b.error_rate ?? 0))
     : null;
+  const memoryReading = health ? decodeMemoryReading(health.memory) : null;
+  const diskReading = health ? decodeDiskReading(health.disk) : null;
   return (
     <Panel ticks className="grid gap-6 lg:grid-cols-[auto_auto_1fr] lg:items-center">
-      {health ? (
+      {health && memoryReading && diskReading ? (
         <>
-          <Readout
-            label="Memory"
-            percent={health.memory.used_percent}
-            display={`${health.memory.used_percent}%`}
-            sub={`${health.memory.used_mb} / ${health.memory.total_mb} MB in use`}
-          />
-          <Readout
-            label="Disk"
-            percent={parsePercent(health.disk.use_percent)}
-            display={health.disk.use_percent}
-            sub={`${health.disk.used} / ${health.disk.total} used · ${health.disk.available} free`}
-          />
+          {memoryReading.kind === 'measured' ? (
+            <Readout
+              label="Memory"
+              percent={memoryReading.percent}
+              display={memoryReading.label}
+              sub={`${health.memory.used_mb} / ${health.memory.total_mb} MB in use`}
+            />
+          ) : (
+            <UnmeasuredReadout label="Memory" display={memoryReading.label} sub={memoryReading.basis} />
+          )}
+          {diskReading.kind === 'measured' ? (
+            <Readout
+              label="Disk"
+              percent={diskReading.percent}
+              display={diskReading.label}
+              sub={`${diskReading.used} / ${diskReading.total} used · ${diskReading.available} free`}
+            />
+          ) : (
+            <UnmeasuredReadout label="Disk" display={diskReading.label} sub={diskReading.basis} />
+          )}
         </>
       ) : (
         <>

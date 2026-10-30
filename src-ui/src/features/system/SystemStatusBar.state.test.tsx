@@ -89,6 +89,8 @@ describe('SystemStatusBar telemetry observation state', () => {
     expect(screen.getByText('SYS PENDING')).toBeInTheDocument();
     expect(screen.getByText('BUN ?')).toBeInTheDocument();
     expect(screen.getByText('MEM —')).toBeInTheDocument();
+    // No snapshot means no disk reading either: never a 0 it does not have.
+    expect(screen.getByText('DSK —')).toBeInTheDocument();
     expect(screen.getByText('INF …')).toBeInTheDocument();
   });
 

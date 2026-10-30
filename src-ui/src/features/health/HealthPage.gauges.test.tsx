@@ -135,8 +135,9 @@ describe('Health page verdict and gauges', () => {
   it('shows memory and disk as dials with the numbers as text', async () => {
     serve(status, healthFor('ollama', true));
     render(<HealthPage />);
-    expect(await screen.findByText('30%')).toBeInTheDocument();
-    expect(screen.getByText('20%')).toBeInTheDocument();
+    // One decimal place is the shared decoder's rendering for both dials.
+    expect(await screen.findByText('30.0%')).toBeInTheDocument();
+    expect(screen.getByText('20.0%')).toBeInTheDocument();
     expect(screen.getByText('300 / 1000 MB in use')).toBeInTheDocument();
     expect(screen.getByText('20G / 100G used · 80G free')).toBeInTheDocument();
   });

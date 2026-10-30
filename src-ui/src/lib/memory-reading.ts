@@ -92,3 +92,83 @@ export function decodeMemoryReading(value: unknown): MemoryReading {
 
   return { kind: 'measured', reason: null, percent, label: `${percent.toFixed(1)}%`, basis: null };
 }
+
+// ── Disk ─────────────────────────────────────────────────────────────────────
+//
+// The same health command answers an unreadable `df` with `?` in every disk
+// field and an empty record can reach the surface through a drifted payload.
+// The memory half of this module rejects the zeroed record; the disk half
+// rejects the `?` record, for the same reason and with the same verdict:
+// what cannot be vouched for is never rendered as a number.
+
+/** Printed in place of a percentage whenever disk use cannot be measured. */
+export const DISK_UNMEASURED_LABEL = 'Not measured';
+
+export type DiskUnavailableReason =
+  /** The health record carries no disk object at all. */
+  | 'no-record'
+  /** Rust's `?` sentinel: the probe ran and reported nothing. */
+  | 'unprobed'
+  | 'unreadable';
+
+export type DiskReading =
+  | {
+      kind: 'measured';
+      reason: null;
+      percent: number;
+      label: string;
+      basis: null;
+      used: string;
+      total: string;
+      available: string;
+    }
+  | {
+      kind: 'unmeasured';
+      reason: DiskUnavailableReason;
+      /** Null, so no surface can print a number it does not have. */
+      percent: null;
+      label: string;
+      basis: string;
+      used: null;
+      total: null;
+      available: null;
+    };
+
+const DISK_BASIS: Record<DiskUnavailableReason, string> = {
+  'no-record': 'This system health record carries no disk reading, so disk use cannot be measured.',
+  unprobed: 'The disk probe reported no readable totals, so disk use cannot be measured.',
+  unreadable: 'The disk percentage in this system health record is not a readable measurement, so disk use cannot be measured.',
+};
+
+function diskUnavailable(reason: DiskUnavailableReason): DiskReading {
+  return { kind: 'unmeasured', reason, percent: null, label: DISK_UNMEASURED_LABEL, basis: DISK_BASIS[reason], used: null, total: null, available: null };
+}
+
+export function decodeDiskReading(value: unknown): DiskReading {
+  if (!isRecord(value)) return diskUnavailable('no-record');
+
+  const total = typeof value.total === 'string' ? value.total.trim() : '';
+  const used = typeof value.used === 'string' ? value.used.trim() : '';
+  const available = typeof value.available === 'string' ? value.available.trim() : '';
+  // `?` is Native's disk sentinel (commands/system.rs disk_health). Either an
+  // empty field or the sentinel means the probe did not report: a percentage
+  // without totals is no measurement.
+  if (total === '' || used === '' || total === '?' || used === '?') return diskUnavailable('unprobed');
+
+  const percentText = typeof value.use_percent === 'string' ? value.use_percent.trim() : '';
+  const numeric = percentText.endsWith('%') ? Number(percentText.slice(0, -1).trim()) : Number(percentText);
+  // The range check matches the shared `parsePercent` window so neither decoder
+  // invents a different one.
+  if (!Number.isFinite(numeric) || numeric < 0 || numeric > 100) return diskUnavailable('unreadable');
+
+  return {
+    kind: 'measured',
+    reason: null,
+    percent: numeric,
+    label: `${numeric.toFixed(1)}%`,
+    basis: null,
+    used,
+    total,
+    available,
+  };
+}

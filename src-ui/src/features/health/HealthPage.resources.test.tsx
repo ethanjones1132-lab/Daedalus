@@ -82,7 +82,7 @@ describe.each([
     expect(screen.getByText('test-model')).toBeInTheDocument();
     diagnostics();
     expect(screen.getByText('Synthetic check')).toBeInTheDocument();
-    expect(screen.getByText('30%')).toBeInTheDocument();
+    expect(screen.getByText('30.0%')).toBeInTheDocument();
     expect(screen.queryByText(/private native detail/)).not.toBeInTheDocument();
   });
 });
@@ -104,7 +104,7 @@ it('retains stale diagnostics through a failed refresh and pending recovery', as
   expect(screen.getByRole('button', { name: 'Restart Ollama' })).toBeInTheDocument();
   diagnostics();
   expect(screen.getByText('Synthetic check')).toBeInTheDocument();
-  expect(screen.getByText('30%')).toBeInTheDocument();
+  expect(screen.getByText('30.0%')).toBeInTheDocument();
   for (const label of ['System health', 'Doctor report']) expect(screen.getByRole('alert', { name: `${label} observation` })).toHaveTextContent(/stale/i);
   const pending = deferred(); invokeMock.mockReturnValue(pending.promise);
   fireEvent.click(screen.getByRole('button', { name: 'Retry Doctor report' }));
@@ -190,5 +190,27 @@ describe('Status panel', () => {
     } finally {
       errorLog.mockRestore();
     }
+  });
+
+  it('renders Native’s unmeasured resources as "Not measured", never as zero or green', async () => {
+    // The recordings-driven fixture: a zeroed memory record and a '?' disk
+    // record are sentinels, and the dials must print the shared label with the
+    // basis sentence instead of 0% measured in a muted tone.
+    invokeMock.mockImplementation((name: string) => Promise.resolve({
+      jarvis_check_status: status,
+      get_system_health: {
+        ...health,
+        memory: { total_mb: 0, available_mb: 0, used_mb: 0, used_percent: 0 },
+        disk: { total: '?', used: '?', available: '?', use_percent: '?' },
+      },
+      get_doctor_report: doctor,
+      get_build_info: cleanBuild,
+    }[name]));
+    render(<HealthPage />);
+    expect(await screen.findAllByText('Not measured')).toHaveLength(2);
+    expect(screen.getByText('The memory probe reported no total, so memory use cannot be measured.')).toBeInTheDocument();
+    expect(screen.getByText('The disk probe reported no readable totals, so disk use cannot be measured.')).toBeInTheDocument();
+    expect(screen.queryByText('0%')).not.toBeInTheDocument();
+    expect(screen.queryByText('0 MB used of 0 MB')).not.toBeInTheDocument();
   });
 });
