@@ -158,13 +158,31 @@ fn apply_profile_to_config(config: &mut JarvisConfig, profile: &ModelProfile) {
                 config.openrouter.api_key = profile.api_key.clone();
             }
         }
-        _ => {
+        "ollama" => {
             config.active_backend = JarvisBackend::Ollama;
             config.ollama.model = profile.model.clone();
             if !profile.api_base.is_empty() {
                 config.ollama.base_url = profile.api_base.clone();
             }
         }
+        // An unknown provider is rejected before any write (see
+        // `projected_backend`); never coerce it to a different engine here.
+        _ => {}
+    }
+}
+
+/// The backend a profile projects onto, or `None` for a provider this build
+/// cannot honour. Activation refuses an unknown provider instead of silently
+/// rewriting it as Ollama.
+fn projected_backend(profile: &ModelProfile) -> Option<JarvisBackend> {
+    if profile.engine == "claude_cli" {
+        return Some(JarvisBackend::ClaudeCli);
+    }
+    match profile.provider.as_str() {
+        "llama_cpp" => Some(JarvisBackend::LlamaCpp),
+        "openrouter" => Some(JarvisBackend::OpenRouter),
+        "ollama" => Some(JarvisBackend::Ollama),
+        _ => None,
     }
 }
 
@@ -209,6 +227,15 @@ pub fn set_active_profile_and_reconcile(
             },
         )
         .map_err(|e| format!("profile not found: {e}"))?;
+
+    // Validate the provider before any store write: an unknown provider must
+    // fail the activation, not be coerced into a different engine.
+    if projected_backend(&profile).is_none() {
+        return Err(format!(
+            "Profile '{}' names provider '{}', which this build cannot activate; nothing was changed.",
+            profile.name, profile.provider
+        ));
+    }
 
     tx.execute("UPDATE model_profiles SET is_active = 0", [])
         .map_err(|e| format!("failed to clear active profile: {e}"))?;
@@ -696,5 +723,26 @@ mod tests {
         assert_eq!(config.llama_cpp.model, "Qwen3.6-local.gguf");
         // An empty profile api_base means "keep the configured endpoint".
         assert_eq!(config.llama_cpp.base_url, "http://127.0.0.1:8080/v1");
+    }
+
+    #[test]
+    fn an_unknown_provider_fails_activation_without_rewriting_the_config() {
+        let db = mem_db();
+        let pid = insert_profile(&db, "mystery", "mystery_provider", "some-model");
+        let before = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
+
+        let err = set_active_profile_and_reconcile(&db, &pid).unwrap_err();
+        assert!(err.contains("cannot activate"), "{err}");
+
+        let after = load_jarvis_config_conn(&db.conn.lock().unwrap()).expect("load config");
+        assert_eq!(after.active_backend, before.active_backend);
+        assert_eq!(after.active_profile, before.active_profile);
+        let active: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM model_profiles WHERE is_active = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(active, 0, "no profile is marked active on a rejected activation");
     }
 }

@@ -2,7 +2,7 @@ import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToastProvider } from '../design';
 import { NavigationProvider } from './navigation';
-import { SIGNAL_POLL_INTERVAL_MS, useAppSignals } from './useAppSignals';
+import { SIGNAL_POLL_INTERVAL_MS, PROVEN_READ_FAILURE_THRESHOLD, useAppSignals } from './useAppSignals';
 
 const { invokeMock, listenMock } = vi.hoisted(() => ({ invokeMock: vi.fn(), listenMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -88,5 +88,66 @@ describe('alert delivery with poll fallback', () => {
     mount();
     await act(async () => {});
     expect(view()).toHaveTextContent('quiet');
+  });
+
+  it('withdraws a boot-time read proof only after consecutive poll failures', async () => {
+    vi.useFakeTimers();
+    let failing = false;
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_action_registry_alerts') {
+        return failing ? Promise.reject(new Error('private refusal')) : Promise.resolve([]);
+      }
+      if (command === 'list_pending_missed_jobs') return Promise.resolve([]);
+      return Promise.reject(new Error('unexpected command'));
+    });
+    mount();
+    await advance(0);
+    // Boot read delivered; the refused event path alone is not an outage.
+    expect(view()).toHaveTextContent('quiet');
+
+    // One isolated failure after a delivery is a hiccup, not a claim.
+    failing = true;
+    await advance(SIGNAL_POLL_INTERVAL_MS);
+    expect(view()).toHaveTextContent('quiet');
+
+    // A success re-proves the read.
+    failing = false;
+    await advance(SIGNAL_POLL_INTERVAL_MS);
+    expect(view()).toHaveTextContent('quiet');
+
+    failing = true;
+    for (let index = 0; index < PROVEN_READ_FAILURE_THRESHOLD - 1; index += 1) {
+      await advance(SIGNAL_POLL_INTERVAL_MS);
+    }
+    expect(view()).toHaveTextContent('quiet');
+    await advance(SIGNAL_POLL_INTERVAL_MS);
+    expect(view()).toHaveTextContent('unavailable');
+  });
+
+  it('re-announces an approval alert after it clears and later re-opens', async () => {
+    vi.useFakeTimers();
+    let phase: 'first' | 'cleared' | 'reopened' = 'first';
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'get_action_registry_alerts') {
+        if (phase === 'first') return Promise.resolve([alert({ created_at: '2026-10-11T00:00:00Z' })]);
+        if (phase === 'cleared') {
+          return Promise.resolve([alert({ created_at: '2026-10-11T00:00:00Z', superseded: true })]);
+        }
+        return Promise.resolve([alert({ created_at: '2026-10-12T00:00:00Z' })]);
+      }
+      if (command === 'list_pending_missed_jobs') return Promise.resolve([]);
+      return Promise.reject(new Error('unexpected command'));
+    });
+    mount();
+    await advance(0);
+    expect(screen.getAllByText('Two actions drifted.')).toHaveLength(1);
+
+    phase = 'cleared';
+    await advance(SIGNAL_POLL_INTERVAL_MS);
+    expect(screen.getAllByText('Two actions drifted.')).toHaveLength(1);
+
+    phase = 'reopened';
+    await advance(SIGNAL_POLL_INTERVAL_MS);
+    expect(screen.getAllByText('Two actions drifted.')).toHaveLength(2);
   });
 });

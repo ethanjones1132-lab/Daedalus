@@ -2,11 +2,18 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
-import { bunOrigin, DEFAULT_BUN_ORIGIN, resetBunOriginForTests, resolveBunOrigin } from './bun-origin';
+import {
+  BUN_ORIGIN_RETRY_MS,
+  bunOrigin,
+  DEFAULT_BUN_ORIGIN,
+  resetBunOriginForTests,
+  resolveBunOrigin,
+} from './bun-origin';
 
 afterEach(() => {
   resetBunOriginForTests();
   invokeMock.mockReset();
+  vi.useRealTimers();
 });
 
 describe('resolveBunOrigin', () => {
@@ -36,5 +43,32 @@ describe('bunOrigin', () => {
   it('uses the documented default when the resolver cannot answer', async () => {
     invokeMock.mockRejectedValue(new Error('no runtime'));
     expect(await bunOrigin()).toBe(DEFAULT_BUN_ORIGIN);
+  });
+
+  it('does not re-invoke the failed resolver on every fetch', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-30T00:00:00Z'));
+    invokeMock.mockRejectedValue(new Error('no runtime'));
+
+    expect(await bunOrigin()).toBe(DEFAULT_BUN_ORIGIN);
+    expect(await bunOrigin()).toBe(DEFAULT_BUN_ORIGIN);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(new Date(Date.parse('2026-10-30T00:00:00Z') + BUN_ORIGIN_RETRY_MS + 1));
+    expect(await bunOrigin()).toBe(DEFAULT_BUN_ORIGIN);
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries after the cooldown and then sticks once resolved', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-30T00:00:00Z'));
+    invokeMock.mockRejectedValueOnce(new Error('cold cache'));
+    expect(await bunOrigin()).toBe(DEFAULT_BUN_ORIGIN);
+
+    vi.setSystemTime(new Date(Date.parse('2026-10-30T00:00:00Z') + BUN_ORIGIN_RETRY_MS + 1));
+    invokeMock.mockResolvedValueOnce('http://192.168.1.20:19877');
+    expect(await bunOrigin()).toBe('http://192.168.1.20:19877');
+    expect(await bunOrigin()).toBe('http://192.168.1.20:19877');
+    expect(invokeMock).toHaveBeenCalledTimes(2);
   });
 });

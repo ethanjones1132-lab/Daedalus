@@ -511,16 +511,14 @@ pub async fn disable_cron_job(app: tauri::AppHandle, id: String) -> Result<bool,
 
     if affected > 0 {
         // Propagate to any in-flight execution. The disable itself already
-        // succeeded; the cancellation request is durable before signalling and
-        // returns false when no tracked execution could prove it stopped. An
-        // intent-persistence error is surfaced rather than silently dropped.
-        crate::cron_scheduler::request_cron_cancellation(&app, &id, "disabled").await?;
-
-        // A disabled job is resolved: it cannot be triggered or dismissed
-        // into usefulness, so a pending missed entry for it is cleared once
-        // the disable is confirmed — the page must not keep asking the
-        // operator to act on a job they already switched off.
+        // succeeded, and the job is resolved: release the pending missed entry
+        // even when the cancellation request cannot be persisted. Otherwise the
+        // timeline would keep demanding action on a job the operator just
+        // switched off.
+        let cancellation =
+            crate::cron_scheduler::request_cron_cancellation(&app, &id, "disabled").await;
         crate::cron_scheduler::release_pending_missed(&id);
+        cancellation?;
     }
 
     Ok(affected > 0)
@@ -598,7 +596,10 @@ pub async fn delete_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, 
 /// occurrence the job carried: the history now covers it, so the timeline
 /// should stop asking the operator to trigger or dismiss it.
 #[tauri::command]
-pub async fn run_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+pub async fn run_cron_job(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<crate::cron_scheduler::CronRunOutcome, String> {
     let schedule_expr = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -609,13 +610,13 @@ pub async fn run_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, Str
         )
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?
     };
-    let recorded =
+    let outcome =
         crate::cron_scheduler::execute_job_proving_run(&app, &id, &schedule_expr, "manual")
             .await?;
-    if recorded {
+    if outcome != crate::cron_scheduler::CronRunOutcome::AlreadyClaimed {
         crate::cron_scheduler::release_pending_missed(&id);
     }
-    Ok(recorded)
+    Ok(outcome)
 }
 
 /// Get run history for a specific cron job.
@@ -761,6 +762,9 @@ pub fn dismiss_missed_cron_job(app: tauri::AppHandle, id: String) -> Result<bool
 
 /// Trigger a pending missed cron job immediately.
 #[tauri::command]
-pub async fn trigger_missed_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+pub async fn trigger_missed_cron_job(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<crate::cron_scheduler::CronRunOutcome, String> {
     crate::cron_scheduler::trigger_missed_job(&app, &id).await
 }

@@ -42,7 +42,7 @@ export const INJECTION_REASON_LABELS: Record<InjectionReason, string> = {
 };
 
 export const INJECTION_BASIS =
-  "Evaluated against this Session's recall admission predicate (scope, status, tier, authority and expiry). It does not mean the current query matches.";
+  "Evaluated against the selected Session's recall admission predicate for the chosen scope. It does not mean the current query matches.";
 
 /**
  * Strict-enough decode of the read-only projection. A malformed read returns

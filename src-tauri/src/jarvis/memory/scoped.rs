@@ -627,6 +627,18 @@ fn excluded(reason: &str) -> AdmissionVerdict {
     }
 }
 
+/// The SQL predicate compares `m.project_root = ?` with the scope root or `''`,
+/// so SQL NULL never matches and `Some("")` matches an absent scope root. Mirror
+/// that exactly rather than comparing `Option`s, which disagrees on `Some("")`
+/// versus `None`.
+fn project_root_matches(entry: &Option<String>, scope: &Option<String>) -> bool {
+    match (entry, scope) {
+        (Some(entry_root), Some(scope_root)) => entry_root == scope_root,
+        (Some(entry_root), None) => entry_root.is_empty(),
+        (None, _) => false,
+    }
+}
+
 /// Mirror of `recall_scope_predicate` at the row level. The SQL predicate and
 /// this function must stay in lockstep; the recall path applies SQL first and
 /// this predicate again during admission, while the injectability projection
@@ -641,7 +653,7 @@ fn entry_scope_matches(entry: &ScopedMemoryEntry, scope: &MemoryScope, include_u
         MemoryScopeKind::Project => {
             (entry_scope.kind == MemoryScopeKind::Project
                 && entry_scope.agent_id == scope.agent_id
-                && entry_scope.project_root == scope.project_root)
+                && project_root_matches(&entry_scope.project_root, &scope.project_root))
                 || (entry_scope.kind == MemoryScopeKind::Agent
                     && entry_scope.agent_id == scope.agent_id)
                 || user_match
@@ -1439,5 +1451,150 @@ mod injectability_tests {
                 .any(|entry| entry.memory.entry.id == row.id);
             assert_eq!(row.admitted, recalled, "disagreement for {}", row.id);
         }
+    }
+
+    fn scoped_entry(scope: MemoryScope) -> ScopedMemoryEntry {
+        ScopedMemoryEntry {
+            entry: super::engine::MemoryEntry {
+                id: "m".to_string(),
+                title: "t".to_string(),
+                content: "c".to_string(),
+                tags: "[]".to_string(),
+                category: "project".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                relevance_score: 0.0,
+                agent_id: scope.agent_id.clone(),
+                source: "manual".to_string(),
+                source_session_id: None,
+                source_message_ids: "[]".to_string(),
+                confidence: 0.9,
+                last_used_at: None,
+                usage_count: 0,
+                expires_at: None,
+                review_after: None,
+                status: "active".to_string(),
+                supersedes_id: None,
+                metadata: None,
+                tier: "hot".to_string(),
+                drive_file_id: None,
+                summary: String::new(),
+                archived_at: None,
+                updated_at_ms: 0,
+            },
+            scope,
+            authority_kind: AuthorityKind::Manual,
+            statement_kind: MemoryStatementKind::Unknown,
+            source_run_id: None,
+            verified_at: None,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn scope_matching_mirrors_the_sql_edges_across_all_scope_kinds() {
+        let scope_with_root = MemoryScope::project("agent-a", "/p");
+        let scope_without_root = MemoryScope {
+            kind: MemoryScopeKind::Project,
+            agent_id: "agent-a".to_string(),
+            project_root: None,
+        };
+        let agent_scope = MemoryScope {
+            kind: MemoryScopeKind::Agent,
+            agent_id: "agent-a".to_string(),
+            project_root: None,
+        };
+        let user_scope = MemoryScope {
+            kind: MemoryScopeKind::User,
+            agent_id: String::new(),
+            project_root: None,
+        };
+        let legacy_scope = MemoryScope {
+            kind: MemoryScopeKind::LegacyUnscoped,
+            agent_id: String::new(),
+            project_root: None,
+        };
+
+        // Project scope: the exact root, an agent-scoped row for the same agent,
+        // and (only when asked) user scope.
+        assert!(entry_scope_matches(
+            &scoped_entry(MemoryScope::project("agent-a", "/p")),
+            &scope_with_root,
+            false
+        ));
+        assert!(entry_scope_matches(
+            &scoped_entry(MemoryScope {
+                kind: MemoryScopeKind::Agent,
+                agent_id: "agent-a".to_string(),
+                project_root: None,
+            }),
+            &scope_with_root,
+            false
+        ));
+        assert!(!entry_scope_matches(
+            &scoped_entry(MemoryScope::project("agent-b", "/p")),
+            &scope_with_root,
+            false
+        ));
+        assert!(!entry_scope_matches(
+            &scoped_entry(MemoryScope::project("agent-a", "/other")),
+            &scope_with_root,
+            false
+        ));
+
+        // SQL edge: `Some("")` matches a scope with no root ('' = ''),
+        // but SQL NULL never matches.
+        assert!(entry_scope_matches(
+            &scoped_entry(MemoryScope {
+                kind: MemoryScopeKind::Project,
+                agent_id: "agent-a".to_string(),
+                project_root: Some(String::new()),
+            }),
+            &scope_without_root,
+            false
+        ));
+        assert!(!entry_scope_matches(
+            &scoped_entry(MemoryScope {
+                kind: MemoryScopeKind::Project,
+                agent_id: "agent-a".to_string(),
+                project_root: None,
+            }),
+            &scope_without_root,
+            false
+        ));
+
+        // User scope is included only on request, and only for the empty agent.
+        let user_entry = scoped_entry(user_scope.clone());
+        assert!(!entry_scope_matches(&user_entry, &scope_with_root, false));
+        assert!(entry_scope_matches(&user_entry, &scope_with_root, true));
+        assert!(entry_scope_matches(&user_entry, &user_scope, false));
+
+        // Agent scope matches agent rows only (plus requested user scope).
+        assert!(entry_scope_matches(
+            &scoped_entry(MemoryScope {
+                kind: MemoryScopeKind::Agent,
+                agent_id: "agent-a".to_string(),
+                project_root: None,
+            }),
+            &agent_scope,
+            false
+        ));
+        assert!(!entry_scope_matches(
+            &scoped_entry(MemoryScope::project("agent-a", "/p")),
+            &agent_scope,
+            false
+        ));
+
+        // Legacy scope remains its own namespace.
+        assert!(entry_scope_matches(
+            &scoped_entry(legacy_scope.clone()),
+            &legacy_scope,
+            false
+        ));
+        assert!(!entry_scope_matches(
+            &scoped_entry(legacy_scope),
+            &scope_with_root,
+            false
+        ));
     }
 }

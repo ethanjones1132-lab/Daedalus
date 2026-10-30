@@ -122,7 +122,7 @@ describe('CronTimeline', () => {
       expect(onSelect).toHaveBeenCalledWith(name);
     }
     expect(
-      screen.getByText(/No enabled run is scheduled in the next 24 hours: 2 enabled jobs blocked on a missed run/),
+      screen.getByText(/No enabled run is scheduled in the next 24 hours\. 2 enabled jobs blocked on a missed run/),
     ).toBeInTheDocument();
     expect(screen.getByText(/that awaits trigger or dismissal/)).toBeInTheDocument();
   });

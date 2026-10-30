@@ -20,7 +20,6 @@ use crate::wsl::wsl_home;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use tauri::State;
 use tokio::sync::Mutex;

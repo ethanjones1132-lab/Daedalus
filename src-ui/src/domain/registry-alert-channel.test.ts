@@ -163,9 +163,10 @@ describe('alert channel projection', () => {
     expect(projectAlertChannel(settled({ [ALERTS_READ]: 'failed', [ALERTS_EVENTS]: 'subscribed' })).status).toBe('quiet');
   });
 
-  it('claims unreachability only when both delivery paths of a subject are proven dead', () => {
+  it('claims unreachability only when both delivery paths of a subject are proven dead, naming only that subject', () => {
     const alertsView = projectAlertChannel(settled({ [ALERTS_READ]: 'failed', [ALERTS_EVENTS]: 'failed' }));
     expect(alertsView.status).toBe('unavailable');
+    expect(alertsView.message).toBe('Action registry alerts cannot reach you right now.');
     expect(alertsView.reasons).toEqual([
       ALERT_CHANNEL_REASONS[ALERTS_READ],
       ALERT_CHANNEL_REASONS[ALERTS_EVENTS],
@@ -173,10 +174,18 @@ describe('alert channel projection', () => {
 
     const missedView = projectAlertChannel(settled({ [MISSED_READ]: 'failed', [MISSED_EVENTS]: 'failed' }));
     expect(missedView.status).toBe('unavailable');
+    expect(missedView.message).toBe('Missed-cron alerts cannot reach you right now.');
     expect(missedView.reasons).toEqual([
       ALERT_CHANNEL_REASONS[MISSED_READ],
       ALERT_CHANNEL_REASONS[MISSED_EVENTS],
     ]);
+
+    const both = projectAlertChannel(settled({
+      [ALERTS_READ]: 'failed', [ALERTS_EVENTS]: 'failed',
+      [MISSED_READ]: 'failed', [MISSED_EVENTS]: 'failed',
+    }));
+    expect(both.message).toBe(ALERT_CHANNEL_HEADLINE);
+    expect(both.reasons).toHaveLength(4);
   });
 
   it('keeps the two subjects independent: one dead pair does not announce the other', () => {

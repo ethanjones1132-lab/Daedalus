@@ -96,7 +96,7 @@ pub fn set_setting_value(db: &AppDb, key: &str, value: &str) -> Result<(), Strin
     // and the value reloaded here is the one just written (SQLite is canonical).
     // In unit-test mode we skip the filesystem side effect, as elsewhere.
     #[cfg(not(test))]
-    crate::jarvis::save_jarvis_config(&load_jarvis_config(db)?);
+    crate::jarvis::save_jarvis_config(&load_jarvis_config(db)?)?;
     Ok(())
 }
 

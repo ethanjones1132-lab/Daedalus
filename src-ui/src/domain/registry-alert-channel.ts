@@ -100,17 +100,14 @@ export function reduceAlertChannel(
 }
 
 export function projectAlertChannel(state: AlertChannelState): AlertChannelView {
-  const reasons: string[] = [];
-  for (const { read, events } of DELIVERY_CHAINS) {
-    // Both paths of a subject must be *proven* dead before the banner may
-    // claim that subject's alerts cannot reach the operator. A failed read
-    // with a merely-subscribed event channel is an unknown, and a proven
-    // read delivery silences a refused subscription outright.
-    if (state.channels[read] !== 'failed') continue;
-    if (state.channels[events] !== 'failed') continue;
-    reasons.push(ALERT_CHANNEL_REASONS[read], ALERT_CHANNEL_REASONS[events]);
-  }
-  if (reasons.length === 0) {
+  // Both paths of a subject must be *proven* dead before the banner may
+  // claim that subject's alerts cannot reach the operator. A failed read
+  // with a merely-subscribed event channel is an unknown, and a proven
+  // read delivery silences a refused subscription outright.
+  const deadChains = DELIVERY_CHAINS.filter(
+    ({ read, events }) => state.channels[read] === 'failed' && state.channels[events] === 'failed',
+  );
+  if (deadChains.length === 0) {
     return {
       status: 'quiet',
       message: null,
@@ -119,9 +116,20 @@ export function projectAlertChannel(state: AlertChannelState): AlertChannelView 
       busy: state.channels['alerts-read'] === 'pending',
     };
   }
+  const reasons = deadChains.flatMap(({ read, events }) => [
+    ALERT_CHANNEL_REASONS[read],
+    ALERT_CHANNEL_REASONS[events],
+  ]);
+  // Name only the subjects that are actually unreachable: "and missed-cron"
+  // must not appear when the registry chain still works.
+  const message = deadChains.length === DELIVERY_CHAINS.length
+    ? ALERT_CHANNEL_HEADLINE
+    : deadChains[0].read === 'alerts-read'
+      ? 'Action registry alerts cannot reach you right now.'
+      : 'Missed-cron alerts cannot reach you right now.';
   return {
     status: 'unavailable',
-    message: ALERT_CHANNEL_HEADLINE,
+    message,
     reasons,
     retryLabel: RETRY_LABEL,
     // Only the boot read gates the button: the operator cannot re-read what is

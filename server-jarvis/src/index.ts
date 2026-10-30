@@ -73,7 +73,7 @@ import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
 import { createLifecycleService, validateLifecycleSnapshot, type LifecycleService, type LifecycleSnapshot } from "./agent-lifecycle";
 import { createBoundaryProjectionStore } from "./activation-boundary";
-import { handleAgentRequest, reportAgentsRoot } from "./agent-routes";
+import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { logReadResponse, readLogTail } from "./log-read";
@@ -6580,10 +6580,25 @@ export async function baseFetch(req: Request): Promise<Response> {
       );
       return Response.json(perf);
     }
-    const agentsLifecycle = currentAgentLifecycle();
-    const agentResponse = await handleAgentRequest(req, agentsLifecycle.service, reportAgentsRoot(agentsLifecycle.service, agentsLifecycle.resolved_path, agentsLifecycle.declared));
-    if (agentResponse) {
-      return agentResponse;
+    if (isAgentRoute(path)) {
+      const agentsLifecycle = currentAgentLifecycle();
+      // The live /agents read builds the lifecycle once and reuses that scan for
+      // both the root report and the list; other agent routes scan in the
+      // handler. Unrelated routes never pay a root scan.
+      const isList = req.method === "GET" && path === "/agents";
+      const scan = isList ? agentsLifecycle.service.scan() : undefined;
+      const root = isList
+        ? reportAgentsRoot(
+            agentsLifecycle.service,
+            agentsLifecycle.resolved_path,
+            agentsLifecycle.declared,
+            scan,
+          )
+        : undefined;
+      const agentResponse = await handleAgentRequest(req, agentsLifecycle.service, root, scan);
+      if (agentResponse) {
+        return agentResponse;
+      }
     }
     if (path === "/agents/pool" && req.method === "GET") {
       const poolCfg = loadConfig();

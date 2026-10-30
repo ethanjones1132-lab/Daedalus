@@ -163,6 +163,17 @@ fn resolve_repo_root(configured: &str) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+fn bucket_rows(parsed: serde_json::Value) -> Vec<serde_json::Value> {
+    match parsed {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(mut map) => match map.remove("actions") {
+            Some(serde_json::Value::Array(rows)) => rows,
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
 /// Read an action bucket file. Tolerant of both the `{ "actions": [...] }` object
 /// shape written by the Python adapter and a bare `[...]` array; a missing file is
 /// an empty bucket, not an error. Individual rows that fail to match `RegistryAction`
@@ -175,19 +186,29 @@ fn read_bucket(path: &Path) -> Result<Vec<RegistryAction>, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
 
-    let rows = match parsed {
-        serde_json::Value::Array(rows) => rows,
-        serde_json::Value::Object(mut map) => match map.remove("actions") {
-            Some(serde_json::Value::Array(rows)) => rows,
-            _ => vec![],
-        },
-        _ => vec![],
-    };
-
-    Ok(rows
+    Ok(bucket_rows(parsed)
         .into_iter()
         .filter_map(|value| serde_json::from_value::<RegistryAction>(value).ok())
         .collect())
+}
+
+/// Like `read_bucket`, but any row that does not deserialize makes the whole
+/// bucket unreadable. Reconciliation uses this: one malformed row must not be
+/// silently dropped and then read as "this action is no longer pending".
+fn read_bucket_strict(path: &Path) -> Result<Vec<RegistryAction>, String> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    bucket_rows(parsed)
+        .into_iter()
+        .map(|value| {
+            serde_json::from_value::<RegistryAction>(value)
+                .map_err(|_| format!("parse {}: invalid action row", path.display()))
+        })
+        .collect()
 }
 
 fn read_alerts(path: &Path) -> Vec<ActionRegistryAlert> {
@@ -375,10 +396,13 @@ pub fn get_action_registry_bucket(
 /// genuinely pending approval. A missing bucket file is an authoritative empty
 /// bucket (`read_bucket`), not a failure.
 fn reconcile_alert_supersession(alerts: &mut [ActionRegistryAlert], data_dir: &Path) {
-    let active = read_bucket(&data_dir.join("active.json"));
-    let blocked = read_bucket(&data_dir.join("blocked.json"));
-    let done = read_bucket(&data_dir.join("done.json"));
-    let (Ok(active), Ok(blocked), Ok(_done)) = (active, blocked, done) else {
+    // Only the pending buckets decide supersession: `approval_required` alerts
+    // concern approvals, and an action is pending exactly when active.json or
+    // blocked.json still names it. A malformed row anywhere in either file makes
+    // that bucket unreadable and the verdict unknown.
+    let active = read_bucket_strict(&data_dir.join("active.json"));
+    let blocked = read_bucket_strict(&data_dir.join("blocked.json"));
+    let (Ok(active), Ok(blocked)) = (active, blocked) else {
         return;
     };
 
@@ -392,9 +416,8 @@ fn reconcile_alert_supersession(alerts: &mut [ActionRegistryAlert], data_dir: &P
         fn find<'a>(needle: &str, actions: &'a [RegistryAction]) -> Option<&'a RegistryAction> {
             actions.iter().find(|a| a.id == needle)
         }
-        // The done bucket already participated through the fail-open gate; the
-        // pending buckets decide, and absence from both still means nothing is
-        // pending (completed actions are not read here, only their absence).
+        // Found and approved/waived/no longer approval-gated: resolved. Absent
+        // from both pending buckets: nothing pends, so the alert is historical.
         let superseded = find(action_id, &active)
             .or_else(|| find(action_id, &blocked))
             .is_none_or(|action| {
@@ -1042,6 +1065,29 @@ mod tests {
         reconcile_alert_supersession(&mut alerts, &dir);
 
         assert_eq!(alerts[0].superseded, None, "unreadable buckets never supersede");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_row_in_a_pending_bucket_fails_open() {
+        // A skipped row must not become "absent, therefore not pending": one
+        // malformed row makes the verdict unknown, so the genuinely pending
+        // approval keeps its alert active.
+        let dir = reconcile_fixture("partial", r#"{"actions":[]}"#);
+        let approved = pending_row("a1").replace(r#""approval_status":"pending""#, r#""approval_status":"approved""#);
+        std::fs::write(
+            dir.join("active.json"),
+            format!(r#"[{}, {{"not":"an action"}}]"#, approved),
+        )
+        .unwrap();
+        let mut alerts = vec![approval_alert("a1")];
+
+        reconcile_alert_supersession(&mut alerts, &dir);
+
+        assert_eq!(
+            alerts[0].superseded, None,
+            "a partially unreadable bucket never supersedes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

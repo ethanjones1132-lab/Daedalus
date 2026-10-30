@@ -23,6 +23,7 @@ import {
   cn,
   useToast,
 } from '../workflows/primitives';
+import { decodeCronRunOutcome } from './cron-model';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -1100,7 +1101,7 @@ function CronJobCard({
 // ── Main CronView ────────────────────────────────────────────────────────────
 
 export default function CronView() {
-  const { success } = useToast();
+  const { success, info, warn } = useToast();
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const jobsRef = useRef<CronJob[]>([]);
   const [inFlightIds, setInFlightIds] = useState<Set<string>>(new Set());
@@ -1281,7 +1282,7 @@ export default function CronView() {
     return result;
   }, []);
 
-  const applyOperationSnapshot = useCallback((result: CronReadResult) => {
+  const applyOperationSnapshot = useCallback((result: CronReadResult, announce = true) => {
     if (result.status !== 'success' || !result.snapshot) return;
     const { snapshot } = result;
     const reconciliation = reconcileCronOperations(snapshot.jobs, operationsRef.current, snapshot.requestId);
@@ -1296,6 +1297,7 @@ export default function CronView() {
     setLoading(false);
     setRefreshing(false);
     setError(null);
+    if (!announce) return;
     for (const confirmed of reconciliation.confirmed) {
       success(cronOperationSuccessText(confirmed.operation), 'Cron Job Updated');
     }
@@ -1323,10 +1325,13 @@ export default function CronView() {
 
     try {
       let result: unknown;
+      let runOutcome: ReturnType<typeof decodeCronRunOutcome> = null;
       if (kind === 'toggle') {
         result = await invoke<boolean>(job.enabled ? 'disable_cron_job' : 'enable_cron_job', { id: job.id });
       } else if (kind === 'run') {
-        result = await invoke<boolean>('run_cron_job', { id: job.id });
+        runOutcome = decodeCronRunOutcome(await invoke<unknown>('run_cron_job', { id: job.id }));
+        if (runOutcome === null) throw new Error('Cron run outcome was not confirmed');
+        result = true;
       } else if (kind === 'cancel') {
         result = await invoke<boolean>('cancel_cron_job', { id: job.id });
       } else {
@@ -1352,7 +1357,25 @@ export default function CronView() {
         publishOperations(next);
         await refreshAfterCancel();
         return;
-      } else if (result !== true) {
+      }
+      if (kind === 'run' && runOutcome !== null && runOutcome !== 'ran') {
+        // No new run was recorded: the occurrence was already held, or a
+        // recorded run was cancelled. Reconcile without claiming it ran.
+        const reconciling = transitionCronOperation(operation, 'write-succeeded');
+        if (!reconciling) return;
+        publishOperations({ ...operationsRef.current, [job.id]: reconciling });
+        applyOperationSnapshot(await readOperationSnapshot(), false);
+        if (runOutcome === 'already_claimed') {
+          info(
+            `No new run was recorded for "${job.name}": this occurrence was already claimed.`,
+            'Nothing New To Run',
+          );
+        } else {
+          warn(`The run for "${job.name}" was cancelled; no completed run was recorded.`, 'Run Cancelled');
+        }
+        return;
+      }
+      if (result !== true) {
         throw new Error('Cron operation was not confirmed');
       }
     } catch {
@@ -1365,7 +1388,7 @@ export default function CronView() {
     if (!reconciling) return;
     publishOperations({ ...operationsRef.current, [job.id]: reconciling });
     await reconcileOperation(reconciling);
-  }, [invalidateResourceReads, publishOperations, reconcileOperation, refreshAfterCancel]);
+  }, [invalidateResourceReads, publishOperations, reconcileOperation, refreshAfterCancel, applyOperationSnapshot, readOperationSnapshot, info, warn]);
 
   const handleToggle = useCallback((job: CronJob) => {
     void handleOperation('toggle', job);
@@ -1566,7 +1589,7 @@ export default function CronView() {
     setError(null);
   }, [publishOperations, updateJobs, updatePendingMissed]);
 
-  const reconcileMissedOperation = useCallback(async (operation: MissedOperation) => {
+  const reconcileMissedOperation = useCallback(async (operation: MissedOperation, announce = true) => {
     const result = await readOperationSnapshot();
     if (result.status === 'stale') return;
     if (result.status === 'failure' || !result.snapshot) {
@@ -1592,6 +1615,7 @@ export default function CronView() {
     if (current.ids.every(id => !pendingIds.has(id))) {
       const name = previousNames.get(current.ids[0]);
       publishMissedOperation(null);
+      if (!announce) return;
       if (current.kind === 'dismiss-all') {
         success('All missed jobs dismissed.', 'Missed Jobs Dismissed');
       } else if (current.kind === 'trigger') {
@@ -1615,23 +1639,43 @@ export default function CronView() {
     publishMissedOperation(operation);
     const results = await Promise.all(ids.map(async id => {
       try {
-        const command = kind === 'trigger' ? 'trigger_missed_cron_job' : 'dismiss_missed_cron_job';
-        return { id, ok: await invoke<boolean>(command, { id }) === true };
+        if (kind === 'trigger') {
+          const outcome = decodeCronRunOutcome(await invoke<unknown>('trigger_missed_cron_job', { id }));
+          if (outcome === null) return { id, outcome: 'failed' as const };
+          return { id, outcome };
+        }
+        const dismissed = await invoke<boolean>('dismiss_missed_cron_job', { id }) === true;
+        return { id, outcome: dismissed ? 'ran' as const : 'failed' as const };
       } catch {
-        return { id, ok: false };
+        return { id, outcome: 'failed' as const };
       }
     }));
-    const failedIds = results.filter(result => !result.ok).map(result => result.id);
+    const failedIds = results.filter(result => result.outcome === 'failed').map(result => result.id);
     if (failedIds.length > 0) {
       const failed = { ...operation, phase: 'write-failed' as const, failedIds };
       publishMissedOperation(failed);
       if (kind === 'dismiss-all') await reconcileMissedOperation(failed);
       return;
     }
+    const alreadyClaimed = results.filter(result => result.outcome === 'already_claimed').map(result => result.id);
+    if (kind === 'trigger' && alreadyClaimed.length > 0) {
+      const read = await readOperationSnapshot();
+      if (read.status === 'success' && read.snapshot) updateFromSnapshot(read.snapshot);
+      publishMissedOperation(null);
+      info(
+        'No new run was recorded: this missed occurrence was already claimed. The pending entry remains.',
+        'Nothing New To Run',
+      );
+      return;
+    }
+    const cancelled = results.some(result => result.outcome === 'cancelled');
     const reconciling = { ...operation, phase: 'reconciling' as const };
     publishMissedOperation(reconciling);
-    await reconcileMissedOperation(reconciling);
-  }, [invalidateResourceReads, publishMissedOperation, reconcileMissedOperation]);
+    await reconcileMissedOperation(reconciling, !cancelled);
+    if (cancelled) {
+      warn('The missed run was cancelled; no completed run was recorded.', 'Run Cancelled');
+    }
+  }, [invalidateResourceReads, publishMissedOperation, reconcileMissedOperation, readOperationSnapshot, updateFromSnapshot, info, warn]);
 
   const handleTriggerMissed = useCallback((id: string) => {
     void executeMissedMutation('trigger', [id]);

@@ -37,6 +37,7 @@ import {
   type TrustedManifestSummary,
 } from '../../domain/trusted-receipt-state';
 import type { GoalNotificationSelector, WorkflowDestination, WorkflowNavigationSelector } from '../../domain/types';
+import { decodeCronRunOutcome } from '../cron/cron-model';
 import WorkflowReadinessPanel, { type WorkflowReadinessItem } from './WorkflowReadinessPanel';
 
 interface Goal {
@@ -214,7 +215,7 @@ interface LinkOp {
 }
 
 type ScheduleOpKind = 'pause' | 'resume' | 'run' | 'cancel';
-type ScheduleOpPhase = 'writing' | 'write-failed' | 'read-failed';
+type ScheduleOpPhase = 'writing' | 'write-failed' | 'read-failed' | 'no-op';
 
 interface ScheduleOp {
   kind: ScheduleOpKind;
@@ -1823,16 +1824,20 @@ export default function GoalsView({
       };
 
       let confirmed: boolean;
+      let runOutcome: ReturnType<typeof decodeCronRunOutcome> = null;
       try {
-        const command =
-          kind === 'pause'
-            ? 'disable_cron_job'
-            : kind === 'resume'
-              ? 'enable_cron_job'
-              : kind === 'cancel'
-                ? 'cancel_cron_job'
-                : 'run_cron_job';
-        confirmed = (await invoke<boolean>(command, { id: job.id })) === true;
+        if (kind === 'run') {
+          runOutcome = decodeCronRunOutcome(await invoke<unknown>('run_cron_job', { id: job.id }));
+          confirmed = runOutcome !== null;
+        } else {
+          const command =
+            kind === 'pause'
+              ? 'disable_cron_job'
+              : kind === 'resume'
+                ? 'enable_cron_job'
+                : 'cancel_cron_job';
+          confirmed = (await invoke<boolean>(command, { id: job.id })) === true;
+        }
       } catch (err) {
         fail(
           typeof err === 'string'
@@ -1855,6 +1860,31 @@ export default function GoalsView({
             ? 'Cancellation was requested but the running execution did not confirm it. The run may still be active; reconcile the activation history.'
             : `The native authority did not confirm the ${scheduleOpVerb(kind)} request.`,
         );
+        return;
+      }
+
+      if (kind === 'run' && runOutcome !== null && runOutcome !== 'ran') {
+        // Nothing new ran: the scheduler already held this occurrence, or a
+        // recorded run was cancelled. Refresh, then report it as a resolved
+        // no-op instead of waiting for a run effect that will not appear.
+        await refreshScheduleState(goalId, expectedRequest);
+        if (
+          selectedIdRef.current !== goalId ||
+          expectedRequest !== detailRequestId.current
+        ) {
+          return;
+        }
+        scheduleOpsRef.current = {
+          ...scheduleOpsRef.current,
+          [job.id]: {
+            ...op,
+            phase: 'no-op',
+            message: runOutcome === 'already_claimed'
+              ? 'No new run was recorded: this occurrence was already claimed or is already running.'
+              : 'The run was cancelled; no completed run was recorded.',
+          },
+        };
+        setScheduleOps(scheduleOpsRef.current);
         return;
       }
 
@@ -2652,7 +2682,7 @@ export default function GoalsView({
     } else {
       const ops = Object.values(scheduleOps);
       const writing = ops.some((op) => op.phase === 'writing');
-      const uncertain = ops.some((op) => op.phase !== 'writing');
+      const uncertain = ops.some((op) => op.phase !== 'writing' && op.phase !== 'no-op');
       const claimStates = Object.values(activations)
         .flat()
         .map((activation) => activation.claim_state);
@@ -3689,13 +3719,22 @@ export default function GoalsView({
                               {'Submitting and confirming the authoritative schedule state…'}
                             </div>
                           )}
-                          {op && (op.phase === 'write-failed' || op.phase === 'read-failed') && (
-                            <div role="alert" className="mt-1.5 text-[11px] text-red-200">
+                          {op && (op.phase === 'write-failed' || op.phase === 'read-failed' || op.phase === 'no-op') && (
+                            <div
+                              role={op.phase === 'no-op' ? 'status' : 'alert'}
+                              className={
+                                op.phase === 'no-op'
+                                  ? 'mt-1.5 text-[11px] text-ink/60'
+                                  : 'mt-1.5 text-[11px] text-red-200'
+                              }
+                            >
                               {op.message}
-                              <div className="mt-0.5 text-ink/40">
-                                The mutation is not re-submitted automatically. Use Refresh above to
-                                re-read the authoritative schedule state.
-                              </div>
+                              {op.phase !== 'no-op' && (
+                                <div className="mt-0.5 text-ink/40">
+                                  The mutation is not re-submitted automatically. Use Refresh above to
+                                  re-read the authoritative schedule state.
+                                </div>
+                              )}
                             </div>
                           )}
 

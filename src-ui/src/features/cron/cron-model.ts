@@ -356,6 +356,22 @@ export function cronOperationSuccessText(operation: CronOperation<CronJob>): str
   return `Cron job "${operation.row.name}" ${operation.targetEnabled ? 'enabled' : 'disabled'}.`;
 }
 
+/**
+ * What `run_cron_job` / `trigger_missed_cron_job` actually did. `already_claimed`
+ * means no new run was recorded — the occurrence was already held — and must
+ * not be rendered as a failure. The legacy boolean shapes are accepted so an
+ * older native build still decodes: `true` was "a run was recorded", `false`
+ * was "nothing new ran".
+ */
+export type CronRunOutcome = 'ran' | 'already_claimed' | 'cancelled';
+
+export function decodeCronRunOutcome(value: unknown): CronRunOutcome | null {
+  if (value === true) return 'ran';
+  if (value === false) return 'already_claimed';
+  if (value === 'ran' || value === 'already_claimed' || value === 'cancelled') return value;
+  return null;
+}
+
 export function missedOperationStatusText(operation: MissedOperation): string {
   if (operation.phase === 'reconciling') return 'Missed cron action was saved. Confirming the pending list…';
   if (operation.phase === 'read-failed') return 'Confirming the pending missed cron list…';

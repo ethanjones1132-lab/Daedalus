@@ -12,6 +12,15 @@ import { useNavigation } from './navigation';
 export const SIGNAL_POLL_INTERVAL_MS = 60_000;
 
 /**
+ * A read path that delivered earlier keeps its channel proven across an
+ * isolated failed poll — a single hiccup is not an outage. After this many
+ * consecutive failures, the proof is withdrawn and the failure is dispatched,
+ * so a read that dies after a successful boot can still raise the banner once
+ * the event path is also proven dead.
+ */
+export const PROVEN_READ_FAILURE_THRESHOLD = 3;
+
+/**
  * App-level Tauri signals that must surface no matter which page is open:
  *
  *  - `action-registry://alerts` (plus periodic `get_action_registry_alerts`
@@ -40,8 +49,9 @@ export function useAppSignals() {
   const navigateRef = useRef(navigate);
   toastRef.current = toast;
   navigateRef.current = navigate;
-  // Content identity, not attempt identity: one toast per alert/job per session.
-  const notifiedAlertIds = useRef(new Set<string>());
+  // Content identity, not attempt identity: one toast per alert (id + creation)
+  // or job per session, so a later record with the same id can be announced.
+  const notifiedAlertKeys = useRef(new Set<string>());
   const notifiedMissedIds = useRef(new Set<string>());
   const attemptRef = useRef(attempt);
   attemptRef.current = attempt;
@@ -52,9 +62,11 @@ export function useAppSignals() {
     dispatchChannel({ type: 'begin', attempt });
     const unsubs: Array<() => void> = [];
     // Within one attempt, a read that has delivered keeps its channel proven; a
-    // later failed poll can announce nothing new. Proven-ness is reset by a
-    // Retry, which also re-arms every channel.
+    // single later failed poll can announce nothing new. Proven-ness is
+    // withdrawn after PROVEN_READ_FAILURE_THRESHOLD consecutive failures, and a
+    // Retry re-arms every channel.
     const provenReads = { alerts: false, missed: false };
+    const readFailures = { alerts: 0, missed: 0 };
 
     const track = (pending: Promise<() => void>, channelId?: AlertChannelId) => {
       void Promise.resolve(pending)
@@ -82,12 +94,24 @@ export function useAppSignals() {
     };
 
     /** Announce only registry alerts never announced this session. */
+    const alertKey = (alert: ActionRegistryAlert) => `${alert.id}:${alert.created_at}`;
     const deliverAlerts = (alerts: ActionRegistryAlert[]) => {
+      // A superseded record no longer names a pending approval. Forget its
+      // announcements so a later re-open of the same action can be toasted,
+      // even if the adapter reuses the alert id.
+      for (const alert of alerts) {
+        if (alert.superseded !== true) continue;
+        for (const key of Array.from(notifiedAlertKeys.current)) {
+          if (key.startsWith(`${alert.id}:`)) notifiedAlertKeys.current.delete(key);
+        }
+      }
       // Superseded alerts are history, not something to act on: the native read
       // proved their approval no longer pends, so they are never toasted. An
       // unknown verdict (no flag) stays active — absence is not clearance.
-      const fresh = alerts.filter((alert) => alertIsActive(alert) && !notifiedAlertIds.current.has(alert.id));
-      for (const alert of fresh) notifiedAlertIds.current.add(alert.id);
+      const fresh = alerts.filter(
+        (alert) => alertIsActive(alert) && !notifiedAlertKeys.current.has(alertKey(alert)),
+      );
+      for (const alert of fresh) notifiedAlertKeys.current.add(alertKey(alert));
       if (fresh.length > 0) showRegistryAlert(fresh);
     };
 
@@ -114,11 +138,17 @@ export function useAppSignals() {
         const value = await invoke<unknown>('get_action_registry_alerts');
         if (disposed) return;
         provenReads.alerts = true;
+        readFailures.alerts = 0;
         dispatchChannel({ type: 'live', attempt, channel: 'alerts-read' });
         const alerts = parseActionRegistryAlerts(value);
         if (alerts.length > 0) deliverAlerts(alerts);
       } catch {
-        if (!disposed && !provenReads.alerts) {
+        if (disposed) return;
+        readFailures.alerts += 1;
+        if (!provenReads.alerts || readFailures.alerts >= PROVEN_READ_FAILURE_THRESHOLD) {
+          // The proof is withdrawn: from here a failure is a failure, and the
+          // channel only clears on the next successful read.
+          provenReads.alerts = false;
           dispatchChannel({ type: 'failed', attempt, channel: 'alerts-read' });
         }
       }
@@ -129,10 +159,14 @@ export function useAppSignals() {
         const value = await invoke<unknown>('list_pending_missed_jobs');
         if (disposed) return;
         provenReads.missed = true;
+        readFailures.missed = 0;
         dispatchChannel({ type: 'live', attempt, channel: 'missed-read' });
         deliverMissedJobs(value);
       } catch {
-        if (!disposed && !provenReads.missed) {
+        if (disposed) return;
+        readFailures.missed += 1;
+        if (!provenReads.missed || readFailures.missed >= PROVEN_READ_FAILURE_THRESHOLD) {
+          provenReads.missed = false;
           dispatchChannel({ type: 'failed', attempt, channel: 'missed-read' });
         }
       }

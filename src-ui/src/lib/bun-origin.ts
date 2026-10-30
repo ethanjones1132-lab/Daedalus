@@ -20,10 +20,19 @@ import { invoke } from '@tauri-apps/api/core';
 /** The same default the native side documents (`DEFAULT_BUN_ORIGIN`). */
 export const DEFAULT_BUN_ORIGIN = 'http://127.0.0.1:19877';
 
+/**
+ * How long a failed resolver answer suppresses further invokes. A page that
+ * fetches repeatedly must not pay a failing Tauri invoke per request; 30 s is
+ * short enough that a cold WSL cache can still resolve during normal use.
+ */
+export const BUN_ORIGIN_RETRY_MS = 30_000;
+
 let cached: string | null = null;
+let failedAt: number | null = null;
 
 export function resetBunOriginForTests(): void {
   cached = null;
+  failedAt = null;
 }
 
 /** Pure resolution, testable without Tauri. */
@@ -42,12 +51,22 @@ export function resolveBunOrigin(
  */
 export async function bunOrigin(): Promise<string> {
   if (cached) return cached;
+  if (failedAt !== null && Date.now() - failedAt < BUN_ORIGIN_RETRY_MS) {
+    return DEFAULT_BUN_ORIGIN;
+  }
   try {
     const value = await invoke<unknown>('bun_server_origin');
-    if (typeof value === 'string') cached = resolveBunOrigin(value);
+    if (typeof value === 'string') {
+      cached = resolveBunOrigin(value);
+      failedAt = null;
+    } else {
+      failedAt = Date.now();
+    }
   } catch {
     // The documented default stands in; the read itself reports its own
-    // failure rather than this resolution being guessed at.
+    // failure rather than this resolution being guessed at. Remember the
+    // failure briefly so repeated fetches do not re-invoke the resolver.
+    failedAt = Date.now();
     return DEFAULT_BUN_ORIGIN;
   }
   return cached ?? DEFAULT_BUN_ORIGIN;

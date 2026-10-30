@@ -8,6 +8,7 @@ use chrono::Utc;
 use rusqlite::OptionalExtension;
 use cron::Schedule;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -2212,15 +2213,25 @@ pub async fn start_cron_scheduler(app: AppHandle) {
 pub fn dismiss_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    dismiss_missed_job_conn(&conn, id)?;
+    let registry = get_pending_missed_registry();
+    dismiss_missed_job_with(&conn, registry, id)?;
+    Ok(true)
+}
 
-    // The reschedule is durable; release the pending entry last.
-    get_pending_missed_registry()
+/// The ordering itself, shared by production and its test: persist the future
+/// `next_run` first, release the pending entry only after that write succeeds.
+/// A failed write therefore leaves the operator's pending entry intact.
+fn dismiss_missed_job_with(
+    conn: &rusqlite::Connection,
+    registry: &Mutex<HashSet<String>>,
+    id: &str,
+) -> Result<(), String> {
+    dismiss_missed_job_conn(conn, id)?;
+    registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(id);
-
-    Ok(true)
+    Ok(())
 }
 
 /// The durable half of a dismissal: read the schedule, compute the future
@@ -2273,30 +2284,82 @@ pub fn release_pending_missed(id: &str) {
         .remove(id);
 }
 
-/// Execute a job and report whether **this attempt** recorded a run.
+/// What a manual or missed-job trigger actually accomplished.
 ///
-/// `execute_job` maps an already-claimed occurrence (and a pre-cancelled one)
-/// to an empty success without recording a run, so a caller that reports
-/// success from its return value alone can claim a run the history does not
-/// hold. The proof here is a run-count delta for the job.
+/// `AlreadyClaimed` means no new run row was recorded: the scheduler already
+/// held this occurrence, or a cancellation landed between claim and dispatch.
+/// It is not a failure, and the UI must not report it as one. `Cancelled` means
+/// a run row was recorded with the `cancelled` status, so the history covers
+/// the attempt even though nothing completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronRunOutcome {
+    Ran,
+    AlreadyClaimed,
+    Cancelled,
+}
+
+fn latest_run_status_conn(
+    conn: &rusqlite::Connection,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT status FROM cron_runs WHERE cron_job_id = ?1
+         ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        [job_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| format!("Failed to read the latest run for cron job '{}': {}", job_id, e))
+}
+
+/// Pure classification of a counted attempt, so the ordering/verdict can be
+/// pinned without an AppHandle.
+fn classify_run_outcome(
+    before: i64,
+    after: i64,
+    latest_status: Option<&str>,
+) -> CronRunOutcome {
+    if after <= before {
+        CronRunOutcome::AlreadyClaimed
+    } else if latest_status == Some("cancelled") {
+        CronRunOutcome::Cancelled
+    } else {
+        CronRunOutcome::Ran
+    }
+}
+
+/// Execute a job and report what **this attempt** actually did.
+///
+/// `execute_job` maps an already-claimed occurrence to an empty success without
+/// recording a run, so a caller that reports success from its return value
+/// alone can claim a run the history does not hold. The proof here is a
+/// run-count delta; a recorded `cancelled` run is distinguished from a
+/// completed attempt.
 pub async fn execute_job_proving_run(
     app: &AppHandle,
     job_id: &str,
     schedule_expr: &str,
     trigger_kind: &str,
-) -> Result<bool, String> {
+) -> Result<CronRunOutcome, String> {
     let before = recorded_run_count(app, job_id)?;
     execute_job(app, job_id, schedule_expr, trigger_kind, None).await?;
     let after = recorded_run_count(app, job_id)?;
-    Ok(after > before)
+    if after <= before {
+        return Ok(CronRunOutcome::AlreadyClaimed);
+    }
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    let latest = latest_run_status_conn(&conn, job_id)?;
+    Ok(classify_run_outcome(before, after, latest.as_deref()))
 }
 
 /// Trigger a pending missed cron job. The pending entry is released only after
 /// the attempt is proven recorded in the run history; a failed attempt keeps
-/// the job pending. An occurrence the history already records is reported as
-/// `false` — nothing new ran — and the pending state is kept for the operator
-/// to explicitly trigger or dismiss.
-pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
+/// the job pending. An occurrence the history already records answers
+/// `AlreadyClaimed` — nothing new ran — and the pending state is kept for the
+/// operator to explicitly trigger or dismiss.
+pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<CronRunOutcome, String> {
     let schedule_expr = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -2306,11 +2369,11 @@ pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, Strin
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?
     };
 
-    let recorded = execute_job_proving_run(app, id, &schedule_expr, "missed").await?;
-    if recorded {
+    let outcome = execute_job_proving_run(app, id, &schedule_expr, "missed").await?;
+    if outcome != CronRunOutcome::AlreadyClaimed {
         release_pending_missed(id);
     }
-    Ok(recorded)
+    Ok(outcome)
 }
 
 fn ensure_inference_feedback_job(conn: &rusqlite::Connection) -> Result<bool, String> {
@@ -2408,9 +2471,9 @@ mod missed_ordering_tests {
 
     #[test]
     fn dismissed_next_run_is_written_before_the_pending_entry_releases() {
-        // Structural pin of the dismiss ordering: the durable UPDATE happens in
-        // the connection-based half, and the pending release happens only after
-        // that half runs. A failing write therefore cannot lose the pending id.
+        // Calls the production ordering helper directly: the durable UPDATE runs
+        // first, and the pending release is the helper's last statement. A
+        // failing write therefore cannot lose the pending id.
         let c = conn();
         insert_job(&c, "ok", true, None);
         insert_job(&c, "bad", true, None);
@@ -2421,11 +2484,11 @@ mod missed_ordering_tests {
         )
         .unwrap();
 
-        let registry: Mutex<HashSet<String>> = Mutex::new(HashSet::from(["ok".to_string(), "bad".to_string()]));
+        let registry: Mutex<HashSet<String>> =
+            Mutex::new(HashSet::from(["ok".to_string(), "bad".to_string()]));
 
         let before = recorded_run_count_conn(&c, "bad").unwrap();
-        let err = dismiss_half_and_release(&registry, &c, "bad").unwrap_err();
-        assert!(err.contains("not machine-readable"), "{err}");
+        assert!(dismiss_missed_job_with(&c, &registry, "bad").is_err());
         assert!(
             registry.lock().unwrap().contains("bad"),
             "a failed dismissal never releases the pending entry"
@@ -2435,7 +2498,7 @@ mod missed_ordering_tests {
             .unwrap();
         assert!(next_run.is_none(), "a failed dismissal never writes a NULL next_run");
 
-        dismiss_half_and_release(&registry, &c, "ok").unwrap();
+        dismiss_missed_job_with(&c, &registry, "ok").unwrap();
         let updated: Option<String> = c
             .query_row("SELECT next_run FROM cron_jobs WHERE id = 'ok'", [], |r| r.get(0))
             .unwrap();
@@ -2447,15 +2510,16 @@ mod missed_ordering_tests {
         assert_eq!(recorded_run_count_conn(&c, "bad").unwrap(), before);
     }
 
-    /// The two halves of `dismiss_missed_job`, testable without an AppHandle.
-    fn dismiss_half_and_release(
-        registry: &Mutex<HashSet<String>>,
-        conn: &rusqlite::Connection,
-        id: &str,
-    ) -> Result<(), String> {
-        dismiss_missed_job_conn(conn, id)?;
-        registry.lock().unwrap().remove(id);
-        Ok(())
+    #[test]
+    fn a_counted_attempt_is_classified_without_overclaiming() {
+        assert_eq!(classify_run_outcome(3, 3, None), CronRunOutcome::AlreadyClaimed);
+        assert_eq!(classify_run_outcome(3, 2, None), CronRunOutcome::AlreadyClaimed);
+        assert_eq!(
+            classify_run_outcome(3, 4, Some("cancelled")),
+            CronRunOutcome::Cancelled
+        );
+        assert_eq!(classify_run_outcome(3, 4, Some("success")), CronRunOutcome::Ran);
+        assert_eq!(classify_run_outcome(3, 4, Some("failed")), CronRunOutcome::Ran);
     }
 
     #[test]

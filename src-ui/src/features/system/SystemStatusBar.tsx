@@ -172,6 +172,9 @@ export default function SystemStatusBar() {
     try {
       const snapshot = await invoke<HealthData>('get_system_health');
       dispatch({ type: 'health-success', requestId: id, snapshot });
+      // The health payload carries the same Enable Bridge setting the config
+      // does; use the payload already in hand rather than a second source.
+      if (typeof snapshot.bridge?.enabled === 'boolean') setBridgeEnabled(snapshot.bridge.enabled);
     } catch {
       dispatch({ type: 'health-failure', requestId: id });
     }
@@ -194,12 +197,11 @@ export default function SystemStatusBar() {
   // failed read keeps the last confirmed backend; it never invents one.
   const fetchBackend = useCallback(async () => {
     try {
-      const config = await invoke<{ active_backend?: unknown; bridge_enabled?: unknown } | null>('jarvis_get_config');
+      const config = await invoke<{ active_backend?: unknown } | null>('jarvis_get_config');
       const backend = config?.active_backend;
       setActiveBackend(typeof backend === 'string' ? backend : null);
-      if (typeof config?.bridge_enabled === 'boolean') setBridgeEnabled(config.bridge_enabled);
     } catch {
-      /* keep the last confirmed backend and bridge setting */
+      /* keep the last confirmed backend */
     }
   }, []);
 

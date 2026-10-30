@@ -41,12 +41,13 @@ export function reportAgentsRoot(
   lifecycle: LifecycleService,
   resolvedPath: string,
   declared: boolean,
+  scan?: ReturnType<LifecycleService["scan"]>,
 ): AgentsRootReport {
   // `root_state` is what the scan could establish today. `reason_code` carries
   // the configuration context the scan cannot see: an empty `agents_root`
   // setting means the operator never chose a root, which is actionable on its
   // own even if the default directory happens to exist.
-  const state = lifecycle.scan().root_state;
+  const state = (scan ?? lifecycle.scan()).root_state;
   const reason: AgentsRootReasonCode = !declared
     ? "agents_root_unconfigured"
     : state === "ok"
@@ -68,8 +69,9 @@ export interface AgentsListResponse {
 export function handleListAgents(
   lifecycle: LifecycleService,
   root?: AgentsRootReport,
+  scan?: ReturnType<LifecycleService["scan"]>,
 ): AgentsListResponse | Array<ReturnType<typeof publicEntry>> {
-  const result = lifecycle.scan();
+  const result = scan ?? lifecycle.scan();
   const agents = result.results.map(publicEntry);
   if (!root) {
     // Direct callers without root context keep the historical array shape.
@@ -181,17 +183,31 @@ function responseForActivation(result: ReturnType<typeof handleActivateAgent>): 
   return Response.json(result, { status });
 }
 
+/**
+ * Whether this path is served by `handleAgentRequest`. Checked before the live
+ * server builds a lifecycle: the root scan reads every `soul.md`, and doing it
+ * on unrelated routes (/chat/stream, /memory, /health) would put a synchronous
+ * directory read on every request.
+ */
+export function isAgentRoute(path: string): boolean {
+  if (path === "/agents" || path === "/agents/scan") return true;
+  if (path.startsWith("/agents/pool")) return false;
+  return /^\/agents\/[^/]+(\/(activate|deactivate))?$/.test(path);
+}
+
 export async function handleAgentRequest(
   req: Request,
   lifecycle: LifecycleService,
   /** Root context; present on the live server so /agents can report its state. */
-  root?: AgentsRootReport
+  root?: AgentsRootReport,
+  /** A scan already performed for `reportAgentsRoot`, so /agents scans once. */
+  scan?: ReturnType<LifecycleService["scan"]>,
 ): Promise<Response | null> {
   const url = new URL(req.url, "http://local");
   const path = url.pathname;
 
   if (path === "/agents" && req.method === "GET") {
-    return Response.json(handleListAgents(lifecycle, root));
+    return Response.json(handleListAgents(lifecycle, root, scan));
   }
 
   if (path === "/agents/scan" && req.method === "POST") {

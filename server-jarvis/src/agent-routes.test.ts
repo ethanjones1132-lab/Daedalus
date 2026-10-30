@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createLifecycleService, type ProjectionStore } from "./agent-lifecycle";
+import { createLifecycleService, type LifecycleService, type ProjectionStore } from "./agent-lifecycle";
 import {
   handleActivateAgent,
   handleAgentRequest,
@@ -9,6 +9,7 @@ import {
   handleGetAgent,
   handleListAgents,
   handleScanAgents,
+  isAgentRoute,
   reportAgentsRoot,
 } from "./agent-routes";
 
@@ -215,5 +216,51 @@ describe("agent routes", () => {
       lifecycle,
     );
     expect(response).toBeNull();
+  });
+
+  test("only agent routes are matched before the live server builds a lifecycle", () => {
+    for (const path of [
+      "/agents",
+      "/agents/scan",
+      "/agents/coder",
+      "/agents/coder/activate",
+      "/agents/coder/deactivate",
+    ]) {
+      expect(isAgentRoute(path)).toBe(true);
+    }
+    for (const path of [
+      "/agents/pool",
+      "/agents/pool/define",
+      "/chat/stream",
+      "/health",
+      "/memory",
+      "/skills/candidates",
+    ]) {
+      expect(isAgentRoute(path)).toBe(false);
+    }
+  });
+
+  test("the live list reuses the scan made for the root report", () => {
+    let scans = 0;
+    const result = {
+      root_state: "ok",
+      scanned: 0,
+      valid: 0,
+      invalid: 0,
+      results: [],
+    };
+    const lifecycle = {
+      scan: () => {
+        scans += 1;
+        return result;
+      },
+    } as unknown as LifecycleService;
+
+    const scan = lifecycle.scan();
+    const root = reportAgentsRoot(lifecycle, "/tmp/agents", true, scan);
+    const list = handleListAgents(lifecycle, root, scan) as { agents: unknown[] };
+    expect(list.agents).toEqual([]);
+    expect(root).toMatchObject({ root_state: "ok", reason_code: "agents_root_ok" });
+    expect(scans).toBe(1);
   });
 });

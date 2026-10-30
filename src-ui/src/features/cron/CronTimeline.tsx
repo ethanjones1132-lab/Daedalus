@@ -91,7 +91,7 @@ export function CronTimeline({
   const next = markers[0];
   const blocked = projection.missedBlocked;
   const blockedNote = blocked.length > 0
-    ? ` ${blocked.length} enabled job${blocked.length === 1 ? '' : 's'} blocked on a missed run that awaits trigger or dismissal: ${blocked.map((job) => job.name).join(', ')}.`
+    ? `${blocked.length} enabled job${blocked.length === 1 ? '' : 's'} blocked on a missed run that awaits trigger or dismissal: ${blocked.map((job) => job.name).join(', ')}.`
     : '';
 
   return (
@@ -105,10 +105,10 @@ export function CronTimeline({
             <>
               Next up: <span className="text-ink-2">{next.job.name}</span> {formatWhen(next.job.next_run, now)}
               {markers.length > 1 ? `, then ${markers.length - 1} more.` : '.'}
-              {blockedNote && <span className="block text-[11.5px] text-warning">{blockedNote.trim()}</span>}
+              {blockedNote && <span className="block text-[11.5px] text-warning">{blockedNote}</span>}
             </>
           ) : blocked.length > 0 ? (
-            `No enabled run is scheduled in the next 24 hours:${blockedNote.toLowerCase()}`
+            `No enabled run is scheduled in the next 24 hours. ${blockedNote}`
           ) : (
             'No enabled job is scheduled to run in the next 24 hours.'
           )

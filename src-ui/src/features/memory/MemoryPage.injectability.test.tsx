@@ -75,6 +75,26 @@ describe('Memory Overview injectability', () => {
     expect(screen.queryByText(/out_of_scope/)).not.toBeInTheDocument();
   });
 
+  it('uses the operator-chosen user-scope inclusion for the verdicts', async () => {
+    render(<MemoryPage />);
+    await screen.findByText('Alpha');
+    fireEvent.change(screen.getByRole('combobox', { name: 'Recall scope Session' }), {
+      target: { value: 'ses-1' },
+    });
+    await screen.findByRole('status', { name: 'Injectability: recallable here' });
+
+    invokeMock.mockClear();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include user-scope memories' }));
+
+    await waitFor(() => {
+      const call = invokeMock.mock.calls.find(([command]) => command === 'memory_injectability');
+      expect(call?.[1]).toEqual({
+        request: { session_id: 'ses-1', ids: ['a', 'b'], include_user_scope: true },
+      });
+    });
+    expect(screen.getByText(/User-scope memories are included/)).toBeInTheDocument();
+  });
+
   it('claims no verdict when the projection is unreadable', async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command === 'list_recent_memories') return [entry('a', 'Alpha')];

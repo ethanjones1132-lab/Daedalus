@@ -51,6 +51,7 @@ function MemoryPage() {
   // Read-only injectability for a chosen Session scope. The Overview is an
   // inspection list; without a scope no per-row verdict is claimed.
   const [scopeSessionId, setScopeSessionId] = useState('');
+  const [includeUserScope, setIncludeUserScope] = useState(false);
   const [sessionOptions, setSessionOptions] = useState<Array<{ id: string; label: string }>>([]);
   const [injection, setInjection] = useState<Record<string, InjectionVerdict> | null>(null);
   const [injectionState, setInjectionState] = useState<InjectionState>('idle');
@@ -143,7 +144,7 @@ function MemoryPage() {
           request: {
             session_id: scopeSessionId,
             ids: visibleIds,
-            include_user_scope: false,
+            include_user_scope: includeUserScope,
           },
         });
         if (cancelled) return;
@@ -159,7 +160,7 @@ function MemoryPage() {
     return () => {
       cancelled = true;
     };
-  }, [scopeSessionId, visibleIds, recalling]);
+  }, [scopeSessionId, includeUserScope, visibleIds, recalling]);
   const selected = selectedId ? (filtered.find((memory) => memory.id === selectedId) ?? null) : null;
 
   useEffect(() => {
@@ -258,6 +259,16 @@ function MemoryPage() {
               </option>
             ))}
           </Select>
+          <label className="flex h-12 items-center gap-2 rounded-[9px] border border-line px-3 text-[12px] text-ink-2">
+            <input
+              type="checkbox"
+              aria-label="Include user-scope memories"
+              checked={includeUserScope}
+              onChange={(event) => setIncludeUserScope(event.target.checked)}
+              disabled={!scopeSessionId || recalling}
+            />
+            Include user scope
+          </label>
           <Button variant="primary" size="md" className="h-12 px-6 text-[14px]" onClick={search}>
             Search
           </Button>
@@ -284,7 +295,7 @@ function MemoryPage() {
                     ? 'Checking injectability for this Session…'
                     : injectionState === 'unavailable'
                       ? 'Injectability is unavailable for this Session; no per-row verdict is claimed.'
-                      : INJECTION_BASIS}
+                      : `${INJECTION_BASIS} ${includeUserScope ? 'User-scope memories are included.' : 'User-scope memories are excluded.'}`}
                 </p>
               )}
             </div>

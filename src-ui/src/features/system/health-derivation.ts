@@ -77,7 +77,9 @@ function summaryFor(s: JarvisStatus, level: HealthLevel, fetchError: string | nu
       return 'External Agent bridge is not running — Session turns and inference are unaffected';
     }
   }
-  return 'Inference is responding slowly';
+  // Only `ok` reaches here. Do not label an unknown future warn cause as a slow
+  // inference response.
+  return 'All required services are running.';
 }
 
 const LABELS: Record<Exclude<HealthLevel, 'ok'>, string> = {

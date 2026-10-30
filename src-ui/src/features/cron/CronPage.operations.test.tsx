@@ -198,7 +198,6 @@ describe('Cron operational mutation coordination', () => {
   });
 
   it.each([
-    { command: 'run_cron_job', button: 'Run Alpha', message: 'Could not run cron job' },
     { command: 'delete_cron_job', button: 'Delete Alpha', message: 'Could not delete cron job' },
   ] as const)('requires an explicit true result for $command', async ({ command, button, message }) => {
     await mount();
@@ -212,6 +211,20 @@ describe('Cron operational mutation coordination', () => {
     expect(screen.getAllByText('Alpha').length).toBeGreaterThan(0);
     expect(mutationCalls()).toEqual([[command, { id: 'alpha' }]]);
     expect(screen.queryByText('Cron job "Alpha" deleted.')).not.toBeInTheDocument();
+  });
+
+  it('treats an already-claimed run as no new run, not a failure', async () => {
+    await mount();
+    const result = deferred<unknown>();
+    setWrite('run_cron_job', result.promise, 'alpha');
+    fireEvent.click(screen.getByRole('button', { name: 'Run Alpha' }));
+    await act(async () => result.resolve('already_claimed'));
+    await resolveRead(1, [alpha, beta]);
+
+    expect(
+      await screen.findByText(/No new run was recorded for "Alpha"/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('alert', { name: 'Cron job operation' })).not.toBeInTheDocument();
     expect(screen.queryByText('Run requested for cron job "Alpha".')).not.toBeInTheDocument();
   });
 

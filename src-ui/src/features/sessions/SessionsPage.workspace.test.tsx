@@ -110,6 +110,35 @@ describe('Sessions workspace chrome', () => {
     );
   });
 
+  it('does not select a Session id the native list no longer contains', async () => {
+    function Opener() {
+      const { navigate } = useNavigation();
+      return (
+        <button type="button" onClick={() => navigate('sessions', { sessionId: 'Deleted' })}>
+          Open Deleted
+        </button>
+      );
+    }
+    render(
+      <NavigationProvider initial="sessions">
+        <Opener />
+        <SessionsPage />
+      </NavigationProvider>,
+    );
+    await screen.findByRole('button', { name: 'Select session Alpha' });
+    fireEvent.click(screen.getByRole('button', { name: 'Open Deleted' }));
+
+    expect(
+      await screen.findByText(/no longer in the native Session list; no Session was selected/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Select session Alpha' })).toHaveAttribute('aria-pressed', 'false');
+    expect(
+      invokeMock.mock.calls.some(([command, args]) =>
+        command === 'get_session_history'
+        && typeof args === 'object' && args !== null && (args as { sessionId?: string }).sessionId === 'Deleted'),
+    ).toBe(false);
+  });
+
   it('collapses the Session index to a rail and restores it', async () => {
     render(<SessionsPage />);
     await screen.findByRole('button', { name: 'Select session Alpha' });

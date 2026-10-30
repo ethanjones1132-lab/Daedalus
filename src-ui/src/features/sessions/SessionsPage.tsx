@@ -199,12 +199,25 @@ export default function SessionsPage() {
 
   // One-shot intent from another surface: navigate('sessions', { sessionId }).
   // `expandControls` additionally reveals the memory/goal control disclosure so
-  // a workspace-binding next step is one action away.
+  // a workspace-binding next step is one action away. The intent is a selector,
+  // not authority: the exact id must be present in the native list before it is
+  // selected, and one nonce is applied at most once.
   const { params, nonce } = useNavigation();
   const intentSessionId = params.sessionId;
   const intentExpandControls = params.expandControls === '1';
+  const appliedIntentNonce = useRef(-1);
   useEffect(() => {
+    if (appliedIntentNonce.current === nonce) return;
+    if (intentSessionId && sessionsLoading) return;
+    appliedIntentNonce.current = nonce;
     if (intentSessionId) {
+      if (!sessions.some((session) => session.id === intentSessionId)) {
+        setHandoffNotice(
+          'The Session named by that navigation intent is no longer in the native Session list; no Session was selected.',
+        );
+        setControlsExpanded(false);
+        return;
+      }
       setActiveSession(intentSessionId);
       setIndexTab('sessions');
       feeds.close();
@@ -217,7 +230,7 @@ export default function SessionsPage() {
     }
     if (intentExpandControls) setControlsExpanded(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intentSessionId, intentExpandControls, nonce]);
+  }, [intentSessionId, intentExpandControls, nonce, sessionsLoading, sessions]);
 
   // Project Steward one-shot handoff. Re-read the persisted Session and the
   // native Goal before consuming anything: require the Session to exist, be
