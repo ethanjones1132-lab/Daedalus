@@ -1,14 +1,19 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { Select, StatusLine } from '../../design';
 import MemoryScopeControls from '../memory/MemoryScopeControls';
 import MemoryTurnStatus from '../memory/MemoryTurnStatus';
 import type { SessionTurn } from './useSessionTurn';
 
 /** Native memory identity, explicit Goal binding, and historical turn receipts. */
-export function MemoryTurnControls({ turn }: { turn: SessionTurn }) {
+export function MemoryTurnControls({ turn, defaultOpen = false }: { turn: SessionTurn; defaultOpen?: boolean }) {
   const goalId = useId();
-  const [open, setOpen] = useState(false);
-  return <details onToggle={event => setOpen(event.currentTarget.open)} className="border-t border-line bg-sunken/40 px-8 py-2 text-xs"><summary className="cursor-pointer text-ink-3">Memory and Goal controls{turn.memoryStatusLabel ? ` · ${turn.memoryStatusLabel}` : ''}</summary>{open && <div className="mt-3 max-h-72 space-y-3 overflow-auto">
+  const [open, setOpen] = useState(defaultOpen);
+  const sessionId = turn.sessionSelection.session_id;
+  // A navigation intent opens the disclosure for the Session it targets; a
+  // manual open/close after that is not overridden, and switching Sessions
+  // starts from the new intent.
+  useEffect(() => setOpen(defaultOpen), [defaultOpen, sessionId]);
+  return <details open={open} onToggle={event => setOpen(event.currentTarget.open)} className="border-t border-line bg-sunken/40 px-8 py-2 text-xs"><summary className="cursor-pointer text-ink-3">Memory and Goal controls{turn.memoryStatusLabel ? ` · ${turn.memoryStatusLabel}` : ''}</summary>{open && <div className="mt-3 max-h-72 space-y-3 overflow-auto">
     <MemoryScopeControls selection={turn.sessionSelection} agents={turn.sessionAgents} disabled={turn.isStreaming} agentLocked={turn.pendingNativeSessionId !== null} onSelectAgent={turn.handleSelectAgent} onBindWorkspace={root => { void turn.handleBindWorkspace(root); }} onIncludeUserScope={turn.setIncludeUserScope} />
     <label htmlFor={goalId} className="flex items-center gap-3">Goal<Select id={goalId} value={turn.selectedGoalId ?? ''} disabled={turn.isStreaming} onChange={event => turn.setSelectedGoalId(event.target.value || null)}><option value="">No Goal (ordinary turn)</option>{turn.goalOptions.map(goal => <option key={goal.id} value={goal.id}>{goal.objective}</option>)}</Select></label>
     {turn.memoryHistoryWarning && <StatusLine label="Memory history warning" busy={false}>{turn.memoryHistoryWarning}</StatusLine>}

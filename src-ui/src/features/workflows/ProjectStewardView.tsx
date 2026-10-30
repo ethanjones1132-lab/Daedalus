@@ -24,6 +24,7 @@ import {
   type StatusVariant,
 } from './primitives';
 import type { AgentOption, ProjectStewardHandoff, WorkflowDestination, WorkflowNavigationSelector } from '../../domain/types';
+import { useNavigation } from '../../shell/navigation';
 import WorkflowReadinessPanel, {
   type WorkflowReadinessItem,
 } from './WorkflowReadinessPanel';
@@ -86,7 +87,7 @@ interface CreatedGoal {
 
 /**
  * Canonical persisted Session row as read back from the native `list_sessions`
- * authority. Unlike the chat projection it carries `archived` and the validated
+ * authority. Unlike the chat projection it carries `archived` and the recorded
  * `project_root`, which eligibility requires. Values are selectors only.
  */
 interface StewardSession {
@@ -260,25 +261,169 @@ function projectionUsable(projection: AgentProjectionRow | undefined): boolean {
 }
 
 /**
- * A Session is eligible for a Project Steward task only when it is persisted,
- * non-archived, has a nonempty canonical project root, and its Agent is enabled
- * (custom Agents additionally need a valid/active/non-stale projection). This is
- * a selector filter only; native revalidates everything on `goal_create`.
+ * Why no Session can be selected. Each value is an observed fact about the
+ * native read, not an inferred cause; `eligible` means at least one Session
+ * passed every check. `none-selected` is not a Session defect — it means the
+ * eligible set exists but no exact row is chosen yet.
  */
-function sessionEligible(
-  session: StewardSession,
+export type StewardBlocker =
+  | 'no-sessions'
+  | 'all-archived'
+  | 'no-recorded-workspace'
+  | 'no-enabled-agent'
+  | 'projection-unusable'
+  | 'none-selected'
+  | 'eligible';
+
+export interface StewardEligibility {
+  /** Sessions that pass every selector check (never authority — native revalidates). */
+  eligible: StewardSession[];
+  /** The exact state the guidance copy must report. */
+  blocker: StewardBlocker;
+  /** Per-predicate elimination counts, so a mixed set is reported exactly. */
+  counts: {
+    archived: number;
+    workspace: number;
+    agent: number;
+    projection: number;
+  };
+}
+
+/**
+ * Map the persisted Session read, the Agent read, and the projection read onto
+ * the exact eligibility state. A Session is eligible only when it is persisted,
+ * non-archived, has a nonempty recorded project root, and its Agent is enabled
+ * (custom Agents additionally need a valid/active/non-stale projection). This
+ * is a selector filter only; native revalidates everything on `goal_create`.
+ *
+ * A Session blocked by several predicates is attributed to the first failing
+ * one in the same order the checks run: archived, workspace, agent, projection.
+ */
+export function projectStewardEligibility(
+  sessions: StewardSession[],
   agentsById: Map<string, AgentOption>,
   projectionsBySlug: Map<string, AgentProjectionRow>,
-): boolean {
-  if (session.archived) return false;
-  if (trimRoot(session.project_root) === null) return false;
-  const agentId = typeof session.agent_id === 'string' ? session.agent_id : '';
-  if (!agentId) return false;
-  const agent = agentsById.get(agentId);
-  if (!agent) return agentId === BUILTIN_JARVIS_AGENT_ID;
-  if (!agent.enabled) return false;
-  if (agentId === BUILTIN_JARVIS_AGENT_ID) return true;
-  return projectionUsable(projectionsBySlug.get(agentId));
+  selectedSessionId: string | null,
+): StewardEligibility {
+  const counts = { archived: 0, workspace: 0, agent: 0, projection: 0 };
+  const eligible: StewardSession[] = [];
+
+  for (const session of sessions) {
+    if (session.archived) {
+      counts.archived += 1;
+      continue;
+    }
+    if (trimRoot(session.project_root) === null) {
+      counts.workspace += 1;
+      continue;
+    }
+    const agentId = typeof session.agent_id === 'string' ? session.agent_id : '';
+    if (!agentId) {
+      counts.agent += 1;
+      continue;
+    }
+    const agent = agentsById.get(agentId);
+    if (!agent) {
+      // The built-in Jarvis Agent may have no row; any other unknown Agent id
+      // cannot be confirmed as enabled.
+      if (agentId === BUILTIN_JARVIS_AGENT_ID) {
+        eligible.push(session);
+      } else {
+        counts.agent += 1;
+      }
+      continue;
+    }
+    if (!agent.enabled) {
+      counts.agent += 1;
+      continue;
+    }
+    if (agentId !== BUILTIN_JARVIS_AGENT_ID && !projectionUsable(projectionsBySlug.get(agentId))) {
+      counts.projection += 1;
+      continue;
+    }
+    eligible.push(session);
+  }
+
+  let blocker: StewardBlocker;
+  if (sessions.length === 0) {
+    blocker = 'no-sessions';
+  } else if (eligible.length === 0 && sessions.every((session) => session.archived)) {
+    blocker = 'all-archived';
+  } else if (eligible.length === 0) {
+    // Most common elimination wins; ties break in check order. This is a report
+    // of observed counts, not a claim about a single root cause.
+    const ranked: Array<[StewardBlocker, number]> = [
+      ['no-recorded-workspace', counts.workspace],
+      ['no-enabled-agent', counts.agent],
+      ['projection-unusable', counts.projection],
+    ];
+    const best = ranked.reduce((current, entry) => (entry[1] > current[1] ? entry : current));
+    blocker = best[1] > 0 ? best[0] : 'all-archived';
+  } else if (!selectedSessionId || !eligible.some((session) => session.id === selectedSessionId)) {
+    blocker = 'none-selected';
+  } else {
+    blocker = 'eligible';
+  }
+
+  return { eligible, blocker, counts };
+}
+
+/**
+ * The exact failing predicate, worded so the operator can act on it. The
+ * workspace is described as recorded by the native binder — this screen holds a
+ * persisted string and does not revalidate the directory. Custom Agents'
+ * projection requirement and the deferred binding of a New Session are both
+ * disclosed here, because the previous copy's single "bind a workspace, then
+ * return" step could not work for an unsent Session.
+ */
+export function stewardBlockerGuidance(
+  blocker: StewardBlocker,
+  counts: StewardEligibility['counts'],
+  eligibleCount: number,
+): { detail: string; nextStep: string } {
+  switch (blocker) {
+    case 'no-sessions':
+      return {
+        detail:
+          'The native authority is readable and holds no persisted Session. A Project Steward task needs an existing non-archived Session with an enabled Agent and a recorded project workspace.',
+        nextStep:
+          'Open Chat and send a first message to create a Session (a New Session’s workspace binding is saved on its first Send), then bind the workspace and return here.',
+      };
+    case 'all-archived':
+      return {
+        detail: 'Every persisted Session is archived. Archived Sessions cannot carry a Project Steward task.',
+        nextStep:
+          'Open Chat and start a non-archived Session (a New Session’s workspace binding is saved on its first Send), then return here.',
+      };
+    case 'no-recorded-workspace':
+      return {
+        detail: `${counts.workspace} non-archived Session${counts.workspace === 1 ? '' : 's'} ${counts.workspace === 1 ? 'has' : 'have'} no recorded project workspace. The workspace is recorded by the native binder (memory_bind_session_workspace); this screen does not revalidate the directory.`,
+        nextStep:
+          'Open Chat, expand “Memory and Goal controls”, and bind the workspace on an existing Session — a New Session’s binding is saved on its first Send — then return here.',
+      };
+    case 'no-enabled-agent':
+      return {
+        detail: `${counts.agent} non-archived Session${counts.agent === 1 ? '' : 's'} ${counts.agent === 1 ? 'has' : 'have'} no enabled Agent whose record is confirmed.`,
+        nextStep:
+          'Enable an Agent in Agents, or open a Session whose Agent is enabled, then return here.',
+      };
+    case 'projection-unusable':
+      return {
+        detail: `${counts.projection} non-archived Session${counts.projection === 1 ? '' : 's'} ${counts.projection === 1 ? 'uses' : 'use'} a custom Agent whose Agent projection is missing or stale. A custom Agent needs a valid, active, non-stale projection; the built-in Jarvis Agent does not.`,
+        nextStep:
+          'Refresh that Agent’s projection in Agents, or use a Session whose Agent is the built-in Jarvis, then return here.',
+      };
+    case 'none-selected':
+      return {
+        detail: `${eligibleCount} eligible persisted Session${eligibleCount === 1 ? ' is' : 's are'} available; none is selected.`,
+        nextStep: 'Select one eligible Session above.',
+      };
+    case 'eligible':
+      return {
+        detail: 'At least one eligible persisted Session is available.',
+        nextStep: 'Select one eligible Session above.',
+      };
+  }
 }
 
 /**
@@ -287,7 +432,7 @@ function sessionEligible(
  * canonical root, a non-terminal Goal, and an exactly matching criterion set
  * (order by ordinal).
  */
-function goalMatchesSubmission(
+export function goalMatchesSubmission(
   detail: GoalDetail,
   goalId: string,
   objective: string,
@@ -700,15 +845,34 @@ export default function ProjectStewardView({
     return map;
   }, [projections]);
 
-  const eligibleSessions = useMemo(
-    () => sessions.filter((session) => sessionEligible(session, agentsById, projectionsBySlug)),
-    [sessions, agentsById, projectionsBySlug],
+  const eligibility = useMemo(
+    () => projectStewardEligibility(sessions, agentsById, projectionsBySlug, selectedSessionId),
+    [sessions, agentsById, projectionsBySlug, selectedSessionId],
   );
+  const eligibleSessions = eligibility.eligible;
 
   const selectedSession = useMemo(
     () => eligibleSessions.find((session) => session.id === selectedSessionId) ?? null,
     [eligibleSessions, selectedSessionId],
   );
+
+  // A single eligible Session is the only valid selection; choosing it for the
+  // operator leaves the task definition as the one remaining input.
+  useEffect(() => {
+    if (eligibleSessions.length !== 1) return;
+    if (selectedSessionId === eligibleSessions[0].id) return;
+    setSelectedSessionId(eligibleSessions[0].id);
+  }, [eligibleSessions, selectedSessionId]);
+
+  const { navigate } = useNavigation();
+  // Deep link to Chat with the exact eligible Session (when there is one) and
+  // the "Memory and Goal controls" disclosure already expanded. Navigation is
+  // selector-only; Chat re-reads the Session list and never treats this as
+  // workspace authority.
+  const openChat = useCallback(() => {
+    const single = eligibleSessions.length === 1 ? eligibleSessions[0].id : undefined;
+    navigate('sessions', single ? { sessionId: single, expandControls: '1' } : { expandControls: '1' });
+  }, [eligibleSessions, navigate]);
 
   // A new selection or a new draft invalidates any previously created Goal so a
   // handoff can never reference a Goal that does not match the current inputs.
@@ -957,23 +1121,21 @@ export default function ProjectStewardView({
       recoveryLabel: 'Retry read',
       onRecover: () => setReloadKey((key) => key + 1),
     });
-  } else if (eligibleSessions.length === 0) {
+  } else if (eligibility.blocker !== 'eligible') {
+    const guidance = stewardBlockerGuidance(
+      eligibility.blocker,
+      eligibility.counts,
+      eligibleSessions.length,
+    );
     stewardReadinessItems.push({
       id: 'authority',
       label: 'Eligible persisted Session',
       state: 'needs_user_input',
-      detail:
-        'A readable authority shows no persisted Session with an enabled Agent and a validated project workspace, so no eligible Session exists. This is a real empty selection, not an unavailable read.',
-      nextStep:
-        'Open Chat, choose the Agent, and bind a workspace with the existing Session workspace control (native memory_bind_session_workspace), then return here.',
-    });
-  } else if (!selectedSession) {
-    stewardReadinessItems.push({
-      id: 'authority',
-      label: 'Eligible persisted Session',
-      state: 'needs_user_input',
-      detail: `${eligibleSessions.length} eligible persisted Session(s) are available; none is selected.`,
-      nextStep: 'Select one eligible Session above.',
+      detail: guidance.detail,
+      nextStep: guidance.nextStep,
+      ...(eligibility.blocker === 'none-selected'
+        ? {}
+        : { recoveryLabel: 'Open Chat', onRecover: openChat }),
     });
   } else if (!objective.trim() || criteria.every((criterion) => criterion.trim().length === 0)) {
     stewardReadinessItems.push({
@@ -1046,6 +1208,11 @@ export default function ProjectStewardView({
   const restoreActive = navigationSelector !== null || reviewSelection !== null;
 
   if (loading) return <LoadingState />;
+
+  const emptyGuidance =
+    !loadError && eligibleSessions.length === 0
+      ? stewardBlockerGuidance(eligibility.blocker, eligibility.counts, 0)
+      : null;
 
   return (
     <div className="flex flex-col gap-4 h-full overflow-y-auto">
@@ -1130,21 +1297,27 @@ export default function ProjectStewardView({
         </p>
       )}
 
-      {!loadError && eligibleSessions.length === 0 && (
+      {emptyGuidance && (
         <GlassCard className="p-4">
-          <p className="text-sm text-ink-2 mb-2">No eligible bound Session yet.</p>
-          <p className="text-xs text-ink-3">
-            A Project Steward task needs an existing, non-archived Session with an enabled Agent and
-            a validated project workspace. Open Chat, choose the Agent, bind a workspace with the
-            existing Session workspace control (native <span className="font-mono">memory_bind_session_workspace</span>),
-            then return here. A raw path entered on this screen is never workspace authority.
-          </p>
+          <p className="text-sm text-ink-2 mb-2">No eligible Session yet.</p>
+          <p className="text-xs text-ink-3">{emptyGuidance.detail}</p>
+          <p className="text-xs text-ink-4 mt-2">Next: {emptyGuidance.nextStep}</p>
+          <button type="button" onClick={openChat} className="btn-ghost text-xs mt-3">
+            Open Chat with controls expanded
+          </button>
         </GlassCard>
       )}
 
       {!loadError && eligibleSessions.length > 0 && (
         <GlassCard className="p-3">
-          <div className="text-xs font-mono uppercase tracking-[0.18em] text-ink/40 mb-2">Session</div>
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-mono uppercase tracking-[0.18em] text-ink/40">Session</div>
+            {eligibleSessions.length === 1 && (
+              <button type="button" onClick={openChat} className="btn-ghost text-xs">
+                Open Chat
+              </button>
+            )}
+          </div>
           <div className="flex flex-col gap-2">
             {eligibleSessions.map((session) => {
               const selected = session.id === selectedSessionId;
@@ -1229,7 +1402,12 @@ export default function ProjectStewardView({
             <button
               type="button"
               onClick={() => { void createGoal(); }}
-              disabled={creating || !selectedSession || !objective.trim()}
+              disabled={
+                creating ||
+                !selectedSession ||
+                !objective.trim() ||
+                criteria.every((criterion) => criterion.trim().length === 0)
+              }
               className="btn-ghost text-xs disabled:opacity-40"
             >
               {creating ? 'Creating…' : 'Create Goal'}

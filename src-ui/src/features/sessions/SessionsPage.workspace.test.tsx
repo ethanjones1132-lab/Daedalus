@@ -84,6 +84,32 @@ describe('Sessions workspace chrome', () => {
     expect(screen.getByRole('heading', { name: 'Beta' })).toBeInTheDocument();
   });
 
+  it('opens the memory controls for a navigation intent that asks for them', async () => {
+    function Opener() {
+      const { navigate } = useNavigation();
+      return (
+        <button type="button" onClick={() => navigate('sessions', { sessionId: 'Beta', expandControls: '1' })}>
+          Open Beta controls
+        </button>
+      );
+    }
+    render(
+      <NavigationProvider initial="sessions">
+        <Opener />
+        <SessionsPage />
+      </NavigationProvider>,
+    );
+    await screen.findByRole('button', { name: 'Select session Beta' });
+    fireEvent.click(screen.getByRole('button', { name: 'Open Beta controls' }));
+    const summary = await screen.findByText(/Memory and Goal controls/);
+    await waitFor(() => expect(summary.closest('details')).toHaveAttribute('open'));
+    // A manual switch ends the one-shot intent.
+    fireEvent.click(screen.getByRole('button', { name: 'Select session Alpha' }));
+    await waitFor(() =>
+      expect(screen.getByText(/Memory and Goal controls/).closest('details')).not.toHaveAttribute('open'),
+    );
+  });
+
   it('collapses the Session index to a rail and restores it', async () => {
     render(<SessionsPage />);
     await screen.findByRole('button', { name: 'Select session Alpha' });

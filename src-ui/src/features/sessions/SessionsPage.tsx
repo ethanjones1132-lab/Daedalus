@@ -68,6 +68,8 @@ export default function SessionsPage() {
   const sessionDeleteOperationsRef = useRef<Record<string, SessionDeleteOperation<JarvisSession>>>({});
   const sessionDeleteReadPending = useRef(false);
   const [activeSession, setActiveSession] = useState<string | null>(null);
+  /** One-shot: open Chat with the "Memory and Goal controls" disclosure visible. */
+  const [controlsExpanded, setControlsExpanded] = useState(false);
   const [config, setConfig] = useState<JarvisConfig | null>(null);
   const configPending = useRef(false);
 
@@ -196,16 +198,26 @@ export default function SessionsPage() {
   }, [loadSessions, loadConfig]);
 
   // One-shot intent from another surface: navigate('sessions', { sessionId }).
+  // `expandControls` additionally reveals the memory/goal control disclosure so
+  // a workspace-binding next step is one action away.
   const { params, nonce } = useNavigation();
   const intentSessionId = params.sessionId;
+  const intentExpandControls = params.expandControls === '1';
   useEffect(() => {
     if (intentSessionId) {
       setActiveSession(intentSessionId);
       setIndexTab('sessions');
       feeds.close();
+    } else if (intentExpandControls) {
+      // No exact Session requested: a fresh, unsent Session is the surface that
+      // can carry the first binding (saved on its first Send).
+      setActiveSession(null);
+      setIndexTab('sessions');
+      feeds.close();
     }
+    if (intentExpandControls) setControlsExpanded(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intentSessionId, nonce]);
+  }, [intentSessionId, intentExpandControls, nonce]);
 
   // Project Steward one-shot handoff. Re-read the persisted Session and the
   // native Goal before consuming anything: require the Session to exist, be
@@ -291,6 +303,8 @@ export default function SessionsPage() {
   const selectSession = useCallback(
     (id: string) => {
       setActiveSession(id);
+      // A manual switch ends the one-shot expansion intent.
+      setControlsExpanded(false);
       feeds.close();
     },
     [feeds],
@@ -339,6 +353,7 @@ export default function SessionsPage() {
           config={config}
           backendLabel={backendLabel}
           modelLabel={modelLabel}
+          expandControls={controlsExpanded}
           onSessionCreated={loadSessions}
           onRunRecordSettled={setRunRecord}
           onStreamingChange={setStreaming}

@@ -31,6 +31,8 @@ export interface ChatPanelProps extends SessionTurnProps {
   title?: string;
   /** Told whenever a Session turn starts or stops streaming. */
   onStreamingChange?: (streaming: boolean) => void;
+  /** One-shot: arrive with the "Memory and Goal controls" disclosure open. */
+  expandControls?: boolean;
 }
 
 /**
@@ -129,7 +131,7 @@ function ScopeStrip({ turn }: { turn: SessionTurn }) {
  * the transcript document, the composer with its live wire, and the
  * Inspector. All behaviour lives in `useSessionTurn`.
  */
-export function ChatPanel({ recentSessions = [], title, onStreamingChange, ...props }: ChatPanelProps) {
+export function ChatPanel({ recentSessions = [], title, onStreamingChange, expandControls = false, ...props }: ChatPanelProps) {
   const turn = useSessionTurn(props);
   useEffect(() => {
     onStreamingChange?.(turn.isStreaming);
@@ -207,7 +209,7 @@ export function ChatPanel({ recentSessions = [], title, onStreamingChange, ...pr
         </header>
 
         <Transcript turn={turn} config={config} />
-        <MemoryTurnControls turn={turn} /><Composer turn={turn} />
+        <MemoryTurnControls turn={turn} defaultOpen={expandControls} /><Composer turn={turn} />
       </div>
 
       {inspectorOpen && <Inspector turn={turn} />}
