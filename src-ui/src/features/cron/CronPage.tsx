@@ -163,7 +163,9 @@ function CronPage() {
         onRetry={cron.handleRetryMissed}
       />
 
-      {hasLoaded && jobs.length > 0 && <CronTimeline jobs={jobs} inFlightIds={inFlightIds} onSelect={jumpToJob} />}
+      {hasLoaded && jobs.length > 0 && (
+        <CronTimeline jobs={jobs} pendingMissed={pendingMissed} inFlightIds={inFlightIds} onSelect={jumpToJob} />
+      )}
 
       <div className={showHistory ? 'grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_380px]' : undefined}>
         <Panel flush aria-label="Cron jobs" className="@container min-w-0">

@@ -235,6 +235,94 @@ export function clip(text: string, max = 120): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
+// ── Timeline projection (shared by every next-runs surface) ──────────────────
+
+/** The next-runs ruler covers exactly this much future. */
+export const CRON_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The one timeline state a cron job occupies. Every read of the jobs plus the
+ * pending-missed list maps each job to exactly one of these; a pending missed
+ * occurrence outranks everything else for its job.
+ */
+export type CronTimelineState =
+  /** Next run inside the ruler window; this is what gets a marker. */
+  | 'scheduled'
+  /** A past-due occurrence awaits trigger or dismissal; nothing can be scheduled yet. */
+  | 'missed-blocked'
+  /** Next run exists but lies beyond the ruler window. */
+  | 'beyond-window'
+  /** Disabled by the operator. */
+  | 'paused'
+  /** Enabled but no computable next run. */
+  | 'unscheduled';
+
+export interface CronTimelineProjection {
+  /** Exactly one entry per job, keyed off the jobs list plus the pending set. */
+  states: Array<{ job: CronJob; state: CronTimelineState }>;
+  /** Jobs that own a place on the ruler, soonest first. */
+  scheduled: Array<{ job: CronJob; at: number }>;
+  /** Enabled jobs blocked on a pending missed occurrence. */
+  missedBlocked: CronJob[];
+}
+
+/**
+ * Map the read of all cron jobs and the pending-missed list onto the one state
+ * per job (see `CronTimelineState`). An enabled job with a past-due `next_run`
+ * that the pending-missed registry does not name is still owed a run — the
+ * registry read may have lagged the tick — so it too counts as blocked, never
+ * as silently invisible.
+ */
+export function projectCronTimeline(
+  jobs: CronJob[],
+  pendingMissed: CronJob[],
+  now: number,
+  windowMs = CRON_WINDOW_MS,
+): CronTimelineProjection {
+  const projection: CronTimelineProjection = { states: [], scheduled: [], missedBlocked: [] };
+  const seen = new Set<string>();
+
+  // The pending-missed list first: it outranks any other signal for its jobs.
+  for (const job of pendingMissed) {
+    if (seen.has(job.id)) continue;
+    seen.add(job.id);
+    projection.missedBlocked.push(job);
+    projection.states.push({ job, state: 'missed-blocked' });
+  }
+
+  for (const job of jobs) {
+    if (seen.has(job.id)) continue;
+    seen.add(job.id);
+    if (!job.enabled) {
+      projection.states.push({ job, state: 'paused' });
+      continue;
+    }
+    if (!job.next_run) {
+      projection.states.push({ job, state: 'unscheduled' });
+      continue;
+    }
+    const at = new Date(job.next_run).getTime();
+    if (Number.isNaN(at)) {
+      projection.states.push({ job, state: 'unscheduled' });
+      continue;
+    }
+    if (at <= now) {
+      projection.missedBlocked.push(job);
+      projection.states.push({ job, state: 'missed-blocked' });
+      continue;
+    }
+    if (at <= now + windowMs) {
+      projection.states.push({ job, state: 'scheduled' });
+      projection.scheduled.push({ job, at });
+      continue;
+    }
+    projection.states.push({ job, state: 'beyond-window' });
+  }
+
+  projection.scheduled.sort((a, b) => a.at - b.at);
+  return projection;
+}
+
 // ── Operation copy (pinned by tests — do not reword) ─────────────────────────
 
 function cronOperationVerb(operation: CronOperation<CronJob>): string {

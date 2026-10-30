@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { CalendarClock } from 'lucide-react';
 import { cn, Panel, PanelHeader } from '../../design';
-import { formatWhen, type CronJob } from './cron-model';
+import { CRON_WINDOW_MS, formatWhen, projectCronTimeline, type CronJob, type CronTimelineProjection } from './cron-model';
 
-const WINDOW_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 /** Markers closer than this (percent of the ruler) stack into another lane. */
 const LANE_GAP_PCT = 3.2;
@@ -17,16 +16,14 @@ export interface TimelineMarker {
 }
 
 /** Enabled jobs whose next run falls in (now, now + 24h], placed on the ruler. */
-export function planTimeline(jobs: CronJob[], now: number): TimelineMarker[] {
-  const upcoming = jobs
-    .filter((job) => job.enabled && job.next_run)
-    .map((job) => ({ job, at: new Date(job.next_run as string).getTime() }))
-    .filter(({ at }) => !Number.isNaN(at) && at > now && at <= now + WINDOW_MS)
-    .sort((a, b) => a.at - b.at);
-
+export function planTimeline(
+  scheduled: Array<{ job: CronJob; at: number }>,
+  now: number,
+  windowMs = CRON_WINDOW_MS,
+): TimelineMarker[] {
   const laneEnds: number[] = Array.from({ length: LANES }, () => -Infinity);
-  return upcoming.map(({ job, at }) => {
-    const pct = ((at - now) / WINDOW_MS) * 100;
+  return scheduled.map(({ job, at }) => {
+    const pct = ((at - now) / windowMs) * 100;
     let lane = laneEnds.findIndex((end) => pct - end >= LANE_GAP_PCT);
     if (lane < 0) lane = laneEnds.indexOf(Math.min(...laneEnds));
     laneEnds[lane] = pct;
@@ -37,10 +34,10 @@ export function planTimeline(jobs: CronJob[], now: number): TimelineMarker[] {
 function hourTicks(now: number) {
   const first = Math.ceil(now / HOUR_MS) * HOUR_MS;
   const ticks: Array<{ pct: number; label: string | null }> = [];
-  for (let t = first; t <= now + WINDOW_MS; t += HOUR_MS) {
+  for (let t = first; t <= now + CRON_WINDOW_MS; t += HOUR_MS) {
     const hour = new Date(t).getHours();
     ticks.push({
-      pct: ((t - now) / WINDOW_MS) * 100,
+      pct: ((t - now) / CRON_WINDOW_MS) * 100,
       label: hour % 3 === 0 ? `${String(hour).padStart(2, '0')}:00` : null,
     });
   }
@@ -62,36 +59,56 @@ function useNow(intervalMs: number) {
 
 /**
  * The next-runs timeline: a 24h ruler starting at "now" (the brass needle),
- * with one marker per enabled job at its next run. Hover or focus a marker to
- * read its name; click to jump to the job's row.
+ * with one marker per enabled job at its next run, and a distinct blocked
+ * marker for every job whose missed run still awaits trigger or dismissal
+ * (the projection is the one authority; see `projectCronTimeline`). Hover or
+ * focus a marker to read its name; click to jump to the job's row.
  */
 export function CronTimeline({
   jobs,
+  pendingMissed,
   inFlightIds,
   onSelect,
 }: {
   jobs: CronJob[];
+  pendingMissed: CronJob[];
   inFlightIds: Set<string>;
   onSelect: (jobId: string) => void;
 }) {
   const now = useNow(30_000);
-  const markers = useMemo(() => planTimeline(jobs, now), [jobs, now]);
+  const projection: CronTimelineProjection = useMemo(
+    () => projectCronTimeline(jobs, pendingMissed, now),
+    [jobs, pendingMissed, now],
+  );
+  const markers = useMemo(() => planTimeline(projection.scheduled, now), [projection, now]);
+  // Blocked jobs sit at the needle: their run is already in the past.
+  const blockedMarkers = useMemo(() => {
+    const stuck = projection.missedBlocked.map((job) => ({ job, at: now }));
+    return planTimeline(stuck, now);
+  }, [projection, now]);
   const ticks = useMemo(() => hourTicks(now), [now]);
   const [active, setActive] = useState<string | null>(null);
   const next = markers[0];
+  const blocked = projection.missedBlocked;
+  const blockedNote = blocked.length > 0
+    ? ` ${blocked.length} enabled job${blocked.length === 1 ? '' : 's'} blocked on a missed run that awaits trigger or dismissal: ${blocked.map((job) => job.name).join(', ')}.`
+    : '';
 
   return (
     <Panel ticks className="mb-6" aria-label="Next runs timeline">
       <PanelHeader
         icon={<CalendarClock />}
         title="Next 24 hours"
-        meta={markers.length}
+        meta={markers.length + blocked.length}
         description={
           next ? (
             <>
               Next up: <span className="text-ink-2">{next.job.name}</span> {formatWhen(next.job.next_run, now)}
               {markers.length > 1 ? `, then ${markers.length - 1} more.` : '.'}
+              {blockedNote && <span className="block text-[11.5px] text-warning">{blockedNote.trim()}</span>}
             </>
+          ) : blocked.length > 0 ? (
+            `No enabled run is scheduled in the next 24 hours:${blockedNote.toLowerCase()}`
           ) : (
             'No enabled job is scheduled to run in the next 24 hours.'
           )
@@ -152,6 +169,39 @@ export function CronTimeline({
                   <div className="text-[12px] font-medium text-ink">{job.name}</div>
                   <div className="font-mono text-[10.5px] text-ink-3 tabular">
                     {clockTime(at)} · {formatWhen(job.next_run, now)}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {blockedMarkers.map(({ job, pct, lane }) => {
+          const showing = active === job.id;
+          return (
+            <div
+              key={`blocked-${job.id}`}
+              className="absolute bottom-5 -translate-x-1/2"
+              style={{ left: `${Math.max(pct, 1.2)}%`, height: `${22 + lane * 22}px` }}
+            >
+              <button
+                type="button"
+                aria-label={`${job.name}, blocked on a missed run awaiting trigger or dismissal`}
+                onClick={() => onSelect(job.id)}
+                onMouseEnter={() => setActive(job.id)}
+                onMouseLeave={() => setActive((current) => (current === job.id ? null : current))}
+                onFocus={() => setActive(job.id)}
+                onBlur={() => setActive((current) => (current === job.id ? null : current))}
+                className={cn(
+                  'absolute left-1/2 top-0 size-[11px] -translate-x-1/2 rotate-45 border border-warning bg-warning/15 transition-colors',
+                  'hover:bg-warning/40 focus-visible:bg-warning/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-warning',
+                )}
+              />
+              {showing && (
+                <div className="pointer-events-none absolute -top-9 left-[-6px] z-10 whitespace-nowrap rounded-md border border-line-strong bg-overlay px-2 py-1 shadow-pop">
+                  <div className="text-[12px] font-medium text-ink">{job.name}</div>
+                  <div className="font-mono text-[10.5px] text-ink-3 tabular">
+                    blocked on a missed run · {formatWhen(job.next_run, now)}
                   </div>
                 </div>
               )}

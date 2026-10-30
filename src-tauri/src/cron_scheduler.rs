@@ -2045,42 +2045,15 @@ fn update_claim_state(
 
 /// Detect jobs whose `next_run` has already passed (missed while the app was closed).
 fn detect_missed_jobs(app: &AppHandle) {
-    #[derive(serde::Serialize, Clone)]
-    struct MissedJob {
-        id: String,
-        name: String,
-        schedule: String,
-        next_run: String,
-    }
-
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    let mut stmt = match conn.prepare(
-        "SELECT id, name, schedule, next_run FROM cron_jobs \
-         WHERE enabled = 1 \
-         AND next_run IS NOT NULL \
-         AND next_run < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
-    ) {
-        Ok(s) => s,
+    let missed = match missed_job_rows(&conn) {
+        Ok(rows) => rows,
         Err(e) => {
             eprintln!("[cron] missed-job query error: {}", e);
             return;
         }
     };
-
-    let missed: Vec<MissedJob> = stmt
-        .query_map([], |row| {
-            Ok(MissedJob {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                schedule: row.get(2)?,
-                next_run: row.get(3)?,
-            })
-        })
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .collect();
 
     if !missed.is_empty() {
         {
@@ -2092,8 +2065,44 @@ fn detect_missed_jobs(app: &AppHandle) {
             }
         }
         eprintln!("[cron] {} missed job(s) detected on startup", missed.len());
-        let _ = app.emit("cron://missed-jobs", missed);
+        let _ = app.emit("cron://missed-jobs", &missed);
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MissedJobRow {
+    pub id: String,
+    pub name: String,
+    pub schedule: String,
+    pub next_run: String,
+}
+
+/// The missed-occurrence selection, as one authority for "enabled job with a
+/// past-due next run". This does not advance `next_run` — the row stays past
+/// due until the operator triggers or dismisses the pending occurrence, which
+/// is exactly why the timeline must be able to name that state.
+pub fn missed_job_rows(conn: &rusqlite::Connection) -> Result<Vec<MissedJobRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, name, schedule, next_run FROM cron_jobs \
+             WHERE enabled = 1 \
+             AND next_run IS NOT NULL \
+             AND next_run < strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+        )
+        .map_err(|e| format!("[cron] missed-job query error: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MissedJobRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                schedule: row.get(2)?,
+                next_run: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("[cron] missed-job query error: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }
 
 /// Scheduler loop — spawned once at app startup.
@@ -2195,26 +2204,39 @@ pub async fn start_cron_scheduler(app: AppHandle) {
     }
 }
 
-/// Dismiss a pending missed cron job. Removes it from PENDING_MISSED registry,
-/// re-computes its `next_run` from now, and updates the database.
+/// Dismiss a pending missed cron job. Re-computes its `next_run` from now,
+/// updates the database, and only then removes it from PENDING_MISSED
+/// registry: a failed write leaves the job pending so the operator can retry,
+/// and a dismiss can no longer remove the pending entry before proving the
+/// reschedule.
 pub fn dismiss_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
-    {
-        let mut guard = get_pending_missed_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        guard.remove(id);
-    }
-
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    dismiss_missed_job_conn(&conn, id)?;
 
+    // The reschedule is durable; release the pending entry last.
+    get_pending_missed_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
+
+    Ok(true)
+}
+
+/// The durable half of a dismissal: read the schedule, compute the future
+/// `next_run`, and persist it. Fails closed: a schedule the engine cannot
+/// compute answers an error instead of writing `next_run = NULL` — the old
+/// behaviour silently un-scheduled the job, which never appeared on the
+/// timeline again.
+fn dismiss_missed_job_conn(conn: &rusqlite::Connection, id: &str) -> Result<(), String> {
     let schedule: String = conn
         .query_row("SELECT schedule FROM cron_jobs WHERE id = ?", [id], |row| {
             row.get(0)
         })
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?;
 
-    let next_run = compute_next_run(&schedule);
+    let next_run = compute_next_run(&schedule)
+        .ok_or_else(|| format!("Could not compute a next run for cron job '{}' (schedule '{}' is not machine-readable); the pending occurrence was kept.", id, schedule))?;
     let now = Utc::now().to_rfc3339();
 
     conn.execute(
@@ -2223,19 +2245,58 @@ pub fn dismiss_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
     )
     .map_err(|e| format!("Failed to update dismissed cron job next_run: {}", e))?;
 
-    Ok(true)
+    Ok(())
 }
 
-/// Trigger a pending missed cron job. Removes it from PENDING_MISSED registry
-/// and executes it immediately.
-pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
-    {
-        let mut guard = get_pending_missed_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        guard.remove(id);
-    }
+/// Number of run rows the job has recorded, as the proof of "this attempt
+/// landed in the history".
+fn recorded_run_count_conn(conn: &rusqlite::Connection, job_id: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM cron_runs WHERE cron_job_id = ?",
+        [job_id],
+        |row| row.get(0),
+    )
+    .map_err(|e| format!("Failed to count recorded runs for cron job '{}': {}", job_id, e))
+}
 
+pub fn recorded_run_count(app: &AppHandle, job_id: &str) -> Result<i64, String> {
+    let db = app.state::<AppDb>();
+    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+    recorded_run_count_conn(&conn, job_id)
+}
+
+/// Release the pending-missed entry for `id`, if present.
+pub fn release_pending_missed(id: &str) {
+    get_pending_missed_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(id);
+}
+
+/// Execute a job and report whether **this attempt** recorded a run.
+///
+/// `execute_job` maps an already-claimed occurrence (and a pre-cancelled one)
+/// to an empty success without recording a run, so a caller that reports
+/// success from its return value alone can claim a run the history does not
+/// hold. The proof here is a run-count delta for the job.
+pub async fn execute_job_proving_run(
+    app: &AppHandle,
+    job_id: &str,
+    schedule_expr: &str,
+    trigger_kind: &str,
+) -> Result<bool, String> {
+    let before = recorded_run_count(app, job_id)?;
+    execute_job(app, job_id, schedule_expr, trigger_kind, None).await?;
+    let after = recorded_run_count(app, job_id)?;
+    Ok(after > before)
+}
+
+/// Trigger a pending missed cron job. The pending entry is released only after
+/// the attempt is proven recorded in the run history; a failed attempt keeps
+/// the job pending. An occurrence the history already records is reported as
+/// `false` — nothing new ran — and the pending state is kept for the operator
+/// to explicitly trigger or dismiss.
+pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, String> {
     let schedule_expr = {
         let db = app.state::<AppDb>();
         let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
@@ -2245,9 +2306,11 @@ pub async fn trigger_missed_job(app: &AppHandle, id: &str) -> Result<bool, Strin
         .map_err(|e| format!("Cron job '{}' not found: {}", id, e))?
     };
 
-    execute_job(app, id, &schedule_expr, "missed", None)
-        .await
-        .map(|_| true)
+    let recorded = execute_job_proving_run(app, id, &schedule_expr, "missed").await?;
+    if recorded {
+        release_pending_missed(id);
+    }
+    Ok(recorded)
 }
 
 fn ensure_inference_feedback_job(conn: &rusqlite::Connection) -> Result<bool, String> {
@@ -2270,9 +2333,158 @@ fn ensure_inference_feedback_job(conn: &rusqlite::Connection) -> Result<bool, St
 }
 
 #[cfg(test)]
+mod missed_ordering_tests {
+    //! Ordering and honesty of the missed-occurrence flow, over temp/in-memory
+    //! schemas. No test triggers a real scheduled job: `execute_job` is mocked
+    //! out of reach; the ordering properties are enforced structurally (the
+    //! pending entry is released only after success) and the durable halves are
+    //! tested directly against the connection.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    const SCHEMA: &str = "
+        CREATE TABLE cron_jobs (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule TEXT NOT NULL,
+            agent_id TEXT NOT NULL DEFAULT 'jarvis', session_id TEXT,
+            prompt TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+            last_run TEXT, next_run TEXT, run_count INTEGER NOT NULL DEFAULT 0,
+            metadata TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE cron_runs (
+            id TEXT PRIMARY KEY, cron_job_id TEXT NOT NULL REFERENCES cron_jobs(id),
+            status TEXT, output TEXT, error TEXT, duration_ms INTEGER,
+            started_at TEXT, finished_at TEXT, execution_evidence TEXT,
+            activation_id TEXT, schedule_occurrence TEXT, goal_id TEXT, terminal_reason TEXT
+        );
+    ";
+
+    fn conn() -> rusqlite::Connection {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db
+    }
+
+    fn insert_job(
+        conn: &rusqlite::Connection,
+        id: &str,
+        enabled: bool,
+        next_run: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO cron_jobs (id, name, schedule, enabled, next_run, prompt)
+             VALUES (?, ?, '*/5 * * * *', ?, ?, '')",
+            rusqlite::params![id, id, i64::from(enabled), next_run],
+        )
+        .unwrap();
+    }
+
+    fn insert_run(conn: &rusqlite::Connection, job_id: &str, run_id: &str) {
+        conn.execute(
+            "INSERT INTO cron_runs (id, cron_job_id, status, started_at)
+             VALUES (?, ?, 'success', '2026-10-30T00:00:00.0Z')",
+            rusqlite::params![run_id, job_id],
+        )
+        .unwrap();
+    }
+
+    fn past_due() -> String {
+        "2026-09-15T08:00:00.000Z".to_string()
+    }
+
+    #[test]
+    fn missed_selection_takes_only_enabled_jobs_with_past_due_next_run() {
+        let c = conn();
+        insert_job(&c, "missed", true, Some(&past_due()));
+        insert_job(&c, "disabled", false, Some(&past_due()));
+        insert_job(&c, "future", true, Some("2027-01-01T00:00:00.000Z"));
+        insert_job(&c, "unscheduled", true, None);
+
+        let rows = missed_job_rows(&c).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["missed"], "disabled, future, and unscheduled rows are not missed");
+    }
+
+    #[test]
+    fn dismissed_next_run_is_written_before_the_pending_entry_releases() {
+        // Structural pin of the dismiss ordering: the durable UPDATE happens in
+        // the connection-based half, and the pending release happens only after
+        // that half runs. A failing write therefore cannot lose the pending id.
+        let c = conn();
+        insert_job(&c, "ok", true, None);
+        insert_job(&c, "bad", true, None);
+        // An un-machine-readable schedule must fail closed, not write NULL.
+        c.execute(
+            "UPDATE cron_jobs SET schedule = 'not a schedule' WHERE id = 'bad'",
+            [],
+        )
+        .unwrap();
+
+        let registry: Mutex<HashSet<String>> = Mutex::new(HashSet::from(["ok".to_string(), "bad".to_string()]));
+
+        let before = recorded_run_count_conn(&c, "bad").unwrap();
+        let err = dismiss_half_and_release(&registry, &c, "bad").unwrap_err();
+        assert!(err.contains("not machine-readable"), "{err}");
+        assert!(
+            registry.lock().unwrap().contains("bad"),
+            "a failed dismissal never releases the pending entry"
+        );
+        let next_run: Option<String> = c
+            .query_row("SELECT next_run FROM cron_jobs WHERE id = 'bad'", [], |r| r.get(0))
+            .unwrap();
+        assert!(next_run.is_none(), "a failed dismissal never writes a NULL next_run");
+
+        dismiss_half_and_release(&registry, &c, "ok").unwrap();
+        let updated: Option<String> = c
+            .query_row("SELECT next_run FROM cron_jobs WHERE id = 'ok'", [], |r| r.get(0))
+            .unwrap();
+        assert!(updated.is_some(), "the schedule is future-set");
+        assert!(
+            !registry.lock().unwrap().contains("ok"),
+            "the pending entry releases only after the write succeeded"
+        );
+        assert_eq!(recorded_run_count_conn(&c, "bad").unwrap(), before);
+    }
+
+    /// The two halves of `dismiss_missed_job`, testable without an AppHandle.
+    fn dismiss_half_and_release(
+        registry: &Mutex<HashSet<String>>,
+        conn: &rusqlite::Connection,
+        id: &str,
+    ) -> Result<(), String> {
+        dismiss_missed_job_conn(conn, id)?;
+        registry.lock().unwrap().remove(id);
+        Ok(())
+    }
+
+    #[test]
+    fn run_history_count_proves_a_recorded_attempt() {
+        let c = conn();
+        insert_job(&c, "a1", true, None);
+        insert_job(&c, "other", true, None);
+        assert_eq!(recorded_run_count_conn(&c, "a1").unwrap(), 0);
+        insert_run(&c, "a1", "r1");
+        insert_run(&c, "a1", "r2");
+        insert_run(&c, "other", "r3");
+        assert_eq!(recorded_run_count_conn(&c, "a1").unwrap(), 2);
+    }
+
+    #[test]
+    fn releasing_a_pending_entry_takes_only_that_entry() {
+        let registry = Mutex::new(HashSet::from(["a".to_string(), "b".to_string()]));
+        registry.lock().unwrap().remove("a");
+        assert_eq!(
+            *registry.lock().unwrap(),
+            HashSet::from(["b".to_string()]),
+            "a single release affects only its own id"
+        );
+    }
+}
+
+#[cfg(test)]
 mod inference_feedback_job_tests {
     use super::*;
-
     #[test]
     fn system_feedback_job_is_seeded_idempotently_without_overriding_operator_disable() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

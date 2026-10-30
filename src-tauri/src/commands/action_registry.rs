@@ -378,7 +378,7 @@ fn reconcile_alert_supersession(alerts: &mut [ActionRegistryAlert], data_dir: &P
     let active = read_bucket(&data_dir.join("active.json"));
     let blocked = read_bucket(&data_dir.join("blocked.json"));
     let done = read_bucket(&data_dir.join("done.json"));
-    let (Ok(active), Ok(blocked), Ok(done)) = (active, blocked, done) else {
+    let (Ok(active), Ok(blocked), Ok(_done)) = (active, blocked, done) else {
         return;
     };
 
