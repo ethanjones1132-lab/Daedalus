@@ -227,7 +227,10 @@ pub fn dispatch_approved_action(
 }
 
 #[tauri::command]
-pub fn dispatch_action(db: State<AppDb>, action_id: String) -> Result<ActionDispatchOutcome, String> {
+pub fn dispatch_action(
+    db: State<AppDb>,
+    action_id: String,
+) -> Result<ActionDispatchOutcome, String> {
     dispatch_approved_action(db.inner(), action_id)
 }
 
@@ -257,7 +260,10 @@ pub fn resolve_bindable_action_conn(
     let active = read_bucket(&root.join("data").join("active.json"))
         .map_err(|e| format!("could not read the active Action Registry bucket: {e}"))?;
 
-    let matches: Vec<&RegistryAction> = active.iter().filter(|action| action.id == action_id).collect();
+    let matches: Vec<&RegistryAction> = active
+        .iter()
+        .filter(|action| action.id == action_id)
+        .collect();
     if matches.is_empty() {
         return Err(format!(
             "action '{action_id}' is not present in the active Action Registry bucket; binding requires exactly one active open/in_progress action"
@@ -478,7 +484,10 @@ fn read_bucket_value(path: &Path) -> Result<serde_json::Value, String> {
             }
             Ok(serde_json::Value::Object(map))
         }
-        _ => Err(format!("bucket {} has an unsupported shape", path.display())),
+        _ => Err(format!(
+            "bucket {} has an unsupported shape",
+            path.display()
+        )),
     }
 }
 
@@ -531,10 +540,7 @@ fn unique_action<'a>(
     Ok(first)
 }
 
-fn proof_from_action(
-    action: &serde_json::Value,
-    action_id: &str,
-) -> ActionRegistryTerminalProof {
+fn proof_from_action(action: &serde_json::Value, action_id: &str) -> ActionRegistryTerminalProof {
     let run_id = action
         .get("execution_evidence")
         .and_then(|e| e.get("run_id"))
@@ -660,8 +666,7 @@ pub fn finalize_action_registry_done(
     // Exact readback.
     let done_after = read_bucket_value(&done_path)?;
     let active_after = read_bucket_value(&active_path)?;
-    if matching_count(&done_after, action_id) != 1
-        || matching_count(&active_after, action_id) != 0
+    if matching_count(&done_after, action_id) != 1 || matching_count(&active_after, action_id) != 0
     {
         return Err(format!(
             "action '{action_id}' terminal write could not be confirmed; reconciliation required"
@@ -788,8 +793,14 @@ mod tests {
         let db = tmp_db_with_jarvis_path(&root);
         let outcome = dispatch_approved_action(&db, "a1".to_string()).unwrap();
         let payload = serde_json::to_value(&outcome).unwrap();
-        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("unavailable"));
-        assert_eq!(payload.get("code").and_then(|v| v.as_str()), Some("verification_manifest_missing"));
+        assert_eq!(
+            payload.get("status").and_then(|v| v.as_str()),
+            Some("unavailable")
+        );
+        assert_eq!(
+            payload.get("code").and_then(|v| v.as_str()),
+            Some("verification_manifest_missing")
+        );
         assert_eq!(std::fs::read(&active_path).unwrap(), before);
         assert!(!data.join("done.json").exists());
 
@@ -841,7 +852,10 @@ mod tests {
         let db = tmp_db_with_jarvis_path(&root);
         let outcome = dispatch_approved_action(&db, "a1".to_string()).unwrap();
         let payload = serde_json::to_value(&outcome).unwrap();
-        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("unavailable"));
+        assert_eq!(
+            payload.get("status").and_then(|v| v.as_str()),
+            Some("unavailable")
+        );
         assert_eq!(std::fs::read(&active_path).unwrap(), before);
         assert!(!data.join("done.json").exists());
 
@@ -863,11 +877,7 @@ mod tests {
             "description":"D","status":"open","owner":"o","approval_required":true,
             "approval_status":"pending","updated_at":"2026-06-22"}"#;
         let active_path = data.join("active.json");
-        std::fs::write(
-            &active_path,
-            format!(r#"{{"actions":[{row}]}}"#),
-        )
-        .unwrap();
+        std::fs::write(&active_path, format!(r#"{{"actions":[{row}]}}"#)).unwrap();
         let before = std::fs::read(&active_path).unwrap();
 
         let db = tmp_db_with_jarvis_path(&root);

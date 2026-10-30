@@ -177,7 +177,9 @@ fn validate_relative_path(label: &str, raw: &str) -> Result<(), String> {
         return Err(format!("{label}: path contains control characters"));
     }
     if raw.starts_with('/') || raw.starts_with('\\') || raw.starts_with("//") {
-        return Err(format!("{label}: path must be workspace-relative, not absolute"));
+        return Err(format!(
+            "{label}: path must be workspace-relative, not absolute"
+        ));
     }
     if raw.as_bytes().get(1) == Some(&b':') {
         return Err(format!("{label}: path must not use a drive prefix"));
@@ -201,7 +203,9 @@ fn validate_pattern(label: &str, raw: &str) -> Result<(), String> {
         return Err(format!("{label}: pattern must not be empty"));
     }
     if raw.len() > MAX_PATTERN_LEN {
-        return Err(format!("{label}: pattern exceeds {MAX_PATTERN_LEN} characters"));
+        return Err(format!(
+            "{label}: pattern exceeds {MAX_PATTERN_LEN} characters"
+        ));
     }
     if has_control_chars(raw) {
         return Err(format!("{label}: pattern contains control characters"));
@@ -209,12 +213,7 @@ fn validate_pattern(label: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_opt_range(
-    label: &str,
-    value: Option<u32>,
-    min: u32,
-    max: u32,
-) -> Result<(), String> {
+fn validate_opt_range(label: &str, value: Option<u32>, min: u32, max: u32) -> Result<(), String> {
     if let Some(n) = value {
         if n < min || n > max {
             return Err(format!("{label}: must be between {min} and {max}"));
@@ -244,7 +243,9 @@ fn reject_payload_fields(label: &str, a: &ToolCallArgumentsV1) -> Result<(), Str
 /// the overall manifest cap bounding the total.
 fn validate_payload(label: &str, raw: &str) -> Result<(), String> {
     if raw.len() > MAX_PAYLOAD_BYTES {
-        return Err(format!("{label}: payload exceeds {MAX_PAYLOAD_BYTES} bytes"));
+        return Err(format!(
+            "{label}: payload exceeds {MAX_PAYLOAD_BYTES} bytes"
+        ));
     }
     if raw.contains('\0') {
         return Err(format!("{label}: payload contains a NUL byte"));
@@ -261,9 +262,17 @@ fn validate_call_tool(
     args: Option<&ToolCallArgumentsV1>,
     allow_writers: bool,
 ) -> Result<(), String> {
-    let allowed = if allow_writers { EXECUTION_TOOLS } else { ACCEPTANCE_TOOLS };
+    let allowed = if allow_writers {
+        EXECUTION_TOOLS
+    } else {
+        ACCEPTANCE_TOOLS
+    };
     if !allowed.contains(&tool) {
-        let kind = if allow_writers { "execution" } else { "acceptance" };
+        let kind = if allow_writers {
+            "execution"
+        } else {
+            "acceptance"
+        };
         return Err(format!(
             "{label}: tool '{tool}' is not allowlisted for {kind} calls"
         ));
@@ -323,7 +332,9 @@ fn validate_call_tool(
             }
             if let Some(mode) = a.output_mode.as_deref() {
                 if !ALLOWED_OUTPUT_MODES.contains(&mode) {
-                    return Err(format!("{label}.output_mode: unsupported output mode '{mode}'"));
+                    return Err(format!(
+                        "{label}.output_mode: unsupported output mode '{mode}'"
+                    ));
                 }
             }
             validate_opt_range(&format!("{label}.head_limit"), a.head_limit, 1, 1000)?;
@@ -361,7 +372,9 @@ fn validate_call_tool(
                 .as_deref()
                 .ok_or_else(|| format!("{label}: edit_file requires 'old_string'"))?;
             if old_string.is_empty() {
-                return Err(format!("{label}: edit_file requires a non-empty 'old_string'"));
+                return Err(format!(
+                    "{label}: edit_file requires a non-empty 'old_string'"
+                ));
             }
             validate_payload(&format!("{label}.old_string"), old_string)?;
             let new_string = a
@@ -382,8 +395,14 @@ fn validate_call_tool(
 }
 
 fn validate_sha256(label: &str, raw: &str) -> Result<(), String> {
-    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(format!("{label}: expected a lowercase 64-character SHA-256 hex string"));
+    if raw.len() != 64
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "{label}: expected a lowercase 64-character SHA-256 hex string"
+        ));
     }
     Ok(())
 }
@@ -442,9 +461,7 @@ pub fn validate_trusted_manifest_content(
     let mut total_checks = 0usize;
     for (criterion_id, checks) in &content.acceptance {
         uuid::Uuid::parse_str(criterion_id).map_err(|_| {
-            format!(
-                "acceptance criterion id '{criterion_id}' is not a stable Goal criterion UUID"
-            )
+            format!("acceptance criterion id '{criterion_id}' is not a stable Goal criterion UUID")
         })?;
         if checks.is_empty() {
             return Err(format!(
@@ -494,9 +511,11 @@ pub fn validate_trusted_manifest_content(
 /// Agent row. A disabled or unknown Agent fails closed: no privileged fallback.
 fn require_enabled_agent(conn: &Connection, agent_id: &str) -> Result<(), String> {
     let enabled: Option<i64> = conn
-        .query_row("SELECT enabled FROM agents WHERE id = ?1", [agent_id], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT enabled FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|e| format!("failed to resolve Agent '{agent_id}': {e}"))?;
     match enabled {
@@ -628,7 +647,10 @@ fn map_manifest_row(
     ))
 }
 
-fn load_manifest(conn: &Connection, manifest_id: &str) -> Result<TrustedAcceptanceManifest, String> {
+fn load_manifest(
+    conn: &Connection,
+    manifest_id: &str,
+) -> Result<TrustedAcceptanceManifest, String> {
     let row = conn
         .query_row(
             &format!(
@@ -801,9 +823,7 @@ pub fn replace_trusted_acceptance_manifest(
         )
         .map_err(|e| format!("failed to replace trusted manifest: {e}"))?;
     if affected != 1 {
-        return Err(
-            "trusted manifest changed while replacing; no update was applied".to_string(),
-        );
+        return Err("trusted manifest changed while replacing; no update was applied".to_string());
     }
     tx.commit().map_err(|e| e.to_string())?;
 
@@ -858,13 +878,15 @@ pub fn remove_trusted_acceptance_manifest(
         .execute(
             "DELETE FROM trusted_acceptance_manifests
              WHERE manifest_id = ?1 AND registry_version = ?2 AND content_hash = ?3",
-            params![&manifest_id, current.registry_version, &current.content_hash],
+            params![
+                &manifest_id,
+                current.registry_version,
+                &current.content_hash
+            ],
         )
         .map_err(|e| format!("failed to remove trusted manifest: {e}"))?;
     if affected != 1 {
-        return Err(
-            "trusted manifest changed while removing; nothing was deleted".to_string(),
-        );
+        return Err("trusted manifest changed while removing; nothing was deleted".to_string());
     }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(true)

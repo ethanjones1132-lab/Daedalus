@@ -265,7 +265,9 @@ fn attempt_relay_memory_finalize(
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(std::time::Duration::from_millis(RELAY_MEMORY_FINALIZE_TIMEOUT_MS)) {
+    match rx.recv_timeout(std::time::Duration::from_millis(
+        RELAY_MEMORY_FINALIZE_TIMEOUT_MS,
+    )) {
         Ok(Ok(outcome)) => {
             // A reused turn id whose canonical stored turn does not own this
             // newly saved relay source is never synced, appended, or captured.
@@ -434,19 +436,22 @@ pub fn run_jarvis_message(
         // explicit native ownership metadata. `native_owns_append: true` means
         // the native relay owns the append attempt for this turn; a null id
         // means native did not append a row and the UI must NOT fall back.
-        let emit_error =
-            |app: &AppHandle, sid: &str, turn_id: &str, msg: String, assistant_message_id: Option<&str>| {
-                let _ = app.emit(
-                    "jarvis://error",
-                    serde_json::json!({
-                        "error": msg,
-                        "session_id": sid,
-                        "turn_id": turn_id,
-                        "assistant_message_id": assistant_message_id,
-                        "native_owns_append": true,
-                    }),
-                );
-            };
+        let emit_error = |app: &AppHandle,
+                          sid: &str,
+                          turn_id: &str,
+                          msg: String,
+                          assistant_message_id: Option<&str>| {
+            let _ = app.emit(
+                "jarvis://error",
+                serde_json::json!({
+                    "error": msg,
+                    "session_id": sid,
+                    "turn_id": turn_id,
+                    "assistant_message_id": assistant_message_id,
+                    "native_owns_append": true,
+                }),
+            );
+        };
         let emit_done =
             |app: &AppHandle, sid: &str, turn_id: &str, assistant_message_id: Option<&str>| {
                 let _ = app.emit(
@@ -502,7 +507,8 @@ pub fn run_jarvis_message(
             "memory_status": &initial_memory_status,
         });
         if let Some(preparation_id) = memory_preparation_id.as_deref() {
-            request_body["memory_preparation_id"] = serde_json::Value::String(preparation_id.to_string());
+            request_body["memory_preparation_id"] =
+                serde_json::Value::String(preparation_id.to_string());
         }
         // Exact persisted saved-user source row for a Goal-linked relay turn.
         // Association identity only: the owned Bun child matches it against the
@@ -681,14 +687,15 @@ pub fn run_jarvis_message(
                         &run_acc,
                     );
                     if let Some(e) = error {
-                        emit_error(&app, &sid, &turn_id, e, relay_assistant_message_id.as_deref());
+                        emit_error(
+                            &app,
+                            &sid,
+                            &turn_id,
+                            e,
+                            relay_assistant_message_id.as_deref(),
+                        );
                     }
-                    emit_done(
-                        &app,
-                        &sid,
-                        &turn_id,
-                        relay_assistant_message_id.as_deref(),
-                    );
+                    emit_done(&app, &sid, &turn_id, relay_assistant_message_id.as_deref());
                     terminated = true;
                     break;
                 }
@@ -703,12 +710,7 @@ pub fn run_jarvis_message(
                         &mut memory_finalized,
                         &run_acc,
                     );
-                    emit_done(
-                        &app,
-                        &sid,
-                        &turn_id,
-                        relay_assistant_message_id.as_deref(),
-                    );
+                    emit_done(&app, &sid, &turn_id, relay_assistant_message_id.as_deref());
                     terminated = true;
                     break;
                 }
@@ -732,12 +734,7 @@ pub fn run_jarvis_message(
                         &mut memory_finalized,
                         &run_acc,
                     );
-                    emit_done(
-                        &app,
-                        &sid,
-                        &turn_id,
-                        relay_assistant_message_id.as_deref(),
-                    );
+                    emit_done(&app, &sid, &turn_id, relay_assistant_message_id.as_deref());
                     terminated = true;
                     break;
                 }
@@ -880,13 +877,15 @@ pub fn run_jarvis_message(
             // id. A missing/mismatched receipt leaves the run goal-less.
             let verified_goal_id = match goal_binding_id.as_deref() {
                 Some(binding_id) if !binding_id.is_empty() => {
-                    let transport =
-                        crate::jarvis::memory::transport::native_memory_transport();
+                    let transport = crate::jarvis::memory::transport::native_memory_transport();
                     match rusqlite::Connection::open(&db_path) {
-                        Ok(conn) => crate::jarvis::memory::transport::
-                            resolve_goal_terminal_authority(&conn, transport, binding_id, run_id)
+                        Ok(conn) => {
+                            crate::jarvis::memory::transport::resolve_goal_terminal_authority(
+                                &conn, transport, binding_id, run_id,
+                            )
                             .ok()
-                            .flatten(),
+                            .flatten()
+                        }
                         Err(_) => None,
                     }
                 }
@@ -935,12 +934,7 @@ pub fn run_jarvis_message(
                 &mut memory_finalized,
                 &run_acc,
             );
-            emit_done(
-                &app,
-                &sid,
-                &turn_id,
-                relay_assistant_message_id.as_deref(),
-            );
+            emit_done(&app, &sid, &turn_id, relay_assistant_message_id.as_deref());
         }
     });
 
@@ -1265,7 +1259,12 @@ impl SseRelay {
                 let selected_ids = evt
                     .get("selected_ids")
                     .and_then(|v| v.as_array())
-                    .map(|values| values.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let store_revision = evt.get("store_revision").and_then(|v| v.as_i64());
                 let code = evt.get("code").and_then(|v| v.as_str()).map(String::from);
@@ -1291,7 +1290,12 @@ impl SseRelay {
                 let selected_ids = evt
                     .get("selected_ids")
                     .and_then(|v| v.as_array())
-                    .map(|values| values.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let status = evt
                     .get("status")
@@ -1960,9 +1964,14 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
                 .and_then(|client| client.get(url).send().ok())
                 .and_then(|response| response.json::<serde_json::Value>().ok())
                 .and_then(|json| json.get("data").and_then(|data| data.as_array()).cloned())
-                .map(|models| models.is_empty() || models.iter().any(|item| {
-                    item.get("id").and_then(|id| id.as_str()).map_or(true, |id| id == model)
-                }))
+                .map(|models| {
+                    models.is_empty()
+                        || models.iter().any(|item| {
+                            item.get("id")
+                                .and_then(|id| id.as_str())
+                                .map_or(true, |id| id == model)
+                        })
+                })
                 .unwrap_or(false)
         })
         .join()
@@ -1986,8 +1995,7 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     };
 
     // ── Claude CLI proxy ─────────────────────────────────────────
-    let claude_proxy_running =
-        check_claude_proxy_status(config, crate::claude_proxy_is_listening);
+    let claude_proxy_running = check_claude_proxy_status(config, crate::claude_proxy_is_listening);
 
     // ── Bridge ───────────────────────────────────────────────────
     let bridge_active =

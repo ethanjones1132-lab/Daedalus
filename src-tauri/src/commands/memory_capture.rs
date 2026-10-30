@@ -21,6 +21,7 @@ use crate::jarvis::memory::capture_contracts::{
     NativeDerivedMutationPlan, ScopedCorrectRequest, ScopedForgetRequest, SessionContinuity,
     StageProposalRequest,
 };
+use crate::jarvis::memory::continuity;
 use crate::jarvis::memory::contracts::{
     AuthorityKind, MemoryError, MemoryProvenance, MutationResult,
 };
@@ -29,7 +30,6 @@ use crate::jarvis::memory::transport::{self, native_memory_transport, NativeMemo
 use crate::jarvis::memory::turn::{
     self, MemoryTurnDiagnostic, MemoryTurnIdentityRequest, MemoryTurnTerminalStatus,
 };
-use crate::jarvis::memory::continuity;
 
 fn join_error(context: &str, error: impl std::fmt::Display) -> MemoryError {
     MemoryError::storage_unavailable(format!("{context}: {error}"))
@@ -135,11 +135,21 @@ pub async fn memory_capture_turn(
     match &sync_result {
         Ok(Err(error)) => {
             eprintln!("[memory] capture pre-sync failed: {}", error);
-            emit_sync_unavailable(&app, &request.session_id, &request.turn_id, "sync_unavailable");
+            emit_sync_unavailable(
+                &app,
+                &request.session_id,
+                &request.turn_id,
+                "sync_unavailable",
+            );
         }
         Err(error) => {
             eprintln!("[memory] capture pre-sync join error: {}", error);
-            emit_sync_unavailable(&app, &request.session_id, &request.turn_id, "sync_unavailable");
+            emit_sync_unavailable(
+                &app,
+                &request.session_id,
+                &request.turn_id,
+                "sync_unavailable",
+            );
         }
         Ok(Ok(())) => {}
     }
@@ -202,7 +212,8 @@ pub async fn memory_continuity_set(
         app,
         session_id,
         move |conn| {
-            if let Some(prior) = continuity::replay_session_continuity_set(conn, &resolve_request)? {
+            if let Some(prior) = continuity::replay_session_continuity_set(conn, &resolve_request)?
+            {
                 return Ok(transport::DerivedGatePlan::Replay(prior));
             }
             continuity::validate_continuity_set(conn, &resolve_request)?;
@@ -212,15 +223,17 @@ pub async fn memory_continuity_set(
                 None,
                 &[],
             )?;
-            Ok(transport::DerivedGatePlan::Invalidate(NativeDerivedMutationPlan {
-                invalidation: MemoryDerivedInvalidation {
-                    operation_id: resolve_request.operation_id.clone(),
-                    affected_session_ids,
-                    memory_ids: Vec::new(),
-                    source_message_ids: Vec::new(),
+            Ok(transport::DerivedGatePlan::Invalidate(
+                NativeDerivedMutationPlan {
+                    invalidation: MemoryDerivedInvalidation {
+                        operation_id: resolve_request.operation_id.clone(),
+                        affected_session_ids,
+                        memory_ids: Vec::new(),
+                        source_message_ids: Vec::new(),
+                    },
+                    scope: None,
                 },
-                scope: None,
-            }))
+            ))
         },
         move |conn, _plan| continuity::set_session_continuity(conn, request, Utc::now()),
     )
@@ -286,8 +299,11 @@ pub async fn memory_scoped_correct(
             if let Some(prior) = replay_manual_correct(conn, &resolve_request)? {
                 return Ok(transport::DerivedGatePlan::Replay(prior));
             }
-            let scope =
-                scope::resolve_write_scope(conn, &resolve_request.session_id, &resolve_request.selector)?;
+            let scope = scope::resolve_write_scope(
+                conn,
+                &resolve_request.session_id,
+                &resolve_request.selector,
+            )?;
             let memory_ids = vec![resolve_request.id.clone()];
             let source_message_ids =
                 continuity::collect_memory_source_message_ids(conn, &scope, &memory_ids)?;
@@ -297,15 +313,17 @@ pub async fn memory_scoped_correct(
                 Some(&scope),
                 &memory_ids,
             )?;
-            Ok(transport::DerivedGatePlan::Invalidate(NativeDerivedMutationPlan {
-                invalidation: MemoryDerivedInvalidation {
-                    operation_id: resolve_request.operation_id.clone(),
-                    affected_session_ids,
-                    memory_ids,
-                    source_message_ids,
+            Ok(transport::DerivedGatePlan::Invalidate(
+                NativeDerivedMutationPlan {
+                    invalidation: MemoryDerivedInvalidation {
+                        operation_id: resolve_request.operation_id.clone(),
+                        affected_session_ids,
+                        memory_ids,
+                        source_message_ids,
+                    },
+                    scope: Some(scope),
                 },
-                scope: Some(scope),
-            }))
+            ))
         },
         move |conn, _plan| {
             // Recheck the operation identity inside the gate to close races.
@@ -345,8 +363,11 @@ pub async fn memory_scoped_forget(
             if let Some(prior) = replay_manual_forget(conn, &resolve_request)? {
                 return Ok(transport::DerivedGatePlan::Replay(prior));
             }
-            let scope =
-                scope::resolve_write_scope(conn, &resolve_request.session_id, &resolve_request.selector)?;
+            let scope = scope::resolve_write_scope(
+                conn,
+                &resolve_request.session_id,
+                &resolve_request.selector,
+            )?;
             let memory_ids = vec![resolve_request.id.clone()];
             let source_message_ids =
                 continuity::collect_memory_source_message_ids(conn, &scope, &memory_ids)?;
@@ -356,15 +377,17 @@ pub async fn memory_scoped_forget(
                 Some(&scope),
                 &memory_ids,
             )?;
-            Ok(transport::DerivedGatePlan::Invalidate(NativeDerivedMutationPlan {
-                invalidation: MemoryDerivedInvalidation {
-                    operation_id: resolve_request.operation_id.clone(),
-                    affected_session_ids,
-                    memory_ids,
-                    source_message_ids,
+            Ok(transport::DerivedGatePlan::Invalidate(
+                NativeDerivedMutationPlan {
+                    invalidation: MemoryDerivedInvalidation {
+                        operation_id: resolve_request.operation_id.clone(),
+                        affected_session_ids,
+                        memory_ids,
+                        source_message_ids,
+                    },
+                    scope: Some(scope),
                 },
-                scope: Some(scope),
-            }))
+            ))
         },
         move |conn, _plan| {
             if let Some(prior) = replay_manual_forget(conn, &request)? {
@@ -401,23 +424,28 @@ pub async fn memory_stage_proposal(
             if let Some(prior) = capture::stage_memory_proposal_replay(conn, &resolve_request)? {
                 return Ok(transport::DerivedGatePlan::Replay(prior));
             }
-            let persisted =
-                turn::read_memory_turn(conn, &resolve_request.session_id, &resolve_request.turn_id)?;
+            let persisted = turn::read_memory_turn(
+                conn,
+                &resolve_request.session_id,
+                &resolve_request.turn_id,
+            )?;
             let affected_session_ids = continuity::collect_affected_session_ids(
                 conn,
                 &resolve_request.session_id,
                 Some(&persisted.scope),
                 &[],
             )?;
-            Ok(transport::DerivedGatePlan::Invalidate(NativeDerivedMutationPlan {
-                invalidation: MemoryDerivedInvalidation {
-                    operation_id: resolve_request.operation_id.clone(),
-                    affected_session_ids,
-                    memory_ids: Vec::new(),
-                    source_message_ids: Vec::new(),
+            Ok(transport::DerivedGatePlan::Invalidate(
+                NativeDerivedMutationPlan {
+                    invalidation: MemoryDerivedInvalidation {
+                        operation_id: resolve_request.operation_id.clone(),
+                        affected_session_ids,
+                        memory_ids: Vec::new(),
+                        source_message_ids: Vec::new(),
+                    },
+                    scope: Some(persisted.scope),
                 },
-                scope: Some(persisted.scope),
-            }))
+            ))
         },
         move |conn, _plan| {
             // Stage rechecks the payload identity inside its own savepoint.
@@ -477,7 +505,8 @@ fn objective_capture_invalidation(
     session_id: &str,
     turn_id: &str,
 ) -> Result<NativeDerivedMutationPlan, MemoryError> {
-    let affected_session_ids = continuity::collect_affected_session_ids(conn, session_id, None, &[])?;
+    let affected_session_ids =
+        continuity::collect_affected_session_ids(conn, session_id, None, &[])?;
     Ok(NativeDerivedMutationPlan {
         invalidation: MemoryDerivedInvalidation {
             operation_id: format!("turn/{turn_id}/user/0"),
@@ -758,7 +787,8 @@ pub fn recover_recorded_memory_captures(
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(MemoryError::from)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)?
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(MemoryError::from)?
     };
 
     let mut captured = 0usize;

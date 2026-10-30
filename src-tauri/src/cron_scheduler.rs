@@ -5,9 +5,9 @@
 
 use crate::db::AppDb;
 use chrono::Utc;
-use rusqlite::OptionalExtension;
 use cron::Schedule;
 use reqwest::Client;
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -241,7 +241,10 @@ fn claim_activation(
     // any claim/dispatch. The intent was already persisted by the caller; this
     // path simply refuses to start.
     if is_cancel_requested(job_id) {
-        return Err(format!("cron job '{}' was cancelled before dispatch", job_id));
+        return Err(format!(
+            "cron job '{}' was cancelled before dispatch",
+            job_id
+        ));
     }
 
     let occurrence_source = next_run_override
@@ -579,7 +582,11 @@ fn settle_cancellation_unconfirmed(app: &AppHandle, job_id: &str) -> Result<(), 
 /// asserting that it stopped. Writes the intent columns (schema-valid
 /// `claim_state` is left untouched) and returns the activation id it applied to,
 /// if any. Fails closed if the intent write does not commit.
-pub fn persist_cancellation_intent(app: &AppHandle, job_id: &str, reason: &str) -> Result<Option<String>, String> {
+pub fn persist_cancellation_intent(
+    app: &AppHandle,
+    job_id: &str,
+    reason: &str,
+) -> Result<Option<String>, String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let activation_id: Option<String> = conn
@@ -624,12 +631,26 @@ fn settle_activation_denied(
 
     // Read the current state so an already-recorded identical denial is treated
     // as an idempotent success rather than a failed update.
-    let existing: Option<(String, Option<String>, Option<String>, Option<String>, Option<String>)> = conn
+    let existing: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .query_row(
             "SELECT claim_state, terminal_reason, goal_id, cron_job_id, session_id \
              FROM cron_activations WHERE activation_id = ?1",
             [activation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|e| format!("failed to read activation {activation_id}: {e}"))?;
@@ -648,7 +669,9 @@ fn settle_activation_denied(
         {
             return Ok(());
         }
-        Some((state, _, _, _, _)) if matches!(state.as_str(), "completed" | "failed" | "cancelled") => {
+        Some((state, _, _, _, _))
+            if matches!(state.as_str(), "completed" | "failed" | "cancelled") =>
+        {
             // A terminal activation must not be overwritten by a late denial.
             return Ok(());
         }
@@ -718,12 +741,7 @@ pub fn mark_activation_cancelled(
     // terminal activation is never overwritten and the post-write notification
     // can be scoped to a Goal-linked activation.
     #[allow(clippy::type_complexity)]
-    let identity: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = conn
+    let identity: Option<(String, Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT claim_state, goal_id, cron_job_id, run_id \
              FROM cron_activations WHERE activation_id = ?1",
@@ -856,9 +874,7 @@ pub async fn request_cron_cancellation(
     // publish before the receiver exists. Take the signal sender under the same
     // lock, then release all locks before awaiting.
     let control = {
-        let guard = cancel_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let guard = cancel_registry().lock().unwrap_or_else(|p| p.into_inner());
         guard.get(job_id).and_then(|control| {
             if control.activation_id != id {
                 return None;
@@ -1115,13 +1131,11 @@ pub async fn dispatch_cron_job(
             ));
         }
 
-        let sender_agent = job_agent
-            .as_deref()
-            .ok_or_else(|| CronDispatchError::Denied(
-                crate::commands::agents::ActivationDenial::Blocked(
-                    "cron job has no Agent identity; refusing dispatch".to_string(),
-                ),
-            ))?;
+        let sender_agent = job_agent.as_deref().ok_or_else(|| {
+            CronDispatchError::Denied(crate::commands::agents::ActivationDenial::Blocked(
+                "cron job has no Agent identity; refusing dispatch".to_string(),
+            ))
+        })?;
 
         // Captured claim workspace policy, if this is a claimed activation. It is
         // compared against the current canonical Goal/Session workspace below.
@@ -1206,9 +1220,7 @@ pub async fn dispatch_cron_job(
                     )),
                 ));
             }
-            if claim_agent != sender_agent
-                || claim_session != job_session
-                || claim_goal != job_goal
+            if claim_agent != sender_agent || claim_session != job_session || claim_goal != job_goal
             {
                 return Err(CronDispatchError::Denied(
                     crate::commands::agents::ActivationDenial::Blocked(
@@ -1435,13 +1447,14 @@ pub async fn dispatch_cron_job(
                 }
             }
         }
-        None => text_future
-            .await
-            .map_err(|e| CronDispatchError::Transport(format!("Failed to read cron run response: {}", e)))?,
+        None => text_future.await.map_err(|e| {
+            CronDispatchError::Transport(format!("Failed to read cron run response: {}", e))
+        })?,
     };
 
-    let result: serde_json::Value = serde_json::from_str(&raw_body)
-        .map_err(|e| CronDispatchError::Transport(format!("Failed to parse cron run response: {}", e)))?;
+    let result: serde_json::Value = serde_json::from_str(&raw_body).map_err(|e| {
+        CronDispatchError::Transport(format!("Failed to parse cron run response: {}", e))
+    })?;
 
     let output = result["output"].as_str().unwrap_or("").to_string();
     let error = result["error"].as_str().map(|s| s.to_string());
@@ -1746,7 +1759,13 @@ pub async fn execute_job(
     // Claim first. A durable prior claim for this occurrence is never
     // re-dispatched; errors (disabled/missing job, terminal Goal association,
     // invalid occurrence) fail closed before any dispatch.
-    let claim = claim_activation(app, job_id, schedule_expr, trigger_kind, occurrence_override)?;
+    let claim = claim_activation(
+        app,
+        job_id,
+        schedule_expr,
+        trigger_kind,
+        occurrence_override,
+    )?;
     let Some(activation_id) = claim else {
         eprintln!(
             "[cron] {} occurrence already claimed; skipping dispatch",
@@ -1802,9 +1821,7 @@ pub async fn execute_job(
     let (ack_tx, _ack_keepalive) = tokio::sync::broadcast::channel::<()>(4);
     let mut pre_cancelled = false;
     {
-        let mut guard = cancel_registry()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut guard = cancel_registry().lock().unwrap_or_else(|p| p.into_inner());
         guard.insert(
             job_id.to_string(),
             CancelControl {
@@ -1951,9 +1968,7 @@ pub async fn execute_job(
 
 /// Remove the abort token registration for a job.
 fn release_cancel_registration(job_id: &str) {
-    let mut guard = cancel_registry()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = cancel_registry().lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(job_id);
 }
 
@@ -1974,9 +1989,11 @@ fn occurrence_source(app: &AppHandle, job_id: &str, override_next: Option<&str>)
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let stored: Option<String> = conn
-        .query_row("SELECT next_run FROM cron_jobs WHERE id = ?1", [job_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT next_run FROM cron_jobs WHERE id = ?1",
+            [job_id],
+            |r| r.get(0),
+        )
         .optional()
         .ok()
         .flatten();
@@ -1987,9 +2004,11 @@ fn occurrence_source(app: &AppHandle, job_id: &str, override_next: Option<&str>)
 fn cron_job_goal_id(app: &AppHandle, job_id: &str) -> Option<String> {
     let db = app.state::<AppDb>();
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    conn.query_row("SELECT goal_id FROM cron_jobs WHERE id = ?1", [job_id], |r| {
-        r.get(0)
-    })
+    conn.query_row(
+        "SELECT goal_id FROM cron_jobs WHERE id = ?1",
+        [job_id],
+        |r| r.get(0),
+    )
     .optional()
     .ok()
     .flatten()
@@ -2139,15 +2158,14 @@ pub async fn start_cron_scheduler(app: AppHandle) {
                     continue;
                 }
             };
-            let collected: Vec<(String, String, Option<String>)> = match stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            {
-                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-                Err(e) => {
-                    eprintln!("[cron] row error: {}", e);
-                    vec![]
-                }
-            };
+            let collected: Vec<(String, String, Option<String>)> =
+                match stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))) {
+                    Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                    Err(e) => {
+                        eprintln!("[cron] row error: {}", e);
+                        vec![]
+                    }
+                };
             collected
         };
 

@@ -70,13 +70,7 @@ where
     tauri::async_runtime::spawn_blocking(move || {
         let db = app.state::<AppDb>();
         let transport = native_memory_transport();
-        transport::run_derived_mutation_gate(
-            db.inner(),
-            transport,
-            &session_id,
-            resolve,
-            mutation,
-        )
+        transport::run_derived_mutation_gate(db.inner(), transport, &session_id, resolve, mutation)
     })
     .await
     .map_err(|error| join_error("memory derived mutation task join error", error))?

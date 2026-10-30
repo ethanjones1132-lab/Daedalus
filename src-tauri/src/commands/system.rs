@@ -554,11 +554,18 @@ pub async fn get_doctor_report(
     let config = state.config.lock().await.clone();
 
     // Active local inference backends
-    let ollama_required = matches!(config.active_backend, crate::jarvis::types::JarvisBackend::Ollama);
+    let ollama_required = matches!(
+        config.active_backend,
+        crate::jarvis::types::JarvisBackend::Ollama
+    );
     let ollama = crate::is_port_listening(11434);
     checks.push(DoctorCheck {
         name: "ollama".into(),
-        status: if !ollama_required || ollama { "ok".into() } else { "warn".into() },
+        status: if !ollama_required || ollama {
+            "ok".into()
+        } else {
+            "warn".into()
+        },
         detail: if !ollama_required {
             "Ollama is not the active inference backend".into()
         } else if ollama {
@@ -568,7 +575,10 @@ pub async fn get_doctor_report(
         },
     });
 
-    let llama_cpp_required = matches!(config.active_backend, crate::jarvis::types::JarvisBackend::LlamaCpp);
+    let llama_cpp_required = matches!(
+        config.active_backend,
+        crate::jarvis::types::JarvisBackend::LlamaCpp
+    );
     let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
     checks.push(DoctorCheck {
         name: "llama_cpp".into(),
@@ -611,7 +621,10 @@ pub async fn get_doctor_report(
     });
 
     // Claude CLI proxy
-    checks.push(claude_proxy_doctor_check(&config, crate::claude_proxy_is_listening));
+    checks.push(claude_proxy_doctor_check(
+        &config,
+        crate::claude_proxy_is_listening,
+    ));
 
     // System store
     let store_ok = system_store_path().exists()

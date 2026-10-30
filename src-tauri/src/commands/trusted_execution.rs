@@ -278,8 +278,9 @@ fn resolve_dispatch_authority(
     action_id: &str,
     manifest: &ManifestScope,
 ) -> Result<DispatchAuthority, DispatchDenial> {
-    let bound_action = crate::commands::action_registry::resolve_bindable_action_conn(conn, action_id)
-        .map_err(DispatchDenial::Blocked)?;
+    let bound_action =
+        crate::commands::action_registry::resolve_bindable_action_conn(conn, action_id)
+            .map_err(DispatchDenial::Blocked)?;
     if bound_action != action_id {
         return Err(DispatchDenial::Blocked(
             "resolved Action Registry id does not match the requested binding".to_string(),
@@ -289,13 +290,13 @@ fn resolve_dispatch_authority(
         .map_err(|e| DispatchDenial::Blocked(format!("project root unavailable: {e}")))?;
     let snapshot = crate::commands::agents::resolve_activation_boundary(conn, &manifest.agent_id)
         .map_err(|denial| match denial {
-            crate::commands::agents::ActivationDenial::WaitingForUser(reason) => {
-                DispatchDenial::Waiting(reason)
-            }
-            crate::commands::agents::ActivationDenial::Blocked(reason) => {
-                DispatchDenial::Blocked(reason)
-            }
-        })?;
+        crate::commands::agents::ActivationDenial::WaitingForUser(reason) => {
+            DispatchDenial::Waiting(reason)
+        }
+        crate::commands::agents::ActivationDenial::Blocked(reason) => {
+            DispatchDenial::Blocked(reason)
+        }
+    })?;
     Ok(DispatchAuthority {
         action_id: bound_action,
         project_root,
@@ -668,7 +669,8 @@ fn conflict_for_existing(
                 {
                     return conflict(
                         "projection_changed",
-                        "receipt projection identity differs from the current projection".to_string(),
+                        "receipt projection identity differs from the current projection"
+                            .to_string(),
                     );
                 }
             }
@@ -847,7 +849,8 @@ fn settle_dispatch_result(
         } else {
             (incoming_status, reason)
         };
-    let _ = set_execution_runtime_bounds(conn, execution_id, runtime_started_at, runtime_finished_at);
+    let _ =
+        set_execution_runtime_bounds(conn, execution_id, runtime_started_at, runtime_finished_at);
     settle_and_verify(
         conn,
         execution_id,
@@ -918,31 +921,30 @@ fn settle_and_verify(
         bun_run_id,
         evidence,
     );
-    load_execution(conn, execution_id)
-        .unwrap_or_else(|_| TrustedActionExecution {
-            execution_id: execution_id.to_string(),
-            idempotency_key: String::new(),
-            action_id: String::new(),
-            manifest_id: String::new(),
-            manifest_registry_version: 0,
-            manifest_content_hash: String::new(),
-            manifest_schema_version: 0,
-            agent_id: String::new(),
-            project_root: String::new(),
-            status: STATUS_AMBIGUOUS.to_string(),
-            terminal_reason: Some("execution receipt could not be durably confirmed".to_string()),
-            run_id: None,
-            bun_run_id: None,
-            evidence: None,
-            started_at: None,
-            settled_at: None,
-            runtime_started_at: None,
-            runtime_finished_at: None,
-            cancel_requested_at: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            conflict: None,
-        })
+    load_execution(conn, execution_id).unwrap_or_else(|_| TrustedActionExecution {
+        execution_id: execution_id.to_string(),
+        idempotency_key: String::new(),
+        action_id: String::new(),
+        manifest_id: String::new(),
+        manifest_registry_version: 0,
+        manifest_content_hash: String::new(),
+        manifest_schema_version: 0,
+        agent_id: String::new(),
+        project_root: String::new(),
+        status: STATUS_AMBIGUOUS.to_string(),
+        terminal_reason: Some("execution receipt could not be durably confirmed".to_string()),
+        run_id: None,
+        bun_run_id: None,
+        evidence: None,
+        started_at: None,
+        settled_at: None,
+        runtime_started_at: None,
+        runtime_finished_at: None,
+        cancel_requested_at: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+        conflict: None,
+    })
 }
 
 fn insert_claimed_execution(
@@ -1372,7 +1374,9 @@ pub fn list_trusted_executions(
                     "SELECT {EXECUTION_COLS} FROM trusted_action_executions ORDER BY created_at DESC"
                 ))
                 .map_err(|e| e.to_string())?;
-            let mapped = stmt.query_map([], map_execution_row).map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map([], map_execution_row)
+                .map_err(|e| e.to_string())?;
             for row in mapped {
                 rows.push(row.map_err(|e| e.to_string())?);
             }
@@ -1434,9 +1438,9 @@ fn cancel_execution(
     let transport = crate::jarvis::memory::transport::native_memory_transport();
     let ack = crate::jarvis::memory::transport::cancel_trusted_execution(transport, execution_id);
     let ack_reason = if ack.ambiguous {
-        ack.reason
-            .clone()
-            .or_else(|| Some("cancel acknowledgement was not bound to the exact live process".to_string()))
+        ack.reason.clone().or_else(|| {
+            Some("cancel acknowledgement was not bound to the exact live process".to_string())
+        })
     } else {
         None
     };
@@ -1458,9 +1462,9 @@ fn cancel_execution(
             if row.status == STATUS_CANCELLED || row.status == STATUS_AMBIGUOUS {
                 return Ok(row);
             }
-            let reason = ack_reason
-                .clone()
-                .unwrap_or_else(|| "cancellation not durably confirmed within the wait bound".to_string());
+            let reason = ack_reason.clone().unwrap_or_else(|| {
+                "cancellation not durably confirmed within the wait bound".to_string()
+            });
             let _ = settle_execution(
                 &conn,
                 execution_id,

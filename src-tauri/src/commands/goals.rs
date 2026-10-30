@@ -622,13 +622,7 @@ fn validate_cron_job(
     reject_conflicting_goal(existing_goal, goal, "cron job", target_id)?;
     require_same_agent(&agent_id, goal, "cron job", target_id)?;
     if let Some(session_agent) = bound_session_agent.as_deref() {
-        require_bound_session_agent(
-            session_agent,
-            &agent_id,
-            goal,
-            "cron job",
-            target_id,
-        )?;
+        require_bound_session_agent(session_agent, &agent_id, goal, "cron job", target_id)?;
     }
     require_same_workspace(project_root.as_deref(), goal, "cron job", target_id)
 }
@@ -659,13 +653,7 @@ fn validate_cron_run(
     reject_conflicting_goal(existing_goal, goal, "cron run", target_id)?;
     require_same_agent(&agent_id, goal, "cron run", target_id)?;
     if let Some(session_agent) = bound_session_agent.as_deref() {
-        require_bound_session_agent(
-            session_agent,
-            &agent_id,
-            goal,
-            "cron run",
-            target_id,
-        )?;
+        require_bound_session_agent(session_agent, &agent_id, goal, "cron run", target_id)?;
     }
     require_same_workspace(project_root.as_deref(), goal, "cron run", target_id)
 }
@@ -1366,9 +1354,7 @@ pub fn goal_link_remove(
             return Err("goal link target id must not be empty".to_string());
         }
         load_goal(&conn, &goal_id)?;
-        return crate::commands::system::clear_commitment_goal_conn(
-            &conn, &target_id, &goal_id,
-        );
+        return crate::commands::system::clear_commitment_goal_conn(&conn, &target_id, &goal_id);
     }
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -1446,7 +1432,10 @@ fn load_saved_user_source(
     if role != "user" {
         return Err("source message must be a persisted user-role message".to_string());
     }
-    Ok((content.clone(), crate::jarvis::memory::turn::message_sha256(&content)))
+    Ok((
+        content.clone(),
+        crate::jarvis::memory::turn::message_sha256(&content),
+    ))
 }
 
 /// Resolve the native authority for linking one prospective Session turn to a
@@ -1487,10 +1476,14 @@ pub fn resolve_goal_run_binding(
         session.ok_or_else(|| format!("session not found: {}", session_id))?;
 
     require_same_agent(&session_agent, &goal, "session", session_id)?;
-    require_same_workspace(session_project_root.as_deref(), &goal, "session", session_id)?;
+    require_same_workspace(
+        session_project_root.as_deref(),
+        &goal,
+        "session",
+        session_id,
+    )?;
 
-    let (_, source_message_hash) =
-        load_saved_user_source(conn, session_id, source_message_id)?;
+    let (_, source_message_hash) = load_saved_user_source(conn, session_id, source_message_id)?;
 
     let criteria = load_criteria(conn, &goal.id)?
         .into_iter()
@@ -1498,9 +1491,8 @@ pub fn resolve_goal_run_binding(
         .collect::<Vec<_>>();
 
     let issued_at = now_iso();
-    let expires_at = (chrono::Utc::now()
-        + chrono::Duration::seconds(GOAL_RUN_BINDING_TTL_SECONDS))
-    .to_rfc3339();
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(GOAL_RUN_BINDING_TTL_SECONDS)).to_rfc3339();
 
     Ok(GoalRunBinding {
         binding_id: new_id(),
@@ -1774,7 +1766,14 @@ pub fn goal_run_progress(
                 let finished_at: Option<String> = row.get(3)?;
                 let binding_id: Option<String> = row.get(4)?;
                 let task_run_id: Option<String> = row.get(5)?;
-                Ok((run_id, session_id, outcome, finished_at, binding_id, task_run_id))
+                Ok((
+                    run_id,
+                    session_id,
+                    outcome,
+                    finished_at,
+                    binding_id,
+                    task_run_id,
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()

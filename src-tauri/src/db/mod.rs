@@ -263,7 +263,10 @@ fn acquire_secure_root(app_data_dir: &Path) -> Result<std::fs::File, String> {
                 .map_err(|e| format!("Failed to stat app data root {:?}: {}", app_data_dir, e))?
                 .is_dir()
             {
-                return Err(format!("app data root {:?} is not a directory", app_data_dir));
+                return Err(format!(
+                    "app data root {:?} is not a directory",
+                    app_data_dir
+                ));
             }
             return Ok(dir);
         }
@@ -274,7 +277,10 @@ fn acquire_secure_root(app_data_dir: &Path) -> Result<std::fs::File, String> {
             .map_err(|e| format!("Failed to stat app data root {:?}: {}", app_data_dir, e))?
             .is_dir()
         {
-            return Err(format!("app data root {:?} is not a directory", app_data_dir));
+            return Err(format!(
+                "app data root {:?} is not a directory",
+                app_data_dir
+            ));
         }
         return Ok(dir);
     }
@@ -286,9 +292,7 @@ fn acquire_secure_root(app_data_dir: &Path) -> Result<std::fs::File, String> {
     )))]
     {
         let _ = app_data_dir;
-        return Err(
-            "secure app-data root acquisition is unsupported on this platform".to_string()
-        );
+        return Err("secure app-data root acquisition is unsupported on this platform".to_string());
     }
 }
 
@@ -370,9 +374,8 @@ fn open_connection_and_root(
             }
             let conn = rusqlite::Connection::open(db_path)
                 .map_err(|e| format!("Failed to open database at {:?}: {}", db_path, e))?;
-            let dir = std::fs::File::open(app_data_dir).map_err(|e| {
-                format!("Failed to open app data root {:?}: {}", app_data_dir, e)
-            })?;
+            let dir = std::fs::File::open(app_data_dir)
+                .map_err(|e| format!("Failed to open app data root {:?}: {}", app_data_dir, e))?;
             Ok((
                 conn,
                 AppDataRoot {

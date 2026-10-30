@@ -39,7 +39,10 @@ const MAX_TITLE_SCALARS: usize = 80;
 /// exclusively from the immutable `PersistedMemoryTurn` snapshot.
 #[derive(Debug, Clone)]
 pub enum UserMemoryOperation {
-    Save { draft: MemoryDraft, source: String },
+    Save {
+        draft: MemoryDraft,
+        source: String,
+    },
     Correct {
         id: String,
         expected_revision: i64,
@@ -128,7 +131,9 @@ fn quoted_or_fenced(message: &str) -> bool {
 }
 
 fn mentions_directive(lower: &str) -> bool {
-    directive_prefixes().iter().any(|prefix| lower.contains(prefix))
+    directive_prefixes()
+        .iter()
+        .any(|prefix| lower.contains(prefix))
 }
 
 /// Count sentence-like segments whose trimmed start matches a directive
@@ -374,8 +379,8 @@ pub(crate) fn hash_parts(parts: Vec<JsonValue>) -> String {
     let mut canonical = Vec::with_capacity(parts.len() + 1);
     canonical.push(JsonValue::String(CAPTURE_HASH_VERSION.to_string()));
     canonical.extend(parts);
-    let serialized = serde_json::to_string(&JsonValue::Array(canonical))
-        .unwrap_or_else(|_| "[]".to_string());
+    let serialized =
+        serde_json::to_string(&JsonValue::Array(canonical)).unwrap_or_else(|_| "[]".to_string());
     sha256_hex(serialized.as_bytes())
 }
 
@@ -414,7 +419,12 @@ fn save_operation_hash(
     source: &str,
     draft: &MemoryDraft,
 ) -> String {
-    let mut parts = vec![json!("save"), json!(source), json!(source_message_id), json!(message_hash)];
+    let mut parts = vec![
+        json!("save"),
+        json!(source),
+        json!(source_message_id),
+        json!(message_hash),
+    ];
     parts.extend(scope_parts(scope));
     parts.extend(draft_parts(draft));
     hash_parts(parts)
@@ -624,12 +634,9 @@ fn legacy_operation_payload_hash(
             *expected_revision,
             SOURCE_FORGET,
         ),
-        Some(UserMemoryOperation::AcceptProposal { id }) => accept_operation_hash(
-            &turn.scope,
-            &turn.source_message_id,
-            &turn.message_hash,
-            id,
-        ),
+        Some(UserMemoryOperation::AcceptProposal { id }) => {
+            accept_operation_hash(&turn.scope, &turn.source_message_id, &turn.message_hash, id)
+        }
         Some(UserMemoryOperation::Pending { reason_code }) => {
             hash_parts(vec![json!("pending"), json!(reason_code)])
         }
@@ -702,7 +709,13 @@ pub(crate) fn ledger_put<T: Serialize>(
              (session_id, operation_id, payload_hash, response_json, created_at)
          VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(session_id, operation_id) DO NOTHING",
-        params![session_id, operation_id, payload_hash, response_json, now.to_rfc3339()],
+        params![
+            session_id,
+            operation_id,
+            payload_hash,
+            response_json,
+            now.to_rfc3339()
+        ],
     )
     .map_err(MemoryError::from)?;
     Ok(())
@@ -847,14 +860,8 @@ fn replace_scoped_memory(
     )
     .map_err(MemoryError::storage_unavailable)?;
 
-    let tombstoned = scoped::tombstone_scoped_memory(
-        conn,
-        scope,
-        target_id,
-        expected_revision,
-        reason,
-        now,
-    )?;
+    let tombstoned =
+        scoped::tombstone_scoped_memory(conn, scope, target_id, expected_revision, reason, now)?;
 
     // The superseded record's exact source messages must not be replayed from
     // derived prompt state, and any active objective that declared a dependency
@@ -862,8 +869,7 @@ fn replace_scoped_memory(
     // replacement/ledger; the replacement's own new user source is NOT
     // suppressed.
     let _ = continuity::suppress_memory_sources(conn, scope, &[target_id.to_string()], now)?;
-    let _ =
-        continuity::clear_continuity_dependent_on(conn, &[target_id.to_string()], now)?;
+    let _ = continuity::clear_continuity_dependent_on(conn, &[target_id.to_string()], now)?;
     Ok(CorrectionResult {
         previous: tombstoned.memory,
         replacement,
@@ -915,8 +921,7 @@ fn forget_scoped_memory_body(
     if before.entry.status == "tombstoned" {
         // Ensure suppression is established even for a historically tombstoned
         // row, and return the persisted consequence ids for inspectability.
-        let suppressed =
-            continuity::suppress_memory_sources(conn, scope, &[id.to_string()], now)?;
+        let suppressed = continuity::suppress_memory_sources(conn, scope, &[id.to_string()], now)?;
         let _ = continuity::clear_continuity_dependent_on(conn, &[id.to_string()], now)?;
         return Ok(ForgetResult {
             memory: before,
@@ -1004,8 +1009,8 @@ fn accept_proposal(
             "Proposal was not staged in this Session",
         ));
     }
-    let cited: Vec<String> = serde_json::from_str(&proposal.entry.source_message_ids)
-        .unwrap_or_default();
+    let cited: Vec<String> =
+        serde_json::from_str(&proposal.entry.source_message_ids).unwrap_or_default();
     let assistant_message_id = cited.first().cloned().ok_or_else(|| {
         MemoryError::invalid_acceptance("Proposal has no persisted assistant source message")
     })?;
@@ -1027,11 +1032,9 @@ fn accept_proposal(
             "Proposal assistant message has no persisted turn association",
         )
     })?;
-    let staging_turn = turn::read_memory_turn(conn, &turn.session_id, &staging_turn_id)
-        .map_err(|_| {
-            MemoryError::invalid_acceptance(
-                "Proposal staging turn does not belong to this Session",
-            )
+    let staging_turn =
+        turn::read_memory_turn(conn, &turn.session_id, &staging_turn_id).map_err(|_| {
+            MemoryError::invalid_acceptance("Proposal staging turn does not belong to this Session")
         })?;
     if staging_turn.scope != turn.scope {
         return Err(MemoryError::invalid_acceptance(
@@ -1040,8 +1043,12 @@ fn accept_proposal(
     }
 
     let acceptance_message = turn.source_message_id.as_str();
-    if !message_is_strictly_after(conn, &turn.session_id, acceptance_message, &assistant_message_id)?
-    {
+    if !message_is_strictly_after(
+        conn,
+        &turn.session_id,
+        acceptance_message,
+        &assistant_message_id,
+    )? {
         return Err(MemoryError::invalid_acceptance(
             "Acceptance must be strictly later than the assistant proposal source",
         ));
@@ -1275,9 +1282,8 @@ fn execute_capture_operation(
             )])
         }
         UserMemoryOperation::AcceptProposal { id } => {
-            let result = scoped::with_memory_savepoint(conn, |conn| {
-                accept_proposal(conn, turn, id, now)
-            })?;
+            let result =
+                scoped::with_memory_savepoint(conn, |conn| accept_proposal(conn, turn, id, now))?;
             Ok(vec![operation_receipt(
                 operation_id,
                 CaptureOperationStatus::Corrected,
@@ -1698,7 +1704,12 @@ pub fn stage_memory_proposal_replay(
         &request.operation_id,
         &request.draft,
     );
-    replay_ledger::<MutationResult>(conn, &request.session_id, &request.operation_id, &payload_hash)
+    replay_ledger::<MutationResult>(
+        conn,
+        &request.session_id,
+        &request.operation_id,
+        &payload_hash,
+    )
 }
 
 /// Stage an exact assistant-substring proposal. Staging requires an
@@ -1794,14 +1805,7 @@ pub fn stage_memory_proposal(
             return Ok(prior);
         }
         let saved = scoped::save_scoped_memory(conn, &scope, draft, &provenance, now)?;
-        ledger_put(
-            conn,
-            &session_id,
-            &operation_id,
-            &payload_hash,
-            &saved,
-            now,
-        )?;
+        ledger_put(conn, &session_id, &operation_id, &payload_hash, &saved, now)?;
         Ok(saved)
     })
 }
@@ -1852,21 +1856,12 @@ pub fn correct_scoped_memory_with_kind(
     kind: Option<MemoryStatementKind>,
     now: DateTime<Utc>,
 ) -> Result<CorrectionResult, MemoryError> {
-    let payload_hash = manual_correct_operation_hash(
-        session_id,
-        scope,
-        id,
-        expected_revision,
-        &draft,
-        kind,
-    );
+    let payload_hash =
+        manual_correct_operation_hash(session_id, scope, id, expected_revision, &draft, kind);
     scoped::with_memory_savepoint(conn, |conn| {
-        if let Some(prior) = replay_ledger::<CorrectionResult>(
-            conn,
-            session_id,
-            operation_id,
-            &payload_hash,
-        )? {
+        if let Some(prior) =
+            replay_ledger::<CorrectionResult>(conn, session_id, operation_id, &payload_hash)?
+        {
             return Ok(prior);
         }
         let result = correct_scoped_memory_body(
@@ -1905,8 +1900,7 @@ pub fn forget_scoped_memory(
         {
             return Ok(prior);
         }
-        let result =
-            forget_scoped_memory_body(conn, scope, id, expected_revision, reason, now)?;
+        let result = forget_scoped_memory_body(conn, scope, id, expected_revision, reason, now)?;
         ledger_put(conn, session_id, operation_id, &payload_hash, &result, now)?;
         Ok(result)
     })

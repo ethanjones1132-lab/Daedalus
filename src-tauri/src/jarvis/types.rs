@@ -279,23 +279,40 @@ impl LlamaCppConfig {
         let batch = self.batch_size.to_string();
         let budget = self.reasoning_budget.to_string();
         let fixed: [&str; 32] = [
-            "-m", self.model_path.trim(),
-            "--alias", self.model.as_str(),
-            "--host", "127.0.0.1",
-            "--port", port.as_str(),
-            "-ngl", "99",
-            "--n-cpu-moe", n_cpu_moe.as_str(),
-            "-c", context.as_str(),
-            "-ctk", "q8_0", "-ctv", "q8_0",
-            "--flash-attn", "on",
-            "-b", batch.as_str(), "-ub", batch.as_str(),
+            "-m",
+            self.model_path.trim(),
+            "--alias",
+            self.model.as_str(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            port.as_str(),
+            "-ngl",
+            "99",
+            "--n-cpu-moe",
+            n_cpu_moe.as_str(),
+            "-c",
+            context.as_str(),
+            "-ctk",
+            "q8_0",
+            "-ctv",
+            "q8_0",
+            "--flash-attn",
+            "on",
+            "-b",
+            batch.as_str(),
+            "-ub",
+            batch.as_str(),
             // -np > 1 is not supported with MTP
-            "-np", "1",
+            "-np",
+            "1",
             "--jinja",
-            "--reasoning-budget", budget.as_str(),
+            "--reasoning-budget",
+            budget.as_str(),
             "--no-webui",
             // The default 8 GiB host prompt cache starves a 16 GB machine.
-            "--cache-ram", "0",
+            "--cache-ram",
+            "0",
         ];
         let mut args: Vec<String> = fixed.iter().map(|arg| arg.to_string()).collect();
 
@@ -355,7 +372,10 @@ mod llama_cpp_config_tests {
         assert_eq!(flag(&args, "--cache-ram"), Some("0"));
         assert_eq!(flag(&args, "--spec-type"), Some("draft-mtp,ngram-mod"));
         assert_eq!(flag(&args, "--spec-draft-n-max"), Some("2"));
-        assert_eq!(flag(&args, "--alias"), Some("Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf"));
+        assert_eq!(
+            flag(&args, "--alias"),
+            Some("Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf")
+        );
         assert!(!args.iter().any(|arg| arg == "-md"));
     }
 

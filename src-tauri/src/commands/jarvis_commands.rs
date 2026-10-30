@@ -101,9 +101,10 @@ fn resolve_learning_authority(
     // 1. Session owner Agent + canonical, revalidated project root.
     let scope = crate::jarvis::memory::scope::resolve_session_memory_scope(conn, session_id)
         .map_err(|error| format!("Session authority is unavailable: {}", error.message))?;
-    let project_root = scope.project_root.clone().ok_or_else(|| {
-        "the selected Session has no canonical project root binding".to_string()
-    })?;
+    let project_root = scope
+        .project_root
+        .clone()
+        .ok_or_else(|| "the selected Session has no canonical project root binding".to_string())?;
 
     // 2. Exactly one native-written completed run for the exact tuple.
     //
@@ -156,7 +157,9 @@ fn resolve_learning_authority(
         .map_err(|error| format!("could not read native run mirror: {error}"))?;
     if let Some((completed, mirror_session_id)) = mirror {
         if completed != 1 {
-            return Err("the selected Agent run is not marked completed in the native mirror".to_string());
+            return Err(
+                "the selected Agent run is not marked completed in the native mirror".to_string(),
+            );
         }
         if mirror_session_id != session_id {
             return Err(
@@ -526,9 +529,10 @@ pub async fn run_learning_session(
         learning::LearningOutcome::Blocked => {
             (learning::LearningOutcome::Blocked, response.reason.clone())
         }
-        learning::LearningOutcome::Unavailable => {
-            (learning::LearningOutcome::Unavailable, response.reason.clone())
-        }
+        learning::LearningOutcome::Unavailable => (
+            learning::LearningOutcome::Unavailable,
+            response.reason.clone(),
+        ),
         learning::LearningOutcome::Complete | learning::LearningOutcome::Partial => {
             if has_rejected {
                 if has_findings {
@@ -690,9 +694,9 @@ pub async fn get_learning_research_receipt(
     db: State<'_, crate::db::AppDb>,
     record_id: String,
 ) -> Result<Option<crate::jarvis::learning::LearningResearchReceipt>, String> {
-    let root = db.app_data_root().ok_or_else(|| {
-        "research receipt storage is unavailable in this build".to_string()
-    })?;
+    let root = db
+        .app_data_root()
+        .ok_or_else(|| "research receipt storage is unavailable in this build".to_string())?;
     crate::jarvis::learning::read_research_receipt(root, &record_id)
 }
 
@@ -1060,16 +1064,18 @@ pub async fn jarvis_delete_session(app: AppHandle, session_id: String) -> Result
         {
             let session_for_plan = session_id.clone();
             move |_conn| {
-                Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
-                    invalidation:
-                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
-                            operation_id: uuid::Uuid::new_v4().to_string(),
-                            affected_session_ids: vec![session_for_plan],
-                            memory_ids: Vec::new(),
-                            source_message_ids: Vec::new(),
-                        },
-                    scope: None,
-                })
+                Ok(
+                    crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                        invalidation:
+                            crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                                operation_id: uuid::Uuid::new_v4().to_string(),
+                                affected_session_ids: vec![session_for_plan],
+                                memory_ids: Vec::new(),
+                                source_message_ids: Vec::new(),
+                            },
+                        scope: None,
+                    },
+                )
             }
         },
         move |conn, _plan| {

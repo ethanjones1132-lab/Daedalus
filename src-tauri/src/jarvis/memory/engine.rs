@@ -1431,9 +1431,7 @@ fn active_memories(conn: &Connection) -> Result<Vec<MemoryEntry>, String> {
 /// uses, exposed so the command can resolve derived invalidation for those
 /// exact candidates without enumerating (or blocking on) unrelated explicitly
 /// scoped facts.
-pub fn legacy_consolidation_candidate_ids(
-    conn: &Connection,
-) -> Result<Vec<String>, MemoryError> {
+pub fn legacy_consolidation_candidate_ids(conn: &Connection) -> Result<Vec<String>, MemoryError> {
     let mut stmt = conn
         .prepare(
             "SELECT id FROM memory
@@ -1442,17 +1440,18 @@ pub fn legacy_consolidation_candidate_ids(
         )
         .map_err(MemoryError::from)?;
     let rows = stmt
-        .query_map([RECALL_CANDIDATE_LIMIT as i64], |row| row.get::<_, String>(0))
+        .query_map([RECALL_CANDIDATE_LIMIT as i64], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
 }
 
 fn memory_scope_kind_of(conn: &Connection, id: &str) -> Result<Option<String>, String> {
-    conn.query_row(
-        "SELECT scope_kind FROM memory WHERE id = ?",
-        [id],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT scope_kind FROM memory WHERE id = ?", [id], |row| {
+        row.get(0)
+    })
     .optional()
     .map_err(|e| e.to_string())
 }
@@ -1479,7 +1478,11 @@ fn require_legacy_scope(conn: &Connection, id: &str) -> Result<(), String> {
 pub fn legacy_command_guard(conn: &Connection, id: &str) -> Result<bool, MemoryError> {
     let kind = match memory_scope_kind_of(conn, id) {
         Ok(kind) => kind,
-        Err(_) => return Err(MemoryError::storage_unavailable("Memory storage is unavailable")),
+        Err(_) => {
+            return Err(MemoryError::storage_unavailable(
+                "Memory storage is unavailable",
+            ))
+        }
     };
     match kind.as_deref() {
         Some("legacy_unscoped") => Ok(true),
@@ -1560,7 +1563,11 @@ fn active_prompt_deltas(conn: &Connection) -> Result<Vec<String>, String> {
     Ok(collected)
 }
 
-pub(crate) fn validate_memory_payload(title: &str, content: &str, category: &str) -> Result<(), SafetyBlock> {
+pub(crate) fn validate_memory_payload(
+    title: &str,
+    content: &str,
+    category: &str,
+) -> Result<(), SafetyBlock> {
     let allowed = ["general", "user", "feedback", "project", "reference"];
     if !allowed.contains(&category) {
         return Err(SafetyBlock {
@@ -2198,9 +2205,8 @@ pub fn review_session(conn: &Connection, session_id: &str) -> Result<Value, Stri
             // A persisted receipt is CHECK(json_valid) and typed; a row that no
             // longer decodes is corrupt storage and must fail closed, never be
             // silently skipped or undercounted.
-            let receipt: CaptureReceipt = serde_json::from_str(&raw).map_err(|_| {
-                "corrupt persisted capture receipt in review_session".to_string()
-            })?;
+            let receipt: CaptureReceipt = serde_json::from_str(&raw)
+                .map_err(|_| "corrupt persisted capture receipt in review_session".to_string())?;
             // Validate the typed receipt before trusting its counts: the receipt
             // must belong to the requested Session, carry a nonempty turn id and
             // unique nonempty operation ids, use positive revisions, and its
@@ -2514,7 +2520,10 @@ pub struct ColdCacheEntry {
 
 /// Look up a cold-cache entry by Drive source ID. Returns None on cache miss or
 /// if the entry has expired.
-fn get_cold_cache_entry(conn: &Connection, source_id: &str) -> Result<Option<ColdCacheEntry>, String> {
+fn get_cold_cache_entry(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<Option<ColdCacheEntry>, String> {
     let row: Option<ColdCacheEntry> = conn
         .query_row(
             "SELECT source_id, content, fetched_at, redaction_state, expires_at
@@ -2533,7 +2542,9 @@ fn get_cold_cache_entry(conn: &Connection, source_id: &str) -> Result<Option<Col
         .optional()
         .map_err(|e| e.to_string())?;
 
-    let Some(entry) = row else { return Ok(None); };
+    let Some(entry) = row else {
+        return Ok(None);
+    };
 
     if let Some(expires_at) = &entry.expires_at {
         if let Ok(exp) = DateTime::parse_from_rfc3339(expires_at) {
@@ -2556,7 +2567,8 @@ pub fn cache_cold_content(
     ttl_seconds: Option<i64>,
 ) -> Result<(), String> {
     let fetched_at = now();
-    let expires_at = ttl_seconds.map(|secs| (Utc::now() + ChronoDuration::seconds(secs)).to_rfc3339());
+    let expires_at =
+        ttl_seconds.map(|secs| (Utc::now() + ChronoDuration::seconds(secs)).to_rfc3339());
     conn.execute(
         "INSERT INTO cold_cache (source_id, content, fetched_at, redaction_state, expires_at)
          VALUES (?, ?, ?, ?, ?)
@@ -2675,8 +2687,14 @@ mod tests {
         )
         .unwrap();
 
-        cache_cold_content(&conn, "drive-file-abc", "retrieved content", "none", Some(3600))
-            .unwrap();
+        cache_cold_content(
+            &conn,
+            "drive-file-abc",
+            "retrieved content",
+            "none",
+            Some(3600),
+        )
+        .unwrap();
 
         let content = recall_cold_memory(&conn, "cold-1").unwrap().unwrap();
         assert_eq!(content, "retrieved content");

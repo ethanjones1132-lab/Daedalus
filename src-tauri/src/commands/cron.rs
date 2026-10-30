@@ -302,11 +302,7 @@ pub fn edit_cron_job(
                     raw.to_string()
                 }
             }
-            None => {
-                return Err(
-                    "Invalid patch field 'agent_id': must be a string".to_string(),
-                )
-            }
+            None => return Err("Invalid patch field 'agent_id': must be a string".to_string()),
         },
     };
     let effective_session: Option<String> = if let Some(v) = obj.get("session_id") {
@@ -314,9 +310,7 @@ pub fn edit_cron_job(
             serde_json::Value::Null => None,
             serde_json::Value::String(s) => Some(s.to_string()),
             _ => {
-                return Err(
-                    "Invalid patch field 'session_id': must be a string or null".to_string(),
-                )
+                return Err("Invalid patch field 'session_id': must be a string or null".to_string())
             }
         }
     } else {
@@ -338,9 +332,7 @@ pub fn edit_cron_job(
             Some(serde_json::Value::Null) => None,
             Some(serde_json::Value::String(s)) => normalize_cron_goal_id(Some(s.clone())),
             Some(_) => {
-                return Err(
-                    "Invalid patch field 'goal_id': must be a string or null".to_string(),
-                )
+                return Err("Invalid patch field 'goal_id': must be a string or null".to_string())
             }
             None => None,
         };
@@ -550,8 +542,8 @@ pub async fn delete_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, 
     // aborts the delete rather than removing the job with an unrecorded stop.
     let active = crate::cron_scheduler::has_active_activation(&app, &id)?;
     if active {
-        let confirmed = crate::cron_scheduler::request_cron_cancellation(&app, &id, "job deleted")
-            .await?;
+        let confirmed =
+            crate::cron_scheduler::request_cron_cancellation(&app, &id, "job deleted").await?;
         if !confirmed {
             return Err(format!(
                 "Cron job '{}' has an active run whose cancellation could not be confirmed; \
@@ -577,7 +569,12 @@ pub async fn delete_cron_job(app: tauri::AppHandle, id: String) -> Result<bool, 
             "DELETE FROM goal_links WHERE target_kind = 'cron_job' AND target_id = ?1",
             [&id],
         )
-        .map_err(|e| format!("Failed to remove goal link for deleted cron job '{}': {}", id, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to remove goal link for deleted cron job '{}': {}",
+                id, e
+            )
+        })?;
     }
 
     tx.commit().map_err(|e| e.to_string())?;
@@ -649,7 +646,10 @@ pub fn get_cron_runs(db: State<AppDb>, cron_id: String) -> Result<Vec<CronRun>, 
 /// List durable activation/occurrence claims for a cron job (newest first).
 /// Read-only; the scheduler owns claims. A read failure is not a claim failure.
 #[tauri::command]
-pub fn get_cron_activations(db: State<AppDb>, cron_id: String) -> Result<Vec<CronActivation>, String> {
+pub fn get_cron_activations(
+    db: State<AppDb>,
+    cron_id: String,
+) -> Result<Vec<CronActivation>, String> {
     let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
     let mut stmt = conn
         .prepare(

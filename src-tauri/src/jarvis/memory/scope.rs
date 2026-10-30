@@ -13,7 +13,10 @@ use super::contracts::{MemoryError, MemoryScope, ScopeSelector, WritableScopeKin
 
 /// Read `(agent_id, project_root)` for a Session, failing closed when the
 /// Session does not exist or has no usable Agent identity.
-fn session_owner(conn: &Connection, session_id: &str) -> Result<(String, Option<String>), MemoryError> {
+fn session_owner(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<(String, Option<String>), MemoryError> {
     let row: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT agent_id, project_root FROM sessions WHERE id = ?",
@@ -22,9 +25,8 @@ fn session_owner(conn: &Connection, session_id: &str) -> Result<(String, Option<
         )
         .optional()
         .map_err(MemoryError::from)?;
-    let (agent_id, project_root) = row.ok_or_else(|| {
-        MemoryError::session_not_found("Session not found")
-    })?;
+    let (agent_id, project_root) =
+        row.ok_or_else(|| MemoryError::session_not_found("Session not found"))?;
     if agent_id.trim().is_empty() {
         return Err(MemoryError::invalid_scope(
             "Persisted Session has no Agent identity",
@@ -86,9 +88,8 @@ pub fn normalize_project_root(raw: &str) -> Result<String, MemoryError> {
         ));
     }
 
-    let canonical = std::fs::canonicalize(path).map_err(|_| {
-        MemoryError::workspace_unavailable("Project workspace is unavailable")
-    })?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| MemoryError::workspace_unavailable("Project workspace is unavailable"))?;
     if !canonical.is_dir() {
         return Err(MemoryError::invalid_path(
             "Project root must be an existing directory",

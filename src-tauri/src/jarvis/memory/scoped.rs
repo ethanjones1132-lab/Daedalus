@@ -15,9 +15,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value as JsonValue;
 
 use super::contracts::{
-    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope,
-    MemoryScopeKind, MemoryStatementKind, MutationResult, RecallOptions, RecallPreview,
-    ScopedMemoryEntry, ScopedMemoryRecall,
+    AuthorityKind, MemoryDraft, MemoryError, MemoryProvenance, MemoryScope, MemoryScopeKind,
+    MemoryStatementKind, MutationResult, RecallOptions, RecallPreview, ScopedMemoryEntry,
+    ScopedMemoryRecall,
 };
 use super::engine;
 
@@ -34,7 +34,10 @@ pub(crate) fn with_memory_savepoint<T>(
     conn: &Connection,
     operation: impl FnOnce(&Connection) -> Result<T, MemoryError>,
 ) -> Result<T, MemoryError> {
-    let name = format!("memory_sp_{}", SAVEPOINT_SEQ.fetch_add(1, Ordering::Relaxed));
+    let name = format!(
+        "memory_sp_{}",
+        SAVEPOINT_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
     conn.execute_batch(&format!("SAVEPOINT {}", name))
         .map_err(MemoryError::from)?;
     match operation(conn) {
@@ -221,9 +224,8 @@ fn validate_provenance_for_write(
                 )
                 .optional()
                 .map_err(MemoryError::from)?;
-            let owner = owner.ok_or_else(|| {
-                MemoryError::invalid_provenance("source Session does not exist")
-            })?;
+            let owner = owner
+                .ok_or_else(|| MemoryError::invalid_provenance("source Session does not exist"))?;
             if matches!(
                 scope.kind,
                 MemoryScopeKind::Project | MemoryScopeKind::Agent
@@ -275,9 +277,7 @@ fn scope_predicate(prefix: &str, scope: &MemoryScope) -> (String, Vec<Value>) {
     let p = prefix;
     match scope.kind {
         MemoryScopeKind::Project => (
-            format!(
-                "({p}.scope_kind = 'project' AND {p}.agent_id = ? AND {p}.project_root = ?)"
-            ),
+            format!("({p}.scope_kind = 'project' AND {p}.agent_id = ? AND {p}.project_root = ?)"),
             vec![
                 Value::from(scope.agent_id.clone()),
                 Value::from(scope.project_root.clone().unwrap_or_default()),
@@ -310,9 +310,7 @@ fn scoped_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScopedMemoryEntr
         .get(25)
         .unwrap_or_else(|_| "legacy_unscoped".to_string());
     let memory_root: Option<String> = row.get(26).unwrap_or(None);
-    let authority: String = row
-        .get(27)
-        .unwrap_or_else(|_| "legacy_unknown".to_string());
+    let authority: String = row.get(27).unwrap_or_else(|_| "legacy_unknown".to_string());
     let source_run_id: Option<String> = row.get(28).unwrap_or(None);
     let verified_at: Option<String> = row.get(29).unwrap_or(None);
     let revision: i64 = row.get(30).unwrap_or(1);
@@ -381,7 +379,8 @@ pub fn list_scoped_memories(
     let rows = stmt
         .query_map(rusqlite::params_from_iter(scope_params), scoped_from_row)
         .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
 }
 
 pub fn save_scoped_memory(
@@ -417,8 +416,7 @@ pub fn save_scoped_memory_with_kind(
     let id = uuid::Uuid::new_v4().to_string();
     let stored = with_memory_savepoint(conn, |conn| {
         let now_str = now.to_rfc3339();
-        let tags_json =
-            serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
         let source_message_ids = serde_json::to_string(&provenance.source_message_ids)
             .unwrap_or_else(|_| "[]".to_string());
         let expires_at = normalize_optional_ts(draft.expires_at.as_deref())?;
@@ -576,10 +574,9 @@ fn recall_scope_predicate(scope: &MemoryScope, include_user: bool) -> (String, V
             "(m.scope_kind = 'user' AND m.agent_id = '')".to_string(),
             vec![],
         ),
-        MemoryScopeKind::LegacyUnscoped => (
-            "(m.scope_kind = 'legacy_unscoped')".to_string(),
-            vec![],
-        ),
+        MemoryScopeKind::LegacyUnscoped => {
+            ("(m.scope_kind = 'legacy_unscoped')".to_string(), vec![])
+        }
     };
 
     if include_user && scope.kind != MemoryScopeKind::User {
@@ -634,9 +631,7 @@ fn admit_lifecycle(
         if expires_at.map(|expires| expires <= *now).unwrap_or(false) {
             continue;
         }
-        let stale = review_after
-            .map(|review| review <= *now)
-            .unwrap_or(false);
+        let stale = review_after.map(|review| review <= *now).unwrap_or(false);
         admitted.push((memory, stale));
     }
     Ok(admitted)
@@ -847,8 +842,6 @@ pub fn adopt_legacy_memory(
     })
 }
 
-
-
 #[allow(clippy::too_many_arguments)]
 pub fn update_scoped_memory(
     conn: &Connection,
@@ -899,8 +892,7 @@ pub fn update_scoped_memory_with_kind(
         // semantic statement-kind change.
         let resolved_kind = kind.unwrap_or(before.statement_kind);
         let now_str = now.to_rfc3339();
-        let tags_json =
-            serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
+        let tags_json = serde_json::to_string(&draft.tags).unwrap_or_else(|_| "[]".to_string());
         let source_message_ids = serde_json::to_string(&provenance.source_message_ids)
             .unwrap_or_else(|_| "[]".to_string());
         let expires_at = normalize_optional_ts(draft.expires_at.as_deref())?;
@@ -992,10 +984,8 @@ pub fn tombstone_scoped_memory(
         if before.entry.status == "tombstoned" {
             return Ok((before, false));
         }
-        let mut values: Vec<Value> = vec![
-            Value::from(now.to_rfc3339()),
-            Value::from(id.to_string()),
-        ];
+        let mut values: Vec<Value> =
+            vec![Value::from(now.to_rfc3339()), Value::from(id.to_string())];
         values.extend(scope_params.clone());
         let sql = format!(
             "UPDATE memory SET status = 'tombstoned', revision = revision + 1, updated_at = ?
@@ -1047,10 +1037,8 @@ pub fn restore_scoped_memory(
         if before.entry.status == "active" {
             return Ok((before, false));
         }
-        let mut values: Vec<Value> = vec![
-            Value::from(now.to_rfc3339()),
-            Value::from(id.to_string()),
-        ];
+        let mut values: Vec<Value> =
+            vec![Value::from(now.to_rfc3339()), Value::from(id.to_string())];
         values.extend(scope_params.clone());
         let sql = format!(
             "UPDATE memory SET status = 'active', revision = revision + 1, updated_at = ?

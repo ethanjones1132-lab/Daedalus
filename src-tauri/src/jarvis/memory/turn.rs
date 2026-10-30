@@ -267,8 +267,7 @@ fn required_applied_revalidation_ids(
     turn: &PersistedMemoryTurn,
     applied: &[String],
 ) -> Vec<String> {
-    let applied_set: std::collections::HashSet<&str> =
-        applied.iter().map(String::as_str).collect();
+    let applied_set: std::collections::HashSet<&str> = applied.iter().map(String::as_str).collect();
     turn.selected
         .iter()
         .filter(|selection| {
@@ -283,10 +282,7 @@ fn required_applied_revalidation_ids(
 /// current-turn `read_file`/`grep` execution with a non-empty canonical path
 /// inside the effective workspace. Failed, other-tool, missing-path, or
 /// out-of-workspace refs are rejected.
-fn evidence_is_current_canonical_read(
-    evidence: &MemoryRuntimeEvidence,
-    workspace: &str,
-) -> bool {
+fn evidence_is_current_canonical_read(evidence: &MemoryRuntimeEvidence, workspace: &str) -> bool {
     if !evidence.success {
         return false;
     }
@@ -452,7 +448,8 @@ pub fn build_prepared_memory_items(preview: &RecallPreview) -> Vec<PreparedMemor
             // " :: " is four scalars. Omit the title label, then the whole
             // label, when it cannot fit without starving the excerpt.
             let sep_len = 4;
-            let label = if scalar_len(&full_label) + sep_len + MIN_BODY_SCALARS <= MAX_ITEM_SCALARS {
+            let label = if scalar_len(&full_label) + sep_len + MIN_BODY_SCALARS <= MAX_ITEM_SCALARS
+            {
                 full_label
             } else if scalar_len(&base_label) + sep_len + MIN_BODY_SCALARS <= MAX_ITEM_SCALARS {
                 base_label
@@ -841,10 +838,10 @@ fn verify_replay_identity(
         ));
     }
 
-    let user_message = load_source_user_message(conn, &request.session_id, &request.user_message_id)
-        .map_err(|_| {
-            MemoryError::turn_conflict("Source message identity changed since preparation")
-        })?;
+    let user_message =
+        load_source_user_message(conn, &request.session_id, &request.user_message_id).map_err(
+            |_| MemoryError::turn_conflict("Source message identity changed since preparation"),
+        )?;
     if existing.message_hash != sha256_hex(user_message.as_bytes()) {
         return Err(MemoryError::turn_conflict(
             "Replayed source message bytes do not match the persisted preparation",
@@ -876,10 +873,7 @@ fn turn_is_expired(turn: &PersistedMemoryTurn, now: DateTime<Utc>) -> bool {
 /// or consumed work, and work not yet registered all report a null public
 /// reference while the durable ID remains stored for diagnostics and replay
 /// checks.
-fn preparation_from_turn(
-    turn: &PersistedMemoryTurn,
-    now: DateTime<Utc>,
-) -> MemoryTurnPreparation {
+fn preparation_from_turn(turn: &PersistedMemoryTurn, now: DateTime<Utc>) -> MemoryTurnPreparation {
     let expired = turn_is_expired(turn, now);
     let eligible = matches!(turn.state, MemoryTurnState::Registered)
         && matches!(
@@ -1031,18 +1025,15 @@ pub fn prepare_memory_turn_record(
 
         // Persist selection metadata for retained items only — never item text
         // or the block.
-        let selected_metadata: Vec<PreparedMemorySelection> = selected
-            .iter()
-            .map(|item| item.selection.clone())
-            .collect();
+        let selected_metadata: Vec<PreparedMemorySelection> =
+            selected.iter().map(|item| item.selection.clone()).collect();
         let selected_json = serde_json::to_string(&selected_metadata)
             .map_err(|_| MemoryError::storage_unavailable("Failed to serialize selection"))?;
         let scope_json = serde_json::to_string(&scope)
             .map_err(|_| MemoryError::storage_unavailable("Failed to serialize scope"))?;
 
         let prepared_at = now.to_rfc3339();
-        let expires_at =
-            (now + ChronoDuration::seconds(PREPARATION_TTL_SECONDS)).to_rfc3339();
+        let expires_at = (now + ChronoDuration::seconds(PREPARATION_TTL_SECONDS)).to_rfc3339();
         let include_flag = if request.include_user_scope { 1 } else { 0 };
 
         conn.execute(
@@ -1271,7 +1262,8 @@ pub fn history_for_memory_turn(
             Ok(PromptHistoryMessage { id, role, content })
         })
         .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
 }
 
 /// Suppression-aware model-facing transcript for the whole Session in stable
@@ -1315,7 +1307,8 @@ pub fn sanitized_session_messages(
             Ok(PromptHistoryMessage { id, role, content })
         })
         .map_err(MemoryError::from)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(MemoryError::from)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
 }
 
 // ── Trusted runtime receipt (Bun -> native metadata only) ───────────────────
@@ -1403,8 +1396,7 @@ fn normalize_revalidation(
 
     // Declared memory IDs: bounded, known selection IDs, no duplicates.
     let mut memory_ids = Vec::new();
-    let mut memory_id_seen: std::collections::HashSet<&str> =
-        std::collections::HashSet::new();
+    let mut memory_id_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for id in result.memory_ids.iter().take(MAX_REVALIDATION_IDS) {
         if id.chars().count() > MAX_REVALIDATION_ID_CHARS
             || !selected_ids.contains(id.as_str())
@@ -1425,7 +1417,11 @@ fn normalize_revalidation(
     // Declared evidence IDs: bounded, known persisted refs, no duplicates.
     let mut evidence_tool_call_ids = Vec::new();
     let mut evidence_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for id in result.evidence_tool_call_ids.iter().take(MAX_REVALIDATION_IDS) {
+    for id in result
+        .evidence_tool_call_ids
+        .iter()
+        .take(MAX_REVALIDATION_IDS)
+    {
         if id.chars().count() > MAX_REVALIDATION_ID_CHARS
             || !evidence_ids.contains(id.as_str())
             || !evidence_seen.insert(id.as_str())
@@ -1487,8 +1483,9 @@ fn normalize_revalidation(
                 malformed = true;
             } else {
                 for id in &evidence_tool_call_ids {
-                    let Some(evidence) =
-                        persisted_evidence.iter().find(|item| &item.tool_call_id == id)
+                    let Some(evidence) = persisted_evidence
+                        .iter()
+                        .find(|item| &item.tool_call_id == id)
                     else {
                         malformed = true;
                         break;
@@ -1505,10 +1502,7 @@ fn normalize_revalidation(
             }
         }
         MemoryRevalidationState::Unavailable => {
-            if !memory_ids_exact
-                || !evidence_tool_call_ids.is_empty()
-                || reason_code.is_none()
-            {
+            if !memory_ids_exact || !evidence_tool_call_ids.is_empty() || reason_code.is_none() {
                 malformed = true;
             }
         }
@@ -1612,7 +1606,10 @@ pub fn apply_memory_turn_receipt(
         .recall_status
         .map(recall_status_str)
         .unwrap_or_else(|| recall_status_str(turn.recall_status));
-    let mut error_code = receipt.error_code.clone().or_else(|| turn.error_code.clone());
+    let mut error_code = receipt
+        .error_code
+        .clone()
+        .or_else(|| turn.error_code.clone());
     if evidence_unavailable {
         error_code = Some("evidence_unavailable".to_string());
     }
@@ -1621,8 +1618,13 @@ pub fn apply_memory_turn_receipt(
     // tuple, the exact effective applied-selected IDs, and the exact persisted
     // evidence set; malformed or inconsistent input is normalized to observable
     // `unavailable`, never trusted as success.
-    let revalidation =
-        normalize_revalidation(&receipt.revalidation, &turn, &applied, &evidence, has_terminal);
+    let revalidation = normalize_revalidation(
+        &receipt.revalidation,
+        &turn,
+        &applied,
+        &evidence,
+        has_terminal,
+    );
     let revalidation_json = serde_json::to_string(&revalidation)
         .map_err(|_| MemoryError::storage_unavailable("Failed to serialize revalidation"))?;
 
@@ -1731,7 +1733,10 @@ pub fn mark_turn_expired(
     turn_id: &str,
 ) -> Result<MemoryTurnDiagnostic, MemoryError> {
     let turn = read_memory_turn(conn, session_id, turn_id)?;
-    if !matches!(turn.state, MemoryTurnState::Registered | MemoryTurnState::Prepared) {
+    if !matches!(
+        turn.state,
+        MemoryTurnState::Registered | MemoryTurnState::Prepared
+    ) {
         return Ok(memory_turn_diagnostic(&turn));
     }
     conn.execute(

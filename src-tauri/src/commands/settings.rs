@@ -168,12 +168,14 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
         }
     }
     if let Some(v) = settings.get("opencode_zen") {
-        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v) {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        {
             config.opencode_zen = parsed;
         }
     }
     if let Some(v) = settings.get("opencode_go") {
-        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v) {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
+        {
             config.opencode_go = parsed;
         }
     }

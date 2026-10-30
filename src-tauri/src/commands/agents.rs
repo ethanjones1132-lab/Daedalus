@@ -590,20 +590,20 @@ pub async fn delete_agent(app: AppHandle, id: String) -> Result<(), String> {
             for row in rows {
                 affected_session_ids.push(row.map_err(MemoryError::from)?);
             }
-            Ok(crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
-                invalidation:
-                    crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
-                        operation_id: uuid::Uuid::new_v4().to_string(),
-                        affected_session_ids,
-                        memory_ids: Vec::new(),
-                        source_message_ids: Vec::new(),
-                    },
-                scope: None,
-            })
+            Ok(
+                crate::jarvis::memory::capture_contracts::NativeDerivedMutationPlan {
+                    invalidation:
+                        crate::jarvis::memory::capture_contracts::MemoryDerivedInvalidation {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            affected_session_ids,
+                            memory_ids: Vec::new(),
+                            source_message_ids: Vec::new(),
+                        },
+                    scope: None,
+                },
+            )
         },
-        move |conn, _plan| {
-            delete_agent_row(conn, &id).map_err(MemoryError::storage_unavailable)
-        },
+        move |conn, _plan| delete_agent_row(conn, &id).map_err(MemoryError::storage_unavailable),
     )
     .await
     .map_err(|error| error.message)
@@ -817,14 +817,17 @@ mod tests {
     #[test]
     fn activation_is_idempotent_for_the_same_source_and_increments_for_a_new_source() {
         let conn = test_db();
-        let first = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        let first =
+            activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
         assert!(first.active);
         assert_eq!(first.projection_version, 1);
 
-        let same = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        let same =
+            activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
         assert_eq!(same.projection_version, 1);
 
-        let changed = activate_projection_row(&conn, projection("coder", &"b".repeat(64), None)).unwrap();
+        let changed =
+            activate_projection_row(&conn, projection("coder", &"b".repeat(64), None)).unwrap();
         assert_eq!(changed.projection_version, 2);
         assert_eq!(changed.source_hash, "b".repeat(64));
         assert!(changed.active);
@@ -833,18 +836,28 @@ mod tests {
     #[test]
     fn deactivation_preserves_provenance_and_is_idempotent() {
         let conn = test_db();
-        let active = activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
-        let inactive = deactivate_projection_row(&conn, "coder").unwrap().expect("projection");
+        let active =
+            activate_projection_row(&conn, projection("coder", &"a".repeat(64), None)).unwrap();
+        let inactive = deactivate_projection_row(&conn, "coder")
+            .unwrap()
+            .expect("projection");
         assert!(!inactive.active);
         assert!(inactive.activated_at.is_some());
         assert!(inactive.deactivated_at.is_some());
         assert_eq!(inactive.source_hash, active.source_hash);
-        assert_eq!(deactivate_projection_row(&conn, "coder").unwrap().expect("projection").active, false);
+        assert_eq!(
+            deactivate_projection_row(&conn, "coder")
+                .unwrap()
+                .expect("projection")
+                .active,
+            false
+        );
     }
 
     #[test]
     fn activation_state_survives_database_reopen() {
-        let dir = std::env::temp_dir().join(format!("jarvis-agent-projection-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("jarvis-agent-projection-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = AppDb::new(&dir).unwrap();
         {
