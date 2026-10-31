@@ -30,6 +30,10 @@ import {
 
 const BUN_URL = 'http://127.0.0.1:19877';
 const POLL_MS = 30_000;
+// The only automatic retry in this surface: recovery of the initial
+// direct-to-Bun read while the Bun server is still starting. 1 s, then 2 s,
+// then every 4 s, and never across the mount-clock grace boundary.
+const INFERENCE_RETRY_DELAYS_MS = [1_000, 2_000, 4_000] as const;
 
 const CHIP_LABELS: Record<TelemetryServiceKey, string> = {
   bun: 'BUN',
@@ -106,16 +110,14 @@ function inferenceLabel(view: ReturnType<typeof deriveSystemTelemetryView>): str
 }
 
 /**
- * A direct-to-Bun inference read is issued at mount, before the Bun server can
- * be listening, so its first failure is the same cold start the verdict above
- * calls starting — not an inference outage. Present it as waiting only when a
- * fresh native health observation says Bun is down inside the same
- * STARTUP_GRACE_MS the banner uses, supervisor has not given up, and no earlier
- * inference reading exists to keep showing. Anything else — Bun up, absent or
- * stale health, give-up, a previously observed reading — stays the ordinary
- * unavailable/stale observation with its Retry.
+ * The initial direct-to-Bun read failed, and every condition that makes it the
+ * ordinary cold start still holds: a fresh valid native health observation says
+ * Bun is down, supervisor has not given up, no inference reading has ever been
+ * observed, and the mount clock is strictly inside the same STARTUP_GRACE_MS
+ * the banner uses. Anything else — Bun up, absent/stale/invalid health,
+ * give-up, a previously observed reading, the boundary itself — revokes it.
  */
-function inferenceWaitingForBunStart(
+function initialInferenceFailureDuringStartup(
   view: ReturnType<typeof deriveSystemTelemetryView>,
   mountedForMs: number,
 ): boolean {
@@ -123,13 +125,51 @@ function inferenceWaitingForBunStart(
     mountedForMs < STARTUP_GRACE_MS &&
     view.health.status === 'ready' &&
     !view.health.stale &&
+    !view.health.error &&
     view.health.services.bun === 'down' &&
     !view.health.bunGiveUp &&
     view.inference.error &&
-    view.inference.status === 'unavailable' &&
     !view.inference.hasData &&
     !view.inference.stale
   );
+}
+
+/**
+ * Present that failure as waiting rather than as an outage. A retry issued from
+ * it is still the same unobserved startup, so its pending request keeps the
+ * waiting copy: nothing is claimed until a valid inference response arrives.
+ */
+function inferenceWaitingForBunStart(
+  view: ReturnType<typeof deriveSystemTelemetryView>,
+  mountedForMs: number,
+): boolean {
+  return (
+    initialInferenceFailureDuringStartup(view, mountedForMs) &&
+    (view.inference.status === 'unavailable' || view.inference.status === 'pending')
+  );
+}
+
+/**
+ * Automatic recovery is allowed only for the settled initial failure — never
+ * while a read is in flight — and only while the document is visible. One
+ * attempt at a time; a hung request simply ends the chain, because nothing is
+ * retried until that observation has come back.
+ */
+function inferenceRetryEligible(
+  view: ReturnType<typeof deriveSystemTelemetryView>,
+  mountedForMs: number,
+  visible: boolean,
+): boolean {
+  return visible && view.inference.status === 'unavailable' && initialInferenceFailureDuringStartup(view, mountedForMs);
+}
+
+/** 1 s, 2 s, then 4 s for every later attempt. */
+function inferenceRetryDelayMs(attempt: number): number {
+  return INFERENCE_RETRY_DELAYS_MS[Math.min(attempt, INFERENCE_RETRY_DELAYS_MS.length - 1)];
+}
+
+function documentIsVisible(): boolean {
+  return typeof document === 'undefined' || !document.hidden;
 }
 
 function percentTone(value: number | null): Tone {
@@ -174,9 +214,9 @@ export default function SystemStatusBar() {
   // The derivation needs to know how long this surface has been mounted: a Bun
   // server that has not come up yet is the cold start the banner above already
   // reads as "starting", not a fault. Same clock as HealthBanner — the mount
-  // instant. The elapsed value is read on each render, and the only timer it
-  // schedules is the single grace-boundary update below (cleared on unmount),
-  // not a second poll.
+  // instant. The elapsed value is read on each render; the timers scheduled from
+  // it are the single grace-boundary update below and the bounded cold-start
+  // inference retry, both cleared on unmount. Neither is a second poll.
   const mountedAtRef = useRef(Date.now());
   const [activeBackend, setActiveBackend] = useState<string | null>(null);
   // Rendered once when the grace closes, so the initial failed inference read
@@ -188,6 +228,12 @@ export default function SystemStatusBar() {
   const [bridgeEnabled, setBridgeEnabled] = useState<boolean>(true);
   const healthRequestId = useRef(0);
   const inferenceRequestId = useRef(0);
+  // Automatic recovery of the initial failed inference read. The attempt count
+  // is per mount and deliberately survives failed responses and rerenders, so
+  // the 1 s → 2 s → 4 s progression can never restart; at most one timer exists.
+  const inferenceRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inferenceRetryAttempt = useRef(0);
+  const [documentVisible, setDocumentVisible] = useState<boolean>(() => documentIsVisible());
   const verdictRef = useRef<HTMLSpanElement | null>(null);
   // A focused Retry disappears the moment its read recovers. Without this the
   // browser strands focus on the document body, so recovery is tracked and the
@@ -233,6 +279,39 @@ export default function SystemStatusBar() {
     }
   }, []);
 
+  const clearInferenceRetry = useCallback(() => {
+    if (inferenceRetryTimer.current === null) return;
+    clearTimeout(inferenceRetryTimer.current);
+    inferenceRetryTimer.current = null;
+  }, []);
+
+  // Everything the scheduled callback needs is read from the latest committed
+  // render, because it fires outside that render's closure.
+  const latestObservation = useRef({ state, activeBackend, bridgeEnabled });
+  latestObservation.current = { state, activeBackend, bridgeEnabled };
+
+  // Re-check every condition at fire time. A newer read — manual refresh, the
+  // visibility re-read, or the ordinary poll — carries a newer request identity
+  // and is never duplicated; a stale identity means this observation is gone.
+  const runScheduledInferenceRetry = useCallback((scheduledRequestId: number) => {
+    inferenceRetryTimer.current = null;
+    const current = latestObservation.current;
+    // The dispatch-side ref is incremented synchronously by every reader, so it
+    // catches a newer/manual read even before its state has committed.
+    if (scheduledRequestId !== inferenceRequestId.current) return;
+    if (scheduledRequestId !== current.state.inference.requestId) return;
+    const mountedForMs = Date.now() - mountedAtRef.current;
+    const currentView = deriveSystemTelemetryView(
+      current.state,
+      current.activeBackend,
+      current.bridgeEnabled,
+      mountedForMs,
+    );
+    if (!inferenceRetryEligible(currentView, mountedForMs, documentIsVisible())) return;
+    inferenceRetryAttempt.current += 1;
+    void fetchInference();
+  }, [fetchInference]);
+
   // The persisted Inference backend decides which services are required. A
   // failed read keeps the last confirmed backend; it never invents one.
   const fetchBackend = useCallback(async () => {
@@ -275,6 +354,34 @@ export default function SystemStatusBar() {
     boundary = setTimeout(updateAtBoundary, Math.max(0, STARTUP_GRACE_MS - (Date.now() - mountedAtRef.current)));
     return () => clearTimeout(boundary);
   }, [graceOpen]);
+  // Automatic retries pause while the document is hidden; the shared polling
+  // hook already issues its own fresh read on becoming visible, so recovery
+  // there is a new observation rather than a resumed retry chain.
+  useEffect(() => {
+    const updateVisibility = () => setDocumentVisible(documentIsVisible());
+    document.addEventListener('visibilitychange', updateVisibility);
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  }, []);
+
+  // Bounded automatic recovery of the initial failed inference observation.
+  // Nothing is scheduled unless the settled failure is still the one DS-17
+  // presents as waiting; the timer is cleared on success, any revoking
+  // observation, the grace boundary and unmount. A retry that would land on or
+  // after the mount-clock deadline is never scheduled.
+  const inferenceRetryEligibleNow = inferenceRetryEligible(view, elapsedMs, documentVisible);
+  useEffect(() => {
+    if (!inferenceRetryEligibleNow) {
+      clearInferenceRetry();
+      return;
+    }
+    if (inferenceRetryTimer.current !== null) return;
+    const delay = inferenceRetryDelayMs(inferenceRetryAttempt.current);
+    if (Date.now() + delay >= mountedAtRef.current + STARTUP_GRACE_MS) return;
+    const scheduledRequestId = state.inference.requestId;
+    inferenceRetryTimer.current = setTimeout(() => runScheduledInferenceRetry(scheduledRequestId), delay);
+    return clearInferenceRetry;
+  }, [inferenceRetryEligibleNow, state.inference.requestId, clearInferenceRetry, runScheduledInferenceRetry]);
+
   const inferenceWaiting = inferenceWaitingForBunStart(view, elapsedMs);
   const healthStale = view.health.stale;
   const inferenceStale = view.inference.stale;

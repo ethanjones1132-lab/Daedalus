@@ -432,7 +432,20 @@ describe('SystemStatusBar cold-start inference presentation', () => {
     await mount();
     await settleHealth(0, bunDownHealth);
     await failInference(0);
-    await advance(STARTUP_GRACE_MS - 1);
+    // Answer every automatic recovery attempt with the same rejection. This keeps
+    // the observation the settled initial failure (rather than leaving a read in
+    // flight across the boundary) and makes the extra cold-start request count
+    // explicit: 1 s, 2 s, then the 4 s cap at 7 s, 11 s, 15 s and 19 s.
+    await advance(1_000);
+    await failInference(1);
+    await advance(2_000);
+    await failInference(2);
+    for (const index of [3, 4, 5, 6]) {
+      await advance(4_000);
+      await failInference(index);
+    }
+    // t = 19 s: the next 4 s attempt would cross the deadline, so none is armed.
+    await advance(STARTUP_GRACE_MS - 1 - 19_000);
     expect(screen.getByText('INF WAITING')).toBeInTheDocument();
     // Strictly below the threshold is the only window that reads as waiting;
     // the boundary update arrives from the mount clock with no new response and
@@ -513,5 +526,206 @@ describe('SystemStatusBar cold-start inference presentation', () => {
     expect(vi.getTimerCount()).toBeGreaterThan(0);
     await act(async () => { unmount(); });
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('regression: retries the initial failed inference read automatically and clears waiting on a valid response', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    expect(inferenceWaiting()).toHaveTextContent('Inference telemetry is waiting for the Bun server to start.');
+    expect(inferenceRequests).toHaveLength(1);
+
+    await advance(1_000);
+    expect(inferenceRequests).toHaveLength(2);
+    // The automatic read is in flight: still the same unobserved startup, so it
+    // stays waiting rather than flashing an unavailable fault.
+    expect(inferenceWaiting()).toBeInTheDocument();
+    expect(inferenceAlert()).not.toBeInTheDocument();
+
+    await settleInference(1);
+    // The response itself clears the waiting presentation: no poll, rerender or
+    // manual Retry is involved.
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(inferenceAlert()).not.toBeInTheDocument();
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+    expect(verdict()).not.toHaveTextContent('inference telemetry is unavailable');
+
+    // A valid response ends the chain.
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(2);
+  });
+
+  it('spaces automatic retries 1 s, 2 s, then 4 s and never restarts the progression', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+
+    await advance(999);
+    expect(inferenceRequests).toHaveLength(1);
+    await advance(1);
+    expect(inferenceRequests).toHaveLength(2);
+    await failInference(1);
+
+    await advance(1_999);
+    expect(inferenceRequests).toHaveLength(2);
+    await advance(1);
+    expect(inferenceRequests).toHaveLength(3);
+    await failInference(2);
+
+    for (const index of [3, 4, 5, 6]) {
+      await advance(3_999);
+      expect(inferenceRequests).toHaveLength(index);
+      await advance(1);
+      expect(inferenceRequests).toHaveLength(index + 1);
+      await failInference(index);
+    }
+    // t = 19 s: six attempts after the initial failure. The next 4 s delay would
+    // land past the 20 s deadline, so the chain is bounded and ends here.
+    await advance(8_000);
+    expect(inferenceRequests).toHaveLength(7);
+  });
+
+  it('never schedules an automatic retry at or after the exact grace boundary', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    // The initial read is still outstanding until the last second of the grace.
+    await advance(STARTUP_GRACE_MS - 1_000);
+    await failInference(0);
+    // A 1 s retry would land exactly on the boundary, so none is armed.
+    await advance(1_000);
+    expect(inferenceRequests).toHaveLength(1);
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+    expect(screen.getByRole('button', { name: 'Retry inference telemetry' })).toBeInTheDocument();
+  });
+
+  it('does not dispatch another automatic read while one is already pending', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    await advance(1_000);
+    expect(inferenceRequests).toHaveLength(2);
+    // The automatic read never comes back: a hung request must not grow a
+    // retry chain behind it.
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(2);
+    await settleInference(1);
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+  });
+
+  it('lets a manual read supersede a scheduled retry without dispatching a duplicate', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+
+    // Manual refresh before the scheduled retry fires: it issues its own read.
+    fireEvent.click(refresh());
+    expect(inferenceRequests).toHaveLength(2);
+    await advance(5_000);
+    // The stale scheduled callback must not add a third read behind it.
+    expect(inferenceRequests).toHaveLength(2);
+
+    await settleHealth(1, bunDownHealth);
+    await settleInference(1);
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+  });
+
+  it('drops a late automatic completion after a newer visibility read recovers', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    await advance(1_000);
+    expect(inferenceRequests).toHaveLength(2); // automatic retry in flight
+
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    fireEvent(document, new Event('visibilitychange'));
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+    fireEvent(document, new Event('visibilitychange'));
+    expect(inferenceRequests).toHaveLength(3); // visibility read supersedes it
+
+    await settleHealth(1, bunDownHealth);
+    await settleInference(2);
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+
+    // The older automatic read completes after the recovery and is dropped.
+    await failInference(1);
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+    expect(inferenceAlert()).not.toBeInTheDocument();
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+  });
+
+  it('does not retry automatically when Bun auto-restart has given up', async () => {
+    await mount();
+    await settleHealth(0, bunGiveUpHealth);
+    await failInference(0);
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(1);
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+  });
+
+  it('does not retry automatically once Bun is already up', async () => {
+    await mount();
+    await settleHealth(0);
+    await failInference(0);
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(1);
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+  });
+
+  it('does not retry automatically without a valid native health observation', async () => {
+    await mount();
+    await failInference(0);
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(1);
+    expect(screen.getByText('SYS PENDING')).toBeInTheDocument();
+  });
+
+  it('stops automatic retries when health goes stale', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0); // an automatic retry is scheduled
+    fireEvent.click(refresh());
+    await failHealth(1);
+    await failInference(1);
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(2);
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+  });
+
+  it('does not retry automatically when an inference reading was already observed', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await settleInference(0); // a real reading exists
+    fireEvent.click(refresh());
+    await settleHealth(1, bunDownHealth);
+    await failInference(1); // a stale failure, not the initial observation
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(2);
+    expect(screen.getByText('INF EMPTY (stale)')).toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Showing previously observed inference telemetry; it may be stale.');
+  });
+
+  it('does not retry automatically while the document is hidden', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    fireEvent(document, new Event('visibilitychange'));
+    await advance(STARTUP_GRACE_MS + 1_000);
+    expect(inferenceRequests).toHaveLength(1);
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+  });
+
+  it('stops automatic retries on unmount and sends no post-unmount request', async () => {
+    const { unmount } = await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    await act(async () => { unmount(); });
+    await advance(STARTUP_GRACE_MS);
+    expect(inferenceRequests).toHaveLength(1);
   });
 });
