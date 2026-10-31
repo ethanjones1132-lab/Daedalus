@@ -17,6 +17,7 @@ import {
   deriveSystemTelemetryView,
   initialSystemTelemetryState,
   reduceSystemTelemetryState,
+  STARTUP_GRACE_MS,
   summarizeVerdict,
   REQUIREMENT_WORDS,
   SERVICE_NAMES,
@@ -104,6 +105,33 @@ function inferenceLabel(view: ReturnType<typeof deriveSystemTelemetryView>): str
   return `INF OK${suffix}`;
 }
 
+/**
+ * A direct-to-Bun inference read is issued at mount, before the Bun server can
+ * be listening, so its first failure is the same cold start the verdict above
+ * calls starting — not an inference outage. Present it as waiting only when a
+ * fresh native health observation says Bun is down inside the same
+ * STARTUP_GRACE_MS the banner uses, supervisor has not given up, and no earlier
+ * inference reading exists to keep showing. Anything else — Bun up, absent or
+ * stale health, give-up, a previously observed reading — stays the ordinary
+ * unavailable/stale observation with its Retry.
+ */
+function inferenceWaitingForBunStart(
+  view: ReturnType<typeof deriveSystemTelemetryView>,
+  mountedForMs: number,
+): boolean {
+  return (
+    mountedForMs < STARTUP_GRACE_MS &&
+    view.health.status === 'ready' &&
+    !view.health.stale &&
+    view.health.services.bun === 'down' &&
+    !view.health.bunGiveUp &&
+    view.inference.error &&
+    view.inference.status === 'unavailable' &&
+    !view.inference.hasData &&
+    !view.inference.stale
+  );
+}
+
 function percentTone(value: number | null): Tone {
   if (value === null) return 'warn';
   if (value >= 90) return 'error';
@@ -146,10 +174,14 @@ export default function SystemStatusBar() {
   // The derivation needs to know how long this surface has been mounted: a Bun
   // server that has not come up yet is the cold start the banner above already
   // reads as "starting", not a fault. Same clock as HealthBanner — the mount
-  // instant, read on each render the existing poll already causes, so no second
-  // timer is started here.
+  // instant. The elapsed value is read on each render, and the only timer it
+  // schedules is the single grace-boundary update below (cleared on unmount),
+  // not a second poll.
   const mountedAtRef = useRef(Date.now());
   const [activeBackend, setActiveBackend] = useState<string | null>(null);
+  // Rendered once when the grace closes, so the initial failed inference read
+  // returns to its unavailable alert at the boundary even if no poll lands then.
+  const [, setGraceBoundaryTick] = useState(0);
   // The bridge requirement follows the operator's Enable Bridge setting. Only
   // an explicit false disables it; an unreadable config keeps the last value
   // rather than guessing.
@@ -219,14 +251,42 @@ export default function SystemStatusBar() {
 
   usePolling(fetchTelemetry, POLL_MS, [fetchTelemetry]);
 
-  // The elapsed reading is taken on the render the existing poll already
-  // causes, so the grace needs no timer of its own.
-  const view = deriveSystemTelemetryView(state, activeBackend, bridgeEnabled, Date.now() - mountedAtRef.current);
+  // The elapsed reading is taken on each render the existing poll already
+  // causes; the grace boundary itself is the only extra update scheduled here.
+  const elapsedMs = Date.now() - mountedAtRef.current;
+  const view = deriveSystemTelemetryView(state, activeBackend, bridgeEnabled, elapsedMs);
+  // Presenting the first inference failure as "waiting" must expire on its own:
+  // schedule the one boundary render from this same mount clock and clear it on
+  // unmount. No polling, no retry and no extra fetch is added here. A timer
+  // that lands a hair early re-arms for the remainder rather than leaving the
+  // startup copy up until the next poll.
+  const graceOpen = elapsedMs < STARTUP_GRACE_MS;
+  useEffect(() => {
+    if (!graceOpen) return;
+    let boundary: ReturnType<typeof setTimeout>;
+    const updateAtBoundary = () => {
+      const remaining = STARTUP_GRACE_MS - (Date.now() - mountedAtRef.current);
+      if (remaining > 0) {
+        boundary = setTimeout(updateAtBoundary, remaining);
+        return;
+      }
+      setGraceBoundaryTick((tick) => tick + 1);
+    };
+    boundary = setTimeout(updateAtBoundary, Math.max(0, STARTUP_GRACE_MS - (Date.now() - mountedAtRef.current)));
+    return () => clearTimeout(boundary);
+  }, [graceOpen]);
+  const inferenceWaiting = inferenceWaitingForBunStart(view, elapsedMs);
   const healthStale = view.health.stale;
   const inferenceStale = view.inference.stale;
   const inferenceStatus = view.inference.status;
   const refreshing = state.health.error || state.inference.error || state.health.data !== null || state.inference.data !== null;
-  const verdict = summarizeVerdict(view);
+  // While the first inference read is only waiting on Bun, the verdict must not
+  // name it as a confirmed fault either; at the boundary the reason returns.
+  const verdict = summarizeVerdict(
+    inferenceWaiting
+      ? { ...view, overallReasons: view.overallReasons.filter((reason) => reason !== 'inference_unavailable') }
+      : view,
+  );
   const llama = view.health.backend === 'llama_cpp';
 
   const serviceTone = (key: TelemetryServiceKey): Tone => {
@@ -269,7 +329,11 @@ export default function SystemStatusBar() {
 
       <Chip name={view.health.memoryReading?.basis ?? undefined} tone={percentTone(view.health.memoryPercent)} label={percentLabel('MEM', view.health.memoryPercent, healthStale)} />
       <Chip tone={percentTone(view.health.diskPercent)} label={percentLabel('DSK', view.health.diskPercent, healthStale)} />
-      <Chip tone={inferenceTone} label={inferenceLabel(view)} />
+      <Chip
+        name={inferenceWaiting ? 'Inference telemetry is waiting for the Bun server to start.' : undefined}
+        tone={inferenceWaiting ? 'info' : inferenceTone}
+        label={inferenceWaiting ? 'INF WAITING' : inferenceLabel(view)}
+      />
       {hit !== null && (
         <Chip
           tone={hit >= 0.8 ? 'ok' : hit >= 0.5 ? 'warn' : 'error'}
@@ -309,7 +373,15 @@ export default function SystemStatusBar() {
           </button>
         </span>
       )}
-      {view.inference.error && (
+      {inferenceWaiting && (
+        <span role="status" aria-label="Inference telemetry observation" className="inline-flex h-full shrink-0 items-center gap-2 px-2.5 text-info">
+          <span className="sr-only">Inference telemetry is waiting for the Bun server to start.</span>
+          <span aria-hidden="true" title="Inference telemetry is waiting for the Bun server to start.">
+            waiting for Bun
+          </span>
+        </span>
+      )}
+      {view.inference.error && !inferenceWaiting && (
         <span role="alert" aria-label="Inference telemetry observation" className="inline-flex h-full shrink-0 items-center gap-2 px-2.5 text-warn">
           <span className="sr-only">{inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}</span>
           <span aria-hidden="true" title={inferenceStale ? 'Showing previously observed inference telemetry; it may be stale.' : 'Inference telemetry is unavailable.'}>

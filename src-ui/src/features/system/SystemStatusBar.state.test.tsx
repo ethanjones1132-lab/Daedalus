@@ -38,6 +38,18 @@ const emptyInference: InferenceMetrics = {
   conductor_cache: null,
 };
 
+// A cold start: Native has answered with a fresh observation that says Bun is
+// not listening yet. Inside the grace this is the ordinary startup, not a fault.
+const bunDownHealth: HealthData = {
+  ...baseHealth,
+  bun_server: { ...baseHealth.bun_server, running: false },
+};
+
+const bunGiveUpHealth: HealthData = {
+  ...bunDownHealth,
+  supervisor: { bun_give_up: true, proxy_give_up: false, ollama_give_up: false },
+};
+
 let healthRequests: Deferred<unknown>[];
 let inferenceRequests: Deferred<Response>[];
 // The bar now reads the persisted Inference backend itself (`jarvis_get_config`)
@@ -45,7 +57,7 @@ let inferenceRequests: Deferred<Response>[];
 let configuredBackend: string | null;
 
 beforeEach(() => {
-  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
   healthRequests = [];
   inferenceRequests = [];
   configuredBackend = 'ollama';
@@ -380,5 +392,126 @@ describe('SystemStatusBar self-contained backend and polling', () => {
     expect(healthRequests).toHaveLength(2);
     await advance(30_000);
     expect(healthRequests).toHaveLength(3);
+  });
+});
+
+describe('SystemStatusBar cold-start inference presentation', () => {
+  const inferenceWaiting = () => screen.queryByRole('status', { name: 'Inference telemetry observation' });
+  const inferenceAlert = () => screen.queryByRole('alert', { name: 'Inference telemetry observation' });
+
+  it('regression: presents the initial failed inference read as waiting for Bun inside the grace', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    expect(inferenceWaiting()).toHaveTextContent('Inference telemetry is waiting for the Bun server to start.');
+    expect(inferenceAlert()).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry inference telemetry' })).not.toBeInTheDocument();
+    expect(screen.getByText('INF WAITING')).toBeInTheDocument();
+    expect(screen.queryByText('INF UNAVAILABLE')).not.toBeInTheDocument();
+    // Waiting is not a reading: no fabricated empty payload and no zero.
+    expect(screen.queryByText('INF EMPTY')).not.toBeInTheDocument();
+    expect(screen.getByText('SYS STARTING')).toBeInTheDocument();
+    expect(screen.queryByText(/private inference detail/)).not.toBeInTheDocument();
+    // The verdict is part of the presentation too: waiting is not a fault.
+    expect(verdict()).toHaveTextContent('Starting');
+    expect(verdict()).not.toHaveTextContent('inference telemetry is unavailable');
+  });
+
+  it('keeps a successful inference read that recovers before the grace boundary', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await settleInference(0);
+    expect(screen.queryByRole('status', { name: 'Inference telemetry observation' })).not.toBeInTheDocument();
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+    await advance(STARTUP_GRACE_MS);
+    expect(screen.queryByRole('alert', { name: 'Inference telemetry observation' })).not.toBeInTheDocument();
+    expect(screen.getByText('INF EMPTY')).toBeInTheDocument();
+  });
+
+  it('restores the unavailable alert and Retry exactly at the grace boundary without a rerender', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    await advance(STARTUP_GRACE_MS - 1);
+    expect(screen.getByText('INF WAITING')).toBeInTheDocument();
+    // Strictly below the threshold is the only window that reads as waiting;
+    // the boundary update arrives from the mount clock with no new response and
+    // no explicit rerender.
+    await advance(1);
+    expect(screen.queryByText('INF WAITING')).not.toBeInTheDocument();
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+    expect(screen.getByRole('button', { name: 'Retry inference telemetry' })).toBeInTheDocument();
+    expect(screen.getByText('SYS STOPPED')).toBeInTheDocument();
+    expect(verdict()).toHaveTextContent('Stopped');
+    expect(verdict()).toHaveTextContent('inference telemetry is unavailable');
+  });
+
+  it('keeps the failure honest when Bun auto-restart has given up inside the grace', async () => {
+    await mount();
+    await settleHealth(0, bunGiveUpHealth);
+    await failInference(0);
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+    expect(screen.getByText('SYS STOPPED')).toBeInTheDocument();
+    expect(screen.getByText('BUN GIVE-UP')).toBeInTheDocument();
+  });
+
+  it('keeps an inference failure immediate once Bun is already running', async () => {
+    await mount();
+    await settleHealth(0);
+    await failInference(0);
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+  });
+
+  it('keeps the failure immediate when no valid health observation has arrived', async () => {
+    await mount();
+    await failInference(0);
+    expect(inferenceWaiting()).not.toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Inference telemetry is unavailable.');
+    expect(screen.getByText('INF UNAVAILABLE')).toBeInTheDocument();
+    expect(screen.getByText('SYS PENDING')).toBeInTheDocument();
+  });
+
+  it('never hides a previously successful inference reading behind startup copy', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await settleInference(0);
+    fireEvent.click(refresh());
+    // Fresh health still says Bun is down inside the grace, but the inference
+    // read already succeeded once, so its failure stays a stale observation.
+    await settleHealth(1, bunDownHealth);
+    await failInference(1);
+    expect(screen.queryByText('INF WAITING')).not.toBeInTheDocument();
+    expect(screen.getByText('INF EMPTY (stale)')).toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Showing previously observed inference telemetry; it may be stale.');
+    expect(screen.getByRole('button', { name: 'Retry inference telemetry' })).toBeInTheDocument();
+    expect(screen.getByText('SYS STARTING')).toBeInTheDocument();
+  });
+
+  it('treats stale native health as no evidence that Bun is still starting', async () => {
+    await mount();
+    await settleHealth(0, bunDownHealth);
+    await settleInference(0);
+    fireEvent.click(refresh());
+    await failHealth(1);
+    await failInference(1);
+    expect(screen.queryByText('INF WAITING')).not.toBeInTheDocument();
+    expect(inferenceAlert()).toHaveTextContent('Showing previously observed inference telemetry; it may be stale.');
+    expect(screen.getByRole('alert', { name: 'System health observation' })).toHaveTextContent('Showing previously observed system health; it may be stale.');
+    expect(screen.getByText('SYS STALE')).toBeInTheDocument();
+  });
+
+  it('clears the grace boundary timer on unmount', async () => {
+    const { unmount } = await mount();
+    await settleHealth(0, bunDownHealth);
+    await failInference(0);
+    expect(screen.getByText('INF WAITING')).toBeInTheDocument();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    await act(async () => { unmount(); });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
