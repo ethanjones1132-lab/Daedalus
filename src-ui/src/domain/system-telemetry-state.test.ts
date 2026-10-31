@@ -6,10 +6,14 @@ import {
   parseInferenceMetrics,
   projectServiceRequirements,
   reduceSystemTelemetryState,
+  STARTUP_GRACE_MS,
   summarizeVerdict,
   type HealthData,
   type InferenceMetrics,
 } from './system-telemetry-state';
+// The banner's own cold-start window. Imported so the two thresholds cannot
+// drift: the footer and the banner must agree about the same observation.
+import { STARTUP_GRACE_MS as BANNER_STARTUP_GRACE_MS } from '../features/system/health-derivation';
 
 const health: HealthData = {
   ollama: { running: true, model: 'test-model', url: 'http://127.0.0.1:11434' },
@@ -191,6 +195,68 @@ const stockReadyHealth: HealthData = {
 };
 
 const stockReady = () => readyWith(stockReadyHealth);
+
+describe('cold-start grace', () => {
+  const bunDown = () => readyWith({ ...health, bun_server: { ...health.bun_server, running: false } });
+
+  it('keeps the footer and banner grace windows identical', () => {
+    expect(STARTUP_GRACE_MS).toBe(BANNER_STARTUP_GRACE_MS);
+  });
+
+  it.each([0, STARTUP_GRACE_MS - 1])(
+    'reads a not-yet-running Bun server as starting %ims after mount',
+    (elapsed) => {
+      const view = deriveSystemTelemetryView(bunDown(), 'openrouter', false, elapsed);
+      expect(view.overall).toBe('starting');
+      // The cold-start absence is already said as "starting", so it is not
+      // repeated as a fault reason.
+      expect(view.overallReasons).not.toContain('bun_down');
+      expect(summarizeVerdict(view)).toBe('Starting');
+    },
+  );
+
+  it.each([STARTUP_GRACE_MS, STARTUP_GRACE_MS + 1])(
+    'reads the same absence as stopped %ims after mount',
+    (elapsed) => {
+      const view = deriveSystemTelemetryView(bunDown(), 'openrouter', false, elapsed);
+      expect(view.overall).toBe('stopped');
+      expect(view.overallReasons).toEqual(['bun_down']);
+      expect(summarizeVerdict(view)).toBe('Stopped: Bun server is not running.');
+    },
+  );
+
+  it('keeps auto-restart give-up a stopped fault even inside the grace', () => {
+    const giveUp = readyWith({
+      ...health,
+      bun_server: { ...health.bun_server, running: false },
+      supervisor: { bun_give_up: true, proxy_give_up: false, ollama_give_up: false },
+    });
+    const view = deriveSystemTelemetryView(giveUp, 'openrouter', false, 0);
+    expect(view.overall).toBe('stopped');
+    expect(view.overallReasons).toContain('bun_give_up');
+  });
+
+  it('defaults to the grace boundary, so a caller that omits elapsed time still reads stopped', () => {
+    expect(deriveSystemTelemetryView(bunDown(), 'openrouter', false).overall).toBe('stopped');
+  });
+
+  it('keeps a stale or absent read honest inside the grace', () => {
+    // A stale read is not a cold-start observation: the surface says stale and
+    // still names what the last read saw, rather than claiming "starting".
+    const stale = deriveSystemTelemetryView(
+      reduceSystemTelemetryState(bunDown(), { type: 'health-pending', requestId: 2 }),
+      'openrouter',
+      false,
+      0,
+    );
+    expect(stale.overall).toBe('stale');
+    expect(stale.overallReasons).toContain('bun_down');
+
+    // No health read at all is still pending: the grace never invents a
+    // "starting" claim from an observation that has not happened.
+    expect(deriveSystemTelemetryView(initialSystemTelemetryState(), 'openrouter', false, 0).overall).toBe('pending');
+  });
+});
 
 describe('inference-backend service requirements', () => {
   it('binds the backend-dependent services to the confirmed active inference backend', () => {

@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import SystemStatusBar from './SystemStatusBar';
-import type { HealthData, InferenceMetrics } from '../../domain/system-telemetry-state';
+import { STARTUP_GRACE_MS, type HealthData, type InferenceMetrics } from '../../domain/system-telemetry-state';
 
 const { invokeMock, fetchMock } = vi.hoisted(() => ({ invokeMock: vi.fn(), fetchMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -45,7 +45,7 @@ let inferenceRequests: Deferred<Response>[];
 let configuredBackend: string | null;
 
 beforeEach(() => {
-  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
   healthRequests = [];
   inferenceRequests = [];
   configuredBackend = 'ollama';
@@ -71,7 +71,9 @@ afterEach(() => {
 
 const mount = async (activeBackend: string | null = 'ollama') => {
   configuredBackend = activeBackend;
-  await act(async () => { render(<SystemStatusBar />); });
+  let result!: ReturnType<typeof render>;
+  await act(async () => { result = render(<SystemStatusBar />); });
+  return result;
 };
 const settleHealth = async (index: number, value: unknown = baseHealth) => { await act(async () => { healthRequests[index].resolve(value); }); };
 const failHealth = async (index: number) => { await act(async () => { healthRequests[index].reject(new Error('private native health detail')); }); };
@@ -141,7 +143,7 @@ describe('SystemStatusBar telemetry observation state', () => {
   });
 
   it('renders valid healthy, degraded, and stopped observations distinctly', async () => {
-    await mount();
+    const { rerender } = await mount();
     await settleHealth(0);
     await settleInference(0);
     expect(screen.getByText('SYS HEALTHY')).toBeInTheDocument();
@@ -179,6 +181,14 @@ describe('SystemStatusBar telemetry observation state', () => {
     fireEvent.click(refresh());
     await settleHealth(2, { ...baseHealth, bun_server: { ...baseHealth.bun_server, running: false } });
     await settleInference(2);
+    // Inside the cold-start grace the footer reads the same absence as the
+    // banner above it: the Bun server is still coming up, not stopped.
+    expect(screen.getByText('SYS STARTING')).toBeInTheDocument();
+    expect(screen.queryByText('SYS STOPPED')).not.toBeInTheDocument();
+    await advance(STARTUP_GRACE_MS);
+    // The clock has reached the boundary; observing the rendered surface again
+    // reads stopped without waiting for the next poll.
+    await act(async () => { rerender(<SystemStatusBar />); });
     expect(screen.getByText('SYS STOPPED')).toBeInTheDocument();
     expect(screen.getByText('BUN DOWN')).toBeInTheDocument();
   });
@@ -205,6 +215,10 @@ describe('SystemStatusBar telemetry observation state', () => {
     await settleHealth(2, { ...baseHealth, bun_server: { ...baseHealth.bun_server, running: false } });
     expect(screen.queryByRole('alert', { name: 'System health observation' })).not.toBeInTheDocument();
     expect(screen.getByRole('alert', { name: 'Inference telemetry observation' })).toBeInTheDocument();
+    // The same in-grace absence reads as starting here too, before the older
+    // inference read is retried; the boundary then reads stopped.
+    expect(screen.getByText('SYS STARTING')).toBeInTheDocument();
+    await advance(STARTUP_GRACE_MS);
     fireEvent.click(screen.getByRole('button', { name: 'Retry inference telemetry' }));
     await settleInference(2);
     expect(screen.getByText('SYS STOPPED')).toBeInTheDocument();

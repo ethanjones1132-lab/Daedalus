@@ -226,7 +226,7 @@ export function reduceSystemTelemetryState(state: SystemTelemetryState, action: 
   }
 }
 
-export type SystemTelemetryOverall = 'pending' | 'unavailable' | 'stale' | 'healthy' | 'degraded' | 'stopped';
+export type SystemTelemetryOverall = 'pending' | 'unavailable' | 'stale' | 'healthy' | 'degraded' | 'starting' | 'stopped';
 export type ServiceState = 'up' | 'down' | 'unknown';
 export type TelemetryServiceKey = 'bun' | 'bridge' | 'ollama' | 'proxy';
 export type ServiceRequirement = 'required' | 'not_required' | 'disabled' | 'unknown';
@@ -360,11 +360,26 @@ const SERVICE_REASON: Record<TelemetryServiceKey, OverallReason> = {
 };
 
 /**
+ * How long after mount a not-yet-running Bun server still reads as starting
+ * rather than stopped. Native spawns the Bun server in the background and the
+ * first health read fires immediately, so an absent server inside this window
+ * is the ordinary cold start, not a fault. The health banner keeps the same
+ * window in `features/system/health-derivation.ts`; domain code must not import
+ * features, so the threshold is named here as well and the domain test fails if
+ * the two values drift apart.
+ */
+export const STARTUP_GRACE_MS = 20_000;
+
+/**
  * Whether the operator's Enable Bridge setting is on decides how a stopped
  * bridge reads. The flag comes from the persisted configuration the same way
  * the active backend does, so a disabled bridge is never a fault here.
+ *
+ * `mountedForMs` is how long the reading surface has been mounted. It defaults
+ * to the grace boundary, so every caller that omits it keeps the long-standing
+ * verdict: only a surface that passes its own elapsed time sees `starting`.
  */
-export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBackend: unknown, bridgeEnabled: unknown = true): SystemTelemetryView {
+export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBackend: unknown, bridgeEnabled: unknown = true, mountedForMs: number = STARTUP_GRACE_MS): SystemTelemetryView {
   const healthData = state.health.data;
   const healthStale = isStale(state.health.status, healthData !== null);
   const inferenceData = state.inference.data;
@@ -401,6 +416,13 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const inferenceAwaiting = state.inference.status === 'pending' || state.inference.status === 'unknown';
   const inferenceReadFailed = state.inference.status === 'unavailable' || state.inference.status === 'stale';
 
+  // A Bun server that has not come up yet is the ordinary cold start while the
+  // grace window is open, so it reads as starting rather than stopped and its
+  // absence names no fault. Auto-restart giving up is a real fault at any time,
+  // so it outranks the grace and stays stopped even inside the window.
+  const bunGiveUp = healthData?.supervisor?.bun_give_up ?? false;
+  const bunStarting = services.bun === 'down' && !bunGiveUp && mountedForMs < STARTUP_GRACE_MS;
+
   // A service that is not running is a fault only when the confirmed active
   // inference backend needs it. An unconfirmed required set is itself a reason
   // not to certify health, so the projection can never read `healthy` while the
@@ -408,12 +430,16 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
   const reasons: OverallReason[] = [];
   if (healthData !== null) {
     for (const key of ['bun', 'bridge', 'ollama', 'proxy'] as const) {
+      // The cold-start absence is already said as `starting`, so it is not
+      // repeated here as `bun_down`. A stale read is not a cold-start
+      // observation: it keeps naming what the last read actually saw.
+      if (key === 'bun' && bunStarting && !healthStale) continue;
       if (services[key] === 'down' && requirements[key] === 'required') {
         reasons.push(key === 'ollama' && backend === 'llama_cpp' ? 'llama_cpp_down' : SERVICE_REASON[key]);
       }
     }
     if (backendUnconfirmed) reasons.push('backend_unconfirmed');
-    if (healthData.supervisor?.bun_give_up ?? false) reasons.push('bun_give_up');
+    if (bunGiveUp) reasons.push('bun_give_up');
     if (healthData.supervisor?.proxy_give_up ?? false) reasons.push('proxy_give_up');
     if (backend === 'llama_cpp' ? (healthData.supervisor?.llama_cpp_give_up ?? false) : (healthData.supervisor?.ollama_give_up ?? false)) {
       reasons.push(backend === 'llama_cpp' ? 'llama_cpp_give_up' : 'ollama_give_up');
@@ -434,10 +460,12 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
     overall = 'stale';
   } else if (services.bun === 'down') {
     // Only the Bun server is part of every Session turn, so only its absence
-    // is "stopped". A stopped-but-enabled bridge degrades the verdict through
-    // its own `bridge_down` reason; a disabled bridge is not a fault and here
-    // yields no reason at all.
-    overall = 'stopped';
+    // is "stopped". Inside the cold-start grace it is "starting" instead, so
+    // the footer agrees with the banner above it for the same observation. A
+    // stopped-but-enabled bridge degrades the verdict through its own
+    // `bridge_down` reason; a disabled bridge is not a fault and here yields no
+    // reason at all.
+    overall = bunStarting ? 'starting' : 'stopped';
   } else if (reasons.length > 0) {
     overall = 'degraded';
   } else if (inferenceAwaiting) {
@@ -460,7 +488,7 @@ export function deriveSystemTelemetryView(state: SystemTelemetryState, activeBac
       memoryPercent,
       memoryReading,
       diskPercent,
-      bunGiveUp: healthData?.supervisor?.bun_give_up ?? false,
+      bunGiveUp,
       proxyGiveUp: healthData?.supervisor?.proxy_give_up ?? false,
       ollamaGiveUp: backend === 'llama_cpp'
         ? (healthData?.supervisor?.llama_cpp_give_up ?? false)
@@ -509,6 +537,7 @@ const VERDICT_LABELS: Record<SystemTelemetryOverall, string> = {
   stale: 'System health may be stale',
   healthy: 'All required services are running',
   degraded: 'Degraded',
+  starting: 'Starting',
   stopped: 'Stopped',
 };
 

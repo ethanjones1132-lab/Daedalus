@@ -117,6 +117,7 @@ const OVERALL_LABEL: Record<SystemTelemetryOverall, string> = {
   stale: 'SYS STALE',
   healthy: 'SYS HEALTHY',
   degraded: 'SYS DEGRADED',
+  starting: 'SYS STARTING',
   stopped: 'SYS STOPPED',
 };
 
@@ -126,6 +127,7 @@ const OVERALL_TONE: Record<SystemTelemetryOverall, Tone> = {
   stale: 'warn',
   healthy: 'ok',
   degraded: 'warn',
+  starting: 'warn',
   stopped: 'error',
 };
 
@@ -141,6 +143,12 @@ function Chip({ tone, label, name }: { tone: Tone; label: string; name?: string 
 
 export default function SystemStatusBar() {
   const [state, dispatch] = useReducer(reduceSystemTelemetryState, undefined, initialSystemTelemetryState);
+  // The derivation needs to know how long this surface has been mounted: a Bun
+  // server that has not come up yet is the cold start the banner above already
+  // reads as "starting", not a fault. Same clock as HealthBanner — the mount
+  // instant, read on each render the existing poll already causes, so no second
+  // timer is started here.
+  const mountedAtRef = useRef(Date.now());
   const [activeBackend, setActiveBackend] = useState<string | null>(null);
   // The bridge requirement follows the operator's Enable Bridge setting. Only
   // an explicit false disables it; an unreadable config keeps the last value
@@ -211,7 +219,9 @@ export default function SystemStatusBar() {
 
   usePolling(fetchTelemetry, POLL_MS, [fetchTelemetry]);
 
-  const view = deriveSystemTelemetryView(state, activeBackend, bridgeEnabled);
+  // The elapsed reading is taken on the render the existing poll already
+  // causes, so the grace needs no timer of its own.
+  const view = deriveSystemTelemetryView(state, activeBackend, bridgeEnabled, Date.now() - mountedAtRef.current);
   const healthStale = view.health.stale;
   const inferenceStale = view.inference.stale;
   const inferenceStatus = view.inference.status;
