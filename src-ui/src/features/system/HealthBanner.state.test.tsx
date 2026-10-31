@@ -69,7 +69,9 @@ describe('HealthBanner observation state', () => {
   it('retains explicitly stale details through failure and pending retry, then self-hides on health', async () => {
     await mount();
     await settle(0, { ...healthy, openrouter_key_set: false });
-    expect(screen.getByText('Offline')).toBeInTheDocument();
+    // The banner mounts and polls immediately, so this first observation is
+    // still inside the startup grace: Starting, not Offline.
+    expect(screen.getByText('Starting')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /details/ }));
     expect(screen.getByText('(observed-model)')).toBeInTheDocument();
     await advance();
@@ -121,7 +123,7 @@ describe('HealthBanner observation state', () => {
     await settle(2, { ...healthy, openrouter_key_set: false });
     if (outcome === 'success') await settle(1);
     else await fail(1);
-    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(screen.getByText('Starting')).toBeInTheDocument();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     cleanup();
     await advance();
@@ -186,8 +188,13 @@ describe('HealthBanner recovery', () => {
   it('announces recovery after the strip self-hides', async () => {
     await mount();
     await settle(0, offline);
-    expect(screen.getByText('Offline')).toBeInTheDocument();
-    expect(announcement()).toHaveTextContent('Backend "openrouter" is unreachable');
+    // A backend that has not answered yet is Starting during the grace window,
+    // so a cold start no longer reads Offline.
+    expect(screen.getByText('Starting')).toBeInTheDocument();
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+    expect(announcement()).toHaveTextContent(
+      'The local model is still loading — the Inference backend is starting up',
+    );
 
     await advance();
     await settle(1, healthy);
@@ -199,23 +206,29 @@ describe('HealthBanner recovery', () => {
     expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, llama.cpp server, Local model and Claude proxy.');
   });
 
-  it('announces a degradation that appears after health', async () => {
+  it('announces a backend that is not yet ready after health', async () => {
     await mount();
     await settle(0, healthy);
     expect(announcement()).toHaveTextContent('Health recovered');
 
     await advance();
     await settle(1, offline);
-    expect(announcement()).toHaveTextContent('Backend "openrouter" is unreachable');
+    expect(screen.getByText('Starting')).toBeInTheDocument();
+    expect(announcement()).toHaveTextContent(
+      'The local model is still loading — the Inference backend is starting up',
+    );
   });
 
   it('never announces recovery while the active inference backend is unconfirmed', async () => {
     await mount();
     await settle(0, { ...offline, active_backend: 'vllm' as never });
 
-    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(screen.getByText('Starting')).toBeInTheDocument();
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
     expect(announcement()).not.toHaveTextContent('Health recovered');
-    expect(announcement()).toHaveTextContent('Backend "vllm" is unreachable');
+    expect(announcement()).toHaveTextContent(
+      'The local model is still loading — the Inference backend is starting up',
+    );
   });
 
   it('keeps focus off the document body when a focused Retry disappears on recovery', async () => {
@@ -256,11 +269,17 @@ describe('HealthBanner llama_cpp backend', () => {
     expect(announcement()).toHaveTextContent('Not required by this backend: Ollama, OpenRouter key and Claude proxy.');
   });
 
-  it('shows Offline with the llama.cpp row as the required, stopped service', async () => {
+  it('shows Starting, not Offline, while a stopped llama.cpp server may still be loading', async () => {
     await mount();
     await settle(0, { ...llamaCpp, llama_cpp_running: false });
-    expect(screen.getByText('Offline')).toBeInTheDocument();
-    expect(announcement()).toHaveTextContent('Backend "llama_cpp" is unreachable');
+    // The test fakes setInterval only, so the banner's first observation is
+    // still inside the startup grace; the post-grace Offline verdict is proven
+    // in health-derivation.test.ts.
+    expect(screen.getByText('Starting')).toBeInTheDocument();
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+    expect(announcement()).toHaveTextContent(
+      'The local model is still loading — the Inference backend is starting up',
+    );
     details();
     expect(screen.getByRole('listitem', { name: 'llama.cpp server is not running and required by the active inference backend.' })).toBeInTheDocument();
     expect(screen.getByRole('listitem', { name: 'Ollama is not running and not required by the active inference backend.' })).toBeInTheDocument();

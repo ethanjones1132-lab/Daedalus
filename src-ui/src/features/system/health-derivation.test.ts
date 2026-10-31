@@ -40,7 +40,45 @@ describe('masthead bridge truthfulness', () => {
 
   it('keeps a backend verdict above the bridge warning', () => {
     const backendAndBridgeDown = { ...healthy, bridge_active: false, llama_cpp_running: false };
-    expect(deriveHealthPresentation(backendAndBridgeDown, null, 0).level).toBe('down');
+    // Inside the window that pair is Starting, never a bridge warning and never
+    // Offline; past the window the stopped backend still outranks the bridge.
+    expect(deriveHealthPresentation(backendAndBridgeDown, null, 0).level).toBe('starting');
+    expect(deriveHealthPresentation(backendAndBridgeDown, null, STARTUP_GRACE_MS).level).toBe('down');
+  });
+});
+
+describe('backend startup grace', () => {
+  // A cold start polls immediately, before llama.cpp has loaded the model.
+  const stoppedLlama: JarvisStatus = { ...healthy, llama_cpp_running: false };
+
+  it.each([[0], [STARTUP_GRACE_MS - 1]])(
+    'reads a stopped llama.cpp backend as Starting at %ims rather than Offline',
+    (mountedForMs) => {
+      const presentation = deriveHealthPresentation(stoppedLlama, null, mountedForMs);
+      expect(presentation.level).toBe('starting');
+      expect(presentation.level).not.toBe('down');
+      expect(presentation.label).toBe('Starting');
+      expect(presentation.summary).toContain('local model');
+      expect(presentation.summary).toContain('still loading');
+    },
+  );
+
+  it('reads Offline, naming the backend, once the grace window has passed', () => {
+    expect(deriveHealthPresentation(stoppedLlama, null, STARTUP_GRACE_MS + 1)).toMatchObject({
+      level: 'down',
+      label: 'Offline',
+      summary: 'Backend "llama_cpp" is unreachable',
+    });
+  });
+
+  it('keeps the Bun-only grace copy when the backend itself is ready', () => {
+    const noBun = { ...healthy, bun_server_running: false };
+    expect(deriveHealthPresentation(noBun, null, STARTUP_GRACE_MS - 1)).toMatchObject({
+      level: 'starting',
+      label: 'Starting',
+      summary: 'Starting Bun server — tools and skills are warming up',
+    });
+    expect(deriveHealthPresentation(noBun, null, STARTUP_GRACE_MS + 1).level).toBe('warn');
   });
 });
 
@@ -55,7 +93,11 @@ describe('stale health snapshot presentation', () => {
   });
 
   it('keeps an existing fault level but still marks the observation stale', () => {
-    const down = deriveHealthPresentation({ ...healthy, llama_cpp_running: false }, null, 0);
+    const down = deriveHealthPresentation(
+      { ...healthy, llama_cpp_running: false },
+      null,
+      STARTUP_GRACE_MS + 1,
+    );
     const stale = markStalePresentation(down);
     expect(stale.level).toBe('down');
     expect(stale.label).toBe('Offline (stale)');

@@ -11,14 +11,18 @@ import type { JarvisStatus } from '../../domain/types';
 
 export type HealthLevel = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
 
-/** How long a missing Bun server reads as "starting" rather than "degraded". */
+/**
+ * How long a not-yet-ready service reads as "starting" rather than failed: a
+ * missing Bun server while the backend is ready, or a backend that is still
+ * coming up.
+ */
 export const STARTUP_GRACE_MS = 20_000;
 
 /*
  * The startup grace is measured from when the app first observed health — the
  * HealthBanner mounts with the shell, so it records that moment. Other
  * surfaces (the Health page) reuse it, so the banner and the page never
- * disagree about whether the Bun server is still "starting".
+ * disagree about whether a service is still "starting".
  */
 let firstObservedAt: number | null = null;
 
@@ -51,7 +55,16 @@ export function backendOk(s: JarvisStatus): boolean {
 
 function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): HealthLevel {
   if (fetchError) return 'unavailable';
-  if (!backendOk(s)) return 'down';
+  /*
+   * A cold start is the normal case: native spawns the Inference backend in the
+   * background and the first poll fires immediately, long before the model can
+   * answer (`llama_cpp` needs its server up; Ollama needs its model loaded). So
+   * a backend that is not ready yet gets the same bounded grace the Bun server
+   * gets and reads "starting" with a loading sentence; only after the window is
+   * a stopped backend a real outage. The backend still outranks the bridge
+   * warning after the window.
+   */
+  if (!backendOk(s)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'down';
   if (!(s.bun_server_running ?? false)) return mountedForMs < STARTUP_GRACE_MS ? 'starting' : 'warn';
   /*
    * The bridge serves external Agent ingress only (server-jarvis/src/bridge.ts);
@@ -70,7 +83,12 @@ function summaryFor(s: JarvisStatus, level: HealthLevel, fetchError: string | nu
     if (!backendOk(s)) return `Backend "${s.active_backend ?? ''}" is unreachable`;
     return 'Status check failed';
   }
-  if (level === 'starting') return 'Starting Bun server — tools and skills are warming up';
+  if (level === 'starting') {
+    // A backend that is the reason for the wait says so, rather than borrowing
+    // the Bun-only sentence while Bun is already up.
+    if (!backendOk(s)) return 'The local model is still loading — the Inference backend is starting up';
+    return 'Starting Bun server — tools and skills are warming up';
+  }
   if (level === 'warn') {
     if (!(s.bun_server_running ?? false)) return 'Bun server is not running — tools and skills unavailable';
     if (s.bridge_enabled !== false && s.bridge_active === false) {

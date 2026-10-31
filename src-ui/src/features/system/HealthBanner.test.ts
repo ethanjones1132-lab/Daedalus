@@ -60,9 +60,11 @@ describe('HealthBanner partial native payload', () => {
   it('tolerates a missing bun_server_running section (partial jarvis_check_status)', () => {
     // Partial answer from native surface: active_backend present, rest undefined
     const partial = { active_backend: 'ollama' } as JarvisStatus;
-    const res = deriveHealthPresentation(partial, null, 0);
+    // Nothing is confirmed yet, so the first observation is Starting, not Offline.
+    expect(deriveHealthPresentation(partial, null, 0).level).toBe('starting');
+    const res = deriveHealthPresentation(partial, null, STARTUP_GRACE_MS + 1);
     expect(res.level).toBe('down');
-    // Partial payload: backend identified, no crash; guard delivers degraded summary
+    // Partial payload: backend identified, no crash; the verdict names it
     expect(res.summary).toContain('ollama');
   });
 });
@@ -87,15 +89,28 @@ describe('HealthBanner llama_cpp backend', () => {
     });
   });
 
-  it('reads Offline, naming the backend, when the llama.cpp server is not running', () => {
+  it('reads Starting, not Offline, while a stopped llama.cpp server may still be loading', () => {
     expect(deriveHealthPresentation({ ...llamaCpp, llama_cpp_running: false }, null, 0)).toMatchObject({
+      level: 'starting',
+      label: 'Starting',
+      summary: 'The local model is still loading — the Inference backend is starting up',
+    });
+  });
+
+  it('reads Offline, naming the backend, when the llama.cpp server is still stopped after the grace', () => {
+    expect(deriveHealthPresentation(
+      { ...llamaCpp, llama_cpp_running: false },
+      null,
+      STARTUP_GRACE_MS + 1,
+    )).toMatchObject({
       level: 'down', label: 'Offline', summary: 'Backend "llama_cpp" is unreachable',
     });
   });
 
   it('never reads a missing llama_cpp_running flag as running', () => {
     const { llama_cpp_running: _omit, ...withoutFlag } = llamaCpp;
-    expect(deriveHealthPresentation(withoutFlag as JarvisStatus, null, 0).level).toBe('down');
+    expect(deriveHealthPresentation(withoutFlag as JarvisStatus, null, 0).level).toBe('starting');
+    expect(deriveHealthPresentation(withoutFlag as JarvisStatus, null, STARTUP_GRACE_MS + 1).level).toBe('down');
   });
 
   it('still honours the Bun grace window under llama_cpp', () => {

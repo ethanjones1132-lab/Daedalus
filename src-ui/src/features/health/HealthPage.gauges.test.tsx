@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import HealthPage from './HealthPage';
 import { resetSharedBuildProvenanceStores } from '../../domain/build-provenance';
+import { STARTUP_GRACE_MS } from '../system/health-derivation';
 import { cleanBuild, doctor, healthFor, status, stubUnreachableBun } from './test-fixtures';
 import type { JarvisStatus } from '../../domain/types';
 
@@ -27,6 +28,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -36,8 +38,21 @@ describe('Health page verdict and gauges', () => {
   it('reads the same verdict the global banner reads, in words', async () => {
     serve({ ...status, openrouter_key_set: false, active_backend: 'openrouter' }, healthFor('ollama', true));
     render(<HealthPage />);
-    expect(await screen.findByText('Backend "openrouter" is unreachable')).toBeInTheDocument();
+    // First paint is inside the startup grace: a backend that has not answered
+    // yet is Starting, exactly as the global banner reads it.
+    expect(await screen.findByText('Starting')).toBeInTheDocument();
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+    expect(
+      screen.getByText('The local model is still loading — the Inference backend is starting up'),
+    ).toBeInTheDocument();
+
+    // Past the window the same snapshot is a real outage, naming the backend.
+    const observedAt = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(observedAt + STARTUP_GRACE_MS + 1);
+    fireEvent.click(screen.getByRole('tab', { name: 'Diagnostics' }));
     expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(screen.getByText('Backend "openrouter" is unreachable')).toBeInTheDocument();
+    clock.mockRestore();
   });
 
   it('says the system is ready when the active backend is healthy', async () => {
@@ -77,15 +92,31 @@ describe('Health page verdict and gauges', () => {
     expect(within(ollama).getByText('Not required by the active Inference backend')).toBeInTheDocument();
   });
 
-  it('reads Offline when the llama.cpp server is stopped', async () => {
+  it('reads Starting at first paint, then Offline when the llama.cpp server is still stopped after the grace', async () => {
     const llama: JarvisStatus = { ...status, active_backend: 'llama_cpp', llama_cpp_running: false };
     serve(llama, {
       ...healthFor('ollama', true),
       llama_cpp: { running: false, model: 'gemma', url: 'http://127.0.0.1:8080' },
     });
     render(<HealthPage />);
-    expect(await screen.findByText('Backend "llama_cpp" is unreachable')).toBeInTheDocument();
+    // The page mounts and reads immediately, so a stopped llama.cpp server is
+    // still inside the grace window on first paint.
+    expect(await screen.findByText('Starting')).toBeInTheDocument();
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument();
+    expect(
+      screen.getByText('The local model is still loading — the Inference backend is starting up'),
+    ).toBeInTheDocument();
     expect(within(gauge('llama.cpp')).getByText('Stopped')).toBeInTheDocument();
+
+    // Drive the page's own Date.now() clock past the grace: the same snapshot
+    // is now a real outage and names the backend.
+    const observedAt = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(observedAt + STARTUP_GRACE_MS + 1);
+    fireEvent.click(screen.getByRole('tab', { name: 'Diagnostics' }));
+    expect(screen.getByText('Backend "llama_cpp" is unreachable')).toBeInTheDocument();
+    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(within(gauge('llama.cpp')).getByText('Stopped')).toBeInTheDocument();
+    clock.mockRestore();
   });
 
   it('prints the requirement for every gauge and flags a paused supervisor on a stopped service', async () => {
