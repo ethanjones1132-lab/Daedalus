@@ -87,6 +87,7 @@ import {
   configuredCliForcesResume,
 } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
+import { applyCachedCompaction, getMessagesHash, type CompactionCacheEntry } from "./compaction-cache";
 import {
   listOpenRouterModels,
   checkOpenRouterHealth,
@@ -837,16 +838,7 @@ const runtimePerformanceLogTimer = shouldLogRuntimePerformance(process.env.JARVI
   : undefined;
 (runtimePerformanceLogTimer as any)?.unref?.();
 
-interface CompactionCacheEntry {
-  originalLength: number;
-  prefixHash: string;
-  summary: any;
-}
 const compactionCache = new Map<string, CompactionCacheEntry>();
-
-function getMessagesHash(messages: Array<any>): string {
-  return messages.map(m => `${m.role}:${m.content || ""}`).join("|");
-}
 
 function normalizeMessagesForLLM(msgs: Array<any>): Array<any> {
   if (!msgs || msgs.length === 0) return [];
@@ -5137,6 +5129,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // ── Ollama / OpenRouter path ─────────────────────────────────
       const originalHistory = [...turnHistory];
       let activeHistory = [...turnHistory];
+      // DD-042 / DD-T2: this turn's ask and tool results are appended only to
+      // activeHistory (never originalHistory), so the cached pre-turn rebuild
+      // must run no later than the first loop iteration of the turn.
+      let inTurnHistoryAppended = false;
       let currentPrompt = message;
       const mainModelName = isOllama ? ollamaTarget!.modelName : resolvedOpenRouterModel ?? cfg.openrouter.model;
       const openRouterEffective = !isOllama
@@ -5184,15 +5180,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const compactCtx = cfg.llama_cpp.context_window ?? compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384;
           // First, check if we can apply cached compaction on originalHistory
           const cached = compactionCache.get(sessionId);
-          if (cached && originalHistory.length >= cached.originalLength) {
-            const prefix = originalHistory.slice(0, cached.originalLength);
-            if (getMessagesHash(prefix) === cached.prefixHash) {
-              activeHistory = [
-                cached.summary,
-                ...originalHistory.slice(cached.originalLength),
-              ];
-              console.log(`[Jarvis] Applied cached compaction for session ${sessionId}, history reduced to ${activeHistory.length} messages`);
-            }
+          const cachedApply = applyCachedCompaction({
+            activeHistory,
+            originalHistory,
+            cached,
+            inTurnHistoryAppended,
+          });
+          if (cachedApply.applied) {
+            activeHistory = cachedApply.history;
+            console.log(`[Jarvis] Applied cached compaction for session ${sessionId}, history reduced to ${activeHistory.length} messages`);
           }
 
           const totalChars = activeHistory.reduce((sum, m) => sum + (m.content?.length ?? 0), 0);
@@ -5772,6 +5768,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         if (shouldForceWebSearch) {
           fullText = fullTextBeforeTurn;
+          inTurnHistoryAppended = true;
           if (currentPrompt) {
             activeHistory.push({ role: "user", content: currentPrompt });
             currentPrompt = "";
@@ -5812,6 +5809,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         if (shouldForceLocalInspection) {
           fullText = fullTextBeforeTurn;
+          inTurnHistoryAppended = true;
           if (currentPrompt) {
             activeHistory.push({ role: "user", content: currentPrompt });
             currentPrompt = "";
@@ -5850,6 +5848,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
 
         if (runnableTextCalls.length > 0) {
+          inTurnHistoryAppended = true;
           if (currentPrompt) {
             activeHistory.push({ role: "user", content: currentPrompt });
           }
@@ -5946,6 +5945,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           loopDone = true;
         } else {
           // Model called tools!
+          inTurnHistoryAppended = true;
           // 1. Add user prompt to history if it was passed as a separate string
           if (currentPrompt) {
             activeHistory.push({ role: "user", content: currentPrompt });
