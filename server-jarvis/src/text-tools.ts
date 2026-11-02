@@ -1,6 +1,7 @@
 import type { ToolCall, ToolDefinition, ToolResult } from "./tool-types";
 import type { JarvisConfig } from "./config";
 import { observeModelToolFormatFromTurn } from "./model-tool-format";
+import { prepareToolResultForContext } from "./tool-result-truncation";
 
 interface ParsedTextToolCall {
   id: string;
@@ -632,6 +633,15 @@ export async function executeTextToolCall(
   return executeTool(call, cfg);
 }
 
+/**
+ * Context budget for one tool result echoed back to the model on the text
+ * protocol. Mirrors the native loop's `MAX_TOOL_RESULT_CHARS` (2000) in
+ * index.ts so a successful read cannot blow the context window just because
+ * the inference backend fell back to `<tool_call>` text (or to the
+ * "retry without tools" recovery path) instead of native tool calls.
+ */
+export const TEXT_TOOL_RESULT_CONTEXT_CHARS = 2000;
+
 export function textToolResultsPrompt(results: ToolResult[]): string {
   return [
     "Tool results are available below. Use them to answer the original user request.",
@@ -640,6 +650,10 @@ export function textToolResultsPrompt(results: ToolResult[]): string {
     ...results.map((result) => {
       const status = result.is_error ? "error" : "success";
       const body = result.is_error ? (result.error || result.output) : result.output;
+      // Bound the body exactly like the native tool-result path before it
+      // enters inference context. The marker keeps the removal honest while
+      // the full output stays available on the `tool_result` SSE frame.
+      const boundedBody = prepareToolResultForContext(body, TEXT_TOOL_RESULT_CONTEXT_CHARS).context;
       // Wrap in the bounded <jarvis_internal_tool_result> tags so both the
       // streaming sanitizer (SUPPRESSED_STREAM_TAGS) and the post-turn
       // stripper (stripBoundedInternalToolResults) recognize and remove
@@ -649,7 +663,7 @@ export function textToolResultsPrompt(results: ToolResult[]): string {
       // `[Tool Call Result (...)]` stripper does NOT match — same gap
       // the 2026-07-05 fix closed for the orchestrator path, mirrored
       // here for the text-tool / agent-loop path.
-      return `<jarvis_internal_tool_result name="${result.name}" call_id="${result.call_id ?? ""}" status="${status}">\nTool result (${status}) for ${result.name} [${result.call_id}]:\n${body}\n</jarvis_internal_tool_result>`;
+      return `<jarvis_internal_tool_result name="${result.name}" call_id="${result.call_id ?? ""}" status="${status}">\nTool result (${status}) for ${result.name} [${result.call_id}]:\n${boundedBody}\n</jarvis_internal_tool_result>`;
     }),
   ].join("\n\n");
 }

@@ -210,6 +210,64 @@ Here is the actual answer.`;
     expect(prompt).toContain("exit 1");
   });
 
+  // ── DD-046 (DD-T2): the text protocol must bound tool results the same
+  // way the native tool-call loop does (2000 chars). Before this, a
+  // successful large read was echoed back to the model in full on both the
+  // text fallback and the "retry without tools" recovery path, blowing the
+  // context window on the very next turn.
+  test("textToolResultsPrompt caps a result longer than 2000 chars (DD-046)", () => {
+    const output = `HEAD_MARKER-${"x".repeat(3000)}-MIDDLE_SENTINEL-${"y".repeat(3000)}-TAIL_MARKER`;
+    const result: ToolResult = {
+      call_id: "call_long",
+      name: "read_file",
+      output,
+      is_error: false,
+      duration_ms: 30,
+    };
+    const prompt = textToolResultsPrompt([result]);
+
+    // The wrapper is preserved so the streaming sanitizer and the post-turn
+    // stripper still recognize the transcript as private evidence.
+    expect(prompt).toContain('<jarvis_internal_tool_result name="read_file"');
+    expect(prompt).toContain('call_id="call_long"');
+    expect(prompt).toContain('status="success"');
+    expect(prompt).toContain("</jarvis_internal_tool_result>");
+    expect(prompt).toContain("Tool result (success) for read_file [call_long]");
+
+    // The body handed to the model is bounded and says so.
+    expect(prompt).toContain("[...truncated -");
+    expect(prompt).not.toContain("MIDDLE_SENTINEL");
+    expect(prompt).not.toContain(output);
+
+    // Head and tail slices survive so the model still sees the edges.
+    expect(prompt).toContain("HEAD_MARKER-");
+    expect(prompt).toContain("-TAIL_MARKER");
+
+    // The bounded body (between the transcript header line and the closing
+    // tag) never exceeds the 2000-character native budget.
+    const header = "Tool result (success) for read_file [call_long]:\n";
+    const bodyStart = prompt.indexOf(header) + header.length;
+    const bodyEnd = prompt.indexOf("\n</jarvis_internal_tool_result>");
+    expect(bodyStart).toBeGreaterThan(0);
+    expect(bodyEnd).toBeGreaterThan(bodyStart);
+    expect(bodyEnd - bodyStart).toBeLessThanOrEqual(2000);
+  });
+
+  test("textToolResultsPrompt leaves a result of exactly 2000 chars unchanged (DD-046 boundary)", () => {
+    const output = "z".repeat(2000);
+    const result: ToolResult = {
+      call_id: "call_edge",
+      name: "read_file",
+      output,
+      is_error: false,
+      duration_ms: 2,
+    };
+    const prompt = textToolResultsPrompt([result]);
+
+    expect(prompt).toContain("z".repeat(2000));
+    expect(prompt).not.toContain("[...truncated -");
+  });
+
   test("post-turn stripper removes an echoed textToolResultsPrompt transcript (text-tool gap, regression)", () => {
     // Simulate a model that quotes the tool-result user message back as part
     // of its response. Before the 2026-07-05 follow-up, the inner
