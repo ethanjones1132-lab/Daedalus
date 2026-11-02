@@ -225,6 +225,85 @@ function Get-JarvisMainBinaryName {
     throw 'cargo_binary_name_unreadable'
 }
 
+function Stage-JarvisBundledBun {
+    <#
+    .SYNOPSIS
+        Stage the build machine's bun.exe where the release bundle expects it.
+
+    .DESCRIPTION
+        The packaged app starts its server with a bun.exe sitting beside the
+        exe (find_bun_executable checks that directory first), so the
+        installer has to carry one.
+
+        It cannot be committed: a binary in the tree is not something this
+        release record can attest, and its presence must never be a
+        precondition for a plain `cargo check`. tauri-build resolves and
+        copies every bundle.resources entry on every build, release or not,
+        so a committed `target/...` source would make a fresh checkout fail
+        before it ever produces a release. The release build stages the build
+        machine's Bun here instead and merges the resource in for its own
+        `cargo tauri build` only (Get-JarvisBundledBunConfigMerge).
+
+    .PARAMETER SourcePath
+        Usually `%USERPROFILE%\.bun\bin\bun.exe`. A missing source fails the
+        release build with bundled_bun_source_missing rather than shipping an
+        installer whose runtime is missing.
+
+    .PARAMETER DestinationPath
+        Where the release tree expects it: `src-tauri\target\release\bun.exe`.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourcePath,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        throw "bundled_bun_source_missing:$SourcePath. The Windows installer must ship bun.exe beside the app binary, and this build machine has no Bun there. Install Bun for the build user (%USERPROFILE%\.bun\bin\bun.exe) or build the release on a machine that has it."
+    }
+    $destinationDir = Split-Path -Parent $DestinationPath
+    if ($destinationDir -and -not (Test-Path -LiteralPath $destinationDir)) {
+        New-Item -ItemType Directory -Force -Path $destinationDir | Out-Null
+    }
+    Copy-Item -LiteralPath $SourcePath -Destination $DestinationPath -Force
+    return $DestinationPath
+}
+
+function Get-JarvisBundledBunConfigMerge {
+    <#
+    .SYNOPSIS
+        The release-only Tauri config merge that puts bun.exe in the installer.
+
+    .DESCRIPTION
+        Returns the object the release build serialises and hands to
+        `cargo tauri build --config`. Merging it adds one bundle.resources
+        entry -- the staged `target/release/bun.exe`, installed beside the
+        exe as `bun.exe` -- to the config the CLI passes to the bundler and
+        re-exports to tauri-build as TAURI_CONFIG.
+
+        This deliberately lives outside src-tauri/tauri.conf.json. The
+        committed config must stay free of sources that only a release step
+        creates, or every ordinary cargo build has to have run the release
+        build first.
+    #>
+    [CmdletBinding()]
+    param(
+        # Relative to the Tauri config directory (src-tauri), the same base
+        # the committed bundle.resources entries use.
+        [string]$ResourceSource = 'target/release/bun.exe',
+        # Beside home-base.exe, where find_bun_executable looks first.
+        [string]$ResourceTarget = 'bun.exe'
+    )
+    $resources = [ordered]@{}
+    $resources[$ResourceSource] = $ResourceTarget
+    return [ordered]@{
+        bundle = [ordered]@{
+            resources = $resources
+        }
+    }
+}
+
 function Get-JarvisReleaseVersion {
     <#
     .SYNOPSIS
@@ -792,6 +871,10 @@ function Test-JarvisInstalledResources {
         mcp_stdio = 'mcp-stdio-server.js'
         claude_proxy = 'resources\claude_cli_proxy.py'
         go_models = 'resources\opencode_go_openai_models.json'
+        # The packaged app runs its server with the bun.exe beside the exe
+        # (find_bun_executable checks that directory first). An install
+        # without it is an install that cannot start its server.
+        bundled_bun = 'bun.exe'
     }
     foreach ($role in $resources.Keys) {
         $entry = @($Manifest.files | Where-Object { $_.role -eq $role })

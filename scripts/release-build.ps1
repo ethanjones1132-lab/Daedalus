@@ -10,11 +10,11 @@
         dist/release/<version>/SHA256SUMS.txt
 
     The record covers the installer, the app binary, the server bundle, the
-    MCP stdio sidecar, the Claude proxy and the OpenCode Go model list, so
-    "what is in this release" is one file rather than three manifests that
-    have to be cross-referenced.
+    MCP stdio sidecar, the Claude proxy, the OpenCode Go model list and the
+    bundled Bun runtime, so "what is in this release" is one file rather than
+    three manifests that have to be cross-referenced.
 
-    Three things this script refuses to do, each of which has bitten this
+    Four things this script refuses to do, each of which has bitten this
     repo before:
 
       * build with a version the surfaces disagree on. The frontend, the
@@ -31,6 +31,12 @@
       * build from a dirty tree silently. A dirty build is recorded as
         dirty in the manifest rather than refused, because a local dev
         build is a legitimate thing to want; but the record says so.
+
+      * build without the bundled Bun. The installer has to carry a
+        bun.exe beside the app binary or the installed app cannot start
+        its server, so a build machine with no Bun fails here with
+        bundled_bun_source_missing instead of shipping a runtime-less
+        install.
 
 .PARAMETER RepoRoot
     Repository root. Defaults to the parent of this script's directory.
@@ -130,10 +136,46 @@ $env:JARVIS_BUILD_SOURCE_TREE_SHA256 = $identity.source_tree_sha256
 
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
 if (-not $cargo) { Die 'cargo not found on PATH' }
+
+# ── Bundled Bun ──────────────────────────────────────────────────────────────
+# The installed app starts its server with a bun.exe beside the exe
+# (find_bun_executable checks that directory first), so the installer must
+# carry one. src-tauri/tauri.conf.json cannot name it: tauri-build resolves
+# and copies every bundle.resources entry on every cargo build, release or
+# not, so a committed `target/...` source turns a plain `cargo check` on a
+# fresh checkout into a missing-resource error. The release build stages the
+# build machine's Bun and merges the entry in for its own `cargo tauri build`.
+Write-Step 'Staging the bundled Bun runtime'
+$bundledBunTarget = Join-Path $RepoRoot 'src-tauri\target\release\bun.exe'
+try {
+    Stage-JarvisBundledBun `
+        -SourcePath (Join-Path $env:USERPROFILE '.bun\bin\bun.exe') `
+        -DestinationPath $bundledBunTarget
+} catch {
+    Die $_.Exception.Message
+}
+Write-Ok "bundled bun -> $bundledBunTarget"
+
+# The merge file lives under target/ as well, so nothing release-only is ever
+# written into the committed config. `--config` is merged by the Tauri CLI
+# into the configuration the bundler uses, and the CLI re-exports that same
+# merge as TAURI_CONFIG for tauri-build to copy. Setting TAURI_CONFIG by hand
+# would only reach tauri-build: the CLI does not merge an externally set
+# TAURI_CONFIG into its own config, so the installer would still not carry
+# bun.exe.
+$bundledBunConfigPath = Join-Path $RepoRoot 'src-tauri\target\release\jarvis-bundled-bun.json'
+$bundledBunMergeJson = Get-JarvisBundledBunConfigMerge | ConvertTo-Json -Depth 5
+[IO.File]::WriteAllText(
+    $bundledBunConfigPath,
+    $bundledBunMergeJson,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+Write-Ok "release config merge -> $bundledBunConfigPath"
+
 Push-Location (Join-Path $RepoRoot 'src-tauri')
 try {
     # The beforeBuildCommand builds the frontend from the same identity.
-    & $cargo.Source tauri build
+    & $cargo.Source tauri build --config $bundledBunConfigPath
     if ($LASTEXITCODE -ne 0) { Die "cargo tauri build failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
@@ -181,6 +223,9 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot 'server-jarvis\dist\mcp-stdio-server
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\claude_cli_proxy.py') -Destination (Join-Path $versionDir 'resources\claude_cli_proxy.py') -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'scripts\opencode_go_openai_models.json') -Destination (Join-Path $versionDir 'resources\opencode_go_openai_models.json') -Force
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'server-jarvis\src\prompts') -Destination (Join-Path $versionDir 'prompts') -Recurse -Force
+# The bundled runtime is hashed beside the installer so the record says which
+# Bun this release ships, not just that one was staged somewhere.
+Copy-Item -LiteralPath $bundledBunTarget -Destination (Join-Path $versionDir 'bun.exe') -Force
 Write-Ok "staged -> $versionDir"
 
 # ── The binary as it actually ships ──────────────────────────────────────────
@@ -269,6 +314,7 @@ $artifacts = @(
     @{ role = 'mcp_stdio';     path = (Join-Path $versionDir 'mcp-stdio-server.js') }
     @{ role = 'claude_proxy';  path = (Join-Path $versionDir 'resources\claude_cli_proxy.py') }
     @{ role = 'go_models';     path = (Join-Path $versionDir 'resources\opencode_go_openai_models.json') }
+    @{ role = 'bundled_bun';   path = (Join-Path $versionDir 'bun.exe') }
 )
 foreach ($artifact in $artifacts) {
     if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) {

@@ -340,6 +340,7 @@ Describe 'installer source provenance' {
             mcp_stdio = 'mcp-stdio-server.js'
             claude_proxy = 'resources\claude_cli_proxy.py'
             go_models = 'resources\opencode_go_openai_models.json'
+            bundled_bun = 'bun.exe'
         }
         $files = foreach ($role in $script:resourceNames.Keys) {
             $path = Join-Path $script:installRoot $script:resourceNames[$role]
