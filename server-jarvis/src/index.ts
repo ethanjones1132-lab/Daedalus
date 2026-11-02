@@ -210,6 +210,7 @@ import { defineAgent } from "./orchestration/define-agent";
 import { prepareToolResultForContext } from "./tool-result-truncation";
 import { detectDegenerateTail } from "./stream-degeneration";
 import { extractDeltaText } from "./sse-delta";
+import { buildCliToolResultFrame } from "./cli-tool-result-frame";
 import { SessionRepetitionStore, assessRepetition, shouldShortCircuitRepeat } from "./orchestration/repetition-guard";
 import { Coordinator } from "./orchestration/coordinator";
 import { PersistentConductor } from "./orchestration/persistent-conductor";
@@ -2335,13 +2336,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               session_id: sessionId,
             })}\n\n`));
           } else if (evt.type === "tool_result") {
-            await writer.write(encoder.encode(`data: ${JSON.stringify({
-              type: "tool_result",
-              id: evt.tool_use_id,
+            // The UI matches a result to its tool card by `call_id`; name the
+            // same call the CLI opened (both id and call_id are the tool use id).
+            const toolResultFrame = buildCliToolResultFrame({
+              toolUseId: evt.tool_use_id,
               output: evt.tool_output,
-              is_error: evt.is_error,
-              session_id: sessionId,
-            })}\n\n`));
+              isError: evt.is_error,
+              sessionId,
+            });
+            await writer.write(encoder.encode(`data: ${JSON.stringify(toolResultFrame)}\n\n`));
           } else if (evt.type === "message_stop") {
             // Transport terminator only. An assistant `message_stop` is NOT
             // the authoritative whole-turn result and must never latch the
