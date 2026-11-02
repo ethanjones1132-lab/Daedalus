@@ -315,6 +315,7 @@ import {
 } from "./orchestration/task-run";
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
 import { finishSinglePassCompletion } from "./single-pass-completion";
+import { classifySinglePassToolArgs } from "./single-pass-tool-args";
 import { createTurnTiming } from "./orchestration/turn-timing";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
@@ -5978,12 +5979,47 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           // 3. Execute each tool call and stream events + append results to history
           for (const tc of formattedToolCalls) {
-            let parsedArgs = {};
-            try {
-              parsedArgs = JSON.parse(tc.function.arguments || "{}");
-            } catch {
-              console.warn(`[Jarvis] Failed to parse tool arguments: ${tc.function.arguments}`);
+            // DD-047: classify the streamed arguments once. Unparseable
+            // arguments are a rejected call — nothing executes, nothing is
+            // counted as tool work, and no verified-search flag is set. The
+            // history and stream record the error instead of a normal result.
+            const toolArgs = classifySinglePassToolArgs(tc.function.arguments);
+            if (!toolArgs.ok) {
+              console.warn(`[Jarvis] Rejected tool ${tc.function.name}: ${toolArgs.error} raw=${toolArgs.raw}`);
+
+              // Show the attempt so the client can surface the rejection,
+              // but never run the empty/invalid call.
+              await writer.write(encoder.encode(`data: ${JSON.stringify({
+                type: "tool_use",
+                id: tc.id,
+                name: tc.function.name,
+                input: {},
+                is_error: true,
+                error: toolArgs.error,
+                session_id: sessionId
+              })}\n\n`));
+
+              await writer.write(encoder.encode(`data: ${JSON.stringify({
+                type: "tool_result",
+                call_id: tc.id,
+                name: tc.function.name,
+                output: toolArgs.error,
+                is_error: true,
+                session_id: sessionId
+              })}\n\n`));
+
+              // The assistant message above still names this tool_call, so the
+              // provider needs a matching tool response. It carries the error,
+              // never a successful execution.
+              activeHistory.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: toolArgs.error
+              });
+              continue;
             }
+
+            const parsedArgs = toolArgs.args;
 
             // Stream tool call event to client
             await writer.write(encoder.encode(`data: ${JSON.stringify({
