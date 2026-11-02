@@ -316,6 +316,7 @@ import {
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
 import { finishSinglePassCompletion } from "./single-pass-completion";
 import { classifySinglePassToolArgs } from "./single-pass-tool-args";
+import { nextVerifiedWebSearchState } from "./verified-web-search";
 import { createTurnTiming } from "./orchestration/turn-timing";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
@@ -5804,8 +5805,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             session_id: sessionId
           })}\n\n`));
 
+          // DD-048: the forced attempt stays bounded by forcedWebSearchDone —
+          // it is consumed whether the search succeeds or fails, so a failed
+          // forced search cannot loop. Only a successful result is recorded as
+          // verified evidence.
           forcedWebSearchDone = true;
-          verifiedWebSearchDone = true;
+          if (nextVerifiedWebSearchState(verifiedWebSearchDone, call.name, toolResult)) {
+            verifiedWebSearchDone = true;
+          }
           toolExecutionCount++;
           currentPrompt = textToolResultsPrompt([toolResult]);
           useTextToolProtocol = true;
@@ -5879,7 +5886,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const toolOutput = toolResult.is_error ? (toolResult.error || toolResult.output) : toolResult.output;
             toolResults.push(toolResult);
             toolExecutionCount++;
-            if (call.name === "web_search") verifiedWebSearchDone = true;
+            // DD-048: a text-fallback web_search only counts as verified when
+            // the runtime result succeeded; prior success stays sticky.
+            if (nextVerifiedWebSearchState(verifiedWebSearchDone, call.name, toolResult)) {
+              verifiedWebSearchDone = true;
+            }
 
             await writer.write(encoder.encode(`data: ${JSON.stringify({
               type: "tool_result",
@@ -6039,7 +6050,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const toolOutput = toolResult.is_error ? (toolResult.error || toolResult.output) : toolResult.output;
             const preparedToolResult = prepareToolResultForContext(toolOutput, MAX_TOOL_RESULT_CHARS);
             toolExecutionCount++;
-            if (tc.function.name === "web_search") verifiedWebSearchDone = true;
+            // DD-048: a native web_search only counts as verified when the
+            // runtime result succeeded; prior success stays sticky.
+            if (nextVerifiedWebSearchState(verifiedWebSearchDone, tc.function.name, toolResult)) {
+              verifiedWebSearchDone = true;
+            }
 
             // Stream tool result event to client
             await writer.write(encoder.encode(`data: ${JSON.stringify({
