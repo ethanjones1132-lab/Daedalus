@@ -314,6 +314,7 @@ import {
   type TaskRunGoalLink,
 } from "./orchestration/task-run";
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
+import { finishSinglePassCompletion } from "./single-pass-completion";
 import { createTurnTiming } from "./orchestration/turn-timing";
 import { collectToolPathTargets } from "./orchestration/mid-loop-intervention";
 import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self-tuning/inference-feedback-refresh";
@@ -5931,20 +5932,27 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             continue;
           }
 
-          if (resultText.trim().length === 0) {
-            // Both the initial attempt and the retry returned empty — surface
-            // a fallback so the user sees something instead of a blank bubble.
-            resultText = toolExecutionCount > 0
-              ? "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review."
-              : "The model returned no content. This can happen due to transient model issues, provider timeouts, or empty completions on the free tier. Please try sending your message again.";
-          }
-
           if (sessionCostInfo) {
             logOpenRouterCost(sessionCostInfo);
             await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "cost_info", ...sessionCostInfo, tool_count: toolExecutionCount, session_id: sessionId })}\n\n`));
           }
-          recordMemoryTerminal("completed");
-          await session.finish(resultText);
+          // DD-045: an empty answer after the single retry must not settle as a
+          // success. Fallback text, the terminal SSE subtype/code and the
+          // memory receipt all come from one classification so they cannot
+          // disagree; previously this branch recorded `completed` even when
+          // both the attempt and the final-answer-only retry returned nothing.
+          // Tool work that already streamed stays visible in either outcome.
+          const completion = await finishSinglePassCompletion({
+            answer: resultText,
+            toolExecutionCount,
+            session,
+            recordMemoryTerminal,
+          });
+          if (completion.empty) {
+            console.warn(
+              `[Jarvis] Empty final answer after retry session=${sessionId} tools=${toolExecutionCount} terminal=${completion.subtype}/${completion.code ?? "no_code"} memory=${completion.memoryStatus}`,
+            );
+          }
           loopDone = true;
         } else {
           // Model called tools!
