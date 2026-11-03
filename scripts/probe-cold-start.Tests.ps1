@@ -16,11 +16,20 @@
 
     Run with Pester 3.4 (Should Be / Should Match):
         Invoke-Pester -Script scripts/probe-cold-start.Tests.ps1 -EnableExit
+
+    DD-052/DD-053 assertions sit on top: the probe must report the packaged
+    app's own log directory (%LOCALAPPDATA%\com.jarvis.desktop\logs) and
+    ignore log files written before the run was launched, and the owned
+    process teardown in scripts/lib/release-common.ps1 must give every CIM
+    query up at its cleanup deadline. The deadline tests stub the CIM cmdlet
+    and the bounded dispatcher, so no real CIM query is ever run.
 #>
 
 . (Join-Path $PSScriptRoot 'lib\probe-bounded-queries.ps1')
+. (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
 $probePath = Join-Path $PSScriptRoot 'probe-cold-start.ps1'
+$releaseCommonPath = Join-Path $PSScriptRoot 'lib\release-common.ps1'
 
 function New-FakeProbeProcess {
     param(
@@ -364,5 +373,119 @@ Describe 'probe wiring' {
         $probeText | Should Match "'HUNG'"
         $probeText | Should Match "'DIED'"
         $probeText | Should Match "'SERVER_UNAVAILABLE'"
+    }
+}
+
+Describe 'app log evidence comes from the packaged app (DD-052)' {
+    # src-tauri/src/lib.rs jarvis_server_log_stdio resolves the packaged
+    # app's log directory (mirrored in server-jarvis/src/self-log.ts
+    # selfLogDir) to %LOCALAPPDATA%\com.jarvis.desktop\logs on Windows.
+    # The old home-directory path belongs to the source-tree server, never
+    # to this install, so any trace of it in the app_log wiring is a defect.
+    It 'points app_log at the LOCALAPPDATA directory jarvis_server_log_stdio writes' {
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match 'LOCALAPPDATA'
+        $probeText | Should Match "'com\.jarvis\.desktop\\logs'"
+    }
+
+    It 'does not read the openclaw home log directory for app_log' {
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        ($probeText -match '\.openclaw\\jarvis\\logs') | Should Be $false
+    }
+
+    It 'ignores log files written before this run was launched' {
+        # A newest-file pick without the launch-time guard reports an older
+        # run's log as this run's boot evidence. Reverting the filter fails
+        # this assertion because the filter expression is the thing matched.
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match '\$launchedAt'
+        $probeText | Should Match 'LastWriteTime -ge \$launchedAt'
+    }
+}
+
+Describe 'owned process cleanup deadline (DD-053)' {
+    # These tests stub every seam they touch (Get-CimInstance,
+    # Invoke-JarvisCleanupBoundedQuery, Stop-Process, Write-Warning), so
+    # nothing here executes a real CIM query or stops a real process.
+    It 'runs no CIM query at all once the cleanup deadline has expired' {
+        Mock Get-CimInstance { throw 'cim_query_must_not_run_once_deadline_expired' }
+        Mock Stop-Process { }
+        Stop-JarvisOwnedProcesses -Process (New-FakeProbeProcess -Id 4400) `
+            -CleanupDeadline ((Get-Date).AddSeconds(-1))
+
+        Assert-MockCalled Get-CimInstance -Scope It -Times 0 -Exactly
+        # Giving up is not failure: the root process is still stopped when
+        # that is possible without further queries.
+        Assert-MockCalled Stop-Process -Scope It -Times 1 -Exactly -ParameterFilter { $Id -eq 4400 }
+    }
+
+    It 'warns, enumerates no descendants, and still stops the root when the table query stalls past the deadline' {
+        # In the deadline path the first cleanup query is the owned-process
+        # table. Stubbed here as one that outlived the deadline, it must
+        # collapse into a warning - never a throw that would fall out of a
+        # caller's finally and drop an already-written verdict - and the
+        # root process must still be stopped.
+        $script:cleanupWarningCount = 0
+        Mock Invoke-JarvisCleanupBoundedQuery {
+            [pscustomobject]@{
+                name = 'owned_process_table'; status = 'timed_out'; value = $null
+                error = $null; detail = 'query_outlived_cleanup_deadline'
+            }
+        }
+        Mock Write-Warning { $script:cleanupWarningCount = $script:cleanupWarningCount + 1 }
+        Mock Get-CimInstance { throw 'cim_query_must_not_run_in_test' }
+        Mock Stop-Process { }
+        Stop-JarvisOwnedProcesses -Process (New-FakeProbeProcess -Id 4400) `
+            -CleanupDeadline ((Get-Date).AddSeconds(5))
+
+        ($script:cleanupWarningCount) | Should Be 1
+        Assert-MockCalled Get-CimInstance -Scope It -Times 0 -Exactly
+        Assert-MockCalled Stop-Process -Scope It -Times 1 -Exactly -ParameterFilter { $Id -eq 4400 }
+    }
+
+    It 'gives up an owned child whose identity check stalled and still stops the root' {
+        # Call order in the deadline path: (1) owned-process table, (2) one
+        # identity re-check per owned child, descending. The table yields an
+        # owned child of the fake root; its identity check stalls past the
+        # deadline. Failing closed on identity, a stalled re-check never
+        # terminates a PID that may have been reused - but the root dies.
+        $script:cleanupQueryCalls = 0
+        $script:cleanupWarningCount = 0
+        Mock Invoke-JarvisCleanupBoundedQuery {
+            $script:cleanupQueryCalls = $script:cleanupQueryCalls + 1
+            if ($script:cleanupQueryCalls -eq 1) {
+                return [pscustomobject]@{
+                    status = 'result'; error = $null
+                    value = @(
+                        [pscustomobject]@{
+                            ProcessId = 5001; ParentProcessId = 4400
+                            CreationDate = [datetime]'2026-10-21T10:00:01'
+                        }
+                    )
+                }
+            }
+            return [pscustomobject]@{ status = 'timed_out'; value = $null; error = $null }
+        }
+        Mock Write-Warning { $script:cleanupWarningCount = $script:cleanupWarningCount + 1 }
+        Mock Stop-Process { }
+        Stop-JarvisOwnedProcesses -Process (New-FakeProbeProcess -Id 4400) `
+            -CleanupDeadline ((Get-Date).AddSeconds(5))
+
+        ($script:cleanupQueryCalls) | Should Be 2
+        Assert-MockCalled Stop-Process -Scope It -Times 0 -Exactly -ParameterFilter { $Id -eq 5001 }
+        Assert-MockCalled Stop-Process -Scope It -Times 1 -Exactly -ParameterFilter { $Id -eq 4400 }
+        ($script:cleanupWarningCount) | Should Be 1
+    }
+
+    It 'bounds the cleanup CIM queries with a deadline passed from the probe teardown' {
+        # Both halves must survive: release-common must own the bounded
+        # deadline machinery, and the probe must actually hand it a deadline
+        # in its finally block. Reverting either side fails here.
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match '-CleanupDeadline'
+        $probeText | Should Match '\$CleanupTimeoutSeconds'
+        $commonText = Get-Content -Raw -LiteralPath $releaseCommonPath
+        $commonText | Should Match 'Invoke-JarvisCleanupBoundedQuery'
+        $commonText | Should Match 'CleanupDeadline'
     }
 }

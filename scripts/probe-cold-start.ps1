@@ -42,6 +42,12 @@
 .PARAMETER KeepInstall
     Leave the scratch install in place afterwards (for inspection).
 
+.PARAMETER CleanupTimeoutSeconds
+    DD-053: hard bound on the finally-block process cleanup. Once the
+    verdict has been written a stalled CIM query must not be able to hold
+    the probe open; past this budget Stop-JarvisOwnedProcesses gives each
+    OS query up with a warning, still stopping the root process when it can.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\probe-cold-start.ps1 `
         -InstallerPath dist\release\1.0.0\Jarvis_1.0.0_x64-setup.exe
@@ -54,6 +60,8 @@ param(
     [string]$InstallRoot = (Join-Path $env:TEMP ('jarvis-cold-start-' + [guid]::NewGuid().ToString('N'))),
 
     [int]$TimeoutSeconds = 120,
+
+    [int]$CleanupTimeoutSeconds = 20,
 
     [switch]$KeepInstall
 )
@@ -133,7 +141,11 @@ if (-not (Test-Path -LiteralPath $appPath -PathType Leaf)) {
 }
 Write-Ok "installed -> $appPath"
 
-$logDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
+# DD-052: this is the log directory the packaged app itself writes - the
+# directory src-tauri/src/lib.rs jarvis_server_log_stdio resolves (mirrored
+# in server-jarvis/src/self-log.ts selfLogDir). Reading anything else
+# reports a foreign build's log as this install's evidence.
+$logDir = Join-Path $env:LOCALAPPDATA 'com.jarvis.desktop\logs'
 $stdout = Join-Path $env:TEMP 'jarvis-cold-start.out.log'
 $stderr = Join-Path $env:TEMP 'jarvis-cold-start.err.log'
 
@@ -238,7 +250,11 @@ if ($childrenEvidence.status -ne 'result') {
 
 $appLog = $null
 if (Test-Path $logDir) {
+    # DD-052: a file whose last write predates this run's launch belongs to
+    # an earlier run; reporting it would attribute old evidence to this boot.
+    $launchedAt = $process.JarvisOwnedStartTime
     $newest = Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+        Where-Object { -not $launchedAt -or $_.LastWriteTime -ge $launchedAt } |
         Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($newest) {
         $appLog = [pscustomobject]@{
@@ -277,7 +293,16 @@ Write-Host "`nVERDICT: $verdict - $lastDetail" -ForegroundColor $(if ($verdict -
 exit $(if ($verdict -eq 'RESPONSIVE') { 0 } else { 1 })
 } finally {
     try {
-        if ($process) { Stop-JarvisOwnedProcesses -Process $process }
+        if ($process) {
+            # DD-053: the verdict is already written; the cleanup must not be
+            # able to stall it out of existence. A cleanup failure after that
+            # point is a warning, never a throw that would mask the verdict
+            # or skip the scratch-install removal below.
+            Stop-JarvisOwnedProcesses -Process $process `
+                -CleanupDeadline (Get-Date).AddSeconds($CleanupTimeoutSeconds)
+        }
+    } catch {
+        Write-Warn "owned process cleanup did not finish: $_"
     } finally {
         if ($installOwned -and -not $KeepInstall) {
             Remove-JarvisReleaseScratchInstall -InstallRoot $InstallRoot

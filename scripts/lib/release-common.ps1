@@ -818,9 +818,151 @@ function Read-JarvisLineWithDeadline {
     return $lineTask.GetAwaiter().GetResult()
 }
 
+function Invoke-JarvisCleanupBoundedQuery {
+    <#
+    .SYNOPSIS
+        Run one cleanup OS query in its own runspace, bounded by a deadline.
+
+    .DESCRIPTION
+        The owned-process teardown (Stop-JarvisOwnedProcesses) runs inside a
+        caller's `finally`, often after the caller has already written its
+        verdict. A Win32 CIM query that stops answering would hold that
+        teardown open forever - exactly how the 2026-10 cold-start probe's
+        observation budget was first blown.
+
+        The query therefore runs in a fresh runspace and is waited on for at
+        most the remaining time to $Deadline. When the deadline expires the
+        pipeline is asked to stop, but never joined or disposed while it may
+        still be stuck in the OS call: joining a call stuck in native code
+        would block the caller exactly as the original query did.
+
+        Same three-state contract as Invoke-JarvisProbeBoundedQuery
+        (scripts/lib/probe-bounded-queries.ps1), but self-contained:
+        release-common.ps1 is dot-sourced by scripts that never load the
+        probe helpers.
+
+    .OUTPUTS
+        [pscustomobject]@{ name; status; value; error; elapsed_ms; budget_ms; detail }
+        where status is result | timed_out | failed, and a timed-out or
+        failed result never carries a value.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][scriptblock]$Query,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [object[]]$ArgumentList = @()
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $remainingMs = ($Deadline - (Get-Date)).TotalMilliseconds
+    $budgetMs = if ($remainingMs -ge [int]::MaxValue) { [int]::MaxValue } else { [int][Math]::Floor($remainingMs) }
+    if ($budgetMs -le 0) {
+        $stopwatch.Stop()
+        # Nothing is started: a spent deadline means no answer, not a fast one.
+        return [pscustomobject]@{
+            name = $Name; status = 'timed_out'; value = $null; error = $null
+            elapsed_ms = 0; budget_ms = 0; detail = 'cleanup_deadline_already_spent'
+        }
+    }
+
+    $runspace = $null
+    $shell = $null
+    try {
+        $runspace = [runspacefactory]::CreateRunspace()
+        $runspace.Open()
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript($Query.ToString())
+        foreach ($argument in $ArgumentList) { [void]$shell.AddArgument($argument) }
+        $async = $shell.BeginInvoke()
+    } catch {
+        $message = $_.Exception.Message
+        try { if ($shell) { $shell.Dispose() } } catch { }
+        try { if ($runspace) { $runspace.Dispose() } } catch { }
+        $stopwatch.Stop()
+        return [pscustomobject]@{
+            name = $Name; status = 'failed'; value = $null; error = $message
+            elapsed_ms = ([int]$stopwatch.Elapsed.TotalMilliseconds); budget_ms = $budgetMs
+            detail = 'runspace_start_failed'
+        }
+    }
+
+    # Re-read the deadline after runspace setup: creating the runspace must
+    # not be spent outside the budget.
+    $remainingMs = ($Deadline - (Get-Date)).TotalMilliseconds
+    $waitMs = if ($remainingMs -ge [int]::MaxValue) { [int]::MaxValue } else { [int][Math]::Floor($remainingMs) }
+    if ($waitMs -le 0) {
+        try { [void]$shell.BeginStop($null, $null) } catch { }
+        $stopwatch.Stop()
+        return [pscustomobject]@{
+            name = $Name; status = 'timed_out'; value = $null; error = $null
+            elapsed_ms = ([int]$stopwatch.Elapsed.TotalMilliseconds); budget_ms = 0
+            detail = 'cleanup_deadline_spent_during_setup'
+        }
+    }
+
+    if (-not $async.AsyncWaitHandle.WaitOne($waitMs)) {
+        # The pipeline outlived the deadline. Ask it to stop, then abandon it.
+        try { [void]$shell.BeginStop($null, $null) } catch { }
+        $stopwatch.Stop()
+        return [pscustomobject]@{
+            name = $Name; status = 'timed_out'; value = $null; error = $null
+            elapsed_ms = ([int]$stopwatch.Elapsed.TotalMilliseconds); budget_ms = $waitMs
+            detail = 'query_outlived_cleanup_deadline'
+        }
+    }
+
+    $value = $null
+    $failure = ''
+    try {
+        $output = @($shell.EndInvoke($async))
+        $streamErrors = @($shell.Streams.Error | ForEach-Object { [string]$_ })
+        if ($streamErrors.Count -gt 0) {
+            $failure = ($streamErrors -join '; ')
+        } elseif ($output.Count -eq 1) {
+            $value = $output[0]
+        } elseif ($output.Count -gt 1) {
+            $value = $output
+        }
+    } catch {
+        $failure = $_.Exception.Message
+    } finally {
+        try { if ($shell) { $shell.Dispose() } } catch { }
+        try { if ($runspace) { $runspace.Dispose() } } catch { }
+    }
+    $stopwatch.Stop()
+
+    if (-not [string]::IsNullOrEmpty($failure)) {
+        return [pscustomobject]@{
+            name = $Name; status = 'failed'; value = $null; error = $failure
+            elapsed_ms = ([int]$stopwatch.Elapsed.TotalMilliseconds); budget_ms = $budgetMs
+            detail = 'query_failed'
+        }
+    }
+    return [pscustomobject]@{
+        name = $Name; status = 'result'; value = $value; error = $null
+        elapsed_ms = ([int]$stopwatch.Elapsed.TotalMilliseconds); budget_ms = $budgetMs
+        detail = $null
+    }
+}
+
 function Stop-JarvisOwnedProcesses {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)]$Process)
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+
+        # DD-053: when set, every CIM query below (the full process table and
+        # each per-child identity check) runs behind
+        # Invoke-JarvisCleanupBoundedQuery and is given up at this deadline
+        # with a warning; the root is still stopped when that is possible and
+        # nothing throws for a lost query capability, so a stalled query
+        # cannot hang a caller's finally after its verdict was written.
+        # When unset (older callers), the former synchronous behavior is kept
+        # exactly as it was.
+        [datetime]$CleanupDeadline = [datetime]::MinValue
+    )
+    $bounded = [datetime]::MinValue -ne $CleanupDeadline
     # The root start is cached immediately after spawn: StartTime can no
     # longer be queried once an already-exited process has been collected.
     $rootStart = if ($Process.PSObject.Properties['JarvisOwnedStartTime']) {
@@ -833,7 +975,18 @@ function Stop-JarvisOwnedProcesses {
     # This also handles a dead root while excluding children of a reused
     # PID. Grandchildren require an unbroken chain through this snapshot;
     # unknown orphan ancestry is deliberately preserved, never guessed.
-    $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    if ($bounded) {
+        $tableResult = Invoke-JarvisCleanupBoundedQuery -Name 'owned_process_table' `
+            -Query { Get-CimInstance Win32_Process -ErrorAction Stop } -Deadline $CleanupDeadline
+        $snapshot = if ($tableResult.status -eq 'result') { @($tableResult.value) } else { @() }
+        if ($tableResult.status -eq 'timed_out') {
+            Write-Warning "Stop-JarvisOwnedProcesses: the owned-process table was not read before the cleanup deadline ($($tableResult.detail)); owned descendants are not enumerated and are left for their own parentage to outlive."
+        } elseif ($tableResult.status -eq 'failed') {
+            Write-Warning "Stop-JarvisOwnedProcesses: the owned-process table query failed ($($tableResult.error)); owned descendants are not enumerated."
+        }
+    } else {
+        $snapshot = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    }
     $parents = [System.Collections.Generic.List[object]]::new()
     $parents.Add([pscustomobject]@{ id = $Process.Id; start = $rootStart; end = $rootEnd })
     $owned = [System.Collections.Generic.List[object]]::new()
@@ -852,8 +1005,24 @@ function Stop-JarvisOwnedProcesses {
     }
     for ($index = $owned.Count - 1; $index -ge 0; $index--) {
         $child = $owned[$index]
-        $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ProcessId -eq $child.ProcessId -and $_.CreationDate -eq $child.CreationDate }
+        if ($bounded) {
+            $identityResult = Invoke-JarvisCleanupBoundedQuery -Name 'owned_child_identity' `
+                -Query { param($ChildId) Get-CimInstance Win32_Process -Filter "ProcessId=$ChildId" -ErrorAction SilentlyContinue } `
+                -ArgumentList @([int]$child.ProcessId) -Deadline $CleanupDeadline
+            if ($identityResult.status -eq 'timed_out' -or $identityResult.status -eq 'failed') {
+                # Fail closed on identity: without a re-confirmed PID we must
+                # not terminate a process that may have been reused, but a
+                # proven child that cannot be re-checked is not silently
+                # dropped either.
+                Write-Warning "Owned child $($child.ProcessId) could not be re-identified before the cleanup deadline ($($identityResult.status)); no termination attempted."
+                continue
+            }
+            $current = @($identityResult.value) |
+                Where-Object { $_.ProcessId -eq $child.ProcessId -and $_.CreationDate -eq $child.CreationDate }
+        } else {
+            $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($child.ProcessId)" -ErrorAction SilentlyContinue |
+                Where-Object { $_.ProcessId -eq $child.ProcessId -and $_.CreationDate -eq $child.CreationDate }
+        }
         if ($current) { Stop-Process -Id $child.ProcessId -Force -ErrorAction SilentlyContinue }
         else { Write-Warning "Owned child $($child.ProcessId) exited or changed identity; no termination attempted." }
     }
