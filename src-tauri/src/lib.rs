@@ -63,6 +63,9 @@ pub(crate) fn wsl_home() -> String {
 //   • claude_cli_proxy.py (port 19878) — Anthropic /v1/messages -> claude CLI
 // Both are spawned lazily off the main thread so the window paints fast.
 
+/// The port `ollama serve` binds. Kept in sync with `supervisor.rs`.
+pub(crate) const OLLAMA_PORT: u16 = 11434;
+
 fn find_ollama_binary() -> Option<String> {
     [
         std::env::var("JARVIS_OLLAMA_BIN").ok(),
@@ -279,14 +282,18 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     } else {
         model
     };
-    if is_port_listening(11434) {
+    // DD-049: `spawn_ollama` launches the resolved binary directly, so a native
+    // Windows Ollama cannot be listening inside WSL. Only pay for the `wsl.exe`
+    // probe when the resolved command is itself a WSL-side (non-`.exe`) binary.
+    let uses_wsl = ollama_uses_wsl();
+    if backend_port_is_listening(OLLAMA_PORT, uses_wsl) {
         println!("[Jarvis] Ollama already running on port 11434");
     } else {
         let launch = process_lifecycle::launch(
             process_lifecycle::ManagedProcess::Ollama,
             true,
             || {
-                if is_port_listening(11434) {
+                if backend_port_is_listening(OLLAMA_PORT, uses_wsl) {
                     return Err(
                         "Ollama port 11434 is occupied by a process this app does not own; leaving it untouched".into(),
                     );
@@ -312,7 +319,7 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
         let mut ready = false;
         for _ in 0..30 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if is_port_listening(11434) {
+            if backend_port_is_listening(OLLAMA_PORT, uses_wsl) {
                 ready = true;
                 break;
             }
@@ -338,11 +345,16 @@ pub(crate) async fn start_llama_cpp_server(
 
     // A server that is already listening (started by this process earlier or
     // by the user by hand) is usable even when no artifact paths are set.
-    if is_port_listening(config.port) {
+    // Env fallbacks are applied first only so the launch mode can be read from
+    // the resolved command; the early return is unchanged.
+    let config = config.with_env_fallbacks();
+    // DD-049: `llama-server` is spawned directly from `server_path`. A Windows
+    // `.exe` never listens inside WSL, so do not spawn `wsl.exe` to find out.
+    let uses_wsl = command_uses_wsl(Some(config.server_path.as_str()));
+    if backend_port_is_listening(config.port, uses_wsl) {
         return Ok(process_lifecycle::StartOutcome::AlreadyListening);
     }
 
-    let config = config.with_env_fallbacks();
     if config.server_path.trim().is_empty() {
         return Err(format!(
             "llama.cpp server_path is not configured: set llama_cpp.server_path in Settings or the {LLAMA_SERVER_PATH_ENV} environment variable to the llama-server executable"
@@ -383,7 +395,7 @@ pub(crate) async fn start_llama_cpp_server(
         process_lifecycle::ManagedProcess::LlamaCpp,
         false,
         || {
-            if is_port_listening(config.port) {
+            if backend_port_is_listening(config.port, uses_wsl) {
                 return Err(format!(
                     "llama.cpp port {} became occupied by an untracked listener; leaving it untouched",
                     config.port
@@ -1527,6 +1539,11 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     }
 }
 
+/// Generic listener probe, used where the caller cannot know how the backend is
+/// launched (status/health surfaces, where a WSL-hosted backend is still a real
+/// possibility). Boot paths that own a specific backend must use
+/// `backend_port_is_listening` instead, so a native Windows backend does not
+/// pay a `wsl.exe` spawn to learn that its port is closed (DD-049).
 pub fn is_port_listening(port: u16) -> bool {
     if local_port_is_listening(port) {
         return true;
@@ -1561,6 +1578,54 @@ fn is_wsl_port_listening(port: u16) -> bool {
     crate::wsl::command_output_timeout(cmd, std::time::Duration::from_secs(2))
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// The `bun_uses_wsl` rule generalised to any local backend command: only a
+/// Windows build whose resolved command is *not* a native `.exe` launches that
+/// backend through `wsl.exe`, and only such a backend can be listening inside
+/// WSL. `None`/blank means nothing would be launched through WSL at all, so the
+/// probe is never warranted (DD-049).
+fn command_uses_wsl(command: Option<&str>) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+    match command.map(str::trim) {
+        Some(value) if !value.is_empty() => !value.to_ascii_lowercase().ends_with(".exe"),
+        _ => false,
+    }
+}
+
+/// `spawn_ollama` runs the resolved Ollama binary directly. Reuse the launch-mode
+/// rule on that command so the WSL probe is kept for a WSL-side binary and
+/// dropped for a native one (or when Ollama is not installed at all).
+fn ollama_uses_wsl() -> bool {
+    command_uses_wsl(find_ollama_binary().as_deref())
+}
+
+/// Port-only liveness check for a backend whose launch mode is known.
+/// A closed local port on a backend this process would launch natively reads as
+/// closed without spawning `wsl.exe`; a WSL-launched backend may still probe.
+fn backend_port_is_listening(port: u16, uses_wsl: bool) -> bool {
+    backend_port_is_listening_with(
+        port,
+        uses_wsl,
+        local_port_is_listening,
+        is_wsl_port_listening,
+    )
+}
+
+/// Pure decision seam: the WSL probe is reachable only when the backend is
+/// launched through `wsl.exe`, so the native path can never build one.
+fn backend_port_is_listening_with(
+    port: u16,
+    uses_wsl: bool,
+    probe_local: impl FnOnce(u16) -> bool,
+    probe_wsl: impl FnOnce(u16) -> bool,
+) -> bool {
+    if probe_local(port) {
+        return true;
+    }
+    uses_wsl && probe_wsl(port)
 }
 
 pub fn get_home_dir() -> String {
@@ -2902,6 +2967,161 @@ mod bun_boot_order_tests {
             !body.contains("JarvisBackend::"),
             "the backend dependency must start through start_backend_dependency, \
              not an inline match in bootstrap_services:\n{body}"
+        );
+    }
+}
+
+/// DD-049 regressions: a native Windows backend (llama.cpp / Ollama launched
+/// from a `.exe`) must read a closed local port as closed without spawning
+/// `wsl.exe`, while a backend this process really launches through `wsl.exe`
+/// keeps its probe. The behavioural tests drive the production decision seam
+/// with injected probes, so no port, WSL state or child process is involved; the
+/// wiring test reads this file because the two starters perform real boot work
+/// and cannot be invoked from a unit test.
+#[cfg(test)]
+mod local_backend_probe_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const NATIVE_COMMAND: &str =
+        r"C:\Users\ethan\AppData\Local\Programs\Ollama\ollama.exe";
+    const WSL_COMMAND: &str = "/usr/local/bin/ollama";
+
+    /// Slice one function body out of this file between its signature and the
+    /// signature of the next item.
+    fn body_of<'a>(source: &'a str, signature: &str, next: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist in lib.rs"));
+        let end = source[start..]
+            .find(next)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{next} must follow {signature} in lib.rs"));
+        &source[start..end]
+    }
+
+    #[test]
+    fn native_backend_closed_port_never_builds_a_wsl_probe() {
+        let wsl_probes = Cell::new(0);
+        let listening = backend_port_is_listening_with(
+            11434,
+            false,
+            |_| false,
+            |_| {
+                wsl_probes.set(wsl_probes.get() + 1);
+                true
+            },
+        );
+
+        assert!(
+            !listening,
+            "a closed locally-launched backend port must read as closed"
+        );
+        assert_eq!(
+            wsl_probes.get(),
+            0,
+            "the native closed-port path must not spawn wsl.exe; only a backend \
+             this process launches through WSL may pay for that probe"
+        );
+    }
+
+    #[test]
+    fn wsl_launched_backend_may_still_probe_wsl() {
+        let wsl_probes = Cell::new(0);
+        let listening = backend_port_is_listening_with(
+            11434,
+            true,
+            |_| false,
+            |_| {
+                wsl_probes.set(wsl_probes.get() + 1);
+                true
+            },
+        );
+
+        assert!(
+            listening,
+            "a WSL-launched backend listening inside WSL must still be detected"
+        );
+        assert_eq!(wsl_probes.get(), 1, "the WSL probe must still run");
+    }
+
+    #[test]
+    fn an_open_local_port_short_circuits_before_any_wsl_probe() {
+        let wsl_probes = Cell::new(0);
+        let listening =
+            backend_port_is_listening_with(11434, true, |_| true, |_| {
+                wsl_probes.set(wsl_probes.get() + 1);
+                false
+            });
+
+        assert!(listening);
+        assert_eq!(wsl_probes.get(), 0, "an open local port needs no WSL probe");
+    }
+
+    #[test]
+    fn a_windows_exe_command_is_never_wsl_launched() {
+        assert!(
+            !command_uses_wsl(Some(NATIVE_COMMAND)),
+            "a native .exe command cannot be listening inside WSL"
+        );
+    }
+
+    #[test]
+    fn a_linux_style_command_is_wsl_launched_only_on_windows() {
+        assert_eq!(
+            command_uses_wsl(Some(WSL_COMMAND)),
+            cfg!(target_os = "windows"),
+            "only a Windows build launches a non-.exe command through wsl.exe"
+        );
+    }
+
+    #[test]
+    fn a_missing_command_never_implies_wsl() {
+        assert!(!command_uses_wsl(None));
+        assert!(!command_uses_wsl(Some("   ")));
+    }
+
+    #[test]
+    fn boot_backends_check_ports_through_the_gated_probe() {
+        const SOURCE: &str = include_str!("lib.rs");
+
+        let ollama = body_of(
+            SOURCE,
+            "pub(crate) async fn start_ollama_and_warm(",
+            "pub(crate) async fn start_llama_cpp_server(",
+        );
+        assert!(
+            ollama.contains("let uses_wsl = ollama_uses_wsl();"),
+            "the Ollama boot path must derive its launch mode first:\n{ollama}"
+        );
+        assert!(
+            ollama.contains("backend_port_is_listening(OLLAMA_PORT, uses_wsl)"),
+            "the Ollama boot path must use the gated port check:\n{ollama}"
+        );
+        assert!(
+            !ollama.contains("is_port_listening(") && !ollama.contains("is_wsl_port_listening("),
+            "the Ollama boot path must not use the unconditional probe, which \
+             spawns wsl.exe even for a native backend:\n{ollama}"
+        );
+
+        let llama = body_of(
+            SOURCE,
+            "pub(crate) async fn start_llama_cpp_server(",
+            "pub fn reconcile_backend_services(",
+        );
+        assert!(
+            llama.contains("command_uses_wsl(Some(config.server_path.as_str()))"),
+            "the llama.cpp boot path must derive its launch mode from the \
+             configured server command:\n{llama}"
+        );
+        assert!(
+            llama.contains("backend_port_is_listening(config.port, uses_wsl)"),
+            "the llama.cpp boot path must use the gated port check:\n{llama}"
+        );
+        assert!(
+            !llama.contains("is_port_listening(") && !llama.contains("is_wsl_port_listening("),
+            "the llama.cpp boot path must not use the unconditional probe, which \
+             spawns wsl.exe even for a native backend:\n{llama}"
         );
     }
 }
