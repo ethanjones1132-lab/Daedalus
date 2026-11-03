@@ -952,6 +952,67 @@ fn find_claude_cli_proxy() -> Option<ProxyScript> {
     Some(script)
 }
 
+/// Bundled server entry points checked beside the running executable, in
+/// priority order. These are the only packaged entries a release build launches.
+#[cfg(any(target_os = "windows", test))]
+const BESIDE_EXE_BUNDLE_CANDIDATES: &[&str] = &[
+    "index.js",
+    "resources/index.js",
+    "server-jarvis/dist/index.js",
+    "server.js",
+];
+
+/// The only repo-relative entry an ancestry walk may return. A packaged install
+/// must never fall back to a TypeScript source tree.
+#[cfg(any(target_os = "windows", test))]
+const ANCESTRY_BUNDLE_CANDIDATE: &str = "server-jarvis/dist/index.js";
+
+/// How many parent directories an ancestry walk inspects.
+#[cfg(any(target_os = "windows", test))]
+const ANCESTRY_WALK_DEPTH: usize = 8;
+
+/// Chooses a bundled server next to `dir`, then in up to `ANCESTRY_WALK_DEPTH`
+/// of its ancestors. Only built bundle paths are considered, so a packaged
+/// install that finds none reports a miss instead of silently starting the
+/// developer source tree. `exists` is injected so this policy is testable
+/// without a real executable or filesystem.
+#[cfg(any(target_os = "windows", test))]
+fn find_bundled_server(
+    dir: Option<&std::path::Path>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    let dir = dir?;
+    for rel in BESIDE_EXE_BUNDLE_CANDIDATES {
+        let cand = dir.join(rel);
+        if exists(&cand) {
+            return Some(cand);
+        }
+    }
+    find_bundle_in_ancestry(dir, &exists)
+}
+
+/// Walks `start` and its ancestors looking only for the bundled dist entry, so a
+/// sibling `server-jarvis/src/index.ts` is never treated as the server.
+#[cfg(any(target_os = "windows", test))]
+fn find_bundle_in_ancestry<F>(
+    start: &std::path::Path,
+    exists: &F,
+) -> Option<std::path::PathBuf>
+where
+    F: Fn(&std::path::Path) -> bool,
+{
+    let mut cursor = Some(start.to_path_buf());
+    for _ in 0..ANCESTRY_WALK_DEPTH {
+        let Some(dir) = cursor.as_ref() else { break };
+        let cand = dir.join(ANCESTRY_BUNDLE_CANDIDATE);
+        if exists(&cand) {
+            return Some(cand);
+        }
+        cursor = dir.parent().map(|p| p.to_path_buf());
+    }
+    None
+}
+
 fn find_jarvis_server() -> Option<String> {
     // Explicit override — useful for dev without WSL.
     if let Ok(path) = std::env::var("JARVIS_SERVER_PATH") {
@@ -962,108 +1023,30 @@ fn find_jarvis_server() -> Option<String> {
     }
 
     // Bundled server next to the EXE (production installer / cargo tauri build).
+    // A packaged install that finds no bundle must report a miss: never fall
+    // back to a developer source tree, or release builds depend on a checkout.
     #[cfg(target_os = "windows")]
     {
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                for cand in [
-                    dir.join("index.js"),
-                    dir.join("resources").join("index.js"),
-                    dir.join("server-jarvis").join("dist").join("index.js"),
-                    dir.join("server.js"),
-                ] {
-                    if cand.exists() {
-                        return Some(cand.to_string_lossy().into_owned());
-                    }
-                }
+            if let Some(found) = find_bundled_server(exe.parent(), |path| path.exists()) {
+                return Some(found.to_string_lossy().into_owned());
             }
         }
 
-        // Walk up the current_exe ancestry looking for a repo-rooted
-        // server-jarvis. This catches `cargo tauri build` outputs that
-        // ended up under target/.../home-base.exe and dev runs that point
-        // at a sibling checkout, without hardcoding the home path.
-        if let Ok(exe) = std::env::current_exe() {
-            let mut cursor = exe.parent().map(|p| p.to_path_buf());
-            for _ in 0..8 {
-                let Some(dir) = cursor.as_ref() else { break };
-                for rel in ["server-jarvis/dist/index.js", "server-jarvis/src/index.ts"] {
-                    let cand = dir.join(rel);
-                    if cand.exists() {
-                        return Some(cand.to_string_lossy().into_owned());
-                    }
-                }
-                match dir.parent() {
-                    Some(p) => cursor = Some(p.to_path_buf()),
-                    None => break,
-                }
-            }
-        }
-
-        // Same check relative to CWD — useful when the binary is launched
-        // from a sibling of the repo (e.g. `target\release\home-base.exe`
+        // Same bundle-only search relative to CWD — useful when the binary is
+        // launched from a sibling of the repo (e.g. `target\release\home-base.exe`
         // run from the repo root, or from a CI workspace).
         if let Ok(cwd) = std::env::current_dir() {
-            let mut cursor = Some(cwd);
-            for _ in 0..8 {
-                let Some(dir) = cursor.as_ref() else { break };
-                for rel in ["server-jarvis/dist/index.js", "server-jarvis/src/index.ts"] {
-                    let cand = dir.join(rel);
-                    if cand.exists() {
-                        return Some(cand.to_string_lossy().into_owned());
-                    }
-                }
-                match dir.parent() {
-                    Some(p) => cursor = Some(p.to_path_buf()),
-                    None => break,
-                }
-            }
-        }
-
-        // Windows-native dev tree locations (no WSL required).
-        // Checked in order; first existing path wins.
-        let dev_candidates: &[&str] =
-            &[r"C:\Projects\home-base-recovered\server-jarvis\src\index.ts"];
-        for cand in dev_candidates {
-            if std::path::Path::new(cand).exists() {
-                println!("[Jarvis] Found server at native dev path: {}", cand);
-                return Some(cand.to_string());
-            }
-        }
-
-        // Standard user-level openclaw install (Windows without WSL).
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            let user_server = std::path::PathBuf::from(profile)
-                .join(".openclaw")
-                .join("jarvis")
-                .join("server-jarvis")
-                .join("src")
-                .join("index.ts");
-            if user_server.exists() {
-                return Some(user_server.to_string_lossy().into_owned());
+            if let Some(found) =
+                find_bundle_in_ancestry(&cwd, &|path: &std::path::Path| path.exists())
+            {
+                return Some(found.to_string_lossy().into_owned());
             }
         }
     }
 
-    let home = wsl_home();
-    let base = format!(
-        "{}/.openclaw/agents/coderclaw/workspace/home-base/server-jarvis/src/index.ts",
-        home
-    );
-    let exists = if cfg!(target_os = "windows") {
-        let mut cmd = std::process::Command::new("wsl.exe");
-        cmd.args(["--", "test", "-f", &base]);
-        crate::wsl::command_output_timeout(cmd, std::time::Duration::from_secs(15))
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    } else {
-        std::path::Path::new(&base).exists()
-    };
-    if exists {
-        Some(base)
-    } else {
-        None
-    }
+    // No bundle found — do not silently start a TypeScript source tree.
+    None
 }
 
 /// Async health probe with a local fast path. WSL hostname discovery can take
@@ -3123,5 +3106,115 @@ mod local_backend_probe_tests {
             "the llama.cpp boot path must not use the unconditional probe, which \
              spawns wsl.exe even for a native backend:\n{llama}"
         );
+    }
+}
+
+/// DD-051 regressions: a packaged install that finds no bundled `index.js` must
+/// report a miss instead of silently starting a developer TypeScript source
+/// tree. The tests drive the production choice seam with an injected `exists`
+/// predicate, so no executable, filesystem, or WSL launch is involved.
+#[cfg(test)]
+mod jarvis_bundle_lookup_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Reads `true` only for the exact paths listed, like a filesystem holding
+    /// just those files.
+    fn only_files(paths: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |candidate: &Path| paths.iter().any(|path| path == candidate)
+    }
+
+    /// The developer source-tree locations the bundled lookup used to return.
+    /// None of these is a packaged server entry.
+    fn developer_source_candidates() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from(r"C:\Projects\home-base-recovered\server-jarvis\src\index.ts"),
+            PathBuf::from(r"C:\Users\ethan\.openclaw\jarvis\server-jarvis\src\index.ts"),
+            PathBuf::from(
+                "/root/.openclaw/agents/coderclaw/workspace/home-base/server-jarvis/src/index.ts",
+            ),
+        ]
+    }
+
+    #[test]
+    fn beside_exe_bundle_wins_over_a_developer_source_tree() {
+        let exe_dir = PathBuf::from("install");
+        let bundled = exe_dir.join("index.js");
+        let mut existing = developer_source_candidates();
+        existing.push(bundled.clone());
+
+        let found = find_bundled_server(Some(&exe_dir), only_files(&existing));
+
+        assert_eq!(
+            found,
+            Some(bundled),
+            "a beside-exe index.js must win over any existing source tree"
+        );
+    }
+
+    #[test]
+    fn packaged_install_without_a_bundle_never_returns_a_source_tree() {
+        let exe_dir = PathBuf::from("install");
+        let existing = developer_source_candidates();
+
+        let found = find_bundled_server(Some(&exe_dir), only_files(&existing));
+
+        assert_eq!(
+            found, None,
+            "a packaged install must miss instead of starting a developer \
+             source tree; found {found:?}"
+        );
+    }
+
+    #[test]
+    fn ancestry_returns_the_dist_bundle_and_never_the_source_sibling() {
+        let repo = PathBuf::from("checkout");
+        let exe_dir = repo.join("target").join("release");
+        let dist = repo.join("server-jarvis").join("dist").join("index.js");
+        let source = repo.join("server-jarvis").join("src").join("index.ts");
+        let existing = vec![source.clone(), dist.clone()];
+
+        let found = find_bundled_server(Some(&exe_dir), only_files(&existing));
+
+        assert_eq!(found, Some(dist), "ancestry must return the dist bundle");
+        assert_ne!(found, Some(source), "a sibling source entry is never a server");
+    }
+
+    #[test]
+    fn ancestry_source_tree_alone_is_not_a_server() {
+        let repo = PathBuf::from("checkout");
+        let exe_dir = repo.join("target").join("release");
+        let source = repo.join("server-jarvis").join("src").join("index.ts");
+
+        let found = find_bundled_server(Some(&exe_dir), only_files(&[source]));
+
+        assert_eq!(
+            found, None,
+            "an ancestry walk that only finds src/index.ts must report a miss"
+        );
+    }
+
+    /// The live lookup must not reintroduce a source-tree candidate or a probe
+    /// for one. The behavioural tests above only see the injected predicate, so
+    /// this reads the function body for the three paths DD-051 removed.
+    #[test]
+    fn find_jarvis_server_has_no_developer_source_fallback() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("fn find_jarvis_server() -> Option<String> {")
+            .expect("find_jarvis_server must exist in lib.rs");
+        let rest = &SOURCE[start..];
+        let end = rest
+            .find("/// Async health probe with a local fast path.")
+            .expect("probe_jarvis_healthy must follow find_jarvis_server");
+        let body = &rest[..end];
+
+        for forbidden in ["index.ts", "home-base-recovered", "USERPROFILE", "wsl.exe"] {
+            assert!(
+                !body.contains(forbidden),
+                "find_jarvis_server must not reference {forbidden}; a packaged \
+                 install that finds no bundle must return None:\n{body}"
+            );
+        }
     }
 }
