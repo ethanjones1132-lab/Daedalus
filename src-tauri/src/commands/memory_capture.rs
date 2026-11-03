@@ -9,6 +9,8 @@
 // so a failed cleanup can never confirm a mutation. Replay lookups precede the
 // gate and return the persisted original result without invalidating.
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -751,59 +753,339 @@ pub fn finalize_relay_turn_with_capture(
 // pending rather than serving stale derived context; the next preparation/history
 // read drains it.
 
-/// One startup recovery pass over unfinalized capture turns. Selects turns with
-/// no receipt AND turns with a preterminal receipt (`terminal_hash IS NULL`)
-/// whose canonical turn now carries an authoritative terminal tuple, so the
-/// canonical capture helper performs its allowed one-time terminal augmentation
-/// WITHOUT rerunning operations. Only an authenticated `finished_at` or a
-/// `completed|partial|cancelled|failed` terminal is authoritative; a bare
-/// `unterminated` generation-loss marker is not, so a started-but-lost turn is
-/// left for a later authoritative sync rather than freezing a false terminal.
-/// Runs each turn through the shared gate (idempotent: an exact replay is a
-/// no-op) and never holds the AppDb lock while entering the operation/HTTP gate.
-/// Returns the number of turns that now have a committed receipt.
+/// The maximum number of turn candidates one startup recovery pass examines.
+///
+/// Cold start must do a fixed, small amount of recovery work no matter how many
+/// uncaptured turns have accumulated: every candidate costs a bounded
+/// operation/HTTP gate round trip, so an unbounded sweep made startup time grow
+/// with the whole turn history. Oldest-first order means the backlog still drains
+/// in order across later passes and later boots. This is deliberately a
+/// build-time constant rather than a config key or CLI flag: it is a safety
+/// bound on startup cost, not a user preference.
+const RECOVERY_TURN_LIMIT: usize = 25;
+
+/// Turn ids whose recovery capture already failed during this process. A turn
+/// that keeps failing would otherwise sit at the front of the oldest-first sweep
+/// and consume part of every pass's bounded budget; excluding it lets later
+/// passes make progress on the rest of the backlog. The set is process-lifetime
+/// (never persisted), so a fresh boot still gets one retry per turn. Failures are
+/// still observable through the sweep's `eprintln!`.
+fn recovery_skip_set() -> &'static std::sync::Mutex<HashSet<String>> {
+    static SKIP: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SKIP.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Select up to `limit` recovery candidates in the existing oldest-first order.
+///
+/// The candidate predicate is unchanged: turns with no receipt, plus turns with a
+/// preterminal receipt (`terminal_hash IS NULL`) whose canonical turn now carries
+/// an authoritative terminal tuple, so the canonical capture helper performs its
+/// allowed one-time terminal augmentation WITHOUT rerunning operations. Only an
+/// authenticated `finished_at` or a `completed|partial|cancelled|failed` terminal
+/// is authoritative; a bare `unterminated` generation-loss marker is not. Turn ids
+/// in `skip` (already failed in this process) are excluded before the limit is
+/// applied, so a poisoned turn cannot consume the bounded budget.
+fn select_recovery_candidates(
+    conn: &Connection,
+    limit: usize,
+    skip: &HashSet<String>,
+) -> Result<Vec<(String, String)>, MemoryError> {
+    let mut sql = String::from(
+        "SELECT p.session_id, p.turn_id
+         FROM memory_turn_preparations p
+         LEFT JOIN memory_capture_receipts r ON r.turn_id = p.turn_id
+         WHERE (r.turn_id IS NULL
+                OR (r.terminal_hash IS NULL
+                    AND (p.finished_at IS NOT NULL
+                         OR p.terminal_status IN
+                             ('completed','partial','cancelled','failed'))))",
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if !skip.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(skip.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND p.turn_id NOT IN ({placeholders})"));
+        for turn_id in skip {
+            params.push(rusqlite::types::Value::Text(turn_id.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY p.prepared_at ASC LIMIT ?");
+    params.push(rusqlite::types::Value::Integer(limit as i64));
+
+    let mut stmt = conn.prepare(&sql).map_err(MemoryError::from)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(MemoryError::from)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(MemoryError::from)
+}
+
+/// Run one bounded recovery pass. `capture` performs the actual per-turn capture
+/// so the selection, budget, and failure bookkeeping stay testable without a live
+/// transport; every failed turn id is added to `skip` for later passes in this
+/// process.
+fn sweep_recorded_memory_captures<F>(
+    db: &AppDb,
+    limit: usize,
+    skip: &mut HashSet<String>,
+    mut capture: F,
+) -> Result<usize, MemoryError>
+where
+    F: FnMut(&AppDb, &str, &str) -> Result<(), MemoryError>,
+{
+    let candidates = {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        select_recovery_candidates(&conn, limit, skip)?
+    };
+
+    let mut captured = 0usize;
+    for (session_id, turn_id) in candidates {
+        match capture(db, &session_id, &turn_id) {
+            Ok(()) => captured += 1,
+            Err(error) => {
+                // Recovery is best-effort and observable; one bad turn must not
+                // abort the sweep or fabricate a receipt, and it must not be
+                // retried for the rest of this process.
+                eprintln!(
+                    "[memory] recovery capture failed session={} turn={} error={}",
+                    session_id, turn_id, error
+                );
+                skip.insert(turn_id);
+            }
+        }
+    }
+    Ok(captured)
+}
+
+/// One startup recovery pass over unfinalized capture turns.
+///
+/// Runs each selected turn through the shared gate (idempotent: an exact replay
+/// is a no-op) and never holds the AppDb lock while entering the operation/HTTP
+/// gate. At most `RECOVERY_TURN_LIMIT` turns are examined per call, and turns that
+/// already failed earlier in this process are skipped. Returns the number of turns
+/// that now have a committed receipt.
 pub fn recover_recorded_memory_captures(
     db: &AppDb,
     transport: &NativeMemoryTransport,
     _now: chrono::DateTime<Utc>,
 ) -> Result<usize, MemoryError> {
-    let candidates: Vec<(String, String)> = {
-        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-        let mut stmt = conn
-            .prepare(
-                "SELECT p.session_id, p.turn_id
-                 FROM memory_turn_preparations p
-                 LEFT JOIN memory_capture_receipts r ON r.turn_id = p.turn_id
-                 WHERE r.turn_id IS NULL
-                    OR (r.terminal_hash IS NULL
-                        AND (p.finished_at IS NOT NULL
-                             OR p.terminal_status IN
-                                 ('completed','partial','cancelled','failed')))
-                 ORDER BY p.prepared_at ASC",
-            )
-            .map_err(MemoryError::from)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(MemoryError::from)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(MemoryError::from)?
-    };
+    let mut skip = recovery_skip_set()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sweep_recorded_memory_captures(
+        db,
+        RECOVERY_TURN_LIMIT,
+        &mut *skip,
+        |db: &AppDb, session_id: &str, turn_id: &str| {
+            run_capture_for_turn(db, transport, session_id, turn_id).map(|_| ())
+        },
+    )
+}
 
-    let mut captured = 0usize;
-    for (session_id, turn_id) in candidates {
-        match run_capture_for_turn(db, transport, &session_id, &turn_id) {
-            Ok(_) => captured += 1,
-            Err(error) => {
-                // Recovery is best-effort and observable; one bad turn must not
-                // abort the sweep or fabricate a receipt.
-                eprintln!(
-                    "[memory] recovery capture failed session={} turn={} error={}",
-                    session_id, turn_id, error
-                );
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::run_migrations;
+    use rusqlite::Connection;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    fn mem_db() -> AppDb {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        run_migrations(&conn).expect("run migrations");
+        AppDb {
+            conn: Mutex::new(conn),
+            db_path: std::path::PathBuf::from(":memory:"),
         }
     }
-    Ok(captured)
+
+    /// A real in-memory AppDb with one Session and one user message, enough to
+    /// satisfy the preparation foreign keys.
+    fn fixture() -> (AppDb, String, String) {
+        let db = mem_db();
+        let session = crate::commands::sessions::create_session_row(
+            &db,
+            Some("recovery".into()),
+            None,
+            None,
+            None,
+        )
+        .expect("create session");
+        let message_id = crate::commands::sessions::insert_message_row(
+            &db,
+            &session.id,
+            "user",
+            "remember this",
+            0,
+        )
+        .expect("insert user message");
+        (db, session.id, message_id)
+    }
+
+    /// Seed one never-receipted, never-terminal preparation.
+    fn seed_preparation(
+        db: &AppDb,
+        session_id: &str,
+        message_id: &str,
+        turn_id: &str,
+        prepared_at: &str,
+    ) {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO memory_turn_preparations
+             (turn_id, preparation_id, session_id, source_message_id, user_message, message_hash,
+              scope_json, include_user_scope, store_revision, selected_json,
+              applied_selected_ids_json, app_instance_id, state, recall_status, prepared_at,
+              expires_at)
+             VALUES (?, ?, ?, ?, 'remember this', 'message-hash', '{}', 0, 1, '[]', '[]',
+                     'test-app', 'prepared', 'ready', ?, ?)",
+            rusqlite::params![
+                turn_id,
+                format!("prep-{turn_id}"),
+                session_id,
+                message_id,
+                prepared_at,
+                prepared_at
+            ],
+        )
+        .expect("seed preparation");
+    }
+
+    fn seed_turns(db: &AppDb, session_id: &str, message_id: &str, count: usize) {
+        for index in 0..count {
+            let turn_id = format!("turn-{index:02}");
+            // Distinct, lexically ordered timestamps so `ORDER BY prepared_at`
+            // gives an unambiguous oldest-first order.
+            let prepared_at = format!("2026-01-01T00:00:{index:02}Z");
+            seed_preparation(db, session_id, message_id, &turn_id, &prepared_at);
+        }
+    }
+
+    fn record_receipt(db: &AppDb, session_id: &str, turn_id: &str) {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.execute(
+            "INSERT INTO memory_capture_receipts (turn_id, session_id, receipt_json)
+             VALUES (?, ?, '{}')",
+            rusqlite::params![turn_id, session_id],
+        )
+        .expect("record receipt");
+    }
+
+    fn turn_ids(candidates: &[(String, String)]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|(_, turn_id)| turn_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn sweep_examines_at_most_the_limit_oldest_first() {
+        let (db, session_id, message_id) = fixture();
+        seed_turns(&db, &session_id, &message_id, 30);
+
+        let candidates = {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            select_recovery_candidates(&conn, RECOVERY_TURN_LIMIT, &HashSet::new())
+                .expect("select candidates")
+        };
+
+        let expected: Vec<String> = (0..RECOVERY_TURN_LIMIT)
+            .map(|index| format!("turn-{index:02}"))
+            .collect();
+        assert_eq!(
+            candidates.len(),
+            RECOVERY_TURN_LIMIT,
+            "a 30-turn backlog must be bounded to the limit"
+        );
+        assert_eq!(
+            turn_ids(&candidates),
+            expected,
+            "candidates must be the oldest turns in ascending prepared_at order"
+        );
+    }
+
+    #[test]
+    fn a_preparation_with_a_receipt_is_never_returned() {
+        let (db, session_id, message_id) = fixture();
+        seed_turns(&db, &session_id, &message_id, 3);
+        // A receipt that carries no terminal hash is still a committed capture:
+        // this turn must not satisfy either branch of the candidate predicate.
+        record_receipt(&db, &session_id, "turn-01");
+
+        let candidates = {
+            let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+            select_recovery_candidates(&conn, RECOVERY_TURN_LIMIT, &HashSet::new())
+                .expect("select candidates")
+        };
+
+        assert_eq!(
+            turn_ids(&candidates),
+            vec!["turn-00".to_string(), "turn-02".to_string()],
+            "a receipted turn must never be selected for recovery"
+        );
+    }
+
+    #[test]
+    fn a_failed_turn_is_not_selected_again_in_the_same_process() {
+        let (db, session_id, message_id) = fixture();
+        seed_turns(&db, &session_id, &message_id, 30);
+        let poisoned = "turn-00".to_string();
+
+        let mut skip = recovery_skip_set()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut first_attempts: Vec<String> = Vec::new();
+        let captured = sweep_recorded_memory_captures(
+            &db,
+            RECOVERY_TURN_LIMIT,
+            &mut *skip,
+            |db: &AppDb, session_id: &str, turn_id: &str| {
+                first_attempts.push(turn_id.to_string());
+                if turn_id == poisoned.as_str() {
+                    return Err(MemoryError::storage_unavailable("poisoned turn"));
+                }
+                record_receipt(db, session_id, turn_id);
+                Ok(())
+            },
+        )
+        .expect("first sweep");
+
+        assert_eq!(
+            first_attempts.len(),
+            RECOVERY_TURN_LIMIT,
+            "the first pass must examine exactly the bounded budget"
+        );
+        assert_eq!(captured, RECOVERY_TURN_LIMIT - 1);
+        assert!(skip.contains(&poisoned), "the failed turn must be skipped");
+
+        let mut second_attempts: Vec<String> = Vec::new();
+        let captured = sweep_recorded_memory_captures(
+            &db,
+            RECOVERY_TURN_LIMIT,
+            &mut *skip,
+            |db: &AppDb, session_id: &str, turn_id: &str| {
+                assert_ne!(turn_id, poisoned.as_str(), "a failed turn must not be retried");
+                second_attempts.push(turn_id.to_string());
+                record_receipt(db, session_id, turn_id);
+                Ok(())
+            },
+        )
+        .expect("second sweep");
+
+        let expected_remaining: Vec<String> = (RECOVERY_TURN_LIMIT..30)
+            .map(|index| format!("turn-{index:02}"))
+            .collect();
+        assert_eq!(
+            second_attempts, expected_remaining,
+            "the poisoned oldest turn must be skipped so the rest of the backlog still drains"
+        );
+        assert_eq!(captured, 30 - RECOVERY_TURN_LIMIT);
+        // The skip set is process-lifetime; leave it tidy for any later check.
+        skip.remove(&poisoned);
+    }
 }
