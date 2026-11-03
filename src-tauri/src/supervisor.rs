@@ -177,6 +177,13 @@ async fn tick(handle: &AppHandle) {
         )
     };
 
+    // DD-054: how each backend is launched decides whether a closed local port
+    // may also be probed inside WSL. A native backend reads as closed without
+    // paying for a helper-process spawn; a WSL-hosted one still gets its guest probe, so it is
+    // not reported down and relaunched on every tick (same rule as the boot paths).
+    let ollama_uses_wsl = crate::ollama_uses_wsl();
+    let llama_cpp_uses_wsl = crate::command_uses_wsl(Some(llama_cpp_config.server_path.as_str()));
+
     // ── Bun server (required by every backend for tools/skills/models) ──
     if crate::bun_server_is_listening() {
         reset_failures(SupervisedService::Bun);
@@ -231,13 +238,13 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── Ollama (only required when it is the active backend) ──
-    if !is_ollama || crate::is_port_listening(OLLAMA_PORT) {
+    if !is_ollama || crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
         OLLAMA_FAILS.store(0, Ordering::Relaxed);
     } else {
         let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
             crate::start_ollama_and_warm(ollama_model).await;
-            if crate::is_port_listening(OLLAMA_PORT) {
+            if crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
                 OLLAMA_FAILS.store(0, Ordering::Relaxed);
                 println!("[supervisor] Ollama was down — relaunched.");
             } else {
@@ -250,7 +257,7 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── llama.cpp (only required when Gemma is the active backend) ──
-    if !is_llama_cpp || crate::is_port_listening(llama_cpp_config.port) {
+    if !is_llama_cpp || crate::backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl) {
         LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
         if !is_llama_cpp {
             crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::LlamaCpp);
@@ -280,12 +287,12 @@ async fn tick(handle: &AppHandle) {
             "proxy_up": proxy_heartbeat_status(proxy_required, || {
                 crate::claude_proxy_is_listening()
             }),
-            "ollama_up": crate::is_port_listening(OLLAMA_PORT),
+            "ollama_up": crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl),
             "ollama_required": is_ollama,
             "bun_give_up": supervisor.bun_give_up,
             "proxy_give_up": supervisor.proxy_give_up,
             "ollama_give_up": supervisor.ollama_give_up,
-            "llama_cpp_up": crate::is_port_listening(llama_cpp_config.port),
+            "llama_cpp_up": crate::backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl),
             "llama_cpp_required": is_llama_cpp,
             "llama_cpp_give_up": supervisor.llama_cpp_give_up,
             "bun_restart_failures": supervisor.bun_restart_failures,
@@ -429,5 +436,66 @@ mod tests {
         assert!(diagnostic.contains("Restart"));
 
         reset_failures(SupervisedService::Bun);
+    }
+
+    /// Production half of this file: everything above the test module.
+    fn supervisor_production_source() -> &'static str {
+        include_str!("supervisor.rs")
+            .split_once("#[cfg(test)]")
+            .map(|(production, _)| production)
+            .expect("supervisor.rs must keep its test module after the production code")
+    }
+
+    #[test]
+    fn backend_checks_use_the_launch_mode_aware_probe_not_the_generic_one() {
+        let production = supervisor_production_source();
+
+        // `crate::is_port_listening` spawns `wsl.exe` on every closed local port.
+        // The Ollama and llama.cpp checks (and the heartbeat reporting them) must
+        // go through `backend_port_is_listening`, which only probes WSL for a
+        // backend that is actually launched there (DD-054, DD-049).
+        assert!(
+            !production.contains("crate::is_port_listening"),
+            "Ollama/llama.cpp liveness must not use the generic wsl.exe-spawning probe"
+        );
+        assert!(
+            !production.contains("is_wsl_port_listening"),
+            "the supervisor must not reach for the guest-hosted probe directly"
+        );
+        assert!(
+            !production.to_ascii_lowercase().contains("wsl.exe"),
+            "no supervisor production path may name wsl.exe"
+        );
+
+        // Guard against passing vacuously: the two Ollama sites, the llama.cpp
+        // site and the two heartbeat fields must all use the aware probe.
+        let aware = production.matches("crate::backend_port_is_listening(").count();
+        assert!(
+            aware >= 5,
+            "expected five Ollama/llama.cpp probe call sites, found {aware}"
+        );
+    }
+
+    #[test]
+    fn a_wsl_hosted_backend_is_not_hard_coded_native() {
+        let production = supervisor_production_source();
+
+        // Hard-coding the native probe would read a WSL-hosted Ollama or
+        // llama.cpp as permanently down and relaunch it on every tick. Both
+        // launch modes must be resolved from the same rule the boot paths use.
+        assert!(
+            production.contains("crate::ollama_uses_wsl()"),
+            "Ollama launch mode must come from ollama_uses_wsl"
+        );
+        assert!(
+            production.contains("crate::command_uses_wsl(Some(llama_cpp_config.server_path.as_str()))"),
+            "llama.cpp launch mode must come from its configured server_path"
+        );
+        assert!(
+            production.contains("backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl)")
+                && production
+                    .contains("backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl)"),
+            "the probes must be passed the resolved launch mode"
+        );
     }
 }
