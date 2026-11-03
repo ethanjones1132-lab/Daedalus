@@ -712,6 +712,262 @@ export function decodeClaudeCliMessage(
   return [];
 }
 
+/** Structured error for a stream read that produced no completion in time. */
+export function claudeCliStreamTimeoutEvent(timeoutMs: number): ClaudeStreamEvent {
+  const message = `Claude CLI stream timed out after ${timeoutMs}ms`;
+  return { type: "error", error: message, content: message, is_error: true };
+}
+
+export type ClaudeCliStreamReadOutcome<T> =
+  | { timedOut: false; value: T }
+  | { timedOut: true; error: ClaudeStreamEvent };
+
+/** One armed timer. `cancel` is safe after the callback has already run. */
+export interface ClaudeCliClock {
+  setTimeout: (callback: () => void, ms: number) => { cancel: () => void };
+}
+
+const realClaudeCliClock: ClaudeCliClock = {
+  setTimeout(callback, ms) {
+    const handle = setTimeout(callback, ms);
+    // A leaked deadline must not keep a finished test process alive. The
+    // server's own sockets keep a real turn alive until the callback fires.
+    if (typeof handle === "object" && handle !== null && "unref" in handle) {
+      const unref = handle.unref;
+      if (typeof unref === "function") unref.call(handle);
+    }
+    return { cancel: () => clearTimeout(handle) };
+  },
+};
+
+/**
+ * Wall-clock budget for one Claude CLI turn.
+ *
+ * Arm it once. A child that dribbles stdout must not get a fresh `timeout_ms`
+ * per chunk, and stdout EOF must not start a second budget for stderr or exit.
+ * A non-positive `timeoutMs` disables the deadline, matching `invokeClaudeCli`.
+ */
+export class ClaudeCliTurnDeadline {
+  readonly timeoutMs: number;
+  readonly disabled: boolean;
+  timedOut = false;
+  readonly fired: Promise<void>;
+  private resolveFired: () => void = () => {};
+  private timer: { cancel: () => void } | undefined;
+
+  constructor(timeoutMs: number, kill: () => void, clock: ClaudeCliClock = realClaudeCliClock) {
+    this.timeoutMs = timeoutMs;
+    this.disabled = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
+    this.fired = new Promise<void>((resolve) => {
+      this.resolveFired = resolve;
+    });
+    if (this.disabled) return;
+    this.timer = clock.setTimeout(() => {
+      if (this.timedOut) return;
+      this.timedOut = true;
+      try {
+        kill();
+      } catch {
+        // A child that already exited must not mask the timeout error.
+      }
+      this.resolveFired();
+    }, timeoutMs);
+  }
+
+  dispose(): void {
+    this.timer?.cancel();
+    this.timer = undefined;
+  }
+}
+
+export function createClaudeCliTurnDeadline(
+  timeoutMs: number,
+  kill: () => void,
+  clock?: ClaudeCliClock,
+): ClaudeCliTurnDeadline {
+  if (clock) return new ClaudeCliTurnDeadline(timeoutMs, kill, clock);
+  return new ClaudeCliTurnDeadline(timeoutMs, kill);
+}
+
+/**
+ * Race one Claude CLI stream read against a turn deadline.
+ *
+ * Pass a number for a one-shot budget (tests of a single read). Pass the turn's
+ * `ClaudeCliTurnDeadline` to keep the same wall clock across spawn, stdout,
+ * stderr and exit. A non-positive number disables the race.
+ */
+export async function readClaudeCliStreamWithTimeout<T>(
+  readPromise: Promise<T>,
+  timeoutMsOrDeadline: number | ClaudeCliTurnDeadline,
+  kill: () => void = () => {},
+): Promise<ClaudeCliStreamReadOutcome<T>> {
+  const ownsDeadline = !(timeoutMsOrDeadline instanceof ClaudeCliTurnDeadline);
+  const deadline = ownsDeadline
+    ? createClaudeCliTurnDeadline(timeoutMsOrDeadline, kill)
+    : timeoutMsOrDeadline;
+
+  try {
+    if (deadline.disabled) {
+      return { timedOut: false, value: await readPromise };
+    }
+    if (deadline.timedOut) {
+      return { timedOut: true, error: claudeCliStreamTimeoutEvent(deadline.timeoutMs) };
+    }
+
+    const settled = readPromise.then((value) => ({ timedOut: false as const, value }));
+    // The read can reject after the deadline won; observe it so it is not
+    // reported as an unhandled rejection.
+    settled.catch(() => {});
+
+    const timedOut = deadline.fired.then(() => ({
+      timedOut: true as const,
+      error: claudeCliStreamTimeoutEvent(deadline.timeoutMs),
+    }));
+    return await Promise.race([settled, timedOut]);
+  } finally {
+    if (ownsDeadline) deadline.dispose();
+  }
+}
+
+export interface ClaudeCliSpawnedChild {
+  waitUntilSpawned: () => Promise<Error | undefined>;
+  stdout: AsyncIterable<unknown>;
+  stderr: AsyncIterable<unknown>;
+  kill: () => void;
+  waitForExit: () => Promise<number>;
+  /** Runs only after spawn succeeds, before the first stdout read. */
+  onSpawned?: () => void;
+}
+
+function claudeCliChunkText(value: unknown): Uint8Array | string | undefined {
+  if (value instanceof Uint8Array || typeof value === "string") return value;
+  return undefined;
+}
+
+/**
+ * Drive an already-spawned CLI child on one lifetime deadline.
+ *
+ * The budget starts before spawn confirmation and covers every later wait:
+ * stdout (including a child that keeps emitting), stderr after stdout EOF, and
+ * process exit. Dispose runs on every return, including abort and spawn failure.
+ */
+export async function* streamSpawnedClaudeCli(
+  child: ClaudeCliSpawnedChild,
+  timeoutMs: number,
+  sessionId: string | undefined,
+  abortSignal: AbortSignal | undefined,
+  cleanup: () => void,
+  clock?: ClaudeCliClock,
+): AsyncGenerator<ClaudeStreamEvent> {
+  const deadline = createClaudeCliTurnDeadline(timeoutMs, () => child.kill(), clock);
+  const onAbort = () => child.kill();
+  let abortListening = false;
+
+  try {
+    const spawnRead = await readClaudeCliStreamWithTimeout(child.waitUntilSpawned(), deadline);
+    if (spawnRead.timedOut) {
+      yield spawnRead.error;
+      return;
+    }
+    if (spawnRead.value) {
+      yield { type: "error", error: spawnRead.value.message };
+      return;
+    }
+
+    child.onSpawned?.();
+
+    if (abortSignal) {
+      if (abortSignal.aborted) {
+        child.kill();
+        return;
+      }
+      abortSignal.addEventListener("abort", onAbort);
+      abortListening = true;
+    }
+
+    const decoder = new TextDecoder();
+    const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
+    let buffer = "";
+    let fullOutput = "";
+    const stdoutIterator = child.stdout[Symbol.asyncIterator]();
+
+    while (true) {
+      if (abortSignal?.aborted) return;
+      const read = await readClaudeCliStreamWithTimeout(stdoutIterator.next(), deadline);
+      if (read.timedOut) {
+        yield read.error;
+        return;
+      }
+      const { done, value } = read.value;
+      if (done) break;
+      const chunk = claudeCliChunkText(value);
+      if (chunk === undefined) continue;
+
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        try {
+          const msg: ClaudeCliMessage = JSON.parse(trimmed);
+          for (const event of decodeClaudeCliMessage(msg, decodeState)) {
+            if (event.type === "stream_event" && event.delta?.text) {
+              fullOutput += event.delta.text;
+            } else if (event.type === "result" && !event.content) {
+              event.content = fullOutput;
+            }
+            yield event;
+          }
+        } catch {
+          // Non-JSON line — treat as plain text
+          if (trimmed.length > 0) {
+            fullOutput += trimmed + "\n";
+            yield { type: "stream_event", delta: { text: trimmed + "\n" } };
+          }
+        }
+      }
+    }
+
+    let stderr = "";
+    const stderrIterator = child.stderr[Symbol.asyncIterator]();
+    while (true) {
+      if (abortSignal?.aborted) return;
+      const read = await readClaudeCliStreamWithTimeout(stderrIterator.next(), deadline);
+      if (read.timedOut) {
+        yield read.error;
+        return;
+      }
+      const { done, value } = read.value;
+      if (done) break;
+      const chunk = claudeCliChunkText(value);
+      if (chunk === undefined) continue;
+      stderr += decoder.decode(chunk, { stream: true });
+    }
+
+    const exitRead = await readClaudeCliStreamWithTimeout(child.waitForExit(), deadline);
+    if (exitRead.timedOut) {
+      yield exitRead.error;
+      return;
+    }
+
+    if (exitRead.value !== 0 && stderr) {
+      yield { type: "error", error: stderr.slice(0, 500) };
+    } else {
+      yield { type: "message_stop", session_id: sessionId };
+    }
+  } finally {
+    if (abortListening && abortSignal) {
+      abortSignal.removeEventListener("abort", onAbort);
+    }
+    deadline.dispose();
+    cleanup();
+    child.kill();
+  }
+}
+
 export async function* streamClaudeCli(
   cfg: JarvisConfig,
   req: ClaudeCliRequest,
@@ -746,94 +1002,41 @@ export async function* streamClaudeCli(
     cwd: req.cwd || cliCfg.cwd,
   });
 
-  const spawnError = await new Promise<Error | undefined>((resolve) => {
-    proc.once("error", (err) => resolve(err));
-    proc.once("spawn", () => resolve(undefined));
-  });
-  if (spawnError) {
+  if (!proc.stdout || !proc.stderr) {
     cleanup();
-    yield { type: "error", error: spawnError.message };
+    try { proc.kill(); } catch { /* already exited */ }
+    yield { type: "error", error: "Claude CLI spawn did not provide stdio pipes" };
     return;
   }
 
-  if (promptOnStdin) {
-    proc.stdin?.write(req.prompt, "utf8");
-  }
-  proc.stdin?.end();
-
-  const decoder = new TextDecoder();
-  const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
-  let buffer = "";
-  let fullOutput = "";
-
-  const stdoutIterator = proc.stdout![Symbol.asyncIterator]();
-  const onAbort = () => {
-    try { proc.kill(); } catch {}
-  };
-  if (abortSignal) {
-    if (abortSignal.aborted) {
-      proc.kill();
-      return;
-    }
-    abortSignal.addEventListener("abort", onAbort);
-  }
-
-  try {
-    while (true) {
-      if (abortSignal?.aborted) {
+  const child: ClaudeCliSpawnedChild = {
+    waitUntilSpawned: () => new Promise((resolve) => {
+      proc.once("error", (err) => resolve(err));
+      proc.once("spawn", () => resolve(undefined));
+    }),
+    stdout: proc.stdout,
+    stderr: proc.stderr,
+    kill: () => { try { proc.kill(); } catch { /* already exited */ } },
+    waitForExit: () => new Promise((resolve) => {
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        resolve(proc.exitCode ?? 0);
         return;
       }
-      const { done, value } = await stdoutIterator.next();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        try {
-          const msg: ClaudeCliMessage = JSON.parse(trimmed);
-          for (const event of decodeClaudeCliMessage(msg, decodeState)) {
-            if (event.type === "stream_event" && event.delta?.text) {
-              fullOutput += event.delta.text;
-            } else if (event.type === "result" && !event.content) {
-              event.content = fullOutput;
-            }
-            yield event;
-          }
-        } catch {
-          // Non-JSON line — treat as plain text
-          if (trimmed.length > 0) {
-            fullOutput += trimmed + "\n";
-            yield { type: "stream_event", delta: { text: trimmed + "\n" } };
-          }
-        }
+      proc.once("close", (code) => resolve(code ?? 0));
+    }),
+    onSpawned: () => {
+      if (promptOnStdin) {
+        proc.stdin?.write(req.prompt, "utf8");
       }
-    }
+      proc.stdin?.end();
+    },
+  };
 
-    // Check stderr for errors
-    let stderr = "";
-    for await (const chunk of proc.stderr!) {
-      stderr += decoder.decode(chunk, { stream: true });
-    }
-
-    const exitCode = await new Promise<number>((resolve) => {
-      proc.on("close", (code) => resolve(code || 0));
-    });
-
-    if (exitCode !== 0 && stderr) {
-      yield { type: "error", error: stderr.slice(0, 500) };
-    } else {
-      yield { type: "message_stop", session_id: req.session_id };
-    }
-  } finally {
-    if (abortSignal) {
-      abortSignal.removeEventListener("abort", onAbort);
-    }
-    cleanup();
-    proc.kill();
-  }
+  yield* streamSpawnedClaudeCli(
+    child,
+    cliCfg.timeout_ms,
+    req.session_id,
+    abortSignal,
+    cleanup,
+  );
 }
