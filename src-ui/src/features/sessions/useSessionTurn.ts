@@ -243,6 +243,63 @@ class JarvisStreamError extends Error {
   }
 }
 
+/**
+ * A failed `/chat/stream` POST must say what the server said, not just its
+ * status. The Bun server reports a pre-stream failure through `baseFetch`'s
+ * catch as JSON `{ error }` with status 500 (`server-jarvis/src/index.ts`
+ * around line 6914); a gateway in front of it may answer with HTML instead.
+ * Only the server's own short message is kept: markup, structured bodies that
+ * do not parse, headers, and the raw body never reach the bubble.
+ */
+const MAX_SERVER_ERROR_DETAIL_CHARS = 200;
+
+function compactServerMessage(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const compact = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return null;
+  return compact.length > MAX_SERVER_ERROR_DETAIL_CHARS
+    ? `${compact.slice(0, MAX_SERVER_ERROR_DETAIL_CHARS)}…`
+    : compact;
+}
+
+function extractServerErrorMessage(parsed: unknown): string | null {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  for (const key of ['error', 'message', 'detail']) {
+    const direct = compactServerMessage(record[key]);
+    if (direct) return direct;
+    const nested = record[key];
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      const nestedRecord = nested as Record<string, unknown>;
+      const nestedMessage =
+        compactServerMessage(nestedRecord.message) ?? compactServerMessage(nestedRecord.error);
+      if (nestedMessage) return nestedMessage;
+    }
+  }
+  return null;
+}
+
+async function readServerErrorMessage(response: Response): Promise<string | null> {
+  // Read the body exactly once. An unreadable body is not a second failure:
+  // the caller keeps its status-only message.
+  const raw = await response.text().catch(() => '');
+  const body = raw.trim();
+  if (!body) return null;
+  if (body.startsWith('{') || body.startsWith('[')) {
+    try {
+      return extractServerErrorMessage(JSON.parse(body));
+    } catch {
+      return null;
+    }
+  }
+  // A proxy/gateway HTML page, an SSE frame, or anything else structured is
+  // never surfaced as prose. Only a plain-text snippet is acceptable.
+  if (/[<>{}[\]]/.test(body) || body.startsWith('data:')) return null;
+  return compactServerMessage(body);
+}
 
 export const CURATED_SUGGESTIONS = ['Refine the previous answer', 'Walk me through the reasoning', 'Suggest next steps', 'Apply this to my code'];
 
@@ -1920,8 +1977,12 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       });
 
       if (!response.ok) {
-        await response.text().catch(() => '');
-        throw new Error(`Jarvis server returned ${response.status}.`);
+        const detail = await readServerErrorMessage(response);
+        const statusMessage = `Jarvis server returned ${response.status}.`;
+        throw new JarvisStreamError(
+          detail ? `${statusMessage} ${detail}` : statusMessage,
+          'server_error',
+        );
       }
       if (!response.body) {
         throw new Error('Jarvis server returned no response stream.');
