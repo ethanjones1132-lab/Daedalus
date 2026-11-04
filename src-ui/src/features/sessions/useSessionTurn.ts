@@ -93,6 +93,7 @@ import {
   type SessionRunWrite,
 } from '../../domain/session-run-telemetry';
 import { sessionRoutingNotice } from './outcome';
+import { bunOrigin } from '../../lib/bun-origin';
 import type { MemorySourceMessage } from '../memory/MemoryTurnStatus';
 
 export type ToolApprovalRequest = {
@@ -215,7 +216,10 @@ const readSessionRunsFor = async (sessionId: string): Promise<SessionRunRead> =>
   }
 };
 
-const JARVIS_API_URL = 'http://127.0.0.1:19877';
+// The chat POST goes to the origin the native runtime resolved
+// (`bun_server_origin`, read through `lib/bun-origin`), resolved at call time
+// rather than captured as a module-level loopback literal. `bun-origin` keeps
+// the documented default, so a test environment still reaches the same URL.
 const STREAM_INACTIVITY_TIMEOUT_MS = 90_000;
 // Phase 2.4 — bound the UI's native memory finalization attempt (including the
 // Tauri command wait and any native operation-gate backlog) so a stuck native
@@ -1893,7 +1897,8 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       stopIfStale();
 
       if (submissionRef.current?.generation === sendGeneration) submissionRef.current.dispatched = true;
-      const response = await fetch(`${JARVIS_API_URL}/chat/stream`, {
+      const origin = await bunOrigin();
+      const response = await fetch(`${origin}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
