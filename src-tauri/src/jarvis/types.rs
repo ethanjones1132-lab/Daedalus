@@ -139,7 +139,7 @@ impl JarvisConfig {
 // ── Sub-configs (recovered from callsite inspection) ──
 // ═══════════════════════════════════════════════════════════════
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OllamaConfig {
     pub base_url: String,
     pub model: String,
@@ -151,6 +151,33 @@ pub struct OllamaConfig {
     pub health_check_interval_ms: u64,
     #[serde(default)]
     pub options: OllamaOptions,
+}
+
+impl Default for OllamaConfig {
+    /// Mirrors the Bun server's `defaultConfig().ollama` in
+    /// `server-jarvis/src/config.ts` so a Settings save from the native side
+    /// cannot replace a working Ollama block with empty/false scalars. The
+    /// values (and their source lines) are:
+    /// - `base_url: "http://localhost:11434/v1"` (config.ts:667)
+    /// - `model: "qwen3.5-9b:latest"` (config.ts:668)
+    /// - `auto_pull: true` (config.ts:669)
+    /// - `health_check_interval_ms: 30000` (config.ts:670)
+    /// - `num_ctx: 8192` (config.ts:672, Bun nests it under `options`)
+    /// - `options.num_gpu: 31` (config.ts:673)
+    /// - `options.num_thread: 8` (config.ts:674)
+    fn default() -> Self {
+        Self {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen3.5-9b:latest".to_string(),
+            auto_pull: true,
+            num_ctx: 8192,
+            health_check_interval_ms: 30000,
+            options: OllamaOptions {
+                num_gpu: 31,
+                num_thread: 8,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -431,6 +458,45 @@ mod llama_cpp_config_tests {
         assert_eq!(resolved.server_path, "configured-llama-server");
         assert_eq!(resolved.model_path, "env-model.gguf");
         assert_eq!(resolved.mtp_path, "");
+    }
+}
+
+/// Pins the native `OllamaConfig::default()` to the Bun server's
+/// `defaultConfig().ollama` (`server-jarvis/src/config.ts:666-677`). If the Bun
+/// defaults move, or these values drift back to empty/zero, the first Settings
+/// save in a fresh install blanks a working Ollama block again.
+#[cfg(test)]
+mod ollama_config_default_tests {
+    use super::*;
+
+    #[test]
+    fn default_matches_bun_ollama_defaults() {
+        let config = OllamaConfig::default();
+        // config.ts:667
+        assert_eq!(config.base_url, "http://localhost:11434/v1");
+        // config.ts:668
+        assert_eq!(config.model, "qwen3.5-9b:latest");
+        // config.ts:669
+        assert!(config.auto_pull);
+        // config.ts:670
+        assert_eq!(config.health_check_interval_ms, 30000);
+        // config.ts:672 (Bun keeps num_ctx under `options`, the native struct
+        // carries it as a top-level field; the value is the same)
+        assert_eq!(config.num_ctx, 8192);
+        // config.ts:673
+        assert_eq!(config.options.num_gpu, 31);
+        // config.ts:674
+        assert_eq!(config.options.num_thread, 8);
+    }
+
+    #[test]
+    fn default_ollama_block_is_not_blank() {
+        let config = OllamaConfig::default();
+        assert!(
+            !config.base_url.trim().is_empty(),
+            "a blank base_url is what DD-058 reported getting written on first save"
+        );
+        assert!(!config.model.trim().is_empty());
     }
 }
 

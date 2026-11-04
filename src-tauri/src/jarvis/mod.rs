@@ -99,7 +99,16 @@ fn deep_merge_obj(
 /// `compaction.ollama_url`, `surface_temperatures`) survive a UI save.
 /// Both the Tauri process and the Bun server share this file.
 pub fn save_jarvis_config(config: &JarvisConfig) -> Result<(), String> {
-    let config_path = get_config_path();
+    save_jarvis_config_to_path(&get_config_path(), config)
+}
+
+/// Backing implementation of [`save_jarvis_config`]. Takes the target file so
+/// tests can round-trip through a temp path instead of the real canonical
+/// store; production callers always pass [`get_config_path`].
+fn save_jarvis_config_to_path(
+    config_path: &std::path::Path,
+    config: &JarvisConfig,
+) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {}", e))?;
     }
@@ -107,7 +116,7 @@ pub fn save_jarvis_config(config: &JarvisConfig) -> Result<(), String> {
     let new_value =
         serde_json::to_value(config).map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    let final_value = if let Ok(existing_str) = fs::read_to_string(&config_path) {
+    let final_value = if let Ok(existing_str) = fs::read_to_string(config_path) {
         if let (Ok(serde_json::Value::Object(mut merged)), serde_json::Value::Object(new_map)) = (
             serde_json::from_str::<serde_json::Value>(&existing_str),
             new_value.clone(),
@@ -123,7 +132,7 @@ pub fn save_jarvis_config(config: &JarvisConfig) -> Result<(), String> {
 
     let json = serde_json::to_string_pretty(&final_value)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
-    fs::write(&config_path, json).map_err(|e| format!("Failed to write config: {}", e))?;
+    fs::write(config_path, json).map_err(|e| format!("Failed to write config: {}", e))?;
     Ok(())
 }
 
@@ -170,3 +179,79 @@ pub fn save_companion_state(state: &serde_json::Value) -> Result<(), String> {
 // SQLite `sessions`/`messages` tables). The Bun server keeps its own per-session
 // message history as a runtime context cache — a projection, not a competing
 // metadata store.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Temp file so the round-trip exercises the real merge/write path without
+    /// touching the canonical store (`~/.openclaw/jarvis/config.json`).
+    fn temp_config_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("jarvis-dd058-{name}-{}.json", std::process::id()))
+    }
+
+    #[test]
+    fn save_keeps_a_populated_ollama_block_written_by_the_bun_server() {
+        let path = temp_config_path("ollama-round-trip");
+        let _ = fs::remove_file(&path);
+
+        // Fresh install: the Bun server has already written its defaults, plus
+        // a Bun-only nested key that the deep-merge must preserve.
+        let bun_defaults = serde_json::json!({
+            "version": "1.0.0",
+            "ollama": {
+                "base_url": "http://localhost:11434/v1",
+                "model": "qwen3.5-9b:latest",
+                "auto_pull": true,
+                "health_check_interval_ms": 30000,
+                "options": {
+                    "num_ctx": 8192,
+                    "num_gpu": 31,
+                    "num_thread": 8,
+                    "num_batch": 256
+                },
+                "bun_only_field": "keep-me"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&bun_defaults).unwrap()).unwrap();
+
+        // A Settings save whose Ollama block is still the native default must
+        // not replace the Bun values with empty/false (DD-058).
+        save_jarvis_config_to_path(&path, &JarvisConfig::default()).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ollama = written
+            .get("ollama")
+            .expect("ollama block must survive the merge");
+        assert_eq!(ollama["base_url"], "http://localhost:11434/v1");
+        assert_eq!(ollama["model"], "qwen3.5-9b:latest");
+        assert_eq!(ollama["auto_pull"], true);
+        assert_eq!(ollama["health_check_interval_ms"], 30000);
+        assert_eq!(ollama["num_ctx"], 8192);
+        assert_eq!(ollama["options"]["num_gpu"], 31);
+        assert_eq!(ollama["options"]["num_thread"], 8);
+        // Deep-merge semantics are unchanged: Bun-only nested keys still survive.
+        assert_eq!(ollama["options"]["num_batch"], 256);
+        assert_eq!(ollama["bun_only_field"], "keep-me");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_writes_working_ollama_defaults_when_no_file_exists() {
+        let path = temp_config_path("ollama-no-file");
+        let _ = fs::remove_file(&path);
+
+        save_jarvis_config_to_path(&path, &JarvisConfig::default()).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let ollama = written.get("ollama").expect("ollama block is always written");
+        assert_eq!(ollama["base_url"], "http://localhost:11434/v1");
+        assert_eq!(ollama["model"], "qwen3.5-9b:latest");
+        assert_eq!(ollama["auto_pull"], true);
+
+        let _ = fs::remove_file(&path);
+    }
+}
