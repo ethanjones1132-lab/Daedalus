@@ -108,7 +108,8 @@ import {
   providerSupportsNativeTools,
   resolveProviderTarget,
 } from "./providers";
-import { routableOrchestratorAgents, runtimeFactsSystemMessage } from "./provider-availability";
+import { runtimeFactsSystemMessage } from "./provider-availability";
+import { routableAgentsWithProviderHealth } from "./orchestration/routable-agent-pool";
 import {
   recordInference,
   recordInferenceAttempt,
@@ -2485,7 +2486,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           console.log(`[Jarvis Orchestrator] Pruned ${pruned} expired conductor session file(s)`);
         }
         // AgentPool applies learned + cron feedback exactly once at selection.
-        const agentPool = new AgentPool(routableOrchestratorAgents(cfg));
+        const agentPool = new AgentPool(await routableAgentsWithProviderHealth(cfg));
         const poolCoverage = agentPool.coverage();
         console.log(`[Jarvis Orchestrator] Agent pool coverage: ${formatPoolDiversity(poolCoverage)}${poolCoverage.stage_gaps.length > 0 ? `; gaps=${poolCoverage.stage_gaps.join(",")}` : ""}`);
 
@@ -2649,7 +2650,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               // re-trialled on every restart.
               // M5: same scorecard supplies reliability/latency stats for
               // budget-aware refuse + success/latency ranking within tier.
-              const pool = new AgentPool(routableOrchestratorAgents(cfg))
+              const pool = new AgentPool(await routableAgentsWithProviderHealth(cfg))
                 .withTrialSampleCounts((agent, trialStage) =>
                   modelScorecard.sampleCount(trialStage, `${agent.provider}:${agent.model_id}`))
                 .withReliabilityStats((agent, relStage) =>
@@ -5542,7 +5543,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // despite the override being "in effect". `firstTokenTimeoutFor`
         // clamps to [1_000, 60_000] so this watchdog can never fire
         // after the outer 60s stream-stall watchdog would have.
-        const agentLoopPool = new AgentPool(routableOrchestratorAgents(cfg));
+        const agentLoopPool = new AgentPool(await routableAgentsWithProviderHealth(cfg));
         const firstTokenMs = firstTokenTimeoutFor(
           agentLoopPool,
           modelName,
@@ -6539,7 +6540,7 @@ export async function baseFetch(req: Request): Promise<Response> {
         const healthCfg = loadConfig();
         live_model_catalog = await discoverLiveOrchestratorAgents(healthCfg);
         healthCfg.orchestrator.agents = live_model_catalog.agents;
-        pool_coverage = new AgentPool(routableOrchestratorAgents(healthCfg)).coverage();
+        pool_coverage = new AgentPool(await routableAgentsWithProviderHealth(healthCfg)).coverage();
       } catch {}
       return Response.json({
         ...inferenceMetricsSnapshot(),
@@ -6666,7 +6667,7 @@ export async function baseFetch(req: Request): Promise<Response> {
       const poolCfg = loadConfig();
       const liveCatalog = await discoverLiveOrchestratorAgents(poolCfg);
       poolCfg.orchestrator.agents = liveCatalog.agents;
-      const pool = new AgentPool(routableOrchestratorAgents(poolCfg));
+      const pool = new AgentPool(await routableAgentsWithProviderHealth(poolCfg));
       return Response.json({
         pool: pool.list(),
         coverage: pool.coverage(),
