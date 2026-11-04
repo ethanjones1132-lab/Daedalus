@@ -1076,16 +1076,208 @@ async fn probe_jarvis_candidates(client: &reqwest::Client, candidates: &[String]
     for base in candidates {
         let trimmed = base.trim_end_matches('/').to_string();
         let probe = format!("{}/health", trimmed);
-        if let Ok(Ok(resp)) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), client.get(&probe).send()).await
-        {
-            if resp.status().is_success() {
-                crate::wsl::set_cached_bun_url(trimmed);
-                return true;
+        // A 2xx is not enough: anything else on the port (a Vite preview, a
+        // stale process, some other app's health route) answers 2xx too. The
+        // body must identify this Jarvis before the origin is adopted.
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let resp = match client.get(&probe).send().await {
+                Ok(resp) => resp,
+                Err(_) => return false,
+            };
+            if !resp.status().is_success() {
+                return false;
             }
+            match resp.text().await {
+                Ok(body) => jarvis_health_identifies(&body),
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if accepted {
+            crate::wsl::set_cached_bun_url(trimmed);
+            return true;
         }
     }
     false
+}
+
+/// Does this `/health` body come from *this* Jarvis?
+///
+/// The server's `/health` handler (`server-jarvis/src/index.ts`, the
+/// `path === "/health"` branch) sends no `name` or `service` field, so the
+/// identity it does report is `git_sha` — the build identity it carries so
+/// one build can be told apart from "any other build". Jarvis also always
+/// sends a boolean `ok`, a non-empty `version`, and a non-empty `backend`, so
+/// the body has to match that shape too. `git_sha` is `"dev"` for a build
+/// without the release provenance bake, and that is still Jarvis; a
+/// stranger's health route has no `git_sha` at all.
+///
+/// Anything that fails this is not healthy, so the app keeps looking and
+/// eventually spawns the server it owns.
+fn jarvis_health_identifies(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    let non_empty_str = |key: &str| {
+        object
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+
+    object.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && non_empty_str("version")
+        && non_empty_str("git_sha")
+        && non_empty_str("backend")
+}
+
+#[cfg(test)]
+mod probe_jarvis_health_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::{Mutex, OnceLock};
+
+    /// `set_cached_bun_url` is process-global, so these probes take turns.
+    fn cache_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// A one-shot loopback stand-in for whatever is listening on a Jarvis port.
+    /// It answers the first request with `status` and `body` over real HTTP, so
+    /// the probe is exercised end to end instead of against a stub client.
+    fn spawn_health_listener(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("make loopback listener non-blocking");
+        let addr = listener.local_addr().expect("read loopback address");
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        return;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), handle)
+    }
+
+    async fn probe_one(candidate: &str) -> bool {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback probe client");
+        let candidates = [candidate.to_string()];
+        probe_jarvis_candidates(&client, &candidates).await
+    }
+
+    /// The body `GET /health` really returns today: `ok`, `version`, the
+    /// active backend, and the build-provenance fields (`git_sha` included).
+    const OWN_HEALTH: &str = r#"{"ok":true,"uptime":12.5,"version":"1.0.0","backend":"ollama","model":"qwen3:8b","configured_model":"qwen3:8b","model_resolved":true,"git_sha":"dev","built_at":null,"git_dirty":null,"source_tree_sha256":null}"#;
+
+    #[tokio::test]
+    async fn probe_jarvis_accepts_own_health() {
+        let _guard = cache_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::wsl::clear_cached_bun_url();
+        let (origin, server) = spawn_health_listener("200 OK", OWN_HEALTH);
+
+        assert!(
+            probe_one(&origin).await,
+            "a /health body that identifies this Jarvis must be accepted"
+        );
+        assert_eq!(
+            crate::wsl::get_cached_bun_url(),
+            Some(origin),
+            "the accepted origin is the only origin cached as the Bun URL"
+        );
+
+        let _ = server.join();
+        crate::wsl::clear_cached_bun_url();
+    }
+
+    #[tokio::test]
+    async fn probe_jarvis_rejects_foreign_health() {
+        let _guard = cache_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::wsl::clear_cached_bun_url();
+        // A stranger's 200: healthy and JSON, but nothing says "this Jarvis" —
+        // no git_sha, and a version/service that belong to another app.
+        let (origin, server) = spawn_health_listener(
+            "200 OK",
+            r#"{"status":"ok","service":"vite-preview","version":"5.4.0"}"#,
+        );
+
+        assert!(
+            !probe_one(&origin).await,
+            "a stranger's 200 must not count as healthy, or the app never spawns \
+             its own server"
+        );
+        assert_ne!(
+            crate::wsl::get_cached_bun_url(),
+            Some(origin),
+            "a stranger's 200 must not become the cached Bun origin"
+        );
+
+        let _ = server.join();
+        crate::wsl::clear_cached_bun_url();
+    }
+
+    #[tokio::test]
+    async fn probe_jarvis_rejects_health_without_a_json_body() {
+        let _guard = cache_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::wsl::clear_cached_bun_url();
+        let (origin, server) = spawn_health_listener("200 OK", "");
+
+        assert!(
+            !probe_one(&origin).await,
+            "2xx with an empty body cannot identify anything"
+        );
+        assert_ne!(crate::wsl::get_cached_bun_url(), Some(origin));
+
+        let _ = server.join();
+        crate::wsl::clear_cached_bun_url();
+    }
+
+    #[tokio::test]
+    async fn probe_jarvis_rejects_health_that_is_not_json() {
+        let _guard = cache_lock().lock().unwrap_or_else(|poison| poison.into_inner());
+        crate::wsl::clear_cached_bun_url();
+        let (origin, server) = spawn_health_listener("200 OK", "<html><body>ok</body></html>");
+
+        assert!(
+            !probe_one(&origin).await,
+            "a 200 whose body is not JSON cannot identify this Jarvis"
+        );
+        assert_ne!(crate::wsl::get_cached_bun_url(), Some(origin));
+
+        let _ = server.join();
+        crate::wsl::clear_cached_bun_url();
+    }
 }
 
 fn find_bun_executable() -> String {
