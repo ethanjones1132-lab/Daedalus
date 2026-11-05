@@ -903,7 +903,7 @@ export async function* streamSpawnedClaudeCli(
       const chunk = claudeCliChunkText(value);
       if (chunk === undefined) continue;
 
-      buffer += decoder.decode(chunk, { stream: true });
+      buffer += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
 
@@ -944,7 +944,7 @@ export async function* streamSpawnedClaudeCli(
       if (done) break;
       const chunk = claudeCliChunkText(value);
       if (chunk === undefined) continue;
-      stderr += decoder.decode(chunk, { stream: true });
+      stderr += typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
     }
 
     const exitRead = await readClaudeCliStreamWithTimeout(child.waitForExit(), deadline);

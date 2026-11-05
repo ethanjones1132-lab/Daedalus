@@ -238,6 +238,41 @@ describe("Claude CLI child lifetime", () => {
     expect(events.some((event) => event.error?.includes("timed out"))).toBe(false);
   });
 
+  test("string stdout and stderr chunks match equivalent byte chunks", async () => {
+    const stdoutText = '{"type":"result","result":"hello"}\n';
+    const stderrText = "diagnostic text";
+    const makeChild = (stdoutChunk: Uint8Array | string, stderrChunk: Uint8Array | string): ClaudeCliSpawnedChild => {
+      const stdout = new ScriptedStream();
+      const stderr = new ScriptedStream();
+      stdout.push({ done: false, value: stdoutChunk });
+      stdout.push({ done: true, value: undefined });
+      stderr.push({ done: false, value: stderrChunk });
+      stderr.push({ done: true, value: undefined });
+      return {
+        waitUntilSpawned: async () => undefined,
+        stdout,
+        stderr,
+        kill() {},
+        waitForExit: async () => 0,
+      };
+    };
+
+    const byteEvents = await withSuiteDeadline(collect(
+      makeChild(new TextEncoder().encode(stdoutText), new TextEncoder().encode(stderrText)),
+      5_000,
+      manualClock(),
+      "sess",
+    ));
+    const stringEvents = await withSuiteDeadline(collect(
+      makeChild(stdoutText, stderrText),
+      5_000,
+      manualClock(),
+      "sess",
+    ));
+
+    expect(stringEvents).toEqual(byteEvents);
+  });
+
   test("periodic stdout still dies on the original turn deadline", async () => {
     const clock = manualClock();
     const stdout = new ScriptedStream();
