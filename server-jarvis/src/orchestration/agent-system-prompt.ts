@@ -11,11 +11,17 @@ export const AGENT_SYSTEM_PROMPT_HEADER = "Agent-specific directives:";
 export function applyAgentSystemPrompt(
   messages: Array<{ role?: string; content?: string; [k: string]: unknown }>,
   systemPrompt: string | undefined | null,
+  renderedGuide?: string | undefined | null,
 ): Array<{ role?: string; content?: string; [k: string]: unknown }> {
   const text = typeof systemPrompt === "string" ? systemPrompt.trim() : "";
-  if (!text) return messages;
+  const guide = typeof renderedGuide === "string" ? renderedGuide.trim() : "";
+  if (!text && !guide) return messages;
 
-  const block = `${AGENT_SYSTEM_PROMPT_HEADER}\n${text.slice(0, 4000)}`;
+  const blocks = [
+    ...(text ? [`${AGENT_SYSTEM_PROMPT_HEADER}\n${text.slice(0, 4000)}`] : []),
+    ...(guide ? [guide] : []),
+  ];
+  const block = blocks.join("\n\n");
   const out = messages.map((m) => ({ ...m }));
   const leadingSystemIdx = out.findIndex((m) => m?.role === "system");
   if (leadingSystemIdx >= 0) {
