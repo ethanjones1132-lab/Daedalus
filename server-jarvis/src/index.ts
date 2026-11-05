@@ -67,7 +67,7 @@ import { readdirSync, existsSync, readFileSync, writeFileSync, mkdirSync, realpa
 import { join, isAbsolute, relative, resolve } from "path";
 import { homedir } from "os";
 import { spawn, execSync } from "child_process";
-import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, resolveAgentsRoot, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature } from "./config";
+import { loadConfig, saveConfig, saveConfigWithValidation, normalizeConfig, resolveAgentsRoot, InvalidConfigError, CONFIG_DIR, COMPANION_FILE, SESSIONS_DIR, surfaceTemperature, ensureWorkspaceDirectory } from "./config";
 import type { JarvisConfig, OllamaConfig, SurfaceType } from "./config";
 import { Database } from "bun:sqlite";
 import { buildLearningPrompt, buildReviewPrompt, buildCodebaseAuditPrompt, buildFootballAuditPrompt } from "./cron-prompts";
@@ -6927,6 +6927,11 @@ export async function baseFetch(req: Request): Promise<Response> {
 // default (all interfaces) so the diagnostic can never name a host we did not
 // actually bind.
 const BIND_TARGET = resolveBindTarget(PORT);
+
+// Ensure the jarvis workspace directory exists before the server starts
+// loadConfig() returns defaultConfig() untouched when no config file exists, and
+// its jarvis_path is blank; normalizeConfig gives the path a first run resolves to.
+ensureWorkspaceDirectory(normalizeConfig(loadConfig()).jarvis_path, mkdirSync);
 
 guardServerBind(
   () => serve({

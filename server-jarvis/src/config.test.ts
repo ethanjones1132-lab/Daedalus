@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
-import { InvalidConfigError, defaultConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig } from "./config";
+import { InvalidConfigError, defaultConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -258,5 +258,87 @@ describe("llama.cpp artifact paths", () => {
     expect(cfg.llama_cpp.model_path).toBe("X:/models/model.gguf");
     expect(cfg.llama_cpp.mtp_path).toBe("");
     expect(validateConfig({ ...cfg, active_backend: "llama_cpp" }).warnings.some((w) => w.includes("llama.cpp"))).toBe(false);
+  });
+});
+
+describe("first-run workspace config", () => {
+  test("a fresh install's config normalizes to a real workspace path for boot to create", () => {
+    // The boot call normalizes because defaultConfig() alone is blank, and mkdir refuses a blank path.
+    expect(defaultConfig().jarvis_path).toBe("");
+    expect(normalizeConfig(defaultConfig()).jarvis_path).toBe(
+      join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base"),
+    );
+  });
+});
+
+describe("ensureWorkspaceDirectory", () => {
+  test("creates a missing directory", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "jarvis-test-ensure-dir-"));
+    const targetDir = join(tempDir, "subdir", "nested");
+    const mockMkdirCalls: Array<{ dir: string; options?: any }> = [];
+    const mockMkdir = (dir: string, options?: any) => {
+      mockMkdirCalls.push({ dir, options });
+    };
+    
+    ensureWorkspaceDirectory(targetDir, mockMkdir);
+    
+    expect(mockMkdirCalls).toHaveLength(1);
+    expect(mockMkdirCalls[0].dir).toBe(targetDir);
+    expect(mockMkdirCalls[0].options).toEqual({ recursive: true });
+    
+    // Clean up
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("leaves an existing directory intact", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "jarvis-test-existing-dir-"));
+    const mockMkdirCalls: Array<{ dir: string; options?: any }> = [];
+    const mockMkdir = (dir: string, options?: any) => {
+      mockMkdirCalls.push({ dir, options });
+    };
+    
+    ensureWorkspaceDirectory(tempDir, mockMkdir);
+    
+    expect(mockMkdirCalls).toHaveLength(0);
+    
+    // Clean up
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("does not use the real homedir when a temp directory is provided", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "jarvis-test-homedir-"));
+    const targetDir = join(tempDir, "workspace");
+    const mockMkdirCalls: Array<{ dir: string; options?: any }> = [];
+    const mockMkdir = (dir: string, options?: any) => {
+      mockMkdirCalls.push({ dir, options });
+    };
+    
+    ensureWorkspaceDirectory(targetDir, mockMkdir);
+    
+    expect(mockMkdirCalls).toHaveLength(1);
+    expect(mockMkdirCalls[0].dir).toBe(targetDir);
+    expect(mockMkdirCalls[0].options).toEqual({ recursive: true });
+    
+    // Clean up
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("a directory that cannot be created is reported, not thrown, so boot continues", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "jarvis-test-mkdir-fail-"));
+    const targetDir = join(tempDir, "unreachable");
+    const refuse = () => {
+      throw new Error("EACCES: permission denied");
+    };
+
+    expect(ensureWorkspaceDirectory(targetDir, refuse)).toBe(false);
+    expect(ensureWorkspaceDirectory(tempDir, refuse)).toBe(true);
+
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  test("fails if the helper is removed", () => {
+    // This test simulates the scenario where ensureWorkspaceDirectory is removed
+    // by checking that the imported function exists
+    expect(typeof ensureWorkspaceDirectory).toBe("function");
   });
 });

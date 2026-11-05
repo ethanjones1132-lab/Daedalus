@@ -1262,6 +1262,28 @@ export function deepMerge(target: any, source: any): any {
   return result;
 }
 
+/**
+ * Ensure a workspace directory exists, creating it only when it is missing.
+ *
+ * Never throws: a configured path that cannot be created (an unplugged drive,
+ * no permission) must not stop the server from booting. The failure is logged
+ * and reported through the return value, and tools keep their own errors.
+ *
+ * @param dir - The directory path to ensure exists
+ * @param mkdir - Function to use for directory creation (e.g., mkdirSync)
+ * @returns true when the directory exists afterwards as far as we can tell
+ */
+export function ensureWorkspaceDirectory(dir: string, mkdir: (path: string, options?: any) => void): boolean {
+  if (existsSync(dir)) return true;
+  try {
+    mkdir(dir, { recursive: true });
+    return true;
+  } catch (error) {
+    console.error(`[Config] Could not create workspace directory ${dir}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 // ── Validation ──
 
 export interface ConfigValidation {
