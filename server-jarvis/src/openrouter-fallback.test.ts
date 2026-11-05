@@ -57,7 +57,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     const cfg = cfgWithPool();
     cfg.openrouter.api_key = "";
     cfg.opencode_zen.api_key = "";
-    cfg.opencode_go.api_key = "sk-go-key";
+    cfg.opencode_go.api_key = "test-go-key";
     cfg.opencode_go.base_url = "https://opencode.ai/zen/go/v1";
     cfg.orchestrator.agents = [{
       id: "go-minimax-m3",
@@ -116,7 +116,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     const normalized = await result.response.text();
 
     expect(attemptedUrl).toBe("https://opencode.ai/zen/go/v1/messages");
-    expect(attemptedHeaders?.["x-api-key"]).toBe("sk-go-key");
+    expect(attemptedHeaders?.["x-api-key"]).toBe("test-go-key");
     expect(attemptedHeaders?.["anthropic-version"]).toBe("2023-06-01");
     expect(attemptedBody?.system).toBe("Be concise.");
     expect(attemptedBody?.messages).toEqual([{ role: "user", content: "Say hello." }]);
@@ -279,7 +279,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     // optimal pool model. The secondary here is an OpenCode Zen agent, which
     // must be called at its own base_url with its own key (NOT OpenRouter's).
     const cfg = cfgWithPool();
-    cfg.openrouter.api_key = "sk-or-key";
+    cfg.openrouter.api_key = "test-or-key";
     cfg.openrouter.max_retries = 3; // allow the 2-strike rate-limit rule to apply
     cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
     cfg.opencode_zen.api_key = "sk-zen-key";
@@ -338,7 +338,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     // 2 consecutive 429s on the primary, then advance.
     expect(primaryCalls.length).toBe(2);
     expect(primaryCalls.every((c) => c.url.startsWith("https://openrouter.ai/api/v1"))).toBe(true);
-    expect(primaryCalls.every((c) => c.auth === "Bearer sk-or-key")).toBe(true);
+    expect(primaryCalls.every((c) => c.auth === "Bearer test-or-key")).toBe(true);
 
     // The OpenCode Zen secondary is hit at its own endpoint with its own key.
     expect(zenCalls.length).toBe(1);
@@ -591,7 +591,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     // of the generic overallScore ranking (fast-balanced > secondary) — the
     // exact inversion that caused the live bug.
     const cfg = cfgWithPool();
-    cfg.openrouter.api_key = "sk-or-key";
+    cfg.openrouter.api_key = "test-or-key";
     cfg.opencode_zen.base_url = "https://opencode.ai/zen/v1";
     cfg.opencode_zen.api_key = "sk-zen-key";
     cfg.orchestrator.agents = [
