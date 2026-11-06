@@ -75,6 +75,7 @@ import { createLifecycleService, validateLifecycleSnapshot, type LifecycleServic
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
+import { handleHarnessRequest } from "./harness/routes";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { logReadResponse, readLogTail } from "./log-read";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
@@ -6907,6 +6908,18 @@ export async function baseFetch(req: Request): Promise<Response> {
 
     const tuningResponse = await handleTuningProposalsRequest(req, new SelfTuningStore());
     if (tuningResponse) return tuningResponse;
+
+    const harnessResponse = await handleHarnessRequest(req, {
+      resolveKnownProjectRoot: (root) => {
+        const knownRoot = normalizeConfig(loadConfig()).jarvis_path;
+        try {
+          const canonicalKnownRoot = realpathSync(knownRoot);
+          const canonicalRequestedRoot = realpathSync(root);
+          return canonicalRequestedRoot === canonicalKnownRoot ? canonicalKnownRoot : null;
+        } catch { return null; }
+      },
+    });
+    if (harnessResponse) return harnessResponse;
 
     return Response.json({ error: `Not found: ${req.method} ${path}` }, { status: 404 });
   } catch (err: any) {
