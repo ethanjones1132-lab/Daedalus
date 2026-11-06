@@ -655,7 +655,7 @@ export const LOGS_DIR = join(CONFIG_DIR, "logs");
 
 // ── Defaults ──
 
-export function defaultConfig(): JarvisConfig {
+export function defaultConfig(home: string = homedir()): JarvisConfig {
   return {
     // Schema marker for the persisted config, not the app version. It
     // tracks the app version so a config file names the build that wrote
@@ -936,7 +936,7 @@ Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
     top_k: 40,
     bridge_port: 19876,
     bridge_enabled: true,
-    jarvis_path: "",
+    jarvis_path: join(home, ".openclaw", "agents", "coderclaw", "workspace", "home-base"),
     compaction: {
       model: "nemotron-mini:4b",
       ollama_url: "",
@@ -981,7 +981,7 @@ Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
     },
     active_profile: "quality",
     api_sports_key: "",
-    agents_root: join(homedir(), ".openclaw", "jarvis", "agents"),
+    agents_root: join(home, ".openclaw", "jarvis", "agents"),
   };
 }
 
@@ -989,6 +989,7 @@ export interface NormalizeConfigOptions {
   platform?: NodeJS.Platform;
   exists?: (path: string) => boolean;
   healInvalidTrajectorySnapshots?: boolean;
+  home?: string;
 }
 
 /** Parse the public vLLM settings while dropping unsupported secret fields. */
@@ -1056,7 +1057,8 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
 }
 
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
-  const merged = deepMerge(defaultConfig(), raw);
+  const home = options.home ?? homedir();
+  const merged = deepMerge(defaultConfig(home), raw);
   merged.vllm = normalizeVllmConfig(merged.vllm);
   const configuredTrajectoryRetention = merged.orchestrator?.conductor_learning?.max_trajectory_snapshots;
   if (!isValidTrajectoryRetention(configuredTrajectoryRetention)) {
@@ -1098,7 +1100,7 @@ export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}):
   if (Array.isArray(merged.claude_cli?.args)) {
     merged.claude_cli.args = merged.claude_cli.args.filter((arg: unknown) => arg !== "--no-telemetry");
   }
-  const defaultWorkspacePath = join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base");
+  const defaultWorkspacePath = join(home, ".openclaw", "agents", "coderclaw", "workspace", "home-base");
   // Ensure jarvis_path is always set — an empty string or missing value
   // must never cause the workspace to silently resolve to process.cwd()
   // (e.g. the Windows Desktop when spawned from Tauri via wsl.exe).
@@ -1127,24 +1129,35 @@ let configCache: JarvisConfig | null = null;
 let configCacheTime = 0;
 const CONFIG_CACHE_TTL = 5000; // 5 seconds
 
-export function loadConfig(): JarvisConfig {
+export interface LoadConfigOptions {
+  configFile?: string;
+  home?: string;
+}
+
+export function loadConfig(options: LoadConfigOptions = {}): JarvisConfig {
+  const configFile = options.configFile ?? CONFIG_FILE;
+  const home = options.home ?? homedir();
+  const usingDefaults = options.configFile !== undefined || options.home !== undefined;
   const now = Date.now();
-  if (configCache && (now - configCacheTime) < CONFIG_CACHE_TTL) {
+  if (!usingDefaults && configCache && (now - configCacheTime) < CONFIG_CACHE_TTL) {
     return configCache;
   }
 
   try {
-    if (existsSync(CONFIG_FILE)) {
-      const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf-8").replace(/^\uFEFF/, ""));
-      configCache = normalizeConfig(raw);
-      configCacheTime = now;
-      return configCache!;
+    if (existsSync(configFile)) {
+      const raw = JSON.parse(readFileSync(configFile, "utf-8").replace(/^\uFEFF/, ""));
+      const config = normalizeConfig(raw, { home });
+      if (!usingDefaults) {
+        configCache = config;
+        configCacheTime = now;
+      }
+      return config;
     }
   } catch (e) {
     console.error("[Config] Load error, using defaults:", e);
   }
 
-  return defaultConfig();
+  return normalizeConfig(defaultConfig(home), { home });
 }
 
 export function invalidateConfigCache(): void {

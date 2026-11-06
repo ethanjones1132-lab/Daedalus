@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { homedir, tmpdir } from "os";
+import { tmpdir } from "os";
 import { join } from "path";
-import { InvalidConfigError, defaultConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
+import { InvalidConfigError, defaultConfig, loadConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -262,12 +262,37 @@ describe("llama.cpp artifact paths", () => {
 });
 
 describe("first-run workspace config", () => {
-  test("a fresh install's config normalizes to a real workspace path for boot to create", () => {
-    // The boot call normalizes because defaultConfig() alone is blank, and mkdir refuses a blank path.
-    expect(defaultConfig().jarvis_path).toBe("");
-    expect(normalizeConfig(defaultConfig()).jarvis_path).toBe(
-      join(homedir(), ".openclaw", "agents", "coderclaw", "workspace", "home-base"),
-    );
+  test("first load returns the app-owned workspace path before any config is written", () => {
+    const home = mkdtempSync(join(tmpdir(), "jarvis-first-load-"));
+    const configFile = join(home, ".openclaw", "jarvis", "config.json");
+    const expectedWorkspace = join(home, ".openclaw", "agents", "coderclaw", "workspace", "home-base");
+
+    try {
+      const config = loadConfig({ configFile, home });
+
+      expect(config.jarvis_path).toBe(expectedWorkspace);
+      expect(config.jarvis_path.trim()).not.toBe("");
+      expect(existsSync(configFile)).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an existing configured workspace path on first load", () => {
+    const home = mkdtempSync(join(tmpdir(), "jarvis-configured-workspace-"));
+    const configDir = join(home, ".openclaw", "jarvis");
+    const workspace = join(home, "custom-workspace");
+    const configFile = join(configDir, "config.json");
+
+    try {
+      mkdirSync(configDir, { recursive: true });
+      mkdirSync(workspace, { recursive: true });
+      writeFileSync(configFile, JSON.stringify({ jarvis_path: workspace }));
+
+      expect(loadConfig({ configFile, home }).jarvis_path).toBe(workspace);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
