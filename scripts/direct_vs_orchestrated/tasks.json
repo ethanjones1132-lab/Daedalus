@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "arithmetic",
+      "prompt": "What is 17 plus 25? Reply with the integer only.",
+      "max_tokens": 16,
+      "temperature": 0,
+      "top_p": 1,
+      "acceptance": {
+        "id": "exact_answer_42",
+        "expected_answer": "42",
+        "criteria": [
+          {
+            "id": "normalized_exact_answer",
+            "kind": "exact_text",
+            "expected": "42"
+          }
+        ]
+      }
+    },
+    {
+      "id": "code_explanation",
+      "prompt": "In at most three sentences, explain a Python list comprehension, mention optional filtering, and give one short example that squares 0 through 4.",
+      "max_tokens": 160,
+      "temperature": 0,
+      "top_p": 1,
+      "acceptance": {
+        "id": "blind_code_explanation",
+        "criteria": [
+          {
+            "id": "maps_expression",
+            "criterion": "Correctly explains mapping an expression over an iterable.",
+            "score": "binary"
+          },
+          {
+            "id": "optional_filter",
+            "criterion": "Describes optional filtering.",
+            "score": "binary"
+          },
+          {
+            "id": "squares_example",
+            "criterion": "Includes a valid concise example that squares 0 through 4.",
+            "score": "binary"
+          }
+        ]
+      }
+    },
+    {
+      "id": "fixture_tool_read",
+      "prompt": "Use the file-reading tool to read `stock.csv`. Return the product with the highest in-stock quantity as `name: quantity` only.",
+      "max_tokens": 64,
+      "temperature": 0,
+      "top_p": 1,
+      "acceptance": {
+        "id": "fixture_file_read",
+        "expected_answer": "beans: 14",
+        "criteria": [
+          {
+            "id": "highest_stock_answer",
+            "kind": "exact_text",
+            "expected": "beans: 14"
+          },
+          {
+            "id": "successful_read_file",
+            "kind": "minimum_successful_tool_calls",
+            "tool": "read_file",
+            "minimum": 1
+          },
+          {
+            "id": "no_failed_tool_results",
+            "kind": "maximum_failed_tool_results",
+            "maximum": 0
+          },
+          {
+            "id": "fixture_unchanged",
+            "kind": "fixture_sha256_matches_baseline"
+          }
+        ]
+      }
+    },
+    {
+      "id": "planning_no_implementation",
+      "prompt": "Give exactly four ordered planning steps for a lunch pickup flow. Cover menu choice, payment, kitchen order, and pickup notice. Do not write code or implement anything.",
+      "max_tokens": 192,
+      "temperature": 0,
+      "top_p": 1,
+      "acceptance": {
+        "id": "blind_planning_no_implementation",
+        "criteria": [
+          {
+            "id": "exactly_four_ordered_steps",
+            "criterion": "Contains exactly four ordered planning steps.",
+            "score": "binary"
+          },
+          {
+            "id": "menu_choice",
+            "criterion": "Covers menu choice.",
+            "score": "binary"
+          },
+          {
+            "id": "payment",
+            "criterion": "Covers payment.",
+            "score": "binary"
+          },
+          {
+            "id": "kitchen_order",
+            "criterion": "Covers the kitchen order.",
+            "score": "binary"
+          },
+          {
+            "id": "pickup_notice",
+            "criterion": "Covers a pickup notice.",
+            "score": "binary"
+          },
+          {
+            "id": "no_implementation_effects",
+            "criterion": "Contains no code block or file/tool writes.",
+            "score": "binary"
+          }
+        ]
+      }
+    }
+  ]
+}
