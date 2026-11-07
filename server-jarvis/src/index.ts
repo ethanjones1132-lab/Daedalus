@@ -320,6 +320,8 @@ import { withWireToolCalls } from "./orchestration/tool-call-wire";
 import { RoutePlan, routeAttemptSseFrame, type RouteChoice } from "./orchestration/route-plan";
 import { createToolTraceObserver } from "./orchestration/tool-trace";
 import { applyComparisonGeneration } from "./orchestration/comparison-generation";
+import { hasStageRouteOverride, resolveStageRoute, runStageRoute, stageTargetKey, type StageTarget } from "./orchestration/stage-route-policy";
+import { requestStageTarget } from "./orchestration/stage-target-request";
 import { finishSinglePassCompletion } from "./single-pass-completion";
 import { classifySinglePassToolArgs } from "./single-pass-tool-args";
 import { nextVerifiedWebSearchState } from "./verified-web-search";
@@ -2574,8 +2576,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastFallbackReason: string | undefined;
         let orchLastFallbackModel: string | undefined;
         // Who actually answered this turn, and every attempt that led there.
-
-        const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
+        const callModelAttempt = async (
+          messages: any[],
+          callOptions?: any,
+          excludeModels?: Set<string>,
+          forcedTarget?: StageTarget,
+          forcedAttemptIndex = 0,
+          forcedFallbackReason?: string,
+        ) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
           let attemptModel: string | undefined;
@@ -2584,10 +2592,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let attemptFirstTokenMs: number | undefined;
           let attemptFallbackRetries = excludeModels?.size ?? 0;
           let attemptFallbackDepth = 0;
-          let attemptFallbackReason: string | undefined;
+          let attemptFallbackReason: string | undefined = forcedFallbackReason;
           // Route plan: the selected backend unless the pool or cascade picks,
           // and "fallback" once an earlier candidate for this stage was excluded.
-          let attemptRouteChoice: RouteChoice = excludeModels && excludeModels.size > 0 ? "fallback" : "configured";
+          let attemptRouteChoice: RouteChoice = forcedTarget
+            ? (forcedAttemptIndex > 0 ? "fallback" : "configured")
+            : excludeModels && excludeModels.size > 0 ? "fallback" : "configured";
           let attemptInitialModel: string | undefined;
           /** F2/F3: stage/turn budget exhaustion is not model failure. */
           let runtimeStarvation = false;
@@ -2602,6 +2612,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
            */
           let attemptSettlement: StageSettlementDecision | null = null;
           const attemptStage = callOptions?.stageLabel as string | undefined;
+          const forcedBufferedActivity: string[] = [];
           try {
           const activeBackendIsOllama = cfg.active_backend === "ollama";
           const activeBackendIsLlamaCpp = cfg.active_backend === "llama_cpp";
@@ -2636,7 +2647,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // the portable qwen pair when localModels is omitted.
           let ollamaAvailableForPick = false;
           let localModelsForPick: string[] | undefined;
-          if (stageLabel && preferLocalForStage(stageLabel)) {
+          if (!forcedTarget && stageLabel && preferLocalForStage(stageLabel)) {
             try {
               const health = await checkOllamaHealth(cfg.ollama);
               ollamaAvailableForPick = health.running;
@@ -2678,7 +2689,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               modelScorecard.unfitKeys(stageLabel),
             )
             : new Set<string>(excludeModels ?? []);
-          if (stageLabel && cfg.orchestrator?.enabled) {
+          if (!forcedTarget && stageLabel && cfg.orchestrator?.enabled) {
             try {
               // Trial counts come from the in-process scorecard, which is
               // seeded from model_attributions — so a model that already has
@@ -2724,30 +2735,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
-          const resolvedOpenRouterModel = cfg.active_backend === "openrouter" && !poolProvider
+          const resolvedOpenRouterModel = !forcedTarget && cfg.active_backend === "openrouter" && !poolProvider
             ? await resolveOpenRouterModel(cfg)
             : null;
           // A pool-selected "ollama" agent (e.g. a local reviewer lane) pins
           // this stage to ITS model_id, independent of the backend-wide
           // active_backend setting — that's what lets a stage route to a
           // local model even when the global default backend is openrouter.
-          const isPoolOllama = poolProvider === "ollama";
-          const isOllama = isPoolOllama || (activeBackendIsOllama && !poolProvider);
-          const isLlamaCpp = activeBackendIsLlamaCpp && !poolProvider;
+          const isPoolOllama = forcedTarget?.provider === "ollama" || poolProvider === "ollama";
+          const isOllama = isPoolOllama || (!forcedTarget && activeBackendIsOllama && !poolProvider);
+          const isLlamaCpp = forcedTarget?.provider === "llama_cpp" || (!forcedTarget && activeBackendIsLlamaCpp && !poolProvider);
           const isLocalInference = isOllama || isLlamaCpp;
           const localTarget = isLlamaCpp
-            ? { chatUrl: `${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/chat/completions`, modelName: cfg.llama_cpp.model, tried: [cfg.llama_cpp.base_url], supportsNativeTools: true }
+            ? { chatUrl: `${cfg.llama_cpp.base_url.replace(/\/+$/, "")}/chat/completions`, modelName: forcedTarget?.model ?? cfg.llama_cpp.model, tried: [cfg.llama_cpp.base_url], supportsNativeTools: true }
             : isOllama
-            ? await resolveOllamaChatTarget(cfg, isPoolOllama ? poolModel ?? undefined : undefined)
+            ? forcedTarget?.provider === "ollama"
+              ? { chatUrl: `${cleanOllamaBaseUrl(cfg.ollama.base_url)}/v1/chat/completions`, modelName: forcedTarget.model, tried: [cfg.ollama.base_url], supportsNativeTools: true }
+              : await resolveOllamaChatTarget(cfg, isPoolOllama ? poolModel ?? undefined : undefined)
             : null;
 
           const modelName = isLocalInference
-            ? (localTarget?.modelName ?? (isPoolOllama ? poolModel! : isLlamaCpp ? cfg.llama_cpp.model : cfg.ollama.model))
-            : poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
+            ? (forcedTarget?.model ?? localTarget?.modelName ?? (isPoolOllama ? poolModel! : isLlamaCpp ? cfg.llama_cpp.model : cfg.ollama.model))
+            : forcedTarget?.model ?? poolModel ?? resolvedOpenRouterModel ?? cfg.openrouter.model;
           // The effective provider for the PRIMARY request. OpenCode providers
           // speak OpenAI-compatible /chat/completions but live on their own
           // base_url + key (resolveProviderTarget). OpenRouter is the default.
-          const effectiveProvider = poolProvider ?? "openrouter";
+          const effectiveProvider = (forcedTarget && !isLocalInference ? forcedTarget.provider : poolProvider ?? "openrouter") as "openrouter" | "opencode_zen" | "opencode_go" | "vllm";
           attemptModel = modelName;
           attemptProvider = isLlamaCpp ? "llama_cpp" : effectiveProvider;
           attemptInitialModel = modelName;
@@ -2755,7 +2768,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const providerTarget = !isLocalInference ? resolveProviderTarget(cfg, effectiveProvider) : null;
           // Only OpenRouter models are described by the OpenRouter catalog;
           // OpenCode and self-hosted vLLM use their own provider capabilities.
-          const openRouterEffective = (!isLocalInference && effectiveProvider === "openrouter")
+          const openRouterEffective = (!forcedTarget && !isLocalInference && effectiveProvider === "openrouter")
             ? await resolveEffectiveOpenRouterRequestConfig(cfg, modelName, messages, { surface })
             : null;
           const baseUrl = isLocalInference
@@ -2839,6 +2852,14 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (callOptions?.temperature !== undefined) requestBody.temperature = callOptions.temperature;
             else if (cfg.temperature !== undefined) requestBody.temperature = cfg.temperature;
             if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
+          } else if (forcedTarget) {
+            // Explicit routes do not consult the live OpenRouter catalog. Keep
+            // the request within the user-selected candidate sequence while
+            // preserving the configured sampler and output budget.
+            requestBody.max_tokens = callOptions?.max_tokens ?? cfg.max_tokens;
+            requestBody.temperature = callOptions?.temperature ?? cfg.temperature;
+            if (cfg.top_p !== undefined) requestBody.top_p = cfg.top_p;
+            if (typeof cfg.top_k === "number" && cfg.top_k > 0) requestBody.top_k = cfg.top_k;
           } else {
             await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
               requestedMaxTokens: callOptions?.max_tokens,
@@ -2850,7 +2871,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
           if (cfg.tools.enabled && !useTextTools && callOptions?.tools && callOptions.tools.length > 0) {
             requestBody.tools = toApiTools(callOptions.tools);
-            if (!isLocalInference && effectiveProvider === "openrouter") {
+            if (!forcedTarget && !isLocalInference && effectiveProvider === "openrouter") {
               await applyOpenRouterRequestConfig(requestBody, cfg, modelName, normalizedMessages, {
                 requestedMaxTokens: callOptions?.max_tokens,
                 requestedTemperature: callOptions?.temperature,
@@ -2872,7 +2893,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // 429s frequently and 503s during provider outages). Without this
           // every orchestrator stage dies on the first transient error and the
           // user sees a silent stall.
-          const useFallback = !isLocalInference && cfg.openrouter.enable_fallbacks;
+          const useFallback = !forcedTarget && !isLocalInference && cfg.openrouter.enable_fallbacks;
           const requestTimeout = isLocalInference ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
           const ctrl = new AbortController();
           // F3: distinguish true turn exhaustion from per-stage usage exhaustion
@@ -3020,7 +3041,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 })}\n\n`));
               }
             } else {
-              fetchRes = effectiveProvider === "vllm"
+              fetchRes = forcedTarget
+                ? await requestStageTarget(cfg, forcedTarget, requestBody, ctrl.signal)
+                : effectiveProvider === "vllm"
                 ? await fetchVllmChat(cfg, providerTarget!, modelName, requestBody, { signal: ctrl.signal })
                 : await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
             }
@@ -3356,6 +3379,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // attemptOutcome in the catch block.
           const finishTracker = createStreamFinishTracker();
           const emitTextToken = async (text: string) => {
+            if (forcedTarget) {
+              forcedBufferedActivity.push(text);
+              return;
+            }
             if (callOptions?.surfaceAsAnswer) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ type: "stream_event", delta: { text }, session_id: sessionId })}\n\n`));
             } else if (!callOptions?.suppressActivity) {
@@ -3561,7 +3588,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // orchestrator path now does the same and additionally surfaces a
           // one-line `[Jarvis]` warning per malformed entry so the operator
           // can attribute the failure to a specific model output.
-          const normalizeCtx = `model=${poolModel ?? "<unknown>"} provider=${poolProvider ?? "<unknown>"} stage=${stageLabel ?? "<none>"}`;
+          const normalizeCtx = `model=${forcedTarget?.model ?? poolModel ?? "<unknown>"} provider=${forcedTarget?.provider ?? poolProvider ?? "<unknown>"} stage=${stageLabel ?? "<none>"}`;
           const normalized = normalizeStreamedToolCalls(activeToolCalls);
           for (const w of normalized.warnings) {
             console.warn(`[Jarvis] malformed streamed tool_call (${w.kind}) ${normalizeCtx}: ${w.message}`);
@@ -3576,7 +3603,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             tools: callOptions?.tools,
             useTextTools: Boolean(useTextTools),
             // W3.3: per-model tool-format observation for later prompt selection.
-            modelId: poolModel ?? null,
+            modelId: forcedTarget?.model ?? poolModel ?? null,
           });
           let parsedToolCalls = resolvedTools.calls;
           let toolParseFlags = resolvedTools.toolParseFlags;
@@ -3748,6 +3775,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               `finish_reason=${finishSettle.finish_reason ?? "null"} stop_reason=${finishSettle.stop_reason}`,
             );
           }
+          if (forcedTarget && (cleanContent.trim() || parsedToolCalls.length > 0)) {
+            for (const text of forcedBufferedActivity) {
+              visibleTurnText += text;
+              callOptions?.onChunk?.(text);
+              await writer.write(encoder.encode(`data: ${JSON.stringify(callOptions?.surfaceAsAnswer
+                ? { type: "stream_event", delta: { text }, session_id: sessionId }
+                : { type: "agent_activity", stage: callOptions?.stageLabel ?? "agent", text, session_id: sessionId })}\n\n`));
+            }
+          }
           return {
             content: cleanContent,
             tool_calls: parsedToolCalls.length > 0 ? parsedToolCalls : undefined,
@@ -3894,6 +3930,140 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // extra advance to cap latency; if both come back empty the pipeline
         // records `empty_completion` and the user gets the friendly retry notice.
         const callModel = async (messages: any[], callOptions?: any) => {
+          const routeStage = callOptions?.stageLabel as import("./orchestration/stage-route-policy").RoutingStage | undefined;
+          if (routeStage && hasStageRouteOverride(cfg, routeStage)) {
+            const excludedModels = new Set<string>(callOptions?.excludeModels ?? []);
+            const stageExclusions = combinedStageExclusions(
+              stageHealth,
+              routeStage,
+              excludedModels,
+              excludedModelKeys(),
+              modelScorecard.unfitKeys(routeStage),
+            );
+            const primarySetting = cfg.orchestrator.stage_models?.[routeStage];
+            const fallbackSetting = cfg.orchestrator.fallback_chains?.[routeStage];
+            const needsAutomaticPrimary = primarySetting === undefined || primarySetting === "automatic";
+            const needsAutomaticFallbacks = fallbackSetting === undefined || fallbackSetting === "automatic";
+            const automatic: { primary?: StageTarget; fallbacks: StageTarget[] } = { fallbacks: [] };
+
+            if (needsAutomaticPrimary || needsAutomaticFallbacks) {
+              try {
+                const candidates = await routableAgentsWithProviderHealth(cfg);
+                const automaticPool = new AgentPool(candidates)
+                  .withTrialSampleCounts((agent, trialStage) => modelScorecard.sampleCount(trialStage, `${agent.provider}:${agent.model_id}`))
+                  .withReliabilityStats((agent, reliabilityStage) => modelScorecard.reliabilityEntry(reliabilityStage, `${agent.provider}:${agent.model_id}`));
+                const cascadeTier = callOptions?.cascadeTier as "cheap" | "strong" | undefined;
+                const chain = cascadeTier
+                  ? automaticPool.cascadeChain(routeStage, orchestratorTaskType, stageExclusions)
+                  : undefined;
+                let ollamaAvailable = false;
+                let localModels: string[] | undefined;
+                if (preferLocalForStage(routeStage)) {
+                  try {
+                    const health = await checkOllamaHealth(cfg.ollama);
+                    ollamaAvailable = health.running;
+                    if (ollamaAvailable) {
+                      const preferred = [cfg.orchestrator?.conductor?.model, cfg.orchestrator?.conductor?.fallback_model]
+                        .filter((model): model is string => typeof model === "string" && model.trim().length > 0);
+                      if (preferred.length > 0) {
+                        const installed = preferred.filter((model) => health.models.some((name) =>
+                          name === model || name.startsWith(`${model.split(":")[0]}:`) || name === model.split(":")[0],
+                        ));
+                        localModels = installed.length > 0 ? installed : preferred;
+                      }
+                    }
+                  } catch {
+                    ollamaAvailable = false;
+                  }
+                }
+                const selected = chain
+                  ? (cascadeTier === "cheap" ? chain[0] : chain[chain.length - 1])
+                  : automaticPool.pickFor(routeStage, orchestratorTaskType, stageExclusions, {
+                      complexity: callOptions?.complexity ?? activeTaskRun.estimatedComplexity ?? "medium",
+                      preferStrong: callOptions?.preferStrongModel === true,
+                      remainingStageMs: turnBudget.stageRemainingMs(routeStage, Date.now()),
+                      ollamaAvailable,
+                      localModels,
+                    });
+                const targetForAgent = (agent: import("./orchestration/agent-pool").OrchestratorAgent | undefined): StageTarget | undefined => {
+                  if (!agent) return undefined;
+                  if (agent.provider === "ollama" || isHttpProviderId(agent.provider)) {
+                    return { provider: agent.provider, model: agent.model_id } as StageTarget;
+                  }
+                  return undefined;
+                };
+                automatic.primary = targetForAgent(selected);
+                const autoChain = selected
+                  ? automaticPool.fallbackChain(selected, routeStage, orchestratorTaskType)
+                  : [];
+                automatic.fallbacks = autoChain.slice(1)
+                  .map(targetForAgent)
+                  .filter((candidate): candidate is StageTarget => Boolean(candidate));
+              } catch (error) {
+                console.warn(`[Jarvis Orchestrator] Automatic stage route selection failed for ${routeStage}: ${error instanceof Error ? error.message : String(error)}`);
+              }
+              if (needsAutomaticPrimary && !automatic.primary) {
+                automatic.primary = cfg.active_backend === "llama_cpp"
+                  ? { provider: "llama_cpp", model: cfg.llama_cpp.model }
+                  : cfg.active_backend === "ollama"
+                    ? { provider: "ollama", model: cfg.ollama.model }
+                    : { provider: "openrouter", model: cfg.openrouter.model || "openrouter/free" };
+              }
+            }
+
+            const routeExclusions = new Set<string>();
+            for (const key of stageExclusions) {
+              const splitAt = key.indexOf(":");
+              if (splitAt <= 0) continue;
+              const provider = key.slice(0, splitAt);
+              const model = key.slice(splitAt + 1);
+              for (const target of [automatic.primary, ...automatic.fallbacks]) {
+                if (target && (key === `${target.provider}:${target.model}` || (model === "*" && target.provider === provider))) {
+                  routeExclusions.add(stageTargetKey(target));
+                }
+              }
+            }
+            const candidates = resolveStageRoute(cfg, routeStage, automatic, routeExclusions)
+              .filter((candidate) =>
+                !stageExclusions.has(`${candidate.provider}:${candidate.model}`)
+                && !stageExclusions.has(`${candidate.provider}:*`),
+              );
+            let attemptIndex = 0;
+            let fallbackReason: string | undefined;
+            const routeSignal = callOptions?.stageAbort
+              ? AbortSignal.any([streamAbort.signal, callOptions.stageAbort])
+              : streamAbort.signal;
+            return runStageRoute(candidates, {
+              cfg,
+              signal: routeSignal,
+              deadline: turnBudget.stageStreamDeadlineAt(routeStage, Date.now()) ?? turnBudget.deadlineAt,
+              onRejected: (candidate, reason) => {
+                attemptIndex += 1;
+                fallbackReason = reason;
+                const rejection = routePlan.reject(candidate, reason, routeStage);
+                if (rejection) {
+                  void writer.write(encoder.encode(`data: ${JSON.stringify({ type: "route_rejected", ...rejection, session_id: sessionId })}\n\n`)).catch(() => {});
+                }
+              },
+            }, async (candidate) => {
+              const currentAttempt = attemptIndex++;
+              try {
+                const result = await callModelAttempt(messages, callOptions, new Set(), candidate, currentAttempt, fallbackReason);
+                const usable = Boolean(result.content?.trim()) || Boolean(result.tool_calls?.length);
+                if (!usable) {
+                  fallbackReason = "empty_completion";
+                  return { usable: false, reason: "empty_completion" };
+                }
+                return { usable: true, value: result };
+              } catch (error) {
+                if (routeSignal.aborted || error instanceof StageDeadlineExceededError || error instanceof StageBudgetExhaustedError || error instanceof TurnDeadlineExceededError) {
+                  throw error;
+                }
+                fallbackReason = error instanceof Error ? error.message : String(error);
+                return { usable: false, reason: fallbackReason };
+              }
+            });
+          }
           const canRetryStage = Boolean(callOptions?.stageLabel) && cfg.active_backend !== "ollama" && cfg.active_backend !== "llama_cpp" && cfg.openrouter.enable_fallbacks;
           const canAdvanceEmpty = (callOptions?.surfaceAsAnswer === true || callOptions?.advanceOnEmpty === true) && canRetryStage;
           const exclude = new Set<string>(callOptions?.excludeModels ?? []);
@@ -3993,7 +4163,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             session_id: sessionId,
           })}\n\n`));
         };
-        const coordinator = new Coordinator(callModel, persistentConductor, onLocalUnavailable);
+        const coordinator = new Coordinator(callModel, persistentConductor, onLocalUnavailable, {
+          preferPersistentConductor: !hasStageRouteOverride(cfg, "coordinator"),
+        });
         const grantedRootsHint = activeTaskRun.sessionGrants?.length
           ? ` Session-granted filesystem roots: ${activeTaskRun.sessionGrants.join(", ")}.`
           : "";
@@ -4333,6 +4505,20 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         // leak handlers or abort handles into another request.
         const conductorBus = new ConductorBus();
         const localSupervisor = async (messages: any[]) => {
+          if (hasStageRouteOverride(cfg, "coordinator")) {
+            const result = await callModel(messages, {
+              stageLabel: "coordinator",
+              temperature: 0.1,
+              max_tokens: 4096,
+              suppressActivity: true,
+            });
+            return {
+              content: result.content,
+              _provider: result._provider,
+              _modelUsed: result._modelUsed,
+              _fallbackUsed: result._fallbackUsed,
+            };
+          }
           const timeoutMs = Math.max(
             1_000,
             cfg.orchestrator.conductor.supervision.supervision_timeout_ms - 250,

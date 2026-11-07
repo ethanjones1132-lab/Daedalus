@@ -1,4 +1,5 @@
 import type { JarvisConfig, OrchestratorConfig } from "../config";
+import { cloudHelpersAllowed, isCloudProvider, isProviderAvailable } from "../provider-availability";
 
 export const ROUTING_STAGES = [
   "coordinator",
@@ -31,6 +32,41 @@ export const MAX_STAGE_MODEL_ID_LENGTH = 512;
 export interface AutomaticStageRoute {
   primary?: StageTarget;
   fallbacks: readonly StageTarget[];
+}
+
+export type StageAttemptResult<T> =
+  | { usable: true; value: T }
+  | { usable: false; reason: string };
+
+export interface StageRouteRunContext {
+  cfg: JarvisConfig;
+  signal: AbortSignal;
+  /** Absolute wall-clock deadline shared by every candidate in this route. */
+  deadline: number;
+  onRejected(target: StageTarget, reason: string): void;
+  /** Optional provider-specific readiness check, run immediately before dispatch. */
+  preflight?(target: StageTarget, signal: AbortSignal): Promise<string | undefined | null>;
+}
+
+export class StageRouteExhaustedError extends Error {
+  constructor(readonly reason: string) {
+    super(reason || "stage_route_exhausted: no usable target");
+    this.name = "StageRouteExhaustedError";
+  }
+}
+
+class StageRouteAbortedError extends Error {
+  constructor() {
+    super("stage route cancelled");
+    this.name = "AbortError";
+  }
+}
+
+class StageRouteDeadlineError extends Error {
+  constructor() {
+    super("stage route deadline exceeded");
+    this.name = "TimeoutError";
+  }
 }
 
 /** A stable, unambiguous identity for exclusion and de-duplication. */
@@ -158,4 +194,52 @@ export function resolveStageRoute(
     resolved.push(candidate);
   }
   return resolved;
+}
+
+function assertStageRouteActive(context: StageRouteRunContext): void {
+  if (context.signal.aborted) throw new StageRouteAbortedError();
+  if (Date.now() >= context.deadline) throw new StageRouteDeadlineError();
+}
+
+function targetPreflightRejection(cfg: JarvisConfig, target: StageTarget): string | undefined {
+  if (isCloudProvider(target.provider) && !cloudHelpersAllowed(cfg)) {
+    return "cloud_helpers_disabled";
+  }
+  if (target.provider === "llama_cpp") {
+    return cfg.llama_cpp?.base_url?.trim() && cfg.llama_cpp.model === target.model
+      ? undefined
+      : "provider_unavailable";
+  }
+  return isProviderAvailable(cfg, target.provider) ? undefined : "provider_unavailable";
+}
+
+/** Run only the supplied sequence. It never extends it with a pool or provider tail. */
+export async function runStageRoute<T>(
+  targets: readonly StageTarget[],
+  context: StageRouteRunContext,
+  attempt: (target: StageTarget, signal: AbortSignal) => Promise<StageAttemptResult<T>>,
+): Promise<T> {
+  let lastReason = targets.length === 0 ? "stage_route_exhausted: no candidates" : "stage_route_exhausted: no usable target";
+
+  for (const target of targets) {
+    assertStageRouteActive(context);
+
+    let rejected = targetPreflightRejection(context.cfg, target);
+    if (!rejected && context.preflight) {
+      rejected = (await context.preflight(target, context.signal)) ?? undefined;
+    }
+    assertStageRouteActive(context);
+    if (rejected) {
+      context.onRejected(target, rejected);
+      lastReason = rejected;
+      continue;
+    }
+
+    const result = await attempt(target, context.signal);
+    assertStageRouteActive(context);
+    if (result.usable) return result.value;
+    lastReason = result.reason;
+  }
+
+  throw new StageRouteExhaustedError(lastReason);
 }

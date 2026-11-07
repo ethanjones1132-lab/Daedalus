@@ -937,6 +937,35 @@ function normalizeAnthropicSse(response: Response, requestedModel: string): Resp
   return new Response(readable, { status: response.status, statusText: response.statusText, headers });
 }
 
+/** Provider-specific wire body for a single, already-selected stage target. */
+export function buildSingleProviderRequestBody(
+  provider: HttpProviderId,
+  model: string,
+  body: Record<string, any>,
+): Record<string, any> {
+  const selected: Record<string, any> = { ...body, model };
+  if (provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic") {
+    return buildAnthropicAttemptBody(selected, model);
+  }
+  if (provider !== "openrouter" && !providerSupportsNativeTools(provider)) {
+    delete selected.tools;
+    delete selected.tool_choice;
+    if (Array.isArray(selected.messages)) selected.messages = sanitizeToolMessages(selected.messages);
+  }
+  return selected;
+}
+
+/** Normalize the one provider protocol that is not OpenAI-compatible. */
+export function normalizeSingleProviderResponse(
+  response: Response,
+  provider: HttpProviderId,
+  model: string,
+): Response {
+  return provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic"
+    ? normalizeAnthropicSse(response, model)
+    : response;
+}
+
 /**
  * Build the per-attempt request body for a provider. OpenRouter bodies get the
  * full catalog-aware massaging (max_tokens, temperature/top_p gating, native

@@ -225,6 +225,7 @@ export class Coordinator {
     private persistentConductor?: PersistentConductor,
     /** T1.7: fired exactly once per fallback turn when local conductor was expected but unavailable. */
     private onLocalUnavailable?: LocalUnavailableCallback,
+    private options: { preferPersistentConductor?: boolean } = {},
   ) {}
 
   async route(request: string, options: CoordinatorRouteOptions): Promise<CoordinatorResult> {
@@ -356,7 +357,9 @@ export class Coordinator {
     },
   ): Promise<{ content: string; source: "local" | "api" | "deterministic"; model?: string }> {
     throwIfAborted(options.signal);
-    const conductor = this.persistentConductor;
+    const conductor = this.options.preferPersistentConductor === false
+      ? undefined
+      : this.persistentConductor;
     if (conductor) {
       try {
         if (await conductor.isAvailable()) {

@@ -357,6 +357,41 @@ describe("Coordinator", () => {
     expect(decision.pipeline).toEqual(["planner", "executor", "synthesizer"]);
   });
 
+  test("explicit coordinator policy bypasses the resident conductor", async () => {
+    let apiCalls = 0;
+    let apiStage = "";
+    let residentCalls = 0;
+    (globalThis as any).fetch = async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/tags")) { residentCalls += 1; return Response.json({ models: [{ name: "gemma4:e2b" }] }); }
+      if (url.endsWith("/api/chat")) { residentCalls += 1; throw new Error("resident conductor must be bypassed"); }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+    const cfg: JarvisConfig = defaultConfig();
+    cfg.orchestrator.conductor.enabled = true;
+    cfg.orchestrator.conductor.persist_sessions = false;
+    cfg.orchestrator.conductor.kv_backend = "ollama";
+    cfg.orchestrator.conductor.fallback_model = "gemma4:e2b";
+    const conductor = new PersistentConductor(() => cfg);
+    const coordinator = new Coordinator(async (_messages, options) => {
+      apiCalls += 1;
+      apiStage = options?.stageLabel ?? "";
+      return { content: JSON.stringify({
+        task_type: "debug",
+        pipeline: ["planner", "executor", "synthesizer"],
+        topology: "linear",
+        context: { needs_workspace_inspection: true, needs_memory: true, estimated_complexity: "high" },
+        coordinator_rationale: "Explicit stage route",
+      }) };
+    }, conductor, undefined, { preferPersistentConductor: false });
+
+    const decision = await coordinator.route("Fix the auth module", { sessionId: "explicit-coordinator-1" });
+    expect(apiCalls).toBe(1);
+    expect(apiStage).toBe("coordinator");
+    expect(residentCalls).toBe(0);
+    expect(decision.task_type).toBe("debug");
+  });
+
   test("falls back to API coordinator when local conductor is unavailable", async () => {
     (globalThis as any).fetch = async (input: string | URL) => {
       const url = String(input);

@@ -49,6 +49,15 @@ export interface RoutePlanSummary {
   /** True when any attempt in this turn went to a cloud provider. */
   left_machine: boolean;
   attempts: RouteAttempt[];
+  /** Candidates denied before a network request; these do not count as cloud hops. */
+  preflight_rejections: RoutePreflightRejection[];
+}
+
+export interface RoutePreflightRejection {
+  stage: string;
+  provider: string;
+  model: string;
+  reason: string;
 }
 
 const ANSWER_STAGES = ["synthesizer", "rewriter", "executor", "agent", "agent_loop"];
@@ -57,6 +66,20 @@ const MAX_ERROR_CHARS = 240;
 
 export class RoutePlan {
   private readonly items: RouteAttempt[] = [];
+  private readonly rejected: RoutePreflightRejection[] = [];
+
+  /** Record a bounded candidate denial without attributing a provider request. */
+  reject(target: { provider: string; model: string }, reason: string, stage = "agent"): RoutePreflightRejection | undefined {
+    if (!stage || !target.provider || !target.model || this.rejected.length >= MAX_ATTEMPTS) return undefined;
+    const rejection = {
+      stage,
+      provider: target.provider,
+      model: target.model,
+      reason: reason.slice(0, MAX_ERROR_CHARS),
+    };
+    this.rejected.push(rejection);
+    return rejection;
+  }
 
   /** Record one settled attempt. Bounded, and never throws. */
   add(input: Omit<RouteAttempt, "cloud" | "answered"> & { answered?: boolean }): RouteAttempt | undefined {
@@ -104,6 +127,7 @@ export class RoutePlan {
         : {}),
       left_machine: this.items.some((attempt) => attempt.cloud),
       attempts: [...this.items],
+      preflight_rejections: [...this.rejected],
     };
   }
 }

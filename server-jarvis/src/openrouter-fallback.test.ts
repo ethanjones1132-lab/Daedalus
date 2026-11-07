@@ -329,11 +329,12 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       });
     }) as typeof fetch;
 
+    const observedAttempts: Array<{ provider: string; model: string; outcome: string; duration_ms: number; error?: string }> = [];
     const result = await chatCompletionWithFallback(
       cfg,
       { model: "cohere/north-mini-code:free", messages: [{ role: "user", content: "go" }], stream: true },
       undefined,
-      { stage: "executor", taskType: "debug" },
+      { stage: "executor", taskType: "debug", onAttempt: (attempt) => observedAttempts.push(attempt) },
     );
 
     const chatCalls = calls.filter((c) => c.url.includes("/chat/completions"));
@@ -353,6 +354,11 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(result.retries).toBe(2);
     expect(result.fallback_depth).toBe(1);
     expect(result.fallback_reason).toBe("rate_limited");
+    expect(observedAttempts.map(({ provider, model, outcome }) => ({ provider, model, outcome }))).toEqual([
+      { provider: "openrouter", model: "cohere/north-mini-code:free", outcome: "http_error" },
+      { provider: "openrouter", model: "cohere/north-mini-code:free", outcome: "http_error" },
+      { provider: "opencode_zen", model: "nemotron-3-ultra-free", outcome: "response" },
+    ]);
 
     // The two 429s represent an endpoint quota window, so a later stage must
     // skip every model on that provider instead of paying the same tax again.

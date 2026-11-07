@@ -402,6 +402,27 @@ describe("Claude executor delegate", () => {
     expect(delegateEligibility(base)).toEqual({ eligible: true });
   });
 
+  test("an explicit executor route keeps work on the configured stage caller", () => {
+    const config = testConfig();
+    const base = {
+      config,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      healthAvailable: true,
+      allowedRoots: ["C:\\repo"],
+    };
+    config.orchestrator.stage_models = { executor: { provider: "ollama", model: "executor-local" } };
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "explicit_executor_route" });
+
+    config.orchestrator.stage_models = {};
+    config.orchestrator.fallback_chains = { executor: [] };
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "explicit_executor_route" });
+
+    config.orchestrator.fallback_chains = {};
+    expect(delegateEligibility(base)).toEqual({ eligible: true });
+  });
+
   test("refuses subscription mode so the automated delegate never spends Claude quota", () => {
     // Free-routing imperative: the delegate is automated, so subscription mode
     // (which bypasses the local proxy and bills the user's Anthropic quota) must

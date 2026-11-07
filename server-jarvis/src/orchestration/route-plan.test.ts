@@ -24,6 +24,16 @@ describe("route plan", () => {
     expect(summary.answered_by?.provider).toBe("llama_cpp");
   });
 
+  test("preflight rejections are visible without counting as dispatched cloud attempts", () => {
+    const plan = new RoutePlan();
+    plan.reject({ provider: "openrouter", model: "blocked-cloud" }, "cloud_helpers_disabled", "executor");
+    const summary = plan.summary();
+    expect(summary).toMatchObject({ left_machine: false, preflight_rejections: [{
+      stage: "executor", provider: "openrouter", model: "blocked-cloud", reason: "cloud_helpers_disabled",
+    }] });
+    expect(summary.attempts).toEqual([]);
+  });
+
   test("an answer stage wins over a later non-answer stage", () => {
     const plan = new RoutePlan();
     plan.add({ stage: "synthesizer", provider: "llama_cpp", model: "a", choice: "configured", outcome: "success", duration_ms: 1 });

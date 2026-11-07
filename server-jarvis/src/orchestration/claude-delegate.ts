@@ -16,6 +16,7 @@ import {
 } from "../mcp-adapter";
 import { openCodeGoProtocolForModel } from "./live-model-catalog";
 import { cloudHelpersAllowed } from "../provider-availability";
+import { hasStageRouteOverride } from "./stage-route-policy";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
 import { mkdtempSync, rmSync, writeFileSync, type Dirent } from "fs";
@@ -320,6 +321,7 @@ export interface DelegateEligibilityInput {
 export type DelegateIneligibilityReason =
   | "claude_cli_disabled"
   | "delegate_disabled"
+  | "explicit_executor_route"
   | "local_only"
   | "subscription_mode"
   | "missing_opencode_go_key"
@@ -334,6 +336,9 @@ export function delegateEligibility(
 ): { eligible: true } | { eligible: false; reason: DelegateIneligibilityReason } {
   if (!input.config.claude_cli.enabled) return { eligible: false, reason: "claude_cli_disabled" };
   if (!input.config.claude_cli.delegate.enabled) return { eligible: false, reason: "delegate_disabled" };
+  if (hasStageRouteOverride(input.config, "executor")) {
+    return { eligible: false, reason: "explicit_executor_route" };
+  }
   // Local boundary: the delegate's models are cloud (OpenCode Go / free
   // routers via the proxy). With a local Inference backend and cloud helpers
   // off, the native local executor loop runs instead.
