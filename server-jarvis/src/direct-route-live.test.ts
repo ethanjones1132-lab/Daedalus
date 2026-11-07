@@ -84,7 +84,8 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
         expect(requests).toBe(requestsBeforeStartup);
         const start = (session: string) => fetch(`${base}/chat/stream`, {
           method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: "Hi", session_id: session, history: [] }), signal: AbortSignal.timeout(12_000),
+          body: JSON.stringify({ message: "Hi", session_id: session, history: [],
+            config: { ...config, max_tokens: 16, temperature: 0, top_p: 1 } }), signal: AbortSignal.timeout(12_000),
         });
         const frames = async (response: Response) => (await response.text()).split("\n")
           .filter((line) => line.startsWith("data: {"))
