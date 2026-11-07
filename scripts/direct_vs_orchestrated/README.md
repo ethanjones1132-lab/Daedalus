@@ -2,7 +2,7 @@
 
 This harness runs a fixed, descriptive comparison of Jarvis direct chat and the built-in orchestrator against one explicitly supplied local `llama-server` and GGUF. It records 2 process-cold arithmetic turns, 2 unreported warm-ups, and 24 warm observations arranged as 3 counterbalanced pairs for each of 4 tasks.
 
-The sample is descriptive only. It does not establish general quality superiority. The harness does not start inference during development or tests.
+The sample is descriptive only. It does not establish general quality superiority. Offline tests use controlled fixtures; they do not run a real model or establish model performance.
 
 The frozen corpus uses temperature 0, top-p 1, and a 4,096-token completion cap per model invocation. The explicit `comparison_generation` policy applies those values at the final Direct, orchestration-stage, and resident-conductor request boundaries. Normal Jarvis generation defaults remain unchanged when that policy is absent. The total per-turn time budget is 120 seconds; orchestration may make multiple capped model calls within it. All corpus tasks share the persisted policy so the resident conductor also uses the same settings.
 

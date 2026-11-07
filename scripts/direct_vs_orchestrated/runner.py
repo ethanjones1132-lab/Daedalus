@@ -1187,7 +1187,7 @@ def _execute_campaign(
     _atomic_write_json(manifest_path, manifest)
     task_by_id = {task["id"]: task for task in tasks}
     server_root = repo_root / "server-jarvis"
-    bun_argv = [str(bun_path), "run", "--no-env-file", "src/index.ts"]
+    bun_argv = [str(bun_path), "run", "--no-env-file", "--no-install", "src/index.ts"]
     bun_commands = [bun_argv, bun_argv]
     bun_modes = ["direct", "orchestrated"]
     bun_envs = [
@@ -1521,7 +1521,7 @@ def run_comparison(args: argparse.Namespace) -> Path:
         ports = {"llama_cpp": allocate_loopback_port(), "direct": allocate_loopback_port(), "orchestrated": allocate_loopback_port()}
     ensure_loopback_ports_free(list(ports.values()))
     model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
-    bun_model_argv = [str(bun_path), "run", "--no-env-file", "src/index.ts"]
+    bun_model_argv = [str(bun_path), "run", "--no-env-file", "--no-install", "src/index.ts"]
     llama_argv = [
         str(llama_server), "--model", str(model_path), "--host", "127.0.0.1",
         "--port", str(ports["llama_cpp"]), "--alias", served_alias, *llama_extra,

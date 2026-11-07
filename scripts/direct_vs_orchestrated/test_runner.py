@@ -619,6 +619,7 @@ class ProcessHarnessTests(unittest.TestCase):
         self.assertEqual(len(bun_processes), 2)
         for process in bun_processes:
             self.assertIn("--no-env-file", process.command)
+            self.assertIn("--no-install", process.command)
             self.assertEqual(process.kwargs["env"]["JARVIS_SERVER_HOST"], "127.0.0.1")
             self.assertNotIn("OPENAI_API_KEY", process.kwargs["env"])
 
