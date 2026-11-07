@@ -2762,7 +2762,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // base_url + key (resolveProviderTarget). OpenRouter is the default.
           const effectiveProvider = (forcedTarget && !isLocalInference ? forcedTarget.provider : poolProvider ?? "openrouter") as "openrouter" | "opencode_zen" | "opencode_go" | "vllm";
           attemptModel = modelName;
-          attemptProvider = isLlamaCpp ? "llama_cpp" : effectiveProvider;
+          attemptProvider = isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : effectiveProvider;
           attemptInitialModel = modelName;
           const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
           const providerTarget = !isLocalInference ? resolveProviderTarget(cfg, effectiveProvider) : null;

@@ -5,6 +5,8 @@ import { cn } from '../../design';
 export interface Choice<T extends string> {
   id: T;
   title: ReactNode;
+  /** Override the button's accessible name when its visible description should not be part of the name. */
+  ariaLabel?: string;
   description?: ReactNode;
   /** Small trailing tag, e.g. a local / cloud Badge. */
   badge?: ReactNode;
@@ -51,6 +53,7 @@ export function ChoiceCards<T extends string>({
             key={o.id}
             type="button"
             aria-pressed={on}
+            aria-label={o.ariaLabel}
             onClick={() => onChange(o.id)}
             className={cn(
               'group relative flex min-w-0 flex-col items-start gap-1.5 rounded-lg border p-3 text-left',

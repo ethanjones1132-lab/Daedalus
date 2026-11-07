@@ -12,6 +12,7 @@ export function SaveBar({
   saving,
   saved,
   saveError,
+  syncUnconfirmed,
   onSave,
   onDiscard,
 }: {
@@ -19,10 +20,11 @@ export function SaveBar({
   saving: boolean;
   saved: boolean;
   saveError: boolean;
+  syncUnconfirmed: boolean;
   onSave: () => void;
   onDiscard: () => void;
 }) {
-  if (!dirty && !saving && !saved && !saveError) return null;
+  if (!dirty && !saving && !saved && !saveError && !syncUnconfirmed) return null;
   return (
     <div className="sticky bottom-4 z-20 d-rise">
       <div className="space-y-2.5 rounded-[10px] border border-line-strong bg-overlay px-4 py-3 shadow-pop">
@@ -37,8 +39,13 @@ export function SaveBar({
             Config saved.
           </StatusLine>
         )}
+        {syncUnconfirmed && (
+          <StatusLine busy={false} tone="warn">
+            Saved locally; Bun sync unconfirmed
+          </StatusLine>
+        )}
         <div className="flex items-center justify-between gap-4">
-          <p className="d-label">{dirty ? 'Unsaved changes' : saved ? 'Up to date' : 'Nothing to save'}</p>
+          <p className="d-label">{dirty ? 'Unsaved changes' : saved ? 'Up to date' : syncUnconfirmed ? 'Sync unconfirmed' : 'Nothing to save'}</p>
           <div className="flex items-center gap-2">
             {dirty && (
               <Button variant="ghost" icon={<RotateCcw />} onClick={onDiscard} disabled={saving}>
@@ -46,7 +53,7 @@ export function SaveBar({
               </Button>
             )}
             <Button variant="primary" size="md" busy={saving} icon={saved && !saving ? <Check /> : undefined} onClick={onSave} disabled={saving}>
-              {saving ? 'Saving...' : saved ? 'Saved' : 'Save Config'}
+              {saving ? 'Saving...' : saved ? 'Saved' : syncUnconfirmed && !dirty ? 'Retry sync' : 'Save Config'}
             </Button>
           </div>
         </div>

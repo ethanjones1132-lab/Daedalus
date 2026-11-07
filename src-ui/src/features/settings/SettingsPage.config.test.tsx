@@ -42,9 +42,13 @@ const settingsTable: Record<string, string> = { system_prompt: 'Be useful.', the
 
 beforeEach(() => {
   invokeMock.mockReset();
+  let nativeConfig: Record<string, unknown> = structuredClone(baseConfig);
   invokeMock.mockImplementation((name: string, args?: Record<string, unknown>) => {
-    if (name === 'jarvis_get_config') return Promise.resolve(structuredClone(baseConfig));
-    if (name === 'jarvis_save_config') return Promise.resolve(null);
+    if (name === 'jarvis_get_config') return Promise.resolve(structuredClone(nativeConfig));
+    if (name === 'jarvis_save_config') {
+      nativeConfig = structuredClone(args?.config as Record<string, unknown>);
+      return Promise.resolve({ persisted: true, readbackOk: true, runtimeSynced: true });
+    }
     if (name === 'get_all_settings') return Promise.resolve({ ...settingsTable });
     if (name === 'set_setting') return Promise.resolve(args ? null : null);
     return Promise.resolve(null);
@@ -90,10 +94,28 @@ describe('Settings config round trip', () => {
 
   it('keeps unknown nested fields when a nested block is edited', async () => {
     await open();
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle orchestration runtime' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Direct' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
     await screen.findByRole('button', { name: 'Saved' });
     expect(savedConfig().orchestrator).toEqual({ enabled: false, max_stages: 4 });
+  });
+});
+
+describe('Settings unconfirmed Native readback', () => {
+  it('keeps the submitted draft when persistence succeeds but Native readback is unconfirmed', async () => {
+    await open();
+    const previous = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation((name: string, args?: Record<string, unknown>) => {
+      if (name === 'jarvis_save_config') return Promise.resolve({ persisted: true, readbackOk: false, runtimeSynced: false });
+      return previous?.(name, args);
+    });
+    const prompt = screen.getByRole('textbox', { name: 'System prompt text' });
+    fireEvent.change(prompt, { target: { value: 'Keep the submitted draft.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
+    await screen.findByText('Saved locally; Bun sync unconfirmed');
+    expect(prompt).toHaveValue('Keep the submitted draft.');
+    expect(calls('jarvis_get_config')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Save Config' })).toBeEnabled();
   });
 });
 
@@ -177,7 +199,7 @@ describe('Settings save bar and fields', () => {
     await open();
     expect(screen.queryByText(/spends your Claude subscription quota/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /Subscription/ }));
-    expect(screen.getByRole('note')).toHaveTextContent('spends your Claude subscription quota');
+    expect(screen.getAllByRole('note').some((note) => note.textContent?.includes('spends your Claude subscription quota'))).toBe(true);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -199,6 +221,54 @@ describe('Settings save bar and fields', () => {
       'Inference backend', 'Provider keys', 'Model', 'Orchestration', 'Endpoints', 'System prompt',
       'Bridge', 'Web search', 'Shell', 'Claude CLI auth', 'Appearance', 'Advanced',
     ]);
+  });
+
+  it('reports a persisted config as locally saved when Bun sync is unconfirmed', async () => {
+    await open();
+    fireEvent.change(screen.getByRole('textbox', { name: 'System prompt text' }), { target: { value: 'Locally persisted.' } });
+    let submitted: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation((name: string, args?: Record<string, unknown>) => {
+      if (name === 'jarvis_save_config') {
+        submitted = structuredClone(args?.config as Record<string, unknown>);
+        return Promise.resolve({ persisted: true, readbackOk: true, runtimeSynced: false, warningCode: 'bun_unavailable' });
+      }
+      if (name === 'jarvis_get_config') return Promise.resolve(structuredClone(submitted ?? baseConfig));
+      return Promise.resolve(null);
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
+    expect(await screen.findByText('Saved locally; Bun sync unconfirmed')).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'System prompt text' })).toHaveValue('Locally persisted.');
+    expect(screen.queryByText('Config saved.')).not.toBeInTheDocument();
+  });
+
+  it('keeps the submitted draft and marks sync unconfirmed when the follow-up Native read fails', async () => {
+    await open();
+    const prompt = screen.getByRole('textbox', { name: 'System prompt text' });
+    fireEvent.change(prompt, { target: { value: 'Keep this submitted draft.' } });
+    invokeMock.mockImplementation((name: string) => {
+      if (name === 'jarvis_save_config') return Promise.resolve({ persisted: true, readbackOk: true, runtimeSynced: true });
+      if (name === 'jarvis_get_config') return Promise.reject(new Error('sensitive native detail'));
+      return Promise.resolve(null);
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
+    expect(await screen.findByText('Saved locally; Bun sync unconfirmed')).toBeInTheDocument();
+    expect(prompt).toHaveValue('Keep this submitted draft.');
+    expect(screen.queryByText(/sensitive native detail/)).not.toBeInTheDocument();
+  });
+
+  it('uses the authoritative Native readback and reports synced only after acknowledgement', async () => {
+    await open();
+    fireEvent.change(screen.getByRole('textbox', { name: 'System prompt text' }), { target: { value: 'Submitted text.' } });
+    invokeMock.mockImplementation((name: string) => {
+      if (name === 'jarvis_save_config') return Promise.resolve({ persisted: true, readbackOk: true, runtimeSynced: true });
+      if (name === 'jarvis_get_config') return Promise.resolve({ ...structuredClone(baseConfig), system_prompt: 'Native canonical text.' });
+      return Promise.resolve(null);
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
+    expect(await screen.findByRole('button', { name: 'Saved' })).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'System prompt text' })).toHaveValue('Native canonical text.');
+    expect(screen.getByText('Config saved.')).toBeInTheDocument();
+    expect(screen.queryByText('Saved locally; Bun sync unconfirmed')).not.toBeInTheDocument();
   });
 });
 

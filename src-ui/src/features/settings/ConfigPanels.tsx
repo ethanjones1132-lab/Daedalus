@@ -4,6 +4,7 @@ import { Badge, Button, Field, Input, Panel, PanelHeader, Select, Switch, Textar
 import { OPENROUTER_MODELS, type JarvisBackend, type JarvisConfig } from '../../domain/types';
 import { BACKENDS } from '../models/backends';
 import { ChoiceCards } from './ChoiceCards';
+import { OrchestrationPanel } from './OrchestrationPanel';
 import {
   DEFAULT_BRIDGE_PORT,
   OPENCODE_DEFAULT_TIMEOUT_MS,
@@ -339,14 +340,7 @@ export function ConfigPanels({
         )}
       </SettingsPanel>
 
-      <SettingsPanel id="orchestration" title="Orchestration" description="Runs coordinator, tool, review, and synthesis stages. Turn it off for a faster single-pass response.">
-        <ToggleRow
-          label={draft.orchestrator?.enabled ? 'Multi-stage orchestration' : 'Single-pass runtime'}
-          checked={Boolean(draft.orchestrator?.enabled)}
-          toggleLabel="Toggle orchestration runtime"
-          onChange={(enabled) => patch('orchestrator', { enabled })}
-        />
-      </SettingsPanel>
+      <OrchestrationPanel config={draft} update={(next) => update(() => next)} />
 
       <SettingsPanel id="endpoints" title="Endpoints" description="Base URLs the Bun server calls for each Inference backend.">
         <div className="grid gap-4 sm:grid-cols-2">

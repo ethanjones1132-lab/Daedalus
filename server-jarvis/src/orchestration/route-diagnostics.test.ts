@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "../config";
-import { createRouteDiagnosticService, type RouteDiagnosticInput } from "./route-diagnostics";
+import { createRouteDiagnosticService, ROUTE_DIAGNOSTIC_TIMEOUT_MS, type RouteDiagnosticInput } from "./route-diagnostics";
 import type { StageTarget } from "./stage-route-policy";
 
 const target = (provider: StageTarget["provider"], model: string): StageTarget => ({ provider, model });
@@ -141,6 +141,109 @@ describe("bounded orchestration route diagnostics", () => {
     expect(dispatches).toBe(1);
   });
 
+  test("a valid cancellation that arrives before run suppresses that operation without dispatch", async () => {
+    let dispatches = 0;
+    const service = createRouteDiagnosticService({
+      requestTarget: async () => {
+        dispatches += 1;
+        return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n');
+      },
+    });
+
+    expect(service.cancel("probe-before-run")).toEqual({
+      operation_id: "probe-before-run",
+      cancelled: true,
+    });
+    const result = await service.run(explicitInput({ operation_id: "probe-before-run" }));
+    const replay = await service.run(explicitInput({ operation_id: "probe-before-run" }));
+
+    expect(result).toMatchObject({ status: "cancelled", reason_code: "cancelled", attempts: [] });
+    expect(replay).toMatchObject({ status: "cancelled", reason_code: "cancelled", attempts: [] });
+    expect(dispatches).toBe(0);
+  });
+
+  test("invalid cancellation IDs do not consume bounded pre-cancel capacity", async () => {
+    let dispatches = 0;
+    const service = createRouteDiagnosticService({
+      requestTarget: async () => {
+        dispatches += 1;
+        return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n');
+      },
+    });
+    for (let index = 0; index < 256; index += 1) {
+      service.cancel(`queued-${index}`);
+    }
+
+    expect(service.cancel("bad / id").cancelled).toBe(false);
+    const result = await service.run(explicitInput({ operation_id: "queued-0" }));
+
+    expect(result.status).toBe("cancelled");
+    expect(dispatches).toBe(0);
+  });
+
+  test("pre-cancel markers expire within the bounded diagnostic window", async () => {
+    let currentTime = 10_000;
+    let dispatches = 0;
+    const service = createRouteDiagnosticService({
+      now: () => currentTime,
+      requestTarget: async () => {
+        dispatches += 1;
+        return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n');
+      },
+    });
+    service.cancel("probe-expiring");
+    currentTime += ROUTE_DIAGNOSTIC_TIMEOUT_MS;
+
+    const result = await service.run(explicitInput({ operation_id: "probe-expiring" }));
+
+    expect(result.status).toBe("success");
+    expect(dispatches).toBe(1);
+  });
+
+  test("pre-cancel storage is bounded and evicts the oldest operation", async () => {
+    let dispatches = 0;
+    const service = createRouteDiagnosticService({
+      requestTarget: async () => {
+        dispatches += 1;
+        return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n');
+      },
+    });
+    for (let index = 0; index < 257; index += 1) {
+      service.cancel(`bounded-${index}`);
+    }
+
+    const oldest = await service.run(explicitInput({ operation_id: "bounded-0" }));
+    const newest = await service.run(explicitInput({ operation_id: "bounded-256" }));
+
+    expect(oldest.status).toBe("success");
+    expect(newest.status).toBe("cancelled");
+    expect(dispatches).toBe(1);
+  });
+
+  test("cancelling a future operation does not abort the different active probe", async () => {
+    let release!: () => void;
+    let dispatches = 0;
+    let activeSignal: AbortSignal | undefined;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const service = createRouteDiagnosticService({
+      requestTarget: async (_cfg, _target, _body, signal) => {
+        dispatches += 1;
+        activeSignal = signal;
+        await blocked;
+        return new Response('data: {"choices":[{"delta":{"content":"OK"}}]}\n\n');
+      },
+    });
+    const active = service.run(explicitInput({ operation_id: "active-probe" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(service.cancel("future-probe").cancelled).toBe(true);
+    expect(activeSignal?.aborted).toBe(false);
+    release();
+    expect((await active).status).toBe("success");
+    expect((await service.run(explicitInput({ operation_id: "future-probe" }))).status).toBe("cancelled");
+    expect(dispatches).toBe(1);
+  });
+
   test("cancels only the matching active operation and cleans up after settlement", async () => {
     let dispatches = 0;
     const service = createRouteDiagnosticService({
@@ -158,7 +261,7 @@ describe("bounded orchestration route diagnostics", () => {
     });
     const first = service.run(explicitInput());
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(service.cancel("other-operation").cancelled).toBe(false);
+    expect(service.cancel("other-operation").cancelled).toBe(true);
     expect(service.cancel("probe-1").cancelled).toBe(true);
     expect(await first).toMatchObject({ status: "cancelled", reason_code: "cancelled" });
 

@@ -52,9 +52,15 @@ const callsFor = (command: string) => invokeMock.mock.calls.filter(([name]) => n
 
 describe('Config save state', () => {
   async function openConfig(save: () => Promise<unknown>) {
-    invokeMock.mockImplementation((name: string) => {
-      if (name === 'jarvis_get_config') return Promise.resolve(config);
-      if (name === 'jarvis_save_config') return save();
+    let nativeConfig = config;
+    invokeMock.mockImplementation((name: string, args?: Record<string, unknown>) => {
+      if (name === 'jarvis_get_config') return Promise.resolve(nativeConfig);
+      if (name === 'jarvis_save_config') {
+        return save().then((result) => {
+          if ((result as { persisted?: boolean } | null)?.persisted) nativeConfig = structuredClone(args?.config as JarvisConfig);
+          return result;
+        });
+      }
       return Promise.resolve([]);
     });
     render(<SettingsPage />);
@@ -76,7 +82,7 @@ describe('Config save state', () => {
     expect(model).toBeDisabled();
     expect(screen.getByRole('status')).toHaveTextContent('Saving config');
     expect(screen.queryByRole('button', { name: 'Saved' })).not.toBeInTheDocument();
-    await act(async () => save.resolve(null));
+    await act(async () => save.resolve({ persisted: true, readbackOk: true, runtimeSynced: true }));
     expect(screen.getByRole('status')).toHaveTextContent('Config saved');
     expect(screen.getByRole('button', { name: 'Saved' })).toBeEnabled();
     expect(model).toBeEnabled();
@@ -108,7 +114,7 @@ describe('Config save state', () => {
       fireEvent.click(button);
       expect(save).toHaveBeenCalledTimes(2);
       expect(callsFor('jarvis_save_config')[1]).toEqual(callsFor('jarvis_save_config')[0]);
-      await act(async () => retry.resolve(null));
+      await act(async () => retry.resolve({ persisted: true, readbackOk: true, runtimeSynced: true }));
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
       expect(screen.getByRole('status')).toHaveTextContent('Config saved');
       // Direct-setter controls must invalidate saved feedback too.

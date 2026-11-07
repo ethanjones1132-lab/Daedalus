@@ -28,6 +28,7 @@ enum RoutingSyncOutcome {
 
 fn config_save_result(
     persisted: bool,
+    projection_succeeded: bool,
     readback_ok: bool,
     sync: RoutingSyncOutcome,
 ) -> ConfigSaveResult {
@@ -35,6 +36,8 @@ fn config_save_result(
         Some("persist_failed")
     } else if !readback_ok {
         Some("native_readback_failed")
+    } else if !projection_succeeded {
+        Some("bun_config_projection_failed")
     } else {
         match sync {
             RoutingSyncOutcome::Synced => None,
@@ -46,13 +49,16 @@ fn config_save_result(
     ConfigSaveResult {
         persisted,
         readback_ok,
-        runtime_synced: persisted && readback_ok && sync == RoutingSyncOutcome::Synced,
+        runtime_synced: persisted
+            && projection_succeeded
+            && readback_ok
+            && sync == RoutingSyncOutcome::Synced,
         warning_code: warning_code.map(str::to_string),
     }
 }
 
 fn config_readback_mismatch_result() -> ConfigSaveResult {
-    let mut result = config_save_result(true, false, RoutingSyncOutcome::Unavailable);
+    let mut result = config_save_result(true, true, false, RoutingSyncOutcome::Unavailable);
     result.warning_code = Some("native_readback_mismatch".to_string());
     result
 }
@@ -1203,19 +1209,27 @@ pub async fn jarvis_save_config(
             .map_err(|_| "invalid_orchestration_config".to_string())?
             .1;
 
-    // SQLite is canonical; this also projects to the Bun-readable file store.
-    if crate::commands::persist_jarvis_config_with_status(&db, &config).is_err() {
-        return Ok(config_save_result(
-            false,
-            false,
-            RoutingSyncOutcome::Unavailable,
-        ));
-    }
+    // SQLite is canonical; the bool reports whether its Bun-readable file
+    // projection succeeded. A false projection result does not undo the
+    // already committed SQLite save, so continue with canonical readback.
+    let projection_succeeded =
+        match crate::commands::persist_jarvis_config_with_status(&db, &config) {
+            Ok(succeeded) => succeeded,
+            Err(_) => {
+                return Ok(config_save_result(
+                    false,
+                    false,
+                    false,
+                    RoutingSyncOutcome::Unavailable,
+                ));
+            }
+        };
     let readback = match crate::commands::load_jarvis_config(&db) {
         Ok(config) => config,
         Err(_) => {
             return Ok(config_save_result(
                 true,
+                projection_succeeded,
                 false,
                 RoutingSyncOutcome::Unavailable,
             ));
@@ -1227,6 +1241,7 @@ pub async fn jarvis_save_config(
             Err(_) => {
                 return Ok(config_save_result(
                     true,
+                    projection_succeeded,
                     false,
                     RoutingSyncOutcome::Unavailable,
                 ));
@@ -1246,6 +1261,18 @@ pub async fn jarvis_save_config(
     // Bring up whatever the (possibly newly selected) backend needs — e.g. start
     // Ollama when the user switches to it in Control. Idempotent + non-blocking.
     crate::reconcile_backend_services(backend, ollama_model, llama_cpp);
+
+    // The Bun server reads the projected file. If that projection failed, a
+    // reload acknowledgement could only describe stale file state, so report
+    // the successful native save without claiming runtime synchronization.
+    if !projection_succeeded {
+        return Ok(config_save_result(
+            true,
+            false,
+            true,
+            RoutingSyncOutcome::Unavailable,
+        ));
+    }
 
     let expected_fingerprint = readback_fingerprint;
     let sync = match tauri::async_runtime::spawn_blocking(move || {
@@ -1267,7 +1294,7 @@ pub async fn jarvis_save_config(
             RoutingSyncOutcome::FingerprintMismatch
         }
     };
-    Ok(config_save_result(true, true, sync))
+    Ok(config_save_result(true, true, true, sync))
 }
 
 #[tauri::command]
@@ -1348,6 +1375,7 @@ mod orchestration_config_save_tests {
             (
                 false,
                 false,
+                false,
                 RoutingSyncOutcome::Unavailable,
                 false,
                 false,
@@ -1355,6 +1383,7 @@ mod orchestration_config_save_tests {
                 Some("persist_failed"),
             ),
             (
+                true,
                 true,
                 false,
                 RoutingSyncOutcome::Unavailable,
@@ -1366,6 +1395,7 @@ mod orchestration_config_save_tests {
             (
                 true,
                 true,
+                true,
                 RoutingSyncOutcome::Unavailable,
                 true,
                 true,
@@ -1373,6 +1403,7 @@ mod orchestration_config_save_tests {
                 Some("bun_unavailable"),
             ),
             (
+                true,
                 true,
                 true,
                 RoutingSyncOutcome::InstanceMismatch,
@@ -1384,6 +1415,7 @@ mod orchestration_config_save_tests {
             (
                 true,
                 true,
+                true,
                 RoutingSyncOutcome::FingerprintMismatch,
                 true,
                 true,
@@ -1393,16 +1425,32 @@ mod orchestration_config_save_tests {
             (
                 true,
                 true,
+                true,
                 RoutingSyncOutcome::Synced,
                 true,
                 true,
                 true,
                 None,
             ),
+            // Simulate persist_jarvis_config_with_status returning Ok(false):
+            // SQLite committed, readback matched, but the Bun projection did
+            // not. Even a matching routing reload acknowledgement cannot turn
+            // the result into a synchronized save.
+            (
+                true,
+                false,
+                true,
+                RoutingSyncOutcome::Synced,
+                true,
+                true,
+                false,
+                Some("bun_config_projection_failed"),
+            ),
         ];
 
         for (
             persisted,
+            projection_succeeded,
             readback_ok,
             sync,
             expected_persisted,
@@ -1411,7 +1459,7 @@ mod orchestration_config_save_tests {
             warning,
         ) in cases
         {
-            let result = config_save_result(persisted, readback_ok, sync);
+            let result = config_save_result(persisted, projection_succeeded, readback_ok, sync);
             assert_eq!(result.persisted, expected_persisted);
             assert_eq!(result.readback_ok, expected_readback);
             assert_eq!(result.runtime_synced, expected_sync);

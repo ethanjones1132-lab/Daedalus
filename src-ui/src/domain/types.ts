@@ -4,6 +4,55 @@
 
 export type JarvisBackend = 'ollama' | 'openrouter' | 'llama_cpp' | 'claude_cli';
 
+export type RoutingProvider = 'llama_cpp' | 'ollama' | 'openrouter' | 'opencode_zen' | 'opencode_go' | 'vllm';
+export type RoutingStage = 'coordinator' | 'planner' | 'executor' | 'reviewer' | 'rewriter' | 'synthesizer';
+export interface StageTarget {
+  provider: RoutingProvider;
+  model: string;
+}
+export type StagePrimary = StageTarget | 'automatic';
+export type StageFallbacks = StageTarget[] | 'automatic';
+
+export interface ConfigSaveResult {
+  persisted: boolean;
+  readbackOk: boolean;
+  runtimeSynced: boolean;
+  warningCode?: 'persist_failed' | 'native_readback_failed' | 'bun_unavailable' | 'bun_instance_mismatch' | 'bun_fingerprint_mismatch' | string;
+}
+
+export interface RouteDiagnosticAttempt {
+  stage: string;
+  provider: string;
+  model: string;
+  choice: string;
+  outcome: string;
+  answered: boolean;
+  cloud: boolean;
+  duration_ms: number;
+  first_token_ms?: number;
+  fallback_reason?: string;
+  error?: string;
+}
+
+export interface RouteDiagnosticRejection {
+  stage: string;
+  provider: string;
+  model: string;
+  reason: string;
+}
+
+export interface RouteDiagnosticResult {
+  operation_id: string;
+  stage: RoutingStage;
+  status: 'success' | 'failed' | 'cancelled' | 'timeout';
+  attempts: RouteDiagnosticAttempt[];
+  rejected_candidates: RouteDiagnosticRejection[];
+  answered_by?: { stage: string; provider: string; model: string; cloud: boolean };
+  left_machine: boolean;
+  duration_ms: number;
+  reason_code?: string;
+}
+
 /// Build provenance returned by the `get_build_info` Tauri command.
 export interface BuildInfo {
   version: string;
@@ -111,6 +160,17 @@ export interface JarvisConfig {
   };
   orchestrator: {
     enabled: boolean;
+    allow_cloud_helpers?: boolean;
+    stage_models?: Partial<Record<RoutingStage, StagePrimary>>;
+    fallback_chains?: Partial<Record<RoutingStage, StageFallbacks>>;
+    [key: string]: unknown;
+  };
+  vllm?: {
+    enabled: boolean;
+    base_url: string;
+    model: string;
+    api_key_env?: string;
+    first_token_timeout_ms?: number;
     [key: string]: unknown;
   };
   system_prompt: string;

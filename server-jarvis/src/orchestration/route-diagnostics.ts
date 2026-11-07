@@ -40,6 +40,7 @@ type RouteDiagnosticSummary = ReturnType<RoutePlan["summary"]>;
 
 export interface RouteDiagnosticCancelResult {
   operation_id: string;
+  /** True means an active probe was aborted or a valid ID was tombstoned. */
   cancelled: boolean;
 }
 
@@ -63,6 +64,8 @@ interface ActiveDiagnostic {
 }
 
 const OPERATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const PRE_CANCELLED_OPERATION_MAX = 256;
+const PRE_CANCELLED_OPERATION_TTL_MS = ROUTE_DIAGNOSTIC_TIMEOUT_MS;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -177,6 +180,27 @@ export function createRouteDiagnosticService(
   const timeoutMs = Math.max(1, Math.min(ROUTE_DIAGNOSTIC_TIMEOUT_MS, dependencies.timeoutMs ?? ROUTE_DIAGNOSTIC_TIMEOUT_MS));
   const now = dependencies.now ?? Date.now;
   let active: ActiveDiagnostic | undefined;
+  const preCancelled = new Map<string, number>();
+
+  const prunePreCancelled = (at: number): void => {
+    for (const [operationId, expiresAt] of preCancelled) {
+      if (expiresAt <= at) preCancelled.delete(operationId);
+    }
+  };
+
+  const recordPreCancelled = (operationId: string): void => {
+    const recordedAt = now();
+    prunePreCancelled(recordedAt);
+    // Do not extend a tombstone on duplicate cancel requests. This preserves
+    // the fixed maximum cancellation window for an operation ID.
+    if (preCancelled.has(operationId)) return;
+    while (preCancelled.size >= PRE_CANCELLED_OPERATION_MAX) {
+      const oldest = preCancelled.keys().next().value;
+      if (oldest === undefined) break;
+      preCancelled.delete(oldest);
+    }
+    preCancelled.set(operationId, recordedAt + PRE_CANCELLED_OPERATION_TTL_MS);
+  };
 
   return {
     async run(rawInput: unknown): Promise<RouteDiagnosticResult> {
@@ -187,6 +211,19 @@ export function createRouteDiagnosticService(
       const stage = typeof input.stage === "string" ? input.stage.slice(0, 64) : "";
       if (!validOperationId) {
         return failedResult(operationId, stage, "invalid_operation_id", now() - startedAt);
+      }
+      prunePreCancelled(startedAt);
+      if (preCancelled.has(operationId)) {
+        // Keep the marker until expiry so a retried POST with this ID cannot
+        // turn a navigation-time cancellation race into a delayed probe.
+        return summaryResult(
+          operationId,
+          stage,
+          "cancelled",
+          new RoutePlan().summary(),
+          now() - startedAt,
+          "cancelled",
+        );
       }
       if (!isRecord(rawInput) || typeof input.stage !== "string" || !STAGES.has(stage)) {
         return failedResult(operationId, stage, "invalid_stage", now() - startedAt);
@@ -289,11 +326,19 @@ export function createRouteDiagnosticService(
 
     cancel(operationId: unknown): RouteDiagnosticCancelResult {
       const id = typeof operationId === "string" ? operationId : "";
-      if (!active || !OPERATION_ID.test(id) || active.operationId !== id) {
+      if (!OPERATION_ID.test(id)) {
         return { operation_id: id, cancelled: false };
       }
-      active.cancelReason = "cancelled";
-      active.controller.abort("route_diagnostic_cancelled");
+      if (active?.operationId === id) {
+        active.cancelReason = "cancelled";
+        active.controller.abort("route_diagnostic_cancelled");
+        return { operation_id: id, cancelled: true };
+      }
+      // Native owns one service instance per app context. If the cancellation
+      // request races ahead of its run request (or names a future operation
+      // while another probe is active), retain a bounded marker for that ID
+      // without affecting the currently active probe.
+      recordPreCancelled(id);
       return { operation_id: id, cancelled: true };
     },
   };

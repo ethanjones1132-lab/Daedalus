@@ -2,7 +2,7 @@ import WorkflowSettings from './WorkflowSettings';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertLine, Page, PageHeader, StatusLine } from '../../design';
-import type { JarvisConfig } from '../../domain/types';
+import type { ConfigSaveResult, JarvisConfig } from '../../domain/types';
 import { AdvancedPanel } from './AdvancedPanel';
 import { AppearancePanel } from './AppearancePanel';
 import { ConfigPanels, type ConfigUpdater } from './ConfigPanels';
@@ -53,6 +53,7 @@ export default function SettingsPage() {
   const [savedConfig, setSavedConfig] = useState<JarvisConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
+  const [syncUnconfirmed, setSyncUnconfirmed] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
   const savePending = useRef(false);
   // "Saved" is true only while the draft is the very object that was saved.
@@ -75,9 +76,39 @@ export default function SettingsPage() {
     setSaveError(false);
     setSavedConfig(null);
     try {
-      await invoke('jarvis_save_config', { config: submitted });
-      setConfig(submitted);
-      setSavedConfig(submitted);
+      const saveResult = await invoke<ConfigSaveResult | null>('jarvis_save_config', { config: submitted });
+      if (!saveResult?.persisted) {
+        setSaveError(true);
+        return;
+      }
+      if (!saveResult.readbackOk) {
+        // get_config reads Native in-memory state, which may still predate the
+        // committed SQLite write when its authoritative readback failed.
+        setDraft(submitted);
+        setSyncUnconfirmed(true);
+        return;
+      }
+
+      let authoritativeConfig: JarvisConfig;
+      try {
+        authoritativeConfig = await invoke<JarvisConfig>('jarvis_get_config');
+        if (!authoritativeConfig) throw new Error('Missing config readback');
+      } catch {
+        // Native may have committed while the follow-up read failed. Keep the
+        // submitted draft visible and never claim a completed sync.
+        setDraft(submitted);
+        setSyncUnconfirmed(true);
+        return;
+      }
+
+      setConfig(authoritativeConfig);
+      setDraft(authoritativeConfig);
+      if (saveResult.readbackOk && saveResult.runtimeSynced) {
+        setSavedConfig(authoritativeConfig);
+        setSyncUnconfirmed(false);
+      } else {
+        setSyncUnconfirmed(true);
+      }
     } catch {
       // Native errors may contain configuration values; never display or log them.
       setSaveError(true);
@@ -133,7 +164,7 @@ export default function SettingsPage() {
           <AppearancePanel />
           <WorkflowSettings /><AdvancedPanel />
 
-          {draft && <SaveBar dirty={dirty} saving={saving} saved={saved} saveError={saveError} onSave={() => void save()} onDiscard={discard} />}
+          {draft && <SaveBar dirty={dirty} saving={saving} saved={saved} saveError={saveError} syncUnconfirmed={syncUnconfirmed} onSave={() => void save()} onDiscard={discard} />}
         </div>
       </div>
     </Page>
