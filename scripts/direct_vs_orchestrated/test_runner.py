@@ -328,6 +328,50 @@ class ProcessHarnessTests(unittest.TestCase):
 
         self.assertIn("tool_trace_identity_missing", reasons)
 
+    def test_duplicate_tool_call_ids_are_unknown_and_fail_trace_safety_check(self):
+        import hashlib
+        import tempfile
+
+        from scripts.direct_vs_orchestrated.runner import evaluate_acceptance, validate_trial_safety
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = root / "stock.csv"
+            fixture.write_text("fixture\n", encoding="utf-8")
+            digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+            observation = {
+                "observation_id": "fixture-duplicate-ids",
+                "visible_text": "beans: 14",
+                "route_attempts": [{"provider": "llama_cpp", "model": "alias", "cloud": False}],
+                "tool_use_frames": [
+                    {"id": "duplicate", "name": "read_file"},
+                    {"id": "duplicate", "name": "unknown_tool"},
+                ],
+                "tool_result_frames": [
+                    {"call_id": "duplicate", "is_error": False},
+                    {"call_id": "duplicate", "is_error": False},
+                ],
+                "fixture_sha256_before": digest,
+                "fixture_sha256_after": digest,
+            }
+            acceptance = evaluate_acceptance(
+                load_tasks()[2],
+                observation,
+                fixture_sha256_before=digest,
+                fixture_sha256_after=digest,
+                expected_fixture_sha256=digest,
+            )
+            reasons = validate_trial_safety(
+                observation,
+                served_alias="alias",
+                fixture_root=root,
+                fixture_sha256=digest,
+            )
+
+        successful_read = next(row for row in acceptance["mechanical_results"] if row["criterion_id"] == "successful_read_file")
+        self.assertEqual(successful_read["status"], "unknown")
+        self.assertIn("tool_trace_identity_duplicate", reasons)
+
     def test_web_tool_and_escaped_fixture_path_stop_the_campaign(self):
         import hashlib
 

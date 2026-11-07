@@ -647,6 +647,8 @@ def validate_trial_safety(
             reasons.append("tool_trace_mismatch")
         elif len(use_ids) != len(uses) or len(result_ids) != len(results) or any(not value for value in [*use_ids, *result_ids]):
             reasons.append("tool_trace_identity_missing")
+        elif len(set(use_ids)) != len(use_ids) or len(set(result_ids)) != len(result_ids):
+            reasons.append("tool_trace_identity_duplicate")
         elif sorted(use_ids) != sorted(result_ids):
             reasons.append("tool_trace_mismatch")
     for use in uses if isinstance(uses, list) else []:
@@ -770,6 +772,8 @@ def _successful_named_tool_calls(observation: dict[str, Any], tool_name: str) ->
         or len(use_ids) != len(uses)
         or len(result_ids) != len(results)
         or any(not value for value in [*use_ids, *result_ids])
+        or len(set(use_ids)) != len(use_ids)
+        or len(set(result_ids)) != len(result_ids)
         or sorted(use_ids) != sorted(result_ids)
         or any(not isinstance(result, dict) or result.get("is_error") not in {True, False} for result in results)
     ):
