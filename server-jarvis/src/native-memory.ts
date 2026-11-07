@@ -29,6 +29,7 @@ import { readPersistedGoalCheckpoint } from "./orchestration/session-memory";
 import { loadConfig } from "./config";
 import { handleTrustedExecutionRequest } from "./trusted-execution";
 import { handleLearningSessionRequest } from "./learning-session";
+import { routeDiagnosticService, type RouteDiagnosticService } from "./orchestration/route-diagnostics";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
@@ -45,6 +46,7 @@ export const NATIVE_MEMORY_RECEIPT_CAP = 256;
 export const NATIVE_MEMORY_IDENTITY_CAP =
   NATIVE_MEMORY_UNCONSUMED_CAP + NATIVE_MEMORY_RECEIPT_CAP;
 export const NATIVE_MEMORY_BODY_CAP_BYTES = 128 * 1024;
+export const ORCHESTRATION_DIAGNOSTIC_BODY_CAP_BYTES = 256 * 1024;
 export const NATIVE_MEMORY_EVIDENCE_REF_CAP = 100;
 export const NATIVE_MEMORY_EVIDENCE_BYTES_CAP = 64 * 1024;
 export const NATIVE_MEMORY_TTL_MS = 120_000;
@@ -951,7 +953,7 @@ function json(body: unknown, status = 200): Response {
  * Read the request body without buffering more than the internal cap. The
  * stream is cancelled as soon as it overflows.
  */
-async function readBoundedBody(req: Request): Promise<unknown> {
+async function readBoundedBody(req: Request, maximumBytes = NATIVE_MEMORY_BODY_CAP_BYTES): Promise<unknown> {
   const body = req.body;
   if (!body) return {};
   const reader = body.getReader();
@@ -963,7 +965,7 @@ async function readBoundedBody(req: Request): Promise<unknown> {
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
-      if (total > NATIVE_MEMORY_BODY_CAP_BYTES) {
+      if (total > maximumBytes) {
         await reader.cancel("body_too_large").catch(() => {});
         throw new RegistryError("body_too_large", 413, "request body exceeds the internal limit");
       }
@@ -1243,15 +1245,47 @@ export async function handleNativeMemoryRequest(
   registry: NativeMemoryRegistry,
   onDerivedInvalidate?: (input: MemoryDerivedInvalidation) => void,
   goalRegistry: GoalRunRegistry | null = null,
+  diagnostics: RouteDiagnosticService = routeDiagnosticService,
 ): Promise<Response | null> {
   const path = new URL(req.url).pathname;
   if (
     !path.startsWith("/internal/memory") &&
     !path.startsWith("/internal/goals") &&
     !path.startsWith("/internal/trusted") &&
-    !path.startsWith("/internal/learning")
+    !path.startsWith("/internal/learning") &&
+    !path.startsWith("/internal/orchestration/")
   ) {
     return null;
+  }
+
+  if (path.startsWith("/internal/orchestration/")) {
+    const meta = registryMeta.get(registry);
+    if (!meta || !meta.capability) {
+      return json({ code: "route_diagnostic_unavailable" }, 503);
+    }
+    if (!bearerAuthorized(req, meta.capability)) {
+      return json({ code: "unauthorized" }, 401);
+    }
+    try {
+      if (path === "/internal/orchestration/test" && req.method === "POST") {
+        const body = await readBoundedBody(req, ORCHESTRATION_DIAGNOSTIC_BODY_CAP_BYTES);
+        const result = await diagnostics.run(body);
+        return json({ ...result, bun_instance_id: meta.bunInstanceId });
+      }
+      if (path === "/internal/orchestration/test/cancel" && req.method === "POST") {
+        const body = await readBoundedBody(req);
+        if (typeof body !== "object" || body === null || Array.isArray(body) || typeof (body as { operation_id?: unknown }).operation_id !== "string") {
+          return json({ code: "invalid_request" }, 400);
+        }
+        const result = diagnostics.cancel((body as { operation_id: string }).operation_id);
+        return json({ ...result, bun_instance_id: meta.bunInstanceId });
+      }
+      return json({ code: "not_found" }, 404);
+    } catch (error) {
+      if (error instanceof RegistryError) return json({ code: error.code }, error.status);
+      if (error instanceof SyntaxError) return json({ code: "invalid_json" }, 400);
+      return json({ code: "route_diagnostic_unavailable" }, 503);
+    }
   }
 
   // Goal binding routes are capability-authenticated but deliberately do not

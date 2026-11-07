@@ -2069,6 +2069,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             jarvis_send_message,
+            jarvis_test_orchestration_route,
+            jarvis_cancel_orchestration_route_test,
             cancel_chat_stream,
             jarvis_new_session,
             jarvis_list_sessions,

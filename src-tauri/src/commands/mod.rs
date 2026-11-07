@@ -40,6 +40,10 @@ pub use skills::*;
 pub mod models;
 pub use models::*;
 
+// Orchestration stage route diagnostics (owned Bun capability only)
+pub mod orchestration;
+pub use orchestration::*;
+
 // Channel command handlers (SQLite-backed CRUD)
 pub mod channels;
 pub use channels::*;

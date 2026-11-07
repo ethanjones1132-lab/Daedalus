@@ -644,6 +644,145 @@ pub fn execute_trusted_acceptance(
 /// result rather than being cut off by the shared 3s client default.
 pub const LEARNING_RESEARCH_TIMEOUT_MS: u64 = 240_000;
 
+/// Wire request for a one-off explicit/automatic stage route diagnostic.
+#[derive(Debug, Serialize)]
+pub struct OrchestrationRouteTestRequest {
+    pub operation_id: String,
+    pub stage: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestrationRouteTestResponse {
+    #[serde(flatten)]
+    result: crate::commands::orchestration::OrchestrationRouteTestResult,
+    bun_instance_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OrchestrationRouteCancelRequest<'a> {
+    operation_id: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestrationRouteCancelResponse {
+    operation_id: String,
+    cancelled: bool,
+    bun_instance_id: String,
+}
+
+pub const ORCHESTRATION_ROUTE_TEST_TIMEOUT_MS: u64 = 90_000;
+const ORCHESTRATION_ROUTE_TEST_HTTP_MARGIN_MS: u64 = 10_000;
+const ORCHESTRATION_ROUTE_CANCEL_TIMEOUT_MS: u64 = 5_000;
+const ORCHESTRATION_ROUTE_TEST_BODY_MAX_BYTES: usize = 256 * 1024;
+
+fn accept_orchestration_route_instance(
+    transport: &NativeMemoryTransport,
+    generation: u64,
+    bun_instance_id: &str,
+) -> Result<(), String> {
+    if bun_instance_id.trim().is_empty() {
+        return Err("owned Bun route-test response identity missing".to_string());
+    }
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
+    {
+        return Err("owned Bun child was replaced during route test".to_string());
+    }
+    let mut state = transport.lock_state();
+    if state.bound_generation == Some(generation) {
+        if let Some(bound) = state.bound_bun_instance_id.as_deref() {
+            if bound != bun_instance_id {
+                return Err("owned Bun route-test instance mismatch".to_string());
+            }
+        }
+    } else {
+        state.bound_generation = None;
+        state.bound_bun_instance_id = None;
+    }
+    state.bound_generation = Some(generation);
+    state.bound_bun_instance_id = Some(bun_instance_id.to_string());
+    Ok(())
+}
+
+/// Run one bounded route diagnostic against the exact live owned Bun child.
+/// The provider config is carried only to that authenticated child and is never
+/// reflected in the result. `None` means there was no owned live child, so no
+/// request was dispatched.
+pub fn execute_orchestration_route_test(
+    transport: &NativeMemoryTransport,
+    request: &OrchestrationRouteTestRequest,
+) -> Result<Option<crate::commands::orchestration::OrchestrationRouteTestResult>, String> {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
+        return Ok(None);
+    }
+    let encoded = serde_json::to_vec(request)
+        .map_err(|_| "orchestration route test request could not be encoded".to_string())?;
+    if encoded.len() > ORCHESTRATION_ROUTE_TEST_BODY_MAX_BYTES {
+        return Err("orchestration route test request exceeds the bound".to_string());
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let body = transport
+        .post_json_with_timeout(
+            "/internal/orchestration/test",
+            request,
+            200,
+            std::time::Duration::from_millis(
+                ORCHESTRATION_ROUTE_TEST_TIMEOUT_MS + ORCHESTRATION_ROUTE_TEST_HTTP_MARGIN_MS,
+            ),
+        )
+        .map_err(|_| "orchestration route test transport unavailable".to_string())?;
+    let parsed: OrchestrationRouteTestResponse = serde_json::from_str(&body)
+        .map_err(|_| "orchestration route test response could not be read".to_string())?;
+    if parsed.result.operation_id != request.operation_id || parsed.result.stage != request.stage {
+        return Err("orchestration route test response identity mismatch".to_string());
+    }
+    accept_orchestration_route_instance(transport, generation, &parsed.bun_instance_id)?;
+    Ok(Some(parsed.result))
+}
+
+/// Cancel exactly one route-test operation on the current owned Bun child.
+/// The acknowledgement is generation-checked even when no prior route probe
+/// has completed and bound the child instance id yet.
+pub fn cancel_orchestration_route_test(
+    transport: &NativeMemoryTransport,
+    operation_id: &str,
+) -> Result<Option<crate::commands::orchestration::OrchestrationRouteCancelResult>, String> {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
+        return Ok(None);
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let body = transport
+        .post_json_with_timeout(
+            "/internal/orchestration/test/cancel",
+            &OrchestrationRouteCancelRequest { operation_id },
+            200,
+            std::time::Duration::from_millis(ORCHESTRATION_ROUTE_CANCEL_TIMEOUT_MS),
+        )
+        .map_err(|_| "orchestration route cancellation transport unavailable".to_string())?;
+    let parsed: OrchestrationRouteCancelResponse = serde_json::from_str(&body)
+        .map_err(|_| "orchestration route cancellation response could not be read".to_string())?;
+    if parsed.operation_id != operation_id {
+        return Err("orchestration route cancellation identity mismatch".to_string());
+    }
+    accept_orchestration_route_instance(transport, generation, &parsed.bun_instance_id)?;
+    Ok(Some(
+        crate::commands::orchestration::OrchestrationRouteCancelResult {
+            operation_id: parsed.operation_id,
+            cancelled: parsed.cancelled,
+        },
+    ))
+}
+
 /// Dispatch one bounded learning research request to the live owned Bun
 /// child over the same private authenticated capability path used by memory
 /// and trusted execution. The request carries no permission and no network
