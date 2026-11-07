@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync
 import { tmpdir } from "os";
 import { join } from "path";
 import { InvalidConfigError, defaultConfig, loadConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
+import { hasStageRouteOverride, resolveStageRoute } from "./orchestration/stage-route-policy";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -31,6 +32,45 @@ describe("review repair budget", () => {
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: 99 } }).orchestrator.max_review_repair_rounds).toBe(2);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: -3 } }).orchestrator.max_review_repair_rounds).toBe(0);
     expect(normalizeConfig({ orchestrator: { max_review_repair_rounds: "not-a-number" } }).orchestrator.max_review_repair_rounds).toBe(1);
+  });
+});
+
+describe("orchestration stage route config", () => {
+  test("resets a persisted pin and fallback list to automatic and observes no override", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-stage-route-reset-"));
+    const file = join(dir, "config.json");
+    const target = { provider: "ollama", model: "old-stage-model" };
+
+    try {
+      const pinned = saveConfig({
+        orchestrator: {
+          stage_models: { executor: target },
+          fallback_chains: { executor: [{ provider: "vllm", model: "old-fallback" }] },
+        },
+      } as any, { currentConfig: defaultConfig(), configFile: file });
+      expect(pinned.orchestrator.stage_models?.executor).toEqual(target);
+
+      const reset = saveConfig({
+        orchestrator: {
+          stage_models: { executor: "automatic" },
+          fallback_chains: { executor: "automatic" },
+        },
+      } as any, { currentConfig: pinned, configFile: file });
+      const loaded = loadConfig({ configFile: file, home: dir });
+
+      expect(reset.orchestrator.stage_models?.executor).toBe("automatic");
+      expect(loaded.orchestrator.stage_models?.executor).toBe("automatic");
+      expect(loaded.orchestrator.fallback_chains?.executor).toBe("automatic");
+      expect(hasStageRouteOverride(loaded, "executor")).toBe(false);
+      expect(resolveStageRoute(
+        loaded,
+        "executor",
+        { primary: { provider: "ollama", model: "automatic-primary" }, fallbacks: [] },
+        new Set(),
+      )).toEqual([{ provider: "ollama", model: "automatic-primary" }]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

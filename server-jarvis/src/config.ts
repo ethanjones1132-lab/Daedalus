@@ -17,6 +17,8 @@ import {
   isValidTrajectoryRetention,
   normalizeTrajectoryRetention,
 } from "./self-tuning/trajectory-retention";
+import { validateStageRouteConfig } from "./orchestration/stage-route-policy";
+import type { StageFallbacks, StageModels } from "./orchestration/stage-route-policy";
 
 /**
  * Schema marker written into the persisted config file.
@@ -472,6 +474,10 @@ export interface OrchestratorConfig {
    * help, and every such hop is disclosed in the turn's route plan.
    */
   allow_cloud_helpers?: boolean;
+  /** Explicit primary provider/model by pipeline stage; "automatic" clears a saved pin. */
+  stage_models?: StageModels;
+  /** Ordered stage fallbacks after the selected primary; [] disables fallback. */
+  fallback_chains?: StageFallbacks;
   max_recursion_depth: number;
   /** B-02: bound on how many times a single turn may re-invoke the conductor
    *  via `conductor_replan` before the replan loop just runs the remaining
@@ -1409,6 +1415,8 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
   if (!isValidTrajectoryRetention(cfg.orchestrator?.conductor_learning?.max_trajectory_snapshots)) {
     errors.push("orchestrator.conductor_learning.max_trajectory_snapshots must be a finite positive integer");
   }
+
+  errors.push(...validateStageRouteConfig(cfg.orchestrator, cfg.llama_cpp?.model ?? ""));
 
   // T3.1: WARN-level orchestrator agent pool validation (existing configs keep booting).
   // Even "error"-severity rules surface as warnings so pre-existing pool entries load.
