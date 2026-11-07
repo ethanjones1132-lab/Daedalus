@@ -30,6 +30,7 @@ import { loadConfig } from "./config";
 import { handleTrustedExecutionRequest } from "./trusted-execution";
 import { handleLearningSessionRequest } from "./learning-session";
 import { routeDiagnosticService, type RouteDiagnosticService } from "./orchestration/route-diagnostics";
+import { reloadNativeRoutingConfig, type RoutingReloadAcknowledgement } from "./orchestration/routing-reload";
 
 const CAPABILITY_ENV = "JARVIS_NATIVE_MEMORY_CAPABILITY";
 const APP_INSTANCE_ENV = "JARVIS_NATIVE_APP_INSTANCE_ID";
@@ -1246,6 +1247,7 @@ export async function handleNativeMemoryRequest(
   onDerivedInvalidate?: (input: MemoryDerivedInvalidation) => void,
   goalRegistry: GoalRunRegistry | null = null,
   diagnostics: RouteDiagnosticService = routeDiagnosticService,
+  reloadRoutingConfig: () => RoutingReloadAcknowledgement = reloadNativeRoutingConfig,
 ): Promise<Response | null> {
   const path = new URL(req.url).pathname;
   if (
@@ -1278,6 +1280,11 @@ export async function handleNativeMemoryRequest(
           return json({ code: "invalid_request" }, 400);
         }
         const result = diagnostics.cancel((body as { operation_id: string }).operation_id);
+        return json({ ...result, bun_instance_id: meta.bunInstanceId });
+      }
+      if (path === "/internal/orchestration/reload" && req.method === "POST") {
+        await readBoundedBody(req, 1024);
+        const result = reloadRoutingConfig();
         return json({ ...result, bun_instance_id: meta.bunInstanceId });
       }
       return json({ code: "not_found" }, 404);

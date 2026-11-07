@@ -1,0 +1,242 @@
+{
+  "config": {
+    "active_backend": "llama_cpp",
+    "ollama": {
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "qwen3.5:8b"
+    },
+    "llama_cpp": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "model": "local-alias.gguf"
+    },
+    "openrouter": {
+      "base_url": "https://openrouter.example/v1",
+      "model": "cloud/model:tag"
+    },
+    "opencode_zen": {
+      "base_url": "https://zen.example/v1"
+    },
+    "opencode_go": {
+      "base_url": "https://go.example/v1"
+    },
+    "vllm": {
+      "enabled": true,
+      "base_url": "http://127.0.0.1:8000/v1",
+      "model": "self-hosted-vllm",
+      "api_key_env": ""
+    },
+    "orchestrator": {
+      "enabled": true,
+      "allow_cloud_helpers": false,
+      "stage_models": {
+        "coordinator": "automatic",
+        "planner": {
+          "provider": "ollama",
+          "model": "org/model:tag"
+        },
+        "executor": {
+          "provider": "llama_cpp",
+          "model": "local-alias.gguf"
+        },
+        "reviewer": "automatic",
+        "rewriter": {
+          "provider": "openrouter",
+          "model": "cloud/model:tag"
+        },
+        "synthesizer": "automatic"
+      },
+      "fallback_chains": {
+        "coordinator": "automatic",
+        "planner": [
+          {
+            "provider": "opencode_zen",
+            "model": "zen/model-a"
+          },
+          {
+            "provider": "ollama",
+            "model": "local/model-b"
+          }
+        ],
+        "executor": [],
+        "reviewer": "automatic",
+        "rewriter": [
+          {
+            "provider": "openrouter",
+            "model": "cloud/fallback-a"
+          },
+          {
+            "provider": "openrouter",
+            "model": "cloud/fallback-b"
+          }
+        ],
+        "synthesizer": []
+      },
+      "conductor": {
+        "enabled": true,
+        "model": "conductor:latest",
+        "fallback_model": "conductor-backup:latest",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "kv_backend": "llama_cpp",
+        "fallback_to_api": false
+      },
+      "descriptor_unknown_field": {
+        "keep": true
+      }
+    }
+  },
+  "expected_descriptor": {
+    "descriptor_version": 1,
+    "backend": "llama_cpp",
+    "enabled": true,
+    "allow_cloud_helpers": false,
+    "providers": {
+      "ollama": {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "qwen3.5:8b"
+      },
+      "llama_cpp": {
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "local-alias.gguf"
+      },
+      "openrouter": {
+        "base_url": "https://openrouter.example/v1",
+        "model": "cloud/model:tag"
+      },
+      "opencode_zen": {
+        "base_url": "https://zen.example/v1"
+      },
+      "opencode_go": {
+        "base_url": "https://go.example/v1"
+      },
+      "vllm": {
+        "enabled": true,
+        "base_url": "http://127.0.0.1:8000/v1",
+        "model": "self-hosted-vllm"
+      }
+    },
+    "stage_models": {
+      "coordinator": "automatic",
+      "planner": {
+        "provider": "ollama",
+        "model": "org/model:tag"
+      },
+      "executor": {
+        "provider": "llama_cpp",
+        "model": "local-alias.gguf"
+      },
+      "reviewer": "automatic",
+      "rewriter": {
+        "provider": "openrouter",
+        "model": "cloud/model:tag"
+      },
+      "synthesizer": "automatic"
+    },
+    "fallback_chains": {
+      "coordinator": "automatic",
+      "planner": [
+        {
+          "provider": "opencode_zen",
+          "model": "zen/model-a"
+        },
+        {
+          "provider": "ollama",
+          "model": "local/model-b"
+        }
+      ],
+      "executor": [],
+      "reviewer": "automatic",
+      "rewriter": [
+        {
+          "provider": "openrouter",
+          "model": "cloud/fallback-a"
+        },
+        {
+          "provider": "openrouter",
+          "model": "cloud/fallback-b"
+        }
+      ],
+      "synthesizer": []
+    },
+    "conductor": {
+      "enabled": true,
+      "model": "conductor:latest",
+      "fallback_model": "conductor-backup:latest",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "kv_backend": "llama_cpp",
+      "fallback_to_api": false
+    },
+    "provider_readiness": {
+      "ollama": true,
+      "llama_cpp": true,
+      "openrouter": true,
+      "opencode_zen": true,
+      "opencode_go": true,
+      "vllm": true
+    }
+  },
+  "expected_sha256": "e5a9bd419a60a3bec62889fd06ec3d56040a248233dcd1fea168d61317380891",
+  "expected_default_sha256": "28ba8d3f89751f2a7fe30224cca8a1f7d755c576b3e05ef29f759771bcdc917b",
+  "expected_default_descriptor": {
+    "descriptor_version": 1,
+    "backend": "llama_cpp",
+    "enabled": true,
+    "allow_cloud_helpers": false,
+    "providers": {
+      "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "model": "qwen3.5-9b:latest"
+      },
+      "llama_cpp": {
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf"
+      },
+      "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "cohere/north-mini-code:free"
+      },
+      "opencode_zen": {
+        "base_url": "https://opencode.ai/zen/v1"
+      },
+      "opencode_go": {
+        "base_url": "https://opencode.ai/zen/go/v1"
+      },
+      "vllm": {
+        "enabled": false,
+        "base_url": "",
+        "model": ""
+      }
+    },
+    "stage_models": {
+      "coordinator": "automatic",
+      "planner": "automatic",
+      "executor": "automatic",
+      "reviewer": "automatic",
+      "rewriter": "automatic",
+      "synthesizer": "automatic"
+    },
+    "fallback_chains": {
+      "coordinator": "automatic",
+      "planner": "automatic",
+      "executor": "automatic",
+      "reviewer": "automatic",
+      "rewriter": "automatic",
+      "synthesizer": "automatic"
+    },
+    "conductor": {
+      "enabled": true,
+      "model": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+      "fallback_model": "",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "kv_backend": "llama_cpp",
+      "fallback_to_api": true
+    },
+    "provider_readiness": {
+      "ollama": true,
+      "llama_cpp": true,
+      "openrouter": false,
+      "opencode_zen": false,
+      "opencode_go": false,
+      "vllm": false
+    }
+  }
+}

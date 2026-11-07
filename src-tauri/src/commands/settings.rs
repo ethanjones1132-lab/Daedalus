@@ -113,7 +113,7 @@ pub fn get_jarvis_config(db: State<AppDb>) -> Result<JarvisConfig, String> {
     load_jarvis_config(&db)
 }
 
-fn normalize_jarvis_config(config: &mut JarvisConfig) {
+pub(crate) fn normalize_jarvis_config(config: &mut JarvisConfig) {
     if config.ollama.model == "qwen3.6:9b" {
         config.ollama.model = "qwen3.5-9b:latest".to_string();
     }
@@ -189,6 +189,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
         if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::OpenCodeProviderConfig>(v)
         {
             config.opencode_go = parsed;
+        }
+    }
+    if let Some(v) = settings.get("vllm") {
+        if let Ok(parsed) = serde_json::from_str::<crate::jarvis::types::VllmConfig>(v) {
+            config.vllm = parsed;
         }
     }
     if let Some(v) = settings.get("claude_cli") {
@@ -305,8 +310,42 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
 /// (`save_jarvis_config`, `jarvis_save_config`, `jarvis_switch_backend`, and
 /// the single-key `set_setting`) projects through the same deep-merge.
 pub fn persist_jarvis_config(db: &AppDb, config: &JarvisConfig) -> Result<(), String> {
-    let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
-    persist_jarvis_config_conn(&conn, config)
+    match persist_jarvis_config_with_status(db, config)? {
+        true => Ok(()),
+        false => Err("Failed to project canonical config to Bun-readable file".to_string()),
+    }
+}
+
+/// Persist SQLite atomically, then attempt the Bun-readable file projection.
+/// The bool reports projection success; an `Err` means SQLite did not commit.
+/// Unit tests intentionally skip the real-home projection and report it as
+/// available so callers can exercise the canonical database path safely.
+pub fn persist_jarvis_config_with_status(
+    db: &AppDb,
+    config: &JarvisConfig,
+) -> Result<bool, String> {
+    let mut canonical = config.clone();
+    normalize_jarvis_config(&mut canonical);
+    {
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|_| "Failed to begin canonical config transaction".to_string())?;
+        persist_jarvis_config_conn(&transaction, &canonical)?;
+        transaction
+            .commit()
+            .map_err(|_| "Failed to commit canonical config".to_string())?;
+    }
+
+    #[cfg(test)]
+    {
+        let _ = canonical;
+        Ok(true)
+    }
+    #[cfg(not(test))]
+    {
+        Ok(crate::jarvis::save_jarvis_config(&canonical).is_ok())
+    }
 }
 
 /// Connection-based persister so callers already holding the DB lock can write
@@ -340,6 +379,10 @@ pub fn persist_jarvis_config_conn(
         (
             "opencode_go",
             serde_json::to_string(&config.opencode_go).map_err(|e| e.to_string())?,
+        ),
+        (
+            "vllm",
+            serde_json::to_string(&config.vllm).map_err(|e| e.to_string())?,
         ),
         (
             "claude_cli",
@@ -395,15 +438,6 @@ pub fn persist_jarvis_config_conn(
             )
             .map_err(|e| format!("Failed to save setting '{}': {}", key, e))?;
     }
-
-    // Project the canonical config onto the Bun-readable file. `save_jarvis_config`
-    // in jarvis/mod.rs deep-merges onto the existing file, so nested keys the Bun
-    // server owns survive a UI save (replacing the previous wholesale overwrite,
-    // which could clobber `compaction.*`, `surface_temperatures`, etc.).
-    // In unit-test mode we skip the filesystem side effect so tests cannot
-    // corrupt the developer's real config.
-    #[cfg(not(test))]
-    crate::jarvis::save_jarvis_config(&config)?;
 
     Ok(())
 }
@@ -556,6 +590,104 @@ mod tests {
 
         let cfg = load_jarvis_config(&db).expect("load config");
         assert!(!cfg.orchestrator.enabled);
+    }
+
+    #[test]
+    fn route_reset_survives_sqlite_and_file_projection_with_unknown_fields() {
+        let db = mem_db();
+        let mut config = load_jarvis_config(&db).expect("load defaults");
+        config.orchestrator.extra.insert(
+            "stage_models".to_string(),
+            serde_json::json!({
+                "executor": { "provider": "ollama", "model": "pinned/model:tag" }
+            }),
+        );
+        config.orchestrator.extra.insert(
+            "fallback_chains".to_string(),
+            serde_json::json!({
+                "executor": [{ "provider": "ollama", "model": "fallback/model" }]
+            }),
+        );
+        config.orchestrator.extra.insert(
+            "unknown_nested_field".to_string(),
+            serde_json::json!({ "nested": ["preserve", { "value": 7 }] }),
+        );
+        persist_jarvis_config(&db, &config).expect("persist pinned config");
+
+        let mut reset = load_jarvis_config(&db).expect("read pinned config");
+        reset.orchestrator.extra.insert(
+            "stage_models".to_string(),
+            serde_json::json!({ "executor": "automatic" }),
+        );
+        reset.orchestrator.extra.insert(
+            "fallback_chains".to_string(),
+            serde_json::json!({ "executor": "automatic" }),
+        );
+        persist_jarvis_config(&db, &reset).expect("persist automatic reset");
+
+        let sqlite_readback = load_jarvis_config(&db).expect("read reset config");
+        assert_eq!(
+            sqlite_readback.orchestrator.extra["stage_models"]["executor"],
+            "automatic"
+        );
+        assert_eq!(
+            sqlite_readback.orchestrator.extra["fallback_chains"]["executor"],
+            "automatic"
+        );
+
+        let config_path = std::env::temp_dir().join(format!(
+            "jarvis-routing-projection-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{"unknown_future_section":{"preserve":true},"orchestrator":{"unknown_bun_field":{"keep":true}}}"#,
+        )
+        .expect("seed temp config");
+        crate::jarvis::save_jarvis_config_to_path(&config_path, &sqlite_readback)
+            .expect("project SQLite readback");
+        let projected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&config_path).expect("read projected config"),
+        )
+        .expect("parse projected config");
+        std::fs::remove_file(&config_path).expect("remove temp config");
+
+        assert_eq!(projected["unknown_future_section"]["preserve"], true);
+        assert_eq!(projected["orchestrator"]["unknown_bun_field"]["keep"], true);
+        assert_eq!(
+            projected["orchestrator"]["unknown_nested_field"],
+            serde_json::json!({ "nested": ["preserve", { "value": 7 }] })
+        );
+        assert_eq!(
+            projected["orchestrator"]["stage_models"]["executor"],
+            "automatic"
+        );
+        assert_eq!(
+            projected["orchestrator"]["fallback_chains"]["executor"],
+            "automatic"
+        );
+    }
+
+    #[test]
+    fn sqlite_persistence_failure_rolls_back_all_config_rows() {
+        let db = mem_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_orchestrator_insert BEFORE INSERT ON settings
+                 WHEN NEW.key = 'orchestrator' BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .expect("install test trigger");
+        }
+
+        let result = persist_jarvis_config_with_status(&db, &JarvisConfig::default());
+
+        assert!(result.is_err());
+        let conn = db.conn.lock().unwrap();
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
+            .expect("count settings");
+        assert_eq!(row_count, 0, "failed saves must not leave partial rows");
     }
 
     #[test]

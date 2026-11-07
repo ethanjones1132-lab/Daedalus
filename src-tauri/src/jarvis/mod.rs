@@ -105,7 +105,7 @@ pub fn save_jarvis_config(config: &JarvisConfig) -> Result<(), String> {
 /// Backing implementation of [`save_jarvis_config`]. Takes the target file so
 /// tests can round-trip through a temp path instead of the real canonical
 /// store; production callers always pass [`get_config_path`].
-fn save_jarvis_config_to_path(
+pub(crate) fn save_jarvis_config_to_path(
     config_path: &std::path::Path,
     config: &JarvisConfig,
 ) -> Result<(), String> {

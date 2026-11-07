@@ -253,6 +253,8 @@ pub fn set_active_profile_and_reconcile(
 
     tx.commit()
         .map_err(|e| format!("failed to commit profile activation: {e}"))?;
+    crate::jarvis::save_jarvis_config(&config)
+        .map_err(|_| "failed to project activated profile config".to_string())?;
 
     let provider = config.active_backend.to_string();
     Ok(EffectiveRuntimeConfig {

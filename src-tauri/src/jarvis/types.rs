@@ -55,6 +55,8 @@ pub struct JarvisConfig {
     pub opencode_zen: OpenCodeProviderConfig,
     #[serde(default)]
     pub opencode_go: OpenCodeProviderConfig,
+    #[serde(default)]
+    pub vllm: VllmConfig,
     pub claude_cli: ClaudeCliConfig,
     pub tools: ToolConfig,
     pub reasoning: ReasoningConfig,
@@ -98,6 +100,7 @@ impl Default for JarvisConfig {
                 api_key: String::new(),
                 first_token_timeout_ms: default_opencode_first_token_timeout_ms(),
             },
+            vllm: VllmConfig::default(),
             claude_cli: ClaudeCliConfig::default(),
             tools: ToolConfig::default(),
             reasoning: ReasoningConfig::default(),
@@ -513,6 +516,30 @@ pub struct OpenCodeProviderConfig {
     /// to the next model. Individual pool-agent overrides still take priority.
     #[serde(default = "default_opencode_first_token_timeout_ms")]
     pub first_token_timeout_ms: u64,
+}
+
+/// Optional self-hosted vLLM route. The API key remains in the named process
+/// environment variable; this config stores only its name.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct VllmConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub model: String,
+    pub api_key_env: String,
+    pub first_token_timeout_ms: u64,
+}
+
+impl Default for VllmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            model: String::new(),
+            api_key_env: String::new(),
+            first_token_timeout_ms: 120_000,
+        }
+    }
 }
 
 fn default_opencode_first_token_timeout_ms() -> u64 {

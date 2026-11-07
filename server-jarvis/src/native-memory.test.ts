@@ -85,4 +85,46 @@ describe("Native-authorized orchestration diagnostics routes", () => {
     expect(cancelled?.status).toBe(200);
     expect(calls).toEqual({ test: 1, cancel: ["op-1"] });
   });
+
+  test("authenticated reload returns only Bun identity and routing fingerprint", async () => {
+    let reloads = 0;
+    const registry = createNativeMemoryRegistry({ capability: "owned-secret", appInstanceId: "app-1" });
+    const response = await handleNativeMemoryRequest(
+      request("/internal/orchestration/reload", "{}", "Bearer owned-secret"),
+      registry,
+      undefined,
+      null,
+      fakeDiagnostics({ test: 0, cancel: [] }),
+      () => {
+        reloads += 1;
+        return { routing_fingerprint: "a".repeat(64) };
+      },
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      bun_instance_id: expect.any(String),
+      routing_fingerprint: "a".repeat(64),
+    });
+    expect(reloads).toBe(1);
+  });
+
+  test("unauthorized reload never reads runtime configuration", async () => {
+    let reloads = 0;
+    const registry = createNativeMemoryRegistry({ capability: "owned-secret", appInstanceId: "app-1" });
+    const response = await handleNativeMemoryRequest(
+      request("/internal/orchestration/reload", "{}", "Bearer wrong"),
+      registry,
+      undefined,
+      null,
+      fakeDiagnostics({ test: 0, cancel: [] }),
+      () => {
+        reloads += 1;
+        return { routing_fingerprint: "a".repeat(64) };
+      },
+    );
+
+    expect(response?.status).toBe(401);
+    expect(reloads).toBe(0);
+  });
 });

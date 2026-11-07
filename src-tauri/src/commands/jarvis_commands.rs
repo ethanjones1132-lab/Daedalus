@@ -8,6 +8,55 @@ use serde::Serialize;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigSaveResult {
+    pub persisted: bool,
+    pub readback_ok: bool,
+    pub runtime_synced: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutingSyncOutcome {
+    Synced,
+    Unavailable,
+    InstanceMismatch,
+    FingerprintMismatch,
+}
+
+fn config_save_result(
+    persisted: bool,
+    readback_ok: bool,
+    sync: RoutingSyncOutcome,
+) -> ConfigSaveResult {
+    let warning_code = if !persisted {
+        Some("persist_failed")
+    } else if !readback_ok {
+        Some("native_readback_failed")
+    } else {
+        match sync {
+            RoutingSyncOutcome::Synced => None,
+            RoutingSyncOutcome::Unavailable => Some("bun_unavailable"),
+            RoutingSyncOutcome::InstanceMismatch => Some("bun_instance_mismatch"),
+            RoutingSyncOutcome::FingerprintMismatch => Some("bun_fingerprint_mismatch"),
+        }
+    };
+    ConfigSaveResult {
+        persisted,
+        readback_ok,
+        runtime_synced: persisted && readback_ok && sync == RoutingSyncOutcome::Synced,
+        warning_code: warning_code.map(str::to_string),
+    }
+}
+
+fn config_readback_mismatch_result() -> ConfigSaveResult {
+    let mut result = config_save_result(true, false, RoutingSyncOutcome::Unavailable);
+    result.warning_code = Some("native_readback_mismatch".to_string());
+    result
+}
+
 async fn chat_base_url() -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -1141,23 +1190,84 @@ pub async fn jarvis_get_config(state: State<'_, JarvisState>) -> Result<JarvisCo
 
 #[tauri::command]
 pub async fn jarvis_save_config(
-    config: JarvisConfig,
+    mut config: JarvisConfig,
     state: State<'_, JarvisState>,
     db: State<'_, crate::db::AppDb>,
-) -> Result<(), String> {
+) -> Result<ConfigSaveResult, String> {
+    crate::commands::settings::normalize_jarvis_config(&mut config);
+    crate::commands::orchestration::validate_routing_config(&config)
+        .map_err(|_| "invalid_orchestration_config".to_string())?;
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let submitted_fingerprint =
+        crate::commands::orchestration::routing_descriptor_fingerprint(&config, &env)
+            .map_err(|_| "invalid_orchestration_config".to_string())?
+            .1;
+
     // SQLite is canonical; this also projects to the Bun-readable file store.
-    crate::commands::persist_jarvis_config(&db, &config)?;
-    let backend = config.active_backend.clone();
-    let ollama_model = config.ollama.model.clone();
-    let llama_cpp = config.llama_cpp.clone();
+    if crate::commands::persist_jarvis_config_with_status(&db, &config).is_err() {
+        return Ok(config_save_result(
+            false,
+            false,
+            RoutingSyncOutcome::Unavailable,
+        ));
+    }
+    let readback = match crate::commands::load_jarvis_config(&db) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(config_save_result(
+                true,
+                false,
+                RoutingSyncOutcome::Unavailable,
+            ));
+        }
+    };
+    let readback_fingerprint =
+        match crate::commands::orchestration::routing_descriptor_fingerprint(&readback, &env) {
+            Ok((_, fingerprint)) => fingerprint,
+            Err(_) => {
+                return Ok(config_save_result(
+                    true,
+                    false,
+                    RoutingSyncOutcome::Unavailable,
+                ));
+            }
+        };
+    if submitted_fingerprint != readback_fingerprint {
+        return Ok(config_readback_mismatch_result());
+    }
+
+    let backend = readback.active_backend.clone();
+    let ollama_model = readback.ollama.model.clone();
+    let llama_cpp = readback.llama_cpp.clone();
     {
         let mut guard = state.config.lock().await;
-        *guard = config;
+        *guard = readback;
     }
     // Bring up whatever the (possibly newly selected) backend needs — e.g. start
     // Ollama when the user switches to it in Control. Idempotent + non-blocking.
     crate::reconcile_backend_services(backend, ollama_model, llama_cpp);
-    Ok(())
+
+    let expected_fingerprint = readback_fingerprint;
+    let sync = match tauri::async_runtime::spawn_blocking(move || {
+        crate::jarvis::memory::transport::reload_routing_descriptor(
+            crate::jarvis::memory::transport::native_memory_transport(),
+            &expected_fingerprint,
+        )
+    })
+    .await
+    {
+        Ok(Ok(Some(()))) => RoutingSyncOutcome::Synced,
+        Ok(Ok(None))
+        | Ok(Err(crate::jarvis::memory::transport::RoutingReloadFailure::Unavailable))
+        | Err(_) => RoutingSyncOutcome::Unavailable,
+        Ok(Err(crate::jarvis::memory::transport::RoutingReloadFailure::InstanceMismatch)) => {
+            RoutingSyncOutcome::InstanceMismatch
+        }
+        Ok(Err(crate::jarvis::memory::transport::RoutingReloadFailure::FingerprintMismatch)) => {
+            RoutingSyncOutcome::FingerprintMismatch
+        }
+    };
+    Ok(config_save_result(true, true, sync))
 }
 
 #[tauri::command]
@@ -1224,6 +1334,97 @@ mod status_check_tests {
         assert!(
             started.elapsed() < std::time::Duration::from_millis(150),
             "status work blocked the single-thread async runtime"
+        );
+    }
+}
+
+#[cfg(test)]
+mod orchestration_config_save_tests {
+    use super::*;
+
+    #[test]
+    fn save_outcomes_distinguish_persistence_readback_and_runtime_sync() {
+        let cases = [
+            (
+                false,
+                false,
+                RoutingSyncOutcome::Unavailable,
+                false,
+                false,
+                false,
+                Some("persist_failed"),
+            ),
+            (
+                true,
+                false,
+                RoutingSyncOutcome::Unavailable,
+                true,
+                false,
+                false,
+                Some("native_readback_failed"),
+            ),
+            (
+                true,
+                true,
+                RoutingSyncOutcome::Unavailable,
+                true,
+                true,
+                false,
+                Some("bun_unavailable"),
+            ),
+            (
+                true,
+                true,
+                RoutingSyncOutcome::InstanceMismatch,
+                true,
+                true,
+                false,
+                Some("bun_instance_mismatch"),
+            ),
+            (
+                true,
+                true,
+                RoutingSyncOutcome::FingerprintMismatch,
+                true,
+                true,
+                false,
+                Some("bun_fingerprint_mismatch"),
+            ),
+            (
+                true,
+                true,
+                RoutingSyncOutcome::Synced,
+                true,
+                true,
+                true,
+                None,
+            ),
+        ];
+
+        for (
+            persisted,
+            readback_ok,
+            sync,
+            expected_persisted,
+            expected_readback,
+            expected_sync,
+            warning,
+        ) in cases
+        {
+            let result = config_save_result(persisted, readback_ok, sync);
+            assert_eq!(result.persisted, expected_persisted);
+            assert_eq!(result.readback_ok, expected_readback);
+            assert_eq!(result.runtime_synced, expected_sync);
+            assert_eq!(result.warning_code.as_deref(), warning);
+        }
+
+        let mismatch = config_readback_mismatch_result();
+        assert!(mismatch.persisted);
+        assert!(!mismatch.readback_ok);
+        assert!(!mismatch.runtime_synced);
+        assert_eq!(
+            mismatch.warning_code.as_deref(),
+            Some("native_readback_mismatch")
         );
     }
 }

@@ -164,6 +164,39 @@ struct AckRequest {
     turn_id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct RoutingReloadRequest {}
+
+#[derive(Debug, Deserialize)]
+struct RoutingReloadResponse {
+    bun_instance_id: String,
+    routing_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingReloadFailure {
+    Unavailable,
+    InstanceMismatch,
+    FingerprintMismatch,
+}
+
+fn verify_routing_reload_ack(
+    response: &RoutingReloadResponse,
+    expected_instance_id: Option<&str>,
+    expected_fingerprint: &str,
+) -> Result<(), RoutingReloadFailure> {
+    if response.bun_instance_id.trim().is_empty() {
+        return Err(RoutingReloadFailure::Unavailable);
+    }
+    if expected_instance_id.is_some_and(|expected| expected != response.bun_instance_id) {
+        return Err(RoutingReloadFailure::InstanceMismatch);
+    }
+    if response.routing_fingerprint != expected_fingerprint {
+        return Err(RoutingReloadFailure::FingerprintMismatch);
+    }
+    Ok(())
+}
+
 /// Mutable owned-generation state, guarded by one mutex that also acts as the
 /// native operation gate. Preparation, sync, invalidation and every semantic
 /// mutation serialize through it, so no registration can race a commit.
@@ -544,6 +577,91 @@ impl NativeMemoryTransport {
 pub fn native_memory_transport() -> &'static NativeMemoryTransport {
     static TRANSPORT: OnceLock<NativeMemoryTransport> = OnceLock::new();
     TRANSPORT.get_or_init(NativeMemoryTransport::new)
+}
+
+/// Force Bun to evict its five-second config cache and confirm the canonical
+/// routing descriptor currently loaded from disk. The request is bounded to
+/// five seconds independently of the shared transport timeout.
+pub fn reload_routing_descriptor(
+    transport: &NativeMemoryTransport,
+    expected_fingerprint: &str,
+) -> Result<Option<()>, RoutingReloadFailure> {
+    if !matches!(
+        crate::process_lifecycle::bun_ownership(),
+        BunOwnership::Live
+    ) {
+        return Ok(None);
+    }
+    let generation = crate::process_lifecycle::bun_generation();
+    let previously_bound_id = {
+        let state = transport.lock_state();
+        (state.bound_generation == Some(generation))
+            .then(|| state.bound_bun_instance_id.clone())
+            .flatten()
+    };
+    let body = transport
+        .post_json_with_timeout(
+            "/internal/orchestration/reload",
+            &RoutingReloadRequest {},
+            200,
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(|_| RoutingReloadFailure::Unavailable)?;
+    let response: RoutingReloadResponse =
+        serde_json::from_str(&body).map_err(|_| RoutingReloadFailure::Unavailable)?;
+    if crate::process_lifecycle::bun_generation() != generation
+        || !matches!(
+            crate::process_lifecycle::bun_ownership(),
+            BunOwnership::Live
+        )
+    {
+        return Err(RoutingReloadFailure::Unavailable);
+    }
+    verify_routing_reload_ack(
+        &response,
+        previously_bound_id.as_deref(),
+        expected_fingerprint,
+    )?;
+    {
+        let mut state = transport.lock_state();
+        state.bound_generation = Some(generation);
+        state.bound_bun_instance_id = Some(response.bun_instance_id);
+    }
+    Ok(Some(()))
+}
+
+#[cfg(test)]
+mod routing_reload_ack_tests {
+    use super::*;
+
+    #[test]
+    fn reload_ack_requires_the_expected_instance_and_fingerprint() {
+        let correct = RoutingReloadResponse {
+            bun_instance_id: "bun-1".to_string(),
+            routing_fingerprint: "a".repeat(64),
+        };
+        let wrong_instance = RoutingReloadResponse {
+            bun_instance_id: "bun-2".to_string(),
+            routing_fingerprint: "a".repeat(64),
+        };
+        let wrong_fingerprint = RoutingReloadResponse {
+            bun_instance_id: "bun-1".to_string(),
+            routing_fingerprint: "b".repeat(64),
+        };
+
+        assert_eq!(
+            verify_routing_reload_ack(&correct, Some("bun-1"), &"a".repeat(64)),
+            Ok(())
+        );
+        assert_eq!(
+            verify_routing_reload_ack(&wrong_instance, Some("bun-1"), &"a".repeat(64)),
+            Err(RoutingReloadFailure::InstanceMismatch)
+        );
+        assert_eq!(
+            verify_routing_reload_ack(&wrong_fingerprint, Some("bun-1"), &"a".repeat(64)),
+            Err(RoutingReloadFailure::FingerprintMismatch)
+        );
+    }
 }
 
 /// Dispatch one native-approved trusted manifest execution to the live owned
