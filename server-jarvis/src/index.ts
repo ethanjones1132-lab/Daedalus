@@ -316,6 +316,7 @@ import {
   type TaskRunGoalLink,
 } from "./orchestration/task-run";
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
+import { withWireToolCalls } from "./orchestration/tool-call-wire";
 import { RoutePlan, routeAttemptSseFrame, type RouteChoice } from "./orchestration/route-plan";
 import { finishSinglePassCompletion } from "./single-pass-completion";
 import { classifySinglePassToolArgs } from "./single-pass-tool-args";
@@ -881,7 +882,9 @@ function normalizeMessagesForLLM(msgs: Array<any>): Array<any> {
         content: msg.content?.startsWith("[") ? msg.content : `[System: ${msg.content}]`,
       });
     } else {
-      normalized.push(msg);
+      // Pipeline history carries parsed { id, name, arguments } calls;
+      // llama.cpp rejects anything but the OpenAI wire shape.
+      normalized.push(withWireToolCalls(msg));
     }
   }
   
