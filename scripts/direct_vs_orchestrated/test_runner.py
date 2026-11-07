@@ -347,7 +347,7 @@ class ProcessHarnessTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            with patch.object(runner.time, "monotonic", side_effect=[100.0, 221.0, 222.0]):
+            with patch.object(runner.time, "monotonic", side_effect=[100.0, 221.0, 222.0, 222.0, 222.0, 222.0]):
                 with patch.object(runner, "_cancel_session", return_value=True) as cancel:
                     result = runner._run_capture_worker(
                         base_url="http://127.0.0.1:19006",
@@ -364,7 +364,7 @@ class ProcessHarnessTests(unittest.TestCase):
 
         self.assertEqual(process.timeouts[0], 0.0)
         self.assertEqual(process.timeouts[1], 5.0)
-        cancel.assert_called_once_with("http://127.0.0.1:19006", "session-timeout")
+        cancel.assert_called_once_with("http://127.0.0.1:19006", "session-timeout", timeout_s=5.0)
         self.assertEqual(result["outcome"], "timeout")
         self.assertTrue(result["cancel_confirmed"])
         self.assertFalse(result["capture_worker_settled"])

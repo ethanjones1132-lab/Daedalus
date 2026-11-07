@@ -270,7 +270,7 @@ def _open_local(request: urllib.request.Request, *, timeout: float):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
     return opener.open(request, timeout=timeout)
 
-def _cancel_session(base_url: str, session_id: str) -> bool:
+def _cancel_session(base_url: str, session_id: str, *, timeout_s: float = 5.0) -> bool:
     endpoint = _local_endpoint(base_url, "chat/cancel")
     request = urllib.request.Request(
         endpoint,
@@ -279,7 +279,7 @@ def _cancel_session(base_url: str, session_id: str) -> bool:
         method="POST",
     )
     try:
-        with _open_local(request, timeout=5.0) as response:
+        with _open_local(request, timeout=timeout_s) as response:
             payload = json.loads(response.read(16_384).decode("utf-8"))
         return isinstance(payload, dict) and payload.get("cancelled") is True
     except (OSError, TimeoutError, ValueError, urllib.error.URLError):

@@ -34,6 +34,10 @@ CLOUD_SECRET_NAMES = {
     "OPENCODE_API_KEY", "TAVILY_API_KEY", "BRAVE_API_KEY", "HTTP_PROXY", "HTTPS_PROXY",
     "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
 }
+_SECRET_FIELD_RE = re.compile(
+    r"(?:^|[_-])(?:api[_-]?key|access[_-]?key|(?:access|refresh|id|session)[_-]?token|client[_-]?secret|secret|password|passwd|authorization|auth|token)(?:$|[_-])",
+    re.IGNORECASE,
+)
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -339,7 +343,7 @@ def redact_config(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
         for key, item in value.items():
-            if re.search(r"(api[_-]?key|token|secret|password|authorization)", key, re.IGNORECASE):
+            if _SECRET_FIELD_RE.search(str(key)):
                 redacted[key] = "[REDACTED]" if item not in (None, "", False) else item
             else:
                 redacted[key] = redact_config(item)
@@ -434,7 +438,8 @@ def _redact_argv(argv: Sequence[str]) -> list[str]:
             result.append("[REDACTED]")
             redact_next = False
             continue
-        if re.search(r"(api[_-]?key|token|secret|password|authorization)", value, re.IGNORECASE):
+        option = value.split("=", 1)[0]
+        if _SECRET_FIELD_RE.search(option):
             if "=" in value:
                 key, _secret = value.split("=", 1)
                 result.append(f"{key}=[REDACTED]")
@@ -881,12 +886,17 @@ def _run_capture_worker(
         try:
             stdout, _stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            cancel_confirmed = _cancel_session(base_url, session_id)
+            cancellation_deadline = time.monotonic() + 5.0
+            cancel_confirmed = _cancel_session(
+                base_url,
+                session_id,
+                timeout_s=max(0.0, cancellation_deadline - time.monotonic()),
+            )
             settled = False
             stdout = b""
             if cancel_confirmed:
                 try:
-                    stdout, _stderr = process.communicate(timeout=5.0)
+                    stdout, _stderr = process.communicate(timeout=max(0.0, cancellation_deadline - time.monotonic()))
                     settled = True
                 except subprocess.TimeoutExpired:
                     pass
@@ -963,6 +973,21 @@ def _new_output_dir(out_dir: Path) -> Path:
     else:
         resolved.mkdir(parents=True)
     return resolved
+
+
+def _write_report_artifact(out_dir: Path, manifest: dict[str, Any], manifest_path: Path) -> None:
+    from .report import write_report
+
+    try:
+        report_path = write_report(out_dir)
+    except Exception as exc:
+        manifest["report_error"] = {"type": type(exc).__name__}
+        if manifest.get("run_status") == "complete":
+            manifest["run_status"] = "report_failed"
+        _atomic_write_json(manifest_path, manifest)
+        raise RuntimeError(f"comparison report generation failed: {type(exc).__name__}") from exc
+    manifest["report_path"] = str(report_path)
+    _atomic_write_json(manifest_path, manifest)
 
 
 def _execute_campaign(
@@ -1381,8 +1406,13 @@ def run_comparison(args: argparse.Namespace) -> Path:
         manifest["run_status"] = "failed" if manifest.get("run_status") != "incomplete" else "incomplete"
         manifest["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
         _atomic_write_json(manifest_path, manifest)
+        try:
+            _write_report_artifact(out_dir, manifest, manifest_path)
+        except Exception:
+            pass
         raise
 
+    _write_report_artifact(out_dir, manifest, manifest_path)
     return out_dir
 
 
