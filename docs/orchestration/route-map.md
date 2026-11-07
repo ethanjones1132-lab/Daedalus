@@ -1,5 +1,7 @@
 # Inference route map — Phase 0
 
+**2026-11-07 source checkpoint:** The later [comparison landing](../reports/2026-11-07-direct-orchestrated-landing.md) and [Orchestration Settings source review](../reports/2026-11-07-orchestration-settings.md) add local-routing boundaries, per-attempt disclosure, explicit stage routes, and owned Native route diagnostics. The settings landing ran compilation/build checks only; its live, model, and packaged acceptance remains NOT RUN. The Phase 0 map and revision-specific references below are retained as historical evidence, not a description of the current tree.
+
 **Source:** `f681841dc900425c81df9d2e2159815e2abd5652`, inspected 2026-11-06.
 **Status:** source map recorded; Phase 0 runtime evidence **BLOCKED / NOT RUN**.
 All references below are repository-relative `file:line` references at that revision. Defaults are source defaults, not observations of an installed configuration.
