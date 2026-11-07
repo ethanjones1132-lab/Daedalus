@@ -19,8 +19,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
+
+from .sse_capture import _cancel_session
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parents[1]
@@ -492,6 +495,466 @@ def _load_tasks() -> list[dict[str, Any]]:
     return tasks
 
 
+def build_trial_schedule(tasks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the fixed two process-cold, two warm-up, and 24 warm schedule."""
+    by_id = {str(task.get("id")): task for task in tasks if isinstance(task, dict)}
+    arithmetic = by_id.get("arithmetic")
+    if arithmetic is None or len(by_id) != len(tasks):
+        raise ValueError("the frozen schedule requires unique task IDs including arithmetic")
+
+    schedule: list[dict[str, Any]] = []
+    for index, mode in enumerate(("direct", "orchestrated"), start=1):
+        schedule.append({
+            "observation_id": f"cold_{index:02d}_arithmetic",
+            "phase": "process_cold",
+            "mode": mode,
+            "task_id": "arithmetic",
+            "pair_id": None,
+            "pair_order": None,
+            "order_index": index,
+            "reported": True,
+        })
+    for index, mode in enumerate(("direct", "orchestrated"), start=1):
+        schedule.append({
+            "observation_id": f"warmup_{index:02d}",
+            "phase": "warmup",
+            "mode": mode,
+            "task_id": "arithmetic",
+            "pair_id": None,
+            "pair_order": None,
+            "order_index": index,
+            "reported": False,
+        })
+
+    pair_index = 0
+    orders = (
+        ("direct_then_orchestrated", ("direct", "orchestrated")),
+        ("orchestrated_then_direct", ("orchestrated", "direct")),
+        ("direct_then_orchestrated", ("direct", "orchestrated")),
+    )
+    for task in tasks:
+        task_id = str(task["id"])
+        for pair_number, (pair_order, modes) in enumerate(orders, start=1):
+            pair_index += 1
+            pair_id = f"{task_id}_pair_{pair_number:02d}"
+            for slot, mode in zip(("a", "b"), modes):
+                schedule.append({
+                    "observation_id": f"pair_{pair_number:02d}_{task_id}_{slot}",
+                    "phase": "warm",
+                    "mode": mode,
+                    "task_id": task_id,
+                    "pair_id": pair_id,
+                    "pair_order": pair_order,
+                    "order_index": pair_index,
+                    "reported": True,
+                })
+    return schedule
+
+
+def cold_observation_metadata(*, model_ready_ms: float, first_output_ms: float | None) -> dict[str, Any]:
+    return {
+        "cold_label": "process-cold",
+        "cold_state": "llama_process_and_kv",
+        "os_page_cache_cold": False,
+        "whole_machine_cold": False,
+        "model_process_ready_ms": max(0.0, float(model_ready_ms)),
+        "first_output_ms": None if first_output_ms is None else max(0.0, float(first_output_ms)),
+    }
+
+
+def _route_records(observation: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for key in ("route_attempts", "stage_routes", "direct_path_route_attribution"):
+        value = observation.get(key)
+        if isinstance(value, list):
+            records.extend(record for record in value if isinstance(record, dict))
+    for key in ("answered_by",):
+        value = observation.get(key)
+        if isinstance(value, dict):
+            records.append(value)
+    return records
+
+
+def _path_fields(value: Any) -> Iterator[str]:
+    path_keys = {"path", "paths", "file", "files", "file_path", "filepath", "directory", "directories", "dir", "root", "cwd"}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).casefold() in path_keys:
+                if isinstance(child, str):
+                    yield child
+                elif isinstance(child, list):
+                    yield from (item for item in child if isinstance(item, str))
+                else:
+                    yield from _path_fields(child)
+            else:
+                yield from _path_fields(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _path_fields(child)
+
+
+def _path_within(root: Path, value: str) -> bool:
+    try:
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        return candidate.resolve(strict=False).is_relative_to(root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def validate_trial_safety(
+    observation: dict[str, Any],
+    *,
+    served_alias: str,
+    fixture_root: Path,
+    fixture_sha256: str,
+) -> list[str]:
+    """Return fail-closed reasons from observed routes, tools, and fixture hashes."""
+    reasons: list[str] = []
+    routes = _route_records(observation)
+    if not routes:
+        reasons.append("route_attribution_missing")
+    for route in routes:
+        provider = route.get("provider", route.get("actual_provider"))
+        model = route.get("model", route.get("actual_model"))
+        if route.get("cloud") is True:
+            reasons.append("cloud_route")
+        if provider != "llama_cpp":
+            reasons.append("non_local_route")
+        if model != served_alias:
+            reasons.append("unexpected_alias")
+
+    uses = observation.get("tool_use_frames")
+    results = observation.get("tool_result_frames")
+    if isinstance(uses, list) and isinstance(results, list):
+        use_ids = [item.get("id", item.get("call_id")) for item in uses if isinstance(item, dict)]
+        result_ids = [item.get("call_id", item.get("id")) for item in results if isinstance(item, dict)]
+        if len(uses) != len(results) or (all(use_ids) and all(result_ids) and sorted(use_ids) != sorted(result_ids)):
+            reasons.append("tool_trace_mismatch")
+    for use in uses if isinstance(uses, list) else []:
+        if not isinstance(use, dict):
+            continue
+        name = use.get("name")
+        if name in {"web_search", "web_fetch"}:
+            reasons.append("web_tool_attempt")
+        if name in {"write_file", "edit_file", "multi_edit", "Write", "Edit", "MultiEdit", "bash", "powershell", "Bash"}:
+            reasons.append("mutating_tool_attempt")
+        for path_value in _path_fields(use.get("input", {})):
+            if not _path_within(fixture_root, path_value):
+                reasons.append("escaped_tool_path")
+
+    before = observation.get("fixture_sha256_before")
+    after = observation.get("fixture_sha256_after")
+    if before != fixture_sha256:
+        reasons.append("fixture_baseline_mismatch")
+    if after != fixture_sha256:
+        reasons.append("fixture_mutated")
+    if observation.get("outcome") == "timeout" and observation.get("cancel_confirmed") is not True:
+        reasons.append("cancellation_unconfirmed")
+    if observation.get("capture_worker_settled") is False:
+        reasons.append("capture_worker_unsettled")
+    return list(dict.fromkeys(reasons))
+
+
+def run_trial_schedule(
+    schedule: Sequence[dict[str, Any]],
+    trial_runner,
+) -> list[dict[str, Any]]:
+    """Keep all failure records and stop only when safety/cancellation requires it."""
+    records: list[dict[str, Any]] = []
+    for trial in schedule:
+        try:
+            result = trial_runner(trial)
+        except Exception as exc:
+            result = {"outcome": "transport_failure", "error_type": type(exc).__name__, "stop_campaign": True}
+        if not isinstance(result, dict):
+            result = {"outcome": "transport_failure", "error_type": "InvalidTrialResult", "stop_campaign": True}
+        record = {**trial, **result}
+        if record.get("outcome") == "timeout" and record.get("cancel_confirmed") is not True:
+            record["stop_campaign"] = True
+        if record.get("outcome") == "blocked" or record.get("trial_status") == "blocked":
+            record["stop_campaign"] = True
+        records.append(record)
+        if record.get("stop_campaign") is True:
+            break
+    return records
+
+
+def capture_trial(
+    trial: dict[str, Any],
+    task: dict[str, Any],
+    *,
+    base_url: str,
+    fixture_path: Path,
+    fixture_root: Path,
+    fixture_sha256: str,
+    out_path: Path,
+    served_alias: str,
+    wall_cap_ms: int = 120_000,
+    worker=None,
+) -> dict[str, Any]:
+    """Capture one fresh Session and verify local-only and fixture invariants."""
+    session_id = uuid.uuid4().hex
+    record: dict[str, Any] = {
+        **trial,
+        "session_id": session_id,
+        "raw_capture_path": str(out_path),
+        "history_reset": True,
+    }
+    try:
+        before = artifact_sha256(fixture_path)
+    except OSError:
+        before = None
+    record["fixture_sha256_before"] = before
+    if before != fixture_sha256:
+        record.update({
+            "outcome": "blocked",
+            "trial_status": "blocked",
+            "fixture_sha256_after": before,
+            "safety_reasons": ["fixture_baseline_mismatch"],
+            "stop_campaign": True,
+        })
+        return record
+
+    capture_worker = worker or _run_capture_worker
+    try:
+        observation = capture_worker(
+            base_url=base_url,
+            session_id=session_id,
+            task=task,
+            wall_cap_ms=wall_cap_ms,
+            out_path=out_path,
+        )
+    except Exception as exc:
+        observation = {"outcome": "transport_failure", "error_type": type(exc).__name__}
+    try:
+        after = artifact_sha256(fixture_path)
+    except OSError:
+        after = None
+    record.update(observation if isinstance(observation, dict) else {"outcome": "transport_failure", "error_type": "InvalidCaptureResult"})
+    record["fixture_sha256_after"] = after
+    reasons = validate_trial_safety(record, served_alias=served_alias, fixture_root=fixture_root, fixture_sha256=fixture_sha256)
+    record["safety_reasons"] = reasons
+    record["trial_status"] = "blocked" if reasons else record.get("outcome", "unknown")
+    record["stop_campaign"] = bool(reasons) or record.get("stop_campaign") is True
+    return record
+
+
+def _successful_named_tool_calls(observation: dict[str, Any], tool_name: str) -> int | None:
+    uses = observation.get("tool_use_frames")
+    results = observation.get("tool_result_frames")
+    if not isinstance(uses, list) or not isinstance(results, list):
+        return None
+    successful_results = {
+        result.get("call_id", result.get("id"))
+        for result in results
+        if isinstance(result, dict) and result.get("is_error") is False
+    }
+    if any(not isinstance(result, dict) or result.get("is_error") not in {True, False} for result in results):
+        return None
+    return sum(
+        1 for use in uses
+        if isinstance(use, dict)
+        and use.get("name") == tool_name
+        and use.get("id", use.get("call_id")) in successful_results
+    )
+
+
+def evaluate_acceptance(
+    task: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    fixture_sha256_before: str | None,
+    fixture_sha256_after: str | None,
+    expected_fixture_sha256: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Score only mechanical criteria; preserve subjective criteria as blind pending work."""
+    acceptance = task.get("acceptance", {})
+    criteria = acceptance.get("criteria", []) if isinstance(acceptance, dict) else []
+    observation_id = str(observation.get("observation_id", "unknown-observation"))
+    blind_label = "blind-" + hashlib.sha256(observation_id.encode("utf-8")).hexdigest()[:12]
+    expected_fixture = expected_fixture_sha256 or fixture_sha256_before
+    mechanical: list[dict[str, Any]] = []
+    rubric: list[dict[str, Any]] = []
+
+    for criterion in criteria:
+        if not isinstance(criterion, dict):
+            continue
+        criterion_id = criterion.get("id")
+        kind = criterion.get("kind")
+        status: str | None = None
+        observed: Any = None
+        expected: Any = None
+        if kind == "exact_text":
+            observed = str(observation.get("visible_text", "")).strip()
+            expected = str(criterion.get("expected", acceptance.get("expected_answer", ""))).strip()
+            status = "pass" if observed == expected else "fail"
+        elif kind == "minimum_successful_tool_calls":
+            tool = str(criterion.get("tool", ""))
+            observed = _successful_named_tool_calls(observation, tool)
+            expected = int(criterion.get("minimum", 0))
+            status = "unknown" if observed is None else "pass" if observed >= expected else "fail"
+        elif kind == "maximum_failed_tool_results":
+            results = observation.get("tool_result_frames")
+            if isinstance(results, list) and all(isinstance(result, dict) and result.get("is_error") in {True, False} for result in results):
+                observed = sum(result.get("is_error") is True for result in results)
+                expected = int(criterion.get("maximum", 0))
+                status = "pass" if observed <= expected else "fail"
+            else:
+                status = "unknown"
+        elif kind == "fixture_sha256_matches_baseline":
+            observed = {"before": fixture_sha256_before, "after": fixture_sha256_after}
+            expected = expected_fixture
+            status = "pass" if expected and fixture_sha256_before == expected and fixture_sha256_after == expected else "fail"
+
+        if status is not None:
+            mechanical.append({
+                "observation_id": observation_id,
+                "task_id": task.get("id"),
+                "criterion_id": criterion_id,
+                "kind": kind,
+                "status": status,
+                "observed": observed,
+                "expected": expected,
+            })
+            continue
+
+        rubric.append({
+            "observation_id": observation_id,
+            "blind_label": blind_label,
+            "task_id": task.get("id"),
+            "criterion_id": criterion_id,
+            "criterion": criterion.get("criterion", ""),
+            "score": "pending",
+            "reviewer": {"type": "pending", "identity": None},
+            "comments": [],
+            "raw_output": observation.get("visible_text", ""),
+        })
+
+    return {"mechanical_results": mechanical, "rubric_results": rubric}
+
+
+def _run_capture_worker(
+    *,
+    base_url: str,
+    session_id: str,
+    task: dict[str, Any],
+    wall_cap_ms: int,
+    out_path: Path,
+    worker_home: Path,
+    port: int,
+    workspace: Path,
+    repo_root: Path = REPO_ROOT,
+    popen_factory=subprocess.Popen,
+) -> dict[str, Any]:
+    """Run one capture worker under a parent deadline that includes process spawn."""
+    task_path = out_path.with_suffix(".task.json")
+    _write_json(task_path, task)
+    command = [
+        sys.executable, "-m", "scripts.direct_vs_orchestrated.capture_worker",
+        "--base-url", base_url,
+        "--session-id", session_id,
+        "--task-json", str(task_path),
+        "--out", str(out_path),
+        "--wall-cap-ms", str(wall_cap_ms),
+    ]
+    environment = child_env(worker_home, port=port, workspace=workspace)
+    # The monotonic turn deadline begins before Popen, so interpreter startup
+    # and task-file loading consume the same 120-second budget as SSE capture.
+    capture_started = time.monotonic()
+    deadline = capture_started + wall_cap_ms / 1000.0
+
+    def with_parent_timing(result: dict[str, Any]) -> dict[str, Any]:
+        result["capture_worker_wall_ms"] = round(max(0.0, time.monotonic() - capture_started) * 1000, 3)
+        return result
+    with owned_processes(
+        [command],
+        ports=[],
+        env=[environment],
+        cwd=[repo_root],
+        popen_factory=popen_factory,
+        stdout_targets=[subprocess.PIPE],
+        terminate_timeout_s=1.0,
+    ) as processes:
+        process = processes[0]
+        try:
+            stdout, _stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            cancel_confirmed = _cancel_session(base_url, session_id)
+            settled = False
+            stdout = b""
+            if cancel_confirmed:
+                try:
+                    stdout, _stderr = process.communicate(timeout=5.0)
+                    settled = True
+                except subprocess.TimeoutExpired:
+                    pass
+            elif process.poll() is not None:
+                try:
+                    stdout, _stderr = process.communicate(timeout=0.0)
+                    settled = True
+                except subprocess.TimeoutExpired:
+                    pass
+            if not settled and process.poll() is None:
+                process.terminate()
+                try:
+                    stdout, _stderr = process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, _stderr = process.communicate(timeout=1.0)
+            result = _parse_worker_summary(stdout)
+            if result is None:
+                result = {"outcome": "timeout"}
+            settlement_outcome = result.get("outcome")
+            result.update({
+                "outcome": "timeout",
+                "timeout_ms": wall_cap_ms,
+                "cancel_confirmed": cancel_confirmed,
+                "capture_worker_settled": settled,
+                "cancel_settlement_outcome": settlement_outcome,
+                "capture_worker_pid": process.pid,
+                "stop_campaign": not (cancel_confirmed and settled),
+            })
+            return with_parent_timing(result)
+        result = _parse_worker_summary(stdout)
+        if result is None:
+            return with_parent_timing({
+                "outcome": "transport_failure",
+                "capture_worker_pid": process.pid,
+                "capture_worker_exit_code": process.returncode,
+                "capture_worker_settled": True,
+                "error_type": "InvalidWorkerSummary",
+            })
+        result.update({
+            "capture_worker_pid": process.pid,
+            "capture_worker_exit_code": process.returncode,
+            "capture_worker_settled": True,
+        })
+        return with_parent_timing(result)
+
+
+def _parse_worker_summary(stdout: bytes | str | None) -> dict[str, Any] | None:
+    if stdout is None:
+        return None
+    text = stdout.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else str(stdout)
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("outcome"), str):
+            return value
+    return None
+
+
+def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n")
+        stream.flush()
+
+
 def _new_output_dir(out_dir: Path) -> Path:
     resolved = out_dir.expanduser().resolve()
     if resolved.exists():
@@ -500,6 +963,311 @@ def _new_output_dir(out_dir: Path) -> Path:
     else:
         resolved.mkdir(parents=True)
     return resolved
+
+
+def _execute_campaign(
+    *,
+    out_dir: Path,
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    tasks: list[dict[str, Any]],
+    configs: dict[str, dict[str, Any]],
+    llama_argv: list[str],
+    bun_path: Path,
+    repo_root: Path,
+    homes: Path,
+    fixture_dir: Path,
+    fixture_path: Path,
+    fixture_sha: str,
+    ports: dict[str, int],
+    served_alias: str,
+    model_url: str,
+    popen_factory=subprocess.Popen,
+) -> None:
+    schedule = build_trial_schedule(tasks)
+    manifest.update({
+        "schedule": schedule,
+        "expected_counts": {"process_cold": 2, "warmup_unreported": 2, "warm_reported": 24},
+        "observations": [],
+        "run_status": "starting",
+        "campaign_complete": False,
+    })
+    _atomic_write_json(manifest_path, manifest)
+    task_by_id = {task["id"]: task for task in tasks}
+    server_root = repo_root / "server-jarvis"
+    bun_argv = [str(bun_path), "run", "src/index.ts"]
+    bun_commands = [bun_argv, bun_argv]
+    bun_modes = ["direct", "orchestrated"]
+    bun_envs = [
+        child_env(homes / mode, port=ports[mode], workspace=fixture_dir)
+        for mode in bun_modes
+    ]
+    bun_cwds = [server_root, server_root]
+    log_names = ["llama_cpp_process_cold_direct", "llama_cpp_process_cold_orchestrated", "bun_direct", "bun_orchestrated"]
+    readiness: list[dict[str, Any]] = []
+    process_handles: dict[int, subprocess.Popen] = {}
+    blind_key: dict[str, Any] = {}
+    observations_path = out_dir / "observations.jsonl"
+    rubric_path = out_dir / "rubric.jsonl"
+    packets_path = out_dir / "blind-review-packets.jsonl"
+    blind_key_path = out_dir / "blind-review-key.json"
+
+    def record_process(name: str, process: subprocess.Popen, argv: Sequence[str], cwd: Path) -> dict[str, Any]:
+        row = {
+            "name": name,
+            "pid": process.pid,
+            "argv_redacted": _redact_argv(argv),
+            "cwd": str(cwd),
+            "owned_handle": True,
+            "status": "started",
+        }
+        manifest["processes"].append(row)
+        process_handles[process.pid] = process
+        _atomic_write_json(manifest_path, manifest)
+        return row
+
+    def mark_process_stopped(row: dict[str, Any], process: subprocess.Popen) -> None:
+        row["exit_code"] = process.poll()
+        row["status"] = "stopped" if row["exit_code"] is not None else "stop_unconfirmed"
+        _atomic_write_json(manifest_path, manifest)
+
+    def start_model(process_stack: contextlib.ExitStack, log_file, generation: str):
+        model_stack = process_stack.enter_context(contextlib.ExitStack())
+        ready_started = time.monotonic()
+        processes = model_stack.enter_context(owned_processes(
+            [llama_argv],
+            ports=[ports["llama_cpp"]],
+            env=[child_env(homes / "model", port=ports["llama_cpp"], workspace=fixture_dir)],
+            cwd=[homes / "model"],
+            stdout_targets=[log_file],
+            popen_factory=popen_factory,
+        ))
+        process = processes[0]
+        process_row = record_process(f"llama_cpp_{generation}", process, llama_argv, homes / "model")
+        health = _wait_for_json(f"http://127.0.0.1:{ports['llama_cpp']}/health", process, timeout_s=120.0)
+        model_list = _wait_for_json(
+            f"http://127.0.0.1:{ports['llama_cpp']}/v1/models",
+            process,
+            timeout_s=5.0,
+            expected_alias=served_alias,
+        )
+        ready_ms = round((time.monotonic() - ready_started) * 1000, 3)
+        readiness.append({
+            "component": f"llama_cpp_{generation}",
+            "status": "ready",
+            "health": health,
+            "served_alias": served_alias,
+            "model_count": len(model_list.get("data", [])),
+            "ready_ms": ready_ms,
+        })
+        manifest["readiness"] = readiness
+        _atomic_write_json(manifest_path, manifest)
+        return model_stack, process, process_row, ready_ms
+
+    def record_trial(trial: dict[str, Any], *, model_ready_ms: float, model_generation: str) -> dict[str, Any]:
+        task = task_by_id[trial["task_id"]]
+        mode = trial["mode"]
+        base_url = f"http://127.0.0.1:{ports[mode]}"
+        capture_path = out_dir / "captures" / mode / trial["task_id"] / f"{trial['observation_id']}.jsonl"
+
+        def launch_worker(**kwargs):
+            return _run_capture_worker(
+                **kwargs,
+                worker_home=homes / mode,
+                port=ports[mode],
+                workspace=fixture_dir,
+                repo_root=repo_root,
+                popen_factory=popen_factory,
+            )
+
+        record = capture_trial(
+            trial,
+            task,
+            base_url=base_url,
+            fixture_path=fixture_path,
+            fixture_root=fixture_dir,
+            fixture_sha256=fixture_sha,
+            out_path=capture_path,
+            served_alias=served_alias,
+            wall_cap_ms=120_000,
+            worker=launch_worker,
+        )
+        record["llama_process_generation"] = model_generation
+        if trial["phase"] == "process_cold":
+            record.update(cold_observation_metadata(
+                model_ready_ms=model_ready_ms,
+                first_output_ms=record.get("first_visible_ms"),
+            ))
+
+        all_frames = record.get("raw_frames")
+        normalized = {key: value for key, value in record.items() if key != "raw_frames"}
+        normalized["raw_frame_count"] = len(all_frames) if isinstance(all_frames, list) else None
+        _append_jsonl(observations_path, normalized)
+        acceptance = evaluate_acceptance(
+            task,
+            record,
+            fixture_sha256_before=record.get("fixture_sha256_before"),
+            fixture_sha256_after=record.get("fixture_sha256_after"),
+            expected_fixture_sha256=fixture_sha,
+        )
+        for row in acceptance["mechanical_results"]:
+            _append_jsonl(rubric_path, {"assessment_type": "mechanical", **row})
+        for row in acceptance["rubric_results"]:
+            _append_jsonl(rubric_path, {"assessment_type": "independent_review", **row})
+        if acceptance["rubric_results"]:
+            first = acceptance["rubric_results"][0]
+            blind_label = first["blind_label"]
+            _append_jsonl(packets_path, {
+                "blind_label": blind_label,
+                "task_id": task["id"],
+                "criteria": [
+                    {"criterion_id": row["criterion_id"], "criterion": row["criterion"]}
+                    for row in acceptance["rubric_results"]
+                ],
+                "answer": record.get("visible_text", ""),
+            })
+            blind_key[blind_label] = {
+                "observation_id": trial["observation_id"],
+                "mode": mode,
+                "pair_id": trial.get("pair_id"),
+                "pair_order": trial.get("pair_order"),
+            }
+            _atomic_write_json(blind_key_path, blind_key)
+
+        manifest["observations"].append({
+            "observation_id": trial["observation_id"],
+            "phase": trial["phase"],
+            "mode": mode,
+            "task_id": task["id"],
+            "outcome": record.get("outcome"),
+            "trial_status": record.get("trial_status"),
+            "safety_reasons": record.get("safety_reasons", []),
+            "raw_capture_path": str(capture_path),
+            "cancel_confirmed": record.get("cancel_confirmed"),
+        })
+        manifest["run_status"] = "capturing"
+        manifest["observation_count"] = len(manifest["observations"])
+        if record.get("stop_campaign"):
+            manifest["campaign_stop_reason"] = record.get("safety_reasons") or "capture cancellation did not settle"
+            manifest["run_status"] = "incomplete"
+        _atomic_write_json(manifest_path, manifest)
+        return record
+
+    def consume(trials: Sequence[dict[str, Any]], *, model_ready_ms: float, generation: str) -> bool:
+        records = run_trial_schedule(
+            trials,
+            lambda trial: record_trial(trial, model_ready_ms=model_ready_ms, model_generation=generation),
+        )
+        known_ids = {row.get("observation_id") for row in manifest.get("observations", [])}
+        for row in records:
+            if row.get("observation_id") in known_ids:
+                continue
+            fallback = {
+                key: row.get(key)
+                for key in ("observation_id", "phase", "mode", "task_id", "pair_id", "pair_order", "reported")
+            }
+            fallback.update({
+                "outcome": row.get("outcome", "transport_failure"),
+                "trial_status": row.get("trial_status", "failed"),
+                "error_type": row.get("error_type"),
+                "safety_reasons": row.get("safety_reasons", []),
+                "stop_campaign": row.get("stop_campaign", False),
+            })
+            manifest["observations"].append(fallback)
+            _append_jsonl(observations_path, fallback)
+            known_ids.add(row.get("observation_id"))
+        manifest.setdefault("campaign_records", []).extend({
+            "observation_id": row.get("observation_id"),
+            "outcome": row.get("outcome"),
+            "stop_campaign": row.get("stop_campaign", False),
+        } for row in records)
+        if records and records[-1].get("stop_campaign") is True:
+            manifest["run_status"] = "incomplete"
+            manifest["campaign_stop_reason"] = records[-1].get("safety_reasons") or records[-1].get("error_type") or records[-1].get("outcome")
+        _atomic_write_json(manifest_path, manifest)
+        return len(records) == len(trials) and (not records or records[-1].get("stop_campaign") is not True)
+
+    try:
+        with _open_process_logs(out_dir, log_names) as log_files:
+            logs = dict(zip(log_names, log_files))
+            with contextlib.ExitStack() as process_stack:
+                model_stack, model_process, model_row, direct_ready_ms = start_model(
+                    process_stack, logs["llama_cpp_process_cold_direct"], "process_cold_direct",
+                )
+                bun_processes = process_stack.enter_context(owned_processes(
+                    bun_commands,
+                    ports=[ports["direct"], ports["orchestrated"]],
+                    env=bun_envs,
+                    cwd=bun_cwds,
+                    stdout_targets=[logs["bun_direct"], logs["bun_orchestrated"]],
+                    popen_factory=popen_factory,
+                ))
+                bun_rows = []
+                for mode, process, command, working_dir, port in zip(
+                    bun_modes, bun_processes, bun_commands, bun_cwds, (ports["direct"], ports["orchestrated"]),
+                ):
+                    bun_rows.append(record_process(f"bun_{mode}", process, command, working_dir))
+                    health = _wait_for_json(f"http://127.0.0.1:{port}/health", process, timeout_s=30.0)
+                    config_response = _wait_for_json(f"http://127.0.0.1:{port}/config", process, timeout_s=5.0)
+                    expected_enabled = configs[mode]["orchestrator"]["enabled"]
+                    if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
+                        raise RuntimeError(f"{mode} Bun health did not confirm the expected local backend and alias")
+                    actual_orchestrator = config_response.get("orchestrator")
+                    actual_llama = config_response.get("llama_cpp")
+                    if not isinstance(actual_orchestrator, dict) or actual_orchestrator.get("enabled") is not expected_enabled:
+                        raise RuntimeError(f"{mode} Bun /config did not confirm the intended orchestration mode")
+                    if not isinstance(actual_llama, dict) or actual_llama.get("base_url") != model_url or actual_llama.get("model") != served_alias:
+                        raise RuntimeError(f"{mode} Bun /config did not confirm the isolated llama.cpp target")
+                    readiness.append({
+                        "component": f"bun_{mode}",
+                        "status": "ready",
+                        "health": {key: health.get(key) for key in ("ok", "backend", "model", "configured_model", "git_sha", "source_tree_sha256")},
+                        "effective_config_redacted": redact_config(config_response),
+                        "effective_config_fingerprint": _fingerprint(redact_config(config_response)),
+                    })
+                manifest["readiness"] = readiness
+                manifest["run_status"] = "ready"
+                _atomic_write_json(manifest_path, manifest)
+
+                cold_trials = [trial for trial in schedule if trial["phase"] == "process_cold"]
+                if not consume(cold_trials[:1], model_ready_ms=direct_ready_ms, generation="process_cold_direct"):
+                    return
+
+                # Stop only our first llama-server handle while both owned Bun
+                # servers stay alive; the next mode gets an unloaded process/KV.
+                model_stack.close()
+                mark_process_stopped(model_row, model_process)
+                model_stack, model_process, model_row, orchestrated_ready_ms = start_model(
+                    process_stack, logs["llama_cpp_process_cold_orchestrated"], "process_cold_orchestrated",
+                )
+                if not consume(cold_trials[1:], model_ready_ms=orchestrated_ready_ms, generation="process_cold_orchestrated"):
+                    return
+
+                warmups = [trial for trial in schedule if trial["phase"] == "warmup"]
+                warm = [trial for trial in schedule if trial["phase"] == "warm"]
+                if not consume(warmups, model_ready_ms=orchestrated_ready_ms, generation="warm"):
+                    return
+                if not consume(warm, model_ready_ms=orchestrated_ready_ms, generation="warm"):
+                    return
+
+        # A completed campaign has every scheduled record. Warm-ups remain in
+        # observations with reported=false, while the report can omit them.
+        complete = len(manifest.get("observations", [])) == len(schedule)
+        manifest["run_status"] = "complete" if complete else "incomplete"
+        manifest["campaign_complete"] = complete
+        manifest["reported_warm_count"] = sum(
+            item.get("phase") == "warm" for item in manifest.get("observations", [])
+        )
+        _atomic_write_json(manifest_path, manifest)
+    finally:
+        for row in manifest.get("processes", []):
+            process = process_handles.get(row.get("pid"))
+            if process is not None and row.get("status") != "stopped":
+                exit_code = process.poll()
+                if exit_code is not None:
+                    row["exit_code"] = exit_code
+                    row["status"] = "stopped"
+        _atomic_write_json(manifest_path, manifest)
 
 
 def run_comparison(args: argparse.Namespace) -> Path:
@@ -591,70 +1359,26 @@ def run_comparison(args: argparse.Namespace) -> Path:
     manifest_path = out_dir / "manifest.json"
     _atomic_write_json(manifest_path, manifest)
 
-    server_root = repo_root / "server-jarvis"
-    commands = [
-        llama_argv,
-        [str(bun_path), "run", "src/index.ts"],
-        [str(bun_path), "run", "src/index.ts"],
-    ]
-    child_envs = [
-        child_env(homes / "model", port=ports["llama_cpp"], workspace=fixture_dir),
-        child_env(homes / "direct", port=ports["direct"], workspace=fixture_dir),
-        child_env(homes / "orchestrated", port=ports["orchestrated"], workspace=fixture_dir),
-    ]
-    child_envs[1]["JARVIS_SERVER_PORT"] = str(ports["direct"])
-    child_envs[2]["JARVIS_SERVER_PORT"] = str(ports["orchestrated"])
-    child_cwds = [homes / "model", server_root, server_root]
-    process_names = ["llama_cpp", "direct", "orchestrated"]
-    readiness: list[dict[str, Any]] = []
-
     try:
-        with _open_process_logs(out_dir, process_names) as logs:
-            with owned_processes(
-                commands,
-                ports=list(ports.values()),
-                env=child_envs,
-                cwd=child_cwds,
-                stdout_targets=logs,
-            ) as processes:
-                for name, process, command, working_dir in zip(process_names, processes, commands, child_cwds):
-                    manifest["processes"].append({
-                        "name": name,
-                        "pid": process.pid,
-                        "argv_redacted": _redact_argv(command),
-                        "cwd": str(working_dir),
-                        "owned_handle": True,
-                    })
-                _atomic_write_json(manifest_path, manifest)
-
-                model_health = _wait_for_json(f"http://127.0.0.1:{ports['llama_cpp']}/health", processes[0], timeout_s=120.0)
-                model_list = _wait_for_json(f"http://127.0.0.1:{ports['llama_cpp']}/v1/models", processes[0], timeout_s=5.0, expected_alias=served_alias)
-                readiness.append({"component": "llama_cpp", "status": "ready", "health": model_health, "served_alias": served_alias, "model_count": len(model_list.get("data", []))})
-                for mode, process, port in (("direct", processes[1], ports["direct"]), ("orchestrated", processes[2], ports["orchestrated"])):
-                    health = _wait_for_json(f"http://127.0.0.1:{port}/health", process, timeout_s=30.0)
-                    config_response = _wait_for_json(f"http://127.0.0.1:{port}/config", process, timeout_s=5.0)
-                    expected_enabled = configs[mode]["orchestrator"]["enabled"]
-                    if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
-                        raise RuntimeError(f"{mode} Bun health did not confirm the expected local backend and alias")
-                    actual_orchestrator = config_response.get("orchestrator")
-                    actual_llama = config_response.get("llama_cpp")
-                    if not isinstance(actual_orchestrator, dict) or actual_orchestrator.get("enabled") is not expected_enabled:
-                        raise RuntimeError(f"{mode} Bun /config did not confirm the intended orchestration mode")
-                    if not isinstance(actual_llama, dict) or actual_llama.get("base_url") != model_url or actual_llama.get("model") != served_alias:
-                        raise RuntimeError(f"{mode} Bun /config did not confirm the isolated llama.cpp target")
-                    readiness.append({
-                        "component": f"bun_{mode}",
-                        "status": "ready",
-                        "health": {key: health.get(key) for key in ("ok", "backend", "model", "configured_model", "git_sha", "source_tree_sha256")},
-                        "effective_config_redacted": redact_config(config_response),
-                        "effective_config_fingerprint": _fingerprint(redact_config(config_response)),
-                    })
-                manifest["readiness"] = readiness
-                manifest["run_status"] = "ready"
-                _atomic_write_json(manifest_path, manifest)
+        _execute_campaign(
+            out_dir=out_dir,
+            manifest=manifest,
+            manifest_path=manifest_path,
+            tasks=tasks,
+            configs=configs,
+            llama_argv=llama_argv,
+            bun_path=bun_path,
+            repo_root=repo_root,
+            homes=homes,
+            fixture_dir=fixture_dir,
+            fixture_path=fixture_path,
+            fixture_sha=fixture_sha,
+            ports=ports,
+            served_alias=served_alias,
+            model_url=model_url,
+        )
     except BaseException as exc:
-        manifest["readiness"] = readiness
-        manifest["run_status"] = "failed"
+        manifest["run_status"] = "failed" if manifest.get("run_status") != "incomplete" else "incomplete"
         manifest["failure"] = {"type": type(exc).__name__, "reason": str(exc)}
         _atomic_write_json(manifest_path, manifest)
         raise
