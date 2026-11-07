@@ -22,6 +22,7 @@
 // index.ts and are untouched by this seam.
 import type { MemoryTurnTerminalStatus } from "./memory-contract";
 import type { StreamSession } from "./stream-emitter";
+import type { RoutePlanSummary } from "./orchestration/route-plan";
 import {
   terminalResultFields,
   type TerminalFinishOptions,
@@ -116,6 +117,7 @@ export async function finishSinglePassCompletion(input: {
     status: MemoryTurnTerminalStatus,
     errorCode?: string | null,
   ) => void;
+  route?: RoutePlanSummary;
 }): Promise<SinglePassCompletion> {
   const completion = classifySinglePassCompletion({
     answer: input.answer,
@@ -126,6 +128,7 @@ export async function finishSinglePassCompletion(input: {
     subtype: completion.subtype,
     isError: completion.subtype === "error",
     ...(completion.code ? { code: completion.code } : {}),
+    ...(input.route ? { route: input.route } : {}),
   };
   await input.session.finish(completion.result, options);
   return completion;

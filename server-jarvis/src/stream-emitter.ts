@@ -194,12 +194,13 @@ export class StreamSession {
   }
 
   /** Emit the terminal error outcome. The transport terminator is sent separately. */
-  async error(message: string, code?: string): Promise<void> {
+  async error(message: string, code?: string, route?: unknown): Promise<void> {
     if (!this.noteOutcome()) return;
     await this.write(sseFrame({
       type: "error",
       error: message,
       ...(code ? { code } : {}),
+      ...(route ? { route } : {}),
       session_id: this.sessionId,
       ...this.turnTag(),
     }));

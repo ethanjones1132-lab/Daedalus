@@ -28,6 +28,7 @@ export interface TerminalFinishOptions {
   isError?: boolean;
   subtype?: "success" | "error" | "partial";
   code?: string;
+  route?: RoutePlanSummary;
 }
 
 export interface TerminalResultFields {

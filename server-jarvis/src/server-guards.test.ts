@@ -364,7 +364,7 @@ describe("entrypoint wiring", () => {
     // No bare top-level `serve({` may remain: that is the DS-31 form.
     expect(source).not.toMatch(/^serve\(\{/m);
     expect(source).toMatch(/guardServerBind\(\s*\(\)\s*=>\s*serve\(\{/);
-    expect(source).toMatch(/const BIND_TARGET = resolveBindTarget\(PORT\);/);
+    expect(source).toMatch(/const BIND_TARGET = resolveBindTarget\(PORT, process\.env\.JARVIS_SERVER_HOST\);/);
     expect(source).toMatch(/hostname: BIND_TARGET\.hostname,/);
     // The guarded thunk keeps the original serve options byte-for-byte:
     // idleTimeout 0 (long SSE turns) and the same baseFetch handler.

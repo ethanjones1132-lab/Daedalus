@@ -180,6 +180,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
 
   test("uses the stage-specific OpenRouter agent chain before generic fallbacks", async () => {
     const seenChatModels: string[] = [];
+    const observed: Array<{ provider: string; model: string; outcome: string }> = [];
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/models")) {
@@ -204,7 +205,7 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       cfgWithPool(),
       { model: "openrouter/free", messages: [{ role: "user", content: "fix the bug" }], stream: true },
       undefined,
-      { stage: "executor", taskType: "debug" },
+      { stage: "executor", taskType: "debug", onAttempt: (attempt) => observed.push(attempt) },
     );
 
     expect(result.model_used).toBe("nvidia/nemotron-3-ultra-550b-a55b:free");
@@ -213,6 +214,10 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
       "nvidia/nemotron-3-ultra-550b-a55b:free",
     ]);
     expect(seenChatModels).not.toContain("opencode/big-pickle");
+    expect(observed.map(({ provider, model, outcome }) => ({ provider, model, outcome }))).toEqual([
+      { provider: "openrouter", model: "cohere/north-mini-code:free", outcome: "http_error" },
+      { provider: "openrouter", model: "nvidia/nemotron-3-ultra-550b-a55b:free", outcome: "response" },
+    ]);
   });
 
   test("uses cascade tier to put cheap and strong pool agents first", async () => {

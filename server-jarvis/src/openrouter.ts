@@ -604,6 +604,14 @@ interface FallbackResolveOptions {
   env?: NodeJS.ProcessEnv;
   /** Original turn budget, retained for actionable timeout metadata. */
   turnBudgetMs?: number;
+  /** Observe each physical provider/model request, including failed retries. */
+  onAttempt?: (attempt: {
+    provider: HttpProviderId;
+    model: string;
+    outcome: "response" | "http_error" | "first_token_timeout" | "cancelled";
+    duration_ms: number;
+    error?: string;
+  }) => void;
   /**
    * Ephemeral native recall to refit and attach independently for every
    * cascade candidate (including same-model retries). `requestBody` must be
@@ -1105,6 +1113,21 @@ export async function chatCompletionWithFallback(
     // `break` advances to the next model in the cascade.
     attemptLoop: while (true) {
       assertFallbackDeadline(options);
+      const attemptStartedAt = Date.now();
+      let attemptObserved = false;
+      let requestDispatched = false;
+      const observeAttempt = (
+        outcome: "response" | "http_error" | "first_token_timeout" | "cancelled",
+        error?: string,
+      ) => {
+        if (attemptObserved) return;
+        attemptObserved = true;
+        try {
+          options.onAttempt?.({ provider, model, outcome, duration_ms: Date.now() - attemptStartedAt, ...(error ? { error: error.slice(0, 240) } : {}) });
+        } catch {
+          // Attribution is best-effort and must never affect fallback behavior.
+        }
+      };
       const STALL_REASON = `first-token-timeout:${provider}:${model}`;
       const attemptCtrl = new AbortController();
       const onUserAbort = () => attemptCtrl.abort(signal?.reason);
@@ -1186,12 +1209,15 @@ export async function chatCompletionWithFallback(
         // Bound the pre-header phase by the same per-provider first-token
         // window and advance the cascade instead.
         const HEADERS_STALL_REASON = `headers-timeout:${provider}:${model}`;
+        requestDispatched = true;
         const fetchPromise = fetcher(providerChatUrl(target, model), {
           method: "POST",
           signal: attemptCtrl.signal,
           headers: providerHeaders(cfg, target, model),
           body: JSON.stringify(attemptBody),
         });
+        // The request has been handed to the transport. Observe every settled
+        // response/error below, including same-model retries.
         // The losing race arm may reject (AbortError) after we've moved on —
         // register a no-op handler so it can never surface as an unhandled
         // rejection. The raced arm below still observes the real outcome.
@@ -1206,6 +1232,7 @@ export async function chatCompletionWithFallback(
         if (headersOutcome.kind === "headers-timeout") {
           attemptCtrl.abort(HEADERS_STALL_REASON);
           lastError = `Model ${model} (${provider}) returned no HTTP response headers within ${firstTokenTimeoutMs}ms (headers timeout)`;
+          observeAttempt("first_token_timeout", lastError);
           if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           console.warn(`[Fallback] ${lastError} — advancing to next model`);
           fallbackReason = "first_token_timeout";
@@ -1227,6 +1254,7 @@ export async function chatCompletionWithFallback(
           // First-token watchdog: race the first body chunk against the timer.
           const bodyReader = res.body?.getReader();
           if (!bodyReader) {
+            observeAttempt("response");
             recordSuccess(provider, model);
             return {
               response: provider === "opencode_go" && openCodeGoProtocolForModel(model) === "anthropic"
@@ -1250,6 +1278,7 @@ export async function chatCompletionWithFallback(
             attemptCtrl.abort(STALL_REASON);
             try { await bodyReader.cancel().catch(() => {}); } catch {}
             lastError = `Model ${model} (${provider}) sent no body bytes within ${firstTokenTimeoutMs}ms (first-token timeout)`;
+            observeAttempt("first_token_timeout", lastError);
             if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
             fallbackReason = "first_token_timeout";
@@ -1279,6 +1308,7 @@ export async function chatCompletionWithFallback(
             newResponse = normalizeAnthropicSse(newResponse, model);
           }
           recordSuccess(provider, model);
+          observeAttempt("response");
           return {
             response: newResponse,
             model_used: model,
@@ -1296,6 +1326,7 @@ export async function chatCompletionWithFallback(
           recordRateLimit(provider, model);
           fallbackReason = "rate_limited";
           lastError = `Model ${model} (${provider}) rate limited (429) [strike ${rateLimitStrikes}/${RATE_LIMIT_MAX_ATTEMPTS}]`;
+          observeAttempt("http_error", lastError);
           if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           if (rateLimitStrikes >= RATE_LIMIT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next optimal pool model`);
@@ -1313,6 +1344,7 @@ export async function chatCompletionWithFallback(
           transientRetries++;
           fallbackReason = `http_${res.status}`;
           lastError = `Model ${model} (${provider}) returned ${res.status} [retry ${transientRetries}/${OTHER_TRANSIENT_MAX_ATTEMPTS}]`;
+          observeAttempt("http_error", lastError);
           if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
             console.warn(`[Fallback] ${lastError} — advancing to next model`);
@@ -1326,6 +1358,7 @@ export async function chatCompletionWithFallback(
         const body = await res.text().catch(() => "");
         const safeBody = redactProviderSecret(body.slice(0, 160), target.api_key);
         lastError = `Model ${model} (${provider}) HTTP ${res.status}: ${safeBody}`;
+        observeAttempt("http_error", lastError);
         if (provider === "vllm") lastVllmFailure = { model, detail: `HTTP ${res.status}: ${safeBody}` };
         console.warn(`[Fallback] ${lastError} — advancing to next model`);
         // Cross-turn memory: this is a hard, non-retryable failure (never a
@@ -1342,10 +1375,12 @@ export async function chatCompletionWithFallback(
           || (attemptCtrl.signal.reason === STALL_REASON);
         const isUserCancel = signal?.aborted && !isStall;
         if (isUserCancel || (e.name === "AbortError" && !isStall)) {
+          if (requestDispatched) observeAttempt("cancelled", e instanceof Error ? e.message : String(e));
           throw e; // Don't retry user-aborted requests
         }
         if (isStall) {
           lastError = redactProviderSecret(e.message || lastError, target.api_key);
+          if (requestDispatched) observeAttempt("first_token_timeout", lastError);
           if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
           break attemptLoop;
         }
@@ -1353,6 +1388,7 @@ export async function chatCompletionWithFallback(
         transientRetries++;
         fallbackReason = "network_error";
         lastError = redactProviderSecret(e.message || String(e), target.api_key);
+        if (requestDispatched) observeAttempt("http_error", lastError);
         if (provider === "vllm") lastVllmFailure = { model, detail: lastError };
         if (transientRetries >= OTHER_TRANSIENT_MAX_ATTEMPTS) {
           console.warn(`[Fallback] Model ${model} (${provider}) network error: ${lastError} — advancing to next model`);

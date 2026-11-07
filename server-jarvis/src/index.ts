@@ -2115,6 +2115,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       turnMemoryEnvelope,
       turnMemoryConsume?.code ?? (activeTurnMemory ? undefined : "memory_unavailable"),
     );
+    // Shared by Orchestrated and Direct Sessions so even an admission-time
+    // cancellation can carry the attempts already observed for this turn.
+    const routePlan = new RoutePlan();
+    let pendingDirectRoute: { provider: string; model: string; choice: RouteChoice; startedAt: number } | undefined;
     const emitCancelled = async (): Promise<never> => {
       if (clientDisconnected) throw new StreamCancelledError();
       // 2026-07-13 finding (session 7254c3ae): a "superseded" cancellation
@@ -2132,9 +2136,23 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       // A client disconnect leaves the turn outcome unknowable to the client:
       // record it as unterminated, never as a successful completion.
       recordMemoryTerminal(clientDisconnected ? "unterminated" : "cancelled", cancelReason);
+      if (pendingDirectRoute) {
+        const attempt = routePlan.add({
+          stage: "agent_loop",
+          provider: pendingDirectRoute.provider,
+          model: pendingDirectRoute.model,
+          choice: pendingDirectRoute.choice,
+          outcome: "cancelled",
+          answered: false,
+          duration_ms: Date.now() - pendingDirectRoute.startedAt,
+          error: cancelReason,
+        });
+        if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+        pendingDirectRoute = undefined;
+      }
       if (session.noteOutcome()) {
         session.noteTerminal();
-        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, turn_id: memoryTurnId, reason: cancelReason })}\n\n`);
+        await streamWrite(`data: ${JSON.stringify({ type: "cancelled", session_id: sessionId, turn_id: memoryTurnId, reason: cancelReason, route: routePlan.summary() })}\n\n`);
       }
       throw new StreamCancelledError();
     };
@@ -2549,7 +2567,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchLastFallbackReason: string | undefined;
         let orchLastFallbackModel: string | undefined;
         // Who actually answered this turn, and every attempt that led there.
-        const routePlan = new RoutePlan();
+
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
@@ -5444,6 +5462,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
 
         const useFallback = directUseFallback;
         const requestTimeout = isOllama ? MODEL_REQUEST_TIMEOUT_MS : (cfg.openrouter.timeout_ms || MODEL_REQUEST_TIMEOUT_MS);
+        const directAttemptStartedAt = Date.now();
+        let directFallbackObserved = false;
+        let directPhysicalAttemptIndex = 0;
+        let directPreviousFailure: string | undefined;
         const ctrl = new AbortController();
         const requestBudgetMs = computeBoundedRequestTimeoutMs("agent_loop", turnBudget, requestTimeout);
         let turnDeadlineAbortedRequest = false;
@@ -5468,6 +5490,31 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               deadlineAt: turnBudget.deadlineAt,
               turnBudgetMs: TOTAL_TURN_TIMEOUT_MS,
               memory: directMemoryFallback,
+              onAttempt: (observation) => {
+                directFallbackObserved = true;
+                const choice: RouteChoice = directPhysicalAttemptIndex++ === 0 ? "configured" : "fallback";
+                if (observation.outcome === "response") {
+                  pendingDirectRoute = {
+                    provider: observation.provider,
+                    model: observation.model,
+                    choice,
+                    startedAt: Date.now() - observation.duration_ms,
+                  };
+                  return;
+                }
+                directPreviousFailure = observation.error ?? observation.outcome;
+                const attempt = routePlan.add({
+                  stage: "agent_loop",
+                  provider: observation.provider,
+                  model: observation.model,
+                  choice,
+                  outcome: observation.outcome,
+                  duration_ms: observation.duration_ms,
+                  fallback_reason: choice === "fallback" ? directPreviousFailure : undefined,
+                  error: observation.error,
+                });
+                if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+              },
             });
             fetchRes = result.response;
             actualModelUsed = result.model_used;
@@ -5492,10 +5539,29 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // the turn under).
             lastProviderUsed = isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : "openrouter";
             fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: ctrl.signal });
+            pendingDirectRoute = {
+              provider: lastProviderUsed,
+              model: actualModelUsed,
+              choice: "configured",
+              startedAt: directAttemptStartedAt,
+            };
           }
         } catch (fetchErr: any) {
           clearTimeout(timeout);
           cleanupRequestAbort();
+          if (!useFallback && !directFallbackObserved && !pendingDirectRoute && lastProviderUsed && actualModelUsed) {
+            const attempt = routePlan.add({
+              stage: "agent_loop",
+              provider: lastProviderUsed,
+              model: actualModelUsed,
+              choice: directPhysicalAttemptIndex++ === 0 ? "configured" : "fallback",
+              outcome: streamAbort.signal.aborted ? "cancelled" : "http_error",
+              duration_ms: Date.now() - directAttemptStartedAt,
+              fallback_reason: directPreviousFailure,
+              error: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+            });
+            if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+          }
           if (fetchErr.name === "AbortError" && streamAbort.signal.aborted) {
             await emitCancelled();
           }
@@ -5519,6 +5585,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           
           if (isNativeToolProtocolUnsupportedError(fetchRes.status, errText) && requestBody.tools) {
             cleanupRequestAbort();
+            if (pendingDirectRoute) {
+              const attempt = routePlan.add({
+                stage: "agent_loop",
+                provider: pendingDirectRoute.provider,
+                model: pendingDirectRoute.model,
+                choice: pendingDirectRoute.choice,
+                outcome: "http_error",
+                duration_ms: Date.now() - pendingDirectRoute.startedAt,
+                error: `HTTP ${fetchRes.status}: ${errText.slice(0, 200)}`,
+              });
+              if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+              pendingDirectRoute = undefined;
+            }
             markNativeToolProtocolUnsupported(
               isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : "openrouter",
               actualModelUsed,
@@ -5557,6 +5636,12 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             const retryTimeout = setTimeout(() => retryCtrl.abort(), retryRequestBudgetMs);
             const cleanupRetryAbort = registerAbortHandler(streamAbort.signal, () => retryCtrl.abort());
             try {
+              pendingDirectRoute = {
+                provider: lastProviderUsed ?? (isLlamaCpp ? "llama_cpp" : isOllama ? "ollama" : "openrouter"),
+                model: actualModelUsed,
+                choice: "fallback",
+                startedAt: Date.now(),
+              };
               fetchRes = await fetch(baseUrl, { method: "POST", headers, body: JSON.stringify(requestBody), signal: retryCtrl.signal });
               if (!fetchRes.ok) {
                 const retryErrText = await fetchRes.text();
@@ -5579,6 +5664,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           } else {
             cleanupRequestAbort();
+            if (!useFallback && pendingDirectRoute) {
+              const attempt = routePlan.add({
+                stage: "agent_loop",
+                provider: pendingDirectRoute.provider,
+                model: pendingDirectRoute.model,
+                choice: pendingDirectRoute.choice,
+                outcome: "http_error",
+                duration_ms: Date.now() - pendingDirectRoute.startedAt,
+                error: `HTTP ${fetchRes.status}: ${errText.slice(0, 200)}`,
+              });
+              if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+              pendingDirectRoute = undefined;
+            }
             if (fetchRes.status === 404 && isOllama) throw new Error(`Model "${modelName}" not found in Ollama. Run: ollama pull ${modelName}`);
             if (fetchRes.status === 401) throw new Error(`Authentication failed. ${isOllama ? "Ollama accepts any key." : "Check your OpenRouter API key."}`);
             if (fetchRes.status === 429) throw new Error(`Rate limited by ${isOllama ? "Ollama" : "OpenRouter"}. ${useFallback ? "All fallback models also exhausted." : "Enable fallback models in settings."}`);
@@ -5799,6 +5897,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           cleanupRequestAbort();
         }
 
+        if (pendingDirectRoute) {
+          const hasUsableOutput = Boolean(turnText.trim()) || activeToolCalls.some((call) => call?.name);
+          const attempt = routePlan.add({
+            stage: "agent_loop",
+            provider: pendingDirectRoute.provider,
+            model: pendingDirectRoute.model,
+            choice: pendingDirectRoute.choice,
+            outcome: hasUsableOutput ? "success" : "empty_completion",
+            answered: Boolean(turnText.trim()),
+            duration_ms: Date.now() - pendingDirectRoute.startedAt,
+            fallback_reason: pendingDirectRoute.choice === "fallback" ? directPreviousFailure : undefined,
+          });
+          if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+          pendingDirectRoute = undefined;
+          directFallbackObserved = false;
+          directPhysicalAttemptIndex = 0;
+          directPreviousFailure = undefined;
+        }
+
         // Filter activeToolCalls to only contain valid tool calls
         const validCalls = activeToolCalls.filter(call => call && call.name);
         const textExtraction = validCalls.length === 0 && cfg.tools.enabled
@@ -5980,7 +6097,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // If the user was asked a question, stop the loop and wait for their response.
             if (call.name === "ask_user_question") {
               recordMemoryTerminal("completed");
-              await session.finish(toolOutput);
+              await session.finish(toolOutput, { route: routePlan.summary() });
               loopDone = true;
               break;
             }
@@ -6035,6 +6152,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             toolExecutionCount,
             session,
             recordMemoryTerminal,
+            route: routePlan.summary(),
           });
           if (completion.empty) {
             console.warn(
@@ -6155,7 +6273,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             // If the user was asked a question, stop the loop and wait for their response.
             if (tc.function.name === "ask_user_question") {
               recordMemoryTerminal("completed");
-              await session.finish("Waiting for user response to question.");
+              await session.finish("Waiting for user response to question.", { route: routePlan.summary() });
               loopDone = true;
               break;
             }
@@ -6190,6 +6308,25 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         return;
       }
       const errMsg = error?.message || String(error);
+      if (pendingDirectRoute) {
+        const outcome = streamAbort.signal.aborted
+          ? "cancelled"
+          : error?.name === "FirstTokenTimeoutError" || error?.name === "StreamIdleTimeoutError" || error?.name === "VisibleProgressTimeoutError"
+            ? "timeout"
+            : "http_error";
+        const attempt = routePlan.add({
+          stage: "agent_loop",
+          provider: pendingDirectRoute.provider,
+          model: pendingDirectRoute.model,
+          choice: pendingDirectRoute.choice,
+          outcome,
+          answered: false,
+          duration_ms: Date.now() - pendingDirectRoute.startedAt,
+          error: errMsg,
+        });
+        if (attempt) void writer.write(encoder.encode(routeAttemptSseFrame(sessionId, attempt))).catch(() => {});
+        pendingDirectRoute = undefined;
+      }
       // P0-B (2026-07-02): a first-token timeout is a HUNG MODEL, not a
       // user cancellation. The watchdog (orchestrator + Agent Loop) no
       // longer touches `streamAbort`, so we are guaranteed to land here
@@ -6272,7 +6409,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       });
       recordMemoryTerminal("failed", errorCode ?? null);
       try {
-        await session.error(userFacingMsg, errorCode);
+        await session.error(userFacingMsg, errorCode, routePlan.summary());
       } catch {}
     } finally {
       if (orchestratorRunFinalizer && !orchestratorRunFinalizer.isFinalized()) {
@@ -6585,6 +6722,7 @@ export async function baseFetch(req: Request): Promise<Response> {
         : undefined;
       return Response.json({
         ok: true,
+        bind_host: BIND_TARGET.hostname,
         uptime: process.uptime(),
         version: JARVIS_VERSION,
         backend: hcfg.active_backend,
@@ -7011,9 +7149,9 @@ export async function baseFetch(req: Request): Promise<Response> {
 // state recorded in the /health comment above. The guard names the host and port
 // and exits 1 on EADDRINUSE, and rethrows every other bind failure untouched.
 // The options below are unchanged; hostname is stated explicitly at Bun's
-// default (all interfaces) so the diagnostic can never name a host we did not
-// actually bind.
-const BIND_TARGET = resolveBindTarget(PORT);
+// default (all interfaces) unless an isolated caller selects a host explicitly.
+// The health payload and serve() use this same effective target.
+const BIND_TARGET = resolveBindTarget(PORT, process.env.JARVIS_SERVER_HOST);
 
 // Ensure the jarvis workspace directory exists before the server starts
 // loadConfig() returns defaultConfig() untouched when no config file exists, and
@@ -7045,14 +7183,14 @@ console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
 // ready; otherwise it would remain cold forever after a single early miss.
 async function warmPersistentConductorUntilReady(): Promise<void> {
   let attempt = 0;
-  while (loadConfig().orchestrator.conductor.enabled) {
+  while (loadConfig().orchestrator.conductor.enabled && loadConfig().orchestrator.conductor.keep_warm) {
     try {
       const { model, latencyMs } = await persistentConductor.warmUp();
       console.log(`[PersistentConductor] warm model=${model} latency_ms=${latencyMs}`);
       persistentConductor.startKeepWarm();
       return;
     } catch (error) {
-      if (!loadConfig().orchestrator.conductor.enabled) return;
+      if (!loadConfig().orchestrator.conductor.enabled || !loadConfig().orchestrator.conductor.keep_warm) return;
       attempt += 1;
       const retryMs = Math.min(30_000, 1_000 * 2 ** Math.min(attempt - 1, 5));
       console.warn(

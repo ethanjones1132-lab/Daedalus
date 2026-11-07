@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { StreamSession } from "./stream-emitter";
+import { RoutePlan } from "./orchestration/route-plan";
 import {
   EMPTY_ANSWER_WITHOUT_TOOLS_FALLBACK,
   EMPTY_ANSWER_WITH_TOOL_WORK_FALLBACK,
@@ -42,7 +43,7 @@ function harness() {
     turnId: "turn_dd045",
   });
 
-  const settle = (answer: string, toolExecutionCount: number) =>
+  const settle = (answer: string, toolExecutionCount: number, route?: ReturnType<RoutePlan["summary"]>) =>
     finishSinglePassCompletion({
       answer,
       toolExecutionCount,
@@ -50,6 +51,7 @@ function harness() {
       recordMemoryTerminal: (status, errorCode = null) => {
         receipts.push({ status, errorCode });
       },
+      route,
     });
 
   const ofType = (type: string) => frames.filter((frame) => frame.type === type);
@@ -65,6 +67,38 @@ function harness() {
 }
 
 describe("single-pass terminal completion", () => {
+  test("Direct Session terminal carries failed fallback and actual answer attribution", async () => {
+    const { settle, ofType } = harness();
+    const route = new RoutePlan();
+    route.add({ stage: "agent_loop", provider: "openrouter", model: "model-a", choice: "configured", outcome: "http_error", duration_ms: 9, error: "HTTP 503" });
+    route.add({ stage: "agent_loop", provider: "ollama", model: "org/model:tag", choice: "fallback", outcome: "success", duration_ms: 13 });
+
+    await settle("answer from local", 0, route.summary());
+
+    expect(ofType("result")[0]?.route).toMatchObject({
+      answered_by: { stage: "agent_loop", provider: "ollama", model: "org/model:tag", cloud: false },
+      left_machine: true,
+      attempts: [
+        { provider: "openrouter", model: "model-a", outcome: "http_error", answered: false },
+        { provider: "ollama", model: "org/model:tag", outcome: "success", answered: true },
+      ],
+    });
+  });
+
+  test("Direct Session terminal retains a failed model attempt without naming an answer", async () => {
+    const { settle, ofType } = harness();
+    const route = new RoutePlan();
+    route.add({ stage: "agent_loop", provider: "openrouter", model: "model-a", choice: "configured", outcome: "http_error", duration_ms: 9, error: "HTTP 503" });
+
+    await settle("", 0, route.summary());
+
+    expect(ofType("result")[0]?.route).toMatchObject({
+      left_machine: true,
+      attempts: [{ provider: "openrouter", model: "model-a", outcome: "http_error", answered: false }],
+    });
+    expect((ofType("result")[0]?.route as { answered_by?: unknown }).answered_by).toBeUndefined();
+  });
+
   test("no tools and no answer fails honestly on both the stream and the receipt", async () => {
     const { receipts, settle, ofType, terminalOutcomes } = harness();
 
