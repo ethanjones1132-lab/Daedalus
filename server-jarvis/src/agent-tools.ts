@@ -6,6 +6,7 @@ import { CONFIG_DIR } from "./config";
 import { TOOL_TIMEOUT_REASON, type ExecutionContext } from "./tool-runtime";
 import { ToolExecutionError } from "./tool-types";
 import { buildLocalClaudeArgs, buildLocalClaudeEnv, resolveClaudePath } from "./claude-cli";
+import { cloudHelpersAllowed } from "./provider-availability";
 
 type TaskStatus = "running" | "completed" | "failed" | "stopped";
 
@@ -538,7 +539,9 @@ async function runPromptOnce(
   taskId?: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  if (cfg.claude_cli.enabled) {
+  // The Claude CLI is a cloud route. With a local Inference backend and cloud
+  // helpers off, the Agent tool uses only the selected local backend.
+  if (cfg.claude_cli.enabled && cloudHelpersAllowed(cfg)) {
     const cliOutput = await runClaudeCliPrompt(prompt, cfg, timeoutMs, taskId, signal);
     if (!cliOutput.startsWith("Error:")) return cliOutput;
   }

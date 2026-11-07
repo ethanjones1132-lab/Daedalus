@@ -8,6 +8,35 @@ function hasCredential(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().length >= 10;
 }
 
+/**
+ * Providers whose requests leave this machine for a third-party service.
+ * vLLM is the user's own self-hosted server and Ollama / llama.cpp run here,
+ * so none of those count as cloud.
+ */
+const CLOUD_PROVIDERS: ReadonlySet<string> = new Set(["openrouter", "opencode_zen", "opencode_go", "claude_cli"]);
+
+export function isCloudProvider(provider: string | undefined | null): boolean {
+  return typeof provider === "string" && CLOUD_PROVIDERS.has(provider);
+}
+
+/** A local Inference backend: the selected engine runs on this machine. */
+export function isLocalBackend(backend: BackendType | string | undefined): boolean {
+  return backend === "llama_cpp" || backend === "ollama";
+}
+
+/**
+ * The one local-boundary policy. With a cloud Inference backend selected
+ * (OpenRouter or Claude CLI) the user already chose cloud inference. With a
+ * local backend, cloud help is used only when "Allow cloud helpers"
+ * (`orchestrator.allow_cloud_helpers`) is explicitly on. Every routing path
+ * that could reach a cloud provider (stage pool, HTTP fallback tail,
+ * executor delegate, conductor API fallback, Agent tool) asks this.
+ */
+export function cloudHelpersAllowed(cfg: Pick<JarvisConfig, "active_backend" | "orchestrator">): boolean {
+  if (!isLocalBackend(cfg.active_backend)) return true;
+  return cfg.orchestrator?.allow_cloud_helpers === true;
+}
+
 /** True only when Jarvis can make a request to this provider right now. */
 export function isProviderAvailable(
   cfg: JarvisConfig,
@@ -93,6 +122,10 @@ export function routableOrchestratorAgents(
       }
       return false;
     }
+    // Local boundary: with a local backend and cloud helpers off, no cloud
+    // pool agent is routable, however it got credentials (including keys the
+    // config silently fills from OPENCODE_API_KEY / OPENROUTER_API_KEY).
+    if (isCloudProvider(agent.provider) && !cloudHelpersAllowed(cfg)) return false;
     return isProviderAvailable(cfg, agent.provider, env);
   });
 }

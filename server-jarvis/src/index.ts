@@ -109,7 +109,7 @@ import {
   providerSupportsNativeTools,
   resolveProviderTarget,
 } from "./providers";
-import { runtimeFactsSystemMessage } from "./provider-availability";
+import { cloudHelpersAllowed, runtimeFactsSystemMessage } from "./provider-availability";
 import { routableAgentsWithProviderHealth } from "./orchestration/routable-agent-pool";
 import {
   recordInference,
@@ -316,6 +316,7 @@ import {
   type TaskRunGoalLink,
 } from "./orchestration/task-run";
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
+import { RoutePlan, routeAttemptSseFrame, type RouteChoice } from "./orchestration/route-plan";
 import { finishSinglePassCompletion } from "./single-pass-completion";
 import { classifySinglePassToolArgs } from "./single-pass-tool-args";
 import { nextVerifiedWebSearchState } from "./verified-web-search";
@@ -2544,6 +2545,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         let orchFallbackEvents = 0;
         let orchLastFallbackReason: string | undefined;
         let orchLastFallbackModel: string | undefined;
+        // Who actually answered this turn, and every attempt that led there.
+        const routePlan = new RoutePlan();
         const callModelAttempt = async (messages: any[], callOptions?: any, excludeModels?: Set<string>) => {
           ensureTurnBudget(callOptions?.stageLabel ?? "orchestrator_model_attempt");
           const stageAttemptStart = Date.now();
@@ -2554,6 +2557,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           let attemptFallbackRetries = excludeModels?.size ?? 0;
           let attemptFallbackDepth = 0;
           let attemptFallbackReason: string | undefined;
+          // Route plan: the selected backend unless the pool or cascade picks,
+          // and "fallback" once an earlier candidate for this stage was excluded.
+          let attemptRouteChoice: RouteChoice = excludeModels && excludeModels.size > 0 ? "fallback" : "configured";
+          let attemptInitialModel: string | undefined;
           /** F2/F3: stage/turn budget exhaustion is not model failure. */
           let runtimeStarvation = false;
           /** Kept so the settlement below can name why the attempt stopped. */
@@ -2681,6 +2688,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 poolModel = agent.model_id;
                 poolProvider = agent.provider;
                 poolResolvedAgent = agent;
+                if (attemptRouteChoice !== "fallback") attemptRouteChoice = cascadeTier ? "cascade" : "pool";
                 console.log(`[Jarvis Orchestrator] Pool resolved model ${agent.model_id} for stage=${stageLabel} cascadeTier=${cascadeTier ?? "none"} task=${orchestratorTaskType} agent=${agent.id} (provider=${agent.provider})`);
               }
             } catch (e: any) {
@@ -2714,6 +2722,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const effectiveProvider = poolProvider ?? "openrouter";
           attemptModel = modelName;
           attemptProvider = isLlamaCpp ? "llama_cpp" : effectiveProvider;
+          attemptInitialModel = modelName;
           const isOpenCodeProvider = effectiveProvider === "opencode_zen" || effectiveProvider === "opencode_go";
           const providerTarget = !isLocalInference ? resolveProviderTarget(cfg, effectiveProvider) : null;
           // Only OpenRouter models are described by the OpenRouter catalog;
@@ -3175,16 +3184,28 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // turn waiting for the FIRST token — the other half belongs to a
           // fallback candidate. Floor of 15s so healthy-but-slow models are
           // not cut absurdly short; no effect while budget is ample.
-          const affordabilityCapMs = callOptions?.surfaceAsAnswer === true
+          //
+          // Local-only attempts (2026-11-07, measured): with a local Inference
+          // backend and cloud helpers off there is no other provider to fall
+          // back to, so reserving half the turn for one only aborts a correct
+          // local answer. A trivial "2 plus 2" on an RTX 4060 spent 23.4 s in
+          // llama.cpp prefill (1,644 prompt tokens at ~70 tok/s) and was killed
+          // by the 22.3 s cap a second before its first token. Prefill is real
+          // progress, so a local-only attempt may use its whole request budget
+          // for the first token; the outer stage/turn deadlines still apply.
+          const localOnlyAttempt = isLocalInference && !cloudHelpersAllowed(cfg);
+          const affordabilityCapMs = callOptions?.surfaceAsAnswer === true && !localOnlyAttempt
             ? Math.max(15_000, Math.floor(turnBudget.remainingMs(Date.now()) / 2))
             : Number.POSITIVE_INFINITY;
-          const firstTokenMs = Math.min(requestBudgetMs, affordabilityCapMs, firstTokenTimeoutFor(
-            agentPool,
-            actualModelUsed,
-            MODEL_FIRST_TOKEN_TIMEOUT_MS,
-            60_000,
-            actualProviderUsed,
-          ));
+          const firstTokenMs = localOnlyAttempt
+            ? requestBudgetMs
+            : Math.min(requestBudgetMs, affordabilityCapMs, firstTokenTimeoutFor(
+              agentPool,
+              actualModelUsed,
+              MODEL_FIRST_TOKEN_TIMEOUT_MS,
+              60_000,
+              actualProviderUsed,
+            ));
           // First-token timeout flag. P0-B (2026-07-02): the previous
           // build called `streamAbort.abort("First-token timeout")` from
           // inside this timer, which is the SAME abort domain as the user
@@ -3805,6 +3826,32 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
                 first_token_ms: attemptFirstTokenMs,
                 fallback_attempt: attemptFallbackRetries,
               });
+            }
+            // Route plan: every settled attempt, including failures, timeouts
+            // and stopped stages, so no hop is invisible. A cascade inside
+            // the HTTP helper that answered with a different model than the
+            // one first picked is a fallback, whatever chose the first.
+            const routeAttempt = routePlan.add({
+              stage: attemptStage ?? callOptions?.stageLabel ?? "agent",
+              provider: attemptProvider ?? "",
+              model: attemptModel ?? "",
+              choice: attemptInitialModel && attemptModel && attemptModel !== attemptInitialModel
+                ? "fallback"
+                : attemptRouteChoice,
+              outcome: settlement.mayRecordModelAttribution ? attemptOutcome : "stopped",
+              answered: attemptSucceeded && settlement.mayRecordModelAttribution,
+              duration_ms: Date.now() - stageAttemptStart,
+              first_token_ms: attemptFirstTokenMs,
+              fallback_reason: attemptFallbackReason,
+              error: attemptSucceeded ? undefined : attemptError instanceof Error ? attemptError.message : undefined,
+            });
+            if (routeAttempt) {
+              try {
+                await writer.write(encoder.encode(routeAttemptSseFrame(sessionId, routeAttempt)));
+              } catch {
+                // A closed stream cannot carry the live frame; the terminal
+                // summary (or the absence of one) still reflects the plan.
+              }
             }
           }
         };
@@ -4905,7 +4952,9 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         }
         if (terminalStatus === "claimed") {
           await turnTiming.measureAsync("self_tuning_proposals", () =>
-            selfTuningProposer.proposeAndApply(agentRunId, route.task_type),
+            selfTuningProposer.proposeAndApply(agentRunId, route.task_type, {
+              learningEnabled: cfg.orchestrator.conductor_learning?.enabled !== false,
+            }),
           );
         }
 
@@ -4971,9 +5020,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           });
           repetitionStore.recordOutcome(sessionId, message, result.error_code);
           recordMemoryTerminal("failed", result.error_code ?? null);
-          await turnTiming.measureAsync("terminal_send", () =>
-            session.finish("", { isError: true, code: result.error_code }),
-          );
+          await turnTiming.measureAsync("terminal_send", () => finishWithRunOutcome(session, {
+            result: "",
+            outcome: "failed",
+            errorCode: result.error_code,
+            repeated: false,
+            reason: decision.reason,
+            route: routePlan.summary(),
+            isError: true,
+          }));
         } else if (result.error) {
           // Turn-fatal failure (e.g. auth rejected on every stage): surface a
           // real error frame so the UI shows a banner instead of dropping the
@@ -5009,9 +5064,15 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // the short-circuit memo already tracks server-side.
           recordMemoryTerminal("failed", result.error_code ?? null);
           const errorText = result.error;
-          await turnTiming.measureAsync("terminal_send", () =>
-            session.finish(errorText, { isError: true, code: result.error_code }),
-          );
+          await turnTiming.measureAsync("terminal_send", () => finishWithRunOutcome(session, {
+            result: errorText,
+            outcome: verifiedRunOutcome === "success" ? "failed" : verifiedRunOutcome,
+            errorCode: result.error_code,
+            repeated: false,
+            reason: decision.reason,
+            route: routePlan.summary(),
+            isError: true,
+          }));
         } else if (!trimmedAnswer) {
           // Empty (non-fatal) completion: show the friendly retry notice, but
           // record the inference as a FAILURE so telemetry is truthful (the run
@@ -5044,9 +5105,17 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             ? "The turn ran out of time before producing an answer, and no workspace evidence was gathered to summarize. A narrower request (name a specific file or directory) fits the budget better."
             : "The orchestrator completed but produced no output. This may be a transient model issue. Try your request again.";
           recordMemoryTerminal(terminalStatusForRunOutcome(verifiedRunOutcome), result.error_code ?? null);
-          await turnTiming.measureAsync("terminal_send", () =>
-            session.finish(noOutputNotice),
-          );
+          // The notice stays in the result text, but the frame must not say
+          // success. The 2026-11-07 re-run of "2+2" hit this branch and the
+          // client received subtype success with no reason and no route.
+          await turnTiming.measureAsync("terminal_send", () => finishWithRunOutcome(session, {
+            result: noOutputNotice,
+            outcome: verifiedRunOutcome,
+            errorCode: result.error_code ?? "empty_completion",
+            repeated: repetitionVerdict.repeated,
+            reason: decision.reason,
+            route: routePlan.summary(),
+          }));
         } else {
           // Success path. The orchestrator runs many model calls per user
           // turn (planner, executor, reviewer, synthesizer, recursion_critique,
@@ -5129,6 +5198,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             outcome: verifiedRunOutcome,
             errorCode: result.error_code,
             repeated: repetitionVerdict.repeated,
+            reason: verifiedRunOutcome === "success" ? null : decision.reason,
+            route: routePlan.summary(),
           }));
         }
         return;

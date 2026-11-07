@@ -15,7 +15,18 @@ export class SelfTuningProposer {
     // without mutating active runtime configuration mid-run.
   }
 
-  async proposeAndApply(agentRunId: string, taskType: string): Promise<TuningProposal[]> {
+  /**
+   * `learningEnabled` mirrors `orchestrator.conductor_learning.enabled`.
+   * With learning off nothing is analysed or persisted: before 2026-11-07 the
+   * proposer had no guard and wrote proposals on every claimed run even when
+   * the user had turned learning off.
+   */
+  async proposeAndApply(
+    agentRunId: string,
+    taskType: string,
+    options: { learningEnabled?: boolean } = {},
+  ): Promise<TuningProposal[]> {
+    if (options.learningEnabled === false) return [];
     const suggestions = this.analyzer.analyze(taskType);
     if (suggestions.length === 0) return [];
 

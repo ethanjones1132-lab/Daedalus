@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { defaultConfig } from "./config";
-import { configuredInferenceFacts, isProviderAvailable, routableOrchestratorAgents } from "./provider-availability";
+import {
+  cloudHelpersAllowed,
+  configuredInferenceFacts,
+  isCloudProvider,
+  isProviderAvailable,
+  routableOrchestratorAgents,
+} from "./provider-availability";
 
 describe("provider availability", () => {
   test("does not route an OpenRouter session through an unconfigured OpenCode provider", () => {
@@ -74,5 +80,67 @@ describe("provider availability", () => {
     ];
 
     expect(routableOrchestratorAgents(cfg)).toEqual([]);
+  });
+
+  // 2026-11-07 local boundary (audit 2026-10-29 finding 1): with llama.cpp
+  // selected, normalizeConfig silently filled the OpenCode Zen/Go keys from
+  // OPENCODE_API_KEY, the pool then preferred free Zen models, and the turn
+  // left the machine while the UI named the local model.
+  describe("local boundary", () => {
+    const cloudKeys = (cfg: ReturnType<typeof defaultConfig>) => {
+      cfg.openrouter.api_key = "openrouter-key-1234";
+      cfg.opencode_zen.api_key = "zen-key-12345678";
+      cfg.opencode_go.api_key = "go-key-123456789";
+    };
+
+    test("a local backend allows no cloud helpers by default", () => {
+      for (const backend of ["llama_cpp", "ollama"] as const) {
+        const cfg = defaultConfig();
+        cfg.active_backend = backend;
+        expect(cfg.orchestrator.allow_cloud_helpers).toBe(false);
+        expect(cloudHelpersAllowed(cfg)).toBe(false);
+      }
+    });
+
+    test("a cloud backend, or the explicit setting, allows cloud helpers", () => {
+      const openrouter = defaultConfig();
+      openrouter.active_backend = "openrouter";
+      expect(cloudHelpersAllowed(openrouter)).toBe(true);
+      const cli = defaultConfig();
+      cli.active_backend = "claude_cli";
+      expect(cloudHelpersAllowed(cli)).toBe(true);
+      const optedIn = defaultConfig();
+      optedIn.active_backend = "llama_cpp";
+      optedIn.orchestrator.allow_cloud_helpers = true;
+      expect(cloudHelpersAllowed(optedIn)).toBe(true);
+    });
+
+    test("with keys present, a local backend still routes only local and self-hosted pool agents", () => {
+      const cfg = defaultConfig();
+      cfg.active_backend = "llama_cpp";
+      cloudKeys(cfg);
+      cfg.orchestrator.agents = [
+        ...cfg.orchestrator.agents,
+        { id: "local-reviewer", provider: "ollama", model_id: "qwen3.5-9b:latest", enabled: true,
+          capabilities: { code: 0.5, reasoning: 0.5, speed: 0.5, cost: 1, json_reliability: 0.5 }, default_for: [] } as any,
+      ];
+      const routable = routableOrchestratorAgents(cfg, {});
+      expect(routable.length).toBeGreaterThan(0);
+      expect(routable.every((agent) => !isCloudProvider(agent.provider))).toBe(true);
+      expect(routable.some((agent) => agent.id === "local-reviewer")).toBe(true);
+    });
+
+    test("opting in restores the cloud pool, so the boundary is the only thing removing it", () => {
+      const cfg = defaultConfig();
+      cfg.active_backend = "llama_cpp";
+      cloudKeys(cfg);
+      cfg.orchestrator.allow_cloud_helpers = true;
+      expect(routableOrchestratorAgents(cfg, {}).some((agent) => isCloudProvider(agent.provider))).toBe(true);
+    });
+
+    test("vLLM, Ollama and llama.cpp are not cloud providers", () => {
+      for (const provider of ["vllm", "ollama", "llama_cpp"]) expect(isCloudProvider(provider)).toBe(false);
+      for (const provider of ["openrouter", "opencode_zen", "opencode_go", "claude_cli"]) expect(isCloudProvider(provider)).toBe(true);
+    });
   });
 });

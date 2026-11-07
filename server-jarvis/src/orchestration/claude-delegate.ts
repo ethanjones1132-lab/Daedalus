@@ -15,6 +15,7 @@ import {
   jarvisDelegateMcpToolName,
 } from "../mcp-adapter";
 import { openCodeGoProtocolForModel } from "./live-model-catalog";
+import { cloudHelpersAllowed } from "../provider-availability";
 import { createHash } from "crypto";
 import { execFile, spawn } from "child_process";
 import { mkdtempSync, rmSync, writeFileSync, type Dirent } from "fs";
@@ -319,6 +320,7 @@ export interface DelegateEligibilityInput {
 export type DelegateIneligibilityReason =
   | "claude_cli_disabled"
   | "delegate_disabled"
+  | "local_only"
   | "subscription_mode"
   | "missing_opencode_go_key"
   | "profile"
@@ -332,6 +334,10 @@ export function delegateEligibility(
 ): { eligible: true } | { eligible: false; reason: DelegateIneligibilityReason } {
   if (!input.config.claude_cli.enabled) return { eligible: false, reason: "claude_cli_disabled" };
   if (!input.config.claude_cli.delegate.enabled) return { eligible: false, reason: "delegate_disabled" };
+  // Local boundary: the delegate's models are cloud (OpenCode Go / free
+  // routers via the proxy). With a local Inference backend and cloud helpers
+  // off, the native local executor loop runs instead.
+  if (!cloudHelpersAllowed(input.config)) return { eligible: false, reason: "local_only" };
   // Free-routing imperative: the delegate is an AUTOMATED path, so it must never
   // select subscription mode — that bypasses the local proxy and spends the
   // user's Claude quota. Subscription stays a manual, interactive opt-in; here

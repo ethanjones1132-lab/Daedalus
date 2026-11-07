@@ -45,6 +45,10 @@ function verifiedDelegateOutput(): ExecutorStageOutput {
 function delegateTestConfig() {
   const config = defaultConfig();
   config.opencode_go.api_key = "go-test-key";
+  // The delegate is a cloud route; these tests cover the pipeline's delegate
+  // behaviour, so they opt in to cloud helpers (the local boundary itself is
+  // covered in claude-delegate.test.ts and provider-availability.test.ts).
+  config.orchestrator.allow_cloud_helpers = true;
   return config;
 }
 

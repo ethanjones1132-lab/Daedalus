@@ -51,7 +51,8 @@ export interface CompletionDecision {
     | "write_unverified"
     | "verification_failed"
     | "verified_complete"
-    | "non_write_complete";
+    | "non_write_complete"
+    | "answer_delivered";
 }
 
 export function isAuthoritativelyGreen(check: CheckResult | undefined): boolean {
@@ -94,6 +95,19 @@ export function decideCompletion(input: CompletionDecisionInput): CompletionDeci
       return { taskStatus: "paused", runOutcome: "partial", reason: "verification_failed" };
     }
     return { taskStatus: "paused", runOutcome: "degraded", reason: "pipeline_degraded" };
+  }
+  // A question that only needs an answer (conversational / answer_only), with
+  // no write intent and nothing written: the delivered answer is the work. The
+  // quick-answer path seeds a one-step plan that no stage can verify, so before
+  // 2026-11-07 every such answer ended `partial` with `task_plan_open` (audit
+  // 2026-10-29 finding 2, reproduced: "2 + 2 = 4." reported partial). Only a
+  // still-active plan qualifies; paused or blocked plans stay partial.
+  if (
+    (input.requirement === "conversational" || input.requirement === "answer_only")
+    && !requiresVerification(input)
+    && input.reconciledStatus === "active"
+  ) {
+    return { taskStatus: "completed", runOutcome: "success", reason: "answer_delivered" };
   }
   if (input.reconciledStatus !== "completed") {
     return { taskStatus: input.reconciledStatus, runOutcome: "partial", reason: "task_plan_open" };

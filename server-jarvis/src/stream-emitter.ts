@@ -216,7 +216,18 @@ export class StreamSession {
    * as if it were a real answer — which previously made auth failures look
    * like a silent stall.
    */
-  async finish(result: string, opts?: { isError?: boolean; subtype?: "success" | "error" | "partial"; code?: string }): Promise<void> {
+  async finish(
+    result: string,
+    opts?: {
+      isError?: boolean;
+      subtype?: "success" | "error" | "partial";
+      code?: string;
+      /** Why a non-success turn ended the way it did (completion-policy reason). */
+      reason?: string;
+      /** Who actually answered and every attempt that led there. */
+      route?: unknown;
+    },
+  ): Promise<void> {
     // A terminal effect-gate fence may still carry planner/synthesizer prose
     // in `result`. That text predates the verified no-write outcome and must
     // never cross the public stream boundary as an answer.
@@ -239,6 +250,8 @@ export class StreamSession {
       subtype,
       is_error: isError,
       ...(opts?.code ? { code: opts.code } : {}),
+      ...(opts?.reason ? { reason: opts.reason } : {}),
+      ...(opts?.route ? { route: opts.route } : {}),
       result,
       session_id: this.sessionId,
       ...this.turnTag(),

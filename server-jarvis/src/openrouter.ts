@@ -15,7 +15,7 @@ import {
   VllmProviderRequestError,
   type HttpProviderId,
 } from "./providers";
-import { routableOrchestratorAgents } from "./provider-availability";
+import { cloudHelpersAllowed, routableOrchestratorAgents } from "./provider-availability";
 import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall, recordSuccess } from "./model-failure-memory";
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
@@ -702,8 +702,14 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
     cascade.push(entry);
   };
 
-  // 1. Pool agents first — cross-provider, optimal order.
+  // 1. Pool agents first — cross-provider, optimal order. The pool is
+  // already limited to local/self-hosted agents by the local boundary.
   for (const entry of resolvePoolAgents(cfg, options)) push(entry);
+
+  // Local boundary: with a local Inference backend and cloud helpers off,
+  // there is no OpenRouter tail. An empty cascade means "no allowed model",
+  // which the caller reports instead of silently leaving this machine.
+  if (!cloudHelpersAllowed(cfg)) return cascade;
 
   // 2. OpenRouter free/configured tail (catalog-aware).
   try {

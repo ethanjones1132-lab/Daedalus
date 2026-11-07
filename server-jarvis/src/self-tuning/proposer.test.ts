@@ -104,6 +104,17 @@ describe("SelfTuningProposer", () => {
     expect(store.getPendingProposals()).toHaveLength(0);
   });
 
+  // ── (1b) learning off: nothing analysed or written (2026-11-07) ───────
+  test("with conductor learning off it writes no proposal even when the analyzer would", async () => {
+    seedRuns(store, "coding", makeNegativeCodingRuns(3));
+    const proposer = new SelfTuningProposer(store, new OutcomeAnalyzer(store));
+    const result = await proposer.proposeAndApply("run_off", "coding", { learningEnabled: false });
+    expect(result).toEqual([]);
+    expect(store.getPendingProposals()).toHaveLength(0);
+    // Same seeded data with learning on does propose, so the guard is the cause.
+    expect((await proposer.proposeAndApply("run_on", "coding", { learningEnabled: true })).length).toBeGreaterThan(0);
+  });
+
   // ── (2) happy path + field plumbing ───────────────────────────────────
   test("happy path: emits one proposal with all suggestion fields + agentRunId, applied=0", async () => {
     seedRuns(store, "coding", makeNegativeCodingRuns(3));

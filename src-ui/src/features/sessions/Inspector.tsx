@@ -34,7 +34,7 @@ function Thinking({ text, open, setOpen }: { text: string; open: boolean; setOpe
 }
 
 function RunPanel({ turn }: { turn: SessionTurn }) {
-  const { runMetrics, turnCost, reasoningText, showReasoning, setShowReasoning, sessionStats, displayedRoute, isStreaming, turnElapsedMs } = turn;
+  const { runMetrics, turnCost, reasoningText, showReasoning, setShowReasoning, sessionStats, displayedRoute, routeTrace, turnReasonLabel, isStreaming, turnElapsedMs } = turn;
   const hasRun = Boolean(runMetrics || turnCost || reasoningText || isStreaming);
   if (!hasRun) {
     return (
@@ -58,6 +58,7 @@ function RunPanel({ turn }: { turn: SessionTurn }) {
     items.push(['Fallback', `${runMetrics.fallbackRetries}${runMetrics.fallbackReason ? ` · ${runMetrics.fallbackReason.replace(/_/g, ' ')}` : ''}`]);
   }
   if (runMetrics?.scopeCompliant !== undefined) items.push(['Scope', runMetrics.scopeCompliant ? 'verified' : 'violation']);
+  if (turnReasonLabel) items.push(['Why', turnReasonLabel]);
   if (shouldShowSessionStats(sessionStats.turnCount)) items.push(['Session', formatSessionStatsLine(sessionStats)]);
 
   return (
@@ -66,6 +67,16 @@ function RunPanel({ turn }: { turn: SessionTurn }) {
         <div className="d-label mb-2.5 text-[9.5px]">{isStreaming ? 'This turn · live' : 'Latest turn'}</div>
         <KeyValue items={items} className="text-[12px]" />
       </div>
+      {routeTrace.length > 0 && (
+        <details className="rounded-[10px] border border-line bg-surface p-3.5" open={routeTrace.length <= 4}>
+          <summary className="d-label cursor-pointer text-[9.5px]">Every model attempt ({routeTrace.length})</summary>
+          <ol className="mt-2.5 space-y-1.5 text-[12px]" aria-label="Model attempts this turn">
+            {routeTrace.map((line, index) => (
+              <li key={`${index}-${line}`} className="break-words">{line}</li>
+            ))}
+          </ol>
+        </details>
+      )}
       {reasoningText && <Thinking text={reasoningText} open={showReasoning} setOpen={setShowReasoning} />}
     </div>
   );

@@ -19,6 +19,7 @@
 // pipeline's own code, exactly as the inline call site did before.
 import type { StreamSession } from "../stream-emitter";
 import { terminalSubtypeForRunOutcome } from "./task-run";
+import type { RoutePlanSummary } from "./route-plan";
 
 export type TerminalRunOutcome = "success" | "degraded" | "failed" | "partial";
 
@@ -32,6 +33,13 @@ export interface TerminalFinishOptions {
 export interface TerminalResultFields {
   subtype: "success" | "partial" | "error";
   code?: string;
+  /**
+   * The completion policy's own reason for a non-success outcome (for example
+   * `task_plan_open` or `pipeline_partial`). Sent separately from `code` so a
+   * `partial` turn never arrives with no reason at all, while `code` keeps its
+   * existing meaning (pipeline error codes, some of which are terminal errors).
+   */
+  reason?: string;
 }
 
 /**
@@ -45,16 +53,18 @@ export function terminalResultFields(input: {
   outcome: TerminalRunOutcome;
   errorCode?: string | null;
   repeated: boolean;
+  reason?: string | null;
 }): TerminalResultFields {
   const subtype = terminalSubtypeForRunOutcome(input.outcome);
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
   if (input.repeated) {
     // Existing behaviour: a repeated turn is tagged with the no-progress code
     // regardless of the pipeline's own error code.
-    return { subtype, code: "no_progress_repetition" };
+    return { subtype, code: "no_progress_repetition", ...(reason ? { reason } : {}) };
   }
   if (input.outcome === "success") return { subtype };
   const code = typeof input.errorCode === "string" ? input.errorCode.trim() : "";
-  return code ? { subtype, code } : { subtype };
+  return { subtype, ...(code ? { code } : {}), ...(reason ? { reason } : {}) };
 }
 
 /** Publish the terminal outcome on the stream through the single seam above. */
@@ -65,7 +75,15 @@ export async function finishWithRunOutcome(
     outcome: TerminalRunOutcome;
     errorCode?: string | null;
     repeated: boolean;
+    reason?: string | null;
+    route?: RoutePlanSummary;
+    /** Fatal text that the UI must show as an error banner, not a chat answer. */
+    isError?: boolean;
   },
 ): Promise<void> {
-  await session.finish(input.result, terminalResultFields(input));
+  await session.finish(input.result, {
+    ...terminalResultFields(input),
+    ...(input.isError ? { isError: true } : {}),
+    ...(input.route ? { route: input.route } : {}),
+  });
 }

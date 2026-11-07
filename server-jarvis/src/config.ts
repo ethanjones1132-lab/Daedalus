@@ -462,6 +462,15 @@ export interface BestOfNConfig {
 export interface OrchestratorConfig {
   enabled: boolean;
   agents: OrchestratorAgent[];
+  /**
+   * "Allow cloud helpers". Only consulted when the Inference backend is a
+   * local one (llama_cpp or ollama). When false (the default) no stage,
+   * fallback tail, executor delegate, conductor fallback or Agent tool call
+   * may leave this machine or the user's own vLLM server: what the user
+   * selected is what answers. When true, cloud providers with credentials may
+   * help, and every such hop is disclosed in the turn's route plan.
+   */
+  allow_cloud_helpers?: boolean;
   max_recursion_depth: number;
   /** B-02: bound on how many times a single turn may re-invoke the conductor
    *  via `conductor_replan` before the replan loop just runs the remaining
@@ -807,6 +816,7 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
     orchestrator: {
       enabled: true,
       agents: DEFAULT_ORCHESTRATOR_AGENTS,
+      allow_cloud_helpers: false,
       best_of_n: {
         enabled: false,
         n: 3,

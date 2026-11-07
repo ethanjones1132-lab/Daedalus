@@ -158,6 +158,31 @@ describe("isAuthoritativelyGreen", () => {
 });
 
 describe("decideCompletion", () => {
+  // 2026-11-07: a delivered answer to a question that needs only an answer is
+  // the work, even though the quick-answer path seeded a one-step plan.
+  test("an answer-only question with its answer delivered completes", () => {
+    for (const requirement of ["conversational", "answer_only"]) {
+      expect(decideCompletion({
+        pipelineOutcome: "success", reconciledStatus: "active", writeIntent: false, repeated: false, requirement,
+      })).toEqual({ taskStatus: "completed", runOutcome: "success", reason: "answer_delivered" });
+    }
+  });
+
+  test("the answer-only rule never covers writes, workspace work or a paused plan", () => {
+    expect(decideCompletion({
+      pipelineOutcome: "success", reconciledStatus: "active", writeIntent: false, wroteCode: true, repeated: false, requirement: "answer_only",
+    }).reason).not.toBe("answer_delivered");
+    expect(decideCompletion({
+      pipelineOutcome: "success", reconciledStatus: "active", writeIntent: false, repeated: false, requirement: "workspace_read",
+    })).toEqual({ taskStatus: "active", runOutcome: "partial", reason: "task_plan_open" });
+    expect(decideCompletion({
+      pipelineOutcome: "success", reconciledStatus: "paused", writeIntent: false, repeated: false, requirement: "answer_only",
+    })).toEqual({ taskStatus: "paused", runOutcome: "partial", reason: "task_plan_open" });
+    expect(decideCompletion({
+      pipelineOutcome: "partial", reconciledStatus: "active", writeIntent: false, repeated: false, requirement: "answer_only",
+    }).runOutcome).toBe("partial");
+  });
+
   test("open TaskPlan prevents a successful run", () => {
     expect(decideCompletion({
       pipelineOutcome: "success",

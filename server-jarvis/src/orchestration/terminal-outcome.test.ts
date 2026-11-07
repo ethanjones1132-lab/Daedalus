@@ -114,3 +114,43 @@ describe("finishWithRunOutcome", () => {
     expect(calls).toEqual([{ result: "Done.", options: { subtype: "success" } }]);
   });
 });
+
+describe("terminal reason (2026-11-07)", () => {
+  test("a partial run with no error code still says why", () => {
+    expect(terminalResultFields({ outcome: "partial", errorCode: undefined, repeated: false, reason: "task_plan_open" }))
+      .toEqual({ subtype: "partial", reason: "task_plan_open" });
+  });
+
+  test("the reason travels beside the code, never replacing it", () => {
+    expect(terminalResultFields({ outcome: "degraded", errorCode: "upstream_stage_failed", repeated: false, reason: "pipeline_degraded" }))
+      .toEqual({ subtype: "partial", code: "upstream_stage_failed", reason: "pipeline_degraded" });
+  });
+
+  test("success carries no reason", () => {
+    expect(terminalResultFields({ outcome: "success", repeated: false, reason: "verified_complete" })).toEqual({ subtype: "success" });
+  });
+
+  test("finishWithRunOutcome forwards the reason and the route plan", async () => {
+    const calls: Array<{ result: string; options: unknown }> = [];
+    const session = { finish: async (result: string, options?: unknown) => { calls.push({ result, options }); } };
+    const route = { left_machine: false, attempts: [] };
+    await finishWithRunOutcome(session as any, {
+      result: "4", outcome: "partial", errorCode: null, repeated: false, reason: "task_plan_open", route,
+    });
+    expect(calls).toEqual([{ result: "4", options: { subtype: "partial", reason: "task_plan_open", route } }]);
+  });
+
+  test("a fatal finish keeps the error flag beside the reason and route", async () => {
+    const calls: Array<{ result: string; options: unknown }> = [];
+    const session = { finish: async (result: string, options?: unknown) => { calls.push({ result, options }); } };
+    const route = { left_machine: false, attempts: [] };
+    await finishWithRunOutcome(session as any, {
+      result: "Synthesis failed", outcome: "failed", errorCode: "turn_deadline", repeated: false,
+      reason: "pipeline_failed", route, isError: true,
+    });
+    expect(calls).toEqual([{
+      result: "Synthesis failed",
+      options: { subtype: "error", code: "turn_deadline", reason: "pipeline_failed", isError: true, route },
+    }]);
+  });
+});

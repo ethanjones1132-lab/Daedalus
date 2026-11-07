@@ -1,4 +1,5 @@
 import { decodeStopConfirmation, initialStopRequestState, isCurrentStopRequest, projectStopRequest, reduceStopRequest, type StopRequestEvent, type StopRequestState, type StopOutcome } from '../../domain/turn-cancellation';
+import { formatAnsweredBy, formatAttemptLine, formatTurnReason, parseRouteAttempt, parseRoutePlan, routePlanFromAttempts, type RouteAttemptView, type RoutePlanView } from './route-plan';
 import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -658,6 +659,10 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     firstVisibleTokenMs?: number;
   } | null>(null);
   const [stageRoutes, setStageRoutes] = useState<Array<{ stage: string; provider: string; model: string }>>([]);
+  // Route plan: every settled attempt (live) and the server's terminal summary.
+  const [routeAttempts, setRouteAttempts] = useState<RouteAttemptView[]>([]);
+  const [routePlan, setRoutePlan] = useState<RoutePlanView | null>(null);
+  const [turnReason, setTurnReason] = useState<string | undefined>(undefined);
 
   // Per-session cumulative rollup for the chat header Session Stats pill.
   // Accumulates the `runMetrics.tokens` from every completed turn in the
@@ -1056,6 +1061,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setScopeNotice(null);
       setRunMetrics(null);
       setStageRoutes([]);
+      setRouteAttempts([]);
+      setRoutePlan(null);
+      setTurnReason(undefined);
       setTurnElapsedMs(0);
       turnStartedAtRef.current = null;
       clearPendingApproval();
@@ -1080,6 +1088,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setScopeNotice(null);
       setRunMetrics(null);
       setStageRoutes([]);
+      setRouteAttempts([]);
+      setRoutePlan(null);
+      setTurnReason(undefined);
       setTurnElapsedMs(0);
       turnStartedAtRef.current = null;
       setError(null);
@@ -2207,6 +2218,11 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         });
         return;
       }
+      if (frame.type === 'route_attempt') {
+        const attempt = parseRouteAttempt(frame);
+        if (attempt) setRouteAttempts(previous => [...previous, attempt]);
+        return;
+      }
       if (frame.type === 'stage_route') {
         const stage = typeof frame.stage === 'string' ? frame.stage.trim() : '';
         const provider = typeof frame.actual_provider === 'string' ? frame.actual_provider.trim() : '';
@@ -2287,6 +2303,11 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       if (frame.type === 'result') {
         if (terminalFrame !== null) return;
         const decision = decodeResultFrame(frame);
+        // The server's authoritative route summary and its reason for a
+        // non-success outcome (absent on older servers).
+        const terminalPlan = parseRoutePlan(frame.route);
+        if (terminalPlan) setRoutePlan(terminalPlan);
+        setTurnReason(typeof frame.reason === 'string' && frame.reason.trim() ? frame.reason.trim() : undefined);
         // Record the direct assistant text this turn may persist (and whether
         // the terminal permits it) BEFORE the bounded finalizer runs. A
         // non-success hard error persists nothing.
@@ -2690,6 +2711,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     setScopeNotice(null);
     setRunMetrics(null);
     setStageRoutes([]);
+      setRouteAttempts([]);
+      setRoutePlan(null);
+      setTurnReason(undefined);
     setUserPinnedToBottom(true);
     // Client-side identity for the optimistic user bubble (Task 7 / incident
     // 1d4727cf). Upgraded to the DB row id once `append_message` resolves
@@ -3005,6 +3029,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     setScopeNotice(null);
     setRunMetrics(null);
     setStageRoutes([]);
+      setRouteAttempts([]);
+      setRoutePlan(null);
+      setTurnReason(undefined);
     setTurnElapsedMs(0);
     turnStartedAtRef.current = null;
     setSessionStats({ tokens: 0, turnCount: 0 });
@@ -3052,7 +3079,12 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
 
   const displayedProvider = backendLabel;
   const displayedModel = modelLabel;
-  const displayedRoute = stageRoutes.length > 0
+  const effectiveRoutePlan = routePlan ?? (routeAttempts.length > 0 ? routePlanFromAttempts(routeAttempts) : null);
+  const routeTrace = effectiveRoutePlan ? effectiveRoutePlan.attempts.map(formatAttemptLine) : [];
+  const turnReasonLabel = formatTurnReason(turnReason);
+  const displayedRoute = effectiveRoutePlan
+    ? formatAnsweredBy(effectiveRoutePlan)
+    : stageRoutes.length > 0
     ? `Observed provider responses: ${stageRoutes.map(route => `${route.stage} · ${formatInferenceRoute(route.provider, route.model)}`).join(' → ')}`
     : runMetrics?.provider || runMetrics?.model
       ? `Reported last-stage route only: ${formatInferenceRoute(runMetrics.provider, runMetrics.model)}`
@@ -3176,6 +3208,8 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     displayedProvider,
     displayedModel,
     displayedRoute,
+    routeTrace,
+    turnReasonLabel,
     inferenceRoutingNotice,
     // approvals
     pendingApproval,

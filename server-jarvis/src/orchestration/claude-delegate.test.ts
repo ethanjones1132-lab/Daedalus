@@ -42,6 +42,9 @@ function fixturePathKey(root: string, path: string): string {
 function testConfig(): JarvisConfig {
   const config = defaultConfig();
   config.opencode_go.api_key = "go-test-key";
+  // The delegate is a cloud route. These tests cover its own rules, so they
+  // opt in to cloud helpers; the local boundary has its own test below.
+  config.orchestrator.allow_cloud_helpers = true;
   return config;
 }
 
@@ -380,6 +383,23 @@ describe("Claude executor delegate", () => {
     config.claude_cli.delegate.policy = "escalation";
     expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "awaiting_native_no_write" });
     expect(delegateEligibility({ ...base, nativeNoWrite: true })).toEqual({ eligible: true });
+  });
+
+  test("a local backend with cloud helpers off never delegates to the cloud", () => {
+    const config = testConfig();
+    config.active_backend = "llama_cpp";
+    config.orchestrator.allow_cloud_helpers = false;
+    const base = {
+      config,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      healthAvailable: true,
+      allowedRoots: ["C:\repo"],
+    };
+    expect(delegateEligibility(base)).toEqual({ eligible: false, reason: "local_only" });
+    config.orchestrator.allow_cloud_helpers = true;
+    expect(delegateEligibility(base)).toEqual({ eligible: true });
   });
 
   test("refuses subscription mode so the automated delegate never spends Claude quota", () => {
