@@ -1,6 +1,23 @@
 import unittest
 
 
+def isolated_runtime_config(*, orchestrated=False):
+    from pathlib import Path
+
+    from scripts.direct_vs_orchestrated.runner import build_mode_configs
+
+    root = Path.cwd() / ".comparison-test"
+    configs = build_mode_configs(
+        isolated_home=root / "home",
+        workspace=root / "fixture",
+        llama_base_url="http://127.0.0.1:19002/v1",
+        served_alias="comparison-local",
+        llama_server_path=root / "llama-server.exe",
+        model_path=root / "model.gguf",
+    )
+    return configs["orchestrated" if orchestrated else "direct"]
+
+
 def frame(frame_type, received_ms, **fields):
     return {"frame": {"type": frame_type, **fields}, "received_ms": received_ms}
 
@@ -161,25 +178,58 @@ class CaptureTurnTests(unittest.TestCase):
             "temperature": 0,
             "top_p": 1,
         }
+        mode_configs = {
+            "direct": isolated_runtime_config(orchestrated=False),
+            "orchestrated": isolated_runtime_config(orchestrated=True),
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "frames.jsonl"
-            with patch("scripts.direct_vs_orchestrated.sse_capture._open_local", return_value=FakeResponse(payload)) as open_url:
+            orchestrated_path = Path(temp_dir) / "orchestrated.jsonl"
+            with patch("scripts.direct_vs_orchestrated.sse_capture._open_local", side_effect=[FakeResponse(payload), FakeResponse(payload)]) as open_url:
                 observation = capture_turn(
                     "http://127.0.0.1:19877",
                     session_id="trial-1",
                     task=task,
                     wall_cap_ms=5000,
                     out_path=output_path,
+                    runtime_config=mode_configs["direct"],
+                )
+                orchestrated_observation = capture_turn(
+                    "http://127.0.0.1:19877",
+                    session_id="trial-2",
+                    task=task,
+                    wall_cap_ms=5000,
+                    out_path=orchestrated_path,
+                    runtime_config=mode_configs["orchestrated"],
                 )
 
-            request = open_url.call_args.args[0]
-            body = json.loads(request.data.decode("utf-8"))
-            self.assertEqual(request.full_url, "http://127.0.0.1:19877/chat/stream")
+            request_bodies = [json.loads(call.args[0].data.decode("utf-8")) for call in open_url.call_args_list]
+            body, orchestrated_body = request_bodies
+            expected_config = {**mode_configs["direct"], "max_tokens": 16, "temperature": 0, "top_p": 1}
+            expected_orchestrated_config = {**mode_configs["orchestrated"], "max_tokens": 16, "temperature": 0, "top_p": 1}
+            for expected in (expected_config, expected_orchestrated_config):
+                expected["comparison_generation"] = {"max_tokens": 16, "temperature": 0, "top_p": 1}
+            self.assertEqual(open_url.call_args_list[0].args[0].full_url, "http://127.0.0.1:19877/chat/stream")
             self.assertEqual(body["message"], task["prompt"])
             self.assertEqual(body["session_id"], "trial-1")
             self.assertEqual(body["history"], [])
-            self.assertEqual(body["config"], {"max_tokens": 16, "temperature": 0, "top_p": 1})
+            self.assertEqual(body["config"], expected_config)
+            self.assertFalse(body["config"]["orchestrator"]["enabled"])
+            self.assertEqual(body["config"]["llama_cpp"]["base_url"], "http://127.0.0.1:19002/v1")
+            self.assertEqual(body["config"]["llama_cpp"]["model"], "comparison-local")
+            self.assertFalse(body["config"]["orchestrator"]["allow_cloud_helpers"])
+            self.assertFalse(body["config"]["orchestrator"]["conductor_learning"]["enabled"])
+            self.assertFalse(body["config"]["orchestrator"]["conductor"]["keep_warm"])
+            self.assertFalse(body["config"]["openrouter"]["enable_fallbacks"])
+            self.assertFalse(body["config"]["openrouter"]["enable_paid_fallbacks"])
+            self.assertFalse(body["config"]["claude_cli"]["enabled"])
+            self.assertFalse(body["config"]["vllm"]["enabled"])
+            self.assertEqual(orchestrated_body["config"], expected_orchestrated_config)
+            self.assertTrue(orchestrated_body["config"]["orchestrator"]["enabled"])
+            self.assertEqual(orchestrated_body["config"]["llama_cpp"]["model"], "comparison-local")
+            self.assertNotIn("max_tokens", mode_configs["direct"])
             self.assertEqual(observation["outcome"], "success")
+            self.assertEqual(orchestrated_observation["outcome"], "success")
             records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
             frames = [record["frame"] for record in records if record["frame"] is not None]
             self.assertEqual([frame["type"] for frame in frames], ["stream_event", "message_stop", "result"])
@@ -196,6 +246,24 @@ class CaptureTurnTests(unittest.TestCase):
                 capture_turn(
                     "https://example.com",
                     session_id="trial-1",
+                    task={"id": "x", "prompt": "x", "max_tokens": 1, "temperature": 0, "top_p": 1},
+                    wall_cap_ms=1000,
+                    out_path=Path("unused.jsonl"),
+                    runtime_config=isolated_runtime_config(),
+                )
+        open_url.assert_not_called()
+
+    def test_capture_turn_requires_runtime_config_before_post(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts.direct_vs_orchestrated.sse_capture import capture_turn
+
+        with patch("scripts.direct_vs_orchestrated.sse_capture._open_local") as open_url:
+            with self.assertRaises(TypeError):
+                capture_turn(
+                    "http://127.0.0.1:19877",
+                    session_id="trial-missing-config",
                     task={"id": "x", "prompt": "x", "max_tokens": 1, "temperature": 0, "top_p": 1},
                     wall_cap_ms=1000,
                     out_path=Path("unused.jsonl"),
@@ -257,6 +325,7 @@ class CaptureTimeoutTests(unittest.TestCase):
                     task=task,
                     wall_cap_ms=5000,
                     out_path=output_path,
+                    runtime_config=isolated_runtime_config(),
                 )
             records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
 
@@ -310,14 +379,18 @@ class CaptureWorkerTests(unittest.TestCase):
         task = {"id": "arithmetic", "prompt": "17 plus 25", "max_tokens": 16, "temperature": 0, "top_p": 1}
         with tempfile.TemporaryDirectory() as temp_dir:
             task_path = Path(temp_dir) / "task.json"
+            config_path = Path(temp_dir) / "config.json"
             output_path = Path(temp_dir) / "capture.jsonl"
             task_path.write_text(json.dumps(task), encoding="utf-8")
+            runtime_config = isolated_runtime_config(orchestrated=True)
+            config_path.write_text(json.dumps(runtime_config), encoding="utf-8")
             expected = {"outcome": "success", "terminal_ms": 10, "total_wall_ms": 10}
             with patch("scripts.direct_vs_orchestrated.capture_worker.capture_turn", return_value=expected) as capture:
                 status = main([
                     "--base-url", "http://127.0.0.1:19877",
                     "--session-id", "session-1",
                     "--task-json", str(task_path),
+                    "--config-json", str(config_path),
                     "--out", str(output_path),
                     "--wall-cap-ms", "4500",
                 ])
@@ -329,6 +402,7 @@ class CaptureWorkerTests(unittest.TestCase):
             task=task,
             wall_cap_ms=4500,
             out_path=output_path,
+            runtime_config=runtime_config,
         )
 
     def test_worker_exits_nonzero_for_transport_failure(self):
@@ -343,13 +417,16 @@ class CaptureWorkerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             task_path = Path(temp_dir) / "task.json"
+            config_path = Path(temp_dir) / "config.json"
             task_path.write_text(json.dumps({"id": "x", "prompt": "x"}), encoding="utf-8")
+            config_path.write_text(json.dumps(isolated_runtime_config()), encoding="utf-8")
             with patch("scripts.direct_vs_orchestrated.capture_worker.capture_turn", return_value={"outcome": "transport_failure"}):
                 with contextlib.redirect_stdout(io.StringIO()):
                     status = main([
                         "--base-url", "http://127.0.0.1:19877",
                         "--session-id", "s",
                         "--task-json", str(task_path),
+                        "--config-json", str(config_path),
                         "--out", str(Path(temp_dir) / "out.jsonl"),
                         "--wall-cap-ms", "1000",
                     ])
@@ -407,6 +484,7 @@ class LoopbackRedirectTests(unittest.TestCase):
                     task=task,
                     wall_cap_ms=1000,
                     out_path=Path(temp_dir) / "redirect.jsonl",
+                    runtime_config=isolated_runtime_config(),
                 )
             self.assertEqual(observation["outcome"], "transport_failure")
             self.assertFalse(redirected_request_seen.wait(0.1))

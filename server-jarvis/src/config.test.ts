@@ -95,6 +95,41 @@ describe("trajectory snapshot retention config", () => {
   });
 });
 
+describe("comparison generation config", () => {
+  test("is absent by default so ordinary request generation is unchanged", () => {
+    const cfg = defaultConfig();
+    expect(Object.prototype.hasOwnProperty.call(cfg, "comparison_generation")).toBe(false);
+    expect(validateConfig(cfg).valid).toBe(true);
+  });
+
+  test("accepts a complete bounded comparison policy", () => {
+    const cfg = normalizeConfig({
+      comparison_generation: { max_tokens: 16, temperature: 0, top_p: 1 },
+    });
+
+    expect(validateConfig(cfg).valid).toBe(true);
+  });
+
+  test.each([
+    null,
+    {},
+    { max_tokens: 16, temperature: 0, top_p: 1, extra: true },
+    { max_tokens: 0, temperature: 0, top_p: 1 },
+    { max_tokens: 1.5, temperature: 0, top_p: 1 },
+    { max_tokens: 32_769, temperature: 0, top_p: 1 },
+    { max_tokens: 16, temperature: Number.NaN, top_p: 1 },
+    { max_tokens: 16, temperature: 2.01, top_p: 1 },
+    { max_tokens: 16, temperature: 0, top_p: 0 },
+    { max_tokens: 16, temperature: 0, top_p: 1.01 },
+  ])("rejects malformed comparison policy %p", (comparison_generation) => {
+    const cfg = normalizeConfig({ comparison_generation });
+    const validation = validateConfig(cfg);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.errors.some((error) => error.includes("comparison_generation"))).toBe(true);
+  });
+});
+
 describe("Claude CLI auth mode config", () => {
   test("defaults legacy config inputs to proxy mode", () => {
     expect(defaultConfig().claude_cli.auth_mode).toBe("proxy");

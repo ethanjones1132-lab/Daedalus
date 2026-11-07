@@ -400,6 +400,53 @@ describe("PersistentConductor", () => {
     expect(urls.some((url) => url.includes("/api/"))).toBe(false);
     expect(body?.model).toBe("gemma-test.gguf");
     expect(body?.response_format?.type).toBe("json_schema");
+    expect(body?.max_tokens).toBe(4_096);
+    expect(body?.temperature).toBe(0.2);
+    expect(body?.top_p).toBe(0.95);
+  });
+
+  test("applies comparison generation settings to the final llama.cpp route body", async () => {
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://127.0.0.1:8080/v1/models") return Response.json({ data: [{ id: "gemma-test.gguf" }] });
+      if (url === "http://127.0.0.1:8080/v1/chat/completions") {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ choices: [{ message: { role: "assistant", content: '{"task_type":"general","pipeline":["synthesizer"],"topology":"linear","context":{"needs_workspace_inspection":false,"needs_memory":true,"estimated_complexity":"low"},"coordinator_rationale":"comparison"}' } }] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = llamaCppConfig();
+    cfg.comparison_generation = { max_tokens: 16, temperature: 0, top_p: 1 };
+    const conductor = new PersistentConductor(() => cfg);
+    await conductor.routeTurn({ sessionId: "comparison-route", request: "hello", turnNumber: 1 });
+
+    expect(body?.max_tokens).toBe(16);
+    expect(body?.temperature).toBe(0);
+    expect(body?.top_p).toBe(1);
+  });
+
+  test("applies comparison generation settings to the final llama.cpp warm-up body", async () => {
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://127.0.0.1:8080/v1/models") return Response.json({ data: [{ id: "gemma-test.gguf" }] });
+      if (url === "http://127.0.0.1:8080/v1/chat/completions") {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ choices: [{ message: { role: "assistant", content: "ready" } }] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = llamaCppConfig();
+    cfg.comparison_generation = { max_tokens: 16, temperature: 0, top_p: 1 };
+    const conductor = new PersistentConductor(() => cfg);
+    await conductor.warmUp();
+
+    expect(body?.max_tokens).toBe(16);
+    expect(body?.temperature).toBe(0);
+    expect(body?.top_p).toBe(1);
   });
 
   test("isWarm reads llama.cpp model ids and fails open on a non-llama.cpp listing", async () => {

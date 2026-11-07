@@ -17,6 +17,7 @@ import { checkOllamaHealth, ollamaBaseUrlCandidates } from "../ollama";
 import { resolveSkillsForConductor } from "../intelligence/skill-resolver";
 import { SelfTuningStore, type ConductorOutcomeSummary } from "../self-tuning/store";
 import { getPolicyVersionStore } from "../self-tuning/policy-staging";
+import { applyComparisonGeneration } from "./comparison-generation";
 import {
   getActivePlanItem,
   type TaskPlanGradingMode,
@@ -899,38 +900,43 @@ export class PersistentConductor {
       target = await this.resolveTarget();
       const controller = new AbortController();
       timeout = this.timers.setTimeout(() => controller.abort(), timeoutMs);
-      const warmupResponse = target.backend === "llama_cpp"
-        ? await fetch(`${target.baseUrl}/chat/completions`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: target.model,
-              messages: [
-                { role: "system", content: loadPrompt("coordinator.md") },
-                { role: "user", content: "Return a single short readiness response." },
-              ],
-              stream: false,
-              max_tokens: Math.max(4_096, this.config().max_tokens),
-              temperature: 0,
-              cache_prompt: true,
-            }),
-            signal: controller.signal,
-          })
-        : await fetch(`${target.baseUrl}/api/generate`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: target.model,
-              prompt: "",
-              stream: false,
-              keep_alive: "30m",
-              options: {
-                num_predict: 1,
-                num_ctx: this.config().num_ctx,
-              },
-            }),
-            signal: controller.signal,
-          });
+      let warmupResponse: Response;
+      if (target.backend === "llama_cpp") {
+        const body: Record<string, any> = {
+          model: target.model,
+          messages: [
+            { role: "system", content: loadPrompt("coordinator.md") },
+            { role: "user", content: "Return a single short readiness response." },
+          ],
+          stream: false,
+          max_tokens: Math.max(4_096, this.config().max_tokens),
+          temperature: 0,
+          cache_prompt: true,
+        };
+        applyComparisonGeneration(body, this.getConfig());
+        warmupResponse = await fetch(`${target.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } else {
+        warmupResponse = await fetch(`${target.baseUrl}/api/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: target.model,
+            prompt: "",
+            stream: false,
+            keep_alive: "30m",
+            options: {
+              num_predict: 1,
+              num_ctx: this.config().num_ctx,
+            },
+          }),
+          signal: controller.signal,
+        });
+      }
       const res = warmupResponse;
       if (!res.ok) {
         const body = await res.text().catch(() => "");
@@ -1358,6 +1364,7 @@ export class PersistentConductor {
           },
           format: options.format,
         };
+    applyComparisonGeneration(body, this.getConfig());
 
     try {
       const res = await fetch(target.backend === "llama_cpp" ? `${target.baseUrl}/chat/completions` : `${target.baseUrl}/api/chat`, {

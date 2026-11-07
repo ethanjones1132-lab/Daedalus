@@ -4,7 +4,7 @@
     {
       "id": "arithmetic",
       "prompt": "What is 17 plus 25? Reply with the integer only.",
-      "max_tokens": 16,
+      "max_tokens": 4096,
       "temperature": 0,
       "top_p": 1,
       "acceptance": {
@@ -22,7 +22,7 @@
     {
       "id": "code_explanation",
       "prompt": "In at most three sentences, explain a Python list comprehension, mention optional filtering, and give one short example that squares 0 through 4.",
-      "max_tokens": 160,
+      "max_tokens": 4096,
       "temperature": 0,
       "top_p": 1,
       "acceptance": {
@@ -49,7 +49,7 @@
     {
       "id": "fixture_tool_read",
       "prompt": "Use the file-reading tool to read `stock.csv`. Return the product with the highest in-stock quantity as `name: quantity` only.",
-      "max_tokens": 64,
+      "max_tokens": 4096,
       "temperature": 0,
       "top_p": 1,
       "acceptance": {
@@ -82,7 +82,7 @@
     {
       "id": "planning_no_implementation",
       "prompt": "Give exactly four ordered planning steps for a lunch pickup flow. Cover menu choice, payment, kitchen order, and pickup notice. Do not write code or implement anything.",
-      "max_tokens": 192,
+      "max_tokens": 4096,
       "temperature": 0,
       "top_p": 1,
       "acceptance": {

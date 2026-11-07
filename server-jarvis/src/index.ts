@@ -318,6 +318,8 @@ import {
 import { finishWithRunOutcome } from "./orchestration/terminal-outcome";
 import { withWireToolCalls } from "./orchestration/tool-call-wire";
 import { RoutePlan, routeAttemptSseFrame, type RouteChoice } from "./orchestration/route-plan";
+import { createToolTraceObserver } from "./orchestration/tool-trace";
+import { applyComparisonGeneration } from "./orchestration/comparison-generation";
 import { finishSinglePassCompletion } from "./single-pass-completion";
 import { classifySinglePassToolArgs } from "./single-pass-tool-args";
 import { nextVerifiedWebSearchState } from "./verified-web-search";
@@ -2440,6 +2442,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       if (activeTurnMemory) {
         ctx.onToolResult = (call, result) => observeTurnMemoryToolEvidence(call, result, ctx);
       }
+      if (cfg.orchestrator.enabled) {
+        ctx.onToolTrace = createToolTraceObserver(sessionId, async (frame) => {
+          await streamWrite(`data: ${JSON.stringify(frame)}\n\n`);
+        });
+      }
       // Wire the approval hook: emit a `tool_approval_request` SSE event so
       // the Tauri runner relays it to the UI (ToolApprovalModal), then await
       // the user's decision from the process-level registry. Auto-denies after
@@ -2853,6 +2860,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             }
           }
 
+          applyComparisonGeneration(requestBody, cfg);
           const headers: Record<string, string> = isOllama
             ? { "Authorization": "Bearer ollama", "Content-Type": "application/json" }
             : isLlamaCpp
@@ -5416,6 +5424,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           }
         }
 
+        applyComparisonGeneration(requestBody, cfg);
         // ── Ephemeral native memory at the final direct-provider boundary ──
         // Injected after compaction, context optimization, and normalization.
         // The cascade path refits + attaches independently per candidate; the

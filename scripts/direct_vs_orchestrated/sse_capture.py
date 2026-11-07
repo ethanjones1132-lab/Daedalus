@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import json
 import math
@@ -247,6 +248,70 @@ def _validate_task(task: dict[str, Any], wall_cap_ms: int) -> None:
             raise ValueError(f"task {name} must be a finite number")
 
 
+def validate_runtime_config(runtime_config: dict[str, Any]) -> dict[str, Any]:
+    """Require the complete isolated comparison policy before sending a turn."""
+    if not isinstance(runtime_config, dict):
+        raise ValueError("runtime_config must be a complete isolated comparison object")
+    llama = runtime_config.get("llama_cpp")
+    if runtime_config.get("active_backend") != "llama_cpp" or not isinstance(llama, dict):
+        raise ValueError("runtime_config must select the isolated llama.cpp backend")
+    base_url = llama.get("base_url")
+    model = llama.get("model")
+    if not isinstance(base_url, str) or not isinstance(model, str) or not model.strip():
+        raise ValueError("runtime_config must contain the isolated llama.cpp URL and alias")
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("runtime_config llama.cpp URL must be loopback HTTP") from exc
+    if parsed.scheme != "http" or host != "127.0.0.1" or port is None or parsed.path.rstrip("/") != "/v1" or parsed.query or parsed.fragment or parsed.username or parsed.password:
+        raise ValueError("runtime_config llama.cpp URL must be http://127.0.0.1:<port>/v1")
+
+    orchestrator = runtime_config.get("orchestrator")
+    if not isinstance(orchestrator, dict) or not isinstance(orchestrator.get("enabled"), bool):
+        raise ValueError("runtime_config must contain an explicit orchestration mode")
+    if orchestrator.get("allow_cloud_helpers") is not False:
+        raise ValueError("runtime_config must disable cloud helpers")
+    for section in ("session_memory", "conductor_learning", "skill_distillation"):
+        section_config = orchestrator.get(section)
+        if not isinstance(section_config, dict) or section_config.get("enabled") is not False:
+            raise ValueError(f"runtime_config must disable orchestrator.{section}")
+    if orchestrator["conductor_learning"].get("trajectory_export") is not False:
+        raise ValueError("runtime_config must disable conductor trajectory export")
+    conductor = orchestrator.get("conductor")
+    if not isinstance(conductor, dict):
+        raise ValueError("runtime_config must configure the isolated resident conductor")
+    expected_conductor = {
+        "enabled": True,
+        "base_url": base_url,
+        "model": model,
+        "fallback_model": "",
+        "fallback_to_api": False,
+        "keep_warm": False,
+        "persist_sessions": False,
+        "kv_persist": False,
+        "kv_backend": "llama_cpp",
+    }
+    if any(conductor.get(key) != value for key, value in expected_conductor.items()):
+        raise ValueError("runtime_config resident conductor must match the isolated local endpoint without warm-up, fallback, or persistence")
+
+    claude = runtime_config.get("claude_cli")
+    openrouter = runtime_config.get("openrouter")
+    vllm = runtime_config.get("vllm")
+    if not isinstance(claude, dict) or claude.get("enabled") is not False:
+        raise ValueError("runtime_config must disable Claude CLI")
+    if not isinstance(openrouter, dict) or openrouter.get("api_key") != "" or openrouter.get("enable_fallbacks") is not False or openrouter.get("enable_paid_fallbacks") is not False or openrouter.get("fallbacks") != []:
+        raise ValueError("runtime_config must disable cloud model fallbacks")
+    if not isinstance(vllm, dict) or vllm.get("enabled") is not False:
+        raise ValueError("runtime_config must disable vLLM")
+    for section in ("opencode_zen", "opencode_go"):
+        provider = runtime_config.get(section)
+        if not isinstance(provider, dict) or provider.get("api_key") != "":
+            raise ValueError(f"runtime_config must omit credentials for {section}")
+    return copy.deepcopy(runtime_config)
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     current: Any = exc
     while isinstance(current, BaseException):
@@ -329,23 +394,31 @@ def capture_turn(
     task: dict[str, Any],
     wall_cap_ms: int,
     out_path: Path,
+    runtime_config: dict[str, Any],
 ) -> dict[str, Any]:
     """Post one isolated turn, flushing each SSE line as JSONL evidence."""
     stream_url = _local_endpoint(base_url, "chat/stream")
     _validate_task(task, wall_cap_ms)
     if not isinstance(session_id, str) or not session_id.strip():
         raise ValueError("session_id must be a nonempty string")
+    request_config = validate_runtime_config(runtime_config)
+    request_config.update({
+        "max_tokens": task["max_tokens"],
+        "temperature": task["temperature"],
+        "top_p": task["top_p"],
+    })
+    # Stage presets and local minimums normally override these root samplers.
+    # This explicit opt-in applies the same effective values at final dispatch.
+    request_config["comparison_generation"] = {
+        key: task[key] for key in ("max_tokens", "temperature", "top_p")
+    }
 
     request_body = {
         "message": task["prompt"],
         "history": [],
         "session_id": session_id,
         "surface": "chat",
-        "config": {
-            "max_tokens": task["max_tokens"],
-            "temperature": task["temperature"],
-            "top_p": task["top_p"],
-        },
+        "config": request_config,
     }
     request = urllib.request.Request(
         stream_url,

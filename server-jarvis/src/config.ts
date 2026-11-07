@@ -10,6 +10,7 @@ import { homedir } from "os";
 import jarvisPackage from "../package.json";
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "./orchestration/agent-pool";
 import { validateOrchestratorAgents } from "./orchestration/agent-validation";
+import { validateComparisonGeneration } from "./orchestration/comparison-generation";
 import {
   DEFAULT_MAX_TRAJECTORY_SNAPSHOTS,
   invalidTrajectoryRetentionMessage,
@@ -549,6 +550,12 @@ export interface JarvisConfig {
   prizepicks_prompt: string;
   /** Temperature for chat completions */
   temperature: number;
+  /** Per-turn generation policy used only by the Direct-vs-Orchestrated comparison harness. */
+  comparison_generation?: {
+    max_tokens: number;
+    temperature: number;
+    top_p: number;
+  };
   /** Per-surface temperature overrides (ADR 0002 Layer 1) */
   surface_temperatures: SurfaceTemperatures;
   max_tokens: number;
@@ -1069,6 +1076,12 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const home = options.home ?? homedir();
   const merged = deepMerge(defaultConfig(home), raw);
+  // deepMerge treats null/undefined as non-overriding for ordinary config.
+  // Preserve explicit comparison-policy presence so malformed values remain
+  // visible to validation and fail closed at request construction.
+  if (raw && typeof raw === "object" && Object.prototype.hasOwnProperty.call(raw, "comparison_generation")) {
+    merged.comparison_generation = raw.comparison_generation;
+  }
   merged.vllm = normalizeVllmConfig(merged.vllm);
   const configuredTrajectoryRetention = merged.orchestrator?.conductor_learning?.max_trajectory_snapshots;
   if (!isValidTrajectoryRetention(configuredTrajectoryRetention)) {
@@ -1220,7 +1233,11 @@ export function saveConfig(
 ): JarvisConfig {
   const validate = options.validate !== false;
   const current = options.currentConfig ?? loadConfig();
-  const merged = normalizeConfig(deepMerge(current, partial), {
+  const rawMerged = deepMerge(current, partial);
+  if (Object.prototype.hasOwnProperty.call(partial, "comparison_generation")) {
+    rawMerged.comparison_generation = partial.comparison_generation;
+  }
+  const merged = normalizeConfig(rawMerged, {
     healInvalidTrajectorySnapshots: options.validate === false,
   });
   const validation = validateConfig(merged);
@@ -1383,6 +1400,11 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
   }
   if (cfg.max_tokens < 1 || cfg.max_tokens > 131072) {
     warnings.push("max_tokens outside typical range (1-131072)");
+  }
+  if (Object.prototype.hasOwnProperty.call(cfg, "comparison_generation")) {
+    for (const issue of validateComparisonGeneration(cfg.comparison_generation)) {
+      errors.push(`comparison_generation ${issue}`);
+    }
   }
   if (!isValidTrajectoryRetention(cfg.orchestrator?.conductor_learning?.max_trajectory_snapshots)) {
     errors.push("orchestrator.conductor_learning.max_trajectory_snapshots must be a finite positive integer");

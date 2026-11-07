@@ -437,9 +437,22 @@ class ProcessHarnessTests(unittest.TestCase):
                 return self.returncode
 
         process = TimedOutWorker()
+        spawned = []
+
+        def spawn(command, **kwargs):
+            spawned.append((command, kwargs))
+            return process
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            runtime_config = runner.build_mode_configs(
+                isolated_home=root / "home",
+                workspace=root / "fixture",
+                llama_base_url="http://127.0.0.1:19006/v1",
+                served_alias="comparison-local",
+                llama_server_path=root / "llama-server.exe",
+                model_path=root / "model.gguf",
+            )["direct"]
             with patch.object(runner.time, "monotonic", side_effect=[100.0, 221.0, 222.0, 222.0, 222.0]):
                 with patch.object(runner, "_cancel_session", return_value=True) as cancel:
                     result = runner._run_capture_worker(
@@ -448,12 +461,17 @@ class ProcessHarnessTests(unittest.TestCase):
                         task=load_tasks()[0],
                         wall_cap_ms=120_000,
                         out_path=root / "capture.jsonl",
+                        runtime_config=runtime_config,
                         worker_home=root / "home",
                         port=19007,
                         workspace=root / "fixture",
                         repo_root=root,
-                        popen_factory=lambda *_args, **_kwargs: process,
+                        popen_factory=spawn,
                     )
+
+            command = spawned[0][0]
+            config_path = Path(command[command.index("--config-json") + 1])
+            self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), runtime_config)
 
         self.assertEqual(process.timeouts[0], 0.0)
         self.assertEqual(process.timeouts[1], 5.0)
@@ -558,7 +576,7 @@ class ProcessHarnessTests(unittest.TestCase):
                 if parsed.path == "/health" and parsed.port == ports["llama_cpp"]:
                     return {"status": "ok"}
                 if parsed.path == "/health":
-                    return {"ok": True, "backend": "llama_cpp", "configured_model": "alias"}
+                    return {"ok": True, "backend": "llama_cpp", "configured_model": "alias", "bind_host": "127.0.0.1"}
                 mode = "direct" if parsed.port == ports["direct"] else "orchestrated"
                 return configs[mode]
 
@@ -597,6 +615,12 @@ class ProcessHarnessTests(unittest.TestCase):
         self.assertLess(second_model_spawn_index, orchestrated_trial_index)
         self.assertEqual({process.role for process in processes}, {"llama", "bun"})
         self.assertTrue(all(process.returncode is not None for process in processes))
+        bun_processes = [process for process in processes if process.role == "bun"]
+        self.assertEqual(len(bun_processes), 2)
+        for process in bun_processes:
+            self.assertIn("--no-env-file", process.command)
+            self.assertEqual(process.kwargs["env"]["JARVIS_SERVER_HOST"], "127.0.0.1")
+            self.assertNotIn("OPENAI_API_KEY", process.kwargs["env"])
 
     def test_llama_health_status_contract_is_accepted(self):
         from unittest.mock import patch
@@ -610,9 +634,81 @@ class ProcessHarnessTests(unittest.TestCase):
         with patch.object(runner.time, "monotonic", side_effect=[0.0, 0.0, 2.0]):
             with patch.object(runner, "_local_json_request", return_value={"status": "ok"}):
                 self.assertEqual(
-                    runner._wait_for_json("http://127.0.0.1:19003/health", RunningProcess(), timeout_s=1),
+                    runner._wait_for_json("http://127.0.0.1:19003/health", RunningProcess(), timeout_s=1, readiness_kind="health"),
                     {"status": "ok"},
                 )
+
+    def test_real_bare_config_response_is_accepted_and_validated(self):
+        from unittest.mock import patch
+
+        from scripts.direct_vs_orchestrated import runner
+
+        class RunningProcess:
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            configs = runner.build_mode_configs(
+                isolated_home=root / "home",
+                workspace=root / "fixture",
+                llama_base_url="http://127.0.0.1:19004/v1",
+                served_alias="comparison-local",
+                llama_server_path=root / "llama-server",
+                model_path=root / "model.gguf",
+            )
+            bare_config = configs["orchestrated"]
+            with patch.object(runner.time, "monotonic", side_effect=[0.0, 0.0, 2.0]):
+                with patch.object(runner, "_local_json_request", return_value=bare_config):
+                    response = runner._wait_for_json(
+                        "http://127.0.0.1:19004/config",
+                        RunningProcess(),
+                        timeout_s=1,
+                        readiness_kind="config",
+                    )
+
+            self.assertEqual(response, bare_config)
+            runner._assert_runtime_config(
+                response,
+                expected=configs["orchestrated"],
+                mode="orchestrated",
+                model_url="http://127.0.0.1:19004/v1",
+                served_alias="comparison-local",
+            )
+            wrong_mode = json.loads(json.dumps(response))
+            wrong_mode["orchestrator"]["enabled"] = False
+            with self.assertRaisesRegex(RuntimeError, "orchestration mode"):
+                runner._assert_runtime_config(
+                    wrong_mode,
+                    expected=configs["orchestrated"],
+                    mode="orchestrated",
+                    model_url="http://127.0.0.1:19004/v1",
+                    served_alias="comparison-local",
+                )
+
+    def test_error_objects_are_not_accepted_as_health_or_config_readiness(self):
+        from unittest.mock import patch
+
+        from scripts.direct_vs_orchestrated import runner
+
+        class RunningProcess:
+            def poll(self):
+                return None
+
+        responses = ({"ok": False, "error": "not ready"}, {"ok": True, "status": "error"})
+        for path, readiness_kind in (("/health", "health"), ("/config", "config")):
+            for error_response in responses:
+                with self.subTest(path=path, response=error_response):
+                    with patch.object(runner.time, "monotonic", side_effect=[0.0, 0.0, 2.0]):
+                        with patch.object(runner.time, "sleep"):
+                            with patch.object(runner, "_local_json_request", return_value=error_response):
+                                with self.assertRaises(TimeoutError):
+                                    runner._wait_for_json(
+                                        f"http://127.0.0.1:19005{path}",
+                                        RunningProcess(),
+                                        timeout_s=1,
+                                        readiness_kind=readiness_kind,
+                                    )
 
     def test_llama_extra_args_cannot_override_local_server_identity(self):
         from scripts.direct_vs_orchestrated.runner import validate_llama_extra_args
@@ -625,10 +721,32 @@ class ProcessHarnessTests(unittest.TestCase):
             ["-m", "other.gguf"],
             ["--alias", "other-model"],
             ["--rpc", "remote.example:50052"],
+            ["-hf", "org/model"],
+            ["--hf-repo=org/model"],
+            ["--model-url=https://example.invalid/model.gguf"],
+            ["--model-draft", "draft.gguf"],
+            ["--draft", "draft.gguf"],
+            ["--host-alias", "other"],
+            ["-p", "8080"],
+            ["KEY=value"],
+            ["--threads"],
+            ["--threads=0"],
+            ["--flash-attn"],
         ):
-            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "reserved"):
+            with self.subTest(args=args), self.assertRaises(ValueError):
                 validate_llama_extra_args(args)
-        self.assertEqual(validate_llama_extra_args(["--n-gpu-layers", "99"]), ["--n-gpu-layers", "99"])
+        self.assertEqual(
+            validate_llama_extra_args([
+                "--n-gpu-layers=99", "--cache-type-k=q8_0", "--threads=8",
+                "--n-cpu-moe=8", "--flash-attn=on", "--reasoning-budget=128",
+                "--cache-ram=0", "--jinja", "--no-webui",
+            ]),
+            [
+                "--n-gpu-layers=99", "--cache-type-k=q8_0", "--threads=8",
+                "--n-cpu-moe=8", "--flash-attn=on", "--reasoning-budget=128",
+                "--cache-ram=0", "--jinja", "--no-webui",
+            ],
+        )
 
     def test_process_logs_are_created_under_out_dir(self):
         from scripts.direct_vs_orchestrated.runner import _open_process_logs
@@ -671,7 +789,8 @@ class ProcessHarnessTests(unittest.TestCase):
         self.assertEqual(env["JARVIS_WORKSPACE"], str(workspace))
         for name in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TEMP", "TMP"):
             self.assertTrue(Path(env[name]).is_relative_to(home), name)
-        self.assertLessEqual(set(env), {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TEMP", "TMP", "JARVIS_SERVER_PORT", "JARVIS_WORKSPACE", "JARVIS_HOME"})
+        self.assertEqual(env["JARVIS_SERVER_HOST"], "127.0.0.1")
+        self.assertLessEqual(set(env), {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TEMP", "TMP", "JARVIS_SERVER_PORT", "JARVIS_SERVER_HOST", "JARVIS_WORKSPACE", "JARVIS_HOME"})
 
     def test_unavailable_or_occupied_loopback_ports_abort_before_spawn(self):
         from scripts.direct_vs_orchestrated.runner import owned_processes
@@ -764,6 +883,13 @@ class ProcessHarnessTests(unittest.TestCase):
         self.assertFalse(config["orchestrator"]["conductor_learning"]["enabled"])
         self.assertFalse(config["orchestrator"]["conductor_learning"]["trajectory_export"])
         self.assertFalse(config["orchestrator"]["skill_distillation"]["enabled"])
+        self.assertTrue(config["orchestrator"]["conductor"]["enabled"])
+        self.assertEqual(config["orchestrator"]["conductor"]["base_url"], "http://127.0.0.1:19002/v1")
+        self.assertEqual(config["orchestrator"]["conductor"]["model"], "comparison-local")
+        self.assertFalse(config["orchestrator"]["conductor"]["keep_warm"])
+        self.assertFalse(config["orchestrator"]["conductor"]["fallback_to_api"])
+        self.assertFalse(config["orchestrator"]["conductor"]["persist_sessions"])
+        self.assertFalse(config["orchestrator"]["conductor"]["kv_persist"])
         self.assertEqual(config["jarvis_path"], str(root / "fixture"))
         self.assertTrue({"web_search", "web_fetch"}.issubset(set(config["tools"]["require_approval"])))
 
@@ -834,7 +960,110 @@ class ProcessHarnessTests(unittest.TestCase):
             spawn.assert_not_called()
             self.assertFalse(out_dir.exists())
 
-            (server_dir / "index.ts").write_text('const BIND_TARGET = resolveBindTarget(PORT, "127.0.0.1");\n', encoding="utf-8")
+            (server_dir / "index.ts").write_text("const BIND_TARGET = resolveBindTarget(PORT, process.env.JARVIS_SERVER_HOST);\n", encoding="utf-8")
             self.assertEqual(runner.require_bun_loopback_bind(root), "127.0.0.1")
+
+    def test_wrong_reported_bun_health_bind_fails_before_capture(self):
+        from unittest.mock import patch
+
+        from scripts.direct_vs_orchestrated import runner
+
+        class FakeProcess:
+            next_pid = 1000
+
+            def __init__(self, *_args, **_kwargs):
+                self.pid = FakeProcess.next_pid
+                FakeProcess.next_pid += 1
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        def fake_readiness(url, _process, **kwargs):
+            parsed = runner.urllib.parse.urlsplit(url)
+            if parsed.path == "/v1/models":
+                return {"data": [{"id": kwargs["expected_alias"]}]}
+            if parsed.path == "/health" and parsed.port == ports["llama_cpp"]:
+                return {"status": "ok"}
+            if parsed.path == "/health":
+                return {"ok": True, "backend": "llama_cpp", "configured_model": "alias", "bind_host": "0.0.0.0"}
+            return {}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out_dir = root / "out"
+            out_dir.mkdir()
+            homes = out_dir / "homes"
+            for name in ("model", "direct", "orchestrated"):
+                (homes / name).mkdir(parents=True)
+            fixture_dir = out_dir / "fixture"
+            fixture_dir.mkdir()
+            fixture = fixture_dir / "stock.csv"
+            fixture.write_bytes(FIXTURE_PATH.read_bytes())
+            ports = {name: runner.allocate_loopback_port() for name in ("llama_cpp", "direct", "orchestrated")}
+            while len(set(ports.values())) != len(ports):
+                ports = {name: runner.allocate_loopback_port() for name in ("llama_cpp", "direct", "orchestrated")}
+            runner.ensure_loopback_ports_free(list(ports.values()))
+            model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
+            configs = runner.build_mode_configs(
+                isolated_home=homes,
+                workspace=fixture_dir,
+                llama_base_url=model_url,
+                served_alias="alias",
+                llama_server_path=root / "llama-server.exe",
+                model_path=root / "model.gguf",
+            )
+            manifest = {"processes": [], "readiness": []}
+            manifest_path = out_dir / "manifest.json"
+            manifest_path.write_text("{}\n", encoding="utf-8")
+            with patch.object(runner, "_wait_for_json", side_effect=fake_readiness):
+                with patch.object(runner, "capture_trial") as capture:
+                    with self.assertRaisesRegex(RuntimeError, "loopback"):
+                        runner._execute_campaign(
+                            out_dir=out_dir,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            tasks=load_tasks(),
+                            configs=configs,
+                            llama_argv=["llama-server.exe", "--host", "127.0.0.1"],
+                            bun_path=root / "bun.exe",
+                            repo_root=root,
+                            homes=homes,
+                            fixture_dir=fixture_dir,
+                            fixture_path=fixture,
+                            fixture_sha=runner.artifact_sha256(fixture),
+                            ports=ports,
+                            served_alias="alias",
+                            model_url=model_url,
+                            popen_factory=FakeProcess,
+                        )
+                    capture.assert_not_called()
+class ComparisonEvidenceContractTests(unittest.TestCase):
+    def test_frozen_corpus_matches_persisted_effective_generation_policy(self):
+        from scripts.direct_vs_orchestrated.runner import COMPARISON_GENERATION, _load_tasks
+        for task in _load_tasks():
+            self.assertEqual({key: task[key] for key in COMPARISON_GENERATION}, COMPARISON_GENERATION)
+
+    def test_metrics_cannot_hide_missing_orchestrated_tool_trace(self):
+        from scripts.direct_vs_orchestrated.runner import validate_trial_safety
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observation = {
+                "route_attempts": [{"provider": "llama_cpp", "model": "alias", "cloud": False}],
+                "orchestration_metrics": {"tool_calls": 1},
+                "tool_use_frames": [], "tool_result_frames": [],
+                "fixture_sha256_before": "fixture", "fixture_sha256_after": "fixture",
+            }
+            args = {"served_alias": "alias", "fixture_root": Path(temp_dir), "fixture_sha256": "fixture"}
+            self.assertIn("tool_trace_incomplete", validate_trial_safety(observation, **args))
+            observation["tool_use_frames"] = [{"id": "read", "name": "read_file", "input": {"path": "stock.csv"}}]
+            observation["tool_result_frames"] = [{"call_id": "read", "name": "read_file", "is_error": False}]
+            self.assertNotIn("tool_trace_incomplete", validate_trial_safety(observation, **args))
+
 if __name__ == "__main__":
     unittest.main()

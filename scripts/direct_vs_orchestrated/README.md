@@ -4,13 +4,15 @@ This harness runs a fixed, descriptive comparison of Jarvis direct chat and the 
 
 The sample is descriptive only. It does not establish general quality superiority. The harness does not start inference during development or tests.
 
-## Current startup gate
+The frozen corpus uses temperature 0, top-p 1, and a 4,096-token completion cap per model invocation. The explicit `comparison_generation` policy applies those values at the final Direct, orchestration-stage, and resident-conductor request boundaries. Normal Jarvis generation defaults remain unchanged when that policy is absent. The total per-turn time budget is 120 seconds; orchestration may make multiple capped model calls within it. All corpus tasks share the persisted policy so the resident conductor also uses the same settings.
 
-The runner inspects the checked-out Bun server source before creating the output directory or spawning a process. This branch currently resolves Bun's default bind to `0.0.0.0` and has no supported host override, so the runner refuses startup. Do not bypass that guard with an environment hint or an external proxy. A future comparison run requires a source version that binds the dedicated Bun children to loopback, plus a separately authorized run with explicit model and binary paths.
+## Startup gate
+
+Before creating the output directory or spawning a process, the runner requires the Bun entrypoint to pass `JARVIS_SERVER_HOST` into `resolveBindTarget`. Each child receives the exact value `127.0.0.1`; after startup, `/health.bind_host` must independently confirm an effective loopback bind before the runner reads `/config` or starts a capture. The server's normal default remains unchanged. The runner then checks the bare `/config` response for the intended Direct or Orchestrated mode, local llama.cpp endpoint and alias, and isolated resident-conductor settings.
 
 ## Invocation
 
-From the repository root in PowerShell, after the loopback-bind gate is supported and the local run is authorized:
+From the repository root in PowerShell, with explicit local model and binary paths:
 
 ```powershell
 python -m scripts.direct_vs_orchestrated.runner `
@@ -20,12 +22,15 @@ python -m scripts.direct_vs_orchestrated.runner `
   --bun 'C:\tools\bun\bun.exe'
 ```
 
-`--llama-server` and `--model` must be explicit files; the harness never searches model directories or reads the normal Jarvis home. `--out-dir` must be a new or empty directory. Bun is resolved from `PATH` if `--bun` is omitted; its resolved path and hash are recorded. Repeat `--llama-arg=<single-flag-or-flag=value>` only for non-network serving or hardware tuning options. The harness reserves the model, host, port, alias, and RPC flags so extra arguments cannot replace the isolated target.
+`--llama-server` and `--model` must be explicit files; the harness never searches model directories or reads the normal Jarvis home. `--out-dir` must be a new or empty directory. Bun is resolved from `PATH` if `--bun` is omitted; its resolved path and hash are recorded. Bun starts with `--no-env-file`, and the child environment contains only the runner's allowlisted values, so a checkout-level `repo.env` cannot add credentials or configuration.
+
+Repeat `--llama-arg=<flag-or-flag=value>` only for the runner's validated local tuning allowlist: GPU and CPU MoE layers, CPU threads, context/batch sizes, parallel slots, KV cache types, split mode, tensor split, reasoning budget, cache RAM, Flash Attention, Jinja prompt handling, and selected memory/batching flags. For example, `--llama-arg=--n-gpu-layers=99 --llama-arg=--threads=8 --llama-arg=--flash-attn=on`. Unknown flags and values are rejected. Model selectors (including Hugging Face and model URL forms), draft-model paths, host/port/alias options, RPC, and arbitrary environment assignments cannot be passed through.
 
 ## Isolation and stop behavior
 
-- The llama.cpp and Bun listeners use loopback ports selected by the harness. Occupied ports abort before spawn. The Bun source guard verifies that its actual bind is loopback.
-- Each Bun mode gets a separate temporary home, config file, port, and the same copied fixture. The two configs differ only in `orchestrator.enabled`.
+- The llama.cpp and Bun listeners use loopback ports selected by the harness. Occupied ports abort before spawn. The Bun source guard requires the explicit host override, and runtime `/health.bind_host` must verify loopback before capture.
+- Each Bun mode gets a separate temporary home, config file, port, and the same copied fixture. The two configs differ only in `orchestrator.enabled`. Both point the resident conductor to the isolated llama.cpp endpoint and alias, keep it enabled for on-demand orchestrated use, and set `keep_warm`, API fallback, and session/KV persistence off. Startup warm-up therefore cannot pre-load or periodically query the model.
+- Every capture request carries the full mode-specific config; only the task's `max_tokens`, `temperature`, and `top_p` fields override it. This preserves the isolated backend, alias, mode, and disabled cloud/learning settings when the server resolves a request config.
 - Child environments are allowlisted. Cloud credentials and proxy variables are omitted; cloud helpers, session memory, learning, trajectory export, distillation, and Claude CLI are disabled in the comparison config.
 - SSE and readiness requests use a proxy-free opener that refuses redirects. The capture worker only accepts loopback HTTP.
 - A trial stops the campaign if observed routing leaves the local llama.cpp alias, a web tool is attempted, a tool path escapes the fixture directory, the fixture changes, or cancellation cannot be confirmed and settled. The triggering trial and its safety reason remain in the output.

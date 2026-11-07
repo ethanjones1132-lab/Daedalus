@@ -111,6 +111,11 @@ export function toApiTools(
 
 // ── Execution Context ─────────────────────────────────────────────────────────
 
+/** A non-authoritative orchestration diagnostic about one tool call. */
+export type ToolTraceObservation =
+  | { kind: "use"; call: ToolCall }
+  | { kind: "result"; call: ToolCall; result: ToolResult };
+
 export interface ExecutionContext {
   /** Which surface is invoking the tool. */
   surface: "chat" | "agent" | "cron" | "mcp";
@@ -166,6 +171,12 @@ export interface ExecutionContext {
    * stream to record bounded runtime evidence for the native memory receipt.
    */
   onToolResult?: (call: ToolCall, result: ToolResult) => void;
+  /**
+   * Optional orchestration-only trace for attempted and completed calls,
+   * including policy denials and cache/suppression results. Diagnostics must
+   * not alter permission decisions or tool outcomes.
+   */
+  onToolTrace?: (observation: ToolTraceObservation) => void | Promise<void>;
 }
 
 /**

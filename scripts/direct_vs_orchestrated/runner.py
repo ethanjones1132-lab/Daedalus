@@ -23,11 +23,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
-from .sse_capture import _cancel_session
+from .sse_capture import _cancel_session, validate_runtime_config
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parents[1]
 FIXTURE_SOURCE = PACKAGE_ROOT / "fixtures" / "stock.csv"
+COMPARISON_GENERATION = {"max_tokens": 4096, "temperature": 0, "top_p": 1}
 CLOUD_SECRET_NAMES = {
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "AZURE_OPENAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY",
@@ -141,6 +142,7 @@ def child_env(home: Path, *, port: int, workspace: Path) -> dict[str, str]:
     }
     env.update({key: str(value) for key, value in path_values.items()})
     env["JARVIS_SERVER_PORT"] = str(port)
+    env["JARVIS_SERVER_HOST"] = "127.0.0.1"
     env["JARVIS_WORKSPACE"] = str(isolated_workspace)
     for secret in CLOUD_SECRET_NAMES:
         env.pop(secret, None)
@@ -177,13 +179,70 @@ def allocate_loopback_port() -> int:
 
 
 def validate_llama_extra_args(arguments: Sequence[str]) -> list[str]:
-    """Keep caller tuning flags from overriding the isolated server identity."""
-    reserved = {"--host", "--port", "--model", "-m", "--alias", "--rpc"}
+    """Allow a small, validated set of local inference tuning options only."""
+    value_options: dict[str, tuple[str, int, int] | tuple[str, str]] = {
+        "--n-gpu-layers": ("int", 0, 256), "-ngl": ("int", 0, 256),
+        "--threads": ("int", 1, 1024), "-t": ("int", 1, 1024),
+        "--threads-batch": ("int", 1, 1024), "-tb": ("int", 1, 1024),
+        "--n-cpu-moe": ("int", 0, 256),
+        "--ctx-size": ("int", 1, 2_097_152), "-c": ("int", 1, 2_097_152),
+        "--batch-size": ("int", 1, 2_097_152), "-b": ("int", 1, 2_097_152),
+        "--ubatch-size": ("int", 1, 2_097_152), "-ub": ("int", 1, 2_097_152),
+        "--parallel": ("int", 1, 256), "-np": ("int", 1, 256),
+        "--reasoning-budget": ("int", 0, 32_768),
+        "--cache-ram": ("int", 0, 16_384),
+        "--flash-attn": ("enum", "on,off,auto"), "-fa": ("enum", "on,off,auto"),
+        "--cache-type-k": ("enum", "f16,bf16,q8_0,q5_0,q5_1,q4_0,q4_1"),
+        "-ctk": ("enum", "f16,bf16,q8_0,q5_0,q5_1,q4_0,q4_1"),
+        "--cache-type-v": ("enum", "f16,bf16,q8_0,q5_0,q5_1,q4_0,q4_1"),
+        "-ctv": ("enum", "f16,bf16,q8_0,q5_0,q5_1,q4_0,q4_1"),
+        "--split-mode": ("enum", "none,layer,row"), "-sm": ("enum", "none,layer,row"),
+        "--tensor-split": ("tensor-split", ""),
+    }
+    flag_options = {
+        "--mlock", "--no-mmap", "--no-cont-batching", "--cont-batching",
+        "--no-warmup", "--jinja", "--no-webui",
+    }
     values = [str(argument) for argument in arguments]
-    for value in values:
-        option = value.split("=", 1)[0].casefold()
-        if option in reserved:
-            raise ValueError(f"llama-server argument {option} is reserved by the local comparison harness")
+    index = 0
+    while index < len(values):
+        argument = values[index]
+        option_text, separator, inline_value = argument.partition("=")
+        option = option_text
+        if option in flag_options and not separator:
+            index += 1
+            continue
+        if option not in value_options:
+            raise ValueError(f"llama-server argument {option} is not an allowlisted local tuning option")
+        if separator:
+            value = inline_value
+            index += 1
+        else:
+            if index + 1 >= len(values):
+                raise ValueError(f"llama-server tuning option {option} requires a value")
+            value = values[index + 1]
+            index += 2
+        if not value or value.startswith("--"):
+            raise ValueError(f"invalid value for llama-server tuning option {option}")
+        kind, *bounds = value_options[option]
+        if kind == "int":
+            if not re.fullmatch(r"[0-9]+", value):
+                raise ValueError(f"invalid integer value for llama-server tuning option {option}")
+            number = int(value)
+            minimum, maximum = bounds
+            if not minimum <= number <= maximum:
+                raise ValueError(f"value for llama-server tuning option {option} is out of range")
+        elif kind == "enum":
+            allowed = set(str(bounds[0]).split(","))
+            if value not in allowed:
+                raise ValueError(f"invalid value for llama-server tuning option {option}")
+        elif kind == "tensor-split":
+            if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:,(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))*", value):
+                raise ValueError(f"invalid value for llama-server tuning option {option}")
+            if not any(float(part) > 0 for part in value.split(",")):
+                raise ValueError(f"invalid value for llama-server tuning option {option}")
+    if any("\0" in value for value in values):
+        raise ValueError("llama-server arguments cannot contain NUL bytes")
     return values
 
 
@@ -251,16 +310,23 @@ def _loopback_host(host: str) -> bool:
 
 
 def require_bun_loopback_bind(repo_root: Path | str) -> str:
-    """Confirm the current Bun source binds to loopback; refuse broad binds."""
+    """Require a known loopback override path; runtime health confirms its value."""
     root = Path(repo_root).resolve(strict=True)
     index_source = (root / "server-jarvis" / "src" / "index.ts").read_text(encoding="utf-8")
     guards_source = (root / "server-jarvis" / "src" / "server-guards.ts").read_text(encoding="utf-8")
-    call = re.search(r"resolveBindTarget\(\s*PORT\s*(?:,\s*(['\"])(.*?)\1)?\s*\)", index_source)
+    call = re.search(r"resolveBindTarget\(\s*PORT(?:\s*,\s*([^)]*?))?\s*\)", index_source)
     if not call:
         raise RuntimeError("cannot verify that the Bun server binds to loopback")
-    explicit_host = call.group(2)
-    if explicit_host is not None:
-        host = explicit_host
+    host_argument = (call.group(1) or "").strip()
+    if host_argument == "process.env.JARVIS_SERVER_HOST":
+        # child_env supplies this exact value; /health must confirm the actual
+        # listener address before a capture can begin.
+        host = "127.0.0.1"
+    elif host_argument:
+        literal = re.fullmatch(r"(['\"])(.*?)\1", host_argument)
+        if not literal:
+            raise RuntimeError("cannot verify that the Bun server binds to loopback")
+        host = literal.group(2)
     else:
         default = re.search(r"DEFAULT_BIND_HOSTNAME\s*=\s*(['\"])(.*?)\1", guards_source)
         if not default:
@@ -271,6 +337,42 @@ def require_bun_loopback_bind(repo_root: Path | str) -> str:
             f"Bun source binds to {host}; the comparison requires a loopback-only bind and refuses to start it"
         )
     return "127.0.0.1" if host.lower() == "localhost" else host
+
+
+def _assert_bun_loopback_health(response: dict[str, Any]) -> None:
+    host = response.get("bind_host")
+    if not isinstance(host, str) or not _loopback_host(host):
+        raise RuntimeError("Bun /health did not confirm an effective loopback bind host")
+
+
+def _assert_runtime_config(
+    response: dict[str, Any],
+    *,
+    expected: dict[str, Any],
+    mode: str,
+    model_url: str,
+    served_alias: str,
+) -> None:
+    """Check the bare /config payload against the intended isolated runtime."""
+    expected_enabled = expected["orchestrator"]["enabled"]
+    actual_orchestrator = response.get("orchestrator")
+    actual_llama = response.get("llama_cpp")
+    if response.get("active_backend") != "llama_cpp":
+        raise RuntimeError(f"{mode} Bun /config did not confirm the local llama.cpp backend")
+    if not isinstance(actual_orchestrator, dict) or actual_orchestrator.get("enabled") is not expected_enabled:
+        raise RuntimeError(f"{mode} Bun /config did not confirm the intended orchestration mode")
+    if not isinstance(actual_llama, dict) or actual_llama.get("base_url") != model_url or actual_llama.get("model") != served_alias:
+        raise RuntimeError(f"{mode} Bun /config did not confirm the isolated llama.cpp target")
+    expected_conductor = expected["orchestrator"]["conductor"]
+    actual_conductor = actual_orchestrator.get("conductor")
+    if not isinstance(actual_conductor, dict):
+        raise RuntimeError(f"{mode} Bun /config did not confirm the isolated resident conductor")
+    for key in (
+        "enabled", "base_url", "model", "fallback_model", "keep_warm",
+        "fallback_to_api", "persist_sessions", "kv_persist", "kv_backend",
+    ):
+        if actual_conductor.get(key) != expected_conductor.get(key):
+            raise RuntimeError(f"{mode} Bun /config did not confirm the isolated conductor {key}")
 
 
 def build_mode_configs(
@@ -296,6 +398,7 @@ def build_mode_configs(
 
     base: dict[str, Any] = {
         "active_backend": "llama_cpp",
+        "comparison_generation": dict(COMPARISON_GENERATION),
         "llama_cpp": {
             "base_url": base_url,
             "model": served_alias,
@@ -329,6 +432,17 @@ def build_mode_configs(
             "session_memory": {"enabled": False},
             "conductor_learning": {"enabled": False, "trajectory_export": False},
             "skill_distillation": {"enabled": False},
+            "conductor": {
+                "enabled": True,
+                "base_url": base_url,
+                "model": served_alias,
+                "fallback_model": "",
+                "fallback_to_api": False,
+                "keep_warm": False,
+                "persist_sessions": False,
+                "kv_persist": False,
+                "kv_backend": "llama_cpp",
+            },
         },
     }
     direct = copy.deepcopy(base)
@@ -386,7 +500,18 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
         raise urllib.error.URLError("redirect blocked for local readiness probe")
 
 
-def _wait_for_json(url: str, process: subprocess.Popen, *, timeout_s: float, expected_alias: str | None = None) -> dict[str, Any]:
+def _wait_for_json(
+    url: str,
+    process: subprocess.Popen,
+    *,
+    timeout_s: float,
+    readiness_kind: str,
+    expected_alias: str | None = None,
+) -> dict[str, Any]:
+    if readiness_kind not in {"health", "config", "models"}:
+        raise ValueError(f"unsupported readiness response kind: {readiness_kind}")
+    if readiness_kind == "models" and not expected_alias:
+        raise ValueError("models readiness requires the expected serving alias")
     deadline = time.monotonic() + timeout_s
     last_error = "not yet ready"
     while time.monotonic() < deadline:
@@ -395,15 +520,25 @@ def _wait_for_json(url: str, process: subprocess.Popen, *, timeout_s: float, exp
             raise RuntimeError(f"owned process {process.pid} exited before readiness (code {code})")
         try:
             body = _local_json_request(url, timeout=1.0)
-            if expected_alias is not None:
+            if readiness_kind == "models":
                 models = body.get("data")
                 if isinstance(models, list) and any(isinstance(model, dict) and model.get("id") == expected_alias for model in models):
                     return body
                 last_error = "served alias not present in /v1/models"
-            elif body.get("ok") is True or body.get("status") == "ok":
-                return body
+            elif readiness_kind == "health":
+                has_error = body.get("error") not in (None, "", False)
+                status_conflict = "status" in body and body.get("status") != "ok"
+                if not has_error and not status_conflict and (body.get("ok") is True or body.get("status") == "ok"):
+                    return body
+                last_error = "health response did not report a clean ok status"
+            elif readiness_kind == "config":
+                has_error = body.get("error") not in (None, "", False)
+                status_conflict = "status" in body and body.get("status") != "ok"
+                if not has_error and not status_conflict and body.get("ok") is not False and isinstance(body.get("active_backend"), str) and isinstance(body.get("orchestrator"), dict) and isinstance(body.get("llama_cpp"), dict):
+                    return body
+                last_error = "config response did not contain a clean bare configuration"
             else:
-                last_error = "health response did not report ok=true"
+                last_error = f"{readiness_kind} response did not satisfy its readiness contract"
         except (OSError, ValueError, urllib.error.URLError) as exc:
             last_error = type(exc).__name__
         time.sleep(0.2)
@@ -497,6 +632,9 @@ def _load_tasks() -> list[dict[str, Any]]:
     tasks = payload.get("tasks") if isinstance(payload, dict) else None
     if not isinstance(tasks, list) or len(tasks) != 4:
         raise ValueError("the frozen comparison corpus must contain exactly four tasks")
+    for task in tasks:
+        if not isinstance(task, dict) or any(task.get(key) != value for key, value in COMPARISON_GENERATION.items()):
+            raise ValueError("all frozen tasks must match the persisted comparison generation policy")
     return tasks
 
 
@@ -640,6 +778,10 @@ def validate_trial_safety(
 
     uses = observation.get("tool_use_frames")
     results = observation.get("tool_result_frames")
+    metrics = observation.get("orchestration_metrics")
+    reported_calls = metrics.get("tool_calls") if isinstance(metrics, dict) else None
+    if isinstance(reported_calls, int) and not isinstance(reported_calls, bool) and reported_calls > (len(uses) if isinstance(uses, list) else 0):
+        reasons.append("tool_trace_incomplete")
     if isinstance(uses, list) and isinstance(results, list):
         use_ids = [_tool_call_id(item) for item in uses if isinstance(item, dict)]
         result_ids = [_tool_call_id(item) for item in results if isinstance(item, dict)]
@@ -870,6 +1012,7 @@ def _run_capture_worker(
     base_url: str,
     session_id: str,
     task: dict[str, Any],
+    runtime_config: dict[str, Any],
     wall_cap_ms: int,
     out_path: Path,
     worker_home: Path,
@@ -881,11 +1024,14 @@ def _run_capture_worker(
     """Run one capture worker under a parent deadline that includes process spawn."""
     task_path = out_path.with_suffix(".task.json")
     _write_json(task_path, task)
+    runtime_config_path = Path(worker_home) / ".openclaw" / "jarvis" / "capture-runtime-config.json"
+    _write_json(runtime_config_path, validate_runtime_config(runtime_config))
     command = [
         sys.executable, "-m", "scripts.direct_vs_orchestrated.capture_worker",
         "--base-url", base_url,
         "--session-id", session_id,
         "--task-json", str(task_path),
+        "--config-json", str(runtime_config_path),
         "--out", str(out_path),
         "--wall-cap-ms", str(wall_cap_ms),
     ]
@@ -1041,7 +1187,7 @@ def _execute_campaign(
     _atomic_write_json(manifest_path, manifest)
     task_by_id = {task["id"]: task for task in tasks}
     server_root = repo_root / "server-jarvis"
-    bun_argv = [str(bun_path), "run", "src/index.ts"]
+    bun_argv = [str(bun_path), "run", "--no-env-file", "src/index.ts"]
     bun_commands = [bun_argv, bun_argv]
     bun_modes = ["direct", "orchestrated"]
     bun_envs = [
@@ -1090,11 +1236,17 @@ def _execute_campaign(
         ))
         process = processes[0]
         process_row = record_process(f"llama_cpp_{generation}", process, llama_argv, homes / "model")
-        health = _wait_for_json(f"http://127.0.0.1:{ports['llama_cpp']}/health", process, timeout_s=120.0)
+        health = _wait_for_json(
+            f"http://127.0.0.1:{ports['llama_cpp']}/health",
+            process,
+            timeout_s=120.0,
+            readiness_kind="health",
+        )
         model_list = _wait_for_json(
             f"http://127.0.0.1:{ports['llama_cpp']}/v1/models",
             process,
             timeout_s=5.0,
+            readiness_kind="models",
             expected_alias=served_alias,
         )
         ready_ms = round((time.monotonic() - ready_started) * 1000, 3)
@@ -1119,6 +1271,7 @@ def _execute_campaign(
         def launch_worker(**kwargs):
             return _run_capture_worker(
                 **kwargs,
+                runtime_config=configs[mode],
                 worker_home=homes / mode,
                 port=ports[mode],
                 workspace=fixture_dir,
@@ -1253,21 +1406,32 @@ def _execute_campaign(
                     bun_modes, bun_processes, bun_commands, bun_cwds, (ports["direct"], ports["orchestrated"]),
                 ):
                     bun_rows.append(record_process(f"bun_{mode}", process, command, working_dir))
-                    health = _wait_for_json(f"http://127.0.0.1:{port}/health", process, timeout_s=30.0)
-                    config_response = _wait_for_json(f"http://127.0.0.1:{port}/config", process, timeout_s=5.0)
-                    expected_enabled = configs[mode]["orchestrator"]["enabled"]
+                    health = _wait_for_json(
+                        f"http://127.0.0.1:{port}/health",
+                        process,
+                        timeout_s=30.0,
+                        readiness_kind="health",
+                    )
+                    _assert_bun_loopback_health(health)
                     if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
                         raise RuntimeError(f"{mode} Bun health did not confirm the expected local backend and alias")
-                    actual_orchestrator = config_response.get("orchestrator")
-                    actual_llama = config_response.get("llama_cpp")
-                    if not isinstance(actual_orchestrator, dict) or actual_orchestrator.get("enabled") is not expected_enabled:
-                        raise RuntimeError(f"{mode} Bun /config did not confirm the intended orchestration mode")
-                    if not isinstance(actual_llama, dict) or actual_llama.get("base_url") != model_url or actual_llama.get("model") != served_alias:
-                        raise RuntimeError(f"{mode} Bun /config did not confirm the isolated llama.cpp target")
+                    config_response = _wait_for_json(
+                        f"http://127.0.0.1:{port}/config",
+                        process,
+                        timeout_s=5.0,
+                        readiness_kind="config",
+                    )
+                    _assert_runtime_config(
+                        config_response,
+                        expected=configs[mode],
+                        mode=mode,
+                        model_url=model_url,
+                        served_alias=served_alias,
+                    )
                     readiness.append({
                         "component": f"bun_{mode}",
                         "status": "ready",
-                        "health": {key: health.get(key) for key in ("ok", "backend", "model", "configured_model", "git_sha", "source_tree_sha256")},
+                        "health": {key: health.get(key) for key in ("ok", "backend", "model", "configured_model", "bind_host", "git_sha", "source_tree_sha256")},
                         "effective_config_redacted": redact_config(config_response),
                         "effective_config_fingerprint": _fingerprint(redact_config(config_response)),
                     })
@@ -1319,10 +1483,10 @@ def _execute_campaign(
 def run_comparison(args: argparse.Namespace) -> Path:
     """Start only owned loopback processes, validate readiness, then clean up."""
     repo_root = REPO_ROOT.resolve(strict=True)
-    # This guard is deliberately before directory creation and before Popen.
-    # The current source binds 0.0.0.0, so a caller must first use a source
-    # version with a real loopback bind. An ignored environment hint is not
-    # sufficient evidence of the actual socket address.
+    # This guard recognizes only the server's explicit allowlisted host override
+    # or an explicit loopback source bind. The child environment below pins the
+    # override, then /health must report the actual loopback address before any
+    # capture begins.
     require_bun_loopback_bind(repo_root)
 
     llama_server = _require_explicit_file(getattr(args, "llama_server", None), "llama-server")
@@ -1357,7 +1521,7 @@ def run_comparison(args: argparse.Namespace) -> Path:
         ports = {"llama_cpp": allocate_loopback_port(), "direct": allocate_loopback_port(), "orchestrated": allocate_loopback_port()}
     ensure_loopback_ports_free(list(ports.values()))
     model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
-    bun_model_argv = [str(bun_path), "run", "src/index.ts"]
+    bun_model_argv = [str(bun_path), "run", "--no-env-file", "src/index.ts"]
     llama_argv = [
         str(llama_server), "--model", str(model_path), "--host", "127.0.0.1",
         "--port", str(ports["llama_cpp"]), "--alias", served_alias, *llama_extra,
@@ -1393,6 +1557,7 @@ def run_comparison(args: argparse.Namespace) -> Path:
         "llama_argv_redacted": _redact_argv(llama_argv),
         "bun_argv_redacted": _redact_argv(bun_model_argv),
         "generation_defaults": {task["id"]: {key: task[key] for key in ("max_tokens", "temperature", "top_p")} for task in tasks},
+        "generation_policy": {"source": "comparison_generation", "completion_cap_scope": "per_model_invocation", **COMPARISON_GENERATION},
         "mode_config_fingerprints": fingerprints,
         "ports": ports,
         "fixture_path": str(fixture_path),

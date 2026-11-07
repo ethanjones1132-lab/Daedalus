@@ -244,7 +244,7 @@ def _provenance(manifest: dict[str, Any]) -> dict[str, Any]:
         "source_inventory_complete", "llama_server_path", "llama_server_sha256",
         "gguf_path", "gguf_sha256", "served_alias", "llama_argv_redacted",
         "bun_path", "bun_sha256", "bun_argv_redacted", "hardware",
-        "generation_defaults", "mode_config_fingerprints", "ports", "readiness",
+        "generation_defaults", "generation_policy", "mode_config_fingerprints", "ports", "readiness",
     )
     return {key: _redact(manifest[key]) for key in keys if key in manifest}
 
@@ -263,6 +263,7 @@ def build_report(
         "# Direct vs Orchestrated Comparison",
         "",
         "**This is a small, descriptive-only comparison. It does not establish general quality superiority.**",
+        "Attempt counts describe emitted route records. Native-conductor calls without per-attempt SSE are not included in those counts; wall time includes their work. Treat recorded attempt counts as observed counts rather than a complete inference-call total.",
         "",
         f"Run status: **{_clean(manifest.get('run_status'))}**. "
         f"Observed: {counts['warm']} warm, {counts['process_cold']} process-cold, "

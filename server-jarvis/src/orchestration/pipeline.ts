@@ -13,7 +13,7 @@ import {
 import { runBuildCheck, writtenPathsFrom } from "./build-check";
 import { ensureVerificationWorkspaceCached } from "./verification-workspace";
 import { BUILTIN_MODES, executorTurnLimit, getToolsForMode } from "./modes";
-import { toolResultModelText, type ToolRuntime, type ExecutionContext } from "../tool-runtime";
+import { toolResultModelText, type ToolRuntime, type ExecutionContext, type ToolTraceObservation } from "../tool-runtime";
 import type { CallModelFn, ChatMessage } from "./router";
 import type { SharedContextHints, StageName, WorkerInstructions } from "./coordinator";
 import type { SessionMemory } from "./session-memory";
@@ -1521,6 +1521,9 @@ export class PipelineExecutor {
       const call = parseStreamedToolCall(raw);
       return { raw, call, name: call.name };
     });
+    for (const { call } of parsed) {
+      this.publishToolTrace({ kind: "use", call });
+    }
     const readOnlyOutputCache = duplicateReadOnlyOutputs;
     const cacheInvalidatingTools = new Set([
       ...WRITE_EFFECT_TOOLS,
@@ -1573,7 +1576,7 @@ export class PipelineExecutor {
               };
             }
             readOnlyOutputCache.set(duplicateKey, { output: "", truncated: false });
-            const result = await this.runToolCall(entry.raw, options);
+            const result = await this.runToolCall(entry.raw, options, entry.call);
             const text = toolResultModelText(result);
             const truncated = result.is_error
               ? false
@@ -1581,11 +1584,12 @@ export class PipelineExecutor {
             readOnlyOutputCache.set(duplicateKey, { output: text, truncated });
             return { entry, result, duplicateKey, deflected: false };
           }
-          const result = await this.runToolCall(entry.raw, options);
+          const result = await this.runToolCall(entry.raw, options, entry.call);
           return { entry, result, duplicateKey: undefined, deflected: false };
         }),
       );
       for (const { entry, result } of settled) {
+        this.publishToolTrace({ kind: "result", call: entry.call, result });
         this.conductor?.live?.onToolResult?.(
           stage,
           entry.call.name,
@@ -1612,14 +1616,38 @@ export class PipelineExecutor {
     }
   }
 
-  private async runToolCall(raw: any, options: PipelineExecuteOptions): Promise<ToolResult> {
-    const call = parseStreamedToolCall(raw);
+  private publishToolTrace(observation: ToolTraceObservation): void {
+    try {
+      const pending = this.ctx.onToolTrace?.(observation);
+      if (pending && typeof (pending as Promise<void>).then === "function") {
+        void Promise.resolve(pending).catch(() => {});
+      }
+    } catch {
+      // Diagnostics are observational only and cannot affect tool execution.
+    }
+  }
+
+  private async runToolCall(
+    raw: any,
+    options: PipelineExecuteOptions,
+    normalizedCall?: ToolCall,
+  ): Promise<ToolResult> {
+    const parsedCall = normalizedCall ?? parseStreamedToolCall(raw);
+    // The dispatcher already assigned a stable ID to a batch entry. Reuse it
+    // for execution, but copy the argument object because write preflight may
+    // normalize it in place.
+    const call: ToolCall = { ...parsedCall, arguments: { ...parsedCall.arguments } };
+    this.publishToolTrace({ kind: "use", call });
+    const traceResult = (result: ToolResult): ToolResult => {
+      this.publishToolTrace({ kind: "result", call, result });
+      return result;
+    };
     const sessionId = this.ctx.session_id;
     const memory = options.sessionMemory;
 
     const scopeViolation = workspaceReadScopeViolation(call, options.workspaceReadScope);
     if (scopeViolation) {
-      return {
+      return traceResult({
         call_id: call.id,
         name: call.name,
         output: `Scope denied: ${scopeViolation}`,
@@ -1627,7 +1655,7 @@ export class PipelineExecutor {
         error: scopeViolation,
         error_code: "policy_denied",
         duration_ms: 0,
-      };
+      });
     }
 
     if (memory && sessionId && READ_CACHE_TOOLS.has(call.name)) {
@@ -1642,13 +1670,13 @@ export class PipelineExecutor {
           this.ctx.workspace_path,
         );
         if (cached) {
-          return {
+          return traceResult({
             call_id: call.id,
             name: call.name,
             output: cached,
             is_error: false,
             duration_ms: 0,
-          };
+          });
         }
       }
     }
@@ -1658,7 +1686,7 @@ export class PipelineExecutor {
     if (WRITE_EFFECT_TOOL_NAMES.has(call.name)) {
       const preflighted = await this.preflightWriteEffectCall(call);
       if (preflighted.blocked) {
-        return preflighted.result;
+        return traceResult(preflighted.result);
       }
       if (preflighted.call) {
         Object.assign(call, preflighted.call);
@@ -1675,7 +1703,7 @@ export class PipelineExecutor {
         workspacePath: this.ctx.workspace_path,
       });
     }
-    return result;
+    return traceResult(result);
   }
 
   /**

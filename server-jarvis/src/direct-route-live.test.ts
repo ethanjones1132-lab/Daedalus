@@ -16,8 +16,11 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
       return Response.json({ data: [{ id: alias }] });
     }
     if (req.method !== "POST") return Response.json({ status: "ok" });
-    const body = await req.json() as { model: string };
+    const body = await req.json() as { model: string; max_tokens: number; temperature: number; top_p: number };
     expect(body.model).toBe(alias);
+    expect(body.max_tokens).toBe(16);
+    expect(body.temperature).toBe(0);
+    expect(body.top_p).toBe(1);
     requests++;
     if (behavior === "failure") return new Response("controlled fixture failure", { status: 500 });
     if (behavior === "stall") {
@@ -45,6 +48,7 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
       probe.stop(true);
       writeFileSync(join(configDir, "config.json"), JSON.stringify({
         active_backend: "llama_cpp", jarvis_path: home,
+        comparison_generation: { max_tokens: 16, temperature: 0, top_p: 1 },
         llama_cpp: { base_url: `http://127.0.0.1:${model.port}/v1`, model: alias },
         claude_cli: { enabled: false }, tools: { enabled: false },
         orchestrator: { enabled: orchestrated, allow_cloud_helpers: false, agents: [],
