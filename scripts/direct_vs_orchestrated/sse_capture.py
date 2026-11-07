@@ -6,6 +6,7 @@ import ipaddress
 import json
 import math
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -270,20 +271,55 @@ def _open_local(request: urllib.request.Request, *, timeout: float):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirectHandler())
     return opener.open(request, timeout=timeout)
 
-def _cancel_session(base_url: str, session_id: str, *, timeout_s: float = 5.0) -> bool:
-    endpoint = _local_endpoint(base_url, "chat/cancel")
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps({"session_id": session_id}, separators=(",", ":")).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    try:
-        with _open_local(request, timeout=timeout_s) as response:
-            payload = json.loads(response.read(16_384).decode("utf-8"))
-        return isinstance(payload, dict) and payload.get("cancelled") is True
-    except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+def _cancel_session(
+    base_url: str,
+    session_id: str,
+    *,
+    timeout_s: float = 5.0,
+    deadline_mono: float | None = None,
+) -> bool:
+    """Request cancellation, bounding the whole HTTP operation by a monotonic deadline.
+
+    urllib's timeout is a socket inactivity timeout and can be extended by a
+    slow-drip response. The daemon worker lets the caller stop waiting at the
+    absolute deadline; its owning server/process is then stopped by the runner.
+    """
+    if deadline_mono is None:
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            return False
+        deadline_mono = time.monotonic() + timeout_s
+    elif not math.isfinite(deadline_mono):
         return False
+
+    outcome: list[bool] = []
+
+    def request_cancel() -> None:
+        try:
+            timeout = deadline_mono - time.monotonic()
+            if timeout <= 0:
+                outcome.append(False)
+                return
+            endpoint = _local_endpoint(base_url, "chat/cancel")
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps({"session_id": session_id}, separators=(",", ":")).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            with _open_local(request, timeout=timeout) as response:
+                payload = json.loads(response.read(16_384).decode("utf-8"))
+            outcome.append(isinstance(payload, dict) and payload.get("cancelled") is True)
+        except (OSError, TimeoutError, ValueError, urllib.error.URLError):
+            outcome.append(False)
+
+    worker = threading.Thread(target=request_cancel, name="jarvis-session-cancel", daemon=True)
+    worker.start()
+    while worker.is_alive():
+        remaining = deadline_mono - time.monotonic()
+        if remaining <= 0:
+            return False
+        worker.join(remaining)
+    return bool(outcome and outcome[0])
 
 
 def capture_turn(

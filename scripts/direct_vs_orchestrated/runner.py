@@ -580,6 +580,14 @@ def _route_records(observation: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def _tool_call_id(frame: dict[str, Any]) -> str | None:
+    for key in ("id", "call_id"):
+        value = frame.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _path_fields(value: Any) -> Iterator[str]:
     path_keys = {"path", "paths", "file", "files", "file_path", "filepath", "directory", "directories", "dir", "root", "cwd"}
     if isinstance(value, dict):
@@ -633,9 +641,13 @@ def validate_trial_safety(
     uses = observation.get("tool_use_frames")
     results = observation.get("tool_result_frames")
     if isinstance(uses, list) and isinstance(results, list):
-        use_ids = [item.get("id", item.get("call_id")) for item in uses if isinstance(item, dict)]
-        result_ids = [item.get("call_id", item.get("id")) for item in results if isinstance(item, dict)]
-        if len(uses) != len(results) or (all(use_ids) and all(result_ids) and sorted(use_ids) != sorted(result_ids)):
+        use_ids = [_tool_call_id(item) for item in uses if isinstance(item, dict)]
+        result_ids = [_tool_call_id(item) for item in results if isinstance(item, dict)]
+        if len(uses) != len(results):
+            reasons.append("tool_trace_mismatch")
+        elif len(use_ids) != len(uses) or len(result_ids) != len(results) or any(not value for value in [*use_ids, *result_ids]):
+            reasons.append("tool_trace_identity_missing")
+        elif sorted(use_ids) != sorted(result_ids):
             reasons.append("tool_trace_mismatch")
     for use in uses if isinstance(uses, list) else []:
         if not isinstance(use, dict):
@@ -751,18 +763,27 @@ def _successful_named_tool_calls(observation: dict[str, Any], tool_name: str) ->
     results = observation.get("tool_result_frames")
     if not isinstance(uses, list) or not isinstance(results, list):
         return None
-    successful_results = {
-        result.get("call_id", result.get("id"))
-        for result in results
-        if isinstance(result, dict) and result.get("is_error") is False
-    }
-    if any(not isinstance(result, dict) or result.get("is_error") not in {True, False} for result in results):
+    use_ids = [_tool_call_id(use) for use in uses if isinstance(use, dict)]
+    result_ids = [_tool_call_id(result) for result in results if isinstance(result, dict)]
+    if (
+        len(uses) != len(results)
+        or len(use_ids) != len(uses)
+        or len(result_ids) != len(results)
+        or any(not value for value in [*use_ids, *result_ids])
+        or sorted(use_ids) != sorted(result_ids)
+        or any(not isinstance(result, dict) or result.get("is_error") not in {True, False} for result in results)
+    ):
         return None
+    successful_results = {
+        _tool_call_id(result)
+        for result in results
+        if result.get("is_error") is False
+    }
     return sum(
         1 for use in uses
         if isinstance(use, dict)
         and use.get("name") == tool_name
-        and use.get("id", use.get("call_id")) in successful_results
+        and _tool_call_id(use) in successful_results
     )
 
 
@@ -887,11 +908,7 @@ def _run_capture_worker(
             stdout, _stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             cancellation_deadline = time.monotonic() + 5.0
-            cancel_confirmed = _cancel_session(
-                base_url,
-                session_id,
-                timeout_s=max(0.0, cancellation_deadline - time.monotonic()),
-            )
+            cancel_confirmed = _cancel_session(base_url, session_id, deadline_mono=cancellation_deadline)
             settled = False
             stdout = b""
             if cancel_confirmed:

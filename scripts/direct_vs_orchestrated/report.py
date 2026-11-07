@@ -162,7 +162,10 @@ def _trial_row(observation: dict[str, Any]) -> str:
 def _pair_delta(direct: dict[str, Any] | None, orchestrated: dict[str, Any] | None) -> str:
     if not direct or not orchestrated:
         return "incomplete pair"
-    if direct.get("outcome") != "success" or orchestrated.get("outcome") != "success":
+    if any(
+        row.get("outcome") != "success" or row.get("trial_status") not in (None, "success")
+        for row in (direct, orchestrated)
+    ):
         return "not comparable (failure retained)"
     direct_ms = _number(direct.get("total_wall_ms"))
     orchestrated_ms = _number(orchestrated.get("total_wall_ms"))

@@ -265,6 +265,39 @@ class CaptureTimeoutTests(unittest.TestCase):
         self.assertEqual(records[0]["frame"]["type"], "stream_event")
         self.assertEqual(requests[1].full_url, "http://127.0.0.1:19877/chat/cancel")
         self.assertEqual(json.loads(requests[1].data.decode("utf-8")), {"session_id": "session-timeout"})
+
+    def test_cancel_session_has_a_total_deadline_for_slow_drip_response(self):
+        import threading
+        import time
+        from unittest.mock import patch
+
+        from scripts.direct_vs_orchestrated.sse_capture import _cancel_session
+
+        finished = threading.Event()
+
+        class SlowDripResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                chunks = []
+                for chunk in (b'{"cancelled":', b' true', b'}'):
+                    time.sleep(0.06)
+                    chunks.append(chunk)
+                finished.set()
+                return b"".join(chunks)
+
+        started = time.monotonic()
+        with patch("scripts.direct_vs_orchestrated.sse_capture._open_local", return_value=SlowDripResponse()):
+            confirmed = _cancel_session("http://127.0.0.1:19877", "slow-session", timeout_s=0.05)
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(confirmed)
+        self.assertLess(elapsed, 0.15)
+        self.assertTrue(finished.wait(0.5))
 class CaptureWorkerTests(unittest.TestCase):
     def test_worker_loads_task_and_calls_capture_with_explicit_deadline(self):
         import json

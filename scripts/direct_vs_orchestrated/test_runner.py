@@ -279,6 +279,55 @@ class ProcessHarnessTests(unittest.TestCase):
         )
         self.assertEqual([result["status"] for result in fixture["mechanical_results"]], ["pass", "pass", "pass", "pass"])
 
+    def test_fixture_read_acceptance_is_unknown_when_tool_call_ids_are_missing(self):
+        import hashlib
+
+        from scripts.direct_vs_orchestrated.runner import evaluate_acceptance
+
+        fixture_task = load_tasks()[2]
+        digest = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
+        result = evaluate_acceptance(
+            fixture_task,
+            {
+                "observation_id": "fixture-missing-ids",
+                "visible_text": "beans: 14",
+                "tool_use_frames": [{"name": "read_file"}],
+                "tool_result_frames": [{"name": "read_file", "is_error": False}],
+            },
+            fixture_sha256_before=digest,
+            fixture_sha256_after=digest,
+            expected_fixture_sha256=digest,
+        )
+
+        successful_read = next(row for row in result["mechanical_results"] if row["criterion_id"] == "successful_read_file")
+        self.assertEqual(successful_read["status"], "unknown")
+
+    def test_missing_tool_call_ids_fail_trace_safety_check(self):
+        import hashlib
+        import tempfile
+
+        from scripts.direct_vs_orchestrated.runner import validate_trial_safety
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fixture = root / "stock.csv"
+            fixture.write_text("fixture\n", encoding="utf-8")
+            digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+            reasons = validate_trial_safety(
+                {
+                    "route_attempts": [{"provider": "llama_cpp", "model": "alias", "cloud": False}],
+                    "tool_use_frames": [{"name": "read_file"}],
+                    "tool_result_frames": [{"name": "read_file", "is_error": False}],
+                    "fixture_sha256_before": digest,
+                    "fixture_sha256_after": digest,
+                },
+                served_alias="alias",
+                fixture_root=root,
+                fixture_sha256=digest,
+            )
+
+        self.assertIn("tool_trace_identity_missing", reasons)
+
     def test_web_tool_and_escaped_fixture_path_stop_the_campaign(self):
         import hashlib
 
@@ -347,7 +396,7 @@ class ProcessHarnessTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            with patch.object(runner.time, "monotonic", side_effect=[100.0, 221.0, 222.0, 222.0, 222.0, 222.0]):
+            with patch.object(runner.time, "monotonic", side_effect=[100.0, 221.0, 222.0, 222.0, 222.0]):
                 with patch.object(runner, "_cancel_session", return_value=True) as cancel:
                     result = runner._run_capture_worker(
                         base_url="http://127.0.0.1:19006",
@@ -364,7 +413,7 @@ class ProcessHarnessTests(unittest.TestCase):
 
         self.assertEqual(process.timeouts[0], 0.0)
         self.assertEqual(process.timeouts[1], 5.0)
-        cancel.assert_called_once_with("http://127.0.0.1:19006", "session-timeout", timeout_s=5.0)
+        cancel.assert_called_once_with("http://127.0.0.1:19006", "session-timeout", deadline_mono=227.0)
         self.assertEqual(result["outcome"], "timeout")
         self.assertTrue(result["cancel_confirmed"])
         self.assertFalse(result["capture_worker_settled"])

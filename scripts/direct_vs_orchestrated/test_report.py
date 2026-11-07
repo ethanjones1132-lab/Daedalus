@@ -48,6 +48,20 @@ class ComparisonReportTests(unittest.TestCase):
         self.assertIn("fail", report)
         self.assertLess(report.index("Paired wall time"), report.index("Acceptance results"))
 
+    def test_blocked_success_is_not_used_for_pairwise_latency(self):
+        report = build_report(
+            {},
+            [
+                {"observation_id": "direct", "phase": "warm", "mode": "direct", "task_id": "arithmetic", "pair_id": "pair-1", "outcome": "success", "trial_status": "success", "total_wall_ms": 100},
+                {"observation_id": "orchestrated", "phase": "warm", "mode": "orchestrated", "task_id": "arithmetic", "pair_id": "pair-1", "outcome": "success", "trial_status": "blocked", "safety_reasons": ["cloud_route"], "total_wall_ms": 90},
+            ],
+            [],
+        )
+
+        self.assertIn("not comparable (failure retained)", report)
+        self.assertIn("outcome=success/blocked", report)
+        self.assertIn("cloud_route", report)
+
     def test_unknown_token_and_route_fields_are_not_imputed(self):
         report = build_report(
             {"served_alias": "configured-alias", "generation_defaults": {"arithmetic": {"max_tokens": 999}}},
