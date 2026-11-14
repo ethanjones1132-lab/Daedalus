@@ -288,11 +288,11 @@ pub fn load_jarvis_config_conn(conn: &rusqlite::Connection) -> Result<JarvisConf
     // Preserve the file loader's behavior: jarvis_path defaults to the agent
     // workspace path when not explicitly stored. Boot now hydrates from SQLite,
     // so this fallback lives here instead of in the (retired) file loader.
+    // DD-023 / DS-06: this runs before the Bun child is spawned. A native
+    // install must derive the default from the native home, not from an
+    // uncached `wsl.exe -- bash -lc 'echo $HOME'` (5s timeout on a cold distro).
     if config.jarvis_path.is_empty() {
-        config.jarvis_path = format!(
-            "{}/.openclaw/agents/coderclaw/workspace/Jarvis",
-            crate::wsl::wsl_home()
-        );
+        config.jarvis_path = crate::default_jarvis_workspace_path();
     }
 
     normalize_jarvis_config(&mut config);
@@ -519,6 +519,25 @@ mod tests {
     }
 
     #[test]
+    fn config_load_never_resolves_a_wsl_home() {
+        // DD-023 / DS-06: `load_jarvis_config` runs before the Bun child is
+        // spawned. Building the fresh-install default must not launch
+        // `wsl.exe`; the shared native-home resolver owns that decision.
+        let production = include_str!("settings.rs")
+            .split_once("\n#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("settings.rs must keep its test module after the production code");
+        assert!(
+            !production.contains("wsl_home"),
+            "the boot-time config fallback must not resolve the WSL home"
+        );
+        assert!(
+            production.contains("default_jarvis_workspace_path()"),
+            "the config loader must use the shared fresh-install default"
+        );
+    }
+
+    #[test]
     fn load_fills_jarvis_path_when_unset() {
         let db = mem_db();
         let cfg = load_jarvis_config(&db).expect("load");
@@ -526,6 +545,13 @@ mod tests {
             !cfg.jarvis_path.is_empty(),
             "jarvis_path should fall back to a non-empty default"
         );
+        assert_eq!(
+            cfg.jarvis_path,
+            crate::default_jarvis_workspace_path(),
+            "the config loader must use the shared native-home default, not a \
+             second WSL-home lookup"
+        );
+        assert!(cfg.jarvis_path.ends_with("Jarvis"));
     }
 
     #[test]

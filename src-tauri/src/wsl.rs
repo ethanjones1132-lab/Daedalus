@@ -215,32 +215,41 @@ pub fn jarvis_api_candidates() -> Vec<String> {
 /// Resolve the WSL home directory (`/home/<user>`). On non-Windows targets
 /// this returns the value of `$HOME` directly. Used everywhere the app
 /// needs to construct paths under JARVIS_HOME.
+///
+/// Cached for the process lifetime: the answer cannot change while the app
+/// runs, and an uncached `wsl.exe` launch can block for the full 5s timeout
+/// when the distro is cold (DD-023, DS-06).
 pub fn wsl_home() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        // `wsl.exe -- bash -lc 'echo $HOME'` is the most reliable source
-        // because the user's actual Linux home may differ from the Windows
-        // `%USERPROFILE%`.
-        let mut cmd = Command::new("wsl.exe");
-        cmd.args(["--", "bash", "-lc", "echo -n $HOME"]);
-        hide_windows_console(&mut cmd);
-        if let Some(out) = command_output_timeout(cmd, Duration::from_secs(5)) {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return s;
+    static WSL_HOME: OnceLock<String> = OnceLock::new();
+    WSL_HOME
+        .get_or_init(|| {
+            #[cfg(target_os = "windows")]
+            {
+                // `wsl.exe -- bash -lc 'echo $HOME'` is the most reliable source
+                // because the user's actual Linux home may differ from the Windows
+                // `%USERPROFILE%`.
+                let mut cmd = Command::new("wsl.exe");
+                cmd.args(["--", "bash", "-lc", "echo -n $HOME"]);
+                hide_windows_console(&mut cmd);
+                if let Some(out) = command_output_timeout(cmd, Duration::from_secs(5)) {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if !s.is_empty() {
+                            return s;
+                        }
+                    }
                 }
+                // Fallback to USERPROFILE/HOME
+                std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| r"C:\Users\ethan".to_string())
             }
-        }
-        // Fallback to USERPROFILE/HOME
-        std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| r"C:\Users\ethan".to_string())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("HOME").unwrap_or_else(|_| "/home/ethan".to_string())
-    }
+            #[cfg(not(target_os = "windows"))]
+            {
+                std::env::var("HOME").unwrap_or_else(|_| "/home/ethan".to_string())
+            }
+        })
+        .clone()
 }
 
 /// Run an openclaw CLI subcommand and return its stdout. On Windows, this

@@ -9,7 +9,6 @@ pub mod types;
 pub use types::JarvisState;
 
 use crate::jarvis::types::JarvisConfig;
-use crate::wsl::wsl_home;
 use std::fs;
 use std::path::PathBuf;
 
@@ -19,7 +18,7 @@ const CONFIG_FILE: &str = "config.json";
 /// Load Jarvis config from disk, creating defaults only if the file is missing.
 pub fn load_jarvis_config() -> JarvisConfig {
     let config_path = get_config_path();
-    let jarvis_path = format!("{}/.openclaw/agents/coderclaw/workspace/Jarvis", wsl_home());
+    let jarvis_path = crate::default_jarvis_workspace_path();
 
     if config_path.exists() {
         match fs::read_to_string(&config_path) {

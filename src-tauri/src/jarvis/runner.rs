@@ -1918,9 +1918,15 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     let is_llama_cpp = matches!(config.active_backend, JarvisBackend::LlamaCpp);
 
     // ── Ollama ──────────────────────────────────────────────────
-    let ollama_running = crate::is_port_listening(11434);
+    // DD-023 / DS-04: only a WSL-launched backend can be listening inside the
+    // guest. A native install must not pay a `wsl.exe` spawn per status tick.
+    let ollama_uses_wsl = crate::ollama_uses_wsl();
+    let llama_cpp_uses_wsl =
+        crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
+    let ollama_running = crate::backend_port_is_listening(11434, ollama_uses_wsl);
 
-    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
+    let llama_cpp_running =
+        crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
 
     let model_available = if is_ollama && ollama_running {
         let url = config.ollama.base_url.clone();
@@ -2002,9 +2008,15 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         std::net::TcpStream::connect(format!("127.0.0.1:{}", config.bridge_port)).is_ok();
 
     // ── Bun binary availability (cheap, no HTTP) ─────────────────
-    let bun_available = wsl_openclaw(&["which", "bun"])
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    // A native install already resolved its own bun.exe; only a WSL-launched
+    // Bun needs the guest PATH lookup.
+    let bun_available = if crate::bun_uses_wsl() {
+        wsl_openclaw(&["which", "bun"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    } else {
+        std::path::Path::new(&crate::find_bun_executable()).is_file()
+    };
 
     // ── Active backend descriptor ────────────────────────────────
     let (active_backend, model) = match config.active_backend {
@@ -2054,5 +2066,30 @@ mod proxy_status_tests {
 
         config.claude_cli.auth_mode = crate::jarvis::types::ClaudeCliAuthMode::Proxy;
         assert!(check_claude_proxy_status(&config, || true));
+    }
+
+    #[test]
+    fn status_port_probes_respect_the_backend_launch_mode() {
+        // DD-023 / DS-04: the t=0 status read must not spawn `wsl.exe` for a
+        // natively launched backend while the Bun child is still starting.
+        let source = include_str!("runner.rs");
+        let start = source
+            .find("pub fn check_jarvis_status(")
+            .expect("check_jarvis_status must exist");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("check_jarvis_status body")];
+
+        assert!(
+            !body.contains("crate::is_port_listening("),
+            "status must not use the unconditional WSL port check"
+        );
+        assert!(
+            body.matches("crate::backend_port_is_listening(").count() >= 2,
+            "Ollama and llama.cpp status probes must both use the launch-mode-aware check"
+        );
+        assert!(
+            body.contains("crate::bun_uses_wsl()"),
+            "the Bun availability check must not run the WSL command for a native install"
+        );
     }
 }

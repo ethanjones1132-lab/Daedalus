@@ -1280,7 +1280,7 @@ mod probe_jarvis_health_tests {
     }
 }
 
-fn find_bun_executable() -> String {
+pub(crate) fn find_bun_executable() -> String {
     // NEW: Support bundled / portable Windows execution for installers on new hardware.
     // If a "bun.exe" is present next to the current executable (or in ./resources or ./bin next to it),
     // prefer the local one (no WSL required). This + the bundled server js in resources
@@ -1452,7 +1452,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     Ok(child)
 }
 
-fn bun_uses_wsl() -> bool {
+pub(crate) fn bun_uses_wsl() -> bool {
     cfg!(target_os = "windows") && !find_bun_executable().to_ascii_lowercase().ends_with(".exe")
 }
 
@@ -1760,7 +1760,7 @@ fn is_wsl_port_listening(port: u16) -> bool {
 /// backend through `wsl.exe`, and only such a backend can be listening inside
 /// WSL. `None`/blank means nothing would be launched through WSL at all, so the
 /// probe is never warranted (DD-049).
-fn command_uses_wsl(command: Option<&str>) -> bool {
+pub(crate) fn command_uses_wsl(command: Option<&str>) -> bool {
     if !cfg!(target_os = "windows") {
         return false;
     }
@@ -1773,14 +1773,14 @@ fn command_uses_wsl(command: Option<&str>) -> bool {
 /// `spawn_ollama` runs the resolved Ollama binary directly. Reuse the launch-mode
 /// rule on that command so the WSL probe is kept for a WSL-side binary and
 /// dropped for a native one (or when Ollama is not installed at all).
-fn ollama_uses_wsl() -> bool {
+pub(crate) fn ollama_uses_wsl() -> bool {
     command_uses_wsl(find_ollama_binary().as_deref())
 }
 
 /// Port-only liveness check for a backend whose launch mode is known.
 /// A closed local port on a backend this process would launch natively reads as
 /// closed without spawning `wsl.exe`; a WSL-launched backend may still probe.
-fn backend_port_is_listening(port: u16, uses_wsl: bool) -> bool {
+pub(crate) fn backend_port_is_listening(port: u16, uses_wsl: bool) -> bool {
     backend_port_is_listening_with(
         port,
         uses_wsl,
@@ -1813,6 +1813,34 @@ pub fn get_home_dir() -> String {
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| "/home/ethan".to_string())
     }
+}
+
+/// Default workspace path for a fresh install.
+///
+/// The native home is used for a native install: resolving a filesystem default
+/// must never spawn `wsl.exe`, which on a cold distro can take seconds and sits
+/// directly on the pre-Bun startup path (DD-023, DS-06). A WSL-launched Bun
+/// still reads a guest path, so only that launch mode resolves the WSL home.
+pub(crate) fn default_jarvis_workspace_path() -> String {
+    let home = if cfg!(target_os = "windows") && bun_uses_wsl() {
+        crate::wsl::wsl_home()
+    } else {
+        get_home_dir()
+    };
+    default_jarvis_workspace_path_from(&home)
+}
+
+/// Pure form of [`default_jarvis_workspace_path`] so the shape is testable
+/// without reading the environment or probing any process.
+pub(crate) fn default_jarvis_workspace_path_from(home: &str) -> String {
+    std::path::Path::new(home)
+        .join(".openclaw")
+        .join("agents")
+        .join("coderclaw")
+        .join("workspace")
+        .join("Jarvis")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn spawn_background_thread<F>(name: &str, task: F) -> std::io::Result<std::thread::JoinHandle<()>>
@@ -2356,6 +2384,25 @@ mod startup_thread_tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         command
+    }
+
+    #[test]
+    fn default_workspace_path_is_derived_from_the_given_home() {
+        let home = std::path::Path::new("jarvis-home");
+        let expected = home
+            .join(".openclaw")
+            .join("agents")
+            .join("coderclaw")
+            .join("workspace")
+            .join("Jarvis")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            default_jarvis_workspace_path_from("jarvis-home"),
+            expected,
+            "the fresh-install default must be a pure path join over the native home"
+        );
     }
 
     #[test]

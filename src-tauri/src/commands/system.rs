@@ -400,37 +400,51 @@ pub async fn get_system_health(
     app: tauri::AppHandle,
     state: State<'_, crate::jarvis::types::JarvisState>,
 ) -> Result<HealthData, String> {
-    let ollama_running = crate::is_port_listening(11434);
+    let config = state.config.lock().await.clone();
+    let _ = app; // app kept for future event emission
+
+    // DD-023: this snapshot runs synchronously over bounded subprocess and HTTP
+    // probes. Running it inline on an async command worker competes with the
+    // WebView/IPC while the owned Bun child is still starting, so the whole
+    // snapshot moves to a blocking thread.
+    tokio::task::spawn_blocking(move || system_health_snapshot(&config))
+        .await
+        .map_err(|error| format!("system health task join error: {error}"))
+}
+
+fn system_health_snapshot(config: &crate::jarvis::types::JarvisConfig) -> HealthData {
+    // DD-023 / DS-04: a closed local port only proves a *natively launched*
+    // backend absent. Probing WSL for a native Ollama/llama.cpp/bridge pays a
+    // helper process on every health tick — including the UI's t=0 boot read,
+    // which lands in the same window as the Bun child spawn.
+    let ollama_uses_wsl = crate::ollama_uses_wsl();
+    let llama_cpp_uses_wsl =
+        crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
+    let bridge_uses_wsl = crate::bun_uses_wsl();
+
+    let ollama_running = crate::backend_port_is_listening(11434, ollama_uses_wsl);
     let ollama_url = "http://127.0.0.1:11434".to_string();
     let ollama_model = if ollama_running {
-        crate::wsl::wsl_openclaw(&["ollama", "ps", "--format", "json"])
-            .ok()
-            .and_then(|s| {
-                // best-effort parse; fall back to None
-                serde_json::from_str::<serde_json::Value>(&s)
-                    .ok()
-                    .and_then(|v| {
-                        v.as_array()
-                            .and_then(|arr| arr.first())
-                            .and_then(|m| m.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string())
-                    })
-            })
+        if ollama_uses_wsl {
+            crate::wsl::wsl_openclaw(&["ollama", "ps", "--format", "json"])
+                .ok()
+                .and_then(|body| parse_ollama_ps_model(&body))
+        } else {
+            native_ollama_ps_model(&ollama_url)
+        }
     } else {
         None
     };
 
-    let config = state.config.lock().await.clone();
     // Bun server: probe the cached health URL via crate helper if available
     let bun_running = crate::bun_server_is_listening();
-    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
-    let proxy_required = crate::claude_proxy_enabled(&config);
+    let llama_cpp_running =
+        crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
+    let proxy_required = crate::claude_proxy_enabled(config);
     let proxy_running = proxy_required && crate::claude_proxy_is_listening();
 
-    let disk = disk_health().await;
+    let disk = disk_health();
     let mem = memory_health();
-    let _ = app; // app kept for future event emission
 
     // Reflect the supervisor's own backoff state. `*_give_up` is true after
     // `MAX_CONSECUTIVE_RESTARTS` consecutive failures, at which point the
@@ -438,7 +452,7 @@ pub async fn get_system_health(
     // surface an "auto-restart paused" pill in the Diagnostics grid.
     let supervisor = crate::supervisor::give_up_status();
 
-    Ok(HealthData {
+    HealthData {
         ollama: OllamaHealth {
             running: ollama_running,
             model: ollama_model,
@@ -453,7 +467,9 @@ pub async fn get_system_health(
             running: bun_running,
             url: "http://127.0.0.1:19877".to_string(),
         },
-        bridge: bridge_health_for(&config, crate::is_port_listening),
+        bridge: bridge_health_for(config, |port| {
+            crate::backend_port_is_listening(port, bridge_uses_wsl)
+        }),
         claude_proxy: ClaudeProxyHealth {
             running: proxy_running,
             port: 19878,
@@ -462,10 +478,41 @@ pub async fn get_system_health(
         memory: mem,
         supervisor,
         timestamp: now_iso(),
-    })
+    }
 }
 
-async fn disk_health() -> DiskHealth {
+/// Parse an Ollama `ps` payload. Best-effort: anything unrecognised is `None`.
+fn parse_ollama_ps_model(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_array()
+                .and_then(|models| models.first())
+                .and_then(|model| model.get("name"))
+                .and_then(|name| name.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Native Ollama model read. The WSL-only `ollama ps` helper is wrong (and
+/// slow) for a Windows-hosted Ollama, so query the local API directly.
+fn native_ollama_ps_model(base_url: &str) -> Option<String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("{}/api/ps", base_url.trim_end_matches('/')))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    parse_ollama_ps_model(&response.text().ok()?)
+}
+
+fn disk_health() -> DiskHealth {
     // Best-effort: read from `df` on the WSL side; on Windows, fall back to a sane default.
     let out = crate::wsl::wsl_openclaw(&["df", "-BG", "--output=size,used,avail,pcent", "/"]);
     if let Ok(s) = out {
@@ -567,12 +614,20 @@ pub async fn get_doctor_report(
     let mut checks: Vec<DoctorCheck> = Vec::new();
     let config = state.config.lock().await.clone();
 
+    // DD-023 / DS-04: the doctor must not probe WSL for natively launched
+    // services; the launch mode decides whether a closed local port can hide a
+    // guest listener.
+    let ollama_uses_wsl = crate::ollama_uses_wsl();
+    let llama_cpp_uses_wsl =
+        crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
+    let bridge_uses_wsl = crate::bun_uses_wsl();
+
     // Active local inference backends
     let ollama_required = matches!(
         config.active_backend,
         crate::jarvis::types::JarvisBackend::Ollama
     );
-    let ollama = crate::is_port_listening(11434);
+    let ollama = crate::backend_port_is_listening(11434, ollama_uses_wsl);
     checks.push(DoctorCheck {
         name: "ollama".into(),
         status: if !ollama_required || ollama {
@@ -593,7 +648,8 @@ pub async fn get_doctor_report(
         config.active_backend,
         crate::jarvis::types::JarvisBackend::LlamaCpp
     );
-    let llama_cpp_running = crate::is_port_listening(config.llama_cpp.port);
+    let llama_cpp_running =
+        crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
     checks.push(DoctorCheck {
         name: "llama_cpp".into(),
         status: if !llama_cpp_required || llama_cpp_running { "ok".into() } else { "warn".into() },
@@ -624,7 +680,7 @@ pub async fn get_doctor_report(
     });
 
     // Bridge
-    let bridge = crate::is_port_listening(config.bridge_port);
+    let bridge = crate::backend_port_is_listening(config.bridge_port, bridge_uses_wsl);
     checks.push(DoctorCheck {
         name: "bridge".into(),
         status: if bridge { "ok".into() } else { "warn".into() },
@@ -1156,7 +1212,7 @@ fn toggle_plugin(id: &str, enabled: bool) -> Result<bool, String> {
 
 #[tauri::command]
 pub fn get_gateway_status() -> Result<GatewayStatus, String> {
-    let running = crate::is_port_listening(19876);
+    let running = crate::backend_port_is_listening(19876, crate::bun_uses_wsl());
     Ok(GatewayStatus {
         running,
         port: 19876,
@@ -1344,5 +1400,41 @@ mod bridge_restart_tests {
         assert!(health.running);
         assert_eq!(health.port, started.port);
         crate::jarvis::bridge::stop_bridge().unwrap();
+    }
+
+    #[test]
+    fn health_port_probes_respect_the_backend_launch_mode() {
+        // DD-023 / DS-04: every health port probe must go through the
+        // launch-mode-aware check, so a native install never spawns `wsl.exe`
+        // for a closed local port during the startup window.
+        let production = include_str!("system.rs")
+            .split_once("\n#[cfg(test)]\nmod bridge_restart_tests")
+            .map(|(production, _)| production)
+            .expect("system.rs must keep its test module after the production code");
+
+        assert!(
+            !production.contains("crate::is_port_listening("),
+            "health probes must not use the unconditional WSL port check"
+        );
+        assert!(
+            production.matches("crate::backend_port_is_listening(").count() >= 6,
+            "Ollama, llama.cpp, bridge, gateway and doctor probes must all use \
+             the launch-mode-aware check, found {}",
+            production.matches("crate::backend_port_is_listening(").count()
+        );
+        assert!(
+            production.contains("tokio::task::spawn_blocking"),
+            "get_system_health must run its blocking snapshot off the async IPC runtime"
+        );
+    }
+
+    #[test]
+    fn ollama_model_parsing_accepts_the_ps_payload_shape() {
+        assert_eq!(
+            parse_ollama_ps_model(r#"[{"name":"qwen3:8b","model":"qwen3:8b"}]"#),
+            Some("qwen3:8b".to_string())
+        );
+        assert_eq!(parse_ollama_ps_model("[]"), None);
+        assert_eq!(parse_ollama_ps_model("not json"), None);
     }
 }
