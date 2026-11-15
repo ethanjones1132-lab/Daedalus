@@ -28,6 +28,10 @@ from .sse_capture import _cancel_session, validate_runtime_config
 PACKAGE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_ROOT.parents[1]
 FIXTURE_SOURCE = PACKAGE_ROOT / "fixtures" / "stock.csv"
+# DD-064: the Bun server binds the one fixed port declared in
+# server-jarvis/src/server-guards.ts:31 (`SERVER_PORT`); the harness drives that
+# same constant and lets only one owned Bun child hold it at a time.
+SERVER_PORT = 19877
 COMPARISON_GENERATION = {"max_tokens": 4096, "temperature": 0, "top_p": 1}
 CLOUD_SECRET_NAMES = {
     "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
@@ -119,7 +123,7 @@ def source_fingerprint(repo_root: Path | str) -> dict[str, Any]:
     }
 
 
-def child_env(home: Path, *, port: int, workspace: Path) -> dict[str, str]:
+def child_env(home: Path, *, workspace: Path) -> dict[str, str]:
     """Build one explicit allowlisted Bun child environment rooted in its home."""
     isolated_home = Path(home).resolve()
     isolated_workspace = Path(workspace).resolve()
@@ -141,7 +145,6 @@ def child_env(home: Path, *, port: int, workspace: Path) -> dict[str, str]:
         "JARVIS_HOME": isolated_home,
     }
     env.update({key: str(value) for key, value in path_values.items()})
-    env["JARVIS_SERVER_PORT"] = str(port)
     env["JARVIS_SERVER_HOST"] = "127.0.0.1"
     env["JARVIS_WORKSPACE"] = str(isolated_workspace)
     for secret in CLOUD_SECRET_NAMES:
@@ -543,6 +546,63 @@ def _wait_for_json(
             last_error = type(exc).__name__
         time.sleep(0.2)
     raise TimeoutError(f"readiness timeout for {url}: {last_error}")
+
+
+@contextlib.contextmanager
+def owned_bun_server(
+    *,
+    mode: str,
+    command: Sequence[str],
+    env: dict[str, str],
+    cwd: Path,
+    log_stream: Any,
+    expected_config: dict[str, Any],
+    model_url: str,
+    served_alias: str,
+    popen_factory=subprocess.Popen,
+) -> Iterator[tuple[subprocess.Popen, dict[str, Any]]]:
+    """Start, verify, and stop exactly one owned Bun server on SERVER_PORT.
+
+    DD-064 removed the per-child port override, so every mode binds the same
+    fixed port: the previous owner must be stopped before this one starts.
+    The caller checks SERVER_PORT once before the campaign, because a per-start
+    bind probe would false-positive on the TIME_WAIT sockets the previous owned
+    server left behind. A live squatter still fails closed: this child cannot
+    bind, exits before readiness, and `_wait_for_json` reports the exit. Loopback
+    bind, backend, alias, and mode config are re-proven before a trial may use it.
+    """
+    with owned_processes(
+        [command],
+        ports=[],
+        env=[env],
+        cwd=[cwd],
+        stdout_targets=[log_stream],
+        popen_factory=popen_factory,
+    ) as processes:
+        process = processes[0]
+        health = _wait_for_json(
+            f"http://127.0.0.1:{SERVER_PORT}/health",
+            process,
+            timeout_s=30.0,
+            readiness_kind="health",
+        )
+        _assert_bun_loopback_health(health)
+        if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
+            raise RuntimeError(f"{mode} Bun health did not confirm the expected local backend and alias")
+        config_response = _wait_for_json(
+            f"http://127.0.0.1:{SERVER_PORT}/config",
+            process,
+            timeout_s=5.0,
+            readiness_kind="config",
+        )
+        _assert_runtime_config(
+            config_response,
+            expected=expected_config,
+            mode=mode,
+            model_url=model_url,
+            served_alias=served_alias,
+        )
+        yield process, {"health": health, "config": config_response}
 
 
 def _require_explicit_file(value: Any, label: str) -> Path:
@@ -1016,7 +1076,6 @@ def _run_capture_worker(
     wall_cap_ms: int,
     out_path: Path,
     worker_home: Path,
-    port: int,
     workspace: Path,
     repo_root: Path = REPO_ROOT,
     popen_factory=subprocess.Popen,
@@ -1035,7 +1094,7 @@ def _run_capture_worker(
         "--out", str(out_path),
         "--wall-cap-ms", str(wall_cap_ms),
     ]
-    environment = child_env(worker_home, port=port, workspace=workspace)
+    environment = child_env(worker_home, workspace=workspace)
     # The monotonic turn deadline begins before Popen, so interpreter startup
     # and task-file loading consume the same 120-second budget as SSE capture.
     capture_started = time.monotonic()
@@ -1188,13 +1247,6 @@ def _execute_campaign(
     task_by_id = {task["id"]: task for task in tasks}
     server_root = repo_root / "server-jarvis"
     bun_argv = [str(bun_path), "run", "--no-env-file", "--no-install", "src/index.ts"]
-    bun_commands = [bun_argv, bun_argv]
-    bun_modes = ["direct", "orchestrated"]
-    bun_envs = [
-        child_env(homes / mode, port=ports[mode], workspace=fixture_dir)
-        for mode in bun_modes
-    ]
-    bun_cwds = [server_root, server_root]
     log_names = ["llama_cpp_process_cold_direct", "llama_cpp_process_cold_orchestrated", "bun_direct", "bun_orchestrated"]
     readiness: list[dict[str, Any]] = []
     process_handles: dict[int, subprocess.Popen] = {}
@@ -1203,6 +1255,13 @@ def _execute_campaign(
     rubric_path = out_dir / "rubric.jsonl"
     packets_path = out_dir / "blind-review-packets.jsonl"
     blind_key_path = out_dir / "blind-review-key.json"
+    # DD-064: one fixed Bun port, so the campaign owns exactly one Bun server
+    # at a time. `server_state` records which mode that server was started for
+    # and is cleared whenever it is stopped.
+    server_state: dict[str, Any] = {
+        "mode": None, "process": None, "row": None, "stack": None,
+        "process_stack": None, "logs": {},
+    }
 
     def record_process(name: str, process: subprocess.Popen, argv: Sequence[str], cwd: Path) -> dict[str, Any]:
         row = {
@@ -1223,13 +1282,61 @@ def _execute_campaign(
         row["status"] = "stopped" if row["exit_code"] is not None else "stop_unconfirmed"
         _atomic_write_json(manifest_path, manifest)
 
+    def start_server(mode: str) -> None:
+        """Start the one SERVER_PORT server for `mode` after stopping the other."""
+        process_stack = server_state["process_stack"]
+        server_stack = process_stack.enter_context(contextlib.ExitStack())
+        process, ready = server_stack.enter_context(owned_bun_server(
+            mode=mode,
+            command=bun_argv,
+            env=child_env(homes / mode, workspace=fixture_dir),
+            cwd=server_root,
+            log_stream=server_state["logs"][f"bun_{mode}"],
+            expected_config=configs[mode],
+            model_url=model_url,
+            served_alias=served_alias,
+            popen_factory=popen_factory,
+        ))
+        row = record_process(f"bun_{mode}", process, bun_argv, server_root)
+        readiness.append({
+            "component": f"bun_{mode}",
+            "status": "ready",
+            "pid": process.pid,
+            "health": {key: ready["health"].get(key) for key in ("ok", "backend", "model", "configured_model", "bind_host", "git_sha", "source_tree_sha256")},
+            "effective_config_redacted": redact_config(ready["config"]),
+            "effective_config_fingerprint": _fingerprint(redact_config(ready["config"])),
+        })
+        manifest["readiness"] = readiness
+        server_state.update(mode=mode, process=process, row=row, stack=server_stack)
+        if manifest.get("run_status") == "starting":
+            manifest["run_status"] = "ready"
+        _atomic_write_json(manifest_path, manifest)
+
+    def stop_server() -> None:
+        """Stop only the fixed-port server this campaign started, if any."""
+        server_stack = server_state["stack"]
+        if server_stack is None:
+            return
+        server_stack.close()
+        mark_process_stopped(server_state["row"], server_state["process"])
+        server_state.update(mode=None, process=None, row=None, stack=None)
+
+    def ensure_server(mode: str) -> dict[str, Any]:
+        """Guarantee the live owned Bun server is the one started for `mode`."""
+        if server_state["mode"] != mode:
+            stop_server()
+            start_server(mode)
+        elif server_state["process"].poll() is not None:
+            raise RuntimeError(f"{mode} Bun server exited before its trial")
+        return server_state
+
     def start_model(process_stack: contextlib.ExitStack, log_file, generation: str):
         model_stack = process_stack.enter_context(contextlib.ExitStack())
         ready_started = time.monotonic()
         processes = model_stack.enter_context(owned_processes(
             [llama_argv],
             ports=[ports["llama_cpp"]],
-            env=[child_env(homes / "model", port=ports["llama_cpp"], workspace=fixture_dir)],
+            env=[child_env(homes / "model", workspace=fixture_dir)],
             cwd=[homes / "model"],
             stdout_targets=[log_file],
             popen_factory=popen_factory,
@@ -1265,7 +1372,10 @@ def _execute_campaign(
     def record_trial(trial: dict[str, Any], *, model_ready_ms: float, model_generation: str) -> dict[str, Any]:
         task = task_by_id[trial["task_id"]]
         mode = trial["mode"]
-        base_url = f"http://127.0.0.1:{ports[mode]}"
+        # DD-064: every mode talks to the same fixed port; the owned server for
+        # this trial's mode is started (and the other stopped) first.
+        server = ensure_server(mode)
+        base_url = f"http://127.0.0.1:{SERVER_PORT}"
         capture_path = out_dir / "captures" / mode / trial["task_id"] / f"{trial['observation_id']}.jsonl"
 
         def launch_worker(**kwargs):
@@ -1273,7 +1383,6 @@ def _execute_campaign(
                 **kwargs,
                 runtime_config=configs[mode],
                 worker_home=homes / mode,
-                port=ports[mode],
                 workspace=fixture_dir,
                 repo_root=repo_root,
                 popen_factory=popen_factory,
@@ -1292,6 +1401,8 @@ def _execute_campaign(
             worker=launch_worker,
         )
         record["llama_process_generation"] = model_generation
+        record["server_mode"] = server["mode"]
+        record["server_pid"] = server["process"].pid
         if trial["phase"] == "process_cold":
             record.update(cold_observation_metadata(
                 model_ready_ms=model_ready_ms,
@@ -1343,6 +1454,8 @@ def _execute_campaign(
             "safety_reasons": record.get("safety_reasons", []),
             "raw_capture_path": str(capture_path),
             "cancel_confirmed": record.get("cancel_confirmed"),
+            "server_mode": record.get("server_mode"),
+            "server_pid": record.get("server_pid"),
         })
         manifest["run_status"] = "capturing"
         manifest["observation_count"] = len(manifest["observations"])
@@ -1390,75 +1503,51 @@ def _execute_campaign(
         with _open_process_logs(out_dir, log_names) as log_files:
             logs = dict(zip(log_names, log_files))
             with contextlib.ExitStack() as process_stack:
+                server_state["process_stack"] = process_stack
+                server_state["logs"] = logs
                 model_stack, model_process, model_row, direct_ready_ms = start_model(
                     process_stack, logs["llama_cpp_process_cold_direct"], "process_cold_direct",
                 )
-                bun_processes = process_stack.enter_context(owned_processes(
-                    bun_commands,
-                    ports=[ports["direct"], ports["orchestrated"]],
-                    env=bun_envs,
-                    cwd=bun_cwds,
-                    stdout_targets=[logs["bun_direct"], logs["bun_orchestrated"]],
-                    popen_factory=popen_factory,
-                ))
-                bun_rows = []
-                for mode, process, command, working_dir, port in zip(
-                    bun_modes, bun_processes, bun_commands, bun_cwds, (ports["direct"], ports["orchestrated"]),
-                ):
-                    bun_rows.append(record_process(f"bun_{mode}", process, command, working_dir))
-                    health = _wait_for_json(
-                        f"http://127.0.0.1:{port}/health",
-                        process,
-                        timeout_s=30.0,
-                        readiness_kind="health",
-                    )
-                    _assert_bun_loopback_health(health)
-                    if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
-                        raise RuntimeError(f"{mode} Bun health did not confirm the expected local backend and alias")
-                    config_response = _wait_for_json(
-                        f"http://127.0.0.1:{port}/config",
-                        process,
-                        timeout_s=5.0,
-                        readiness_kind="config",
-                    )
-                    _assert_runtime_config(
-                        config_response,
-                        expected=configs[mode],
-                        mode=mode,
-                        model_url=model_url,
-                        served_alias=served_alias,
-                    )
-                    readiness.append({
-                        "component": f"bun_{mode}",
-                        "status": "ready",
-                        "health": {key: health.get(key) for key in ("ok", "backend", "model", "configured_model", "bind_host", "git_sha", "source_tree_sha256")},
-                        "effective_config_redacted": redact_config(config_response),
-                        "effective_config_fingerprint": _fingerprint(redact_config(config_response)),
-                    })
-                manifest["readiness"] = readiness
-                manifest["run_status"] = "ready"
-                _atomic_write_json(manifest_path, manifest)
 
                 cold_trials = [trial for trial in schedule if trial["phase"] == "process_cold"]
-                if not consume(cold_trials[:1], model_ready_ms=direct_ready_ms, generation="process_cold_direct"):
+                warmups = [trial for trial in schedule if trial["phase"] == "warmup"]
+                warm = [trial for trial in schedule if trial["phase"] == "warm"]
+
+                def in_mode(trials: Sequence[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+                    return [trial for trial in trials if trial["mode"] == mode]
+
+                # DD-064: the fixed SERVER_PORT allows one Bun server at a time,
+                # so the campaign runs one mode at a time: direct cold trial on
+                # the first model process, then the model restart, then the
+                # orchestrated cold trial. Each mode's warm block runs on the
+                # second model process with that mode's own warm-up first, so
+                # both arms are measured against the same model generation and
+                # the same freshly-verified server config. Trial order within a
+                # mode block stays the frozen counterbalanced schedule order.
+                ensure_server("direct")
+                if not consume(in_mode(cold_trials, "direct"), model_ready_ms=direct_ready_ms, generation="process_cold_direct"):
                     return
 
-                # Stop only our first llama-server handle while both owned Bun
-                # servers stay alive; the next mode gets an unloaded process/KV.
+                # Stop only our first llama-server handle; the next mode gets an
+                # unloaded model process/KV on the same fixed port.
                 model_stack.close()
                 mark_process_stopped(model_row, model_process)
                 model_stack, model_process, model_row, orchestrated_ready_ms = start_model(
                     process_stack, logs["llama_cpp_process_cold_orchestrated"], "process_cold_orchestrated",
                 )
-                if not consume(cold_trials[1:], model_ready_ms=orchestrated_ready_ms, generation="process_cold_orchestrated"):
+                ensure_server("orchestrated")
+                if not consume(in_mode(cold_trials, "orchestrated"), model_ready_ms=orchestrated_ready_ms, generation="process_cold_orchestrated"):
                     return
 
-                warmups = [trial for trial in schedule if trial["phase"] == "warmup"]
-                warm = [trial for trial in schedule if trial["phase"] == "warm"]
-                if not consume(warmups, model_ready_ms=orchestrated_ready_ms, generation="warm"):
-                    return
-                if not consume(warm, model_ready_ms=orchestrated_ready_ms, generation="warm"):
-                    return
+                for mode in ("direct", "orchestrated"):
+                    ensure_server(mode)
+                    if not consume(
+                        in_mode(warmups, mode) + in_mode(warm, mode),
+                        model_ready_ms=orchestrated_ready_ms,
+                        generation="warm",
+                    ):
+                        return
+                stop_server()
 
         # A completed campaign has every scheduled record. Warm-ups remain in
         # observations with reported=false, while the report can omit them.
@@ -1488,6 +1577,13 @@ def run_comparison(args: argparse.Namespace) -> Path:
     # override, then /health must report the actual loopback address before any
     # capture begins.
     require_bun_loopback_bind(repo_root)
+    # DD-064: the harness must own the one fixed Bun port for the whole campaign,
+    # so refuse before hashing artifacts or creating any output when another
+    # listener already holds it.
+    try:
+        ensure_loopback_ports_free([SERVER_PORT])
+    except OSError as exc:
+        raise RuntimeError(f"the fixed Bun port {SERVER_PORT} is already in use; stop that listener and re-run") from exc
 
     llama_server = _require_explicit_file(getattr(args, "llama_server", None), "llama-server")
     model_path = _require_explicit_file(getattr(args, "model", None), "model")
@@ -1516,10 +1612,11 @@ def run_comparison(args: argparse.Namespace) -> Path:
     homes = out_dir / "homes"
     for mode in ("model", "direct", "orchestrated"):
         (homes / mode).mkdir(parents=True, exist_ok=True)
-    ports = {"llama_cpp": allocate_loopback_port(), "direct": allocate_loopback_port(), "orchestrated": allocate_loopback_port()}
-    while len(set(ports.values())) != len(ports):
-        ports = {"llama_cpp": allocate_loopback_port(), "direct": allocate_loopback_port(), "orchestrated": allocate_loopback_port()}
-    ensure_loopback_ports_free(list(ports.values()))
+    # Only llama.cpp gets an allocated port. DD-064 fixed the Bun port, so the
+    # harness drives SERVER_PORT and one owned server uses it at a time; it was
+    # proven free above and the restarts reuse the port this harness owns.
+    ports = {"llama_cpp": allocate_loopback_port(), "jarvis_server": SERVER_PORT}
+    ensure_loopback_ports_free([ports["llama_cpp"]])
     model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
     bun_model_argv = [str(bun_path), "run", "--no-env-file", "--no-install", "src/index.ts"]
     llama_argv = [

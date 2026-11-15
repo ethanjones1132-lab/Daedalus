@@ -19,9 +19,13 @@
                    and the installed binary's hash must equal the release
                    record's app_binary hash, proving the installer carries
                    the binary the record describes.
-      3. launch  - the packaged server bundle is started on its own port
-                   (never the default 19877, so a live Jarvis is not
-                   disturbed) with the release identity baked in.
+      3. launch  - the packaged server bundle is started on the one port the
+                   build actually binds: SERVER_PORT 19877 from
+                   server-jarvis/src/server-guards.ts. DD-064 removed the port
+                   override, so the smoke cannot move the server to a private
+                   port; instead it refuses to start while 19877 is busy, so
+                   the health, provenance and chat it reads can only come from
+                   the process it started.
       4. health  - /health must report the git SHA and source-tree digest
                    the release record claims. THIS is the stale-binary
                    check: it is the difference between "the file on disk is
@@ -43,9 +47,6 @@
 .PARAMETER InstallRoot
     Scratch directory the installer is run into.
 
-.PARAMETER Port
-    Port the packaged server is launched on. Deliberately NOT 19877.
-
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\release-smoke.ps1 `
         -ManifestPath dist\release\1.0.0\jarvis-release.json
@@ -58,10 +59,6 @@ param(
     [string]$InstallerPath = '',
 
     [string]$InstallRoot = (Join-Path $env:TEMP ('jarvis-release-smoke-' + [guid]::NewGuid().ToString('N'))),
-
-    # Not the default 19877: a live Jarvis may own that port, and the
-    # smoke must not disturb it or read its /health.
-    [int]$Port = 19888,
 
     [switch]$SkipInstall,
     [switch]$SkipLaunch,
@@ -76,6 +73,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# DD-064: the packaged server binds the fixed SERVER_PORT declared in
+# server-jarvis/src/server-guards.ts (19877) and no longer honours a port
+# override, so the smoke cannot choose its own port. It therefore refuses to
+# run while 19877 is busy: only then can /health, the provenance fields and the
+# chat stream be attributed to the process this script started.
+$ServerPort = 19877
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
@@ -138,15 +142,24 @@ function Wait-JarvisHealth {
     <#
     .SYNOPSIS
         Poll /health until it answers or the budget runs out.
+
+    .DESCRIPTION
+        On the fixed port the only listener may be the process this smoke
+        started, so an owned process that exits without answering is reported
+        instead of being polled until the timeout.
     #>
     [CmdletBinding()]
     param(
         [string]$Url,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        $Process
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastError = 'no attempt'
     while ((Get-Date) -lt $deadline) {
+        if ($Process -and $Process.HasExited) {
+            throw "server_exited_before_health:$($Process.ExitCode)"
+        }
         try {
             return Invoke-RestMethod -Uri $Url -TimeoutSec 5
         } catch {
@@ -160,12 +173,11 @@ function Wait-JarvisHealth {
 function Start-JarvisServerBundle {
     <#
     .SYNOPSIS
-        Launch the packaged server bundle on the smoke's own port.
+        Launch the packaged server bundle; it binds the fixed SERVER_PORT.
     #>
     [CmdletBinding()]
     param(
         [string]$BundlePath,
-        [int]$Port,
         [string]$WorkingDirectory
     )
     $bunCommand = Get-Command bun -ErrorAction SilentlyContinue
@@ -176,21 +188,15 @@ function Start-JarvisServerBundle {
     } else {
         $bunPath = $bunCommand.Source
     }
-    $previousPort = $env:JARVIS_SERVER_PORT
-    $env:JARVIS_SERVER_PORT = [string]$Port
-    try {
-        $logDir = Join-Path $env:TEMP 'jarvis-release-smoke'
-        New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-        $stdout = Join-Path $logDir 'server.out.log'
-        $stderr = Join-Path $logDir 'server.err.log'
-        $startedProcess = Start-Process -FilePath $bunPath -ArgumentList @('"' + $BundlePath + '"') `
-            -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        $startedProcess | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $startedProcess.StartTime
-        return $startedProcess
-    } finally {
-        $env:JARVIS_SERVER_PORT = $previousPort
-    }
+    $logDir = Join-Path $env:TEMP 'jarvis-release-smoke'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $stdout = Join-Path $logDir 'server.out.log'
+    $stderr = Join-Path $logDir 'server.err.log'
+    $startedProcess = Start-Process -FilePath $bunPath -ArgumentList @('"' + $BundlePath + '"') `
+        -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $startedProcess | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $startedProcess.StartTime
+    return $startedProcess
 }
 
 # ── Entry point ──────────────────────────────────────────────────────────────
@@ -240,11 +246,20 @@ $hash = Test-JarvisArtifactHash -Path $InstallerPath -ExpectedSha256 $installerE
 if (-not $hash.ok) { Add-Result 'hash' $false $hash.reason; Die "installer hash check failed: $($hash.reason)" }
 Add-Result 'hash' $true "installer sha256 $($hash.actual)"
 
-# ── 3. Install ───────────────────────────────────────────────────────────────
+# ── 3. Fixed-port preflight and install ──────────────────────────────────────
 $installOwned = $false
 $serverProcess = $null
 try {
-if (-not $SkipLaunch) { Assert-JarvisPortAvailable -Port $Port }
+if (-not $SkipLaunch) {
+    Write-Step 'Preflighting the fixed server port'
+    try {
+        Assert-JarvisPortAvailable -Port $ServerPort
+    } catch {
+        Add-Result 'preflight' $false $_.Exception.Message
+        Die "port $ServerPort is already in use, and the packaged server always binds that fixed port (server-jarvis/src/server-guards.ts SERVER_PORT). The smoke will not measure another process's listener: stop the process that owns $ServerPort and re-run. ($($_.Exception.Message))"
+    }
+    Add-Result 'preflight' $true "port $ServerPort is free"
+}
 if (-not $SkipInstall) {
     Write-Step 'Installing the release'
     try {
@@ -283,21 +298,21 @@ if (-not $SkipLaunch) {
     if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
         Die "packaged server bundle missing: $bundlePath"
     }
-    $healthUrl = "http://127.0.0.1:$Port/health"
+    $healthUrl = "http://127.0.0.1:$ServerPort/health"
     try {
-        $serverProcess = Start-JarvisServerBundle -BundlePath $bundlePath -Port $Port -WorkingDirectory (Split-Path -Parent $bundlePath)
+        $serverProcess = Start-JarvisServerBundle -BundlePath $bundlePath -WorkingDirectory (Split-Path -Parent $bundlePath)
     } catch {
         Add-Result 'launch' $false $_.Exception.Message
         Die "the packaged server could not be launched: $($_.Exception.Message)"
     }
-    Add-Result 'launch' $true "server started on port $Port"
+    Add-Result 'launch' $true "server started on port $ServerPort"
     try {
-        $health = Wait-JarvisHealth -Url $healthUrl -TimeoutSeconds $TimeoutSeconds
+        $health = Wait-JarvisHealth -Url $healthUrl -TimeoutSeconds $TimeoutSeconds -Process $serverProcess
     } catch {
         Add-Result 'health' $false $_.Exception.Message
         Die "the packaged server never became healthy: $($_.Exception.Message)"
     }
-    Add-Result 'health' $true "server answered on port $Port"
+    Add-Result 'health' $true "server answered on port $ServerPort"
 
     Write-Step 'Verifying the running build matches the release record'
     $provenance = Test-JarvisHealthProvenance -Health $health -Manifest $manifest
@@ -310,7 +325,7 @@ if (-not $SkipLaunch) {
     # ── 5. Chat ───────────────────────────────────────────────────────────────
     if (-not $SkipChat) {
         Write-Step 'Sending a chat request'
-        $streamUrl = "http://127.0.0.1:$Port/chat/stream"
+        $streamUrl = "http://127.0.0.1:$ServerPort/chat/stream"
         $sessionId = [guid]::NewGuid().ToString()
         try {
             $events = Read-JarvisSseStream -Url $streamUrl -Timeout $TimeoutSeconds -Body @{

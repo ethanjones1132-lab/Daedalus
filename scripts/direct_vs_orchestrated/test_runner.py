@@ -463,7 +463,6 @@ class ProcessHarnessTests(unittest.TestCase):
                         out_path=root / "capture.jsonl",
                         runtime_config=runtime_config,
                         worker_home=root / "home",
-                        port=19007,
                         workspace=root / "fixture",
                         repo_root=root,
                         popen_factory=spawn,
@@ -504,6 +503,8 @@ class ProcessHarnessTests(unittest.TestCase):
             def terminate(self):
                 events.append(("stop", self.role, self.pid))
                 self.returncode = -15
+                if self.role == "bun":
+                    active_bun.update(mode=None, pid=None)
 
             def kill(self):
                 self.returncode = -9
@@ -513,11 +514,20 @@ class ProcessHarnessTests(unittest.TestCase):
 
         events = []
         processes = []
+        # DD-064: the harness owns one Bun server on the fixed port, so the
+        # campaign test tracks which mode that single server was serving.
+        active_bun = {"mode": None, "pid": None}
+
+        def mode_of(environment):
+            return Path(environment["USERPROFILE"]).name
 
         def spawn(command, **kwargs):
             process = FakeProcess(command, kwargs)
             processes.append(process)
-            events.append(("spawn", process.role, process.pid))
+            served_mode = mode_of(kwargs["env"]) if process.role == "bun" else None
+            events.append(("spawn", process.role, process.pid, served_mode))
+            if process.role == "bun":
+                active_bun.update(mode=served_mode, pid=process.pid)
             return process
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -532,10 +542,8 @@ class ProcessHarnessTests(unittest.TestCase):
             homes = out_dir / "homes"
             for mode in ("model", "direct", "orchestrated"):
                 (homes / mode).mkdir(parents=True)
-            ports = {}
-            while len(set(ports.values())) != 3:
-                ports = {name: runner.allocate_loopback_port() for name in ("llama_cpp", "direct", "orchestrated")}
-            runner.ensure_loopback_ports_free(list(ports.values()))
+            ports = {"llama_cpp": runner.allocate_loopback_port(), "jarvis_server": runner.SERVER_PORT}
+            runner.ensure_loopback_ports_free([ports["llama_cpp"]])
             model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
             configs = runner.build_mode_configs(
                 isolated_home=homes,
@@ -546,14 +554,16 @@ class ProcessHarnessTests(unittest.TestCase):
                 model_path=root / "model.gguf",
             )
             schedule = runner.build_trial_schedule(load_tasks())
-            manifest = {"processes": [], "readiness": []}
+            manifest = {"processes": [], "readiness": [], "ports": ports}
             manifest_path = out_dir / "manifest.json"
             manifest_path.write_text("{}\n", encoding="utf-8")
             trial_events = []
+            trial_base_urls = []
 
-            def fake_capture(trial, task, **_kwargs):
-                events.append(("trial", trial["phase"], trial["mode"], trial["observation_id"]))
+            def fake_capture(trial, task, **kwargs):
+                events.append(("trial", trial["phase"], trial["mode"], trial["observation_id"], active_bun["mode"], active_bun["pid"]))
                 trial_events.append((trial["phase"], trial["mode"], trial["task_id"]))
+                trial_base_urls.append(kwargs.get("base_url"))
                 return {
                     **trial,
                     "outcome": "success",
@@ -577,33 +587,43 @@ class ProcessHarnessTests(unittest.TestCase):
                     return {"status": "ok"}
                 if parsed.path == "/health":
                     return {"ok": True, "backend": "llama_cpp", "configured_model": "alias", "bind_host": "127.0.0.1"}
-                mode = "direct" if parsed.port == ports["direct"] else "orchestrated"
-                return configs[mode]
+                self.assertEqual(parsed.port, runner.SERVER_PORT)
+                return configs[active_bun["mode"]]
 
-            with patch.object(runner, "capture_trial", side_effect=fake_capture):
-                with patch.object(runner, "_wait_for_json", side_effect=fake_readiness):
-                    runner._execute_campaign(
-                        out_dir=out_dir,
-                        manifest=manifest,
-                        manifest_path=manifest_path,
-                        tasks=load_tasks(),
-                        configs=configs,
-                        llama_argv=["llama-server.exe", "--host", "127.0.0.1"],
-                        bun_path=root / "bun.exe",
-                        repo_root=root,
-                        homes=homes,
-                        fixture_dir=fixture_dir,
-                        fixture_path=fixture,
-                        fixture_sha=digest,
-                        ports=ports,
-                        served_alias="alias",
-                        model_url=model_url,
-                        popen_factory=spawn,
-                    )
+            probes = []
+
+            with patch.object(runner, "ensure_loopback_ports_free", side_effect=lambda requested: probes.append(list(requested))):
+                with patch.object(runner, "capture_trial", side_effect=fake_capture):
+                    with patch.object(runner, "_wait_for_json", side_effect=fake_readiness):
+                        runner._execute_campaign(
+                            out_dir=out_dir,
+                            manifest=manifest,
+                            manifest_path=manifest_path,
+                            tasks=load_tasks(),
+                            configs=configs,
+                            llama_argv=["llama-server.exe", "--host", "127.0.0.1"],
+                            bun_path=root / "bun.exe",
+                            repo_root=root,
+                            homes=homes,
+                            fixture_dir=fixture_dir,
+                            fixture_path=fixture,
+                            fixture_sha=digest,
+                            ports=ports,
+                            served_alias="alias",
+                            model_url=model_url,
+                            popen_factory=spawn,
+                        )
 
         self.assertEqual(manifest["run_status"], "complete")
         self.assertEqual(len(manifest["observations"]), 28)
         self.assertEqual(len([trial for trial in trial_events if trial[0] == "warm"]), 24)
+        self.assertEqual(manifest["ports"], {"llama_cpp": ports["llama_cpp"], "jarvis_server": runner.SERVER_PORT})
+        self.assertEqual(set(trial_base_urls), {f"http://127.0.0.1:{runner.SERVER_PORT}"})
+        # DD-064: the fixed port is proven free once before the campaign and is
+        # never re-probed per restart (the previous owner's TIME_WAIT sockets
+        # would make a bind probe fail spuriously); llama.cpp is probed per start.
+        self.assertNotIn(runner.SERVER_PORT, [port for probe in probes for port in probe])
+        self.assertEqual([probe for probe in probes if probe], [[ports["llama_cpp"]], [ports["llama_cpp"]]])
         model_spawns = [event for event in events if event[:2] == ("spawn", "llama")]
         self.assertEqual(len(model_spawns), 2)
         direct_trial_index = next(i for i, event in enumerate(events) if event[0] == "trial" and event[1:3] == ("process_cold", "direct"))
@@ -613,15 +633,56 @@ class ProcessHarnessTests(unittest.TestCase):
         self.assertLess(direct_trial_index, model_stop_index)
         self.assertLess(model_stop_index, second_model_spawn_index)
         self.assertLess(second_model_spawn_index, orchestrated_trial_index)
+
+        # DD-064 fixed the Bun port, so the campaign owns one server at a time:
+        # the direct mode gets its own server, then orchestrated gets a fresh
+        # one, and no two owned Bun servers are ever alive together.
+        bun_spawns = [event for event in events if event[:2] == ("spawn", "bun")]
+        bun_stops = [event for event in events if event[:2] == ("stop", "bun")]
+        self.assertEqual([event[3] for event in bun_spawns], ["direct", "orchestrated", "direct", "orchestrated"])
+        self.assertEqual(len(bun_stops), len(bun_spawns))
+        alive = 0
+        for event in events:
+            if event[:2] == ("spawn", "bun"):
+                alive += 1
+                self.assertEqual(alive, 1, "a second Bun server was started while one was alive")
+            elif event[:2] == ("stop", "bun"):
+                alive -= 1
+                self.assertEqual(alive, 0)
+        self.assertEqual(alive, 0)
+
+        # Every trial records the single server that owned the fixed port, with
+        # the mode that server was started for.
+        for event in (item for item in events if item[0] == "trial"):
+            self.assertEqual(event[4], event[2])
+        observations = {row["observation_id"]: row for row in manifest["observations"]}
+        for event in (item for item in events if item[0] == "trial"):
+            self.assertEqual(observations[event[3]]["server_mode"], event[2])
+            self.assertEqual(observations[event[3]]["server_pid"], event[5])
+
+        # Each mode's warm block runs on the second model process, warm-up
+        # first, in the frozen counterbalanced order for that mode.
+        first_warm_index = next(i for i, event in enumerate(events) if event[0] == "trial" and event[1] in ("warmup", "warm"))
+        self.assertLess(second_model_spawn_index, first_warm_index)
+        expected_warm_order = [
+            trial["observation_id"]
+            for mode in ("direct", "orchestrated")
+            for trial in schedule
+            if trial["phase"] in ("warmup", "warm") and trial["mode"] == mode
+        ]
+        observed_warm_order = [event[3] for event in events if event[0] == "trial" and event[1] in ("warmup", "warm")]
+        self.assertEqual(observed_warm_order, expected_warm_order)
+
         self.assertEqual({process.role for process in processes}, {"llama", "bun"})
         self.assertTrue(all(process.returncode is not None for process in processes))
         bun_processes = [process for process in processes if process.role == "bun"]
-        self.assertEqual(len(bun_processes), 2)
+        self.assertEqual(len(bun_processes), 4)
         for process in bun_processes:
             self.assertIn("--no-env-file", process.command)
             self.assertIn("--no-install", process.command)
             self.assertEqual(process.kwargs["env"]["JARVIS_SERVER_HOST"], "127.0.0.1")
             self.assertNotIn("OPENAI_API_KEY", process.kwargs["env"])
+            self.assertLessEqual(set(process.kwargs["env"]), {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TEMP", "TMP", "JARVIS_HOME", "JARVIS_WORKSPACE", "JARVIS_SERVER_HOST"})
 
     def test_llama_health_status_contract_is_accepted(self):
         from unittest.mock import patch
@@ -780,18 +841,19 @@ class ProcessHarnessTests(unittest.TestCase):
                 "HTTP_PROXY": "http://proxy.invalid:8080",
                 "HTTPS_PROXY": "http://proxy.invalid:8080",
             }, clear=True):
-                env = child_env(home, port=19001, workspace=workspace)
+                env = child_env(home, workspace=workspace)
 
         for secret in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "HTTP_PROXY", "HTTPS_PROXY"):
             self.assertNotIn(secret, env)
         self.assertEqual(env["HOME"], str(home))
         self.assertEqual(env["USERPROFILE"], str(home))
-        self.assertEqual(env["JARVIS_SERVER_PORT"], "19001")
         self.assertEqual(env["JARVIS_WORKSPACE"], str(workspace))
         for name in ("APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "TEMP", "TMP"):
             self.assertTrue(Path(env[name]).is_relative_to(home), name)
         self.assertEqual(env["JARVIS_SERVER_HOST"], "127.0.0.1")
-        self.assertLessEqual(set(env), {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TEMP", "TMP", "JARVIS_SERVER_PORT", "JARVIS_SERVER_HOST", "JARVIS_WORKSPACE", "JARVIS_HOME"})
+        # DD-064: the Bun server binds the fixed SERVER_PORT, so the child
+        # environment carries no port override at all.
+        self.assertEqual(set(env), {"PATH", "SYSTEMROOT", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TEMP", "TMP", "JARVIS_SERVER_HOST", "JARVIS_WORKSPACE", "JARVIS_HOME"})
 
     def test_unavailable_or_occupied_loopback_ports_abort_before_spawn(self):
         from scripts.direct_vs_orchestrated.runner import owned_processes
@@ -1007,10 +1069,8 @@ class ProcessHarnessTests(unittest.TestCase):
             fixture_dir.mkdir()
             fixture = fixture_dir / "stock.csv"
             fixture.write_bytes(FIXTURE_PATH.read_bytes())
-            ports = {name: runner.allocate_loopback_port() for name in ("llama_cpp", "direct", "orchestrated")}
-            while len(set(ports.values())) != len(ports):
-                ports = {name: runner.allocate_loopback_port() for name in ("llama_cpp", "direct", "orchestrated")}
-            runner.ensure_loopback_ports_free(list(ports.values()))
+            ports = {"llama_cpp": runner.allocate_loopback_port(), "jarvis_server": runner.SERVER_PORT}
+            runner.ensure_loopback_ports_free([ports["llama_cpp"]])
             model_url = f"http://127.0.0.1:{ports['llama_cpp']}/v1"
             configs = runner.build_mode_configs(
                 isolated_home=homes,
