@@ -7,6 +7,7 @@ import { ROUTES, routeById, type RouteId } from './routes';
 import { Rail } from './Rail';
 import CommandPalette, { type PaletteItem } from './CommandPalette';
 import HealthBanner from '../features/system/HealthBanner';
+import BackendSetupNotice from '../features/system/BackendSetupNotice';
 import SystemStatusBar from '../features/system/SystemStatusBar';
 import BuildBadge from '../features/system/BuildBadge';
 import ActionRegistryAlertBanner from '../features/system/ActionRegistryAlertBanner';
@@ -35,7 +36,7 @@ function readCollapsed() {
  *   └──────┴──────────────────────────────────────────┘
  */
 export function Shell() {
-  const { route, navigate } = useNavigation();
+  const { route, navigate, nonce } = useNavigation();
   const { theme, toggle, choice } = useTheme();
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -124,6 +125,7 @@ export function Shell() {
 
         {choice.message && <div role={choice.status === 'saving' ? 'status' : 'alert'} className="border-b border-line px-4 py-2 text-xs text-ink-3">{choice.message}</div>}
         <ActionRegistryAlertBanner view={signals.alertChannelView} onRetry={signals.retrySignals} />
+        <BackendSetupNotice refreshKey={nonce} />
         <HealthBanner />
 
         <main

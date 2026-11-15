@@ -1,6 +1,7 @@
 import { ArrowUp, CheckCircle2, CircleAlert, Square } from 'lucide-react';
 import { Kbd, Spinner, StatusDot, cn } from '../../design';
 import { formatRunDuration } from '../../domain/chat-state';
+import { useNavigation } from '../../shell/navigation';
 import type { SessionTurn } from './useSessionTurn';
 
 /**
@@ -65,7 +66,15 @@ function LiveWire({ turn }: { turn: SessionTurn }) {
   );
 }
 
-export function Composer({ turn }: { turn: SessionTurn }) {
+export function Composer({
+  turn,
+  blockedReason = null,
+}: {
+  turn: SessionTurn;
+  /** DD-060: set when no inference backend is configured; blocks sending. */
+  blockedReason?: string | null;
+}) {
+  const { navigate } = useNavigation();
   const {
     inputRef,
     input,
@@ -80,7 +89,7 @@ export function Composer({ turn }: { turn: SessionTurn }) {
     displayedRoute,
     inferenceRoutingNotice,
   } = turn;
-  const canSend = Boolean(input.trim());
+  const canSend = Boolean(input.trim()) && !blockedReason;
 
   return (
     // ⌘K inside the composer means "new Session"; the shell's palette
@@ -91,6 +100,18 @@ export function Composer({ turn }: { turn: SessionTurn }) {
         {inferenceRoutingNotice && (
           <p role="note" aria-label="Inference routing notice" className="mb-2 text-[11px] leading-relaxed text-warn">
             {inferenceRoutingNotice}
+          </p>
+        )}
+        {blockedReason && (
+          <p role="note" aria-label="Chat setup required" className="mb-2 text-[11px] leading-relaxed text-warn">
+            {blockedReason}{' '}
+            <button
+              type="button"
+              onClick={() => navigate('settings')}
+              className="underline decoration-dotted underline-offset-2 hover:text-ink"
+            >
+              Open Settings
+            </button>
           </p>
         )}
         {turn.stopView.status && <div role="status" aria-label="Stop request" className="mb-2 text-xs text-ink-3">{turn.stopView.status}</div>}
@@ -107,13 +128,23 @@ export function Composer({ turn }: { turn: SessionTurn }) {
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
+            onKeyDown={(event) => {
+              // A blocked composer must not fire a doomed turn on Enter; other
+              // keys (⌘K → new Session) still reach the turn's handler.
+              if (blockedReason && event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                return;
+              }
+              handleKeyDown(event);
+            }}
             rows={1}
             aria-label="Chat input"
             placeholder={
-              isStreaming
-                ? 'Jarvis is thinking… (Esc to stop)'
-                : 'Ask Jarvis anything…'
+              blockedReason
+                ? 'Set up an inference backend in Settings to chat…'
+                : isStreaming
+                  ? 'Jarvis is thinking… (Esc to stop)'
+                  : 'Ask Jarvis anything…'
             }
             className="block max-h-80 min-h-[52px] w-full resize-none bg-transparent px-4 pb-1 pt-3.5 text-[14px] leading-relaxed text-ink placeholder:text-ink-4 focus:outline-none focus-visible:outline-none"
           />

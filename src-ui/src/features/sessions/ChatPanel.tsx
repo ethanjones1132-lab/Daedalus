@@ -33,6 +33,11 @@ export interface ChatPanelProps extends SessionTurnProps {
   onStreamingChange?: (streaming: boolean) => void;
   /** One-shot: arrive with the "Memory and Goal controls" disclosure open. */
   expandControls?: boolean;
+  /**
+   * Non-null when the active Inference backend is not configured (DD-060):
+   * the composer is blocked and states which setting is blank.
+   */
+  chatBlockedReason?: string | null;
 }
 
 /**
@@ -131,7 +136,7 @@ function ScopeStrip({ turn }: { turn: SessionTurn }) {
  * the transcript document, the composer with its live wire, and the
  * Inspector. All behaviour lives in `useSessionTurn`.
  */
-export function ChatPanel({ recentSessions = [], title, onStreamingChange, expandControls = false, ...props }: ChatPanelProps) {
+export function ChatPanel({ recentSessions = [], title, onStreamingChange, expandControls = false, chatBlockedReason = null, ...props }: ChatPanelProps) {
   const turn = useSessionTurn(props);
   useEffect(() => {
     onStreamingChange?.(turn.isStreaming);
@@ -209,7 +214,7 @@ export function ChatPanel({ recentSessions = [], title, onStreamingChange, expan
         </header>
 
         <Transcript turn={turn} config={config} />
-        <MemoryTurnControls turn={turn} defaultOpen={expandControls} /><Composer turn={turn} />
+        <MemoryTurnControls turn={turn} defaultOpen={expandControls} /><Composer turn={turn} blockedReason={chatBlockedReason} />
       </div>
 
       {inspectorOpen && <Inspector turn={turn} />}

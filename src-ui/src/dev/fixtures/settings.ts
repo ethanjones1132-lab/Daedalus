@@ -166,6 +166,23 @@ let nextProfile = 1;
 
 defineCommands({
   jarvis_get_config: () => structuredClone(config),
+  // DD-060: the shell's first-run setup state. Derived from the mock config so
+  // blanking a llama.cpp artifact path in Settings shows the gate and saving a
+  // path dismisses it.
+  get_backend_readiness: () => {
+    const backend = String(config.active_backend ?? '');
+    const llama = (config.llama_cpp ?? {}) as Record<string, unknown>;
+    const missing: Array<{ key: string; label: string; env_var: string }> = [];
+    if (backend === 'llama_cpp') {
+      if (!String(llama.server_path ?? '').trim()) {
+        missing.push({ key: 'llama_cpp.server_path', label: 'llama.cpp server_path', env_var: 'JARVIS_LLAMA_SERVER_PATH' });
+      }
+      if (!String(llama.model_path ?? '').trim()) {
+        missing.push({ key: 'llama_cpp.model_path', label: 'llama.cpp model_path', env_var: 'JARVIS_LLAMA_MODEL_PATH' });
+      }
+    }
+    return { state: missing.length > 0 ? 'missing_config' : 'ready', backend, missing };
+  },
   jarvis_save_config: async ({ config: next }) => {
     await sleep(500);
     config = structuredClone(next as Record<string, unknown>);

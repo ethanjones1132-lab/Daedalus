@@ -80,4 +80,27 @@ describe('application shell', () => {
     expect(within(nav).getByRole('button', { name: 'Health' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Expand navigation' })).toBeInTheDocument();
   });
+
+  it('mounts the first-run backend setup state above the routed page', async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'get_backend_readiness') {
+        return {
+          state: 'missing_config',
+          backend: 'llama_cpp',
+          missing: [
+            { key: 'llama_cpp.server_path', label: 'llama.cpp server_path', env_var: 'JARVIS_LLAMA_SERVER_PATH' },
+            { key: 'llama_cpp.model_path', label: 'llama.cpp model_path', env_var: 'JARVIS_LLAMA_MODEL_PATH' },
+          ],
+        };
+      }
+      throw new Error('native unavailable in test');
+    });
+
+    render(<App />);
+
+    const notice = await screen.findByTestId('backend-setup-notice');
+    expect(notice).toHaveTextContent('llama.cpp server_path');
+    expect(notice).toHaveTextContent('llama.cpp model_path');
+    expect(within(notice).getByRole('button', { name: 'Open Settings' })).toBeInTheDocument();
+  });
 });

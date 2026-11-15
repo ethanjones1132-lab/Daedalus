@@ -2308,6 +2308,7 @@ pub fn run() {
             get_setting,
             set_setting,
             get_jarvis_config,
+            get_backend_readiness,
             save_jarvis_config,
             list_model_profiles,
             get_active_profile,

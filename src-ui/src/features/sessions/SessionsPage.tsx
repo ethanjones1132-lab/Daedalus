@@ -15,7 +15,9 @@ import { useNavigation } from '../../shell/navigation';
 import { ChatPanel } from './ChatPanel';
 import { SessionIndex, type IndexTab } from './SessionIndex';
 import { FeedTranscript, useFeedReader } from './SessionFeeds';
-import { backendLabels } from '../../lib/backend-identity';
+import { backendLabels, backendDisplayName } from '../../lib/backend-identity';
+import { joinMissingSettings, needsBackendSetup } from '../../lib/backend-readiness';
+import { useBackendReadiness } from '../system/BackendSetupNotice';
 
 const INDEX_COLLAPSED_KEY = 'jarvis-session-index-collapsed';
 
@@ -197,6 +199,11 @@ export default function SessionsPage() {
     void loadConfig();
   }, [loadSessions, loadConfig]);
 
+  // DD-060: with no usable inference backend a turn can only fail, so the
+  // composer is blocked and says which setting is blank. The page remounts on
+  // navigation, so returning from Settings is already a fresh read.
+  const readiness = useBackendReadiness();
+
   // One-shot intent from another surface: navigate('sessions', { sessionId }).
   // `expandControls` additionally reveals the memory/goal control disclosure so
   // a workspace-binding next step is one action away. The intent is a selector,
@@ -326,6 +333,9 @@ export default function SessionsPage() {
   const { backendLabel, modelLabel } = backendLabels(config);
   const active = sessions.find((s) => s.id === activeSession);
   const feedOpen = indexTab === 'feeds';
+  const chatBlockedReason = needsBackendSetup(readiness)
+    ? `${backendDisplayName(readiness.backend)} is missing ${joinMissingSettings(readiness.missing)}. Set it in Settings to chat.`
+    : null;
 
   return (
     <div className="flex h-full min-h-0 bg-canvas">
@@ -372,6 +382,7 @@ export default function SessionsPage() {
           onStreamingChange={setStreaming}
           recentSessions={sessions}
           title={active ? active.name || active.title || 'Untitled' : undefined}
+          chatBlockedReason={chatBlockedReason}
         />
         {feedOpen && <FeedTranscript reader={feeds} onReturn={() => setIndexTab('sessions')} liveTurn={streaming} />}
       </div>

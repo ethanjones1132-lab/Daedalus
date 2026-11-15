@@ -1,4 +1,5 @@
 use crate::db::AppDb;
+use crate::jarvis::readiness::{derive_backend_readiness, with_backend_reachable, BackendReadiness};
 use crate::jarvis::types::JarvisConfig;
 use std::collections::HashMap;
 use tauri::State;
@@ -111,6 +112,36 @@ pub fn set_setting(db: State<AppDb>, key: String, value: String) -> Result<(), S
 #[tauri::command]
 pub fn get_jarvis_config(db: State<AppDb>) -> Result<JarvisConfig, String> {
     load_jarvis_config(&db)
+}
+
+/// Inference-backend readiness for the shell's first-run setup state (DD-060).
+///
+/// Boot can only `eprintln!` a blank `llama_cpp.server_path`/`model_path` that
+/// stops the local server, so a fresh install opened straight into an empty
+/// chat with no indication of what was missing. This exposes the same
+/// derivation over IPC: `ready`, or `missing_config` naming the blank settings
+/// and where they are edited.
+///
+/// Env fallbacks are applied first, exactly as `start_llama_cpp_server` does,
+/// so a path supplied through `JARVIS_LLAMA_*` counts as configured.
+#[tauri::command]
+pub fn get_backend_readiness(db: State<AppDb>) -> Result<BackendReadiness, String> {
+    let mut config = load_jarvis_config(&db)?;
+    config.llama_cpp = config.llama_cpp.clone().with_env_fallbacks();
+    let mut readiness = derive_backend_readiness(&config);
+    if readiness.backend == crate::jarvis::types::JarvisBackend::LlamaCpp {
+        // Boot skips the spawn when the port already answers
+        // (`start_llama_cpp_server` → `AlreadyListening`), so a server the user
+        // started by hand must not be reported as an unconfigured install.
+        readiness = with_backend_reachable(
+            readiness,
+            crate::backend_port_is_listening(
+                config.llama_cpp.port,
+                crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str())),
+            ),
+        );
+    }
+    Ok(readiness)
 }
 
 pub(crate) fn normalize_jarvis_config(config: &mut JarvisConfig) {
