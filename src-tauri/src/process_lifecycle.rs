@@ -3,7 +3,10 @@
 //! Start/restart callers provide the service-specific spawn function, while
 //! this module serializes starts, stores the resulting `Child`, and is the only
 //! place that terminates a tracked process. A listener on a configured port is
-//! not proof of ownership and is never killed here.
+//! not proof of ownership and is never killed here — with one deliberate
+//! exception: a slot launched through `wsl.exe` also records its guest port, and
+//! stopping that slot terminates the guest process holding it, because the
+//! wrapper handle cannot (DD-063).
 //!
 //! Hermes is the one async child: it is spawned through tokio so its stdio
 //! pipes stay non-blocking, so it cannot use `spawn_managed`'s
@@ -11,9 +14,14 @@
 //! `spawn_managed_tokio`, gets assigned to the same kill-on-close job object,
 //! and is stopped by the same `stop_all` routine the exit hook calls.
 
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+/// Upper bound for one guest-side stop. A cold or wedged distro must not hold
+/// the stop path open; the timeout child is killed by the helper.
+const GUEST_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedProcess {
@@ -48,15 +56,32 @@ pub(crate) type AsyncChildSlot = Arc<Mutex<Option<tokio::process::Child>>>;
 
 #[derive(Default)]
 struct Children {
-    bun_server: Option<Child>,
-    claude_proxy: Option<Child>,
-    ollama: Option<Child>,
-    llama_cpp: Option<Child>,
+    bun_server: Option<Slot>,
+    claude_proxy: Option<Slot>,
+    ollama: Option<Slot>,
+    llama_cpp: Option<Slot>,
     hermes: Option<AsyncChildSlot>,
 }
 
+/// How a slot was launched. A WSL-hosted backend tracks the `wsl.exe` client,
+/// which is only a wrapper: killing it leaves the guest server running with its
+/// listener still bound, so the stop path must also terminate the guest side
+/// (DD-063).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotLaunch {
+    /// The tracked `Child` is the server itself.
+    Direct,
+    /// The tracked `Child` is `wsl.exe`; `port` is the guest port it serves.
+    Wsl { port: u16 },
+}
+
+struct Slot {
+    child: Child,
+    launch: SlotLaunch,
+}
+
 impl Children {
-    fn slot(&mut self, process: ManagedProcess) -> &mut Option<Child> {
+    fn slot(&mut self, process: ManagedProcess) -> &mut Option<Slot> {
         match process {
             ManagedProcess::BunServer => &mut self.bun_server,
             ManagedProcess::ClaudeProxy => &mut self.claude_proxy,
@@ -64,6 +89,66 @@ impl Children {
             ManagedProcess::LlamaCpp => &mut self.llama_cpp,
         }
     }
+}
+
+/// One command in a slot's kill set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StopCommand {
+    pub program: &'static str,
+    pub args: Vec<String>,
+}
+
+/// Everything that has to die before a slot counts as stopped. The tracked child
+/// is always killed and reaped; a WSL-launched slot additionally needs the guest
+/// listener stopped, because `wsl.exe` does not own it on this side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotStopPlan {
+    pub kill_tracked_child: bool,
+    pub guest: Option<StopCommand>,
+}
+
+/// Guest-side stop for a server launched through `wsl.exe`. `ss` (iproute2) is
+/// available in any distro this app drives through WSL — the host-IP resolver
+/// already runs `ip route` — and reports the pid that owns the listening socket
+/// even though the Windows-side wrapper cannot see it. The listener is what
+/// blocks the next launch, so the pid that holds it is the kill target; a guest
+/// process that no longer holds the port cannot block anything.
+fn guest_stop_script(port: u16) -> String {
+    format!(
+        "for p in $(ss -ltnp 2>/dev/null | grep -F ':{port} ' | grep -o 'pid=[0-9]*' \
+         | cut -d= -f2 | sort -u); do kill $p 2>/dev/null; sleep 0.2; kill -9 $p 2>/dev/null; done; true"
+    )
+}
+
+/// The kill set for a slot. Pure so the WSL branch can be asserted without
+/// spawning a real `wsl.exe` or touching a guest distro.
+fn stop_plan(launch: SlotLaunch) -> SlotStopPlan {
+    let guest = match launch {
+        SlotLaunch::Direct => None,
+        SlotLaunch::Wsl { port } => Some(StopCommand {
+            program: "wsl.exe",
+            args: vec![
+                "--".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                guest_stop_script(port),
+            ],
+        }),
+    };
+    SlotStopPlan {
+        kill_tracked_child: true,
+        guest,
+    }
+}
+
+/// Run the guest side of a stop plan. Returns `false` when the stop could not be
+/// run to completion, so callers keep reporting termination as unconfirmed.
+fn run_guest_stop(command: &StopCommand) -> bool {
+    let mut process = Command::new(command.program);
+    process.args(&command.args);
+    crate::wsl::command_output_timeout(process, GUEST_STOP_TIMEOUT)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 static BUN_START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -272,24 +357,59 @@ fn children() -> std::sync::MutexGuard<'static, Children> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Stop and reap a tracked child. Returns `true` only when exit is confirmed
-/// (the process was observed exited, or kill+wait succeeded). An unconfirmed
-/// termination leaves the handle in place so ownership stays tracked.
-fn stop_slot(slot: &mut Option<Child>) -> bool {
-    let Some(child) = slot.as_mut() else {
-        return true;
+/// What reaping a slot left behind. A WSL-launched server is two processes from
+/// this side — the `wsl.exe` wrapper we hold a handle to, and the guest process
+/// that owns the listener — so the guest stop is returned instead of being run
+/// under the CHILDREN lock.
+enum Reap {
+    /// Nothing left to do.
+    Clean,
+    /// The wrapper is gone; this guest stop is still owed.
+    Guest(StopCommand),
+    /// The tracked wrapper could not be confirmed dead.
+    Unconfirmed,
+}
+
+/// Stop and reap a slot's tracked child. The guest side a WSL wrapper started is
+/// *not* run here: it is an external command and must not hold the CHILDREN lock.
+fn reap_slot(slot: &mut Option<Slot>) -> Reap {
+    let Some(tracked) = slot.as_mut() else {
+        return Reap::Clean;
     };
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        slot.take();
+    let plan = stop_plan(tracked.launch);
+    if plan.kill_tracked_child && !matches!(tracked.child.try_wait(), Ok(Some(_))) {
+        let _ = tracked.child.kill();
+        if tracked.child.wait().is_err() {
+            return Reap::Unconfirmed;
+        }
+    }
+    slot.take();
+    match plan.guest {
+        Some(command) => Reap::Guest(command),
+        None => Reap::Clean,
+    }
+}
+
+/// Run one guest side of a stop plan. A guest stop that could not run leaves the
+/// termination unconfirmed: the listener may still hold the port.
+fn stop_guest(command: StopCommand) -> bool {
+    if run_guest_stop(&command) {
         return true;
     }
-    let _ = child.kill();
-    match child.wait() {
-        Ok(_) => {
-            slot.take();
-            true
-        }
-        Err(_) => false,
+    log::warn!(
+        target: "jarvis::lifecycle",
+        "guest stop for a WSL-launched slot did not complete; its listener may still hold the port"
+    );
+    false
+}
+
+/// Whether a reap confirms that the whole slot — wrapper and any guest server it
+/// started — is gone.
+fn confirm_reap(reap: Reap) -> bool {
+    match reap {
+        Reap::Clean => true,
+        Reap::Guest(command) => stop_guest(command),
+        Reap::Unconfirmed => false,
     }
 }
 
@@ -303,7 +423,7 @@ fn lock_async_child(
 /// Stop and reap an async child handle (Hermes). Returns `true` only when exit
 /// is confirmed; an unconfirmed stop leaves the handle in place so ownership
 /// stays tracked. Tokio's `kill` is async-only, so this sends the kill request
-/// and polls for the exit the same way `stop_slot` waits for a std child.
+/// and polls for the exit the same way `reap_slot` waits for a std child.
 fn stop_async_child(slot: &mut Option<tokio::process::Child>) -> bool {
     let Some(child) = slot.as_mut() else {
         return true;
@@ -396,7 +516,7 @@ pub(crate) fn bun_ownership() -> BunOwnership {
     if BUN_TERMINATION_UNCONFIRMED.load(Ordering::SeqCst) {
         // A stop could not confirm exit. Re-check the handle: a confirmed exit
         // clears the uncertainty; otherwise stay Unknown and fail closed.
-        match children.bun_server.as_mut().map(|child| child.try_wait()) {
+        match children.bun_server.as_mut().map(|slot| slot.child.try_wait()) {
             Some(Ok(Some(_))) => {
                 BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
                 return BunOwnership::Exited;
@@ -406,12 +526,25 @@ pub(crate) fn bun_ownership() -> BunOwnership {
     }
     match children.bun_server.as_mut() {
         None => BunOwnership::None,
-        Some(child) => match child.try_wait() {
+        Some(slot) => match slot.child.try_wait() {
             Ok(None) => BunOwnership::Live,
             Ok(Some(_)) => BunOwnership::Exited,
             Err(_) => BunOwnership::Unknown,
         },
     }
+}
+
+/// Whether this process currently owns a live child in the slot. The supervisor
+/// uses this to tell "still coming up" (a child it spawned that has not opened
+/// its port yet, e.g. Ollama loading a model) from "down", so a tick does not
+/// replace a warm-in-progress backend (DD-063).
+pub(crate) fn is_live(process: ManagedProcess) -> bool {
+    let mut children = children();
+    children
+        .slot(process)
+        .as_mut()
+        .map(|slot| matches!(slot.child.try_wait(), Ok(None)))
+        .unwrap_or(false)
 }
 
 /// Start a managed child, or replace the child this process already owns.
@@ -422,16 +555,27 @@ pub(crate) fn launch(
     replace: bool,
     spawn: impl FnOnce() -> Result<Child, String>,
 ) -> Result<StartOutcome, String> {
+    launch_with(process, replace, SlotLaunch::Direct, spawn)
+}
+
+/// [`launch`] with the slot's launch kind. A slot launched through `wsl.exe`
+/// must record that so its stop reaches the guest server, not just the wrapper.
+pub(crate) fn launch_with(
+    process: ManagedProcess,
+    replace: bool,
+    launch: SlotLaunch,
+    spawn: impl FnOnce() -> Result<Child, String>,
+) -> Result<StartOutcome, String> {
     let _serial = process_lock(process);
     let should_clear;
-    let mut bun_unconfirmed = false;
+    let reap;
     {
         let mut children = children();
         let slot = children.slot(process);
 
         should_clear = match slot.as_mut() {
-            Some(child) => match child.try_wait() {
-                Ok(None) if !replace => return Ok(StartOutcome::AlreadyRunning(child.id())),
+            Some(tracked) => match tracked.child.try_wait() {
+                Ok(None) if !replace => return Ok(StartOutcome::AlreadyRunning(tracked.child.id())),
                 Ok(None) => true,
                 Ok(Some(_)) => true,
                 Err(error) if !replace => {
@@ -441,28 +585,30 @@ pub(crate) fn launch(
             },
             None => false,
         };
-        if should_clear {
-            let confirmed = stop_slot(slot);
-            if matches!(process, ManagedProcess::BunServer) && !confirmed {
-                bun_unconfirmed = true;
-            }
-        }
+        reap = if should_clear {
+            reap_slot(slot)
+        } else {
+            Reap::Clean
+        };
     }
+    // The guest stop is an external command; run it after the CHILDREN guard is
+    // dropped, before the replacement spawn needs the port it should have freed.
+    let confirmed = confirm_reap(reap);
     // Generation bookkeeping is atomic; the CHILDREN guard has already been
     // dropped, so no lock held across HTTP is acquired while CHILDREN is held.
     // An unconfirmed termination must NOT bump the generation: ownership stays
     // Unknown and invalidation cannot be bypassed.
     if should_clear && matches!(process, ManagedProcess::BunServer) {
-        if bun_unconfirmed {
-            BUN_TERMINATION_UNCONFIRMED.store(true, Ordering::SeqCst);
-        } else {
+        if confirmed {
             bump_bun_generation();
+        } else {
+            BUN_TERMINATION_UNCONFIRMED.store(true, Ordering::SeqCst);
         }
     }
 
     let child = spawn()?;
     let pid = child.id();
-    *children().slot(process) = Some(child);
+    *children().slot(process) = Some(Slot { child, launch });
     if matches!(process, ManagedProcess::BunServer) {
         BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
         bump_bun_generation();
@@ -473,10 +619,11 @@ pub(crate) fn launch(
 /// Stop and reap a child started by this Tauri process.
 pub(crate) fn stop(process: ManagedProcess) {
     let _serial = process_lock(process);
-    let confirmed = {
+    let reap = {
         let mut children = children();
-        stop_slot(children.slot(process))
+        reap_slot(children.slot(process))
     };
+    let confirmed = confirm_reap(reap);
     if matches!(process, ManagedProcess::BunServer) {
         if confirmed {
             BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
@@ -496,19 +643,77 @@ pub(crate) fn stop_all() {
     // The async Hermes child is tracked in the same ownership set, so the exit
     // hook stops it here too instead of leaving it running after the app quits.
     stop_registered_hermes();
-    let bun_confirmed = {
+    let (bun_reap, other_reaps) = {
         let mut children = children();
-        let confirmed = stop_slot(&mut children.bun_server);
-        stop_slot(&mut children.claude_proxy);
-        stop_slot(&mut children.ollama);
-        stop_slot(&mut children.llama_cpp);
-        confirmed
+        let bun = reap_slot(&mut children.bun_server);
+        let proxy = reap_slot(&mut children.claude_proxy);
+        let ollama = reap_slot(&mut children.ollama);
+        let llama_cpp = reap_slot(&mut children.llama_cpp);
+        (bun, [proxy, ollama, llama_cpp])
     };
+    let bun_confirmed = confirm_reap(bun_reap);
+    for reap in other_reaps {
+        let _ = confirm_reap(reap);
+    }
     if bun_confirmed {
         BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
         bump_bun_generation();
     } else {
         BUN_TERMINATION_UNCONFIRMED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// DD-063: a slot launched through `wsl.exe` must stop the guest server as well
+/// as the wrapper it tracks. The plan is asserted directly — no `wsl.exe`, distro
+/// or real child process is involved.
+#[cfg(test)]
+mod stop_plan_tests {
+    use super::{stop_plan, SlotLaunch};
+
+    fn args_of(command: &super::StopCommand) -> Vec<&str> {
+        command.args.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_wsl_launched_slot_stops_its_guest_listener_not_just_the_wrapper() {
+        let wsl = stop_plan(SlotLaunch::Wsl { port: 19877 });
+
+        assert!(
+            wsl.kill_tracked_child,
+            "the tracked wsl.exe wrapper must still be killed and reaped"
+        );
+        let guest = wsl.guest.expect(
+            "a WSL-launched slot must also stop the guest server it started; \
+             reaping only wsl.exe leaves the listener bound and blocks the next launch",
+        );
+        assert_eq!(
+            guest.program, "wsl.exe",
+            "the guest stop has to run inside WSL, not on the Windows host"
+        );
+        let args = args_of(&guest);
+        assert_eq!(
+            args.iter().take(3).copied().collect::<Vec<_>>(),
+            vec!["--", "bash", "-lc"],
+            "the guest stop must be a WSL bash invocation: {args:?}"
+        );
+        let script = args[3];
+        assert!(
+            script.contains(":19877"),
+            "the guest stop must target the slot's listener port: {script}"
+        );
+        assert!(
+            script.contains("pid=[0-9]*") && script.contains("kill"),
+            "the guest stop must kill the guest pid that owns the port: {script}"
+        );
+
+        // The other half of the regression: a directly launched slot is one
+        // process, so no guest step may be invented for it.
+        let direct = stop_plan(SlotLaunch::Direct);
+        assert!(direct.kill_tracked_child);
+        assert!(
+            direct.guest.is_none(),
+            "a directly launched slot must not run a guest stop"
+        );
     }
 }
 

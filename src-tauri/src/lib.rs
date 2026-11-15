@@ -448,9 +448,13 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     if backend_port_is_listening(OLLAMA_PORT, uses_wsl) {
         println!("[Jarvis] Ollama already running on port 11434");
     } else {
+        // DD-063: a live tracked child is a server that is still starting (model
+        // load can outlast one supervisor tick). Replacing it would kill the warm
+        // server and restart the same work; `false` reports AlreadyRunning and
+        // the wait below gives that child time to open its port.
         let launch = process_lifecycle::launch(
             process_lifecycle::ManagedProcess::Ollama,
-            true,
+            false,
             || {
                 if backend_port_is_listening(OLLAMA_PORT, uses_wsl) {
                     return Err(
@@ -731,6 +735,19 @@ pub(crate) fn claude_proxy_is_listening() -> bool {
             && is_wsl_port_listening(CLAUDE_PROXY_PORT))
 }
 
+/// The proxy runs through `wsl.exe` when its script only exists inside WSL. The
+/// lifecycle slot has to record that, so stopping it reaches the guest python
+/// process instead of only the wrapper (DD-063).
+fn claude_proxy_slot_launch() -> process_lifecycle::SlotLaunch {
+    if PROXY_USES_WSL.load(std::sync::atomic::Ordering::Relaxed) {
+        process_lifecycle::SlotLaunch::Wsl {
+            port: CLAUDE_PROXY_PORT,
+        }
+    } else {
+        process_lifecycle::SlotLaunch::Direct
+    }
+}
+
 /// Parse `netstat -ano` output for PIDs LISTENING on `port` (Windows-format
 /// rows: `  TCP    127.0.0.1:19878   0.0.0.0:0   LISTENING   29084`). Pure and
 /// unit-tested; the real netstat invocation is a thin, untested wrapper below
@@ -891,9 +908,10 @@ pub(crate) fn start_claude_cli_proxy(
         return Ok(process_lifecycle::StartOutcome::AlreadyListening);
     }
 
-    process_lifecycle::launch(
+    process_lifecycle::launch_with(
         process_lifecycle::ManagedProcess::ClaudeProxy,
         false,
+        claude_proxy_slot_launch(),
         || {
             if claude_proxy_is_listening() {
                 return Err(format!(
@@ -910,14 +928,19 @@ pub(crate) fn restart_claude_cli_proxy(
     openrouter_api_key: String,
 ) -> Result<process_lifecycle::StartOutcome, String> {
     let (script, py) = prepare_claude_cli_proxy()?;
-    process_lifecycle::launch(process_lifecycle::ManagedProcess::ClaudeProxy, true, || {
-        if claude_proxy_is_listening() {
-            return Err(format!(
+    process_lifecycle::launch_with(
+        process_lifecycle::ManagedProcess::ClaudeProxy,
+        true,
+        claude_proxy_slot_launch(),
+        || {
+            if claude_proxy_is_listening() {
+                return Err(format!(
                     "Claude proxy port {CLAUDE_PROXY_PORT} remains occupied by a listener this app does not own; leaving it untouched"
                 ));
-        }
-        spawn_claude_cli_proxy_child(script, py, ollama_model, openrouter_api_key)
-    })
+            }
+            spawn_claude_cli_proxy_child(script, py, ollama_model, openrouter_api_key)
+        },
+    )
 }
 
 fn prepare_claude_cli_proxy() -> Result<(ProxyScript, PythonInvocation), String> {
@@ -1535,18 +1558,26 @@ fn should_hide_jarvis_server_console(is_windows: bool, _looks_like_local_bun: bo
     is_windows
 }
 
+/// The one decision on whether the Bun server runs inside WSL. `spawn_jarvis_server`
+/// and the lifecycle slot must agree on it: the slot records how the server was
+/// launched, so a mismatch would make the stop path hunt a guest listener that
+/// was never started (DD-063).
+fn bun_launches_through_wsl(is_windows: bool, bun: &str) -> bool {
+    is_windows && !(bun.to_ascii_lowercase().ends_with(".exe") && !bun.contains("wsl"))
+}
+
 fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
-    let looks_like_local_bun =
-        is_windows && bun.to_lowercase().ends_with(".exe") && !bun.contains("wsl");
+    let launches_through_wsl = bun_launches_through_wsl(is_windows, &bun);
+    let looks_like_local_bun = is_windows && !launches_through_wsl;
 
     // Owned-process authority: only this spawned child receives the private
     // capability and app instance id. Never logged, never persisted to config.
     let (cap_name, cap_value, app_name, app_value) =
         crate::jarvis::memory::transport::owned_memory_env();
 
-    let spawn_result = if is_windows && !looks_like_local_bun {
+    let spawn_result = if launches_through_wsl {
         // Original WSL path for dev / full WSL setups.
         let cmd = format!("exec {} {}", bun, entry);
         let mut command = std::process::Command::new("wsl.exe");
@@ -1630,8 +1661,10 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     Ok(child)
 }
 
+/// Whether the Bun server is launched inside WSL. Shares the spawn rule so the
+/// port probe and the lifecycle slot can never disagree about the launch mode.
 pub(crate) fn bun_uses_wsl() -> bool {
-    cfg!(target_os = "windows") && !find_bun_executable().to_ascii_lowercase().ends_with(".exe")
+    bun_launches_through_wsl(cfg!(target_os = "windows"), &find_bun_executable())
 }
 
 /// Port-only check used by the supervisor. Native desktop launches do not
@@ -1648,9 +1681,21 @@ fn start_jarvis_server(
     replace: bool,
 ) -> Result<process_lifecycle::StartOutcome, String> {
     let entry = entry.to_string();
-    process_lifecycle::launch(
+    // Record how this spawn will launch the server: the tracked `Child` is only
+    // the `wsl.exe` wrapper in a WSL setup, so the stop path needs the guest port
+    // to reach the server that actually holds the listener (DD-063).
+    let bun = find_bun_executable();
+    let slot_launch = if bun_launches_through_wsl(cfg!(target_os = "windows"), &bun) {
+        process_lifecycle::SlotLaunch::Wsl {
+            port: BUN_SERVER_PORT,
+        }
+    } else {
+        process_lifecycle::SlotLaunch::Direct
+    };
+    process_lifecycle::launch_with(
         process_lifecycle::ManagedProcess::BunServer,
         replace,
+        slot_launch,
         || {
             if bun_server_is_listening() {
                 return Err(format!(
@@ -3525,6 +3570,86 @@ mod local_backend_probe_tests {
             !llama.contains("is_port_listening(") && !llama.contains("is_wsl_port_listening("),
             "the llama.cpp boot path must not use the unconditional probe, which \
              spawns wsl.exe even for a native backend:\n{llama}"
+        );
+    }
+}
+
+/// DD-063 wiring: the stop plan and the supervisor decision are only worth
+/// anything if the spawn sites actually record their launch kind and stop
+/// replacing a live child. These starters perform real boot work and cannot be
+/// invoked from a unit test, so this reads their bodies instead.
+#[cfg(test)]
+mod owned_slot_wiring_tests {
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// Whitespace-insensitive slice of one function body, so the assertions do
+    /// not break when a call is rewrapped but the arguments stay the same.
+    fn normalized_body(signature: &str, next: &str) -> String {
+        let start = SOURCE
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} must exist in lib.rs"));
+        let end = SOURCE[start..]
+            .find(next)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{next} must follow {signature} in lib.rs"));
+        SOURCE[start..end].split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn the_ollama_boot_path_never_replaces_a_live_child() {
+        // replace=true would kill a server that is still loading a model: the
+        // launch reports AlreadyRunning and the wait below gives it time instead.
+        let ollama = normalized_body(
+            "pub(crate) async fn start_ollama_and_warm(",
+            "pub(crate) async fn start_llama_cpp_server(",
+        );
+        assert!(
+            ollama.contains("process_lifecycle::launch( process_lifecycle::ManagedProcess::Ollama, false,"),
+            "the Ollama start must not replace a child that is still coming up:\n{ollama}"
+        );
+    }
+
+    #[test]
+    fn wsl_launched_children_record_their_guest_port_in_the_slot() {
+        // Each site that can spawn `wsl.exe` must pass the matching launch kind,
+        // otherwise `stop` only reaps the wrapper and the guest listener survives.
+        let bun = normalized_body("fn start_jarvis_server(", "/// Force-restart the Bun server.");
+        assert!(
+            bun.contains("bun_launches_through_wsl(")
+                && bun.contains("process_lifecycle::SlotLaunch::Wsl { port: BUN_SERVER_PORT,")
+                && bun.contains(
+                    "process_lifecycle::launch_with( process_lifecycle::ManagedProcess::BunServer, replace, slot_launch,"
+                ),
+            "the Bun starter must record a WSL launch so its stop reaches the guest server:\n{bun}"
+        );
+
+        let proxy = normalized_body(
+            "pub(crate) fn start_claude_cli_proxy(",
+            "pub(crate) fn restart_claude_cli_proxy(",
+        );
+        assert!(
+            proxy.contains(
+                "process_lifecycle::launch_with( process_lifecycle::ManagedProcess::ClaudeProxy, false, claude_proxy_slot_launch(),"
+            ),
+            "the proxy starter must record its launch kind:\n{proxy}"
+        );
+
+        let restart = normalized_body(
+            "pub(crate) fn restart_claude_cli_proxy(",
+            "fn prepare_claude_cli_proxy()",
+        );
+        assert!(
+            restart.contains(
+                "process_lifecycle::launch_with( process_lifecycle::ManagedProcess::ClaudeProxy, true, claude_proxy_slot_launch(),"
+            ),
+            "a proxy restart must record its launch kind too:\n{restart}"
+        );
+
+        let slot_launch = normalized_body("fn claude_proxy_slot_launch()", "/// Parse `netstat -ano`");
+        assert!(
+            slot_launch.contains("process_lifecycle::SlotLaunch::Wsl { port: CLAUDE_PROXY_PORT,")
+                && slot_launch.contains("process_lifecycle::SlotLaunch::Direct"),
+            "the proxy launch kind must follow the WSL script source:\n{slot_launch}"
         );
     }
 }

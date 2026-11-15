@@ -50,6 +50,31 @@ fn may_restart(consecutive_failures: u32) -> bool {
     consecutive_failures < MAX_CONSECUTIVE_RESTARTS
 }
 
+/// What one supervisor tick should do about Ollama. Pure and separate from the
+/// tick so the two ownership rules are unit-testable without a live backend:
+/// a closed port does not mean "down" when this process still owns a child that
+/// is coming up, and switching the backend off must stop the owned child
+/// (DD-063).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OllamaAction {
+    /// Ollama is not the active backend: stop the child this process started.
+    StopOwned,
+    /// Listening, or an owned child is still warming: leave it alone.
+    Leave,
+    /// No listener and no owned child: start one.
+    Start,
+}
+
+fn ollama_tick_action(is_ollama: bool, listening: bool, owned_live: bool) -> OllamaAction {
+    if !is_ollama {
+        return OllamaAction::StopOwned;
+    }
+    if listening || owned_live {
+        return OllamaAction::Leave;
+    }
+    OllamaAction::Start
+}
+
 fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
     match service {
         SupervisedService::Bun => &BUN_FAILS,
@@ -238,20 +263,38 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── Ollama (only required when it is the active backend) ──
-    if !is_ollama || crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
-        OLLAMA_FAILS.store(0, Ordering::Relaxed);
-    } else {
-        let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
-        if may_restart(fails) {
-            crate::start_ollama_and_warm(ollama_model).await;
-            if crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
-                OLLAMA_FAILS.store(0, Ordering::Relaxed);
-                println!("[supervisor] Ollama was down — relaunched.");
-            } else {
-                let next = OLLAMA_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!(
-                    "[supervisor] Ollama restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
-                );
+    // A closed port is not proof the backend is down: the child this process
+    // owns may still be warming behind a model load. Restarting it on the next
+    // tick would kill the work in progress, so liveness is read from the slot
+    // first and the backend-off branch stops that child instead of orphaning it.
+    let ollama_owned =
+        crate::process_lifecycle::is_live(crate::process_lifecycle::ManagedProcess::Ollama);
+
+    match ollama_tick_action(
+        is_ollama,
+        crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl),
+        ollama_owned,
+    ) {
+        OllamaAction::StopOwned => {
+            OLLAMA_FAILS.store(0, Ordering::Relaxed);
+            crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::Ollama);
+        }
+        OllamaAction::Leave => {
+            OLLAMA_FAILS.store(0, Ordering::Relaxed);
+        }
+        OllamaAction::Start => {
+            let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
+            if may_restart(fails) {
+                crate::start_ollama_and_warm(ollama_model).await;
+                if crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
+                    OLLAMA_FAILS.store(0, Ordering::Relaxed);
+                    println!("[supervisor] Ollama was down — relaunched.");
+                } else {
+                    let next = OLLAMA_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "[supervisor] Ollama restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
+                    );
+                }
             }
         }
     }
@@ -339,6 +382,62 @@ mod tests {
         assert!(may_restart(MAX_CONSECUTIVE_RESTARTS - 1));
         assert!(!may_restart(MAX_CONSECUTIVE_RESTARTS));
         assert!(!may_restart(MAX_CONSECUTIVE_RESTARTS + 1));
+    }
+
+    #[test]
+    fn a_warming_ollama_is_never_replaced_and_switching_off_stops_it() {
+        // Closed port, but the child this process owns is still loading a model:
+        // the next tick must leave it alone instead of replace=true killing it.
+        assert_eq!(
+            ollama_tick_action(true, false, true),
+            OllamaAction::Leave,
+            "an owned child that has not opened its port yet is coming up, not down"
+        );
+        // No listener and no owned child is the only reason to start one.
+        assert_eq!(ollama_tick_action(true, false, false), OllamaAction::Start);
+        // A listener — ours or someone else's — must not be restarted around.
+        assert_eq!(ollama_tick_action(true, true, false), OllamaAction::Leave);
+        // Switching the backend off stops the child this app started; leaving
+        // it running is the DD-063 orphan.
+        assert_eq!(
+            ollama_tick_action(false, false, true),
+            OllamaAction::StopOwned,
+            "the child must not survive the backend being switched off"
+        );
+        assert_eq!(ollama_tick_action(false, true, false), OllamaAction::StopOwned);
+
+        // The decision only fixes the tick if the tick routes through it and
+        // acts on the stop, so pin the wiring in the production half too.
+        let production = supervisor_production_source();
+        let ollama = production
+            .split_once("// ── Ollama")
+            .and_then(|(_, rest)| rest.split_once("// ── llama.cpp"))
+            .map(|(block, _)| block)
+            .expect("the Ollama supervisor block must sit between its section markers");
+        assert!(
+            ollama.contains("process_lifecycle::is_live"),
+            "the tick must read owned liveness before deciding Ollama is down:\n{ollama}"
+        );
+        let liveness_read = ollama
+            .find("process_lifecycle::is_live")
+            .expect("liveness read must appear in the Ollama block");
+        let decision = ollama
+            .find("ollama_tick_action(")
+            .expect("the Ollama block must route through the decision seam");
+        assert!(
+            liveness_read < decision,
+            "owned liveness must be read before the tick decides Ollama is down:\n{ollama}"
+        );
+        assert!(
+            ollama.contains("ollama_tick_action("),
+            "the tick must route through the tested decision seam:\n{ollama}"
+        );
+        assert!(
+            ollama.contains("OllamaAction::StopOwned")
+                && ollama.contains("process_lifecycle::stop(")
+                && ollama.contains("ManagedProcess::Ollama"),
+            "the backend-off arm must stop the owned Ollama child:\n{ollama}"
+        );
     }
 
     #[test]
