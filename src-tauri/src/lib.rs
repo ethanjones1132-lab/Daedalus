@@ -364,6 +364,40 @@ fn report_ollama_startup_failure(error: &str) {
     record_ollama_startup_failure(&crate::supervisor::OLLAMA_FAILS, error);
 }
 
+/// DD-065: ownership of the single in-flight Ollama warm request.
+///
+/// A warm blocks its thread for up to 180 s, so a second caller (boot, config
+/// save, supervisor tick) must not stack another blocking thread while one is
+/// still running. The flag is held by the worker through this guard and
+/// released in `Drop`, so a warm that has finished never blocks the next one.
+struct OllamaWarmGuard {
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OllamaWarmGuard {
+    /// Returns `None` when another caller still owns the in-flight warm.
+    fn try_acquire(in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Option<Self> {
+        in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| Self {
+                in_flight: std::sync::Arc::clone(in_flight),
+            })
+    }
+}
+
+impl Drop for OllamaWarmGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn warm_model(model: String) {
     // Best-effort: send a 1-token generate request so the model is hot when
     // the user fires their first chat. Failures are non-fatal.
@@ -387,6 +421,9 @@ fn warm_model(model: String) {
 /// spawns `ollama serve`, waits up to ~15s for the port, registers the child for
 /// shutdown, and warms the model off-thread. Only called when Ollama is the active
 /// backend, so OpenRouter/Claude-CLI sessions don't pay for a local model server.
+///
+/// A warm that is already in flight is not duplicated (DD-065); the caller returns
+/// without spawning a second blocking thread.
 ///
 /// `model` is the configured `ollama.model` from the active config. Defaults to
 /// `"qwen3:8b"` only when an empty string is passed (e.g. from the reconcile path
@@ -453,7 +490,26 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
         }
     }
     // Warm the model off the async runtime so we don't block the boot task.
-    std::thread::spawn(move || warm_model(model));
+    // DD-065: at most one warm may be in flight. A config save or supervisor
+    // tick that overlaps the boot warm skips instead of stacking a second
+    // thread that could block for another 180 s. The guard is dropped when the
+    // worker returns, so a later call after a completed warm warms again.
+    static OLLAMA_WARM_IN_FLIGHT: std::sync::OnceLock<
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    > = std::sync::OnceLock::new();
+    let in_flight = OLLAMA_WARM_IN_FLIGHT
+        .get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    match OllamaWarmGuard::try_acquire(in_flight) {
+        Some(guard) => {
+            std::thread::spawn(move || {
+                let _guard = guard;
+                warm_model(model);
+            });
+        }
+        None => {
+            println!("[Jarvis] Ollama warm already in flight; not warming again");
+        }
+    }
 }
 
 /// Start the configured local llama.cpp server with the placement, speculation
@@ -3752,6 +3808,67 @@ mod ollama_binary_lookup_tests {
         assert!(
             !body.contains(r#"eprintln!("[Jarvis] Ollama startup failed"#),
             "the health surface must replace the eprintln-only failure:\n{body}"
+        );
+    }
+}
+
+/// DD-065: overlapping warm requests must not stack background threads that
+/// each block for up to 180 s, while a warm that has finished must still let
+/// the next call warm again. These tests drive the guard directly; no Ollama
+/// process, port, or HTTP client is involved.
+#[cfg(test)]
+mod ollama_warm_guard_tests {
+    use super::OllamaWarmGuard;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn an_in_flight_warm_is_not_stacked_and_a_finished_warm_runs_again() {
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let workers = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+
+        // First caller: acquire then hand the guard to the worker, exactly as
+        // `start_ollama_and_warm` does before `thread::spawn`.
+        let first = {
+            let guard = OllamaWarmGuard::try_acquire(&in_flight)
+                .expect("the first caller must acquire the warm guard");
+            let workers = Arc::clone(&workers);
+            std::thread::spawn(move || {
+                let _guard = guard;
+                workers.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).expect("test receiver must be alive");
+                // Stand in for `warm_model` blocking for up to 180 s.
+                let _ = finish_rx.recv();
+            })
+        };
+        started_rx.recv().expect("the first worker must start");
+
+        assert!(
+            OllamaWarmGuard::try_acquire(&in_flight).is_none(),
+            "a second caller must not spawn a second warm worker while one is in flight"
+        );
+        assert_eq!(
+            workers.load(Ordering::SeqCst),
+            1,
+            "only one warm worker may be started while the warm is in flight"
+        );
+
+        finish_tx.send(()).expect("the first worker must be alive");
+        first.join().expect("the first warm worker must exit cleanly");
+
+        let later = OllamaWarmGuard::try_acquire(&in_flight)
+            .expect("a completed warm must release the guard so a later call can warm again");
+        drop(later);
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "dropping the guard must clear the in-flight flag"
+        );
+        assert_eq!(
+            workers.load(Ordering::SeqCst),
+            1,
+            "the later call must acquire the guard without a second worker starting here"
         );
     }
 }
