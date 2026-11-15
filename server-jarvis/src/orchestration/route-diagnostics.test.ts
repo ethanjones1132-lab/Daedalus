@@ -197,6 +197,7 @@ describe("bounded orchestration route diagnostics", () => {
     const result = await service.run(explicitInput({ operation_id: "probe-expiring" }));
 
     expect(result.status).toBe("success");
+    expect(result.reason_code).toBeUndefined();
     expect(dispatches).toBe(1);
   });
 

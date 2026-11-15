@@ -241,11 +241,15 @@ export function createRouteDiagnosticService(
       const controller = new AbortController();
       const current: ActiveDiagnostic = { operationId, controller };
       active = current;
-      const deadline = startedAt + timeoutMs;
+      // stage-route-policy compares this shared deadline against Date.now(), so it
+      // must be expressed on the wall clock. Deriving it from the injected `now`
+      // (used for reporting timestamps) put the deadline in the past whenever a
+      // caller stubbed the clock, failing every candidate as already expired.
+      const deadline = Date.now() + timeoutMs;
       const timer = setTimeout(() => {
         current.cancelReason = "timeout";
         controller.abort("route_diagnostic_timeout");
-      }, Math.max(0, deadline - now()));
+      }, Math.max(0, deadline - Date.now()));
       const routePlan = new RoutePlan();
       let reasonCode: string | undefined;
       try {
