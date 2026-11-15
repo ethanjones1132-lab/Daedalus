@@ -19,6 +19,17 @@ import { isNativeError } from "node:util/types";
 /** Bun's documented default hostname for `Bun.serve`. */
 export const DEFAULT_BIND_HOSTNAME = "0.0.0.0";
 
+/**
+ * The one port the Bun server binds.
+ *
+ * DD-064: this is the single source of truth. The native side probes this fixed
+ * port (`src-tauri/src/wsl.rs`), so there is deliberately no `JARVIS_SERVER_PORT`
+ * override. A user-set port used to be honoured here while the native probe and
+ * every hard-coded client stayed on this value, so the app silently talked to a
+ * port the server was not listening on.
+ */
+export const SERVER_PORT = 19877;
+
 /** Content budget for a rejection reason, excluding the log prefix/ellipsis. */
 export const MAX_REJECTION_REASON_CHARS = 200;
 
@@ -208,10 +219,16 @@ export function isAddressInUseError(error: unknown): boolean {
   return /\bEADDRINUSE\b|address already in use|is port \d+ in use\?/i.test(errorMessageOf(error));
 }
 
-/** The operator-facing line for a taken port; names the real host and port. */
+/**
+ * The operator-facing line for a taken port; names the real host and port.
+ *
+ * The port is fixed (`SERVER_PORT`), so there is nothing to offer here beyond
+ * stopping the other listener — advertising an env override would send the
+ * operator to a knob the server no longer reads.
+ */
 export function formatAddressInUseMessage(target: BindTarget): string {
   return `${BIND_LOG_PREFIX} cannot start: ${formatBindAddress(target)} is already in use (EADDRINUSE); `
-    + `${ADDRESS_IN_USE_HINT} — stop it, or set JARVIS_SERVER_PORT to a free port.`;
+    + `${ADDRESS_IN_USE_HINT} — stop that process and retry.`;
 }
 
 export interface BindGuardDeps {

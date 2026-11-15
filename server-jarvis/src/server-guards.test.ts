@@ -20,6 +20,7 @@ import { join } from "path";
 import {
   ADDRESS_IN_USE_HINT,
   MAX_REJECTION_REASON_CHARS,
+  SERVER_PORT,
   errorCodeOf,
   formatAddressInUseMessage,
   formatUnhandledRejectionLine,
@@ -353,21 +354,40 @@ describe("entrypoint wiring", () => {
   test("the rejection guard is installed after self-log wiring and before startup constants", () => {
     const selfLogCall = source.indexOf("installSelfLog();");
     const guardCall = source.indexOf("installRejectionGuard();");
-    const portConstant = source.indexOf("const PORT =");
+    const startupConstant = source.indexOf("const BIND_TARGET =");
 
     expect(selfLogCall).toBeGreaterThan(-1);
     expect(guardCall).toBeGreaterThan(selfLogCall);
-    expect(portConstant).toBeGreaterThan(guardCall);
+    expect(startupConstant).toBeGreaterThan(guardCall);
   });
 
   test("the real HTTP bind goes through the guard with the resolved host and port", () => {
     // No bare top-level `serve({` may remain: that is the DS-31 form.
     expect(source).not.toMatch(/^serve\(\{/m);
     expect(source).toMatch(/guardServerBind\(\s*\(\)\s*=>\s*serve\(\{/);
-    expect(source).toMatch(/const BIND_TARGET = resolveBindTarget\(PORT, process\.env\.JARVIS_SERVER_HOST\);/);
+    expect(source).toMatch(/const BIND_TARGET = resolveBindTarget\(SERVER_PORT, process\.env\.JARVIS_SERVER_HOST\);/);
     expect(source).toMatch(/hostname: BIND_TARGET\.hostname,/);
+    // The port is the fixed constant, never an env value.
+    expect(source).toMatch(/^\s*port: SERVER_PORT,$/m);
     // The guarded thunk keeps the original serve options byte-for-byte:
     // idleTimeout 0 (long SSE turns) and the same baseFetch handler.
     expect(source).toMatch(/guardServerBind\(\s*\(\)\s*=>\s*serve\(\{[\s\S]*?idleTimeout: 0,[\s\S]*?fetch: baseFetch,/);
+  });
+
+  // DD-064: the native probe and every client use 19877, so the server must not
+  // read or advertise a port override. Both cases below fail on the pre-patch
+  // entrypoint (an env-derived `const PORT`) and on the pre-patch
+  // address-in-use line.
+  test("the port is a fixed constant and the entrypoint reads no JARVIS_SERVER_PORT", () => {
+    expect(SERVER_PORT).toBe(19877);
+    expect(source).not.toContain("JARVIS_SERVER_PORT");
+  });
+
+  test("the address-in-use line names the fixed port and offers no env override", () => {
+    const message = formatAddressInUseMessage(resolveBindTarget(SERVER_PORT));
+    expect(message).toContain(`0.0.0.0:${SERVER_PORT}`);
+    expect(message).toContain(ADDRESS_IN_USE_HINT);
+    expect(message).not.toContain("JARVIS_SERVER_PORT");
+    expect(message).not.toMatch(/set\b.*\bfree port/i);
   });
 });

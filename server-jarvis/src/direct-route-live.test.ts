@@ -3,6 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
+import { SERVER_PORT } from "./server-guards";
+
 // Real owned Bun children, with a deterministic loopback HTTP fixture in place
 // of a model. This proves dispatch/attribution, not model quality or latency.
 const alias = "direct-route-live-fixture";
@@ -44,7 +46,10 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
       const configDir = join(home, ".openclaw", "jarvis");
       mkdirSync(configDir, { recursive: true });
       const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
-      const port = probe.port!;
+      // DD-064: the server binds the fixed SERVER_PORT and ignores this env var.
+      // Hand it a free port to prove the override is dead, then connect to the
+      // fixed port the native probe uses.
+      const ignoredPort = probe.port!;
       probe.stop(true);
       writeFileSync(join(configDir, "config.json"), JSON.stringify({
         active_backend: "llama_cpp", jarvis_path: home,
@@ -63,11 +68,11 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
         env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "",
           HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
           LOCALAPPDATA: join(home, "AppData", "Local"), TEMP: home, TMP: home,
-          JARVIS_SERVER_PORT: String(port), JARVIS_SERVER_HOST: "127.0.0.1" },
+          JARVIS_SERVER_PORT: String(ignoredPort), JARVIS_SERVER_HOST: "127.0.0.1" },
       });
       const output = new Response(child.stdout).text();
       const errors = new Response(child.stderr).text();
-      const base = `http://127.0.0.1:${port}`;
+      const base = `http://127.0.0.1:${SERVER_PORT}`;
       try {
         let ready = false;
         for (let tries = 0; tries < 120; tries++) {
@@ -75,6 +80,7 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
           try {
             const health = await (await fetch(`${base}/health`, { signal: AbortSignal.timeout(500) })).json() as any;
             expect(health.bind_host).toBe("127.0.0.1");
+            expect(health.bind_port).toBe(SERVER_PORT);
             ready = health.ok === true;
             if (ready) break;
           } catch { /* startup only */ }

@@ -9,7 +9,7 @@ console.log(`[Jarvis startup] process entry uptime=${process.uptime()}s timeOrig
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
 import { installSelfLog, selfLogPath } from "./self-log";
-import { guardServerBind, installRejectionGuard, resolveBindTarget } from "./server-guards";
+import { SERVER_PORT, guardServerBind, installRejectionGuard, resolveBindTarget } from "./server-guards";
 installSelfLog();
 // DD-035 / DS-30: installed right after the self-log tee (so the line is
 // captured no matter how this process was spawned) and before any async startup
@@ -732,7 +732,6 @@ export function saveCompanionState(state: CompanionState): void {
 // ═══════════════════════════════════════════════════════════════
 // ── Constants ──
 // ═══════════════════════════════════════════════════════════════
-const PORT = Number(process.env.JARVIS_SERVER_PORT ?? 19877);
 
 /** Process-wide local conductor — maintains per-session Ollama prefix state. */
 const persistentConductor = new PersistentConductor(loadConfig);
@@ -813,9 +812,6 @@ const replanCounter = new SessionReplanCounter({
   maxPerSession: loadConfig().orchestrator.max_conductor_replans_per_session,
   store: new SelfTuningStore(),
 });
-if (!Number.isInteger(PORT) || PORT <= 0 || PORT > 65535) {
-  throw new Error(`JARVIS_SERVER_PORT must be an integer between 1 and 65535, got ${process.env.JARVIS_SERVER_PORT}`);
-}
 const BRIDGE_PORT = 19876;
 const JARVIS_VERSION = jarvisPackage.version;
 
@@ -6918,6 +6914,7 @@ export async function baseFetch(req: Request): Promise<Response> {
       return Response.json({
         ok: true,
         bind_host: BIND_TARGET.hostname,
+        bind_port: BIND_TARGET.port,
         uptime: process.uptime(),
         version: JARVIS_VERSION,
         backend: hcfg.active_backend,
@@ -7346,7 +7343,11 @@ export async function baseFetch(req: Request): Promise<Response> {
 // The options below are unchanged; hostname is stated explicitly at Bun's
 // default (all interfaces) unless an isolated caller selects a host explicitly.
 // The health payload and serve() use this same effective target.
-const BIND_TARGET = resolveBindTarget(PORT, process.env.JARVIS_SERVER_HOST);
+// DD-064: the port is the fixed `SERVER_PORT` constant (19877) the native probe
+// targets. There is no env override any more: a user-set port was honoured here
+// while every native probe and hard-coded client stayed on 19877, so the app was
+// silently pointed at a port nothing listened on.
+const BIND_TARGET = resolveBindTarget(SERVER_PORT, process.env.JARVIS_SERVER_HOST);
 
 // Ensure the jarvis workspace directory exists before the server starts
 // loadConfig() returns defaultConfig() untouched when no config file exists, and
@@ -7356,7 +7357,7 @@ ensureWorkspaceDirectory(normalizeConfig(loadConfig()).jarvis_path, mkdirSync);
 guardServerBind(
   () => serve({
     hostname: BIND_TARGET.hostname,
-    port: PORT,
+    port: SERVER_PORT,
     // Disable Bun's idle-connection timeout (default 10s). Chat is a long-lived
     // SSE stream: during a single model call the server sends no frames, and a
     // slow local/free model can idle well past 10s — Bun would close the socket
@@ -7370,7 +7371,7 @@ guardServerBind(
   BIND_TARGET,
 );
 
-console.log(`[Jarvis API] Listening on http://localhost:${PORT}`);
+console.log(`[Jarvis API] Listening on http://localhost:${SERVER_PORT}`);
 
 // Warm the resident conductor in the background. Native startup launches the
 // model server asynchronously, so Bun can bind before llama.cpp finishes
