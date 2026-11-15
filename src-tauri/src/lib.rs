@@ -66,19 +66,121 @@ pub(crate) fn wsl_home() -> String {
 /// The port `ollama serve` binds. Kept in sync with `supervisor.rs`.
 pub(crate) const OLLAMA_PORT: u16 = 11434;
 
+/// `ollama` ships as `ollama.exe` on Windows.
+fn ollama_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "ollama.exe"
+    } else {
+        "ollama"
+    }
+}
+
+/// The host's `PATH` separator (`;` on Windows, `:` elsewhere).
+fn ollama_path_separator() -> char {
+    if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    }
+}
+
+/// Every location `find_ollama_binary` searches, in priority order.
+///
+/// Pure — it only reads injected environment values — so the Windows install
+/// locations and the `PATH` walk are unit-testable without a real Ollama
+/// install and without depending on the host's own environment.
+///
+/// Order: an explicit `JARVIS_OLLAMA_BIN`, the Unix install dirs that predate
+/// the Windows lookup, the per-user Windows installer location
+/// (`%LOCALAPPDATA%\Programs\Ollama\ollama.exe`), then every `PATH` directory.
+fn ollama_candidate_paths(
+    env: impl Fn(&str) -> Option<String>,
+    path_separator: char,
+    executable: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(explicit) = env("JARVIS_OLLAMA_BIN").map(|value| value.trim().to_string()) {
+        if !explicit.is_empty() {
+            candidates.push(std::path::PathBuf::from(explicit));
+        }
+    }
+    if let Some(home) = env("HOME").filter(|home| !home.trim().is_empty()) {
+        candidates.push(
+            std::path::PathBuf::from(home.trim())
+                .join(".local")
+                .join("bin")
+                .join(executable),
+        );
+    }
+    candidates.push(std::path::PathBuf::from("/usr/local/bin").join(executable));
+    candidates.push(std::path::PathBuf::from("/usr/bin").join(executable));
+    // DD-061: the per-user install the Windows installer writes. Without it a
+    // native Windows install never finds `ollama` and never starts the backend.
+    if let Some(local_app_data) = env("LOCALAPPDATA").filter(|dir| !dir.trim().is_empty()) {
+        candidates.push(
+            std::path::PathBuf::from(local_app_data.trim())
+                .join("Programs")
+                .join("Ollama")
+                .join(executable),
+        );
+    }
+    if let Some(path) = env("PATH") {
+        for directory in path.split(path_separator) {
+            let directory = directory.trim().trim_matches('"');
+            if !directory.is_empty() {
+                candidates.push(std::path::PathBuf::from(directory).join(executable));
+            }
+        }
+    }
+
+    candidates
+}
+
+fn ollama_candidates_from_env() -> Vec<std::path::PathBuf> {
+    ollama_candidate_paths(
+        |key| std::env::var(key).ok(),
+        ollama_path_separator(),
+        ollama_executable_name(),
+    )
+}
+
+/// Pure lookup seam: candidate list and filesystem probe are injected so a
+/// test can prove precedence and misses without touching the machine.
+fn find_ollama_binary_with(
+    env: impl Fn(&str) -> Option<String>,
+    path_separator: char,
+    executable: &str,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    ollama_candidate_paths(env, path_separator, executable)
+        .into_iter()
+        .find(|candidate| exists(candidate))
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
 fn find_ollama_binary() -> Option<String> {
-    [
-        std::env::var("JARVIS_OLLAMA_BIN").ok(),
-        Some(format!(
-            "{}/.local/bin/ollama",
-            std::env::var("HOME").unwrap_or_default()
-        )),
-        Some("/usr/local/bin/ollama".into()),
-        Some("/usr/bin/ollama".into()),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| std::path::Path::new(p).exists())
+    find_ollama_binary_with(
+        |key| std::env::var(key).ok(),
+        ollama_path_separator(),
+        ollama_executable_name(),
+        |candidate| candidate.exists(),
+    )
+}
+
+/// Actionable text for a lookup miss: names every searched location so the
+/// health surface says how to fix it (install Ollama, add it to `PATH`, or set
+/// the `JARVIS_OLLAMA_BIN` override).
+fn ollama_missing_binary_diagnostic(candidates: &[std::path::PathBuf]) -> String {
+    let searched = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Ollama binary not found; install Ollama, add it to PATH, or set \
+         JARVIS_OLLAMA_BIN. Searched: {searched}"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,18 +330,38 @@ fn build_hermes_app_state() -> HermesAppState {
     HermesAppState::with_lazy_interpreter(build_hermes_config(), resolver)
 }
 
-fn spawn_ollama() -> Option<std::process::Child> {
+/// Resolve and spawn `ollama serve`. A miss is an `Err` carrying the searched
+/// locations so the caller can surface it on the health counter instead of
+/// losing it to the console.
+fn spawn_ollama() -> Result<std::process::Child, String> {
     use std::process::{Command, Stdio};
-    let bin = find_ollama_binary()?;
+    let bin = find_ollama_binary()
+        .ok_or_else(|| ollama_missing_binary_diagnostic(&ollama_candidates_from_env()))?;
     let mut command = Command::new(&bin);
     command
         .arg("serve")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     crate::wsl::hide_windows_console(&mut command);
-    let child = process_lifecycle::spawn_managed(&mut command).ok()?;
+    let child = process_lifecycle::spawn_managed(&mut command)
+        .map_err(|error| format!("could not spawn Ollama ({bin}): {error}"))?;
     println!("[Jarvis] Ollama started (PID {}, bin {})", child.id(), bin);
-    Some(child)
+    Ok(child)
+}
+
+/// Log a failed Ollama start and count it where the rest of the app already
+/// looks: `get_system_health` derives `supervisor.ollama_give_up` from this
+/// counter. A missing binary used to be an `eprintln!` only, so the health row
+/// showed "not running" with no sign that startup was even attempted.
+/// Counting here as well as in the supervisor tick is intentional: an absent
+/// binary is a hard failure, so its retry budget is spent faster.
+fn record_ollama_startup_failure(counter: &std::sync::atomic::AtomicU32, error: &str) -> u32 {
+    log::error!(target: "jarvis::supervisor", "Ollama startup failed: {error}");
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn report_ollama_startup_failure(error: &str) {
+    record_ollama_startup_failure(&crate::supervisor::OLLAMA_FAILS, error);
 }
 
 fn warm_model(model: String) {
@@ -298,7 +420,7 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
                         "Ollama port 11434 is occupied by a process this app does not own; leaving it untouched".into(),
                     );
                 }
-                spawn_ollama().ok_or_else(|| "could not spawn Ollama".to_string())
+                spawn_ollama()
             },
         );
         match launch {
@@ -312,7 +434,7 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
                 println!("[Jarvis] Ollama port is already listening");
             }
             Err(error) => {
-                eprintln!("[Jarvis] Ollama startup failed: {error}");
+                report_ollama_startup_failure(&error);
                 return;
             }
         }
@@ -3457,5 +3579,179 @@ mod jarvis_bundle_lookup_tests {
                  install that finds no bundle must return None:\n{body}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ollama_binary_lookup_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A Windows-shaped environment: no `HOME`, the per-user install root the
+    /// Windows installer uses, and a `PATH` with two directories.
+    const LOCAL_APP_DATA: &str = r"C:\Users\ethan\AppData\Local";
+    const PATH_VALUE: &str = r"C:\Tools;C:\Program Files\Ollama";
+
+    fn windows_env(explicit: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| match key {
+            "JARVIS_OLLAMA_BIN" => explicit.map(str::to_string),
+            "LOCALAPPDATA" => Some(LOCAL_APP_DATA.to_string()),
+            "PATH" => Some(PATH_VALUE.to_string()),
+            _ => None,
+        }
+    }
+
+    fn windows_install() -> PathBuf {
+        PathBuf::from(LOCAL_APP_DATA)
+            .join("Programs")
+            .join("Ollama")
+            .join("ollama.exe")
+    }
+
+    fn on_path(directory: &str) -> PathBuf {
+        PathBuf::from(directory).join("ollama.exe")
+    }
+
+    /// Reads `true` only for the exact paths listed, like a filesystem holding
+    /// just those files.
+    fn only_files(paths: &[PathBuf]) -> impl Fn(&Path) -> bool + '_ {
+        move |candidate: &Path| paths.iter().any(|path| path == candidate)
+    }
+
+    #[test]
+    fn candidates_cover_the_windows_install_and_every_path_entry() {
+        let candidates = ollama_candidate_paths(windows_env(None), ';', "ollama.exe");
+
+        assert!(
+            candidates.contains(&windows_install()),
+            "the per-user Windows install location must be searched: {candidates:?}"
+        );
+        for directory in [r"C:\Tools", r"C:\Program Files\Ollama"] {
+            assert!(
+                candidates.contains(&on_path(directory)),
+                "PATH directory {directory} must be searched for ollama.exe: {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_override_wins_over_the_install_and_path() {
+        let explicit = r"D:\custom\ollama.exe";
+        let mut existing = vec![windows_install()];
+        existing.push(on_path(r"C:\Tools"));
+        existing.push(on_path(r"C:\Program Files\Ollama"));
+        existing.push(PathBuf::from(explicit));
+
+        let found = find_ollama_binary_with(
+            windows_env(Some(explicit)),
+            ';',
+            "ollama.exe",
+            only_files(&existing),
+        );
+
+        assert_eq!(
+            found.as_deref(),
+            Some(explicit),
+            "JARVIS_OLLAMA_BIN must stay the first candidate"
+        );
+    }
+
+    #[test]
+    fn a_native_windows_install_is_found_without_the_binary_being_on_path() {
+        let existing = vec![windows_install()];
+
+        let found = find_ollama_binary_with(
+            windows_env(None),
+            ';',
+            "ollama.exe",
+            only_files(&existing),
+        );
+
+        assert_eq!(
+            found,
+            Some(windows_install().to_string_lossy().into_owned()),
+            "a default Windows install that is not on PATH must still resolve"
+        );
+    }
+
+    #[test]
+    fn a_binary_only_on_path_is_resolved_from_a_path_entry() {
+        let existing = vec![on_path(r"C:\Program Files\Ollama")];
+
+        let found = find_ollama_binary_with(
+            windows_env(None),
+            ';',
+            "ollama.exe",
+            only_files(&existing),
+        );
+
+        assert_eq!(
+            found,
+            Some(on_path(r"C:\Program Files\Ollama").to_string_lossy().into_owned()),
+            "a PATH install must resolve when the default install dir is absent"
+        );
+    }
+
+    #[test]
+    fn a_miss_names_every_searched_location_and_reaches_the_health_counter() {
+        let candidates = ollama_candidate_paths(windows_env(None), ';', "ollama.exe");
+        let diagnostic = ollama_missing_binary_diagnostic(&candidates);
+
+        assert_eq!(
+            find_ollama_binary_with(windows_env(None), ';', "ollama.exe", |_| false),
+            None,
+            "an empty filesystem must miss"
+        );
+        for expected in [
+            windows_install(),
+            on_path(r"C:\Tools"),
+            on_path(r"C:\Program Files\Ollama"),
+        ] {
+            let expected = expected.display().to_string();
+            assert!(
+                diagnostic.contains(&expected),
+                "the miss must name {expected} so the health error is actionable: {diagnostic}"
+            );
+        }
+        assert!(
+            diagnostic.contains("JARVIS_OLLAMA_BIN"),
+            "the miss must point at the override: {diagnostic}"
+        );
+
+        let health_counter = AtomicU32::new(0);
+        let failures = record_ollama_startup_failure(&health_counter, &diagnostic);
+        assert_eq!(failures, 1);
+        assert_eq!(
+            health_counter.load(Ordering::Relaxed),
+            1,
+            "a failed lookup must land on the counter get_system_health reads"
+        );
+        assert_eq!(record_ollama_startup_failure(&health_counter, &diagnostic), 2);
+    }
+
+    /// The pure tests above prove the lookup and the counter; this reads the
+    /// boot path to prove the miss is actually routed there instead of dying in
+    /// an `eprintln!`.
+    #[test]
+    fn the_boot_path_reports_ollama_failures_through_the_health_counter() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("pub(crate) async fn start_ollama_and_warm(")
+            .expect("start_ollama_and_warm must exist in lib.rs");
+        let rest = &SOURCE[start..];
+        let end = rest
+            .find("/// Start the configured local llama.cpp server")
+            .expect("the llama.cpp starter must follow start_ollama_and_warm");
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("report_ollama_startup_failure(&error)"),
+            "the Ollama start error arm must report to the health counter:\n{body}"
+        );
+        assert!(
+            !body.contains(r#"eprintln!("[Jarvis] Ollama startup failed"#),
+            "the health surface must replace the eprintln-only failure:\n{body}"
+        );
     }
 }
