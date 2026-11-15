@@ -190,6 +190,8 @@ Choosing a certificate and wiring it up: [`docs/release-signing.md`](docs/releas
 bash scripts/verify.sh              # rust lint + both tsc jobs
 bash scripts/verify.sh --test       # + cargo test + bun test
 bash scripts/verify.sh --build      # + server dist + UI dist
+
+npm run typecheck:ui                # UI types from the repo root, using src-ui's own tsc
 ```
 
 **Last full recorded run — 2026-10-14: 3,412/3,412 Bun tests and the full Cargo suite green, both `tsc` jobs clean (Windows environment; platform-specific tests skipped where the OS cannot reproduce them).**
@@ -197,6 +199,33 @@ bash scripts/verify.sh --build      # + server dist + UI dist
 The tree has grown since that run: **185 test files under `server-jarvis/src`**, 215 across the repo including the UI. Reproduce with `bash scripts/verify.sh --test` rather than trusting this paragraph — the number in a README is a claim, and the command is the evidence.
 
 Suite growth is itself the artifact of how this repo is maintained: **240 Bun tests on 2026-06-24 → 2,469 on 2026-08-01**, added by a cron-driven maintenance loop that ships small, test-first, commit-attributed changes on a daily cadence. `PRIORITIES.md` records each pass with its commit SHAs and the test delta it produced.
+
+### UI typecheck from the repo root
+
+A brief's acceptance line for UI types should name **`npm run typecheck:ui` at the
+repo root**, not `npx tsc -b src-ui`:
+
+```bash
+npm run typecheck:ui                # tsc -b inside src-ui
+npm run typecheck:ui -- --force     # extra flags pass through to tsc
+```
+
+`scripts/check-root-tsc.mjs` runs the compiler `src-ui` already installed
+(`src-ui/node_modules/typescript`, the version pinned by
+`src-ui/package.json`) with `src-ui` as the working directory, so it needs no
+root dependency, no lockfile, and never reaches the npm registry. If that
+compiler is missing it exits **non-zero with code 2** and names the expected
+path and the fix (`cd src-ui && bun install`), so a half-provisioned worktree is
+a stated environment failure rather than a silent download. `npx` is avoided on
+purpose: it would resolve a compiler from the registry instead of failing.
+
+The two overrides are for exercising the guard: `JARVIS_UI_TSC` names the
+compiler entry point and `JARVIS_UI_DIR` names the UI directory. Pointing
+`JARVIS_UI_TSC` at a bogus path is how the missing-compiler failure is
+reproduced. The project's `include` is `["src"]`, so a deliberate type error
+used to prove the gate is live goes under `src-ui/src/` (for example
+`src-ui/src/typecheck-scratch.ts`); a file elsewhere under `src-ui/` is not
+part of the project and no typecheck would see it.
 
 ---
 

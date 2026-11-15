@@ -1,5 +1,8 @@
 {
   "name": "jarvis-desktop",
   "version": "1.0.0",
-  "private": true
+  "private": true,
+  "scripts": {
+    "typecheck:ui": "node scripts/check-root-tsc.mjs"
+  }
 }
