@@ -4,6 +4,7 @@
 //! Crashed is a terminal state; the user must explicitly restart.
 
 use crate::jarvis::hermes::protocol::{BridgeError, IncomingMessage, OutgoingMessage, Rid};
+use crate::process_lifecycle::{spawn_managed_tokio, stop_hermes, AsyncChildSlot};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -87,8 +88,9 @@ pub struct HermesProcess {
     next_rid: AtomicU64,
     /// Stdin writer side of the child's IPC pipe.
     writer: Mutex<Option<tokio::process::ChildStdin>>,
-    /// Child handle (kept so we can wait/kill).
-    child: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// Child handle (kept so we can wait/kill). Registered with the native
+    /// process lifecycle manager, so the app's exit hook stops it as well.
+    child: AsyncChildSlot,
     /// Broadcast channel for events.
     events: broadcast::Sender<HermesEvent>,
 }
@@ -102,7 +104,7 @@ impl HermesProcess {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_rid: AtomicU64::new(1),
             writer: Mutex::new(None),
-            child: Arc::new(Mutex::new(None)),
+            child: Arc::new(std::sync::Mutex::new(None)),
             events,
         }
     }
@@ -141,18 +143,22 @@ impl HermesProcess {
         for (k, v) in &self.config.extra_env {
             command.env(k, v);
         }
-        let mut child = command.spawn().map_err(BridgeError::Io)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdin not captured")))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdout not captured")))?;
+        // Spawn through the native process lifecycle manager: the child joins
+        // the kill-on-close job object and the ownership registry, so it cannot
+        // outlive the app.
+        if let Err(error) = spawn_managed_tokio(&self.child, &mut command).await {
+            return Err(BridgeError::Io(error));
+        }
+        let (stdin, stdout) = match take_stdio(&self.child) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                // Do not leave an untracked, pipe-less child behind.
+                let _ = stop_hermes(&self.child);
+                return Err(error);
+            }
+        };
 
         *self.writer.lock().await = Some(stdin);
-        *self.child.lock().await = Some(child);
 
         // Reader task: parses newline-delimited JSON, dispatches responses and
         // events. Runs until the child closes stdout or we mark the process
@@ -221,9 +227,16 @@ impl HermesProcess {
                 });
             }
             // Drop the child handle to release the OS process; if the user
-            // wants to restart, they call `start` again.
-            let mut g = child_slot.lock().await;
-            if let Some(mut c) = g.take() {
+            // wants to restart, they call `start` again. The registry entry for
+            // this slot is left for the next start or the exit hook to clear,
+            // so this reader can never stop a newer child.
+            let taken = {
+                let mut g = child_slot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                g.take()
+            };
+            if let Some(mut c) = taken {
                 let _ = c.kill().await;
             }
         });
@@ -302,17 +315,35 @@ impl HermesProcess {
         }
     }
 
-    /// Politely shut the child down. Marks Draining, then kills the OS process
-    /// (the Python side does not currently expose a graceful-shutdown RPC).
+    /// Politely shut the child down. Marks Draining, then stops the OS process
+    /// through the ownership registry (the Python side does not currently
+    /// expose a graceful-shutdown RPC).
     pub async fn shutdown(&self) -> Result<(), BridgeError> {
         *self.state.lock().await = HermesState::Draining;
-        let mut g = self.child.lock().await;
-        if let Some(mut c) = g.take() {
-            let _ = c.kill().await;
-        }
+        stop_hermes(&self.child);
         *self.state.lock().await = HermesState::Cold;
         Ok(())
     }
+}
+
+/// Take the child's piped stdio. The handle itself stays in the registered
+/// slot, so the exit hook can still stop the process after the pipes are gone.
+fn take_stdio(
+    slot: &AsyncChildSlot,
+) -> Result<(tokio::process::ChildStdin, tokio::process::ChildStdout), BridgeError> {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let child = slot.as_mut().ok_or_else(|| {
+        BridgeError::Io(std::io::Error::other("child handle missing after spawn"))
+    })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdin not captured")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BridgeError::Io(std::io::Error::other("child stdout not captured")))?;
+    Ok((stdin, stdout))
 }
 
 // (the broken CloneArc trait helper was removed in the recovery; Arc::clone
