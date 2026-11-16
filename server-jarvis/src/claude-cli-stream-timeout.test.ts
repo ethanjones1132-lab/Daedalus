@@ -236,6 +236,84 @@ describe("Claude CLI child lifetime", () => {
     expect(events.some((event) => event.type === "result" && event.content === "hello")).toBe(true);
     expect(events.some((event) => event.type === "message_stop" && event.session_id === "sess")).toBe(true);
     expect(events.some((event) => event.error?.includes("timed out"))).toBe(false);
+    expect(events.filter((event) => event.type === "message_stop")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+  });
+
+  test("an exit status of code 0 still ends in one message_stop", async () => {
+    const stdout = new ScriptedStream();
+    const stderr = new ScriptedStream();
+    stdout.push({ done: false, value: '{"type":"result","result":"hello"}\n' });
+    stdout.push({ done: true, value: undefined });
+    stderr.push({ done: true, value: undefined });
+    const events = await withSuiteDeadline(collect({
+      waitUntilSpawned: async () => undefined,
+      stdout,
+      stderr,
+      kill() {},
+      waitForExit: async () => ({ code: 0, signal: null }),
+    }, 5_000, manualClock(), "sess"));
+
+    expect(events.filter((event) => event.type === "message_stop")).toHaveLength(1);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  test("a child killed by a signal fails the turn instead of ending at message_stop", async () => {
+    const stdout = new ScriptedStream();
+    const stderr = new ScriptedStream();
+    // Output can look complete and still be truncated by the kill, so the
+    // signal alone must decide the turn's outcome.
+    stdout.push({ done: false, value: '{"type":"result","result":"partial work"}\n' });
+    stdout.push({ done: true, value: undefined });
+    stderr.push({ done: true, value: undefined });
+    const events = await withSuiteDeadline(collect({
+      waitUntilSpawned: async () => undefined,
+      stdout,
+      stderr,
+      kill() {},
+      waitForExit: async () => ({ code: null, signal: "SIGKILL" }),
+    }, 5_000, manualClock(), "sess"));
+
+    const failure = events.find((event) => event.type === "error");
+    if (!failure) throw new Error("a signal-killed child must yield an error event");
+    expect(failure.is_error).toBe(true);
+    expect(failure.error).toContain("SIGKILL");
+    expect(events.some((event) => event.type === "message_stop")).toBe(false);
+  });
+
+  test("a non-zero exit with no stderr still fails the turn", async () => {
+    const stdout = new ScriptedStream();
+    const stderr = new ScriptedStream();
+    stdout.push({ done: true, value: undefined });
+    stderr.push({ done: true, value: undefined });
+    const events = await withSuiteDeadline(collect({
+      waitUntilSpawned: async () => undefined,
+      stdout,
+      stderr,
+      kill() {},
+      waitForExit: async () => 3,
+    }, 5_000, manualClock(), "sess"));
+
+    expect(events.some((event) => event.type === "message_stop")).toBe(false);
+    expect(events.some((event) => event.type === "error" && event.error?.includes("code 3"))).toBe(true);
+  });
+
+  test("a non-zero exit with stderr keeps reporting that stderr", async () => {
+    const stdout = new ScriptedStream();
+    const stderr = new ScriptedStream();
+    stdout.push({ done: true, value: undefined });
+    stderr.push({ done: false, value: "authentication_failed" });
+    stderr.push({ done: true, value: undefined });
+    const events = await withSuiteDeadline(collect({
+      waitUntilSpawned: async () => undefined,
+      stdout,
+      stderr,
+      kill() {},
+      waitForExit: async () => 1,
+    }, 5_000, manualClock(), "sess"));
+
+    expect(events.some((event) => event.type === "message_stop")).toBe(false);
+    expect(events.some((event) => event.type === "error" && event.error === "authentication_failed")).toBe(true);
   });
 
   test("string stdout and stderr chunks match equivalent byte chunks", async () => {

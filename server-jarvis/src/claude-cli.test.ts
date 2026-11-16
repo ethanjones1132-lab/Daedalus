@@ -3,9 +3,11 @@ import {
   buildClaudeCliChatArgs,
   buildLocalClaudeArgs,
   buildLocalClaudeEnv,
+  claudeCliExitStatusFromProcess,
   compactTurnHistoryForCli,
   decodeClaudeCliMessage,
   estimateCommandLineLength,
+  normalizeClaudeCliExit,
   prepareClaudeCliInvocation,
   projectOpenCodeGoBaseUrlForClaudeCli,
   resolveClaudeCliLaunchOptions,
@@ -217,6 +219,40 @@ describe("Claude CLI local-only launch contract", () => {
   test("estimateCommandLineLength accounts for quoting", () => {
     const len = estimateCommandLineLength("claude.exe", ["--print", "hello world"]);
     expect(len).toBeGreaterThan(20);
+  });
+});
+
+describe("Claude CLI exit status", () => {
+  test("a bare exit code is a normal exit and normalises to code 0", () => {
+    expect(normalizeClaudeCliExit(0)).toEqual({ code: 0, signal: null });
+    expect(normalizeClaudeCliExit(7)).toEqual({ code: 7, signal: null });
+  });
+
+  test("an exit status keeps the signal instead of flattening it to exit 0", () => {
+    expect(normalizeClaudeCliExit({ code: null, signal: "SIGTERM" })).toEqual({
+      code: null,
+      signal: "SIGTERM",
+    });
+  });
+
+  test("a signalled child process reports the signal, not a clean exit", () => {
+    // Node/Bun leave exitCode null when the OS killed the child.
+    expect(claudeCliExitStatusFromProcess({ exitCode: null, signalCode: "SIGKILL" })).toEqual({
+      code: null,
+      signal: "SIGKILL",
+    });
+    expect(claudeCliExitStatusFromProcess({ exitCode: null, signalCode: "SIGTERM" })).toEqual({
+      code: null,
+      signal: "SIGTERM",
+    });
+  });
+
+  test("a live child reports no exit status and a clean exit reports code 0", () => {
+    expect(claudeCliExitStatusFromProcess({ exitCode: null, signalCode: null })).toBeUndefined();
+    expect(claudeCliExitStatusFromProcess({ exitCode: 0, signalCode: null })).toEqual({
+      code: 0,
+      signal: null,
+    });
   });
 });
 

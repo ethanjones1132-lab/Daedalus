@@ -829,14 +829,46 @@ export async function readClaudeCliStreamWithTimeout<T>(
   }
 }
 
+/**
+ * How a child process ended.
+ *
+ * `code` is the normal exit status; it is `null` when the OS ended the child
+ * with a signal, in which case `signal` names that signal. A signal kill is
+ * always a failed turn, never a clean `message_stop`.
+ */
+export interface ClaudeCliExitStatus {
+  code: number | null;
+  signal: string | null;
+}
+
 export interface ClaudeCliSpawnedChild {
   waitUntilSpawned: () => Promise<Error | undefined>;
   stdout: AsyncIterable<unknown>;
   stderr: AsyncIterable<unknown>;
   kill: () => void;
-  waitForExit: () => Promise<number>;
+  /** A bare number is a normal exit code, for simple test doubles. */
+  waitForExit: () => Promise<number | ClaudeCliExitStatus>;
   /** Runs only after spawn succeeds, before the first stdout read. */
   onSpawned?: () => void;
+}
+
+/** Normalise an exit code or a full exit status to the same shape. */
+export function normalizeClaudeCliExit(value: number | ClaudeCliExitStatus): ClaudeCliExitStatus {
+  if (typeof value === "number") return { code: value, signal: null };
+  return { code: value.code ?? null, signal: value.signal ?? null };
+}
+
+/**
+ * Read the exit state a spawned child already reports, or `undefined` while it
+ * is still running. Keeping `signalCode` here is what lets a killed turn reach
+ * the caller as a failure instead of being flattened to exit 0.
+ */
+export function claudeCliExitStatusFromProcess(proc: {
+  exitCode: number | null;
+  signalCode: string | null;
+}): ClaudeCliExitStatus | undefined {
+  if (proc.exitCode === null && proc.signalCode === null) return undefined;
+  return { code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
 }
 
 function claudeCliChunkText(value: unknown): Uint8Array | string | undefined {
@@ -953,11 +985,24 @@ export async function* streamSpawnedClaudeCli(
       return;
     }
 
-    if (exitRead.value !== 0 && stderr) {
-      yield { type: "error", error: stderr.slice(0, 500) };
-    } else {
-      yield { type: "message_stop", session_id: sessionId };
+    const exit = normalizeClaudeCliExit(exitRead.value);
+    if (exit.signal) {
+      // The OS killed the child. Its output may be truncated at an arbitrary
+      // point, so the turn failed even if a `result` record was seen earlier.
+      const message = `Claude CLI was killed by signal ${exit.signal}`;
+      yield { type: "error", error: message, content: message, is_error: true };
+      return;
     }
+    if (exit.code !== 0) {
+      yield {
+        type: "error",
+        error: stderr
+          ? stderr.slice(0, 500)
+          : `Claude CLI exited with code ${exit.code ?? "unknown"}`,
+      };
+      return;
+    }
+    yield { type: "message_stop", session_id: sessionId };
   } finally {
     if (abortListening && abortSignal) {
       abortSignal.removeEventListener("abort", onAbort);
@@ -1017,12 +1062,13 @@ export async function* streamClaudeCli(
     stdout: proc.stdout,
     stderr: proc.stderr,
     kill: () => { try { proc.kill(); } catch { /* already exited */ } },
-    waitForExit: () => new Promise((resolve) => {
-      if (proc.exitCode !== null || proc.signalCode !== null) {
-        resolve(proc.exitCode ?? 0);
+    waitForExit: () => new Promise<ClaudeCliExitStatus>((resolve) => {
+      const observed = claudeCliExitStatusFromProcess(proc);
+      if (observed) {
+        resolve(observed);
         return;
       }
-      proc.once("close", (code) => resolve(code ?? 0));
+      proc.once("close", (code, signal) => resolve({ code: code ?? null, signal: signal ?? null }));
     }),
     onSpawned: () => {
       if (promptOnStdin) {
