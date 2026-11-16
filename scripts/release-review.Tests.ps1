@@ -228,19 +228,28 @@ Describe 'cold-start listener ownership' {
     It 'refuses a busy port in the actual probe before creating an install' {
         $root = Join-Path $TestDrive 'probe-must-not-create'
         $runner = Join-Path $TestDrive 'probe-runner.ps1'
+        # DD-095: the preflight queries the listener through a bounded runspace,
+        # so a stubbed Get-NetTCPConnection in this process never reaches it.
+        # Hold a real loopback listener on the fixed port instead; the probe
+        # must still refuse before it creates anything.
         @"
-function global:Get-NetTCPConnection { [pscustomobject]@{ OwningProcess = 555 } }
+`$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 19877)
+try { `$listener.Start() } catch { }
 function global:Start-Process { throw 'unexpected_probe_launch' }
 & '$PSScriptRoot\probe-cold-start.ps1' -InstallerPath fake.exe -InstallRoot '$root'
-exit `$LASTEXITCODE
+`$probeExit = `$LASTEXITCODE
+`$listener.Stop()
+exit `$probeExit
 "@ | Set-Content -LiteralPath $runner
         $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $runner 2>&1 | Out-String
         $output | Should Match 'port_already_in_use'
         (Test-Path -LiteralPath $root) | Should Be $false
     }
     It 'rejects an existing listener before any probe side effects' {
-        Mock Get-NetTCPConnection { [pscustomobject]@{ OwningProcess = 555; LocalPort = 19877; State = 'Listen' } }
-        { Assert-JarvisPortAvailable -Port 19877 } | Should Throw 'port_already_in_use'
+        # DD-095: the preflight asks the bounded dispatcher, so the seam is
+        # the listener scriptblock, not a Get-NetTCPConnection mock.
+        $listener = { param($Port) [pscustomobject]@{ OwningProcess = 555; LocalPort = $Port; State = 'Listen' } }
+        { Assert-JarvisPortAvailable -Port 19877 -ListenerQuery $listener } | Should Throw 'port_already_in_use'
     }
 
     It 'does not stop an unrelated port listener during process cleanup' {

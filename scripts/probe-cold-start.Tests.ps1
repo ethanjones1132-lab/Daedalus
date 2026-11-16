@@ -28,6 +28,12 @@
     Test-JarvisProbeQuitPass, lives in the probe itself and is extracted
     here by AST so it can be driven entirely on fakes; a run without
     -QuitPass is pinned unchanged.
+
+    DD-095 adds the fixed-port preflight: it runs before the observation
+    deadline exists, so Assert-JarvisPortAvailable bounds its listener query
+    with a deadline of its own. The cases below drive it through an injected
+    stalling query (a local Start-Sleep) and through free/in-use answers, so
+    no real port is opened and nothing is installed or launched.
 #>
 
 . (Join-Path $PSScriptRoot 'lib\probe-bounded-queries.ps1')
@@ -145,6 +151,57 @@ Describe 'bounded query dispatch' {
             -ArgumentList @(19877) -Deadline ((Get-Date).AddSeconds(10))
         $result.status | Should Be 'failed'
         $result.error | Should Match 'wmi_unavailable'
+    }
+}
+
+Describe 'fixed-port preflight is bounded (DD-095)' {
+    # The preflight runs BEFORE the observation deadline exists, so it needs
+    # its own: a listener query that stops answering must fail the preflight
+    # inside that budget, with a bounded-query status, and never hang the run.
+    # The listener seam is a scriptblock, so no real port is opened here.
+    It 'passes a free port and hands back the bounded query result' {
+        $result = Assert-JarvisPortAvailable -Port 19877 -Deadline ((Get-Date).AddSeconds(10)) -ListenerQuery { param($Port) $null }
+        $result.name | Should Be 'preflight_listener'
+        $result.status | Should Be 'result'
+        ($null -eq $result.value) | Should Be $true
+    }
+
+    It 'fails a port that is really in use, naming the port' {
+        $listener = { param($Port) [pscustomobject]@{ LocalPort = $Port; State = 'Listen'; OwningProcess = 555 } }
+        $thrown = $null
+        try {
+            $null = Assert-JarvisPortAvailable -Port 19877 -Deadline ((Get-Date).AddSeconds(10)) -ListenerQuery $listener
+        } catch { $thrown = $_ }
+        ($null -ne $thrown) | Should Be $true
+        $thrown.Exception.Message | Should Match 'port_already_in_use:19877'
+    }
+
+    It 'returns inside its budget with a bounded-query status when the listener query stalls' {
+        $stalled = {
+            param($Port)
+            Start-Sleep -Seconds 15
+            [pscustomobject]@{ LocalPort = $Port; State = 'Listen'; OwningProcess = 555 }
+        }
+        $thrown = $null
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $null = Assert-JarvisPortAvailable -Port 19877 -Deadline ((Get-Date).AddSeconds(1)) -ListenerQuery $stalled
+        } catch { $thrown = $_ }
+        $watch.Stop()
+
+        # A bounded-query status, not a guessed verdict and not a hang: the
+        # query sleeps for 15s, the budget is 1s, and the call comes back.
+        ($null -ne $thrown) | Should Be $true
+        $thrown.Exception.Message | Should Match 'port_check_timed_out:19877'
+        ($watch.Elapsed.TotalSeconds -lt 5) | Should Be $true
+    }
+
+    It 'bounds the preflight at both call sites with a deadline' {
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match 'Assert-JarvisPortAvailable -Port 19877 -Deadline'
+        $probeText | Should Match 'ListenerQuery \(Get-JarvisProbeListenerQuery\)'
+        $smokeText = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'release-smoke.ps1')
+        $smokeText | Should Match 'Assert-JarvisPortAvailable -Port \$ServerPort -Deadline'
     }
 }
 

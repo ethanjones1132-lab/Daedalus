@@ -253,9 +253,16 @@ try {
 if (-not $SkipLaunch) {
     Write-Step 'Preflighting the fixed server port'
     try {
-        Assert-JarvisPortAvailable -Port $ServerPort
+        # DD-095: the port query is bounded like the rest of the pipeline's
+        # OS queries. A listener query that stops answering must fail the
+        # preflight inside its own deadline instead of stalling the smoke
+        # before the install has even started.
+        $null = Assert-JarvisPortAvailable -Port $ServerPort -Deadline ((Get-Date).AddSeconds(15))
     } catch {
         Add-Result 'preflight' $false $_.Exception.Message
+        if ($_.Exception.Message -notlike 'port_already_in_use*') {
+            Die "the preflight could not prove port $ServerPort free ($($_.Exception.Message)); the smoke will not attribute a listener it cannot identify to the process it starts."
+        }
         Die "port $ServerPort is already in use, and the packaged server always binds that fixed port (server-jarvis/src/server-guards.ts SERVER_PORT). The smoke will not measure another process's listener: stop the process that owns $ServerPort and re-run. ($($_.Exception.Message))"
     }
     Add-Result 'preflight' $true "port $ServerPort is free"

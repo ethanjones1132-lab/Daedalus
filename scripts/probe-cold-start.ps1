@@ -29,6 +29,9 @@
     runspace and is waited on for at most the remaining budget; a query that
     outlives it is reported as unavailable and abandoned rather than joined,
     so a stalled query cannot turn a 120s observation into an unbounded run.
+    DD-095 extends that to the fixed-port preflight, which runs before the
+    observation deadline exists: it gets its own deadline and fails the run
+    with a bounded-query status instead of hanging there.
 
 .PARAMETER InstallerPath
     The NSIS installer to test. Required.
@@ -289,7 +292,12 @@ function Mark([string]$event, [hashtable]$data) {
 $installOwned = $false
 $process = $null
 try {
-Assert-JarvisPortAvailable -Port 19877
+# DD-095: the fixed-port preflight is an OS query too, so it runs through
+# the bounded dispatcher with its own deadline. A listener query that stops
+# answering must fail the preflight inside that budget, not stall the run
+# before the observation deadline exists.
+$null = Assert-JarvisPortAvailable -Port 19877 -Deadline ((Get-Date).AddSeconds(10)) `
+    -ListenerQuery (Get-JarvisProbeListenerQuery)
 Write-Step 'Installing the packaged app (cold)'
 $InstallRoot = Install-JarvisRelease -InstallerPath $InstallerPath -InstallRoot $InstallRoot -TimeoutSeconds 120
 $installOwned = $true

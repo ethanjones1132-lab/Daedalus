@@ -861,10 +861,95 @@ function Install-JarvisRelease {
 }
 
 function Assert-JarvisPortAvailable {
+    <#
+    .SYNOPSIS
+        Preflight: fail when anything already listens on the probe port.
+
+    .DESCRIPTION
+        DD-095: the preflight is an OS query like every other one a probe run
+        makes, so it does not run on the caller's pipeline. A
+        Get-NetTCPConnection that stops answering would otherwise stall the
+        run BEFORE the observation deadline that is supposed to bound it
+        exists - the same shape as the 2026-10 cold-start run that outlived
+        its budget.
+
+        The listener query therefore goes through the bounded dispatcher the
+        rest of the probe already uses
+        (Invoke-JarvisProbeBoundedQuery in scripts/lib/probe-bounded-queries.ps1,
+        or the self-contained Invoke-JarvisCleanupBoundedQuery below when that
+        helper is not loaded), waited on for at most the remaining time to
+        $Deadline. The answer decides the preflight:
+
+            result, no listener      -> port free; the bounded result is returned
+            result, listener present -> throws port_already_in_use:<port>
+            timed_out                -> throws port_check_timed_out:<port>
+            failed                   -> throws port_check_failed:<port>
+
+        A timed-out or failed query fails the preflight rather than passing
+        it: the check exists so the run cannot be attributed to a foreign
+        listener, and "no answer" is not evidence that the port is free.
+
+    .PARAMETER Port
+        The fixed port the packaged server binds.
+
+    .PARAMETER Deadline
+        Budget for the listener query. Defaults to 15 seconds from the call.
+
+    .PARAMETER ListenerQuery
+        Query handed to the bounded dispatcher. Defaults to the probe's
+        shared query (Get-JarvisProbeListenerQuery) when that helper is
+        loaded, else to the same SELECT stated here for scripts that never
+        dot-source lib/probe-bounded-queries.ps1.
+
+    .OUTPUTS
+        The bounded query result (name, status, value, error, elapsed_ms,
+        budget_ms, detail) when the port is free. Throws otherwise.
+    #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][int]$Port)
-    if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
-        throw "port_already_in_use:$Port (close the existing listener before probing)"
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [datetime]$Deadline = (Get-Date).AddSeconds(15),
+        [scriptblock]$ListenerQuery = $null
+    )
+
+    if (-not $ListenerQuery) {
+        if (Get-Command -Name 'Get-JarvisProbeListenerQuery' -CommandType Function -ErrorAction SilentlyContinue) {
+            $ListenerQuery = Get-JarvisProbeListenerQuery
+        } else {
+            # release-common.ps1 is dot-sourced by scripts that never load
+            # the probe helpers, so the answer is repeated for them here. The
+            # shape is the one the shared query returns: first listener or
+            # $null, nothing else.
+            $ListenerQuery = {
+                param($LocalPort)
+                Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+            }
+        }
+    }
+
+    # Prefer the probe's dispatcher so a probe run uses one bounded-query
+    # implementation end to end; fall back to the one release-common owns.
+    $dispatcher = 'Invoke-JarvisCleanupBoundedQuery'
+    if (Get-Command -Name 'Invoke-JarvisProbeBoundedQuery' -CommandType Function -ErrorAction SilentlyContinue) {
+        $dispatcher = 'Invoke-JarvisProbeBoundedQuery'
+    }
+    $result = & $dispatcher -Name 'preflight_listener' -Query $ListenerQuery `
+        -Deadline $Deadline -ArgumentList @($Port)
+
+    switch ([string]$result.status) {
+        'result' {
+            if ($result.value) {
+                throw "port_already_in_use:$Port (close the existing listener before probing)"
+            }
+            return $result
+        }
+        'timed_out' {
+            throw "port_check_timed_out:$Port (the listener query did not answer inside its budget; the run will not assume the port is free)"
+        }
+        default {
+            throw "port_check_failed:$Port (the listener query errored: $($result.error))"
+        }
     }
 }
 
@@ -904,7 +989,9 @@ function Invoke-JarvisCleanupBoundedQuery {
         Same three-state contract as Invoke-JarvisProbeBoundedQuery
         (scripts/lib/probe-bounded-queries.ps1), but self-contained:
         release-common.ps1 is dot-sourced by scripts that never load the
-        probe helpers.
+        probe helpers. It is also the fallback dispatcher for the DD-095
+        fixed-port preflight (Assert-JarvisPortAvailable) in exactly those
+        scripts, so a stalled listener query cannot hold a caller open.
 
     .OUTPUTS
         [pscustomobject]@{ name; status; value; error; elapsed_ms; budget_ms; detail }
