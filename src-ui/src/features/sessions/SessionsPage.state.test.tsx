@@ -566,6 +566,76 @@ describe('ChatPanel state machine', () => {
   });
 });
 
+// Saved-row handoff around POST /chat/stream: one send produces exactly one
+// saved user row, and a POST that never reaches the server is retried against
+// the SAME persisted row instead of appending a second one.
+describe('saved user row handoff around POST /chat/stream', () => {
+  it('leaves exactly one saved user row after retrying a POST that never reached the server', async () => {
+    let attempt = 0;
+    const fetchMock = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) throw new Error('connection refused');
+      return new Response('data: {"type":"result","result":"recovered answer"}\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+
+    fireEvent.change(composer, { target: { value: 'retry me once' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    // The POST never reached the server: the row is saved (fixture append),
+    // the existing draft-recovery path holds the exact same text, and the
+    // row/draft pair stays consistent — the retry re-sends the saved message.
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('The turn failed.');
+    expect(composer.value).toBe('retry me once');
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user')).toHaveLength(1);
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() => expect(screen.getByText('recovered answer')).toBeInTheDocument());
+    // Exactly ONE saved user row for the two attempts: the retry re-used the
+    // row persisted by the first (never-delivered) POST instead of appending
+    // a second one.
+    const userAppends = invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user');
+    expect(userAppends).toHaveLength(1);
+    expect(userAppends[0]?.[1]?.content).toBe('retry me once');
+    const assistantAppends = invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant');
+    expect(assistantAppends).toHaveLength(1);
+    expect(assistantAppends[0]?.[1]?.content).toBe('recovered answer');
+    // The transcript holds exactly one bubble for the one saved row, and the
+    // draft that backed it is cleared only once the retry is accepted.
+    await waitFor(() => expect(composer.value).toBe(''));
+    expect(screen.getAllByText('retry me once')).toHaveLength(1);
+  });
+
+  it('saves a successful turn exactly once under the server-returned row id', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('data: {"type":"result","result":"done"}\n\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+
+    fireEvent.change(composer, { target: { value: 'first attempt works' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() => expect(screen.getByText('done')).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(1);
+    // The persisted row id replaces the client-generated optimistic id:
+    // native preparation references the exact id `append_message` returned,
+    // never the client id, so a history reload dedupes to one message.
+    expect(invokeMock).toHaveBeenCalledWith('memory_prepare_turn', expect.objectContaining({
+      request: expect.objectContaining({ user_message_id: 'persisted-user' }),
+    }));
+  });
+});
+
 describe('Jarvis viewport navigation', () => {
   it('keeps view and session navigation outside the scrolling transcript', async () => {
     render(<SessionsPage />);

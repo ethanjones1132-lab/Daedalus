@@ -697,6 +697,23 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   const sendGateRef = useRef(new SendGate());
   // Owns setup from native Session creation until the HTTP request begins.
   const submissionRef = useRef<{ generation: number; dispatched: boolean; optimisticUserId?: string } | null>(null);
+  // Saved-row reuse ledger for a POST that never reached the server. The
+  // user row is persisted BEFORE `POST /chat/stream`; when that POST then
+  // fails without ever starting (refused/network fetch error, or a non-OK
+  // HTTP response), there is no native single-message delete/mark command to
+  // roll the row back, so the exact (Session, content, saved row id, stale
+  // bubble ids) tuple is held here. The operator's retry of the same message
+  // in the same Session re-uses that SAME persisted row instead of appending
+  // a second one — one send can never leave two saved user rows. Consumed
+  // once on reuse; re-armed if the retry also fails before reaching the
+  // server. A client-lifetime ledger only: it intentionally never writes or
+  // deletes rows from the webview.
+  const savedUserRowRetryRef = useRef<{
+    sessionId: string;
+    content: string;
+    userMessageId: string;
+    assistantMessageId: string;
+  } | null>(null);
   // 2026-07-13 live incident (session 7254c3ae): a rapid second Enter-press
   // bypassed the React-state `isStreaming` guard because setState is
   // async/batched. The server-side ActiveStreamRegistry then silently
@@ -1651,6 +1668,24 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       throw new DOMException('Stale Session turn', 'AbortError');
     };
 
+    // Failure handoff for a saved user row whose POST never reached the
+    // server. The row stays persisted (no client-side row writes); the exact
+    // retry tuple is armed so the next identical send re-uses the row rather
+    // than appending a duplicate one. An operator Stop or a stale Session
+    // abort is NOT a transport failure and never arms this.
+    const armSavedUserRowRetry = (
+      rowId: string | null,
+      assistantId: string,
+    ) => {
+      if (!rowId) return;
+      savedUserRowRetryRef.current = {
+        sessionId: sid,
+        content: userMsg,
+        userMessageId: rowId,
+        assistantMessageId: assistantId,
+      };
+    };
+
     // One stable turn identity for this submitted turn, held across every
     // frame and the terminal native sync. It is distinct from the opaque
     // native preparation id returned by `memory_prepare_turn`.
@@ -1846,26 +1881,52 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       // returns the DB row id (sessions.rs `insert_message_row`); swapping the
       // client-generated id for it lets a later history-reload dedupe this as
       // the SAME message instance (2026-07-03 incident 1d4727cf).
-      try {
-        const dbId = await invoke<string>('append_message', {
-          ...sessionInvokeArgs(sid),
-          role: 'user',
-          content: userMsg,
-        });
-        if (typeof dbId !== 'string' || !dbId) {
-          throw new Error('the server did not return a saved message id');
+      //
+      // 1b. Saved-row reuse: if the PREVIOUS attempt of this exact message in
+      // this exact Session saved its user row but the POST never reached the
+      // server (armed by the rollback handoff below), this retry re-uses that
+      // SAME persisted row instead of appending a second one. The failed
+      // attempt's visible bubbles — the user bubble bound to the reused row
+      // and its error assistant bubble — are superseded by this retry's own
+      // optimistic bubbles and are removed first, so the transcript holds
+      // exactly one bubble per saved row and the retry looks like a first
+      // attempt. Only a live submission consumes the ledger; a stale/aborted
+      // one falls through unchanged and keeps the row re-usable.
+      const savedRetry = savedUserRowRetryRef.current;
+      const canReuseSavedRow = Boolean(
+        savedRetry
+        && savedRetry.sessionId === sid
+        && savedRetry.content === userMsg
+        && submissionAlive(),
+      );
+      if (canReuseSavedRow && savedRetry) {
+        savedUserRowRetryRef.current = null;
+        userMessageId = savedRetry.userMessageId;
+        setMessages(prev => prev
+          .filter((m) => m.id !== savedRetry.userMessageId && m.id !== savedRetry.assistantMessageId)
+          .map((m) => (m.id === clientMessageId ? { ...m, id: savedRetry.userMessageId } : m)));
+      } else {
+        try {
+          const dbId = await invoke<string>('append_message', {
+            ...sessionInvokeArgs(sid),
+            role: 'user',
+            content: userMsg,
+          });
+          if (typeof dbId !== 'string' || !dbId) {
+            throw new Error('the server did not return a saved message id');
+          }
+          userMessageId = dbId;
+          if (requestIsCurrent()) {
+            setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
+          }
+        } catch (e: any) {
+          stopIfStale();
+          console.error('Failed to persist user message:', e);
+          // No saved row -> no inference. Throw a truthful persistence failure to
+          // the existing draft-recovery path; never claim the optimistic bubble
+          // is saved.
+          throw new Error('Append failed: Daedalus could not save this message to the Session.');
         }
-        userMessageId = dbId;
-        if (requestIsCurrent()) {
-          setMessages(prev => prev.map((m) => (m.id === clientMessageId ? { ...m, id: dbId } : m)));
-        }
-      } catch (e: any) {
-        stopIfStale();
-        console.error('Failed to persist user message:', e);
-        // No saved row -> no inference. Throw a truthful persistence failure to
-        // the existing draft-recovery path; never claim the optimistic bubble
-        // is saved.
-        throw new Error('Append failed: Daedalus could not save this message to the Session.');
       }
 
       // 2. Prepare native recall and load native prompt history. References
@@ -1966,28 +2027,46 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
 
       if (submissionRef.current?.generation === sendGeneration) submissionRef.current.dispatched = true;
       const origin = await bunOrigin();
-      const response = await fetch(`${origin}/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: userMsg,
-          session_id: sid,
-          history,
-          turn_id: turnId,
-          memory_status: initialMemoryStatus,
-          ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
-          // Exact persisted user source row already bound by
-          // `goal_prepare_run`, carried only for a registered Goal turn so the
-          // server can match it against the native binding. Identity only; the
-          // server never treats it as authority and ordinary turns omit it.
-          ...(linkedGoalBindingIdRef.current && userMessageId
-            ? { source_message_id: userMessageId }
-            : {}),
-        }),
-        signal: controller.signal,
-      });
+      let response: Response;
+      try {
+        response = await fetch(`${origin}/chat/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: userMsg,
+            session_id: sid,
+            history,
+            turn_id: turnId,
+            memory_status: initialMemoryStatus,
+            ...(memoryPreparationId ? { memory_preparation_id: memoryPreparationId } : {}),
+            // Exact persisted user source row already bound by
+            // `goal_prepare_run`, carried only for a registered Goal turn so the
+            // server can match it against the native binding. Identity only; the
+            // server never treats it as authority and ordinary turns omit it.
+            ...(linkedGoalBindingIdRef.current && userMessageId
+              ? { source_message_id: userMessageId }
+              : {}),
+          }),
+          signal: controller.signal,
+        });
+      } catch (e) {
+        // The POST never reached the server (refused/network transport
+        // failure). The saved user row stays persisted — there is no native
+        // single-message delete/mark command to remove it — so arm the
+        // saved-row reuse ledger instead: the operator's retry of this exact
+        // message re-uses the row rather than appending a duplicate. An
+        // operator Stop or a stale Session abort is not a transport failure
+        // and keeps the current behaviour exactly.
+        if (controller.signal.aborted || stopRequestedRef.current) throw e;
+        armSavedUserRowRetry(userMessageId, assistantClientMessageId);
+        throw e;
+      }
 
       if (!response.ok) {
+        // Same rollback handoff for an HTTP-level rejection: the turn never
+        // started, so the saved user row is handed to the retry ledger
+        // instead of being duplicated by a re-append.
+        armSavedUserRowRetry(userMessageId, assistantClientMessageId);
         const detail = await readServerErrorMessage(response);
         const statusMessage = `Jarvis server returned ${response.status}.`;
         throw new JarvisStreamError(
