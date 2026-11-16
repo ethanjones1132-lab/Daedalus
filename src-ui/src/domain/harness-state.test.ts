@@ -65,5 +65,24 @@ describe('harness state', () => {
     expect(orderRuns([run('a', '2026-01-01'), run('z', '2026-02-01'), run('b', '2026-02-01')]).map(item => item.id)).toEqual(['z', 'b', 'a']);
     const state = harnessReducer(initialHarnessState, { type: 'history-loaded', runs: [run('a', '2026-01-01'), run('z', '2026-02-01')] });
     expect(state.runHistory.map(item => item.id)).toEqual(['z', 'a']);
+    expect(state.historyStatus).toBe('loaded');
+  });
+
+  it('keeps history loading, empty, and error states distinct and clears stale run details', () => {
+    let state = harnessReducer(initialHarnessState, { type: 'history-loading' });
+    expect(state.historyStatus).toBe('loading');
+    state = harnessReducer(state, { type: 'history-loaded', runs: [] });
+    expect(state.historyStatus).toBe('empty');
+    state = harnessReducer(state, { type: 'history-loaded', runs: [run('one', '2026-01-01')] });
+    state = harnessReducer(state, { type: 'history-run-selected', id: 'one' });
+    state = harnessReducer(state, { type: 'history-run-loaded', run: run('one', '2026-01-01') });
+    state = harnessReducer(state, { type: 'history-run-selected', id: 'missing' });
+    state = harnessReducer(state, { type: 'history-run-error', id: 'missing', message: 'Not found' });
+    expect(state.selectedHistoryRun).toBeNull();
+    expect(state.selectedHistoryRunStatus).toBe('error');
+    state = harnessReducer(state, { type: 'history-error', message: 'Unavailable' });
+    expect(state.historyStatus).toBe('error');
+    expect(state.runHistory).toEqual([]);
+    expect(state.selectedHistoryRun).toBeNull();
   });
 });

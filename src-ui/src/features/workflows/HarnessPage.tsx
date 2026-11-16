@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useReducer, useState } from 'react';
 import { Button, Page, PageHeader } from '../../design';
 import { harnessReducer, initialHarnessState } from '../../domain/harness-state';
-import type { HarnessPurpose, SavedHarnessManifest } from './harness-api';
+import type { HarnessPurpose, HarnessRun, SavedHarnessManifest } from './harness-api';
 import { HarnessApiError, harnessApi } from './harness-api';
 
 const PURPOSES: Array<{ id: HarnessPurpose; label: string }> = [
@@ -66,6 +66,29 @@ export default function HarnessPage() {
     return () => { cancelled = true; };
   }, [projectRoot, reloadKey]);
 
+  useEffect(() => {
+    const root = projectRoot.trim();
+    if (!root) {
+      dispatch({ type: 'history-reset' });
+      return;
+    }
+    let cancelled = false;
+    dispatch({ type: 'history-loading' });
+    void harnessApi.listRuns(root)
+      .then((runs) => {
+        if (cancelled) return;
+        if (!Array.isArray(runs)) {
+          dispatch({ type: 'history-error', message: 'Could not read harness run history. The response was malformed; it is not an empty history.' });
+          return;
+        }
+        dispatch({ type: 'history-loaded', runs });
+      })
+      .catch(() => {
+        if (!cancelled) dispatch({ type: 'history-error', message: 'Could not read harness run history. Retry when the project is readable.' });
+      });
+    return () => { cancelled = true; };
+  }, [projectRoot]);
+
   const manifests = useMemo(
     () => state.manifests.filter((saved) => saved.manifest.purpose === purpose),
     [state.manifests, purpose],
@@ -77,6 +100,32 @@ export default function HarnessPage() {
   function selectManifest(saved: SavedHarnessManifest) {
     setSaveError(null);
     dispatch({ type: 'manifest-selected', saved });
+  }
+
+  async function selectHistoryRun(id: string) {
+    const root = projectRoot.trim();
+    if (!root) return;
+    dispatch({ type: 'history-run-selected', id });
+    try {
+      const run = await harnessApi.getRun(root, id);
+      if (!run || run.id !== id || run.project_root !== root || !Array.isArray(run.rounds) || !Array.isArray(run.events)) {
+        dispatch({ type: 'history-run-error', id, message: 'Could not read this harness run. The response was malformed; no run details are available.' });
+        return;
+      }
+      dispatch({ type: 'history-run-loaded', run });
+    } catch (error) {
+      const message = error instanceof HarnessApiError && error.message === 'run_not_found'
+        ? 'That harness run was not found for this project. No run details are available.'
+        : 'Could not read this harness run. No run details are available; retry the lookup.';
+      dispatch({ type: 'history-run-error', id, message });
+    }
+  }
+
+  function eventPayload(run: HarnessRun, eventType: string): Record<string, unknown> | null {
+    const event = run.events.find((item) => item.event_type === eventType);
+    return typeof event?.payload === 'object' && event.payload !== null
+      ? event.payload as Record<string, unknown>
+      : null;
   }
 
   function editGuideList(field: 'rules' | 'skills' | 'references' | 'banned_defaults', value: string) {
@@ -211,7 +260,7 @@ export default function HarnessPage() {
           {!loading && !loadError && projectRoot.trim() && manifests.length === 0 && (
             <div className="space-y-3 rounded-lg border border-line bg-raised p-4">
               <p className="text-[13px] font-medium text-ink">No saved manifest for this project and purpose.</p>
-              <p className="text-[12px] leading-relaxed text-ink-3">A manifest is required before harness controls are available. No check or harness run has been performed.</p>
+              <p className="text-[12px] leading-relaxed text-ink-3">A manifest is required before harness controls are available. No check or harness run has been started from this page.</p>
               <Button size="xs" disabled>Select a manifest</Button>
             </div>
           )}
@@ -241,7 +290,7 @@ export default function HarnessPage() {
           {selected && (
             <div className="mt-4 space-y-4 rounded-lg border border-line bg-raised p-4">
               <p role="status" className="text-[12px] text-ink-2">
-                Manifest selected. No harness run has been performed.
+                Manifest selected. This page does not start harness runs; saved runs below are read-only.
               </p>
               {state.dirty.guides && (
                 <p className="text-[12px] text-ink-2">
@@ -298,7 +347,129 @@ export default function HarnessPage() {
             </div>
           )}
         </section>
+
+        <section className="rounded-xl border border-line bg-panel p-5" aria-labelledby="harness-history-heading">
+          <div className="mb-4">
+            <h2 id="harness-history-heading" className="text-[15px] font-medium text-ink">Run history</h2>
+            <p className="mt-1 text-[12px] text-ink-3">{projectRoot.trim() || 'Select a project root to view its saved runs.'}</p>
+          </div>
+          {state.historyStatus === 'idle' && (
+            <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">Enter a project root to look up saved harness runs.</p>
+          )}
+          {state.historyStatus === 'loading' && <p role="status" className="py-4 text-[13px] text-ink-3">Loading saved harness runs…</p>}
+          {state.historyStatus === 'empty' && (
+            <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">No harness run has been recorded for this project.</p>
+          )}
+          {state.historyStatus === 'error' && (
+            <p role="alert" className="rounded-lg border border-err/30 bg-err-wash p-4 text-[13px] text-err">{state.historyError}</p>
+          )}
+          {(state.historyStatus === 'loaded' || state.historyStatus === 'loading') && state.runHistory.length > 0 && (
+            <ul className="space-y-2">
+              {state.runHistory.map((run) => {
+                const stopped = eventPayload(run, 'stopped');
+                const isSelected = state.selectedHistoryRunId === run.id;
+                const matchingManifest = state.manifests.find((saved) =>
+                  saved.manifest.id === run.manifest_id && saved.manifest_hash === run.manifest_hash);
+                return (
+                  <li key={run.id}>
+                    <button
+                      type="button"
+                      aria-pressed={isSelected}
+                      onClick={() => void selectHistoryRun(run.id)}
+                      className={`w-full rounded-lg border p-4 text-left transition-colors ${isSelected ? 'border-accent bg-accent-wash' : 'border-line bg-raised hover:border-line-strong'}`}
+                    >
+                      <span className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-medium text-ink">{run.status}</span>
+                        <span className="text-[11px] text-ink-3">{run.rounds.length} {run.rounds.length === 1 ? 'round' : 'rounds'}</span>
+                      </span>
+                      <span className="mt-1 block font-mono text-[11px] text-ink-3">{run.id}</span>
+                      <span className="mt-2 grid gap-1 text-[12px] text-ink-3 sm:grid-cols-2">
+                        <span>Stop reason: {typeof stopped?.stop_reason === 'string' ? stopped.stop_reason : 'Not recorded'}</span>
+                        <span>Manifest revision: {matchingManifest ? matchingManifest.revision : 'Unavailable for this manifest hash'}</span>
+                        <span>Started: {run.created_at}</span>
+                        <span>Finished: {run.events.find((event) => event.event_type === 'stopped')?.created_at ?? 'Not recorded'}</span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+          {state.selectedHistoryRunStatus === 'loading' && <p role="status" className="mt-4 text-[13px] text-ink-3">Loading selected harness run…</p>}
+          {state.selectedHistoryRunStatus === 'error' && (
+            <p role="alert" className="mt-4 text-[13px] text-err">{state.selectedHistoryRunError}</p>
+          )}
+          {state.selectedHistoryRunStatus === 'loaded' && state.selectedHistoryRun && (() => {
+            const run = state.selectedHistoryRun;
+            const matchingManifest = state.manifests.find((saved) =>
+              saved.manifest.id === run.manifest_id && saved.manifest_hash === run.manifest_hash);
+            const sensorsById = new Map(matchingManifest?.manifest.sensors.map((sensor) => [sensor.id, sensor] as const) ?? []);
+            return (
+              <div className="mt-4 space-y-3" aria-label="Selected run details">
+                <h3 className="text-[13px] font-medium text-ink">Run rounds</h3>
+                {run.rounds.length === 0 ? (
+                  <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">This run has no rounds recorded yet.</p>
+                ) : (
+                  <ol className="space-y-3">
+                    {[...run.rounds].sort((a, b) => a.round_number - b.round_number).map((round) => {
+                      const statuses = round.sensor_results.map((result) => result.status);
+                      const hasNonZeroValue = round.sensor_results.some((result) => typeof result.counter === 'number' && result.counter > 0);
+                      const outcome = statuses.length === 0 ? 'No sensor results recorded'
+                        : statuses.includes('failed') ? 'Failed'
+                          : hasNonZeroValue ? 'Non-zero sensor value'
+                          : statuses.every((status) => status === 'passed') ? 'Passed'
+                            : statuses.every((status) => status === 'not_applicable') ? 'Not applicable'
+                              : 'Mixed sensor results';
+                      return (
+                        <li key={round.id} className="rounded-lg border border-line bg-raised p-4">
+                          <h4 className="text-[13px] font-medium text-ink">Round {round.round_number} · {outcome}</h4>
+                          {round.sensor_results.length === 0 ? (
+                            <p className="mt-2 text-[12px] text-ink-3">No sensor results recorded for this round.</p>
+                          ) : (
+                            <ul className="mt-3 space-y-3">
+                              {round.sensor_results.map((result) => {
+                                const sensor = sensorsById.get(result.sensor_id);
+                                const displayedStatus = result.status === 'passed' && typeof result.counter === 'number' && result.counter > 0
+                                  ? 'Non-zero value (reported passed)'
+                                  : result.status;
+                                return (
+                                  <li key={result.id} className="border-t border-line pt-3 text-[12px]">
+                                    <p className="font-medium text-ink">{result.sensor_id} · {displayedStatus}</p>
+                                    <p className="mt-1 text-ink-3">Result ID: <span className="font-mono">{result.id}</span> · Value: {result.counter ?? 'Not recorded'} · Zero threshold: {sensor ? sensor.zero_threshold : 'Unavailable for this manifest hash'}</p>
+                                    {result.stdout && <BoundedOutput label="stdout" value={result.stdout} truncated={result.stdout_truncated} />}
+                                    {result.stderr && <BoundedOutput label="stderr" value={result.stderr} truncated={result.stderr_truncated} />}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ol>
+                )}
+              </div>
+            );
+          })()}
+        </section>
       </section>
     </Page>
+  );
+}
+
+function BoundedOutput({ label, value, truncated }: { label: string; value: string; truncated: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="mt-2">
+      <p className="text-[11px] font-medium text-ink-3">{label}{truncated ? ' (bounded; truncated by the harness)' : ''}</p>
+      <pre className="mt-1 whitespace-pre-wrap break-words rounded-md border border-line bg-panel p-2 text-[11px] text-ink-2">
+        {!expanded && (truncated || value.length > 240) ? `${value.slice(0, 240)}…` : value}
+      </pre>
+      {(truncated || value.length > 240) && (
+        <button type="button" aria-expanded={expanded} onClick={() => setExpanded((open) => !open)} className="mt-1 text-[11px] text-accent hover:underline">
+          {expanded ? 'Show less' : 'Read more'}
+        </button>
+      )}
+    </div>
   );
 }

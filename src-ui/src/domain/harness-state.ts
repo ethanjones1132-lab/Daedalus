@@ -10,11 +10,19 @@ export interface HarnessState {
   approvalNeeded: Record<string, boolean>;
   liveRun: LiveHarnessRun | null;
   runHistory: HarnessRun[];
+  historyStatus: 'idle' | 'loading' | 'loaded' | 'empty' | 'error';
+  historyError: string | null;
+  selectedHistoryRunId: string | null;
+  selectedHistoryRun: HarnessRun | null;
+  selectedHistoryRunStatus: 'idle' | 'loading' | 'loaded' | 'error';
+  selectedHistoryRunError: string | null;
   conflict: { expectedRevision: number; currentRevision: number | null } | null;
 }
 
 export const initialHarnessState: HarnessState = {
-  manifests: [], selected: null, dirty: { guides: null, sensors: null }, approvalNeeded: {}, liveRun: null, runHistory: [], conflict: null,
+  manifests: [], selected: null, dirty: { guides: null, sensors: null }, approvalNeeded: {}, liveRun: null, runHistory: [],
+  historyStatus: 'idle', historyError: null, selectedHistoryRunId: null, selectedHistoryRun: null,
+  selectedHistoryRunStatus: 'idle', selectedHistoryRunError: null, conflict: null,
 };
 
 export type HarnessAction =
@@ -28,7 +36,14 @@ export type HarnessAction =
   | { type: 'revision-conflict'; expectedRevision: number; currentRevision?: number }
   | { type: 'run-updated'; run: LiveHarnessRun }
   | { type: 'run-finished'; run: HarnessRun }
-  | { type: 'history-loaded'; runs: HarnessRun[] };
+  | { type: 'history-loading' }
+  | { type: 'history-loaded'; runs: HarnessRun[] }
+  | { type: 'history-error'; message: string }
+  | { type: 'history-reset' }
+  | { type: 'history-run-selected'; id: string }
+  | { type: 'history-run-loading'; id: string }
+  | { type: 'history-run-loaded'; run: HarnessRun }
+  | { type: 'history-run-error'; id: string; message: string };
 
 export function harnessReducer(state: HarnessState, action: HarnessAction): HarnessState {
   switch (action.type) {
@@ -50,7 +65,41 @@ export function harnessReducer(state: HarnessState, action: HarnessAction): Harn
     case 'revision-conflict': return { ...state, conflict: { expectedRevision: action.expectedRevision, currentRevision: action.currentRevision ?? null } };
     case 'run-updated': return { ...state, liveRun: action.run };
     case 'run-finished': return { ...state, liveRun: null, runHistory: orderRuns([action.run, ...state.runHistory]) };
-    case 'history-loaded': return { ...state, runHistory: orderRuns(action.runs) };
+    case 'history-loading': return {
+      ...state, runHistory: [], historyStatus: 'loading', historyError: null,
+      selectedHistoryRunId: null, selectedHistoryRun: null, selectedHistoryRunStatus: 'idle', selectedHistoryRunError: null,
+    };
+    case 'history-loaded': {
+      const runs = orderRuns(action.runs);
+      return {
+        ...state, runHistory: runs, historyStatus: runs.length ? 'loaded' : 'empty', historyError: null,
+        selectedHistoryRunId: null, selectedHistoryRun: null, selectedHistoryRunStatus: 'idle', selectedHistoryRunError: null,
+      };
+    }
+    case 'history-error': return {
+      ...state, runHistory: [], historyStatus: 'error', historyError: action.message,
+      selectedHistoryRunId: null, selectedHistoryRun: null, selectedHistoryRunStatus: 'idle', selectedHistoryRunError: null,
+    };
+    case 'history-reset': return {
+      ...state, runHistory: [], historyStatus: 'idle', historyError: null,
+      selectedHistoryRunId: null, selectedHistoryRun: null, selectedHistoryRunStatus: 'idle', selectedHistoryRunError: null,
+    };
+    case 'history-run-selected': return {
+      ...state, selectedHistoryRunId: action.id, selectedHistoryRun: null,
+      selectedHistoryRunStatus: 'loading', selectedHistoryRunError: null,
+    };
+    case 'history-run-loading': {
+      if (state.selectedHistoryRunId !== action.id) return state;
+      return { ...state, selectedHistoryRun: null, selectedHistoryRunStatus: 'loading', selectedHistoryRunError: null };
+    }
+    case 'history-run-loaded': {
+      if (state.selectedHistoryRunId !== action.run.id) return state;
+      return { ...state, selectedHistoryRun: action.run, selectedHistoryRunStatus: 'loaded', selectedHistoryRunError: null };
+    }
+    case 'history-run-error': {
+      if (state.selectedHistoryRunId !== action.id) return state;
+      return { ...state, selectedHistoryRun: null, selectedHistoryRunStatus: 'error', selectedHistoryRunError: action.message };
+    }
   }
 }
 

@@ -1,13 +1,15 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NavigationProvider } from '../../shell/navigation';
 import HarnessPage from './HarnessPage';
-import { HarnessApiError, type SavedHarnessManifest } from './harness-api';
+import { HarnessApiError, type HarnessRun, type SavedHarnessManifest } from './harness-api';
 
-const { listManifests, updateManifest } = vi.hoisted(() => ({ listManifests: vi.fn(), updateManifest: vi.fn() }));
+const { listManifests, listRuns, getRun, updateManifest } = vi.hoisted(() => ({
+  listManifests: vi.fn(), listRuns: vi.fn(), getRun: vi.fn(), updateManifest: vi.fn(),
+}));
 vi.mock('./harness-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./harness-api')>();
-  return { ...actual, harnessApi: { ...actual.harnessApi, listManifests, updateManifest } };
+  return { ...actual, harnessApi: { ...actual.harnessApi, listManifests, listRuns, getRun, updateManifest } };
 });
 
 const savedManifest: SavedHarnessManifest = {
@@ -21,12 +23,34 @@ const savedManifest: SavedHarnessManifest = {
     guides: { rules: [], brief_template: '', skills: [], references: [], banned_defaults: [] },
     maker_agent_id: 'maker',
     checker: { enabled: true, agent_id: 'checker', rubric: '' },
-    sensors: [],
+    sensors: [{
+      id: 'tests', kind: 'command', command_id: 'tests', args: [], timeout_ms: 30000,
+      zero_threshold: 0, failure_message: 'tests must be zero', required: true,
+    }],
     loop: { max_rounds: 2, abort_on_no_progress: true },
     approval: { required_for_new_commands: true },
   },
   revision: 3,
   manifest_hash: 'hash-1',
+};
+
+const savedRun: HarnessRun = {
+  id: 'run-1',
+  project_root: 'C:/projects/one',
+  manifest_id: 'manifest-1',
+  manifest_hash: 'hash-1',
+  status: 'failed',
+  created_at: '2026-11-15T10:00:00.000Z',
+  rounds: [{
+    id: 'round-1', run_id: 'run-1', round_number: 1, counter_vector: { tests: 2 },
+    created_at: '2026-11-15T10:01:00.000Z',
+    sensor_results: [{
+      id: 'result-1', run_id: 'run-1', round_id: 'round-1', sensor_id: 'tests',
+      status: 'failed', counter: 2, exit_code: 1, stdout: 'test output', stdout_truncated: false,
+      stderr: 'failure output', stderr_truncated: false, created_at: '2026-11-15T10:01:00.000Z',
+    }],
+  }],
+  events: [{ id: 'event-1', run_id: 'run-1', event_type: 'stopped', payload: { stop_reason: 'max_rounds' }, created_at: '2026-11-15T10:02:00.000Z' }],
 };
 
 function mount() {
@@ -36,7 +60,13 @@ function mount() {
 afterEach(() => {
   cleanup();
   listManifests.mockReset();
+  listRuns.mockReset();
+  getRun.mockReset();
   updateManifest.mockReset();
+});
+
+beforeEach(() => {
+  listRuns.mockResolvedValue([]);
 });
 
 describe('HarnessPage picker route', () => {
@@ -46,9 +76,11 @@ describe('HarnessPage picker route', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
 
     expect(await screen.findByText('No saved manifest for this project and purpose.')).toBeInTheDocument();
-    expect(screen.getByText(/No check or harness run has been performed/)).toBeInTheDocument();
+    expect(screen.getByText(/No check or harness run has been started from this page/)).toBeInTheDocument();
+    expect(await screen.findByText('No harness run has been recorded for this project.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Select a manifest' })).toBeDisabled();
     expect(screen.queryByText(/successful|passed|green/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole('listitem')).not.toBeInTheDocument();
   });
 
   it('lists and selects a saved manifest for the chosen project and purpose', async () => {
@@ -60,8 +92,52 @@ describe('HarnessPage picker route', () => {
     expect(manifest).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(manifest);
     expect(manifest).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText(/No harness run has been performed/)).toBeInTheDocument();
+    expect(screen.getByText(/This page does not start harness runs/)).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: 'Rules' })).toBeInTheDocument();
+  });
+
+  it('lists saved runs with status, stop reason, revision and recorded times', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    listRuns.mockResolvedValue([savedRun]);
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+
+    const row = await screen.findByRole('button', { name: /failed/ });
+    expect(row).toHaveTextContent('Stop reason: max_rounds');
+    expect(row).toHaveTextContent('Manifest revision: 3');
+    expect(row).toHaveTextContent('Started: 2026-11-15T10:00:00.000Z');
+    expect(row).toHaveTextContent('Finished: 2026-11-15T10:02:00.000Z');
+  });
+
+  it('loads a selected run and renders its rounds and non-zero failed sensor results without success styling', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    listRuns.mockResolvedValue([savedRun]);
+    getRun.mockResolvedValue(savedRun);
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /failed/ }));
+
+    expect(getRun).toHaveBeenCalledWith('C:/projects/one', 'run-1');
+    expect(await screen.findByText('Round 1 · Failed')).toBeInTheDocument();
+    expect(screen.getByText('tests · failed')).toBeInTheDocument();
+    expect(screen.getByText((_, node) => node?.tagName === 'P'
+      && node.textContent === 'Result ID: result-1 · Value: 2 · Zero threshold: 0')).toBeInTheDocument();
+    expect(screen.getByText('test output')).toBeInTheDocument();
+    expect(screen.getByText('failure output')).toBeInTheDocument();
+    expect(screen.queryByText(/passed|complete|green/i)).not.toBeInTheDocument();
+  });
+
+  it('shows run_not_found without stale selected-run details', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    listRuns.mockResolvedValue([savedRun]);
+    getRun.mockRejectedValue(new HarnessApiError('run_not_found', 404, 'http_error'));
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /failed/ }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('That harness run was not found for this project.');
+    expect(screen.queryByText('Round 1 · Failed')).not.toBeInTheDocument();
+    expect(screen.queryByText('tests · failed')).not.toBeInTheDocument();
   });
 
   it('keeps a failed lookup distinct from a valid empty manifest list', async () => {
