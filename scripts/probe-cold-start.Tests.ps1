@@ -86,7 +86,11 @@ function Get-ProbeQuitPassFunction {
     if ($definitions.Count -ne 1) {
         throw 'Test-JarvisProbeQuitPass not found exactly once in probe-cold-start.ps1'
     }
-    return [scriptblock]::Create($definitions[0].Body.Extent.Text)
+    # Body.Extent.Text carries the function body's own braces; a scriptblock
+    # created from that text verbatim is a scriptblock *literal* (it returns
+    # the inner scriptblock), so $quit.* read $null in every case below.
+    # GetScriptBlock() compiles the same AST as a runnable scriptblock.
+    return $definitions[0].Body.GetScriptBlock()
 }
 
 Describe 'bounded query dispatch' {
