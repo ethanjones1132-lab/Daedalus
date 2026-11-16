@@ -478,6 +478,67 @@ describe('ChatPanel state machine', () => {
     expect(onSessionCreated).not.toHaveBeenCalled();
   });
 
+  it('persists streamed assistant text when Stop aborts the turn without marking it successful', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let requestSignal!: AbortSignal;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal as AbortSignal;
+      // A real Stop aborts the request, so the reader rejects with AbortError;
+      // closing it instead would bypass the cancelled-turn rendering path.
+      requestSignal.addEventListener('abort', () => controller.error(new DOMException('Stopped', 'AbortError')));
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+    }));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'stop after output' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await waitFor(() => expect(requestSignal).toBeDefined());
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"stream_event","delta":{"text":"partial answer"}}\n\n'));
+    });
+    await waitFor(() => expect(screen.getByText('partial answer')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByLabelText('Stop streaming'));
+    await waitFor(() => expect(requestSignal.aborted).toBe(true));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'cancelled',
+      cancelledReason: 'client_abort',
+    })));
+    await waitFor(() => expect(screen.getByText('(stopped)')).toBeInTheDocument());
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toEqual([
+      expect.arrayContaining([
+        'append_message',
+        expect.objectContaining({ role: 'assistant', content: 'partial answer' }),
+      ]),
+    ]);
+  });
+
+  it('does not append an empty assistant message when Stop happens before any output', async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let requestSignal!: AbortSignal;
+    const stream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestSignal = init?.signal as AbortSignal;
+      requestSignal.addEventListener('abort', () => controller.error(new DOMException('Stopped', 'AbortError')));
+      return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+    }));
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'stop before output' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await waitFor(() => expect(requestSignal).toBeDefined());
+
+    fireEvent.click(screen.getByLabelText('Stop streaming'));
+    await waitFor(() => expect(requestSignal.aborted).toBe(true));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith('record_terminal_run', expect.objectContaining({
+      outcome: 'cancelled',
+    })));
+
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+  });
+
   it('drops late output and terminal effects after passive teardown', async () => {
     let controller!: ReadableStreamDefaultController<Uint8Array>;
     let requestSignal!: AbortSignal;
@@ -505,7 +566,12 @@ describe('ChatPanel state machine', () => {
       controller.close();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toEqual([
+      expect.arrayContaining([
+        'append_message',
+        expect.objectContaining({ role: 'assistant', content: 'visible partial' }),
+      ]),
+    ]);
     expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(0);
     expect(onSessionCreated).not.toHaveBeenCalled();
   });

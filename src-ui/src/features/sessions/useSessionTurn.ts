@@ -2442,6 +2442,11 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
           text: '',
           hardError: false,
         };
+        // A cancelled terminal preserves any assistant text already streamed.
+        // Seed the memoized finalizer before invoking it; it must not turn the
+        // cancelled Session turn into a success or persist an empty row.
+        assistantPersist.text = streamedRawText;
+        assistantPersist.allowed = true;
         await finalizeMemoryTurn();
         if (!requestIsCurrent()) return;
         if (!acceptTerminal(decision)) return;
@@ -2552,6 +2557,14 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       throw error;
     } finally {
       inactivityWatchdog.stop();
+      // Stop and passive teardown can end the reader without a terminal frame.
+      // The finalizer is memoized, so seed its accumulator before its first
+      // invocation on this path. Hard-error result handling has already
+      // finalized with `allowed = false` and does not enter this abort branch.
+      if (controller.signal.aborted || stopRequestedRef.current) {
+        assistantPersist.text = streamedRawText;
+        assistantPersist.allowed = true;
+      }
       // Phase 2.4 — finalize the native turn BEFORE any local terminal
       // publication or run-record write. This is memoized, so terminal-frame
       // branches that already finalized are a no-op here.
