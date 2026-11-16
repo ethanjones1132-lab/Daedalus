@@ -13,6 +13,12 @@
 // row a service is left alone (loudly logged) until it is observed healthy
 // again, so a permanently-broken dependency can't cause an endless respawn
 // loop. The tick interval itself also bounds restart frequency.
+//
+// Bun is also required to be *healthy*, not merely alive (DD-079). A child that
+// is still running but never answers `/health` is counted like a failed attempt
+// and is never reported as a relaunch, so a server that can never become ready
+// still ends in the bounded give-up path instead of resetting its own budget
+// forever.
 
 use crate::commands::system::SupervisorStatus;
 use crate::jarvis::types::{JarvisBackend, JarvisState};
@@ -109,6 +115,50 @@ fn ollama_tick_action(is_ollama: bool, listening: bool, owned_live: bool) -> Oll
 /// the failure counter.
 fn bun_tick_is_healthy(state: crate::BunPortState) -> bool {
     state == crate::BunPortState::ThisApp
+}
+
+/// Why a still-starting Bun is charged to the escalation budget (DD-079).
+///
+/// Kept as a named reason because it is what the operator sees in
+/// `bun_last_error`: "alive but never healthy" is not a spawn error, and saying
+/// so is the whole point of counting it separately from a failed restart.
+const BUN_STILL_STARTING_REASON: &str =
+    "Bun server is still starting: alive but has not answered /health within the start budget";
+
+/// What the Bun block of one tick reports after one ensure attempt (DD-079).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BunTickVerdict {
+    /// `/health` answered: the counter was cleared and a relaunch may be claimed.
+    Healthy,
+    /// The owned child is alive but never answered: counted, never a relaunch.
+    StillStarting,
+    /// The attempt failed: counted with its error.
+    Failed,
+}
+
+/// Record one Bun ensure outcome against the escalation budget.
+///
+/// The counter is the supervisor's memory of "how many swings have failed", so
+/// this is the whole DD-079 rule: only a healthy probe clears it. A child that
+/// stays alive without ever answering `/health` is not evidence the server
+/// works, so it advances the same budget as a failed restart — a Bun that can
+/// never become healthy still ends in the give-up path instead of being reset
+/// forever by its own liveness. Returns the verdict plus the new count.
+fn record_bun_start_outcome(outcome: &crate::BunServerStart) -> (BunTickVerdict, u32) {
+    match outcome {
+        crate::BunServerStart::Healthy => {
+            reset_failures(SupervisedService::Bun);
+            (BunTickVerdict::Healthy, 0)
+        }
+        crate::BunServerStart::StillStarting => (
+            BunTickVerdict::StillStarting,
+            record_restart_failure(SupervisedService::Bun, BUN_STILL_STARTING_REASON),
+        ),
+        crate::BunServerStart::Failed(error) => (
+            BunTickVerdict::Failed,
+            record_restart_failure(SupervisedService::Bun, error),
+        ),
+    }
 }
 
 /// What one supervisor tick should do about the claude_cli_proxy. The same
@@ -293,20 +343,41 @@ async fn tick(handle: &AppHandle) {
             if !may_start_child() {
                 return;
             }
-            // ensure_* is idempotent (it health-probes before spawning).
-            match crate::ensure_jarvis_server_started().await {
-                Ok(_) => {
-                    reset_failures(SupervisedService::Bun);
+            // ensure_* is idempotent (it health-probes before spawning, and
+            // leaves a live child of this app's alone — DD-073).
+            //
+            // DD-079: alive is not healthy. The ensure path reports a child it
+            // is still waiting on separately from a serving server, so only a
+            // healthy probe clears the budget and only that arm may claim a
+            // relaunch.
+            let outcome = crate::ensure_jarvis_server_started_outcome().await;
+            match record_bun_start_outcome(&outcome) {
+                (BunTickVerdict::Healthy, _) => {
                     println!("[supervisor] Bun server was down — relaunched.");
                 }
-                Err(e) => {
-                    let next = record_restart_failure(SupervisedService::Bun, &e);
+                (BunTickVerdict::StillStarting, next) => {
                     log::warn!(
                         target: "jarvis::supervisor",
-                        "Bun server restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {e}"
+                        "Bun server is still starting — alive but has not answered /health \
+                         ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the restart \
+                         budget, not reported as a relaunch"
                     );
                     if next == MAX_CONSECUTIVE_RESTARTS {
-                        if let Some(diagnostic) = bun_diagnostic(next, Some(e.as_str())) {
+                        if let Some(diagnostic) =
+                            bun_diagnostic(next, Some(BUN_STILL_STARTING_REASON))
+                        {
+                            log::error!(target: "jarvis::supervisor", "{diagnostic}");
+                        }
+                    }
+                }
+                (BunTickVerdict::Failed, next) => {
+                    let error = outcome.failure().unwrap_or("unknown Bun startup failure");
+                    log::warn!(
+                        target: "jarvis::supervisor",
+                        "Bun server restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}"
+                    );
+                    if next == MAX_CONSECUTIVE_RESTARTS {
+                        if let Some(diagnostic) = bun_diagnostic(next, Some(error)) {
                             log::error!(target: "jarvis::supervisor", "{diagnostic}");
                         }
                     }
@@ -615,6 +686,120 @@ mod tests {
         );
     }
 
+    /// DD-079: a Bun child that is alive but never answers `/health` is not a
+    /// healthy server. The counter must keep (and advance) instead of being
+    /// reset, and the tick must not claim a relaunch for a wait that ran out.
+    #[test]
+    fn a_bun_that_is_alive_but_never_healthy_is_counted_not_relaunched() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::Bun);
+
+        let (verdict, first) = record_bun_start_outcome(&crate::BunServerStart::StillStarting);
+        assert_eq!(verdict, BunTickVerdict::StillStarting);
+        assert_eq!(first, 1);
+        assert_eq!(
+            BUN_FAILS.load(Ordering::Relaxed),
+            1,
+            "alive is not healthy: a child that never answered /health must not \
+             reset the Bun failure count"
+        );
+
+        // The next tick finds the same child still silent, so the budget
+        // advances instead of starting over.
+        let (verdict, second) = record_bun_start_outcome(&crate::BunServerStart::StillStarting);
+        assert_eq!(verdict, BunTickVerdict::StillStarting);
+        assert_eq!(second, 2);
+        assert_eq!(BUN_FAILS.load(Ordering::Relaxed), 2);
+
+        // A child that can never become healthy still reaches the give-up cap,
+        // so the watchdog stops retrying instead of resetting forever.
+        for _ in 2..MAX_CONSECUTIVE_RESTARTS {
+            record_bun_start_outcome(&crate::BunServerStart::StillStarting);
+        }
+        assert_eq!(
+            BUN_FAILS.load(Ordering::Relaxed),
+            MAX_CONSECUTIVE_RESTARTS
+        );
+        assert!(!may_restart(BUN_FAILS.load(Ordering::Relaxed)));
+        assert_eq!(
+            give_up_status().bun_last_error.as_deref(),
+            Some(BUN_STILL_STARTING_REASON),
+            "the counted outcome must say the server was alive but never healthy"
+        );
+
+        // The tick's still-starting arm must never print the relaunch claim:
+        // no spawn happened, only a wait that outlasted its budget. The single
+        // "relaunched" line belongs to the healthy arm, before it.
+        let production = supervisor_production_source();
+        let bun = production
+            .split_once("// ── Bun server")
+            .and_then(|(_, rest)| rest.split_once("// ── claude_cli_proxy"))
+            .map(|(block, _)| block)
+            .expect("the Bun supervisor block must sit between its section markers");
+        let relaunched = bun
+            .find("relaunched")
+            .expect("the healthy arm must still report a relaunch");
+        let still_starting = bun
+            .find("BunTickVerdict::StillStarting")
+            .expect("the tick must keep a still-starting arm");
+        assert!(
+            relaunched < still_starting,
+            "the relaunch claim must sit in the healthy arm, not the still-starting one:\n{bun}"
+        );
+        assert_eq!(
+            bun.matches("relaunched").count(),
+            1,
+            "a still-starting Bun must not be reported as relaunched:\n{bun}"
+        );
+        let still_starting_arm = &bun[still_starting..];
+        assert!(
+            still_starting_arm.contains("log::warn!")
+                && still_starting_arm.contains("BUN_STILL_STARTING_REASON"),
+            "the still-starting arm must log its own counted outcome:\n{bun}"
+        );
+        assert!(
+            bun.contains("crate::ensure_jarvis_server_started_outcome()"),
+            "the tick must ask the three-state ensure path, not the flattened one:\n{bun}"
+        );
+
+        reset_failures(SupervisedService::Bun);
+    }
+
+    /// DD-079: a healthy probe is still the only thing that clears the Bun
+    /// failure count, and a failed attempt still records its own error.
+    #[test]
+    fn a_healthy_bun_probe_clears_the_still_starting_count() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::Bun);
+        record_bun_start_outcome(&crate::BunServerStart::StillStarting);
+        record_bun_start_outcome(&crate::BunServerStart::StillStarting);
+        assert_eq!(BUN_FAILS.load(Ordering::Relaxed), 2);
+
+        let (verdict, next) = record_bun_start_outcome(&crate::BunServerStart::Healthy);
+        assert_eq!(verdict, BunTickVerdict::Healthy);
+        assert_eq!(next, 0);
+        assert_eq!(BUN_FAILS.load(Ordering::Relaxed), 0);
+        let status = give_up_status();
+        assert!(!status.bun_give_up);
+        assert!(
+            status.bun_last_error.is_none(),
+            "a healthy probe must also clear the stale still-starting reason"
+        );
+
+        // The third state is not folded into either live one.
+        let (verdict, next) = record_bun_start_outcome(&crate::BunServerStart::Failed(
+            "server bundle missing: index.js was not found".to_string(),
+        ));
+        assert_eq!(verdict, BunTickVerdict::Failed);
+        assert_eq!(next, 1);
+        assert_eq!(
+            give_up_status().bun_last_error.as_deref(),
+            Some("server bundle missing: index.js was not found")
+        );
+
+        reset_failures(SupervisedService::Bun);
+    }
+
     #[test]
     fn a_live_owned_proxy_child_is_left_alone_not_reloaded() {
         // Same rule as the Ollama block (DD-063): a closed port with a child
@@ -788,7 +973,7 @@ mod tests {
     /// Every start/restart the tick can perform, in source order. Naming them
     /// here means a new spawn site added without a gate fails this test.
     const TICK_SPAWN_SITES: [&str; 4] = [
-        "crate::ensure_jarvis_server_started(",
+        "crate::ensure_jarvis_server_started_outcome(",
         "crate::restart_claude_cli_proxy(",
         "crate::start_ollama_and_warm(",
         "crate::start_llama_cpp_server(",

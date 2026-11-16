@@ -2130,6 +2130,47 @@ enum StartupFailure {
     TimedOut,
 }
 
+/// What one driven start attempt proved (DD-079).
+///
+/// The driver can only prove the positive states; a spawn error or a spent
+/// budget is its `Err` arm. [`BunServerStart`] widens that into the three
+/// states the ensure path reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BunStartAttempt {
+    /// `/health` answered as this app's Jarvis.
+    Healthy,
+    /// The tracked child is alive and never answered `/health` inside the budget.
+    StillStarting,
+}
+
+/// The three states one ensure attempt can end in (DD-079).
+///
+/// "Alive" and "healthy" are different facts. DD-073 made the still-starting
+/// arm a success so the app would stop killing a child that is still binding;
+/// the supervisor then read every `Ok` as healthy and cleared its failure
+/// count for a server that had never answered. Keeping the states apart lets
+/// the supervisor count a child that never becomes healthy while the ensure
+/// path keeps DD-073's behaviour of leaving that child running.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BunServerStart {
+    /// `/health` answered as this app's Jarvis.
+    Healthy,
+    /// The child this app owns is still live but never answered `/health`.
+    StillStarting,
+    /// The attempt failed; the string is the operator-facing reason.
+    Failed(String),
+}
+
+impl BunServerStart {
+    /// The reason a failed attempt could not reach either live state.
+    pub(crate) fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Failed(error) => Some(error.as_str()),
+            Self::Healthy | Self::StillStarting => None,
+        }
+    }
+}
+
 /// The owned-child startup sequence with every out-of-process effect injected.
 ///
 /// Ordering is the point: when the native listener is closed and no configured
@@ -2141,8 +2182,9 @@ enum StartupFailure {
 ///
 /// `spawn_owned_child` reports whether it spawned a child or left a live one
 /// where it was (DD-073). A child left in place is still waited on for the same
-/// health budget, and reaching the end of that budget is not a failure while
-/// the child it belongs to has not exited.
+/// health budget; reaching the end of that budget while it has not exited is
+/// [`BunStartAttempt::StillStarting`], not success and not a failed start
+/// (DD-079).
 async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, M>(
     remote_endpoint_requires_probe: bool,
     probe_healthy: P,
@@ -2151,7 +2193,7 @@ async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, M>(
     spawn_owned_child: S,
     elapsed_since_spawn: E,
     mark_healthy: M,
-) -> Result<(), StartupFailure>
+) -> Result<BunStartAttempt, StartupFailure>
 where
     P: Fn() -> PF,
     PF: std::future::Future<Output = bool>,
@@ -2170,13 +2212,13 @@ where
     // not even pay a native/WSL listener probe.
     if remote_endpoint_requires_probe && probe_healthy().await {
         mark_healthy();
-        return Ok(());
+        return Ok(BunStartAttempt::Healthy);
     }
 
     let listener_open = listener_present();
     if !remote_endpoint_requires_probe && listener_open && probe_healthy().await {
         mark_healthy();
-        return Ok(());
+        return Ok(BunStartAttempt::Healthy);
     }
 
     if listener_open {
@@ -2190,7 +2232,7 @@ where
         delay(750).await;
         if probe_healthy().await {
             mark_healthy();
-            return Ok(());
+            return Ok(BunStartAttempt::Healthy);
         }
         log::warn!(
             target: "jarvis::startup",
@@ -2224,22 +2266,22 @@ where
     while elapsed_since_spawn() < SPAWN_HEALTH_BUDGET_MS {
         if probe_healthy().await {
             mark_healthy();
-            return Ok(());
+            return Ok(BunStartAttempt::Healthy);
         }
         delay(500).await;
     }
     if owned_start == OwnedBunChildStart::StillStarting {
         // DD-073: the child this app spawned has not exited, so this is a wait
-        // that outlasted one health budget, not a failed start. Report no
-        // failure — the give-up counter must not be advanced for a child the
-        // app is still waiting on — and leave the child running, so the next
-        // ensure waits on it again instead of replacing it.
+        // that outlasted one health budget, not a failed start. Leave the child
+        // running, so the next ensure waits on it again instead of replacing it.
+        // DD-079: say "still starting", not "healthy" — the supervisor counts
+        // this attempt instead of clearing its failure budget for it.
         log::warn!(
             target: "jarvis::startup",
             "Bun child this app owns has not answered /health within one health budget; \
              leaving it running"
         );
-        return Ok(());
+        return Ok(BunStartAttempt::StillStarting);
     }
     Err(StartupFailure::TimedOut)
 }
@@ -2247,7 +2289,21 @@ where
 /// Ensure this app's Bun server is running. Its own live child is never
 /// replaced: the spawn is only reached when the tracked child has exited or no
 /// child was ever tracked (DD-073).
+///
+/// Both live states map to `Ok` for callers that only gate on "the child this
+/// app owns is in place" (boot, session commands, recovery). The supervisor
+/// uses [`ensure_jarvis_server_started_outcome`] instead, because a server
+/// that is alive but never answers must not clear its failure budget (DD-079).
 pub async fn ensure_jarvis_server_started() -> Result<(), String> {
+    match ensure_jarvis_server_started_outcome().await {
+        BunServerStart::Healthy | BunServerStart::StillStarting => Ok(()),
+        BunServerStart::Failed(error) => Err(error),
+    }
+}
+
+/// The same attempt with "healthy" and "alive but never healthy" kept apart
+/// (DD-079).
+pub(crate) async fn ensure_jarvis_server_started_outcome() -> BunServerStart {
     use std::sync::atomic::{AtomicI64, Ordering};
     // Last time the server was confirmed healthy (epoch ms). A short TTL lets the
     // many callers (boot + every frontend status poll) skip all probing/spawning.
@@ -2261,7 +2317,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
 
     // Fast path: confirmed healthy very recently — no probing, no spawning.
     if fresh() {
-        return Ok(());
+        return BunServerStart::Healthy;
     }
 
     // Only one probe/spawn sequence at a time; queued callers fall through to the
@@ -2269,7 +2325,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     let lock = BUN_ENSURE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
     let _guard = lock.lock().await;
     if fresh() {
-        return Ok(());
+        return BunServerStart::Healthy;
     }
 
     // A closed native listener only proves the server absent when every
@@ -2338,8 +2394,9 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     )
     .await
     {
-        Ok(()) => Ok(()),
-        Err(StartupFailure::Spawn(error)) => Err(error),
+        Ok(BunStartAttempt::Healthy) => BunServerStart::Healthy,
+        Ok(BunStartAttempt::StillStarting) => BunServerStart::StillStarting,
+        Err(StartupFailure::Spawn(error)) => BunServerStart::Failed(error),
         Err(StartupFailure::TimedOut) => {
             // Surface the ghost-socket case explicitly — a generic timeout leaves the
             // operator hunting EADDRINUSE in err logs with no recovery path.
@@ -2347,9 +2404,9 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
             if !ghosts.is_empty() {
                 let diagnostic = bun_port_ghost_diagnostic(BUN_SERVER_PORT, &ghosts);
                 log::error!(target: "jarvis::startup", "{diagnostic}");
-                return Err(diagnostic);
+                return BunServerStart::Failed(diagnostic);
             }
-            Err(unhealthy_jarvis_server_error(
+            BunServerStart::Failed(unhealthy_jarvis_server_error(
                 "Bun server did not become healthy within timeout",
             ))
         }
@@ -3618,7 +3675,7 @@ mod bun_startup_tests {
         remote_endpoint_requires_probe: bool,
         listener_open: bool,
         spawn: Result<OwnedBunChildStart, String>,
-    ) -> Result<(), StartupFailure> {
+    ) -> Result<BunStartAttempt, StartupFailure> {
         drive_jarvis_server_start(
             remote_endpoint_requires_probe,
             {
@@ -3679,7 +3736,7 @@ mod bun_startup_tests {
         remote_endpoint_requires_probe: bool,
         listener_open: bool,
         spawn_succeeds: bool,
-    ) -> Result<(), StartupFailure> {
+    ) -> Result<BunStartAttempt, StartupFailure> {
         let spawn = if spawn_succeeds {
             Ok(OwnedBunChildStart::Spawn)
         } else {
@@ -3700,7 +3757,7 @@ mod bun_startup_tests {
         effects.push_elapsed(0);
         let outcome = run_driver(&effects, false, false, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec!["listen", "spawn", "probe", "healthy"],
@@ -3714,7 +3771,7 @@ mod bun_startup_tests {
         effects.set_healthy(true);
         let outcome = run_driver(&effects, false, true, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(effects.snapshot(), vec!["listen", "probe", "healthy"]);
     }
 
@@ -3725,7 +3782,7 @@ mod bun_startup_tests {
         effects.push_probe(true);
         let outcome = run_driver(&effects, false, true, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec!["listen", "probe", "delay:750", "probe", "healthy"],
@@ -3741,7 +3798,7 @@ mod bun_startup_tests {
         effects.push_probe(false);
         let outcome = run_driver(&effects, false, true, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec![
@@ -3762,7 +3819,7 @@ mod bun_startup_tests {
         effects.push_probe(true);
         let outcome = run_driver(&effects, true, false, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec!["probe", "healthy"],
@@ -3777,7 +3834,7 @@ mod bun_startup_tests {
         effects.push_probe(false);
         let outcome = run_driver(&effects, true, false, true).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec!["probe", "listen", "spawn", "probe", "healthy"],
@@ -3813,11 +3870,12 @@ mod bun_startup_tests {
         assert_eq!(effects.snapshot(), vec!["listen", "spawn"]);
     }
 
-    /// DD-073: a Bun child this app spawned and still owns is still starting,
-    /// not somebody else's listener. Even after one health budget without
-    /// `/health`, the ensure path must not spawn a replacement and must not
-    /// report a failure — the give-up counter must not be advanced for work the
-    /// app is still waiting on.
+    /// DD-073 and DD-079: a Bun child this app spawned and still owns is still
+    /// starting, not somebody else's listener. Even after one health budget
+    /// without `/health`, the ensure path must not spawn a replacement, must not
+    /// claim a failed start, and must report that waiting state distinctly
+    /// instead of as healthy — otherwise the supervisor clears its failure
+    /// budget for a server that never answered.
     #[tokio::test]
     async fn an_owned_child_inside_its_start_budget_is_left_alone() {
         let effects = Effects::default();
@@ -3826,14 +3884,19 @@ mod bun_startup_tests {
         effects.push_elapsed(0);
         effects.push_elapsed(20_001);
         effects.push_probe(false);
+        // A second ensure attempt on the same live child is scripted the same
+        // way: the retry must still wait and probe, not kill or replace it.
+        effects.push_elapsed(0);
+        effects.push_elapsed(20_001);
+        effects.push_probe(false);
 
         let spawn = Ok(OwnedBunChildStart::StillStarting);
-        let outcome = run_driver_with(&effects, false, false, spawn).await;
+        let outcome = run_driver_with(&effects, false, false, spawn.clone()).await;
 
         assert_eq!(
             outcome,
-            Ok(()),
-            "waiting on a live child must not be reported as a startup failure"
+            Ok(BunStartAttempt::StillStarting),
+            "waiting on a live child is neither a failed start nor a healthy server"
         );
         assert_eq!(
             effects.snapshot(),
@@ -3844,6 +3907,29 @@ mod bun_startup_tests {
         assert!(
             !effects.snapshot().iter().any(|event| event == "spawn"),
             "the owned child must not be replaced by a second spawn"
+        );
+
+        // DD-073's retry: a later ensure attempt still waits on the same child
+        // and probes it again.
+        let retry = run_driver_with(&effects, false, false, spawn).await;
+        assert_eq!(
+            retry,
+            Ok(BunStartAttempt::StillStarting),
+            "a later ensure attempt must keep waiting on the same live child"
+        );
+        assert_eq!(
+            effects.snapshot(),
+            vec![
+                "listen",
+                "still-starting",
+                "probe",
+                "delay:500",
+                "listen",
+                "still-starting",
+                "probe",
+                "delay:500"
+            ],
+            "the retry must probe the same live child again instead of replacing it"
         );
     }
 
@@ -3857,7 +3943,7 @@ mod bun_startup_tests {
         let spawn = Ok(OwnedBunChildStart::Spawn);
         let outcome = run_driver_with(&effects, false, false, spawn).await;
 
-        assert_eq!(outcome, Ok(()));
+        assert_eq!(outcome, Ok(BunStartAttempt::Healthy));
         assert_eq!(
             effects.snapshot(),
             vec!["listen", "spawn", "probe", "healthy"],
@@ -3985,6 +4071,9 @@ mod bun_boot_order_tests {
             },
         )
         .await
+        // The boot-order trace only cares that the gate finished; DD-079's
+        // healthy/still-starting distinction is pinned in `bun_startup_tests`.
+        .map(|_attempt| ())
         .map_err(|failure| match failure {
             StartupFailure::Spawn(error) => error,
             StartupFailure::TimedOut => "Bun startup timed out".to_string(),
@@ -4331,6 +4420,20 @@ mod owned_slot_wiring_tests {
         assert!(
             ensure.contains("return Ok(OwnedBunChildStart::StillStarting);"),
             "a live owned child must be reported as still starting, not spawned over:\n{ensure}"
+        );
+        // DD-079: the ensure path must keep that still-starting state visible
+        // instead of flattening it into "healthy" on the way out.
+        assert!(
+            ensure.contains("Ok(BunStartAttempt::StillStarting) => BunServerStart::StillStarting,"),
+            "the ensure path must report a still-starting child as still starting, \
+             not as healthy:\n{ensure}"
+        );
+        assert!(
+            ensure.contains(
+                "BunServerStart::Healthy | BunServerStart::StillStarting => Ok(()),"
+            ),
+            "callers that only gate on the child being in place must keep the \
+             DD-073 success contract:\n{ensure}"
         );
         assert!(
             !ensure.contains("ManagedProcess::Ollama"),
