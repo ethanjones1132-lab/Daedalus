@@ -75,6 +75,40 @@ fn ollama_tick_action(is_ollama: bool, listening: bool, owned_live: bool) -> Oll
     OllamaAction::Start
 }
 
+/// Whether the supervisor should treat the Bun port as this app's Bun server
+/// (DD-072). Pure so the identity rule is unit-testable without a live port:
+/// only `BunPortState::ThisApp` is healthy — a foreign or stale listener
+/// accepts the same TCP connection, so it must not read as healthy and reset
+/// the failure counter.
+fn bun_tick_is_healthy(state: crate::BunPortState) -> bool {
+    state == crate::BunPortState::ThisApp
+}
+
+/// What one supervisor tick should do about the claude_cli_proxy. The same
+/// ownership rule the Ollama decision applies: a closed port does not mean
+/// "down" when this process still owns a child that is coming up, and
+/// switching the proxy off must stop the owned child (DD-063). Pure and
+/// separate from the tick so the rule is unit-testable without a live port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyAction {
+    /// The proxy is not required: stop the child this process started.
+    StopOwned,
+    /// Listening, or an owned child is still starting: leave it alone.
+    Leave,
+    /// No listener and no owned child: relaunch.
+    Start,
+}
+
+fn proxy_tick_action(proxy_required: bool, listening: bool, owned_live: bool) -> ProxyAction {
+    if !proxy_required {
+        return ProxyAction::StopOwned;
+    }
+    if listening || owned_live {
+        return ProxyAction::Leave;
+    }
+    ProxyAction::Start
+}
+
 fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
     match service {
         SupervisedService::Bun => &BUN_FAILS,
@@ -210,7 +244,11 @@ async fn tick(handle: &AppHandle) {
     let llama_cpp_uses_wsl = crate::command_uses_wsl(Some(llama_cpp_config.server_path.as_str()));
 
     // ── Bun server (required by every backend for tools/skills/models) ──
-    if crate::bun_server_is_listening() {
+    // DD-072: port occupancy is not identity. A foreign or stale listener on
+    // the Bun port accepts the same TCP connection, so the tick asks the
+    // identity-probing state who holds the port instead of bare occupancy —
+    // a stranger must not read as healthy and reset the failure counter.
+    if bun_tick_is_healthy(crate::probe_bun_port_state()) {
         reset_failures(SupervisedService::Bun);
     } else {
         let fails = BUN_FAILS.load(Ordering::Relaxed);
@@ -238,25 +276,37 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── claude_cli_proxy (routes to whichever backend is active) ──
-    if !proxy_required {
-        PROXY_FAILS.store(0, Ordering::Relaxed);
-        crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
-    } else if crate::claude_proxy_is_listening() {
-        PROXY_FAILS.store(0, Ordering::Relaxed);
-    } else {
-        let fails = PROXY_FAILS.load(Ordering::Relaxed);
-        if may_restart(fails) {
-            match crate::restart_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone())
-            {
-                Ok(_) => {
-                    PROXY_FAILS.store(0, Ordering::Relaxed);
-                    println!("[supervisor] claude_cli_proxy was down — relaunched.");
-                }
-                Err(error) => {
-                    let next = record_restart_failure(SupervisedService::Proxy, &error);
-                    eprintln!(
-                        "[supervisor] claude_cli_proxy restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}"
-                    );
+    // Same owned-liveness rule as the Ollama block below: a closed port is not
+    // proof the proxy is down when the child this process spawned is still
+    // coming up. Reloading on every tick would kill the startup in progress,
+    // so liveness is read from the ownership slot first and the proxy-off
+    // branch stops that child instead of orphaning it.
+    let proxy_owned =
+        crate::process_lifecycle::is_live(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
+
+    match proxy_tick_action(proxy_required, crate::claude_proxy_is_listening(), proxy_owned) {
+        ProxyAction::StopOwned => {
+            PROXY_FAILS.store(0, Ordering::Relaxed);
+            crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
+        }
+        ProxyAction::Leave => {
+            PROXY_FAILS.store(0, Ordering::Relaxed);
+        }
+        ProxyAction::Start => {
+            let fails = PROXY_FAILS.load(Ordering::Relaxed);
+            if may_restart(fails) {
+                match crate::restart_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone())
+                {
+                    Ok(_) => {
+                        PROXY_FAILS.store(0, Ordering::Relaxed);
+                        println!("[supervisor] claude_cli_proxy was down — relaunched.");
+                    }
+                    Err(error) => {
+                        let next = record_restart_failure(SupervisedService::Proxy, &error);
+                        eprintln!(
+                            "[supervisor] claude_cli_proxy restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}"
+                        );
+                    }
                 }
             }
         }
@@ -437,6 +487,123 @@ mod tests {
                 && ollama.contains("process_lifecycle::stop(")
                 && ollama.contains("ManagedProcess::Ollama"),
             "the backend-off arm must stop the owned Ollama child:\n{ollama}"
+        );
+    }
+
+    #[test]
+    fn a_foreign_bun_listener_is_not_healthy_and_does_not_reset_failures() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // DD-072: the tick decides health from the identity-probing state, not
+        // port occupancy. Only a port that answers /health as this Jarvis is
+        // healthy; a foreign or stale listener accepts the same TCP connection
+        // and must not count as healthy.
+        assert!(
+            !bun_tick_is_healthy(crate::BunPortState::ForeignListener),
+            "a listener that is not this app's Bun server is not healthy"
+        );
+        assert!(
+            !bun_tick_is_healthy(crate::BunPortState::Free),
+            "an absent Bun server is not healthy either"
+        );
+        assert!(
+            bun_tick_is_healthy(crate::BunPortState::ThisApp),
+            "this app's serving Bun is healthy"
+        );
+
+        // The counter consequence: a foreign listener takes the not-healthy
+        // branch, so the failure counter is left where it was instead of
+        // being reset by mere occupancy.
+        BUN_FAILS.store(1, Ordering::Relaxed);
+        if bun_tick_is_healthy(crate::BunPortState::ForeignListener) {
+            reset_failures(SupervisedService::Bun);
+        }
+        assert_eq!(
+            BUN_FAILS.load(Ordering::Relaxed),
+            1,
+            "a foreign listener must not reset the Bun failure counter"
+        );
+
+        // A genuinely serving Bun does reset it.
+        if bun_tick_is_healthy(crate::BunPortState::ThisApp) {
+            reset_failures(SupervisedService::Bun);
+        }
+        assert_eq!(BUN_FAILS.load(Ordering::Relaxed), 0);
+
+        // Pin the wiring: the tick's Bun block must consult the identity probe
+        // and route through the seam above, never bare port occupancy. This is
+        // the half that fails if the fix is reverted to `bun_server_is_listening`.
+        let production = supervisor_production_source();
+        let bun = production
+            .split_once("// ── Bun server")
+            .and_then(|(_, rest)| rest.split_once("// ── claude_cli_proxy"))
+            .map(|(block, _)| block)
+            .expect("the Bun supervisor block must sit between its section markers");
+        assert!(
+            bun.contains("crate::probe_bun_port_state()"),
+            "the Bun tick must read the DD-072 identity state, not bare occupancy:\n{bun}"
+        );
+        assert!(
+            bun.contains("bun_tick_is_healthy("),
+            "the Bun tick must route health through the tested seam:\n{bun}"
+        );
+        assert!(
+            !bun.contains("bun_server_is_listening"),
+            "a foreign listener accepts the same TCP connection; bare port occupancy must not decide the Bun tick's health:\n{bun}"
+        );
+    }
+
+    #[test]
+    fn a_live_owned_proxy_child_is_left_alone_not_reloaded() {
+        // Same rule as the Ollama block (DD-063): a closed port with a child
+        // this process spawned still running means "coming up", not "down",
+        // so the tick must leave it alone instead of reloading it.
+        assert_eq!(
+            proxy_tick_action(true, false, true),
+            ProxyAction::Leave,
+            "an owned child that has not opened its port yet is coming up, not down"
+        );
+        // A listener — ours or someone else's — must not be reloaded around.
+        assert_eq!(proxy_tick_action(true, true, false), ProxyAction::Leave);
+        // No listener and no owned child is the only reason to relaunch.
+        assert_eq!(proxy_tick_action(true, false, false), ProxyAction::Start);
+        // Switching the proxy off stops the child this app started.
+        assert_eq!(
+            proxy_tick_action(false, false, true),
+            ProxyAction::StopOwned,
+            "the child must not survive the proxy being switched off"
+        );
+        assert_eq!(proxy_tick_action(false, true, false), ProxyAction::StopOwned);
+
+        // Pin the wiring: the tick's proxy block must read owned liveness
+        // through process_lifecycle before deciding to reload. This is the
+        // half that fails if the owned-liveness arm is reverted away.
+        let production = supervisor_production_source();
+        let proxy = production
+            .split_once("// ── claude_cli_proxy")
+            .and_then(|(_, rest)| rest.split_once("// ── Ollama"))
+            .map(|(block, _)| block)
+            .expect("the proxy supervisor block must sit between its section markers");
+        assert!(
+            proxy.contains("proxy_tick_action("),
+            "the proxy tick must route through the tested decision seam:\n{proxy}"
+        );
+        assert!(
+            proxy.contains("process_lifecycle::is_live"),
+            "the proxy tick must read owned liveness before reloading:\n{proxy}"
+        );
+        assert!(
+            proxy.contains("ManagedProcess::ClaudeProxy"),
+            "owned liveness must be read for the proxy's own slot:\n{proxy}"
+        );
+        let liveness_read = proxy
+            .find("process_lifecycle::is_live")
+            .expect("liveness read must appear in the proxy block");
+        let decision = proxy
+            .find("proxy_tick_action(")
+            .expect("the proxy block must route through the decision seam");
+        assert!(
+            liveness_read < decision,
+            "owned liveness must be read before the tick decides the proxy is down:\n{proxy}"
         );
     }
 
