@@ -2266,6 +2266,66 @@ fn spawn_bootstrap_services(handle: tauri::AppHandle) -> std::io::Result<()> {
     .map(|_| ())
 }
 
+/// The one diagnostic for a first-run boot that cannot establish `jarvis.db`.
+///
+/// The boot log line and the native error dialog both print exactly this text,
+/// so a user whose app-data directory cannot hold `jarvis.db` learns where the
+/// database was meant to live and why the open failed, instead of the process
+/// simply disappearing.
+pub(crate) fn db_open_failure_diagnostic(db_path: &std::path::Path, error: &str) -> String {
+    format!(
+        "Jarvis could not open its database at {}: {error}. The app cannot start without that database and is closing now.",
+        db_path.display()
+    )
+}
+
+/// `MessageBoxW` from `user32`, called with no owner window.
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(
+        hwnd: *mut core::ffi::c_void,
+        text: *const u16,
+        caption: *const u16,
+        box_type: u32,
+    ) -> i32;
+}
+
+/// Show the fail-closed boot diagnostic in a native error dialog.
+///
+/// The Tauri builder — and with it the app window and the log plugin — has not
+/// been constructed at this point, and `tauri-plugin-dialog` is not a dependency
+/// of this crate, so on Windows this calls `MessageBoxW` directly. The line is
+/// written to the app log separately, so the dialog is the user-visible half.
+#[cfg(target_os = "windows")]
+fn show_boot_failure_dialog(diagnostic: &str) {
+    const MB_OK: u32 = 0x0000_0000;
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let text = wide(diagnostic);
+    let caption = wide("Jarvis cannot start");
+    // SAFETY: both buffers are NUL-terminated UTF-16 owned by this frame and
+    // outlive the call, and a message box needs no owner window handle.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// No windowing system is guaranteed before the Tauri app exists on this
+/// platform, so the diagnostic stays in the boot log and on stderr.
+#[cfg(not(target_os = "windows"))]
+fn show_boot_failure_dialog(_diagnostic: &str) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
@@ -2296,11 +2356,41 @@ pub fn run() {
             db
         }
         Err(e) => {
-            eprintln!(
-                "[Jarvis] Failed to open DB at {:?}: {}",
-                app_data_dir.join("jarvis.db"),
-                e
-            );
+            let db_path = app_data_dir.join("jarvis.db");
+            let diagnostic = db_open_failure_diagnostic(&db_path, &e);
+            eprintln!("[Jarvis] {diagnostic}");
+
+            // The log plugin is registered below, so it is not up yet: append to
+            // the file it will own instead of registering a second logger. The
+            // log plugin's directory is app-data/logs on Unix and
+            // %LOCALAPPDATA%\com.jarvis.desktop\logs on Windows. A failed log
+            // write must not hide the dialog.
+            let log_dir = if cfg!(target_os = "windows") {
+                std::env::var_os("LOCALAPPDATA")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join("com.jarvis.desktop")
+                    .join("logs")
+            } else {
+                app_data_dir.join("logs")
+            };
+            let _ = std::fs::create_dir_all(&log_dir);
+            if let Ok(mut log) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("Jarvis.log"))
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    log,
+                    "[{}] [jarvis::startup] {diagnostic}",
+                    chrono::Utc::now().to_rfc3339()
+                );
+            }
+
+            show_boot_failure_dialog(&diagnostic);
+
+            // Fail closed: never continue boot with a path-only database.
             std::process::exit(1);
         }
     };
@@ -3995,6 +4085,36 @@ mod ollama_warm_guard_tests {
             workers.load(Ordering::SeqCst),
             1,
             "the later call must acquire the guard without a second worker starting here"
+        );
+    }
+}
+
+#[cfg(test)]
+mod first_run_db_failure_tests {
+    use super::db_open_failure_diagnostic;
+    use std::path::Path;
+
+    /// A first run that cannot open `jarvis.db` must report the database path
+    /// and the underlying error — not an empty or opaque message — because the
+    /// process exits immediately and this text is the whole explanation.
+    #[test]
+    fn the_boot_diagnostic_names_the_database_path_and_the_error() {
+        let db_path = Path::new(r"C:\Users\ethan\.local\share\com.jarvis.desktop\jarvis.db");
+        let error = "Failed to open database: Access is denied. (os error 5)";
+
+        let diagnostic = db_open_failure_diagnostic(db_path, error);
+
+        assert!(
+            !diagnostic.trim().is_empty(),
+            "a fail-closed boot must explain itself"
+        );
+        assert!(
+            diagnostic.contains(&db_path.display().to_string()),
+            "the diagnostic must name the database path it tried to open: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("Access is denied. (os error 5)"),
+            "the diagnostic must carry the underlying error: {diagnostic}"
         );
     }
 }
