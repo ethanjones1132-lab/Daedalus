@@ -16,7 +16,7 @@
 
 use crate::commands::system::SupervisorStatus;
 use crate::jarvis::types::{JarvisBackend, JarvisState};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
@@ -35,6 +35,33 @@ pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static LLAMA_CPP_FAILS: AtomicU32 = AtomicU32::new(0);
 static BUN_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Set once the app has begun quitting (DD-077).
+///
+/// `RunEvent::ExitRequested` tears every owned child down via
+/// `process_lifecycle::stop_all()`. A tick that was already in flight — waiting
+/// on a config lock or a health probe — would otherwise relaunch exactly what
+/// the exit path is reaping, and that child would outlive the window because
+/// nothing stops it after `stop_all` has run. Every start or restart in the
+/// tick therefore re-reads this flag immediately before spawning.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Mark the app as quitting so the supervisor stops starting or restarting
+/// children. Idempotent, and the single ordering point is the exit handler:
+/// it is called before `stop_all()` so no tick can slip a spawn in afterwards.
+pub(crate) fn mark_quitting() {
+    QUITTING.store(true, Ordering::SeqCst);
+}
+
+/// Whether the supervisor may still start or restart a child.
+///
+/// Reads the flag at the moment of the decision rather than taking an earlier
+/// snapshot: an exit can be requested while the tick is awaiting something, so
+/// a check performed at entry alone is not enough. Pure read of one atomic, so
+/// the shutdown gate is unit-testable without a real process.
+fn may_start_child() -> bool {
+    !QUITTING.load(Ordering::SeqCst)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SupervisedService {
@@ -215,6 +242,13 @@ fn proxy_heartbeat_status(proxy_required: bool, probe: impl FnOnce() -> bool) ->
 }
 
 async fn tick(handle: &AppHandle) {
+    // DD-077: once the app is quitting, a tick does no work at all — no config
+    // read, no probe, and above all no start or restart of a child that the
+    // exit path has already reaped (or is about to).
+    if !may_start_child() {
+        return;
+    }
+
     // Read the active backend + model once per tick.
     let (
         is_ollama,
@@ -253,6 +287,12 @@ async fn tick(handle: &AppHandle) {
     } else {
         let fails = BUN_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
+            // DD-077: the exit path may have set the flag while this tick was
+            // reading config or probing; check again immediately before the
+            // start, which is the last moment a relaunch can be prevented.
+            if !may_start_child() {
+                return;
+            }
             // ensure_* is idempotent (it health-probes before spawning).
             match crate::ensure_jarvis_server_started().await {
                 Ok(_) => {
@@ -295,6 +335,10 @@ async fn tick(handle: &AppHandle) {
         ProxyAction::Start => {
             let fails = PROXY_FAILS.load(Ordering::Relaxed);
             if may_restart(fails) {
+                // DD-077: no restart may begin after the app started quitting.
+                if !may_start_child() {
+                    return;
+                }
                 match crate::restart_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone())
                 {
                     Ok(_) => {
@@ -335,6 +379,11 @@ async fn tick(handle: &AppHandle) {
         OllamaAction::Start => {
             let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
             if may_restart(fails) {
+                // DD-077: the exit path stops the Ollama child; a tick must not
+                // resurrect it while that teardown is in progress.
+                if !may_start_child() {
+                    return;
+                }
                 crate::start_ollama_and_warm(ollama_model).await;
                 if crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl) {
                     OLLAMA_FAILS.store(0, Ordering::Relaxed);
@@ -358,6 +407,10 @@ async fn tick(handle: &AppHandle) {
     } else {
         let fails = LLAMA_CPP_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
+            // DD-077: no start after the app started quitting.
+            if !may_start_child() {
+                return;
+            }
             match crate::start_llama_cpp_server(llama_cpp_config.clone()).await {
                 Ok(_) => {
                     LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
@@ -401,6 +454,16 @@ mod tests {
     use super::*;
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Clears the process-wide quitting flag when a test ends — including when
+    /// it panics — so one test's shutdown state cannot leak into another.
+    struct QuittingFlagReset;
+
+    impl Drop for QuittingFlagReset {
+        fn drop(&mut self) {
+            QUITTING.store(false, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn heartbeat_skips_proxy_probe_when_runtime_gate_is_closed() {
@@ -710,6 +773,110 @@ mod tests {
             .split_once("#[cfg(test)]")
             .map(|(production, _)| production)
             .expect("supervisor.rs must keep its test module after the production code")
+    }
+
+    /// The body of the supervisor tick, from its signature to the end of the
+    /// production half. Reads the source because calling `tick` would need an
+    /// `AppHandle` and could reach a real spawn.
+    fn supervisor_tick_source() -> &'static str {
+        supervisor_production_source()
+            .split_once("async fn tick(handle: &AppHandle) {")
+            .map(|(_, body)| body)
+            .expect("the supervisor tick must still be the function under test")
+    }
+
+    /// Every start/restart the tick can perform, in source order. Naming them
+    /// here means a new spawn site added without a gate fails this test.
+    const TICK_SPAWN_SITES: [&str; 4] = [
+        "crate::ensure_jarvis_server_started(",
+        "crate::restart_claude_cli_proxy(",
+        "crate::start_ollama_and_warm(",
+        "crate::start_llama_cpp_server(",
+    ];
+
+    /// DD-077: after the app starts quitting, the tick must never reach a spawn.
+    ///
+    /// Fails if the quitting read is removed from the gate (the flag no longer
+    /// closes anything) or if any spawn site loses its guard (the flag would be
+    /// set and ignored). No process is started: the gate is a pure atomic read.
+    #[test]
+    fn a_quitting_app_never_reaches_the_ticks_start_or_restart_step() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _reset = QuittingFlagReset;
+
+        // The exit handler's setter is what the tick must observe.
+        mark_quitting();
+        assert!(
+            !may_start_child(),
+            "once the app is quitting the supervisor must neither start nor restart a child"
+        );
+
+        let tick = supervisor_tick_source();
+
+        // The entry check runs before the tick reads config or probes anything,
+        // so a tick that wakes during shutdown does no work at all.
+        let entry_gate = tick
+            .find("if !may_start_child()")
+            .expect("the tick must return early at its entry once the app is quitting");
+        let first_work = tick
+            .find("handle.state::<JarvisState>()")
+            .expect("the tick must still read its config");
+        assert!(
+            entry_gate < first_work,
+            "the quitting check must come before any tick work:\n{tick}"
+        );
+
+        // And every spawn site re-reads the flag: an exit can be requested while
+        // the tick is awaiting a lock or a health probe, so an entry-only check
+        // would still let a relaunch through after the app began quitting.
+        assert!(
+            tick.matches("if !may_start_child()").count() >= 1 + TICK_SPAWN_SITES.len(),
+            "expected the entry gate plus one gate per spawn site, found {}:\n{tick}",
+            tick.matches("if !may_start_child()").count()
+        );
+        let mut cursor = entry_gate + "if !may_start_child()".len();
+        for spawn in TICK_SPAWN_SITES {
+            let at = tick[cursor..]
+                .find(spawn)
+                .map(|offset| cursor + offset)
+                .unwrap_or_else(|| panic!("the tick must still call {spawn}:\n{tick}"));
+            assert!(
+                tick[cursor..at].contains("if !may_start_child()"),
+                "{spawn} must be gated on the quitting flag, so no start or restart \
+                 can happen after it is set:\n{}",
+                &tick[cursor..at]
+            );
+            cursor = at;
+        }
+    }
+
+    /// The complement: with the flag clear, the same seam still permits the
+    /// watchdog's work. A gate that refused unconditionally would pass the test
+    /// above while silently disabling auto-restart.
+    #[test]
+    fn a_running_app_still_lets_the_tick_start_and_restart() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _reset = QuittingFlagReset;
+
+        // Start from a known state: the app is running, not quitting.
+        QUITTING.store(false, Ordering::SeqCst);
+        assert!(
+            may_start_child(),
+            "with the app running the supervisor must still be allowed to start and restart"
+        );
+
+        // The gate reads the live flag rather than caching an earlier answer:
+        // setting it closes the seam, and clearing it opens the seam again.
+        mark_quitting();
+        assert!(
+            !may_start_child(),
+            "with the app quitting the gate must close for that same tick"
+        );
+        QUITTING.store(false, Ordering::SeqCst);
+        assert!(
+            may_start_child(),
+            "the gate must read the flag each time, not remember a stale answer"
+        );
     }
 
     #[test]

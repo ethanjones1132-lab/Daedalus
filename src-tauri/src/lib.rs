@@ -2996,6 +2996,12 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                // DD-077: close the supervisor's start/restart gate *before* any
+                // child is torn down. A tick already in flight would otherwise
+                // relaunch the server stop_all is reaping, leaving it running
+                // after the window is gone. One ordering point: set the flag
+                // here, then reap.
+                supervisor::mark_quitting();
                 process_lifecycle::stop_all();
             }
         });
