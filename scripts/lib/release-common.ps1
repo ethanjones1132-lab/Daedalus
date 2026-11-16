@@ -225,6 +225,70 @@ function Get-JarvisMainBinaryName {
     throw 'cargo_binary_name_unreadable'
 }
 
+function Resolve-JarvisBundledBunSource {
+    <#
+    .SYNOPSIS
+        Find the build machine's Bun the way the machine advertises it.
+
+    .DESCRIPTION
+        PATH first, then the profile install that `bun install` / the Bun
+        installer writes for the build user
+        (`%USERPROFILE%\.bun\bin\bun.exe`). Only when neither has Bun does
+        this fail, with the same `bundled_bun_source_missing` verdict the
+        release build already used.
+
+        PATH-first is the fix for a release runner that has Bun on PATH but
+        not in the profile: the release build used to look ONLY at the
+        profile path, so it could not build the installer on a machine where
+        `bun --version` works fine.
+
+        Only a file actually named bun.exe (or an extensionless `bun`, for a
+        machine that advertises it that way) in a PATH directory or at the
+        profile path is returned. Nothing else is substituted -- staging an
+        unrelated executable as the bundled runtime is exactly the failure
+        this must not introduce -- and nothing is copied here.
+
+        Returns the absolute path of the first match.
+
+    .PARAMETER SearchPath
+        The semicolon-separated directories to treat as PATH. Defaults to the
+        real `$env:PATH`, which is what a release build wants; tests pass a
+        temporary directory instead of mutating the process PATH.
+
+    .PARAMETER ProfilePath
+        The profile install to fall back to. Defaults to
+        `%USERPROFILE%\.bun\bin\bun.exe`.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$SearchPath = $env:PATH,
+        [string]$ProfilePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ProfilePath) -and
+        -not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $ProfilePath = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
+    }
+
+    foreach ($directory in ([string]$SearchPath -split ';')) {
+        $trimmed = $directory.Trim().Replace('"', '')
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        foreach ($name in @('bun.exe', 'bun')) {
+            $candidate = Join-Path $trimmed $name
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return (Resolve-Path -LiteralPath $candidate).Path
+            }
+        }
+    }
+
+    if ((-not [string]::IsNullOrWhiteSpace($ProfilePath)) -and
+        (Test-Path -LiteralPath $ProfilePath -PathType Leaf)) {
+        return (Resolve-Path -LiteralPath $ProfilePath).Path
+    }
+
+    throw "bundled_bun_source_missing:no bun.exe on PATH and none at $ProfilePath. The Windows installer must ship bun.exe beside the app binary, and this build machine has no Bun there. Install Bun for the build user (%USERPROFILE%\.bun\bin\bun.exe) or build the release on a machine that has it."
+}
+
 function Stage-JarvisBundledBun {
     <#
     .SYNOPSIS
@@ -245,8 +309,9 @@ function Stage-JarvisBundledBun {
         `cargo tauri build` only (Get-JarvisBundledBunConfigMerge).
 
     .PARAMETER SourcePath
-        Usually `%USERPROFILE%\.bun\bin\bun.exe`. A missing source fails the
-        release build with bundled_bun_source_missing rather than shipping an
+        The Bun that Resolve-JarvisBundledBunSource found: PATH first, usually
+        `%USERPROFILE%\.bun\bin\bun.exe`. A missing source fails the release
+        build with bundled_bun_source_missing rather than shipping an
         installer whose runtime is missing.
 
     .PARAMETER DestinationPath

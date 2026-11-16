@@ -34,9 +34,10 @@
 
       * build without the bundled Bun. The installer has to carry a
         bun.exe beside the app binary or the installed app cannot start
-        its server, so a build machine with no Bun fails here with
-        bundled_bun_source_missing instead of shipping a runtime-less
-        install.
+        its server, so Bun is resolved PATH first with the build user's
+        profile install as the fallback, and a machine with neither fails
+        here with bundled_bun_source_missing instead of shipping a
+        runtime-less install.
 
 .PARAMETER RepoRoot
     Repository root. Defaults to the parent of this script's directory.
@@ -145,11 +146,15 @@ if (-not $cargo) { Die 'cargo not found on PATH' }
 # not, so a committed `target/...` source turns a plain `cargo check` on a
 # fresh checkout into a missing-resource error. The release build stages the
 # build machine's Bun and merges the entry in for its own `cargo tauri build`.
+#
+# The source is located the way the machine advertises it: PATH first, then
+# the build user's profile install (Resolve-JarvisBundledBunSource). Only
+# when both are missing does this fail, with bundled_bun_source_missing.
 Write-Step 'Staging the bundled Bun runtime'
 $bundledBunTarget = Join-Path $RepoRoot 'src-tauri\target\release\bun.exe'
 try {
     Stage-JarvisBundledBun `
-        -SourcePath (Join-Path $env:USERPROFILE '.bun\bin\bun.exe') `
+        -SourcePath (Resolve-JarvisBundledBunSource -ProfilePath (Join-Path $env:USERPROFILE '.bun\bin\bun.exe')) `
         -DestinationPath $bundledBunTarget
 } catch {
     Die $_.Exception.Message

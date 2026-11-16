@@ -713,6 +713,74 @@ Describe 'the main binary name' {
     }
 }
 
+Describe 'locating the build machine Bun' {
+    It 'finds bun on PATH before the profile copy' {
+        # The release runner advertises Bun on PATH. The build used to look
+        # only at %USERPROFILE%\.bun\bin\bun.exe, so it could not build the
+        # installer on a machine where `bun --version` works.
+        $pathDir = Join-Path $TestDrive 'bun-on-path'
+        New-Item -ItemType Directory -Force -Path $pathDir | Out-Null
+        $pathBun = Join-Path $pathDir 'bun.exe'
+        'fixture bun bytes' | Set-Content -LiteralPath $pathBun
+
+        # A profile copy exists too, with different bytes: PATH has to
+        # WIN, not merely be accepted when the profile is empty. This case
+        # fails if the resolver is reverted to the hardcoded profile path.
+        $profileBun = Join-Path $TestDrive 'bun-in-profile\.bun\bin\bun.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $profileBun) | Out-Null
+        'profile bun bytes' | Set-Content -LiteralPath $profileBun
+
+        $savedPath = $env:PATH
+        try {
+            $env:PATH = "$pathDir;$savedPath"
+            $resolved = Resolve-JarvisBundledBunSource -ProfilePath $profileBun
+        } finally {
+            $env:PATH = $savedPath
+        }
+
+        $resolved | Should Be $pathBun
+        (Get-Content -Raw -LiteralPath $resolved) | Should Match 'fixture bun bytes'
+    }
+
+    It 'falls back to the profile copy when PATH has no bun' {
+        $emptyDir = Join-Path $TestDrive 'path-without-bun'
+        New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+        $profileBun = Join-Path $TestDrive 'profile-only\.bun\bin\bun.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $profileBun) | Out-Null
+        'profile bun bytes' | Set-Content -LiteralPath $profileBun
+
+        Resolve-JarvisBundledBunSource -SearchPath $emptyDir -ProfilePath $profileBun |
+            Should Be $profileBun
+    }
+
+    It 'fails with bundled_bun_source_missing when neither location has Bun' {
+        $emptyDir = Join-Path $TestDrive 'no-bun-on-path'
+        New-Item -ItemType Directory -Force -Path $emptyDir | Out-Null
+        $missingProfile = Join-Path $TestDrive 'no-bun-in-profile\.bun\bin\bun.exe'
+
+        { Resolve-JarvisBundledBunSource -SearchPath $emptyDir -ProfilePath $missingProfile } |
+            Should Throw 'bundled_bun_source_missing'
+    }
+
+    It 'does not stage some other executable as the bundled Bun' {
+        # "Fall back" must never mean "grab whatever is next". A directory
+        # holding node.exe is not a place Bun was found.
+        $otherDir = Join-Path $TestDrive 'path-with-node'
+        New-Item -ItemType Directory -Force -Path $otherDir | Out-Null
+        'not bun' | Set-Content -LiteralPath (Join-Path $otherDir 'node.exe')
+        $missingProfile = Join-Path $TestDrive 'still-no-bun-in-profile\.bun\bin\bun.exe'
+
+        { Resolve-JarvisBundledBunSource -SearchPath $otherDir -ProfilePath $missingProfile } |
+            Should Throw 'bundled_bun_source_missing'
+    }
+
+    It 'is what the release build uses to pick the Bun it stages' {
+        $releaseBuild = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\release-build.ps1')
+        $releaseBuild | Should Match 'Resolve-JarvisBundledBunSource'
+        $releaseBuild | Should Match 'Stage-JarvisBundledBun'
+    }
+}
+
 Describe 'the app binary is read from a real install' {
     It 'installs the installer to learn what the app binary really is' {
         # target/release/home-base.exe and the exe the installer carries are
