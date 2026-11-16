@@ -48,9 +48,28 @@
     the probe open; past this budget Stop-JarvisOwnedProcesses gives each
     OS query up with a warning, still stopping the root process when it can.
 
+.PARAMETER QuitPass
+    DD-083: after the boot verdict, run a graceful-quit pass. The app is
+    asked to close the way a user closes it (CloseMainWindow, the WM_CLOSE
+    path that ends in Tauri's RunEvent::ExitRequested), the exit is waited
+    for inside a bounded budget, and then the shutdown is asserted: no
+    child process the app spawned may survive it, and nothing may still
+    listen on the probe port. A dirty quit turns a RESPONSIVE verdict into
+    QUIT_DIRTY (non-zero exit). Opt-in: without it the run is exactly as
+    before.
+
+.PARAMETER QuitWaitSeconds
+    How long the quit pass waits for the app to exit after CloseMainWindow.
+    Only used with -QuitPass.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\probe-cold-start.ps1 `
         -InstallerPath dist\release\1.0.0\Jarvis_1.0.0_x64-setup.exe
+
+.EXAMPLE
+    Same run, plus the DD-T3 shutdown evidence:
+    powershell -ExecutionPolicy Bypass -File scripts\probe-cold-start.ps1 `
+        -InstallerPath dist\release\1.0.0\Jarvis_1.0.0_x64-setup.exe -QuitPass
 #>
 [CmdletBinding()]
 param(
@@ -63,7 +82,11 @@ param(
 
     [int]$CleanupTimeoutSeconds = 20,
 
-    [switch]$KeepInstall
+    [switch]$KeepInstall,
+
+    [switch]$QuitPass,
+
+    [int]$QuitWaitSeconds = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,6 +137,143 @@ function Get-JarvisWindowState([System.Diagnostics.Process]$Process) {
         $state.responsive = [WindowProbe]::IsResponsive($Process.MainWindowHandle, 3000)
     }
     return $state
+}
+
+# ── Quit pass (DD-083, opt-in -QuitPass) ─────────────────────────────────────
+
+function Test-JarvisProbeQuitPass {
+    <#
+    .SYNOPSIS
+        The graceful-quit assertions behind the probe's opt-in -QuitPass.
+
+    .DESCRIPTION
+        DD-T3 shutdown evidence: a cold boot is only half the story, the
+        shutdown is the other half. This pass asks the app to quit the way a
+        user does - CloseMainWindow, the WM_CLOSE path that ends in Tauri's
+        RunEvent::ExitRequested (src-tauri/src/lib.rs), where the supervisor's
+        restart gate is closed before the children are reaped - waits for the
+        exit inside a bounded budget, and then asserts that the shutdown
+        actually completed: no child process the app spawned may survive it,
+        and nothing may still be listening on the probe port.
+
+        Every OS seam is an injected scriptblock with a real default, and the
+        children and port queries run through the same bounded helpers the
+        observation loop uses (Get-JarvisProbeChildProcessEvidence and
+        Invoke-JarvisProbeBoundedQuery), so the pass cannot outlive its
+        budget and scripts/probe-cold-start.Tests.ps1 can drive it entirely
+        on fakes - no installer, no app, no listener, no real query.
+
+        When the app never exits, its children and its port are expected to
+        still be there; asserting against them would invent shutdown
+        failures the no-exit failure already covers, so both are reported as
+        not_queried and the exit failure carries the run.
+
+        Fails closed: a close that could not be requested is recorded, an
+        app still running at the budget, a child or port query that did not
+        answer are all named failures, never a silent pass. Ownership is the
+        probe's own child-evidence definition - the single PID source of
+        this script; no second enumeration is added here.
+
+    .OUTPUTS
+        [pscustomobject] with ok, close_requested, exited, exit_code,
+        children (leftover owned children), children_query, listener_status,
+        listener_pid and failures (strings naming the offending PID or port).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [int]$Port = 19877,
+        [int]$QuitWaitSeconds = 20,
+        [int]$QueryTimeoutSeconds = 10,
+        [scriptblock]$CloseMainWindow = { param($Proc)
+            if ($Proc.HasExited) { $false } else { [bool]$Proc.CloseMainWindow() }
+        },
+        [scriptblock]$WaitExit = { param($Proc, $TimeoutMs)
+            if ($Proc.HasExited) { $true } else { [bool]$Proc.WaitForExit($TimeoutMs) }
+        },
+        [scriptblock]$ChildrenQuery = $null,
+        [scriptblock]$ListenerQuery = $null
+    )
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $childrenStatus = 'not_queried'
+    $children = @()
+    $listenerStatus = 'not_queried'
+    $listenerPid = $null
+
+    # 1. The graceful close. A process without a window reports no close
+    #    requested; that alone is not a failure, the exit wait below is.
+    $closeRequested = $false
+    try {
+        $closeRequested = [bool](& $CloseMainWindow $Process)
+    } catch {
+        $failures.Add("close_main_window_failed:$($_.Exception.Message)")
+    }
+
+    # 2. Wait for the exit inside the quit budget.
+    $exited = $false
+    try {
+        $exited = [bool](& $WaitExit $Process ([Math]::Max(0, $QuitWaitSeconds) * 1000))
+    } catch {
+        $failures.Add("exit_wait_failed:$($_.Exception.Message)")
+    }
+    if (-not $exited) {
+        $failures.Add("app_did_not_exit_within_${QuitWaitSeconds}s")
+    }
+
+    $exitCode = $null
+    if ($exited) {
+        try { $exitCode = $Process.ExitCode } catch { $exitCode = $null }
+
+        # 3. No child the app spawned may have survived it. Same bounded
+        #    child-evidence helper the run itself records with.
+        $childrenParams = @{
+            ProbeProcessId = $Process.Id
+            Deadline       = (Get-Date).AddSeconds($QueryTimeoutSeconds)
+        }
+        if ($ChildrenQuery) { $childrenParams.ProcessSnapshotQuery = $ChildrenQuery }
+        $childrenEvidence = Get-JarvisProbeChildProcessEvidence @childrenParams
+        $childrenStatus = $childrenEvidence.status
+        if ($childrenEvidence.status -ne 'result') {
+            $failures.Add("children_query_$($childrenEvidence.status):$($childrenEvidence.error)")
+        } else {
+            $children = @($childrenEvidence.children)
+            foreach ($child in $children) {
+                $failures.Add("owned_child_survived_quit:pid=$($child.ProcessId) name=$($child.Name)")
+            }
+        }
+
+        # 4. Nothing may still listen on the probe port, whoever owns it.
+        #    The shared default query comes from the bounded-queries lib, so
+        #    this file keeps naming no OS query cmdlet.
+        if (-not $ListenerQuery) { $ListenerQuery = Get-JarvisProbeListenerQuery }
+        $listenerResult = Invoke-JarvisProbeBoundedQuery -Name 'quit_listener' -Query $ListenerQuery `
+            -ArgumentList @($Port) -Deadline ((Get-Date).AddSeconds($QueryTimeoutSeconds))
+        $listenerStatus = $listenerResult.status
+        if ($listenerResult.status -ne 'result') {
+            $failures.Add("port_query_$($listenerResult.status):$($listenerResult.error)")
+        } else {
+            $listener = $null
+            if ($listenerResult.value) { $listener = @($listenerResult.value)[0] }
+            if ($listener) {
+                $ownerProperty = $listener.PSObject.Properties['OwningProcess']
+                if ($ownerProperty) { $listenerPid = $ownerProperty.Value }
+                $failures.Add("port_${Port}_still_listening:owner_pid=$listenerPid")
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        ok              = ($failures.Count -eq 0)
+        close_requested = $closeRequested
+        exited          = $exited
+        exit_code       = $exitCode
+        children        = @($children)
+        children_query  = $childrenStatus
+        listener_status = $listenerStatus
+        listener_pid    = $listenerPid
+        failures        = @($failures)
+    }
 }
 
 $started = Get-Date
@@ -269,7 +429,37 @@ if (Test-Path $stderr) { $stderrTail = [string[]]@(Get-Content $stderr -Tail 25 
 $stdoutTail = [string[]]@()
 if (Test-Path $stdout) { $stdoutTail = [string[]]@(Get-Content $stdout -Tail 25 -ErrorAction SilentlyContinue) }
 
+# ── Quit pass (DD-083, opt-in) ───────────────────────────────────────────────
+# DD-T3 shutdown evidence: the app must also quit the way a user quits it.
+# CloseMainWindow is the WM_CLOSE path that ends in Tauri's
+# RunEvent::ExitRequested (src-tauri/src/lib.rs), where the supervisor's
+# restart gate closes before the children are reaped; the pass then asserts
+# that no owned child outlived the window and the port came free. Opt-in: a
+# run without -QuitPass never enters this section.
+$quitPassEvidence = $null
+if ($QuitPass) {
+    Write-Step 'Quit pass: graceful quit, then shutdown assertions'
+    $quitPassEvidence = Test-JarvisProbeQuitPass -Process $process -Port 19877 -QuitWaitSeconds $QuitWaitSeconds
+    Mark 'quit_pass' @{ ok = $quitPassEvidence.ok; failures = @($quitPassEvidence.failures) }
+    if ($quitPassEvidence.ok) {
+        Write-Ok "quit pass clean: exited=$($quitPassEvidence.exited), no owned children, port 19877 free"
+    } else {
+        foreach ($quitFailure in @($quitPassEvidence.failures)) {
+            Write-Warn "quit pass: $quitFailure"
+        }
+    }
+}
+
 # ── Verdict ──────────────────────────────────────────────────────────────────
+# DD-083: a dirty graceful quit fails the run. Only a RESPONSIVE verdict can
+# become QUIT_DIRTY: every other verdict already exits non-zero, and its own
+# cause must not be overwritten by the shutdown half; the quit-pass evidence
+# is in the record either way.
+if ($quitPassEvidence -and -not $quitPassEvidence.ok -and $verdict -eq 'RESPONSIVE') {
+    $verdict = 'QUIT_DIRTY'
+    $lastDetail = "graceful quit failed: $(@($quitPassEvidence.failures) -join '; ')"
+}
+
 $summary = [pscustomobject]@{
     verdict        = $verdict
     detail         = $lastDetail
@@ -286,6 +476,11 @@ $summary = [pscustomobject]@{
     stdout_tail    = $stdoutTail
     stderr_tail    = $stderrTail
     app_log        = $appLog
+}
+# DD-083: the shutdown evidence joins the record only when the quit pass ran,
+# so a default run's summary object is unchanged.
+if ($quitPassEvidence) {
+    $summary | Add-Member -NotePropertyName quit_pass -NotePropertyValue $quitPassEvidence
 }
 $summary | ConvertTo-Json -Depth 6 | Write-Output
 

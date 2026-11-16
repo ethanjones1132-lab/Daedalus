@@ -23,6 +23,11 @@
     process teardown in scripts/lib/release-common.ps1 must give every CIM
     query up at its cleanup deadline. The deadline tests stub the CIM cmdlet
     and the bounded dispatcher, so no real CIM query is ever run.
+
+    DD-083 adds the opt-in graceful-quit pass (-QuitPass). Its helper,
+    Test-JarvisProbeQuitPass, lives in the probe itself and is extracted
+    here by AST so it can be driven entirely on fakes; a run without
+    -QuitPass is pinned unchanged.
 #>
 
 . (Join-Path $PSScriptRoot 'lib\probe-bounded-queries.ps1')
@@ -62,6 +67,26 @@ function New-ObservationArguments {
         ListenerQuery  = $ListenerQuery
         ProcessQuery   = $ProcessQuery
     }
+}
+
+# Extracts the probe's Test-JarvisProbeQuitPass function by AST and returns
+# it as a scriptblock, so the quit-pass cases below can invoke it on fakes
+# without running the probe (whose body would install, launch and listen).
+function Get-ProbeQuitPassFunction {
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        (Get-Content -Raw -LiteralPath $probePath), [ref]$tokens, [ref]$parseErrors)
+    if (@($parseErrors).Count -gt 0) { throw "probe parse errors: $($parseErrors[0].Message)" }
+    $definitions = @($ast.FindAll({
+        param($node)
+        ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+        ($node.Name -eq 'Test-JarvisProbeQuitPass')
+    }, $true))
+    if ($definitions.Count -ne 1) {
+        throw 'Test-JarvisProbeQuitPass not found exactly once in probe-cold-start.ps1'
+    }
+    return [scriptblock]::Create($definitions[0].Body.Extent.Text)
 }
 
 Describe 'bounded query dispatch' {
@@ -339,6 +364,139 @@ Describe 'child process evidence' {
         $evidence.status | Should Be 'timed_out'
         @($evidence.children).Count | Should Be 0
         ($watch.Elapsed.TotalSeconds -lt 5) | Should Be $true
+    }
+}
+
+Describe 'graceful quit pass (DD-083)' {
+    # Every case drives the extracted probe helper on fakes: the fake
+    # process is a record, the close/exit seams are local scriptblocks, and
+    # the children and port queries run in the same bounded runspaces the
+    # observation loop uses, fed by injected fakes. No installer, no app, no
+    # listener, no real OS query ever runs here.
+    It 'passes when the app exits, leaves no owned children and the port is free' {
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $true } `
+            -ChildrenQuery { param($ProbeId) } `
+            -ListenerQuery { param($Port) $null }
+        $quit.ok | Should Be $true
+        $quit.close_requested | Should Be $true
+        $quit.exited | Should Be $true
+        @($quit.children).Count | Should Be 0
+        $quit.listener_status | Should Be 'result'
+        @($quit.failures).Count | Should Be 0
+    }
+
+    It 'fails and names the PID of an owned child that survived the quit' {
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $true } `
+            -ChildrenQuery {
+                param($ProbeId)
+                [pscustomobject]@{ ProcessId = 5001; ParentProcessId = $ProbeId; Name = 'bun.exe' }
+            } `
+            -ListenerQuery { param($Port) $null }
+        $quit.ok | Should Be $false
+        @($quit.children).Count | Should Be 1
+        $quit.children[0].ProcessId | Should Be 5001
+        ($quit.failures -join '; ') | Should Match 'owned_child_survived_quit:pid=5001'
+    }
+
+    It 'fails and names the owner when the port is still bound after the quit' {
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $true } `
+            -ChildrenQuery { param($ProbeId) } `
+            -ListenerQuery { param($Port) [pscustomobject]@{ OwningProcess = 4000 } }
+        $quit.ok | Should Be $false
+        $quit.listener_pid | Should Be 4000
+        ($quit.failures -join '; ') | Should Match 'port_19877_still_listening:owner_pid=4000'
+    }
+
+    It 'fails when the app never exits inside the quit budget and skips the shutdown assertions' {
+        # An app that is still running still has its children and its port;
+        # listing them as shutdown failures would invent evidence. The
+        # no-exit failure carries the run instead.
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $false } `
+            -ChildrenQuery { param($ProbeId) throw 'children_query_must_not_run_before_exit' } `
+            -ListenerQuery { param($Port) throw 'port_query_must_not_run_before_exit' }
+        $quit.ok | Should Be $false
+        ($quit.failures -join '; ') | Should Match 'app_did_not_exit_within'
+        $quit.children_query | Should Be 'not_queried'
+        $quit.listener_status | Should Be 'not_queried'
+    }
+
+    It 'fails closed when the children query does not answer' {
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $true } `
+            -QueryTimeoutSeconds 1 `
+            -ChildrenQuery { param($ProbeId) Start-Sleep -Seconds 15 } `
+            -ListenerQuery { param($Port) $null }
+        $quit.ok | Should Be $false
+        $quit.children_query | Should Be 'timed_out'
+        ($quit.failures -join '; ') | Should Match 'children_query_timed_out'
+    }
+
+    It 'bounds the quit children and port queries so a stalled query cannot hold the pass open' {
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        $quit = & (Get-ProbeQuitPassFunction) -Process (New-FakeProbeProcess) `
+            -CloseMainWindow { param($Proc) $true } `
+            -WaitExit { param($Proc, $TimeoutMs) $true } `
+            -QueryTimeoutSeconds 1 `
+            -ChildrenQuery { param($ProbeId) Start-Sleep -Seconds 15 } `
+            -ListenerQuery { param($Port) Start-Sleep -Seconds 15 }
+        $watch.Stop()
+        ($watch.Elapsed.TotalSeconds -lt 10) | Should Be $true
+        $quit.children_query | Should Be 'timed_out'
+        $quit.listener_status | Should Be 'timed_out'
+        $quit.ok | Should Be $false
+    }
+
+    It 'declares -QuitPass as a switch, off by default' {
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match ([regex]::Escape('[switch]$QuitPass'))
+    }
+
+    It 'guards the quit pass behind the -QuitPass switch so a default run never reaches it' {
+        # Regression pin for the default path: exactly one call site, and it
+        # must sit inside an `if ($QuitPass)` - anything else would change a
+        # run that passes no -QuitPass.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            (Get-Content -Raw -LiteralPath $probePath), [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should BeNullOrEmpty
+        $calls = @($ast.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.CommandAst]) -and
+            ($node.GetCommandName() -eq 'Test-JarvisProbeQuitPass')
+        }, $true))
+        $calls.Count | Should Be 1
+        $node = $calls[0]
+        $guard = $null
+        while ($node -and (-not $guard)) {
+            $node = $node.Parent
+            if ($node -is [System.Management.Automation.Language.IfStatementAst]) { $guard = $node }
+        }
+        ($null -ne $guard) | Should Be $true
+        ([string]$guard.Clauses[0].Item1) | Should Be '$QuitPass'
+    }
+
+    It 'joins the quit-pass evidence to the record only when the quit pass ran' {
+        # The summary object is built once for every run; a default run's
+        # JSON must not gain a quit_pass field, so the member is added
+        # behind the ran guard rather than in the literal.
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match 'Add-Member -NotePropertyName quit_pass'
+    }
+
+    It 'turns a dirty quit into a failing QUIT_DIRTY verdict' {
+        $probeText = Get-Content -Raw -LiteralPath $probePath
+        $probeText | Should Match "'QUIT_DIRTY'"
+        $probeText | Should Match 'quit_pass'
     }
 }
 

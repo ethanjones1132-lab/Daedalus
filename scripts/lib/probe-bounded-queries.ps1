@@ -34,6 +34,10 @@
         created at or after the probe started. Port-open alone is never
         evidence, and neither is a parent-PID match on a reused PID.
 
+      * Get-JarvisProbeListenerQuery is the shared default port query both
+        bounded callers hand to the dispatcher, so the OS cmdlet is named
+        here and nowhere else.
+
       * Get-JarvisColdStartObservation is one poll of the observation loop:
         process exit (DIED), window state (injected), then the bounded
         listener and owning-process queries plus the ownership decision.
@@ -197,6 +201,27 @@ function Invoke-JarvisProbeBoundedQuery {
 
 # ── Server ownership ────────────────────────────────────────────────────────
 
+function Get-JarvisProbeListenerQuery {
+    <#
+    .SYNOPSIS
+        The default bounded listener query: is anything listening on a port?
+
+    .DESCRIPTION
+        One definition for every place that asks "is the port open" through
+        the bounded dispatcher - the observation poll and, since DD-083, the
+        opt-in quit pass. Returned as a scriptblock so each caller hands it
+        to Invoke-JarvisProbeBoundedQuery and it runs in its own runspace,
+        never on the caller's pipeline. The probe script itself must not
+        name the OS query cmdlets; that rule is pinned by
+        scripts/probe-cold-start.Tests.ps1 and lives on this file.
+    #>
+    return {
+        param($LocalPort)
+        Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
+}
+
 function Test-JarvisProbeOwnedServer {
     <#
     .SYNOPSIS
@@ -319,13 +344,7 @@ function Get-JarvisColdStartObservation {
         [scriptblock]$ProcessQuery = $null
     )
 
-    if (-not $ListenerQuery) {
-        $ListenerQuery = {
-            param($LocalPort)
-            Get-NetTCPConnection -State Listen -LocalPort $LocalPort -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-        }
-    }
+    if (-not $ListenerQuery) { $ListenerQuery = Get-JarvisProbeListenerQuery }
     if (-not $ProcessQuery) {
         $ProcessQuery = {
             param($ProcessId)
