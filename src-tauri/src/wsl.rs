@@ -212,6 +212,92 @@ pub fn jarvis_api_candidates() -> Vec<String> {
 // The bodies are deliberately conservative: they only call `wsl.exe` on
 // Windows and fall back to plain `Command` on Linux/macOS.
 
+/// Resolve this machine's home directory from an injected environment, in the
+/// order each platform publishes it: `USERPROFILE` then `HOME` on Windows and
+/// the reverse elsewhere, then the `HOMEDRIVE` + `HOMEPATH` pair older Windows
+/// shells set. `None` means the environment names no home, so callers report a
+/// miss instead of reusing a directory from another PC.
+pub(crate) fn home_dir_from_env(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    fn read(env: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+        env(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    let ordered: &[&str] = if cfg!(target_os = "windows") {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME", "USERPROFILE"]
+    };
+    if let Some(home) = ordered.iter().find_map(|name| read(&env, name)) {
+        return Some(home);
+    }
+    match (read(&env, "HOMEDRIVE"), read(&env, "HOMEPATH")) {
+        (Some(drive), Some(path)) => Some(format!("{drive}{path}")),
+        _ => None,
+    }
+}
+
+/// Ask `wsl.exe` for the Linux home directory. `None` when the probe did not
+/// answer with a usable path.
+#[cfg(target_os = "windows")]
+fn probe_wsl_home() -> Option<String> {
+    // `wsl.exe -- bash -lc 'echo $HOME'` is the most reliable source because
+    // the user's actual Linux home may differ from the Windows `%USERPROFILE%`.
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["--", "bash", "-lc", "echo -n $HOME"]);
+    hide_windows_console(&mut cmd);
+    let out = command_output_timeout(cmd, Duration::from_secs(5))?;
+    if !out.status.success() {
+        return None;
+    }
+    let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!home.is_empty()).then_some(home)
+}
+
+/// There is no WSL probe off Windows; the environment names the home directly.
+#[cfg(not(target_os = "windows"))]
+fn probe_wsl_home() -> Option<String> {
+    None
+}
+
+/// Pure decision seam: the `wsl.exe` probe's answer, else this machine's home
+/// from the environment, else an error the caller can report. A failed probe
+/// never turns into a literal `/home/<name>` or `C:\Users\<name>` guess.
+fn resolve_wsl_home(
+    probe: impl FnOnce() -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    if let Some(home) = probe()
+        .map(|home| home.trim().to_string())
+        .filter(|home| !home.is_empty())
+    {
+        return Ok(home);
+    }
+    home_dir_from_env(env).ok_or_else(|| {
+        "WSL home could not be resolved: `wsl.exe` reported none and the \
+         environment names no home (USERPROFILE, HOME, HOMEDRIVE + HOMEPATH)"
+            .to_string()
+    })
+}
+
+/// [`wsl_home`]'s value for one probe/environment pair: the resolver's answer,
+/// or an empty string (with the miss logged) when there is nothing to derive.
+/// Empty is deliberate — a caller that joins it into a path gets an obviously
+/// rootless path rather than a user directory from another PC.
+fn wsl_home_value(
+    probe: impl FnOnce() -> Option<String>,
+    env: impl Fn(&str) -> Option<String>,
+) -> String {
+    match resolve_wsl_home(probe, env) {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("[Jarvis] {error}");
+            String::new()
+        }
+    }
+}
+
 /// Resolve the WSL home directory (`/home/<user>`). On non-Windows targets
 /// this returns the value of `$HOME` directly. Used everywhere the app
 /// needs to construct paths under JARVIS_HOME.
@@ -219,36 +305,14 @@ pub fn jarvis_api_candidates() -> Vec<String> {
 /// Cached for the process lifetime: the answer cannot change while the app
 /// runs, and an uncached `wsl.exe` launch can block for the full 5s timeout
 /// when the distro is cold (DD-023, DS-06).
+///
+/// When neither the probe nor the environment names a home, the miss from
+/// [`resolve_wsl_home`] is logged and [`wsl_home_value`] returns an empty
+/// string rather than a user directory that only exists on one machine.
 pub fn wsl_home() -> String {
     static WSL_HOME: OnceLock<String> = OnceLock::new();
     WSL_HOME
-        .get_or_init(|| {
-            #[cfg(target_os = "windows")]
-            {
-                // `wsl.exe -- bash -lc 'echo $HOME'` is the most reliable source
-                // because the user's actual Linux home may differ from the Windows
-                // `%USERPROFILE%`.
-                let mut cmd = Command::new("wsl.exe");
-                cmd.args(["--", "bash", "-lc", "echo -n $HOME"]);
-                hide_windows_console(&mut cmd);
-                if let Some(out) = command_output_timeout(cmd, Duration::from_secs(5)) {
-                    if out.status.success() {
-                        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        if !s.is_empty() {
-                            return s;
-                        }
-                    }
-                }
-                // Fallback to USERPROFILE/HOME
-                std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_else(|_| r"C:\Users\ethan".to_string())
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                std::env::var("HOME").unwrap_or_else(|_| "/home/ethan".to_string())
-            }
-        })
+        .get_or_init(|| wsl_home_value(probe_wsl_home, |name| std::env::var(name).ok()))
         .clone()
 }
 
@@ -349,5 +413,57 @@ mod tests {
 
         assert_eq!(refreshed, vec!["127.0.0.1"]);
         assert_eq!(cache.lock().unwrap().as_ref().unwrap().0, vec!["127.0.0.1"]);
+    }
+
+    /// A machine that is not the owner's has no `/home/ethan` and no
+    /// `C:\Users\ethan`. When `wsl.exe` cannot answer, the resolver must use
+    /// this machine's own home from the environment — and must report an error
+    /// rather than return the literal owner path when even that is absent.
+    #[test]
+    fn wsl_home_fallback_is_environment_derived_or_reports_a_miss() {
+        let buyer_home = r"C:\Users\buyer";
+        let derived = resolve_wsl_home(|| None, |name| match name {
+            "USERPROFILE" => Some(buyer_home.to_string()),
+            _ => None,
+        })
+        .expect("an environment-derived home is a usable fallback");
+        assert_eq!(derived, buyer_home);
+
+        let error = resolve_wsl_home(|| None, |_: &str| None).expect_err(
+            "with no `wsl.exe` answer and no home in the environment the \
+             resolver must report a miss, not return a path from another PC",
+        );
+        for forbidden in [r"C:\Users\ethan", "/home/ethan"] {
+            assert!(
+                !error.contains(forbidden),
+                "the reported miss must not name a literal user path: {error}"
+            );
+        }
+
+        assert_eq!(
+            home_dir_from_env(|_: &str| None),
+            None,
+            "the environment fallback must not invent a home when no variable names one"
+        );
+        assert_eq!(
+            home_dir_from_env(|name| (name == "USERPROFILE").then(|| buyer_home.to_string())),
+            Some(buyer_home.to_string()),
+            "the environment fallback must use the home the environment names"
+        );
+
+        // The cached production value comes from this seam: a miss must stay
+        // empty, never fall back to a hardcoded user path.
+        assert_eq!(
+            wsl_home_value(|| None, |_: &str| None),
+            "",
+            "an unresolvable WSL home must not resolve to a literal user directory"
+        );
+        assert_eq!(
+            wsl_home_value(|| None, |name| {
+                (name == "USERPROFILE").then(|| buyer_home.to_string())
+            }),
+            buyer_home,
+            "the cached value must come from the environment when the probe is silent"
+        );
     }
 }

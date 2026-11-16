@@ -32,7 +32,8 @@ static BUN_ENSURE_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync:
 
 // ─── WSL Home ────────────────────────────────────────────────────────────────
 // Resolves the WSL home directory on Windows (via `wsl.exe`), falling back to
-// the native HOME env var on Linux/macOS.  Result is cached for the process lifetime.
+// the canonical WSL-home resolver, which derives the guest home from the
+// environment or reports a miss.  Result is cached for the process lifetime.
 
 pub(crate) fn wsl_home() -> String {
     static WSL_HOME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -49,10 +50,11 @@ pub(crate) fn wsl_home() -> String {
                         return h;
                     }
                 }
-                "/home/ethan".to_string()
-            } else {
-                std::env::var("HOME").unwrap_or_else(|_| "/home/ethan".to_string())
             }
+            // The probe did not answer (or does not apply). The canonical
+            // resolver tries its own probe, then this machine's environment,
+            // and returns an empty home rather than another PC's directory.
+            crate::wsl::wsl_home()
         })
         .clone()
 }
@@ -1021,80 +1023,120 @@ struct ProxyDiscoveryContext {
     override_path: Option<std::path::PathBuf>,
     exe_path: Option<std::path::PathBuf>,
     cwd: Option<std::path::PathBuf>,
-    fixed_windows_path: std::path::PathBuf,
+    /// Script under a checkout root named by [`PROXY_REPO_ROOT_ENV`]. `None`
+    /// when the environment names no checkout.
+    repo_root_script: Option<std::path::PathBuf>,
     user_profile: Option<std::path::PathBuf>,
     wsl_candidates: Vec<std::path::PathBuf>,
 }
 
-fn ancestry_proxy_script(start: &std::path::Path) -> Option<std::path::PathBuf> {
+/// The proxy script's path inside a source checkout.
+const PROXY_SCRIPT_REPO_RELATIVE: &str = "scripts/claude_cli_proxy.py";
+
+/// Optional checkout root, for a build whose repo does not sit on the
+/// executable's own ancestry (for example a packaged app pointed at a checkout).
+/// The script itself can also be named directly with
+/// `JARVIS_CLAUDE_PROXY_PATH`. Neither is a default: without them, only paths
+/// derived from the running app are searched.
+const PROXY_REPO_ROOT_ENV: &str = "JARVIS_REPO_ROOT";
+
+/// How many parent directories the proxy ancestry walk inspects.
+const PROXY_ANCESTRY_DEPTH: usize = 8;
+
+/// Reads an environment value as a non-empty path.
+fn env_path(
+    env: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    env(name)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// The proxy discovery inputs this app can actually observe: its own
+/// environment, the executable's location, and the working directory. Nothing
+/// here names a directory the app has not derived.
+fn proxy_discovery_context(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    exe_path: Option<std::path::PathBuf>,
+    cwd: Option<std::path::PathBuf>,
+) -> ProxyDiscoveryContext {
+    ProxyDiscoveryContext {
+        override_path: env_path(&env, "JARVIS_CLAUDE_PROXY_PATH"),
+        exe_path,
+        cwd,
+        repo_root_script: env_path(&env, PROXY_REPO_ROOT_ENV)
+            .map(|root| root.join(PROXY_SCRIPT_REPO_RELATIVE)),
+        user_profile: env_path(&env, "USERPROFILE"),
+        wsl_candidates: Vec::new(),
+    }
+}
+
+/// Every native proxy script candidate, nearest first: an explicit
+/// `JARVIS_CLAUDE_PROXY_PATH`, the app's resource directory beside the
+/// executable, the checkout layout reached by walking up from the executable
+/// and then from the working directory, a configured [`PROXY_REPO_ROOT_ENV`]
+/// checkout, and the per-user install under the profile.
+///
+/// Candidates are not existence-checked here; discovery accepts only the first
+/// one that exists, so a path that is merely shaped right never wins.
+fn native_proxy_candidates(context: &ProxyDiscoveryContext) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = &context.override_path {
+        candidates.push(path.clone());
+    }
+    if let Some(exe_dir) = context.exe_path.as_deref().and_then(std::path::Path::parent) {
+        candidates.push(exe_dir.join("resources").join("claude_cli_proxy.py"));
+    }
+    for start in [context.exe_path.as_deref(), context.cwd.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        candidates.extend(ancestry_proxy_candidates(start));
+    }
+    if let Some(path) = &context.repo_root_script {
+        candidates.push(path.clone());
+    }
+    if let Some(profile) = &context.user_profile {
+        candidates.push(
+            profile
+                .join(".openclaw")
+                .join("jarvis")
+                .join("hermes")
+                .join("claude_cli_proxy.py"),
+        );
+    }
+    candidates
+}
+
+/// Every `scripts/claude_cli_proxy.py` above `start`, nearest first.
+fn ancestry_proxy_candidates(start: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
     let mut cursor = if start.is_dir() {
         Some(start.to_path_buf())
     } else {
         start.parent().map(std::path::Path::to_path_buf)
     };
-    for _ in 0..8 {
+    for _ in 0..PROXY_ANCESTRY_DEPTH {
         let Some(dir) = cursor.as_ref() else { break };
-        let candidate = dir.join("scripts").join("claude_cli_proxy.py");
-        if candidate.exists() {
-            return Some(candidate);
-        }
+        candidates.push(dir.join("scripts").join("claude_cli_proxy.py"));
         cursor = dir.parent().map(std::path::Path::to_path_buf);
     }
-    None
+    candidates
 }
 
 fn find_claude_cli_proxy_with(
     context: &ProxyDiscoveryContext,
     mut wsl_exists: impl FnMut(&std::path::Path) -> bool,
 ) -> Option<ProxyScript> {
-    if let Some(path) = context.override_path.as_ref().filter(|path| path.exists()) {
-        return Some(ProxyScript {
-            path: path.clone(),
-            kind: ProxyScriptKind::Native,
-        });
-    }
-    if let Some(exe_dir) = context
-        .exe_path
-        .as_deref()
-        .and_then(std::path::Path::parent)
-    {
-        let path = exe_dir.join("resources").join("claude_cli_proxy.py");
-        if path.exists() {
-            return Some(ProxyScript {
-                path,
-                kind: ProxyScriptKind::Native,
-            });
-        }
-    }
-    for start in [context.exe_path.as_deref(), context.cwd.as_deref()]
+    if let Some(path) = native_proxy_candidates(context)
         .into_iter()
-        .flatten()
+        .find(|candidate| candidate.exists())
     {
-        if let Some(path) = ancestry_proxy_script(start) {
-            return Some(ProxyScript {
-                path,
-                kind: ProxyScriptKind::Native,
-            });
-        }
-    }
-    if context.fixed_windows_path.exists() {
         return Some(ProxyScript {
-            path: context.fixed_windows_path.clone(),
+            path,
             kind: ProxyScriptKind::Native,
         });
-    }
-    if let Some(profile) = &context.user_profile {
-        let path = profile
-            .join(".openclaw")
-            .join("jarvis")
-            .join("hermes")
-            .join("claude_cli_proxy.py");
-        if path.exists() {
-            return Some(ProxyScript {
-                path,
-                kind: ProxyScriptKind::Native,
-            });
-        }
     }
     context
         .wsl_candidates
@@ -1108,14 +1150,11 @@ fn find_claude_cli_proxy_with(
 }
 
 fn find_claude_cli_proxy() -> Option<ProxyScript> {
-    let native = ProxyDiscoveryContext {
-        override_path: std::env::var_os("JARVIS_CLAUDE_PROXY_PATH").map(Into::into),
-        exe_path: std::env::current_exe().ok(),
-        cwd: std::env::current_dir().ok(),
-        fixed_windows_path: r"C:\Projects\home-base-recovered\scripts\claude_cli_proxy.py".into(),
-        user_profile: std::env::var_os("USERPROFILE").map(Into::into),
-        wsl_candidates: Vec::new(),
-    };
+    let native = proxy_discovery_context(
+        |name| std::env::var_os(name),
+        std::env::current_exe().ok(),
+        std::env::current_dir().ok(),
+    );
     if let Some(script) = find_claude_cli_proxy_with(&native, |_| false) {
         return Some(script);
     }
@@ -1125,7 +1164,7 @@ fn find_claude_cli_proxy() -> Option<ProxyScript> {
         override_path: None,
         exe_path: None,
         cwd: None,
-        fixed_windows_path: std::path::PathBuf::new(),
+        repo_root_script: None,
         user_profile: None,
         wsl_candidates: vec![
             format!(
@@ -2406,16 +2445,13 @@ fn backend_port_is_listening_with(
     uses_wsl && probe_wsl(port)
 }
 
+/// The current user's home directory, derived from this machine's environment.
+///
+/// A missing variable is never filled in with a hardcoded user path: an empty
+/// result means the home could not be derived, so nothing writes to a directory
+/// that only exists on the developer's PC.
 pub fn get_home_dir() -> String {
-    if cfg!(target_os = "windows") {
-        std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| "C:\\Users\\ethan".to_string())
-    } else {
-        std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/home/ethan".to_string())
-    }
+    crate::wsl::home_dir_from_env(|name| std::env::var(name).ok()).unwrap_or_default()
 }
 
 /// Default workspace path for a fresh install.
@@ -3197,7 +3233,7 @@ mod startup_thread_tests {
             override_path: None,
             exe_path: Some(exe),
             cwd: None,
-            fixed_windows_path: root.join("missing/claude_cli_proxy.py"),
+            repo_root_script: Some(root.join("missing/claude_cli_proxy.py")),
             user_profile: Some(root.join("user")),
             wsl_candidates: vec![wsl_script],
         };
@@ -3220,6 +3256,87 @@ mod startup_thread_tests {
         assert_eq!(selected.path, override_script);
 
         std::fs::remove_dir_all(root).expect("remove test directory");
+    }
+
+    /// The candidate list must be built only from paths the running app can
+    /// observe. This models a buyer's PC: the binary lives under that buyer's
+    /// profile, the working directory is an unrelated scratch folder, and no
+    /// environment value names the developer's machine.
+    #[test]
+    fn proxy_candidates_name_no_developer_path() {
+        let profile = PathBuf::from(r"C:\Users\buyer");
+        let exe = profile.join("AppData/Local/Programs/home-base/home-base.exe");
+        let cwd = PathBuf::from(r"C:\Work\scratch");
+
+        let context = proxy_discovery_context(
+            |name| match name {
+                "USERPROFILE" => Some(profile.clone().into_os_string()),
+                _ => None,
+            },
+            Some(exe),
+            Some(cwd),
+        );
+        let candidates = native_proxy_candidates(&context);
+        assert!(
+            !candidates.is_empty(),
+            "a build beside a profile-scoped install still has candidates"
+        );
+
+        for candidate in &candidates {
+            let text = candidate.to_string_lossy();
+            for forbidden in [
+                "home-base-recovered",
+                r"Users\ethan",
+                "Users/ethan",
+                "/home/ethan",
+                "/home/buyer",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "candidate {text} names a path this app did not derive \
+                     ({forbidden}); candidates: {candidates:?}"
+                );
+            }
+        }
+
+        assert!(
+            candidates.contains(&profile.join(".openclaw/jarvis/hermes/claude_cli_proxy.py")),
+            "the per-user candidate must come from the injected profile: {candidates:?}"
+        );
+
+        // With no environment, executable, or working directory there is no
+        // observable path to search, so the resolver must invent nothing. A
+        // restored hardcoded checkout path makes this list non-empty.
+        let empty = native_proxy_candidates(&proxy_discovery_context(
+            |_: &str| -> Option<std::ffi::OsString> { None },
+            None,
+            None,
+        ));
+        assert!(
+            empty.is_empty(),
+            "the resolver must derive no candidate from nothing: {empty:?}"
+        );
+    }
+
+    /// A checkout outside the executable's ancestry is named by configuration,
+    /// never by a hardcoded path.
+    #[test]
+    fn proxy_candidates_accept_a_configured_checkout_root() {
+        let root = PathBuf::from(r"D:\src\home-base");
+        let context = proxy_discovery_context(
+            |name| match name {
+                "JARVIS_REPO_ROOT" => Some(root.clone().into_os_string()),
+                _ => None,
+            },
+            None,
+            None,
+        );
+
+        assert_eq!(
+            native_proxy_candidates(&context),
+            vec![root.join("scripts").join("claude_cli_proxy.py")],
+            "the configured checkout root must contribute exactly its script"
+        );
     }
 
     #[test]
