@@ -18,7 +18,7 @@ use crate::db::AppDb;
 use crate::jarvis::bridge::restart_bridge as restart_bridge_service;
 use crate::wsl::wsl_home;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -1357,10 +1357,117 @@ pub enum BunServerStreamEvent {
     },
 }
 
+/// How many Stops that arrived before their stream registered are held at
+/// once. A Stop whose stream never starts can never be honoured, so the
+/// registry keeps a hard bound instead of growing with every stray id.
+const CANCELLED_BEFORE_START_LIMIT: usize = 128;
+
+/// How long a Stop that arrived before its stream registered stays honourable.
+/// The UI start/Stop race resolves in milliseconds, so a queued Stop older
+/// than this is stale.
+const CANCELLED_BEFORE_START_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many finished request ids are remembered so a late Stop can be told
+/// apart from a Stop-before-start. Bounded for the same reason as above.
+const FINISHED_REQUEST_LIMIT: usize = 128;
+
 #[derive(Default)]
 struct BunRequestCancellationState {
     active: HashMap<String, oneshot::Sender<()>>,
-    cancelled_before_start: std::collections::HashSet<String>,
+    /// Stops waiting for their stream to register, oldest first.
+    cancelled_before_start: VecDeque<(String, std::time::Instant)>,
+    /// Ids whose stream has already exited, oldest first.
+    finished: VecDeque<String>,
+}
+
+impl BunRequestCancellationState {
+    /// Drop queued Stops that are past their time or size bound. Called on
+    /// every mutation so the queue can never grow without bound.
+    fn prune_cancelled_before_start(&mut self, now: std::time::Instant) {
+        while let Some((_, queued_at)) = self.cancelled_before_start.front() {
+            if now.duration_since(*queued_at) < CANCELLED_BEFORE_START_TTL {
+                break;
+            }
+            self.cancelled_before_start.pop_front();
+        }
+        while self.cancelled_before_start.len() > CANCELLED_BEFORE_START_LIMIT {
+            self.cancelled_before_start.pop_front();
+        }
+    }
+
+    fn forget_queued_stop(&mut self, request_id: &str) {
+        self.cancelled_before_start
+            .retain(|(queued_id, _)| queued_id.as_str() != request_id);
+    }
+
+    fn has_queued_stop(&self, request_id: &str) -> bool {
+        self.cancelled_before_start
+            .iter()
+            .any(|(queued_id, _)| queued_id.as_str() == request_id)
+    }
+
+    /// Register a streaming request so Stop can reach it. A Stop that arrived
+    /// before this call is honoured here, exactly once.
+    fn register(&mut self, request_id: &str) -> oneshot::Receiver<()> {
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        // A fresh registration supersedes any remembered exit for this id.
+        self.finished.retain(|finished_id| finished_id.as_str() != request_id);
+        self.prune_cancelled_before_start(std::time::Instant::now());
+        if self.has_queued_stop(request_id) {
+            // A Stop that arrived before this command started is honoured
+            // here, and a Stop that arrives later finds the sender in
+            // `active`.
+            self.forget_queued_stop(request_id);
+            let _ = cancel_tx.send(());
+        } else {
+            self.active.insert(request_id.to_string(), cancel_tx);
+        }
+        cancel_rx
+    }
+
+    /// Send Stop to a live stream, or hold it for a stream that has not
+    /// registered yet. A Stop for a request that already finished is a race
+    /// with the UI abort listener and is dropped: no future call will ever ask
+    /// for that id, so queuing it would leave one entry per turn forever.
+    fn cancel(&mut self, request_id: &str) {
+        if let Some(cancel) = self.active.remove(request_id) {
+            let _ = cancel.send(());
+            return;
+        }
+        if self
+            .finished
+            .iter()
+            .any(|finished_id| finished_id.as_str() == request_id)
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.prune_cancelled_before_start(now);
+        if self.has_queued_stop(request_id) {
+            return;
+        }
+        self.cancelled_before_start
+            .push_back((request_id.to_string(), now));
+        while self.cancelled_before_start.len() > CANCELLED_BEFORE_START_LIMIT {
+            self.cancelled_before_start.pop_front();
+        }
+    }
+
+    /// Record that the stream for `request_id` has exited. Any Stop still
+    /// queued for it can never be honoured, so it is dropped here instead of
+    /// waiting for the time bound.
+    fn finish(&mut self, request_id: &str) {
+        self.active.remove(request_id);
+        self.forget_queued_stop(request_id);
+        // Every stream exit touches the registry, so stale queued Stops also
+        // drain here even when no further Stop ever arrives.
+        self.prune_cancelled_before_start(std::time::Instant::now());
+        self.finished.retain(|finished_id| finished_id.as_str() != request_id);
+        self.finished.push_back(request_id.to_string());
+        while self.finished.len() > FINISHED_REQUEST_LIMIT {
+            self.finished.pop_front();
+        }
+    }
 }
 
 static BUN_REQUEST_CANCELLATIONS: OnceLock<StdMutex<BunRequestCancellationState>> = OnceLock::new();
@@ -1373,20 +1480,19 @@ fn bun_request_cancellations() -> &'static StdMutex<BunRequestCancellationState>
 /// purpose: holding the std mutex guard in the async command body would make
 /// the returned future non-`Send`.
 fn register_bun_server_stream_request(request_id: &str) -> Result<oneshot::Receiver<()>, String> {
-    let (cancel_tx, cancel_rx) = oneshot::channel();
-    {
-        let mut cancellations = bun_request_cancellations()
-            .lock()
-            .map_err(|_| "Bun request cancellation registry is unavailable".to_string())?;
-        // A Stop that arrived before this command started is honoured here,
-        // and a Stop that arrives later finds the sender in `active`.
-        if cancellations.cancelled_before_start.remove(request_id) {
-            let _ = cancel_tx.send(());
-        } else {
-            cancellations.active.insert(request_id.to_string(), cancel_tx);
-        }
+    let mut cancellations = bun_request_cancellations()
+        .lock()
+        .map_err(|_| "Bun request cancellation registry is unavailable".to_string())?;
+    Ok(cancellations.register(request_id))
+}
+
+/// Forget a streaming request once its body has exited, and remember that it
+/// finished so a Stop racing the UI's abort-listener removal is not queued.
+/// Synchronous for the same reason as registration.
+fn finish_bun_server_stream_request(request_id: &str) {
+    if let Ok(mut requests) = bun_request_cancellations().lock() {
+        requests.finish(request_id);
     }
-    Ok(cancel_rx)
 }
 
 /// Stream a Bun response to the UI without buffering its body in the Native
@@ -1411,20 +1517,14 @@ pub async fn bun_server_request_stream(
         cancel_rx,
     )
     .await;
-    if let Ok(mut requests) = bun_request_cancellations().lock() {
-        requests.active.remove(&request_id);
-    }
+    finish_bun_server_stream_request(&request_id);
     result
 }
 
 #[tauri::command]
 pub fn bun_server_request_cancel(request_id: String) {
     if let Ok(mut requests) = bun_request_cancellations().lock() {
-        if let Some(cancel) = requests.active.remove(&request_id) {
-            let _ = cancel.send(());
-        } else {
-            requests.cancelled_before_start.insert(request_id);
-        }
+        requests.cancel(&request_id);
     }
 }
 
@@ -1494,6 +1594,110 @@ async fn bun_server_request_stream_to(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bun_request_cancellation_tests {
+    use super::*;
+
+    fn state_with_queued_stop(request_id: &str) -> BunRequestCancellationState {
+        let mut state = BunRequestCancellationState::default();
+        state.cancel(request_id);
+        state
+    }
+
+    #[test]
+    fn a_stop_for_an_unknown_id_cannot_grow_the_registry() {
+        // Stray Stops (a UI that aborted before any stream started, a
+        // duplicated click) must not leave one entry per turn.
+        let mut state = BunRequestCancellationState::default();
+        for index in 0..1000 {
+            state.cancel(&format!("unknown-request-{index}"));
+            assert!(
+                state.cancelled_before_start.len() <= CANCELLED_BEFORE_START_LIMIT,
+                "queued Stops grew past their bound at cancel {index}"
+            );
+        }
+        assert_eq!(
+            state.cancelled_before_start.len(),
+            CANCELLED_BEFORE_START_LIMIT
+        );
+        assert!(state.active.is_empty());
+        assert!(state.finished.is_empty());
+    }
+
+    #[test]
+    fn a_queued_stop_expires_after_its_time_bound() {
+        let mut state = state_with_queued_stop("request-stale");
+        assert_eq!(state.cancelled_before_start.len(), 1);
+
+        let past_ttl = std::time::Instant::now() + CANCELLED_BEFORE_START_TTL;
+        state.prune_cancelled_before_start(past_ttl);
+        assert!(state.cancelled_before_start.is_empty());
+    }
+
+    #[test]
+    fn remembered_finished_ids_stay_bounded() {
+        let mut state = BunRequestCancellationState::default();
+        for index in 0..1000 {
+            let request_id = format!("finished-request-{index}");
+            let _cancel = state.register(&request_id);
+            state.finish(&request_id);
+        }
+        assert_eq!(state.finished.len(), FINISHED_REQUEST_LIMIT);
+        assert!(state.active.is_empty());
+        assert!(state.cancelled_before_start.is_empty());
+    }
+
+    #[test]
+    fn a_stop_before_start_is_honoured_exactly_once() {
+        let mut state = state_with_queued_stop("request-early");
+
+        let mut cancel = state.register("request-early");
+        // The stream sees Stop immediately, so it never joins `active`.
+        assert!(matches!(cancel.try_recv(), Ok(())));
+        assert!(state.active.is_empty());
+        assert!(state.cancelled_before_start.is_empty());
+
+        // The stream exits; a further Stop for the finished id is a no-op
+        // rather than a second queued entry.
+        state.finish("request-early");
+        state.cancel("request-early");
+        assert!(state.cancelled_before_start.is_empty());
+        assert!(state.active.is_empty());
+        // Nothing re-arms the receiver: the Stop was delivered once, not twice.
+        assert!(cancel.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_stop_for_a_running_request_reaches_its_stream() {
+        let mut state = BunRequestCancellationState::default();
+        let mut cancel = state.register("request-live");
+        assert!(state.active.contains_key("request-live"));
+
+        state.cancel("request-live");
+        assert!(matches!(cancel.try_recv(), Ok(())));
+        assert!(state.active.is_empty());
+        assert!(state.cancelled_before_start.is_empty());
+    }
+
+    #[test]
+    fn a_stop_for_a_finished_request_leaves_no_entry() {
+        let mut state = BunRequestCancellationState::default();
+        let _cancel = state.register("request-done");
+        assert!(state.active.contains_key("request-done"));
+
+        // The stream body has exited, so the command cleans the request up.
+        state.finish("request-done");
+        assert!(state.active.is_empty());
+
+        // A Stop racing the UI's abort-listener removal must not queue an id
+        // that nothing will ever ask for again.
+        state.cancel("request-done");
+        assert!(state.cancelled_before_start.is_empty());
+        assert!(state.active.is_empty());
+        assert_eq!(state.finished.front().map(String::as_str), Some("request-done"));
     }
 }
 
