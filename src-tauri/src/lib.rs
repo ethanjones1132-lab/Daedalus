@@ -1566,6 +1566,86 @@ fn bun_launches_through_wsl(is_windows: bool, bun: &str) -> bool {
     is_windows && !(bun.to_ascii_lowercase().ends_with(".exe") && !bun.contains("wsl"))
 }
 
+/// The exact shell line `wsl.exe -- bash -lc` runs to start the Bun server.
+///
+/// Both values are Windows paths when the app is installed on Windows (the
+/// bundled server lives beside the EXE), and bash can open neither a drive
+/// letter nor a backslash. Each path is therefore rewritten to its `/mnt`
+/// form and single-quoted, so bash sees exactly one word per path no matter
+/// how many spaces the install directory has. Values that are already shell
+/// words (`$HOME/.bun/bin/bun` from `find_bun_executable`, or a bare `bun`)
+/// are left alone so the guest shell can still expand them.
+fn wsl_server_command(bun: &str, entry: &str) -> String {
+    format!("exec {} {}", wsl_shell_word(bun), wsl_shell_word(entry))
+}
+
+fn wsl_shell_word(value: &str) -> String {
+    if let Some(posix) = wsl_posix_path(value) {
+        return sh_single_quote(&posix);
+    }
+    // A `$HOME`-relative command must stay bare to expand; anything with
+    // whitespace would otherwise be split into several arguments.
+    if value.chars().any(char::is_whitespace) {
+        sh_single_quote(value)
+    } else {
+        value.to_string()
+    }
+}
+
+/// `C:\Users\x\index.js` -> `/mnt/c/Users/x/index.js`. `None` for anything that
+/// is not a Windows drive path, so POSIX paths and shell expressions from
+/// `find_bun_executable` are never rewritten.
+fn wsl_posix_path(value: &str) -> Option<String> {
+    let mut chars = value.chars();
+    let drive = chars.next()?;
+    if !drive.is_ascii_alphabetic() || chars.next()? != ':' {
+        return None;
+    }
+    let rest = chars.as_str();
+    let rest = rest
+        .strip_prefix('\\')
+        .or_else(|| rest.strip_prefix('/'))?;
+    Some(format!(
+        "/mnt/{}/{}",
+        drive.to_ascii_lowercase(),
+        rest.replace('\\', "/")
+    ))
+}
+
+/// Quote a value for a POSIX shell, including any embedded apostrophes.
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// What the last Bun server launch actually ran, for timeout diagnostics.
+/// Recorded before the spawn so "did not become healthy" can name the command
+/// instead of leaving the operator to guess which path was attempted.
+static LAST_BUN_LAUNCH: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+fn record_bun_launch(invocation: &str) {
+    let slot = LAST_BUN_LAUNCH.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(invocation.to_string());
+}
+
+fn last_bun_launch() -> Option<String> {
+    let slot = LAST_BUN_LAUNCH.get()?;
+    let guard = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clone()
+}
+
+fn unhealthy_jarvis_server_error(base: &str) -> String {
+    match last_bun_launch() {
+        Some(invocation) => format!("{base} (ran: {invocation})"),
+        None => base.to_string(),
+    }
+}
+
 fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
@@ -1579,7 +1659,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
 
     let spawn_result = if launches_through_wsl {
         // Original WSL path for dev / full WSL setups.
-        let cmd = format!("exec {} {}", bun, entry);
+        let cmd = wsl_server_command(&bun, entry);
+        record_bun_launch(&format!("wsl.exe -- bash -lc \"{cmd}\""));
         let mut command = std::process::Command::new("wsl.exe");
         command
             .args(["--", "bash", "-lc", &cmd])
@@ -1608,6 +1689,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         // This path is taken for installers on new hardware (no WSL checkout needed).
         // The entry should be a .js (the one we added via tauri resources or placed next to exe).
         let mut command = std::process::Command::new(&bun);
+        record_bun_launch(&format!("{bun} {entry}"));
         command
             .arg(entry)
             .env(cap_name, &cap_value)
@@ -1631,6 +1713,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     } else {
         let bun = find_bun_executable();
         let mut command = std::process::Command::new(&bun);
+        record_bun_launch(&format!("{bun} {entry}"));
         command
             .arg(entry)
             .env("JARVIS_HOME", wsl_home())
@@ -1752,7 +1835,9 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         log::error!(target: "jarvis::startup", "{diagnostic}");
         return Err(diagnostic);
     }
-    Err("Bun server did not become healthy within 20s of restart".to_string())
+    Err(unhealthy_jarvis_server_error(
+        "Bun server did not become healthy within 20s of restart",
+    ))
 }
 
 /// Why a startup attempt failed. `TimedOut` is kept distinct so the caller can
@@ -1932,7 +2017,9 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
                 log::error!(target: "jarvis::startup", "{diagnostic}");
                 return Err(diagnostic);
             }
-            Err("Bun server did not become healthy within timeout".to_string())
+            Err(unhealthy_jarvis_server_error(
+                "Bun server did not become healthy within timeout",
+            ))
         }
     }
 }
@@ -4115,6 +4202,107 @@ mod first_run_db_failure_tests {
         assert!(
             diagnostic.contains("Access is denied. (os error 5)"),
             "the diagnostic must carry the underlying error: {diagnostic}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wsl_server_command_tests {
+    use super::wsl_server_command;
+
+    /// The word-splitting rule bash applies before it decides what to `exec`:
+    /// whitespace separates words unless it is inside single quotes, and a
+    /// backslash outside quotes escapes the next character.
+    fn bash_words(command: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut started = false;
+        let mut quoted = false;
+        let mut escaped = false;
+        for ch in command.chars() {
+            if escaped {
+                word.push(ch);
+                escaped = false;
+            } else if ch == '\\' && !quoted {
+                escaped = true;
+                started = true;
+            } else if ch == '\'' {
+                quoted = !quoted;
+                started = true;
+            } else if ch.is_whitespace() && !quoted {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            } else {
+                word.push(ch);
+                started = true;
+            }
+        }
+        if started {
+            words.push(word);
+        }
+        words
+    }
+
+    /// A Windows install path is what the WSL fallback is handed on a machine
+    /// without the native toolchain (DD-T1). The unquoted `exec {bun} {entry}`
+    /// this replaced gave bash `C:Usersethan...` — one token, unopenable.
+    #[test]
+    fn a_windows_bun_and_entry_reach_bash_as_openable_single_words() {
+        let bun = r"C:\Users\ethan\.bun\bin\bun.exe";
+        let entry = r"C:\Users\ethan\AppData\Local\Jarvis\resources\server-jarvis\index.js";
+
+        let words = bash_words(&wsl_server_command(bun, entry));
+
+        assert_eq!(
+            words,
+            vec![
+                "exec".to_string(),
+                "/mnt/c/Users/ethan/.bun/bin/bun.exe".to_string(),
+                "/mnt/c/Users/ethan/AppData/Local/Jarvis/resources/server-jarvis/index.js"
+                    .to_string(),
+            ],
+            "bash must receive two paths it can open, one word each"
+        );
+    }
+
+    /// An install directory with spaces must not split the entry into several
+    /// arguments; bash would then run bun with the wrong script.
+    #[test]
+    fn a_path_with_spaces_stays_one_argument() {
+        let bun = "/mnt/c/Users/Ethan Smith/.bun/bin/bun";
+        let entry = r"C:\Program Files\Jarvis\resources\server-jarvis\index.js";
+
+        let words = bash_words(&wsl_server_command(bun, entry));
+
+        assert_eq!(
+            words,
+            vec![
+                "exec".to_string(),
+                "/mnt/c/Users/Ethan Smith/.bun/bin/bun".to_string(),
+                "/mnt/c/Program Files/Jarvis/resources/server-jarvis/index.js".to_string(),
+            ],
+            "a space inside a path must stay inside that argument"
+        );
+    }
+
+    /// `find_bun_executable` returns `$HOME/.bun/bin/bun` on Windows when it
+    /// cannot find a native install; the guest shell still has to expand it.
+    #[test]
+    fn a_wsl_relative_bun_still_expands_in_the_guest_shell() {
+        let command = wsl_server_command(
+            "$HOME/.bun/bin/bun",
+            "$HOME/jarvis/server-jarvis/index.ts",
+        );
+
+        assert_eq!(
+            command,
+            "exec $HOME/.bun/bin/bun $HOME/jarvis/server-jarvis/index.ts"
+        );
+        assert!(
+            !command.contains('\''),
+            "quoting $HOME would stop the guest shell expanding it: {command}"
         );
     }
 }
