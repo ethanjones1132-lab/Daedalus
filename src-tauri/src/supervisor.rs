@@ -59,6 +59,15 @@ pub(crate) fn mark_quitting() {
     QUITTING.store(true, Ordering::SeqCst);
 }
 
+/// DD-082: whether the app has begun quitting.
+///
+/// The same flag DD-077 added is the single shutdown authority. The supervisor
+/// tick reads it through [`may_start_child`]; managed spawn paths outside the
+/// tick read it here so a child spawned late cannot race quit.
+pub(crate) fn is_quitting() -> bool {
+    QUITTING.load(Ordering::SeqCst)
+}
+
 /// Whether the supervisor may still start or restart a child.
 ///
 /// Reads the flag at the moment of the decision rather than taking an earlier
@@ -66,7 +75,7 @@ pub(crate) fn mark_quitting() {
 /// a check performed at entry alone is not enough. Pure read of one atomic, so
 /// the shutdown gate is unit-testable without a real process.
 fn may_start_child() -> bool {
-    !QUITTING.load(Ordering::SeqCst)
+    !is_quitting()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -2799,6 +2799,24 @@ fn show_boot_failure_dialog(diagnostic: &str) {
 #[cfg(not(target_os = "windows"))]
 fn show_boot_failure_dialog(_diagnostic: &str) {}
 
+/// The run-loop events that require owned-child teardown (DD-082).
+///
+/// `ExitRequested` is the normal clean-quit event. `Exit` is the last chance:
+/// it also fires for exits that never raised `ExitRequested`, and it is what
+/// makes teardown run on that path instead of only on a window close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeardownEvent {
+    ExitRequested,
+    Exit,
+    Other,
+}
+
+impl TeardownEvent {
+    fn tears_down(self) -> bool {
+        matches!(self, Self::ExitRequested | Self::Exit)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
@@ -3088,12 +3106,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+            let teardown = match event {
+                tauri::RunEvent::ExitRequested { .. } => TeardownEvent::ExitRequested,
+                tauri::RunEvent::Exit => TeardownEvent::Exit,
+                _ => TeardownEvent::Other,
+            };
+            if teardown.tears_down() {
                 // DD-077: close the supervisor's start/restart gate *before* any
                 // child is torn down. A tick already in flight would otherwise
                 // relaunch the server stop_all is reaping, leaving it running
                 // after the window is gone. One ordering point: set the flag
-                // here, then reap.
+                // here, then reap. DD-082: `Exit` runs the same teardown as the
+                // backstop for an exit that never emitted `ExitRequested`.
                 supervisor::mark_quitting();
                 process_lifecycle::stop_all();
             }
@@ -4482,6 +4506,143 @@ mod owned_slot_wiring_tests {
             slot_launch.contains("process_lifecycle::SlotLaunch::Wsl { port: CLAUDE_PROXY_PORT,")
                 && slot_launch.contains("process_lifecycle::SlotLaunch::Direct"),
             "the proxy launch kind must follow the WSL script source:\n{slot_launch}"
+        );
+    }
+
+    /// DD-082: every Bun start site named in the quit evidence — the ensure
+    /// path, `chat_base_url`, and backend reconcile — must reach the managed
+    /// spawn that consults DD-077's exit flag at the last instant before the OS
+    /// spawn. Reads the production bodies so this test's own text cannot satisfy
+    /// the check.
+    #[test]
+    fn the_named_bun_spawn_paths_reach_the_quit_gated_spawn() {
+        let lifecycle = include_str!("process_lifecycle.rs");
+        let gate_start = lifecycle
+            .find("pub(crate) fn spawn_managed(")
+            .expect("the managed spawn must exist");
+        let gate_end = lifecycle[gate_start..]
+            .find("fn spawn_managed_with_gate(")
+            .map(|offset| gate_start + offset)
+            .expect("spawn_managed_with_gate must follow spawn_managed");
+        assert!(
+            lifecycle[gate_start..gate_end].contains("crate::supervisor::is_quitting()"),
+            "the managed spawn must refuse once DD-077's flag is set:\n{}",
+            &lifecycle[gate_start..gate_end]
+        );
+
+        let starter = normalized_body("fn start_jarvis_server(", "/// Force-restart the Bun server.");
+        assert!(
+            starter.contains("process_lifecycle::launch_with("),
+            "the Bun starter must spawn through the managed launcher:\n{starter}"
+        );
+
+        // The launcher's spawn closure is `spawn_jarvis_server`, which is the
+        // only Bun function that creates the child and therefore names the gate.
+        let spawn_bun = normalized_body(
+            "fn spawn_jarvis_server(",
+            "/// Whether the Bun server is launched inside WSL.",
+        );
+        assert!(
+            spawn_bun.contains("process_lifecycle::spawn_managed("),
+            "the Bun spawn must go through the quit-gated managed spawn:\n{spawn_bun}"
+        );
+
+        // The ensure path is the spawn evidence for the boot/supervisor callers.
+        let ensure = normalized_body(
+            "pub async fn ensure_jarvis_server_started(",
+            "/// Generic listener probe, used where",
+        );
+        assert!(
+            ensure.contains("start_jarvis_server("),
+            "the ensure path must spawn through the gated starter:\n{ensure}"
+        );
+
+        // lib.rs:652 in the evidence: backend reconcile starts Bun via ensure.
+        let reconcile = normalized_body(
+            "pub fn reconcile_backend_services(",
+            "pub(crate) fn claude_proxy_enabled(",
+        );
+        assert!(
+            reconcile.contains("ensure_jarvis_server_started()"),
+            "backend reconcile must start Bun through the ensure path:\n{reconcile}"
+        );
+
+        // jarvis_commands.rs:78-83 in the evidence: a chat send starts Bun via
+        // ensure, so it reaches the same gate without a second spawn path.
+        let chat = include_str!("commands/jarvis_commands.rs");
+        assert!(
+            chat.contains("crate::ensure_jarvis_server_started()"),
+            "the chat path must start Bun through the ensure path"
+        );
+    }
+}
+
+/// DD-082: teardown must not be limited to `ExitRequested`. A hard or
+/// non-window exit reaches `RunEvent::Exit`; that path must tear the same
+/// children down. The event set is pure and the wiring is read from the real
+/// `.run` callback, so no Tauri app or child process is created here.
+#[cfg(test)]
+mod quit_teardown_tests {
+    use super::TeardownEvent;
+
+    const SOURCE: &str = include_str!("lib.rs");
+
+    /// The production run-loop callback, sliced out so this module's own
+    /// assertion text cannot satisfy the wiring checks.
+    fn run_callback() -> &'static str {
+        let start = SOURCE
+            .find(".run(|_app_handle, event| {")
+            .expect("the app must still install a run-loop callback");
+        let end = SOURCE[start..]
+            .find("        });")
+            .map(|offset| start + offset)
+            .expect("the run-loop callback must have a closing brace");
+        &SOURCE[start..end]
+    }
+
+    #[test]
+    fn exit_tears_down_even_when_exit_requested_never_fired() {
+        assert!(
+            TeardownEvent::ExitRequested.tears_down(),
+            "the normal clean-quit event must still tear children down"
+        );
+        assert!(
+            TeardownEvent::Exit.tears_down(),
+            "RunEvent::Exit must also tear children down; it is the path that \
+             skips the ExitRequested-only teardown"
+        );
+        assert!(
+            !TeardownEvent::Other.tears_down(),
+            "unrelated run-loop events must not run teardown"
+        );
+    }
+
+    #[test]
+    fn the_run_loop_maps_both_exit_events_to_teardown() {
+        let callback = run_callback();
+
+        assert!(
+            callback.contains("tauri::RunEvent::ExitRequested { .. } => TeardownEvent::ExitRequested"),
+            "the run loop must still observe the clean-quit event:\n{callback}"
+        );
+        assert!(
+            callback.contains("tauri::RunEvent::Exit => TeardownEvent::Exit"),
+            "the run loop must observe RunEvent::Exit as a teardown path:\n{callback}"
+        );
+        assert!(
+            callback.contains("if teardown.tears_down()"),
+            "both mapped events must route through the teardown decision:\n{callback}"
+        );
+
+        let gate = callback
+            .find("supervisor::mark_quitting();")
+            .expect("teardown must close the supervisor gate first");
+        let reap = callback
+            .find("process_lifecycle::stop_all();")
+            .expect("teardown must still reap every owned child");
+        assert!(
+            gate < reap,
+            "the quit gate must close before children are reaped:\n{callback}"
         );
     }
 }

@@ -15,7 +15,7 @@
 //! and is stopped by the same `stop_all` routine the exit hook calls.
 
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -192,6 +192,17 @@ static BUN_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Set when the owned Bun child could not be confirmed dead. While set,
 /// `bun_ownership` reports `Unknown` so no mutation may bypass invalidation.
 static BUN_TERMINATION_UNCONFIRMED: AtomicBool = AtomicBool::new(false);
+/// Reaps that could not confirm the child is gone (DD-082). A silent `false`
+/// used to read exactly like a clean stop; this count is what the give-up/status
+/// path can report as "a child of this app may still be running".
+static REAP_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// How many reap attempts have ended unconfirmed in this process's lifetime.
+/// Read by `stop_all`'s summary and available to the status path so a survivor
+/// is reported instead of being mistaken for a clean quit.
+pub(crate) fn reap_failure_count() -> u32 {
+    REAP_FAILURES.load(Ordering::SeqCst)
+}
 
 #[cfg(windows)]
 fn create_kill_on_close_job() -> Result<JobObject, u32> {
@@ -238,9 +249,41 @@ fn process_job() -> std::io::Result<&'static JobObject> {
     }
 }
 
+/// The error a managed spawn returns once the app has begun quitting (DD-082).
+/// The std and async managed spawns share it so both refusals name the same
+/// reason.
+fn quit_spawn_error() -> std::io::Error {
+    std::io::Error::other("the app is quitting; refusing to start a managed child")
+}
+
+/// DD-082: one gate for every managed spawn. Pure so a test can drive the
+/// refused branch without setting the process-wide flag, which would leak into
+/// every other test in this binary. The live value is DD-077's flag, read at the
+/// last instant before the OS spawn.
+fn refuse_spawn_when_quitting(quitting: bool) -> std::io::Result<()> {
+    if quitting {
+        Err(quit_spawn_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Spawn a managed child and assign it to its Windows Job Object immediately.
 /// The non-Windows path preserves the existing child-spawn behavior.
 pub(crate) fn spawn_managed(command: &mut std::process::Command) -> std::io::Result<Child> {
+    spawn_managed_with_gate(command, crate::supervisor::is_quitting())
+}
+
+/// [`spawn_managed`] with the quit gate injected. The gate is the last check
+/// before the OS spawn, so a start path that passed its own gate before a slow
+/// probe still cannot create a child after the app begins quitting. A test can
+/// pass `true` without poisoning the process-wide flag for every other test.
+fn spawn_managed_with_gate(
+    command: &mut std::process::Command,
+    quitting: bool,
+) -> std::io::Result<Child> {
+    refuse_spawn_when_quitting(quitting)?;
+
     #[cfg(windows)]
     {
         return spawn_assigned(command, process_job()?);
@@ -442,23 +485,61 @@ fn reap_slot_with(
 /// Run one guest side of a stop plan. A guest stop that could not run leaves the
 /// termination unconfirmed: the listener may still hold the port.
 fn stop_guest(command: StopCommand) -> bool {
-    if run_guest_stop(&command) {
-        return true;
+    run_guest_stop(&command)
+}
+
+/// The line logged for a service whose child did not confirm as gone. Kept pure
+/// so a test can assert the PID and the service are in the text the log
+/// receives, without installing a logger or starting a process.
+fn reap_failure_message(service: &str, pid: Option<u32>, reason: &str) -> String {
+    match pid {
+        Some(pid) => format!("{service} child PID {pid} survived teardown: {reason}"),
+        None => format!("{service} child survived teardown: {reason}"),
     }
+}
+
+/// Record a reap that could not confirm the child is gone: log it with the PID
+/// and count it. Both halves are the DD-082 contract — a failed reap must never
+/// be silent, and the give-up/status path must be able to say a child survived.
+fn record_service_reap_failure(service: &str, pid: Option<u32>, reason: &str) {
+    REAP_FAILURES.fetch_add(1, Ordering::SeqCst);
     log::warn!(
         target: "jarvis::lifecycle",
-        "guest stop for a WSL-launched slot did not complete; its listener may still hold the port"
+        "{}",
+        reap_failure_message(service, pid, reason)
     );
-    false
+}
+
+fn record_reap_failure(process: ManagedProcess, pid: Option<u32>, reason: &str) {
+    record_service_reap_failure(&format!("{process:?}"), pid, reason);
 }
 
 /// Whether a reap confirms that the whole slot — wrapper and any guest server it
-/// started — is gone.
-fn confirm_reap(reap: Reap) -> bool {
+/// started — is gone. A failure is recorded with the tracked child's PID before
+/// this returns `false`, so no caller can reduce it to a discarded boolean.
+fn confirm_reap(process: ManagedProcess, pid: Option<u32>, reap: Reap) -> bool {
     match reap {
         Reap::Clean => true,
-        Reap::Guest(command) => stop_guest(command),
-        Reap::Unconfirmed => false,
+        Reap::Guest(command) => {
+            if stop_guest(command) {
+                true
+            } else {
+                record_reap_failure(
+                    process,
+                    pid,
+                    "the guest stop did not complete; its listener may still hold the port",
+                );
+                false
+            }
+        }
+        Reap::Unconfirmed => {
+            record_reap_failure(
+                process,
+                pid,
+                "the tracked child did not exit before the reap deadline",
+            );
+            false
+        }
     }
 }
 
@@ -522,15 +603,17 @@ pub(crate) fn stop_hermes(slot: &AsyncChildSlot) -> bool {
 }
 
 /// Take the registered async child out of the ownership set and stop it.
-/// An unconfirmed exit puts the slot back so ownership stays tracked.
-fn stop_registered_hermes() -> bool {
+/// An unconfirmed exit puts the slot back so ownership stays tracked. The
+/// tracked PID is returned alongside the result so a survivor can be named.
+fn stop_registered_hermes_with_pid() -> (bool, Option<u32>) {
     let tracked = { children().hermes.take() };
     let Some(slot) = tracked else {
-        return true;
+        return (true, None);
     };
-    let confirmed = {
+    let (confirmed, pid) = {
         let mut child = lock_async_child(&slot);
-        stop_async_child(&mut child)
+        let pid = child.as_ref().and_then(|child| child.id());
+        (stop_async_child(&mut child), pid)
     };
     if !confirmed {
         // Only put the slot back if no newer child registered meanwhile.
@@ -539,7 +622,12 @@ fn stop_registered_hermes() -> bool {
             children.hermes = Some(slot);
         }
     }
-    confirmed
+    (confirmed, pid)
+}
+
+/// [`stop_registered_hermes_with_pid`] for callers that only need the outcome.
+fn stop_registered_hermes() -> bool {
+    stop_registered_hermes_with_pid().0
 }
 
 /// Whether the async Hermes child is currently in the ownership registry.
@@ -612,6 +700,7 @@ pub(crate) fn launch_with(
     let _serial = process_lock(process);
     let should_clear;
     let reap;
+    let tracked_pid;
     {
         let mut children = children();
         let slot = children.slot(process);
@@ -628,6 +717,9 @@ pub(crate) fn launch_with(
             },
             None => false,
         };
+        // Capture the PID before the reap: an unconfirmed or failed guest stop
+        // must still name the process that may have survived (DD-082).
+        tracked_pid = slot.as_ref().map(|tracked| tracked.child.id());
         reap = if should_clear {
             reap_slot(slot)
         } else {
@@ -636,7 +728,7 @@ pub(crate) fn launch_with(
     }
     // The guest stop is an external command; run it after the CHILDREN guard is
     // dropped, before the replacement spawn needs the port it should have freed.
-    let confirmed = confirm_reap(reap);
+    let confirmed = confirm_reap(process, tracked_pid, reap);
     // Generation bookkeeping is atomic; the CHILDREN guard has already been
     // dropped, so no lock held across HTTP is acquired while CHILDREN is held.
     // An unconfirmed termination must NOT bump the generation: ownership stays
@@ -662,11 +754,13 @@ pub(crate) fn launch_with(
 /// Stop and reap a child started by this Tauri process.
 pub(crate) fn stop(process: ManagedProcess) {
     let _serial = process_lock(process);
-    let reap = {
+    let (reap, tracked_pid) = {
         let mut children = children();
-        reap_slot(children.slot(process))
+        let slot = children.slot(process);
+        let pid = slot.as_ref().map(|tracked| tracked.child.id());
+        (reap_slot(slot), pid)
     };
-    let confirmed = confirm_reap(reap);
+    let confirmed = confirm_reap(process, tracked_pid, reap);
     if matches!(process, ManagedProcess::BunServer) {
         if confirmed {
             BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
@@ -685,24 +779,62 @@ pub(crate) fn stop_all() {
     let _llama_cpp = process_lock(ManagedProcess::LlamaCpp);
     // The async Hermes child is tracked in the same ownership set, so the exit
     // hook stops it here too instead of leaving it running after the app quits.
-    stop_registered_hermes();
-    let (bun_reap, other_reaps) = {
+    let failures_before = reap_failure_count();
+    let (hermes_confirmed, hermes_pid) = stop_registered_hermes_with_pid();
+    if !hermes_confirmed {
+        record_service_reap_failure(
+            "Hermes",
+            hermes_pid,
+            "the async child did not exit before the reap deadline",
+        );
+    }
+    let (bun_reap, bun_pid, other_reaps) = {
         let mut children = children();
+        let bun_pid = children
+            .bun_server
+            .as_ref()
+            .map(|tracked| tracked.child.id());
         let bun = reap_slot(&mut children.bun_server);
+        let proxy_pid = children
+            .claude_proxy
+            .as_ref()
+            .map(|tracked| tracked.child.id());
         let proxy = reap_slot(&mut children.claude_proxy);
+        let ollama_pid = children.ollama.as_ref().map(|tracked| tracked.child.id());
         let ollama = reap_slot(&mut children.ollama);
+        let llama_cpp_pid = children
+            .llama_cpp
+            .as_ref()
+            .map(|tracked| tracked.child.id());
         let llama_cpp = reap_slot(&mut children.llama_cpp);
-        (bun, [proxy, ollama, llama_cpp])
+        (
+            bun,
+            bun_pid,
+            [
+                (ManagedProcess::ClaudeProxy, proxy_pid, proxy),
+                (ManagedProcess::Ollama, ollama_pid, ollama),
+                (ManagedProcess::LlamaCpp, llama_cpp_pid, llama_cpp),
+            ],
+        )
     };
-    let bun_confirmed = confirm_reap(bun_reap);
-    for reap in other_reaps {
-        let _ = confirm_reap(reap);
+    let bun_confirmed = confirm_reap(ManagedProcess::BunServer, bun_pid, bun_reap);
+    for (process, pid, reap) in other_reaps {
+        // Recorded and logged with its PID inside `confirm_reap`; these services
+        // have no generation bookkeeping, but a survivor must still be counted.
+        let _confirmed = confirm_reap(process, pid, reap);
     }
     if bun_confirmed {
         BUN_TERMINATION_UNCONFIRMED.store(false, Ordering::SeqCst);
         bump_bun_generation();
     } else {
         BUN_TERMINATION_UNCONFIRMED.store(true, Ordering::SeqCst);
+    }
+    let failures = reap_failure_count() - failures_before;
+    if failures > 0 {
+        log::warn!(
+            target: "jarvis::lifecycle",
+            "{failures} child reap(s) were unconfirmed during teardown; a child of this app may still be running"
+        );
     }
 }
 
@@ -756,6 +888,113 @@ mod stop_plan_tests {
         assert!(
             direct.guest.is_none(),
             "a directly launched slot must not run a guest stop"
+        );
+    }
+}
+
+/// DD-082: a reap that cannot confirm the child is gone must be observed, not
+/// reduced to a discarded `false`. These drive the recording seam directly and
+/// start no process, so nothing outside this app can be affected.
+#[cfg(test)]
+mod reap_failure_tests {
+    use super::{
+        confirm_reap, reap_failure_count, reap_failure_message, refuse_spawn_when_quitting,
+        spawn_managed_with_gate, ManagedProcess, Reap,
+    };
+
+    #[test]
+    fn an_unconfirmed_reap_is_counted_and_names_the_pid() {
+        let before = reap_failure_count();
+        let pid = 4242;
+        let confirmed = confirm_reap(ManagedProcess::BunServer, Some(pid), Reap::Unconfirmed);
+
+        assert!(
+            !confirmed,
+            "an unconfirmed reap must not report success"
+        );
+        let after = reap_failure_count();
+        assert!(
+            after > before,
+            "a failed reap must be counted, not silently discarded ({before} -> {after})"
+        );
+
+        let message = reap_failure_message(
+            "BunServer",
+            Some(pid),
+            "the tracked child did not exit",
+        );
+        assert!(
+            message.contains("4242"),
+            "the failure log must name the surviving PID: {message}"
+        );
+        assert!(
+            message.contains("BunServer"),
+            "the failure log must name the service that survived: {message}"
+        );
+    }
+
+    #[test]
+    fn a_spawn_after_the_exit_flag_is_refused_without_starting_a_child() {
+        let mut command = std::process::Command::new("definitely-not-a-managed-child-binary");
+        let error = spawn_managed_with_gate(&mut command, true)
+            .expect_err("a spawn attempted after the exit flag must be refused");
+
+        assert!(
+            error.to_string().contains("quitting"),
+            "the refusal must say the app is quitting: {error}"
+        );
+    }
+
+    #[test]
+    fn the_spawn_gate_only_refuses_after_the_exit_flag_is_set() {
+        assert!(
+            refuse_spawn_when_quitting(false).is_ok(),
+            "a running app must keep its existing spawn path"
+        );
+        let error = refuse_spawn_when_quitting(true)
+            .expect_err("the gate must close once the app is quitting");
+        assert!(
+            error.to_string().contains("quitting"),
+            "the refusal must say the app is quitting: {error}"
+        );
+    }
+
+    /// Every named Bun path (ensure, chat, reconcile) reaches `spawn_managed`
+    /// through the managed launcher, so the last-instant gate there covers all
+    /// of them. Reads the two production bodies rather than the whole file so
+    /// this module's own assertion text cannot satisfy the check.
+    #[test]
+    fn the_managed_spawn_reads_the_live_exit_flag_before_spawning() {
+        let source = include_str!("process_lifecycle.rs");
+
+        let start = source
+            .find("pub(crate) fn spawn_managed(")
+            .expect("spawn_managed must still exist");
+        let end = source[start..]
+            .find("fn spawn_managed_with_gate(")
+            .map(|offset| start + offset)
+            .expect("spawn_managed_with_gate must follow spawn_managed");
+        let spawn_managed = &source[start..end];
+        assert!(
+            spawn_managed.contains("crate::supervisor::is_quitting()"),
+            "the managed spawn must read DD-077's live flag:\n{spawn_managed}"
+        );
+        assert!(
+            spawn_managed.contains("spawn_managed_with_gate("),
+            "the managed spawn must route through the quit gate:\n{spawn_managed}"
+        );
+
+        let gate_start = source
+            .find("fn spawn_managed_with_gate(")
+            .expect("spawn_managed_with_gate must still exist");
+        let gate_end = source[gate_start..]
+            .find("fn spawn_assigned(command")
+            .map(|offset| gate_start + offset)
+            .expect("spawn_assigned must follow the gated spawn");
+        let gated_spawn = &source[gate_start..gate_end];
+        assert!(
+            gated_spawn.contains("refuse_spawn_when_quitting(quitting)?;"),
+            "the gate must run immediately before the OS spawn:\n{gated_spawn}"
         );
     }
 }
