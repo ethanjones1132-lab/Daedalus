@@ -17,11 +17,17 @@
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Upper bound for one guest-side stop. A cold or wedged distro must not hold
 /// the stop path open; the timeout child is killed by the helper.
 const GUEST_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound for one tracked-child reap (DD-075). App quit must complete even
+/// when a managed child refuses to die, so a kill request is followed by a
+/// bounded wait: still alive at the deadline means `Reap::Unconfirmed`, never an
+/// open-ended wait on the handle. The async Hermes twin polls the same bound.
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedProcess {
@@ -361,6 +367,7 @@ fn children() -> std::sync::MutexGuard<'static, Children> {
 /// this side — the `wsl.exe` wrapper we hold a handle to, and the guest process
 /// that owns the listener — so the guest stop is returned instead of being run
 /// under the CHILDREN lock.
+#[derive(Debug, PartialEq, Eq)]
 enum Reap {
     /// Nothing left to do.
     Clean,
@@ -370,16 +377,58 @@ enum Reap {
     Unconfirmed,
 }
 
+/// Wait for a child to report an exit, polling `try_wait` until `deadline`.
+/// Returns `true` only when the exit was observed; a child still alive at the
+/// deadline, or a handle that cannot be inspected, ends the wait unconfirmed.
+/// The std reap and the async Hermes stop share this so both are bounded alike.
+fn wait_for_exit(
+    deadline: Instant,
+    mut poll: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+) -> bool {
+    loop {
+        match poll() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// Stop and reap a slot's tracked child. The guest side a WSL wrapper started is
 /// *not* run here: it is an external command and must not hold the CHILDREN lock.
 fn reap_slot(slot: &mut Option<Slot>) -> Reap {
+    reap_slot_with(slot, CHILD_REAP_TIMEOUT, |child| {
+        let _ = child.kill();
+    })
+}
+
+/// [`reap_slot`] with the reap bound and the kill step in hand. The bound is
+/// what keeps quit finite: a child whose kill does not take is still alive at
+/// the deadline, and `Reap::Unconfirmed` says exactly that instead of waiting on
+/// the handle forever. `kill` is a parameter so a test can drive the "the kill
+/// does not take" case against a real child without needing an unkillable one.
+fn reap_slot_with(
+    slot: &mut Option<Slot>,
+    timeout: Duration,
+    kill: impl FnOnce(&mut Child),
+) -> Reap {
     let Some(tracked) = slot.as_mut() else {
         return Reap::Clean;
     };
     let plan = stop_plan(tracked.launch);
     if plan.kill_tracked_child && !matches!(tracked.child.try_wait(), Ok(Some(_))) {
-        let _ = tracked.child.kill();
-        if tracked.child.wait().is_err() {
+        // Start the clock before the kill request so the whole reap — not just
+        // the polling after it — is bounded.
+        let deadline = Instant::now() + timeout;
+        kill(&mut tracked.child);
+        if !wait_for_exit(deadline, || tracked.child.try_wait()) {
+            // The slot is deliberately kept: an unconfirmed kill stays owned
+            // instead of being forgotten as if the child had died.
             return Reap::Unconfirmed;
         }
     }
@@ -423,7 +472,8 @@ fn lock_async_child(
 /// Stop and reap an async child handle (Hermes). Returns `true` only when exit
 /// is confirmed; an unconfirmed stop leaves the handle in place so ownership
 /// stays tracked. Tokio's `kill` is async-only, so this sends the kill request
-/// and polls for the exit the same way `reap_slot` waits for a std child.
+/// and polls for the exit through the same bounded wait `reap_slot` uses for a
+/// std child.
 fn stop_async_child(slot: &mut Option<tokio::process::Child>) -> bool {
     let Some(child) = slot.as_mut() else {
         return true;
@@ -435,22 +485,15 @@ fn stop_async_child(slot: &mut Option<tokio::process::Child>) -> bool {
     // The kill request itself may race an exit that already happened; only a
     // confirmed exit clears the handle.
     let _ = child.start_kill();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                slot.take();
-                return true;
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(_) => return false,
-        }
+    // Bounded like the std reap, so a Hermes child that will not die cannot hold
+    // app quit open either.
+    let deadline = Instant::now() + CHILD_REAP_TIMEOUT;
+    let exited = wait_for_exit(deadline, || child.try_wait());
+    if exited {
+        slot.take();
+        return true;
     }
+    false
 }
 
 /// Register the async child slot so the exit hook stops it. Any previously
@@ -720,8 +763,8 @@ mod stop_plan_tests {
 #[cfg(all(test, windows))]
 mod windows_job_tests {
     use super::{
-        create_kill_on_close_job, hermes_tracked, spawn_assigned, spawn_managed_tokio, stop_all,
-        AsyncChildSlot, JobObject,
+        create_kill_on_close_job, hermes_tracked, reap_slot, reap_slot_with, spawn_assigned,
+        spawn_managed_tokio, stop_all, AsyncChildSlot, JobObject, Reap, Slot, SlotLaunch,
     };
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
@@ -877,5 +920,87 @@ mod windows_job_tests {
             exited,
             "closing the job did not terminate the managed child"
         );
+    }
+
+    /// DD-075: quit must complete even when a managed child refuses to die. The
+    /// dummy child here is a real, running `cmd`/`ping` (the same double the job
+    /// test uses) whose kill deliberately does not take, standing in for a
+    /// process that survives `Child::kill`. What must hold is that the reap is
+    /// bounded: it reports `Reap::Unconfirmed` at the deadline, keeps the handle
+    /// owned, and returns in well under the child's own lifetime. If the
+    /// open-ended `Child::wait` comes back to `reap_slot`, this test blocks for
+    /// the rest of that lifetime and then reports `Clean`, so it fails either
+    /// way instead of passing on a stale code path.
+    #[test]
+    fn a_child_that_never_exits_is_reaped_unconfirmed_at_the_deadline() {
+        let job = create_kill_on_close_job()
+            .unwrap_or_else(|error| panic!("create job failed with Win32 error {error}"));
+        let child = spawn_ping(&job);
+        let mut slot = Some(Slot {
+            child,
+            launch: SlotLaunch::Direct,
+        });
+
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        // The kill does not take: the double keeps running, like a managed child
+        // that refuses to die.
+        let reap = reap_slot_with(&mut slot, timeout, |_child| {});
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            reap,
+            Reap::Unconfirmed,
+            "a child still alive at the deadline must be reported as unconfirmed, \
+             not waited on until it dies"
+        );
+        assert!(
+            elapsed >= timeout,
+            "the reap gave up after {elapsed:?}, before its {timeout:?} deadline"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the reap took {elapsed:?}: the deadline did not bound the wait, so a \
+             child that never dies would hold quit open"
+        );
+        assert!(
+            slot.is_some(),
+            "an unconfirmed reap must keep the child owned instead of forgetting it"
+        );
+
+        // Stop the double for real; the job drop is the backstop if this panics.
+        if let Some(tracked) = slot.as_mut() {
+            let _ = tracked.child.kill();
+            let _ = tracked.child.wait();
+        }
+        drop(job);
+    }
+
+    /// The other half of DD-075: bounding the reap must not turn a kill that
+    /// does take into a false negative. This drives the production `reap_slot`
+    /// entry point — real kill, real deadline — and expects a confirmed, clean
+    /// reap that also clears the slot.
+    #[test]
+    fn a_well_behaved_child_still_reaps_clean() {
+        let job = create_kill_on_close_job()
+            .unwrap_or_else(|error| panic!("create job failed with Win32 error {error}"));
+        let child = spawn_ping(&job);
+        let mut slot = Some(Slot {
+            child,
+            launch: SlotLaunch::Direct,
+        });
+
+        let reap = reap_slot(&mut slot);
+
+        assert_eq!(
+            reap,
+            Reap::Clean,
+            "a child that does exit when killed must still reap clean, not unconfirmed"
+        );
+        assert!(
+            slot.is_none(),
+            "a confirmed reap must clear the tracked slot"
+        );
+        drop(job);
     }
 }
