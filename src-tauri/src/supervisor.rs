@@ -18,7 +18,13 @@
 // is still running but never answers `/health` is counted like a failed attempt
 // and is never reported as a relaunch, so a server that can never become ready
 // still ends in the bounded give-up path instead of resetting its own budget
-// forever.
+// forever. DD-080 applies the same rule to Ollama: a child that stays alive
+// without ever opening port 11434 is counted, not reset every tick.
+//
+// Boot-stage failures that never became a relaunch attempt are recorded here as
+// reasons (DD-080) so `give_up_status` — the status surface `get_system_health`
+// already exposes — can say why a packaged startup failed instead of leaving
+// the UI at "offline" with the explanation discarded with the console.
 
 use crate::commands::system::SupervisorStatus;
 use crate::jarvis::types::{JarvisBackend, JarvisState};
@@ -41,6 +47,19 @@ pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static LLAMA_CPP_FAILS: AtomicU32 = AtomicU32::new(0);
 static BUN_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Boot-stage reasons that must outlive whatever service finally came up
+/// (DD-080).
+///
+/// A packaged build is a `windows_subsystem = "windows"` binary, so a startup
+/// failure printed with `eprintln!` is discarded with the console. Boot records
+/// its reason here and `give_up_status` folds it into `bun_last_error`, the
+/// field the supervisor status already exposes, so Health can say why boot
+/// failed instead of only "offline". `reset_failures` never clears this: a
+/// config that failed to load is still why the run is on defaults after a
+/// later Bun restart.
+static BOOT_FAILURES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+const MAX_BOOT_FAILURES: usize = 8;
 
 /// Set once the app has begun quitting (DD-077).
 ///
@@ -170,6 +189,47 @@ fn record_bun_start_outcome(outcome: &crate::BunServerStart) -> (BunTickVerdict,
     }
 }
 
+/// Why a live-but-unready Ollama child is charged to the escalation budget.
+///
+/// Same reason DD-079 names for Bun: a child that is still running is not a
+/// serving backend, and "did not open its port" is the whole diagnosis. Kept
+/// as a named reason so the supervisor's durable log line says that, not just
+/// a bare counter increment.
+const OLLAMA_STILL_STARTING_REASON: &str =
+    "Ollama child is alive but has not opened port 11434 within the start budget";
+
+/// What the Ollama block of one tick reports for an owned child it left alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OllamaTickVerdict {
+    /// A listener answered: the counter was cleared.
+    Healthy,
+    /// The owned child is alive but never opened its port: counted.
+    StillStarting,
+}
+
+/// Record one Ollama liveness observation against the escalation budget.
+///
+/// DD-079's rule, applied to Ollama: only a listening port is evidence the
+/// backend works, so only it clears the counter. A child this process owns that
+/// stays alive without ever opening port 11434 advances the same budget as a
+/// failed restart — otherwise the `Leave` arm reset the count on every tick and
+/// a warming child that never becomes ready never reached the give-up path.
+/// Returns the verdict plus the new count.
+fn record_ollama_tick_outcome(listening: bool, owned_live: bool) -> (OllamaTickVerdict, u32) {
+    if listening {
+        reset_failures(SupervisedService::Ollama);
+        return (OllamaTickVerdict::Healthy, 0);
+    }
+    debug_assert!(
+        owned_live,
+        "the count path is only reached for an owned child the tick chose to leave"
+    );
+    (
+        OllamaTickVerdict::StillStarting,
+        record_restart_failure(SupervisedService::Ollama, OLLAMA_STILL_STARTING_REASON),
+    )
+}
+
 /// What one supervisor tick should do about the claude_cli_proxy. The same
 /// ownership rule the Ollama decision applies: a closed port does not mean
 /// "down" when this process still owns a child that is coming up, and
@@ -210,6 +270,37 @@ fn bun_last_error() -> Option<String> {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
+}
+
+/// The boot-stage reasons recorded so far, joined for the status surface.
+fn boot_failure_summary() -> Option<String> {
+    let slot = BOOT_FAILURES.get_or_init(|| Mutex::new(Vec::new()));
+    let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_empty() {
+        None
+    } else {
+        Some(guard.join("; "))
+    }
+}
+
+/// Record a boot-stage failure where the supervisor status already reads it
+/// (DD-080).
+///
+/// Boot has no relaunch attempt to charge, so this only records the reason: the
+/// consecutive-failure counter is left alone and the give-up booleans keep
+/// meaning "the supervisor paused retries". The reason survives `reset_failures`
+/// because the condition it describes (for example "the config never loaded")
+/// is still true after a service recovers.
+pub(crate) fn record_boot_failure(reason: &str) {
+    let slot = BOOT_FAILURES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.iter().any(|existing| existing == reason) {
+        return;
+    }
+    if guard.len() >= MAX_BOOT_FAILURES {
+        guard.remove(0);
+    }
+    guard.push(reason.to_string());
 }
 
 fn record_restart_failure(service: SupervisedService, error: &str) -> u32 {
@@ -264,10 +355,20 @@ pub(crate) fn reset_failures(service: SupervisedService) {
 /// Exposed to the UI via `get_system_health` so a down service can show
 /// "auto-restart paused — use Restart" instead of leaving the user guessing
 /// why the watchdog is no longer poking the port. Pure read of the existing
-/// atomic counters, safe to call from any task.
+/// atomics plus the boot-failure record, safe to call from any task.
 pub fn give_up_status() -> SupervisorStatus {
     let bun_restart_failures = BUN_FAILS.load(Ordering::Relaxed);
-    let bun_last_error = bun_last_error();
+    let boot_failure = boot_failure_summary();
+    // DD-080: a boot-stage reason is what the UI reads when no relaunch has
+    // failed yet. A live relaunch error wins because it is the more recent
+    // cause, and the boot reason remains in the log.
+    let bun_last_error = bun_last_error().or_else(|| boot_failure.clone());
+    let restart_diagnostic = bun_diagnostic(bun_restart_failures, bun_last_error.as_deref());
+    let boot_diagnostic = boot_failure.map(|reason| {
+        format!(
+            "Startup failed at boot: {reason}. Services may still come up; see the app log for the full sequence."
+        )
+    });
     SupervisorStatus {
         bun_give_up: bun_restart_failures >= MAX_CONSECUTIVE_RESTARTS,
         proxy_give_up: PROXY_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
@@ -275,7 +376,7 @@ pub fn give_up_status() -> SupervisorStatus {
         llama_cpp_give_up: LLAMA_CPP_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         bun_restart_failures,
         restart_limit: MAX_CONSECUTIVE_RESTARTS,
-        bun_diagnostic: bun_diagnostic(bun_restart_failures, bun_last_error.as_deref()),
+        bun_diagnostic: restart_diagnostic.or(boot_diagnostic),
         bun_last_error,
     }
 }
@@ -443,18 +544,44 @@ async fn tick(handle: &AppHandle) {
     // first and the backend-off branch stops that child instead of orphaning it.
     let ollama_owned =
         crate::process_lifecycle::is_live(crate::process_lifecycle::ManagedProcess::Ollama);
+    // Probed once: the action and the counter decision must see the same
+    // observation, or a port that opened mid-tick could be counted after the
+    // tick decided the child was still warming.
+    let ollama_listening = crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl);
 
-    match ollama_tick_action(
-        is_ollama,
-        crate::backend_port_is_listening(OLLAMA_PORT, ollama_uses_wsl),
-        ollama_owned,
-    ) {
+    match ollama_tick_action(is_ollama, ollama_listening, ollama_owned) {
         OllamaAction::StopOwned => {
             OLLAMA_FAILS.store(0, Ordering::Relaxed);
             crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::Ollama);
         }
         OllamaAction::Leave => {
-            OLLAMA_FAILS.store(0, Ordering::Relaxed);
+            // DD-080: a child left alone is only healthy when its port answers.
+            // A warming child that never opens port 11434 is counted, exactly
+            // like DD-079 counts a Bun that never answers /health, so it still
+            // reaches the give-up path instead of resetting its budget forever.
+            let previous = OLLAMA_FAILS.load(Ordering::Relaxed);
+            match record_ollama_tick_outcome(ollama_listening, ollama_owned) {
+                (OllamaTickVerdict::Healthy, _) => {}
+                // Log one durable line per advance, not once per tick forever:
+                // after the cap the give-up status is the signal.
+                (OllamaTickVerdict::StillStarting, next) if next > previous => {
+                    log::warn!(
+                        target: "jarvis::supervisor",
+                        "Ollama is still starting — alive but has not opened port 11434 \
+                         ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the restart \
+                         budget, not reported as a relaunch: {OLLAMA_STILL_STARTING_REASON}"
+                    );
+                    if next >= MAX_CONSECUTIVE_RESTARTS {
+                        log::error!(
+                            target: "jarvis::supervisor",
+                            "Ollama child never became ready ({next}/{MAX_CONSECUTIVE_RESTARTS}); \
+                             automatic restarts are paused. Last observation: \
+                             {OLLAMA_STILL_STARTING_REASON}. Use Restart to re-arm the budget."
+                        );
+                    }
+                }
+                (OllamaTickVerdict::StillStarting, _) => {}
+            }
         }
         OllamaAction::Start => {
             let fails = OLLAMA_FAILS.load(Ordering::Relaxed);
@@ -469,7 +596,17 @@ async fn tick(handle: &AppHandle) {
                     OLLAMA_FAILS.store(0, Ordering::Relaxed);
                     println!("[supervisor] Ollama was down — relaunched.");
                 } else {
-                    let next = OLLAMA_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let next = record_restart_failure(
+                        SupervisedService::Ollama,
+                        OLLAMA_STILL_STARTING_REASON,
+                    );
+                    // DD-080: a packaged build discards stderr, so this failure
+                    // is only diagnosable if the same line reaches the log.
+                    log::warn!(
+                        target: "jarvis::supervisor",
+                        "Ollama restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): \
+                         {OLLAMA_STILL_STARTING_REASON}"
+                    );
                     eprintln!(
                         "[supervisor] Ollama restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS})."
                     );
@@ -542,6 +679,21 @@ mod tests {
     impl Drop for QuittingFlagReset {
         fn drop(&mut self) {
             QUITTING.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Clears the process-wide boot-failure record when a test ends — including
+    /// when it panics — so one test's boot reasons cannot leak into another
+    /// test's status assertions.
+    struct BootFailuresReset;
+
+    impl Drop for BootFailuresReset {
+        fn drop(&mut self) {
+            BOOT_FAILURES
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
         }
     }
 
@@ -631,6 +783,77 @@ mod tests {
                 && ollama.contains("ManagedProcess::Ollama"),
             "the backend-off arm must stop the owned Ollama child:\n{ollama}"
         );
+    }
+
+    #[test]
+    fn a_live_but_unready_ollama_is_counted_not_reset() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::Ollama);
+
+        // DD-080, following DD-079's Bun rule: a child this process owns that
+        // is still alive but has not opened port 11434 is not a healthy backend
+        // and must not clear the count it is responsible for.
+        let (verdict, first) = record_ollama_tick_outcome(false, true);
+        assert_eq!(verdict, OllamaTickVerdict::StillStarting);
+        assert_eq!(first, 1);
+        assert_eq!(
+            OLLAMA_FAILS.load(Ordering::Relaxed),
+            1,
+            "alive is not ready: a warming child must not reset the Ollama failure count"
+        );
+
+        // The next tick finds the same child still silent, so the budget
+        // advances instead of starting over.
+        let (verdict, second) = record_ollama_tick_outcome(false, true);
+        assert_eq!(verdict, OllamaTickVerdict::StillStarting);
+        assert_eq!(second, 2);
+
+        // A child that never opens its port still reaches the give-up cap, so
+        // the watchdog stops relaunching instead of resetting forever.
+        for _ in 2..MAX_CONSECUTIVE_RESTARTS {
+            record_ollama_tick_outcome(false, true);
+        }
+        assert_eq!(OLLAMA_FAILS.load(Ordering::Relaxed), MAX_CONSECUTIVE_RESTARTS);
+        assert!(!may_restart(OLLAMA_FAILS.load(Ordering::Relaxed)));
+        assert!(
+            give_up_status().ollama_give_up,
+            "a live-but-never-ready Ollama must end in the existing give-up path"
+        );
+
+        // A listener is the only observation that clears the budget.
+        let (verdict, next) = record_ollama_tick_outcome(true, true);
+        assert_eq!(verdict, OllamaTickVerdict::Healthy);
+        assert_eq!(next, 0);
+        assert!(!give_up_status().ollama_give_up);
+
+        // Pin the wiring: the Leave arm must count the owned-but-unready child
+        // and log it, never blank the counter. This is the half that fails if
+        // the fix is reverted to the old unconditional reset.
+        let production = supervisor_production_source();
+        let ollama = production
+            .split_once("// ── Ollama")
+            .and_then(|(_, rest)| rest.split_once("// ── llama.cpp"))
+            .map(|(block, _)| block)
+            .expect("the Ollama supervisor block must sit between its section markers");
+        let leave_arm = ollama
+            .split_once("OllamaAction::Leave =>")
+            .and_then(|(_, rest)| rest.split_once("OllamaAction::Start =>"))
+            .map(|(arm, _)| arm)
+            .expect("the Ollama block must keep its Leave and Start arms");
+        assert!(
+            leave_arm.contains("record_ollama_tick_outcome("),
+            "the Leave arm must route the counter decision through the tested seam:\n{leave_arm}"
+        );
+        assert!(
+            !leave_arm.contains("OLLAMA_FAILS.store(0"),
+            "a child that is alive but unready must not have its failure count reset:\n{leave_arm}"
+        );
+        assert!(
+            leave_arm.contains("OLLAMA_STILL_STARTING_REASON") && leave_arm.contains("log::warn!"),
+            "the counted outcome must be named in the durable log:\n{leave_arm}"
+        );
+
+        reset_failures(SupervisedService::Ollama);
     }
 
     #[test]
@@ -959,6 +1182,81 @@ mod tests {
         assert!(diagnostic.contains("Restart"));
 
         reset_failures(SupervisedService::Bun);
+    }
+
+    /// DD-080: a packaged build's startup reason must reach the status surface
+    /// the UI reads, not only a discarded stderr line. A config that failed to
+    /// load is why the run is on defaults, and a Bun boot failure is why the
+    /// server is offline; both belong in `bun_last_error` before any relaunch
+    /// has been attempted.
+    #[test]
+    fn boot_failures_are_visible_in_the_supervisor_status() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _boot = BootFailuresReset;
+        reset_failures(SupervisedService::Bun);
+        BOOT_FAILURES
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+
+        let config_reason =
+            crate::boot_config_failure_reason("database is locked while reading settings");
+        let bun_reason = crate::boot_bun_failure_reason("bun executable not found");
+        record_boot_failure(&config_reason);
+        record_boot_failure(&bun_reason);
+
+        let status = give_up_status();
+        let last_error = status
+            .bun_last_error
+            .as_deref()
+            .expect("a boot-stage failure must reach the status surface");
+        assert!(
+            last_error.contains("default configuration")
+                && last_error.contains("database is locked while reading settings"),
+            "the recorded reason must say the run is on defaults and why: {last_error}"
+        );
+        assert!(
+            last_error.contains("bun executable not found"),
+            "the boot-stage Bun failure must reach the same surface: {last_error}"
+        );
+        let diagnostic = status
+            .bun_diagnostic
+            .as_deref()
+            .expect("Health must be able to show why boot failed");
+        assert!(
+            diagnostic.contains("Startup failed at boot") && diagnostic.contains("default"),
+            "the diagnostic must explain the boot failure, not just say offline: {diagnostic}"
+        );
+        assert_eq!(
+            status.bun_restart_failures, 0,
+            "recording a boot reason must not fake a failed relaunch attempt"
+        );
+        assert!(!status.bun_give_up);
+
+        // A later Bun reset clears the live relaunch error, but the boot
+        // reason still describes how this run started.
+        reset_failures(SupervisedService::Bun);
+        let after_reset = give_up_status();
+        assert!(
+            after_reset
+                .bun_last_error
+                .as_deref()
+                .is_some_and(|reason| reason.contains("default configuration")),
+            "a recovered Bun must not erase why boot ran on defaults"
+        );
+
+        // Duplicate boot reasons must not accumulate in the status surface.
+        record_boot_failure(&config_reason);
+        assert_eq!(
+            give_up_status()
+                .bun_last_error
+                .as_deref()
+                .unwrap_or_default()
+                .matches("default configuration")
+                .count(),
+            1
+        );
     }
 
     /// Production half of this file: everything above the test module.

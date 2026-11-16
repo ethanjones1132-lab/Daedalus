@@ -490,6 +490,7 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
             }
         }
         if !ready {
+            log::warn!(target: "jarvis::startup", "Ollama did not become ready within 15s");
             eprintln!("[Jarvis] Ollama did not become ready within 15s");
         } else {
             println!("[Jarvis] Ollama ready on 11434");
@@ -644,12 +645,20 @@ pub fn reconcile_backend_services(
         }
         if matches!(backend, crate::jarvis::types::JarvisBackend::LlamaCpp) {
             if let Err(error) = start_llama_cpp_server(llama_cpp).await {
+                log::warn!(
+                    target: "jarvis::startup",
+                    "llama.cpp server startup failed: {error}"
+                );
                 eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         } else {
             process_lifecycle::stop(process_lifecycle::ManagedProcess::LlamaCpp);
         }
         if let Err(e) = ensure_jarvis_server_started().await {
+            log::warn!(
+                target: "jarvis::startup",
+                "ensure server after backend reconcile failed: {e}"
+            );
             eprintln!(
                 "[Jarvis] ensure server after backend reconcile failed: {}",
                 e
@@ -985,6 +994,14 @@ fn spawn_claude_cli_proxy_child(
     let child = match process_lifecycle::spawn_managed(&mut command) {
         Ok(c) => c,
         Err(e) => {
+            log::error!(
+                target: "jarvis::startup",
+                "claude_cli_proxy spawn failed: {e} (interpreter={:?} {:?}, script={}, source={:?}, model={model})",
+                py.program,
+                py.prefix_args,
+                script.path.display(),
+                script.kind,
+            );
             eprintln!(
                 "[Jarvis] claude_cli_proxy spawn failed: {e} (interpreter={:?} {:?}, script={}, source={:?}, model={model})",
                 py.program,
@@ -1672,8 +1689,37 @@ pub(crate) fn find_bun_executable() -> String {
     "bun".to_string()
 }
 
-fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
-    let log_dir = if cfg!(target_os = "windows") {
+/// Where a child's stdout/stderr is written, and the path that was used.
+struct ServerLogTarget {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+/// Outcome of locating one child's log target.
+enum ServerLogOpen {
+    /// The preferred directory was writable.
+    Primary(ServerLogTarget),
+    /// The preferred directory failed; the fallback accepted the file.
+    Fallback {
+        target: ServerLogTarget,
+        primary_error: String,
+    },
+    /// Neither candidate could be opened.
+    None {
+        primary_error: String,
+        fallback_error: String,
+    },
+}
+
+/// Preferred and fallback directories for a child's captured output.
+///
+/// The fallback is deliberately a different directory name than the primary on
+/// every platform: an unresolvable `LOCALAPPDATA`/home must not collapse both
+/// candidates onto the same unwritable path and leave the child with nowhere to
+/// write.
+fn jarvis_server_log_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
+    let fallback = std::env::temp_dir().join("jarvis-logs");
+    let primary = if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
@@ -1685,14 +1731,80 @@ fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
             .join("jarvis")
             .join("logs")
     };
+    (primary, fallback)
+}
 
-    let _ = std::fs::create_dir_all(&log_dir);
-    std::fs::OpenOptions::new()
+fn try_open_server_log(dir: &std::path::Path, file_name: &str) -> Result<ServerLogTarget, String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("create directory {}: {error}", dir.display()))?;
+    let path = dir.join(file_name);
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_dir.join(file_name))
-        .map(std::process::Stdio::from)
-        .unwrap_or_else(|_| std::process::Stdio::null())
+        .open(&path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    Ok(ServerLogTarget { file, path })
+}
+
+/// Open a child's log target, falling back to a second writable directory.
+///
+/// Pure of the environment and of logging so a failed primary target is
+/// testable without an unwritable `LOCALAPPDATA`: the caller decides which
+/// directories to try and how to report the outcome.
+fn open_server_log_target(
+    primary_dir: &std::path::Path,
+    fallback_dir: &std::path::Path,
+    file_name: &str,
+) -> ServerLogOpen {
+    match try_open_server_log(primary_dir, file_name) {
+        Ok(target) => ServerLogOpen::Primary(target),
+        Err(primary_error) => match try_open_server_log(fallback_dir, file_name) {
+            Ok(target) => ServerLogOpen::Fallback {
+                target,
+                primary_error,
+            },
+            Err(fallback_error) => ServerLogOpen::None {
+                primary_error,
+                fallback_error,
+            },
+        },
+    }
+}
+
+fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
+    let (log_dir, fallback_dir) = jarvis_server_log_dirs();
+    match open_server_log_target(&log_dir, &fallback_dir, file_name) {
+        ServerLogOpen::Primary(target) => std::process::Stdio::from(target.file),
+        ServerLogOpen::Fallback {
+            target,
+            primary_error,
+        } => {
+            // DD-080: a packaged build discards stderr, so a failed open must
+            // not fall straight to `Stdio::null()` — the child's own record of
+            // why it died would go nowhere. Name both the failure and where the
+            // output actually went.
+            let line = format!(
+                "server log {file_name} could not be opened ({primary_error}); \
+                 child output is going to {} instead",
+                target.path.display()
+            );
+            log::error!(target: "jarvis::startup", "{line}");
+            eprintln!("[Jarvis] {line}");
+            std::process::Stdio::from(target.file)
+        }
+        ServerLogOpen::None {
+            primary_error,
+            fallback_error,
+        } => {
+            let line = format!(
+                "server log {file_name} could not be opened in either location \
+                 ({primary_error}; fallback {fallback_error}); child output is discarded"
+            );
+            log::error!(target: "jarvis::startup", "{line}");
+            eprintln!("[Jarvis] {line}");
+            std::process::Stdio::null()
+        }
+    }
 }
 
 fn should_hide_jarvis_server_console(is_windows: bool, _looks_like_local_bun: bool) -> bool {
@@ -1877,6 +1989,10 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let child = match spawn_result {
         Ok(c) => c,
         Err(e) => {
+            log::error!(
+                target: "jarvis::startup",
+                "Bun spawn failed: {e} (bun={bun}, entry={entry})"
+            );
             eprintln!("[Jarvis] Bun spawn failed: {e} (bun={bun}, entry={entry})");
             return Err(format!("Bun spawn failed: {e}"));
         }
@@ -2573,11 +2689,17 @@ async fn start_backend_dependency(cfg: &crate::jarvis::types::JarvisConfig) {
         }
         crate::jarvis::types::JarvisBackend::LlamaCpp => {
             if let Err(error) = crate::start_llama_cpp_server(cfg.llama_cpp.clone()).await {
+                log::warn!(target: "jarvis::startup", "llama.cpp server startup failed: {error}");
                 eprintln!("[Daedalus] llama.cpp server startup failed: {error}");
             }
         }
         crate::jarvis::types::JarvisBackend::OpenRouter => {
             if cfg.openrouter.api_key.trim().is_empty() {
+                log::warn!(
+                    target: "jarvis::startup",
+                    "OpenRouter is the active backend but no API key is set — chats will \
+                     fail until a key is configured in Control."
+                );
                 eprintln!(
                     "[Jarvis] OpenRouter is the active backend but no API key is set \
                      — chats will fail until a key is configured in Control."
@@ -2617,6 +2739,49 @@ where
     bun_result
 }
 
+/// Why the run is on default configuration, named for the status surface
+/// (DD-080).
+fn boot_config_failure_reason(error: &str) -> String {
+    format!("Boot config load failed, so the run is using default configuration: {error}")
+}
+
+/// Why the Bun server never started at boot, named for the status surface
+/// (DD-080).
+fn boot_bun_failure_reason(error: &str) -> String {
+    format!("Bun server startup failed at boot: {error}")
+}
+
+/// Load the boot config without silently discarding a failed load (DD-080).
+///
+/// The previous `unwrap_or_default()` did exactly what the UI then could not
+/// explain: a packaged build discards stderr, so the app quietly ran on
+/// defaults while every saved setting appeared to be in force. The reason is
+/// handed to `report` — boot passes [`report_boot_failure`] — before the
+/// defaults are used.
+fn load_boot_config(
+    outcome: Result<crate::jarvis::types::JarvisConfig, String>,
+    report: impl FnOnce(&str),
+) -> crate::jarvis::types::JarvisConfig {
+    match outcome {
+        Ok(config) => config,
+        Err(error) => {
+            report(&boot_config_failure_reason(&error));
+            crate::jarvis::types::JarvisConfig::default()
+        }
+    }
+}
+
+/// Make a boot-stage failure durable (DD-080).
+///
+/// The app log is the record that survives a packaged build; the console line
+/// is kept for a dev run, and the supervisor status is what Health already
+/// exposes, so the reason is not left to a discarded stderr stream.
+fn report_boot_failure(reason: &str) {
+    log::error!(target: "jarvis::startup", "{reason}");
+    eprintln!("[Jarvis] {reason}");
+    crate::supervisor::record_boot_failure(reason);
+}
+
 async fn bootstrap_services(handle: tauri::AppHandle) {
     log::info!(target: "jarvis::startup", "bootstrap thread entered");
     // Hydrate the in-memory config from SQLite — the single source of truth
@@ -2628,7 +2793,10 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
             println!("[Jarvis] Imported legacy file config into SQLite (one-time migration).")
         }
         Ok(false) => {}
-        Err(e) => eprintln!("[Jarvis] config migration check failed: {e}"),
+        Err(e) => {
+            log::warn!(target: "jarvis::startup", "config migration check failed: {e}");
+            eprintln!("[Jarvis] config migration check failed: {e}");
+        }
     }
     log::info!(target: "jarvis::startup", "bootstrap config migration complete");
     // Phase 2.2 recovery: a native restart leaves no Bun registry, so pending
@@ -2659,7 +2827,10 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
         Ok(_) => {}
         Err(e) => log::warn!(target: "jarvis::startup", "memory capture recovery failed: {e:?}"),
     }
-    let cfg = crate::commands::load_jarvis_config(&db_state).unwrap_or_default();
+    let cfg = load_boot_config(
+        crate::commands::load_jarvis_config(&db_state),
+        report_boot_failure,
+    );
     log::info!(target: "jarvis::startup", "bootstrap config load complete");
     {
         let state = handle.state::<crate::jarvis::types::JarvisState>();
@@ -2681,7 +2852,8 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
     match start_bun_and_backend(crate::ensure_jarvis_server_started(), backend_dependency).await {
         Ok(()) => log::info!(target: "jarvis::startup", "Bun server healthy at boot"),
         Err(e) => {
-            log::error!(target: "jarvis::startup", "Bun server startup failed at boot: {e}")
+            let reason = boot_bun_failure_reason(&e);
+            report_boot_failure(&reason);
         }
     }
 
@@ -2704,8 +2876,14 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
             Ok(Ok(process_lifecycle::StartOutcome::AlreadyListening)) => println!(
                 "[Jarvis] Claude CLI proxy port already has a listener; leaving it in place"
             ),
-            Ok(Err(error)) => eprintln!("[Jarvis] Claude CLI proxy not started: {error}"),
-            Err(error) => eprintln!("[Jarvis] Claude CLI proxy start task failed: {error}"),
+            Ok(Err(error)) => {
+                log::warn!(target: "jarvis::startup", "Claude CLI proxy not started: {error}");
+                eprintln!("[Jarvis] Claude CLI proxy not started: {error}");
+            }
+            Err(error) => {
+                log::warn!(target: "jarvis::startup", "Claude CLI proxy start task failed: {error}");
+                eprintln!("[Jarvis] Claude CLI proxy start task failed: {error}");
+            }
         }
     } else {
         println!(
@@ -5018,6 +5196,219 @@ mod first_run_db_failure_tests {
         assert!(
             diagnostic.contains("Access is denied. (os error 5)"),
             "the diagnostic must carry the underlying error: {diagnostic}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod server_log_fallback_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::path::PathBuf;
+
+    fn unique_dir(label: &str) -> PathBuf {
+        static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jarvis-log-{label}-{}-{sequence}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    /// A directory path that exists as a regular file, so `create_dir_all` and
+    /// any open beneath it must fail on every platform.
+    fn blocked_dir(label: &str) -> PathBuf {
+        let path = unique_dir(label).join("blocked");
+        std::fs::write(&path, b"not a directory").expect("write blocking file");
+        path
+    }
+
+    /// DD-080: when the preferred log directory cannot be opened, the child must
+    /// still get a writable target so its own failure output survives, and the
+    /// caller must be told the primary failed so it can record that.
+    #[test]
+    fn a_failed_primary_log_open_falls_back_to_a_writable_target() {
+        let primary = blocked_dir("primary");
+        let fallback = unique_dir("fallback");
+
+        match open_server_log_target(&primary, &fallback, "server-jarvis.err.log") {
+            ServerLogOpen::Fallback {
+                mut target,
+                primary_error,
+            } => {
+                assert!(
+                    primary_error.contains(&primary.display().to_string()),
+                    "the failure must name the attempted location: {primary_error}"
+                );
+                assert_eq!(target.path, fallback.join("server-jarvis.err.log"));
+                target
+                    .file
+                    .write_all(b"child stderr survives\n")
+                    .expect("the fallback handle must be writable");
+            }
+            ServerLogOpen::Primary(_) => {
+                panic!("the blocked primary must not be reported as opened")
+            }
+            ServerLogOpen::None { .. } => {
+                panic!("a writable fallback must be used instead of discarding child output")
+            }
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(fallback.join("server-jarvis.err.log"))
+                .expect("fallback log must exist"),
+            "child stderr survives\n",
+            "the child's output must actually land in the fallback file"
+        );
+    }
+
+    /// When no candidate can be opened the failure is still classified, so the
+    /// caller can log that output is discarded instead of pretending it works.
+    #[test]
+    fn both_targets_failing_is_reported_as_discarded() {
+        let primary = blocked_dir("primary");
+        let fallback = blocked_dir("fallback");
+        match open_server_log_target(&primary, &fallback, "server-jarvis.log") {
+            ServerLogOpen::None {
+                primary_error,
+                fallback_error,
+            } => {
+                assert!(primary_error.contains(&primary.display().to_string()));
+                assert!(fallback_error.contains(&fallback.display().to_string()));
+            }
+            _ => panic!("two unwritable locations must both be reported"),
+        }
+    }
+
+    /// Pin the production half: the spawn path must route through the tested
+    /// fallback and log a failure, never silently map it to `Stdio::null()`.
+    #[test]
+    fn the_spawn_path_reports_a_failed_log_open_before_discarding_output() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("fn jarvis_server_log_stdio(")
+            .expect("jarvis_server_log_stdio must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("\nfn should_hide_jarvis_server_console(")
+            .map(|offset| start + offset)
+            .expect("should_hide_jarvis_server_console must follow the log helper");
+        let body = &SOURCE[start..end];
+
+        assert!(
+            body.contains("open_server_log_target("),
+            "the spawn path must use the tested fallback seam:\n{body}"
+        );
+        assert!(
+            body.contains("ServerLogOpen::Fallback"),
+            "the spawn path must keep the fallback arm:\n{body}"
+        );
+        assert!(
+            body.matches("log::error!").count() >= 2,
+            "both the fallback and the discarded case must reach the durable log:\n{body}"
+        );
+        assert!(
+            !body.contains("unwrap_or_else(|_| std::process::Stdio::null())"),
+            "a failed open must not silently discard the child's output:\n{body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod boot_failure_diagnostic_tests {
+    use super::*;
+
+    /// DD-080: a failed config load must still boot, but the reason the run is
+    /// on defaults must be reported instead of swallowed by `unwrap_or_default`.
+    #[test]
+    fn a_failed_boot_config_load_boots_on_defaults_and_reports_why() {
+        let mut reported: Vec<String> = Vec::new();
+        let cfg = load_boot_config(
+            Err("database is locked while reading settings".to_string()),
+            |reason| reported.push(reason.to_string()),
+        );
+
+        assert_eq!(
+            reported.len(),
+            1,
+            "a failed load must be reported exactly once, got {reported:?}"
+        );
+        let reason = &reported[0];
+        assert!(
+            reason.contains("default configuration"),
+            "the reason must say the run is on defaults: {reason}"
+        );
+        assert!(
+            reason.contains("database is locked while reading settings"),
+            "the reason must carry the underlying load error: {reason}"
+        );
+        assert_eq!(
+            serde_json::to_string(&cfg).expect("config serializes"),
+            serde_json::to_string(&crate::jarvis::types::JarvisConfig::default())
+                .expect("default config serializes"),
+            "boot must continue on defaults rather than failing the run"
+        );
+
+        // A successful load is not reported and is used as loaded.
+        let mut quiet: Vec<String> = Vec::new();
+        let loaded = crate::jarvis::types::JarvisConfig::default();
+        let cfg = load_boot_config(Ok(loaded.clone()), |reason| quiet.push(reason.to_string()));
+        assert!(quiet.is_empty(), "a successful load must report nothing");
+        assert_eq!(
+            serde_json::to_string(&cfg).expect("config serializes"),
+            serde_json::to_string(&loaded).expect("loaded config serializes")
+        );
+    }
+
+    /// Pin the production wiring: boot must record the config failure and the
+    /// Bun boot failure through the one durable reporter, and the old silent
+    /// `unwrap_or_default()` must be gone.
+    #[test]
+    fn bootstrap_reports_boot_failures_to_the_log_and_status_surface() {
+        const SOURCE: &str = include_str!("lib.rs");
+
+        let reporter_start = SOURCE
+            .find("fn report_boot_failure(")
+            .expect("report_boot_failure must exist in lib.rs");
+        let reporter_end = SOURCE[reporter_start..]
+            .find("\nasync fn bootstrap_services(")
+            .map(|offset| reporter_start + offset)
+            .expect("bootstrap_services must follow the reporter");
+        let reporter = &SOURCE[reporter_start..reporter_end];
+        assert!(
+            reporter.contains("log::error!"),
+            "the reason must reach the app log file:\n{reporter}"
+        );
+        assert!(
+            reporter.contains("crate::supervisor::record_boot_failure("),
+            "the reason must reach the supervisor status the UI reads:\n{reporter}"
+        );
+
+        let start = SOURCE
+            .find("async fn bootstrap_services(")
+            .expect("bootstrap_services must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("\nfn spawn_bootstrap_services(")
+            .map(|offset| start + offset)
+            .expect("spawn_bootstrap_services must follow bootstrap_services in lib.rs");
+        let body = &SOURCE[start..end];
+
+        assert!(
+            body.contains("load_boot_config(") && body.contains("report_boot_failure,"),
+            "the boot config load must report a failure through report_boot_failure:\n{body}"
+        );
+        assert!(
+            !body.contains("load_jarvis_config(&db_state).unwrap_or_default()"),
+            "a failed config load must not be silently defaulted:\n{body}"
+        );
+        assert!(
+            body.contains("boot_bun_failure_reason(&e)") && body.contains("report_boot_failure(&reason)"),
+            "the captured Bun boot error must be recorded as the reason:\n{body}"
         );
     }
 }
