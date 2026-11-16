@@ -2,10 +2,13 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NavigationProvider } from '../../shell/navigation';
 import HarnessPage from './HarnessPage';
-import type { SavedHarnessManifest } from './harness-api';
+import { HarnessApiError, type SavedHarnessManifest } from './harness-api';
 
-const { listManifests } = vi.hoisted(() => ({ listManifests: vi.fn() }));
-vi.mock('./harness-api', () => ({ harnessApi: { listManifests } }));
+const { listManifests, updateManifest } = vi.hoisted(() => ({ listManifests: vi.fn(), updateManifest: vi.fn() }));
+vi.mock('./harness-api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./harness-api')>();
+  return { ...actual, harnessApi: { ...actual.harnessApi, listManifests, updateManifest } };
+});
 
 const savedManifest: SavedHarnessManifest = {
   manifest: {
@@ -33,6 +36,7 @@ function mount() {
 afterEach(() => {
   cleanup();
   listManifests.mockReset();
+  updateManifest.mockReset();
 });
 
 describe('HarnessPage picker route', () => {
@@ -56,7 +60,8 @@ describe('HarnessPage picker route', () => {
     expect(manifest).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(manifest);
     expect(manifest).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText(/Guide editing, live rounds, and run history are not part of this picker slice/)).toBeInTheDocument();
+    expect(screen.getByText(/No harness run has been performed/)).toBeInTheDocument();
+    expect(screen.getByRole('textbox', { name: 'Rules' })).toBeInTheDocument();
   });
 
   it('keeps a failed lookup distinct from a valid empty manifest list', async () => {
@@ -81,5 +86,81 @@ describe('HarnessPage picker route', () => {
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('this is not an empty list.');
     expect(screen.queryByText('No saved manifest for this project and purpose.')).not.toBeInTheDocument();
+  });
+
+  it('saves edited guide lines against the loaded revision and shows the returned revision', async () => {
+    const saved = { ...savedManifest, revision: 4, manifest_hash: 'hash-2' };
+    listManifests.mockResolvedValue([savedManifest]);
+    updateManifest.mockResolvedValue(saved);
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /typescript · typescript_node/ }));
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Rules' }), { target: { value: 'a, b\n\nc d' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save guide edits' }));
+
+    expect((await screen.findAllByText('Revision 4')).length).toBeGreaterThan(0);
+    expect(updateManifest).toHaveBeenCalledWith(
+      { ...savedManifest.manifest, guides: { ...savedManifest.manifest.guides, rules: ['a, b', 'c d'] } },
+      3,
+    );
+    expect(screen.queryByText('Unsaved guide edits. Selecting another manifest or purpose discards them.')).not.toBeInTheDocument();
+  });
+
+  it('keeps edits visible and reports stale revisions as unsaved conflicts', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    updateManifest.mockRejectedValue(new HarnessApiError('stale', 409, 'stale_revision'));
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /typescript · typescript_node/ }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Rules' }), { target: { value: 'unsaved rule' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save guide edits' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('This manifest changed since it was loaded.');
+    expect(alert).toHaveTextContent('Your guide edits are unsaved');
+    expect(screen.getByRole('textbox', { name: 'Rules' })).toHaveValue('unsaved rule');
+    expect(screen.getByRole('button', { name: 'Reload manifest to compare' })).toBeInTheDocument();
+    expect(screen.queryByText(/saved at revision|guides saved/i)).not.toBeInTheDocument();
+  });
+
+  it('keeps a typed blank line so a second entry can be started', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /typescript · typescript_node/ }));
+
+    const rules = screen.getByRole('textbox', { name: 'Rules' });
+    fireEvent.change(rules, { target: { value: 'first\n' } });
+
+    expect(rules).toHaveValue('first\n');
+    fireEvent.change(rules, { target: { value: 'first\nsecond\n\n' } });
+    expect(rules).toHaveValue('first\nsecond\n\n');
+  });
+
+  it('reloads after a stale conflict without discarding the edits, then saves against the new revision', async () => {
+    const reloaded = { ...savedManifest, revision: 4, manifest_hash: 'hash-2' };
+    listManifests.mockResolvedValueOnce([savedManifest]).mockResolvedValue([reloaded]);
+    updateManifest.mockRejectedValueOnce(new HarnessApiError('stale', 409, 'stale_revision'))
+      .mockResolvedValue({ ...reloaded, revision: 5 });
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+    fireEvent.click(await screen.findByRole('button', { name: /typescript · typescript_node/ }));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Rules' }), { target: { value: 'kept rule' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save guide edits' }));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Reload manifest to compare' }));
+
+    expect((await screen.findAllByText('Revision 4')).length).toBeGreaterThan(0);
+    expect(screen.getByRole('textbox', { name: 'Rules' })).toHaveValue('kept rule');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save guide edits' }));
+
+    expect((await screen.findAllByText('Revision 5')).length).toBeGreaterThan(0);
+    expect(updateManifest).toHaveBeenLastCalledWith(
+      { ...savedManifest.manifest, guides: { ...savedManifest.manifest.guides, rules: ['kept rule'] } },
+      4,
+    );
   });
 });

@@ -20,6 +20,7 @@ export const initialHarnessState: HarnessState = {
 export type HarnessAction =
   | { type: 'manifests-loaded'; manifests: SavedHarnessManifest[] }
   | { type: 'manifest-selected'; saved: SavedHarnessManifest | null }
+  | { type: 'manifest-refreshed'; saved: SavedHarnessManifest }
   | { type: 'guides-edited'; guides: Partial<HarnessManifest['guides']> }
   | { type: 'sensors-edited'; sensors: HarnessManifest['sensors'] }
   | { type: 'approval-needed'; sensorId: string; needed: boolean }
@@ -33,6 +34,12 @@ export function harnessReducer(state: HarnessState, action: HarnessAction): Harn
   switch (action.type) {
     case 'manifests-loaded': return { ...state, manifests: [...action.manifests] };
     case 'manifest-selected': return { ...state, selected: action.saved, dirty: { guides: null, sensors: null }, conflict: null };
+    case 'manifest-refreshed': {
+      // Re-read after a revision conflict: adopt the fresh copy so the next save
+      // targets the new revision, but keep the operator's unsaved guide edits.
+      const manifests = state.manifests.map(item => item.manifest.id === action.saved.manifest.id ? action.saved : item);
+      return { ...state, manifests, selected: action.saved, conflict: null };
+    }
     case 'guides-edited': return { ...state, dirty: { ...state.dirty, guides: { ...state.dirty.guides, ...action.guides } } };
     case 'sensors-edited': return { ...state, dirty: { ...state.dirty, sensors: action.sensors.map(sensor => ({ ...sensor, args: [...sensor.args] })) } };
     case 'approval-needed': return { ...state, approvalNeeded: { ...state.approvalNeeded, [action.sensorId]: action.needed } };

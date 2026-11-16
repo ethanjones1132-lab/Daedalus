@@ -28,6 +28,24 @@ describe('harness state', () => {
     expect(state.conflict).toEqual({ expectedRevision: 2, currentRevision: 4 });
   });
 
+  it('keeps unsaved guide edits when the manifest is refreshed after a conflict', () => {
+    const selected = {
+      manifest: { id: 'm', project_kind: 'typescript', template_family: 'typescript_node', guides: { rules: ['old'], brief_template: 'b', skills: [], references: [], banned_defaults: [] } } as never,
+      revision: 3,
+      manifest_hash: 'old',
+    };
+    let state = harnessReducer(initialHarnessState, { type: 'manifests-loaded', manifests: [selected] });
+    state = harnessReducer(state, { type: 'manifest-selected', saved: selected });
+    state = harnessReducer(state, { type: 'guides-edited', guides: { rules: ['mine'] } });
+    state = harnessReducer(state, { type: 'revision-conflict', expectedRevision: 3 });
+    const fresh = { ...selected, revision: 4, manifest_hash: 'new' };
+    state = harnessReducer(state, { type: 'manifest-refreshed', saved: fresh });
+    expect(state.conflict).toBeNull();
+    expect(state.dirty.guides).toEqual({ rules: ['mine'] });
+    expect(state.selected?.revision).toBe(4);
+    expect(state.manifests[0].revision).toBe(4);
+  });
+
   it('never reports not-applicable or unapproved sensors as green', () => {
     expect(selectSensorGreen({ sensor_id: 'x', status: 'zero', counter: 0, exit_code: 0 })).toBe(true);
     expect(selectSensorGreen({ sensor_id: 'x', status: 'zero', counter: 0 })).toBe(false);

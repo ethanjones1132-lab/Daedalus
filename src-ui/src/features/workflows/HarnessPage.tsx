@@ -2,7 +2,7 @@ import { useEffect, useMemo, useReducer, useState } from 'react';
 import { Button, Page, PageHeader } from '../../design';
 import { harnessReducer, initialHarnessState } from '../../domain/harness-state';
 import type { HarnessPurpose, SavedHarnessManifest } from './harness-api';
-import { harnessApi } from './harness-api';
+import { HarnessApiError, harnessApi } from './harness-api';
 
 const PURPOSES: Array<{ id: HarnessPurpose; label: string }> = [
   { id: 'bug_fix', label: 'Bug fix' },
@@ -25,6 +25,8 @@ export default function HarnessPage() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     const root = projectRoot.trim();
@@ -73,7 +75,71 @@ export default function HarnessPage() {
     : null;
 
   function selectManifest(saved: SavedHarnessManifest) {
+    setSaveError(null);
     dispatch({ type: 'manifest-selected', saved });
+  }
+
+  function editGuideList(field: 'rules' | 'skills' | 'references' | 'banned_defaults', value: string) {
+    // Keep every line, including blank ones, or the textarea's controlled value
+    // would swallow the newline as soon as the operator presses Enter. Blank
+    // entries are dropped when the guides are saved.
+    const entries = value.split(/\r?\n/);
+    setSaveError(null);
+    dispatch({ type: 'guides-edited', guides: { [field]: entries } });
+  }
+
+  async function reloadToCompare() {
+    const root = projectRoot.trim();
+    const id = selected?.manifest.id;
+    if (!root || !id || loading) return;
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const latest = await harnessApi.listManifests(root);
+      if (!Array.isArray(latest)) {
+        setLoadError(MANIFEST_READ_FAILED);
+        return;
+      }
+      dispatch({ type: 'manifests-loaded', manifests: latest });
+      const fresh = latest.find((item) => item.manifest.id === id);
+      if (fresh) {
+        dispatch({ type: 'manifest-refreshed', saved: fresh });
+      } else {
+        dispatch({ type: 'manifest-selected', saved: null });
+        setSaveError('That manifest is no longer in the saved list. Your guide edits were not saved.');
+      }
+    } catch {
+      setLoadError(MANIFEST_READ_FAILED);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveGuides() {
+    if (!selected || !state.dirty.guides || saving) return;
+    const loadedRevision = selected.revision;
+    const edited = state.dirty.guides;
+    const clean = (lines: string[]) => lines.filter((line) => line.trim().length > 0);
+    const guides = { ...selected.manifest.guides, ...edited };
+    guides.rules = clean(guides.rules);
+    guides.skills = clean(guides.skills);
+    guides.references = clean(guides.references);
+    guides.banned_defaults = clean(guides.banned_defaults);
+    const manifest = { ...selected.manifest, guides };
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const saved = await harnessApi.updateManifest(manifest, loadedRevision);
+      dispatch({ type: 'manifest-saved', saved });
+    } catch (error) {
+      if (error instanceof HarnessApiError && error.code === 'stale_revision') {
+        dispatch({ type: 'revision-conflict', expectedRevision: loadedRevision });
+      } else {
+        setSaveError('Could not save guide edits. Your edits are still unsaved; retry when the manifest can be saved. No harness run or result is claimed.');
+      }
+    } finally {
+      setSaving(false);
+    }
   }
 
   const purposeLabel = PURPOSES.find((item) => item.id === purpose)?.label ?? purpose;
@@ -108,6 +174,7 @@ export default function HarnessPage() {
               value={purpose}
               onChange={(event) => {
                 setPurpose(event.currentTarget.value as HarnessPurpose);
+                setSaveError(null);
                 dispatch({ type: 'manifest-selected', saved: null });
               }}
             >
@@ -172,9 +239,63 @@ export default function HarnessPage() {
             </ul>
           )}
           {selected && (
-            <p role="status" className="mt-4 rounded-lg border border-line bg-raised p-3 text-[12px] text-ink-2">
-              Manifest selected. Guide editing, live rounds, and run history are not part of this picker slice.
-            </p>
+            <div className="mt-4 space-y-4 rounded-lg border border-line bg-raised p-4">
+              <p role="status" className="text-[12px] text-ink-2">
+                Manifest selected. No harness run has been performed.
+              </p>
+              {state.dirty.guides && (
+                <p className="text-[12px] text-ink-2">
+                  Unsaved guide edits. Selecting another manifest or purpose discards them.
+                </p>
+              )}
+              <div className="space-y-3">
+                {([
+                  ['rules', 'Rules'],
+                  ['skills', 'Skills'],
+                  ['references', 'References'],
+                  ['banned_defaults', 'Banned defaults'],
+                ] as const).map(([field, label]) => (
+                  <label key={field} className="block space-y-1.5 text-[12.5px] text-ink-2">
+                    <span>{label} (one entry per line)</span>
+                    <textarea
+                      aria-label={label}
+                      className="min-h-20 w-full rounded-md border border-line-strong bg-panel px-3 py-2 text-[13px] text-ink outline-none focus:border-accent"
+                      value={(state.dirty.guides?.[field] ?? selected.manifest.guides[field]).join('\n')}
+                      onChange={(event) => editGuideList(field, event.currentTarget.value)}
+                    />
+                  </label>
+                ))}
+                <label className="block space-y-1.5 text-[12.5px] text-ink-2">
+                  <span>Brief template</span>
+                  <textarea
+                    aria-label="Brief template"
+                    className="min-h-28 w-full rounded-md border border-line-strong bg-panel px-3 py-2 text-[13px] text-ink outline-none focus:border-accent"
+                    value={state.dirty.guides?.brief_template ?? selected.manifest.guides.brief_template}
+                    onChange={(event) => {
+                      setSaveError(null);
+                      dispatch({ type: 'guides-edited', guides: { brief_template: event.currentTarget.value } });
+                    }}
+                  />
+                </label>
+              </div>
+              {state.conflict && (
+                <div role="alert" className="space-y-3 rounded-lg border border-err/30 bg-err-wash p-3 text-[13px] text-err">
+                  <p>
+                    This manifest changed since it was loaded. Your guide edits are unsaved. Reload the manifest to compare its current version; your edits stay on screen and Save then uses the reloaded revision. No save, harness run, sensor result, or approval is claimed.
+                  </p>
+                  <Button size="xs" onClick={() => void reloadToCompare()} disabled={loading}>
+                    Reload manifest to compare
+                  </Button>
+                </div>
+              )}
+              {saveError && <p role="alert" className="text-[13px] text-err">{saveError}</p>}
+              <div className="flex items-center gap-3">
+                <Button size="xs" onClick={() => void saveGuides()} disabled={!state.dirty.guides || saving || Boolean(state.conflict)}>
+                  {saving ? 'Saving…' : 'Save guide edits'}
+                </Button>
+                {selected && <span className="text-[12px] text-ink-3">Revision {selected.revision}</span>}
+              </div>
+            </div>
           )}
         </section>
       </section>
