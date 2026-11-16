@@ -15,7 +15,7 @@
 // test environment, a failed bridge before the server started), the
 // documented default is used, which is exactly what the old constants said.
 
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 
 /** The same default the native side documents (`DEFAULT_BUN_ORIGIN`). */
 export const DEFAULT_BUN_ORIGIN = 'http://127.0.0.1:19877';
@@ -78,6 +78,110 @@ interface BunProxyResponse {
   content_type?: string | null;
 }
 
+type BunStreamEvent =
+  | { type: 'headers'; status: number; content_type?: string | null }
+  | { type: 'chunk'; chunk: number[] }
+  | { type: 'complete' }
+  | { type: 'error'; message: string };
+
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
+
+async function bunStreamFetch(pathAndQuery: string, init: RequestInit): Promise<Response> {
+  if (init.signal?.aborted) throw abortError();
+
+  const requestId = crypto.randomUUID();
+  const channel = new Channel<BunStreamEvent>();
+  const signal = init.signal;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let responseSettled = false;
+  let streamFinished = false;
+  let resolveResponse!: (response: Response) => void;
+  let rejectResponse!: (error: unknown) => void;
+  const responsePromise = new Promise<Response>((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  let cancelInvoked = false;
+  const cancelNative = () => {
+    if (cancelInvoked) return;
+    cancelInvoked = true;
+    void invoke('bun_server_request_cancel', { requestId });
+  };
+  const onAbort = () => {
+    cancelNative();
+    streamFinished = true;
+    const error = abortError();
+    if (!responseSettled) {
+      responseSettled = true;
+      rejectResponse(error);
+    }
+    streamController?.error(error);
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  channel.onmessage = (event) => {
+    switch (event.type) {
+      case 'headers': {
+        if (responseSettled) return;
+        responseSettled = true;
+        const bodyForbidden = event.status === 204 || event.status === 205 || event.status === 304;
+        const body = bodyForbidden ? null : new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            cancelNative();
+          },
+        });
+        resolveResponse(new Response(body, {
+          status: event.status,
+          headers: event.content_type ? { 'Content-Type': event.content_type } : undefined,
+        }));
+        break;
+      }
+      case 'chunk':
+        if (!streamFinished) streamController?.enqueue(new Uint8Array(event.chunk));
+        break;
+      case 'complete':
+        streamFinished = true;
+        streamController?.close();
+        signal?.removeEventListener('abort', onAbort);
+        break;
+      case 'error': {
+        streamFinished = true;
+        const error = new Error(event.message);
+        if (!responseSettled) {
+          responseSettled = true;
+          rejectResponse(error);
+        }
+        streamController?.error(error);
+        signal?.removeEventListener('abort', onAbort);
+        break;
+      }
+    }
+  };
+
+  void invoke('bun_server_request_stream', {
+    requestId,
+    pathAndQuery,
+    method: init.method ?? 'GET',
+    body: typeof init.body === 'string' ? init.body : null,
+    onEvent: channel,
+  }).catch((error: unknown) => {
+    streamFinished = true;
+    if (!responseSettled) {
+      responseSettled = true;
+      rejectResponse(error);
+    }
+    streamController?.error(error);
+    signal?.removeEventListener('abort', onAbort);
+  });
+
+  const response = await responsePromise;
+  return response;
+}
+
 /** Keep same-machine HTTP on fetch; route other hosts through native IPC. */
 export async function bunFetch(pathAndQuery: string, init: RequestInit = {}): Promise<Response> {
   const origin = await bunOrigin();
@@ -85,7 +189,8 @@ export async function bunFetch(pathAndQuery: string, init: RequestInit = {}): Pr
   if (host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1') {
     return globalThis.fetch(`${origin}${pathAndQuery}`, init);
   }
-  if (init.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+  if (pathAndQuery === '/chat/stream') return bunStreamFetch(pathAndQuery, init);
+  if (init.signal?.aborted) throw abortError();
   const result = await invoke<BunProxyResponse>('bun_server_request', {
     pathAndQuery,
     method: init.method ?? 'GET',

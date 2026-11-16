@@ -3323,6 +3323,8 @@ pub fn run() {
             sync_distilled_skill_candidates,
             bun_server_origin,
             bun_server_request,
+            bun_server_request_stream,
+            bun_server_request_cancel,
             list_channels,
             add_channel,
             remove_channel,

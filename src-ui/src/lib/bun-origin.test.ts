@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Channel } from '@tauri-apps/api/core';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
+  Channel: class {
+    onmessage?: (message: any) => void;
+  },
+}));
 import {
   BUN_ORIGIN_RETRY_MS,
   bunFetch,
@@ -106,5 +112,73 @@ describe('bunFetch', () => {
     expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:19877/health', {});
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(await response.text()).toBe('ok');
+  });
+
+  it('streams a non-loopback chat response as chunks arrive', async () => {
+    type StreamEvent =
+      | { type: 'headers'; status: number; content_type?: string | null }
+      | { type: 'chunk'; chunk: number[] }
+      | { type: 'complete' }
+      | { type: 'error'; message: string };
+    let channel: Channel<StreamEvent> | undefined;
+    invokeMock.mockImplementation((command: string, args?: { onEvent?: Channel<StreamEvent> }) => {
+      if (command === 'bun_server_origin') return Promise.resolve('http://192.168.1.20:19877');
+      if (command === 'bun_server_request_stream') {
+        channel = args?.onEvent;
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+
+    const responsePromise = bunFetch('/chat/stream', { method: 'POST', body: '{}' });
+    await vi.waitFor(() => expect(channel).toBeDefined());
+    channel!.onmessage({ type: 'headers', status: 200 });
+    const response = await responsePromise;
+    const reader = response.body!.getReader();
+    let lastChunkProduced = false;
+    channel!.onmessage({ type: 'chunk', chunk: Array.from(new TextEncoder().encode('first')) });
+    const first = await reader.read();
+
+    expect(new TextDecoder().decode(first.value)).toBe('first');
+    expect(first.done).toBe(false);
+    expect(lastChunkProduced).toBe(false);
+    lastChunkProduced = true;
+    channel!.onmessage({ type: 'chunk', chunk: Array.from(new TextEncoder().encode('last')) });
+    channel!.onmessage({ type: 'complete' });
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe('last');
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it('aborts a non-loopback chat stream with AbortError and cancels native I/O', async () => {
+    type StreamEvent =
+      | { type: 'headers'; status: number; content_type?: string | null }
+      | { type: 'chunk'; chunk: number[] }
+      | { type: 'complete' }
+      | { type: 'error'; message: string };
+    let channel: Channel<StreamEvent> | undefined;
+    invokeMock.mockImplementation((command: string, args?: { onEvent?: Channel<StreamEvent> }) => {
+      if (command === 'bun_server_origin') return Promise.resolve('http://192.168.1.20:19877');
+      if (command === 'bun_server_request_stream') {
+        channel = args?.onEvent;
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+    const controller = new AbortController();
+    const responsePromise = bunFetch('/chat/stream', {
+      method: 'POST',
+      body: '{}',
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(channel).toBeDefined());
+    channel!.onmessage({ type: 'headers', status: 200 });
+    const reader = (await responsePromise).body!.getReader();
+
+    controller.abort();
+
+    await expect(reader.read()).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith('bun_server_request_cancel', expect.any(Object)),
+    );
   });
 });

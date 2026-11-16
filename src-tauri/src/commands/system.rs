@@ -18,11 +18,12 @@ use crate::db::AppDb;
 use crate::jarvis::bridge::restart_bridge as restart_bridge_service;
 use crate::wsl::wsl_home;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use tauri::State;
-use tokio::sync::Mutex;
+use std::sync::{Mutex as StdMutex, OnceLock};
+use tauri::{ipc::Channel, State};
+use tokio::sync::{oneshot, Mutex};
 
 // ── Structs ─────────────────────────────────────────────────
 
@@ -1340,6 +1341,162 @@ pub async fn bun_server_request(
     .await
 }
 
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BunServerStreamEvent {
+    Headers {
+        status: u16,
+        content_type: Option<String>,
+    },
+    Chunk {
+        chunk: Vec<u8>,
+    },
+    Complete,
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Default)]
+struct BunRequestCancellationState {
+    active: HashMap<String, oneshot::Sender<()>>,
+    cancelled_before_start: std::collections::HashSet<String>,
+}
+
+static BUN_REQUEST_CANCELLATIONS: OnceLock<StdMutex<BunRequestCancellationState>> = OnceLock::new();
+
+fn bun_request_cancellations() -> &'static StdMutex<BunRequestCancellationState> {
+    BUN_REQUEST_CANCELLATIONS.get_or_init(|| StdMutex::new(BunRequestCancellationState::default()))
+}
+
+/// Register a streaming request so Stop can reach it. Runs synchronously on
+/// purpose: holding the std mutex guard in the async command body would make
+/// the returned future non-`Send`.
+fn register_bun_server_stream_request(request_id: &str) -> Result<oneshot::Receiver<()>, String> {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    {
+        let mut cancellations = bun_request_cancellations()
+            .lock()
+            .map_err(|_| "Bun request cancellation registry is unavailable".to_string())?;
+        // A Stop that arrived before this command started is honoured here,
+        // and a Stop that arrives later finds the sender in `active`.
+        if cancellations.cancelled_before_start.remove(request_id) {
+            let _ = cancel_tx.send(());
+        } else {
+            cancellations.active.insert(request_id.to_string(), cancel_tx);
+        }
+    }
+    Ok(cancel_rx)
+}
+
+/// Stream a Bun response to the UI without buffering its body in the Native
+/// surface. The request id is also the cancellation key used by Stop.
+#[tauri::command]
+pub async fn bun_server_request_stream(
+    request_id: String,
+    path_and_query: String,
+    method: Option<String>,
+    body: Option<String>,
+    on_event: Channel<BunServerStreamEvent>,
+) -> Result<(), String> {
+    let cancel_rx = register_bun_server_stream_request(&request_id)?;
+
+    let result = bun_server_request_stream_to(
+        &bun_server_origin(),
+        &path_and_query,
+        method.as_deref().unwrap_or("GET"),
+        body,
+        &reqwest::Client::new(),
+        move |event| on_event.send(event).map_err(|error| error.to_string()),
+        cancel_rx,
+    )
+    .await;
+    if let Ok(mut requests) = bun_request_cancellations().lock() {
+        requests.active.remove(&request_id);
+    }
+    result
+}
+
+#[tauri::command]
+pub fn bun_server_request_cancel(request_id: String) {
+    if let Ok(mut requests) = bun_request_cancellations().lock() {
+        if let Some(cancel) = requests.active.remove(&request_id) {
+            let _ = cancel.send(());
+        } else {
+            requests.cancelled_before_start.insert(request_id);
+        }
+    }
+}
+
+async fn bun_server_request_stream_to(
+    origin: &str,
+    path_and_query: &str,
+    method: &str,
+    body: Option<String>,
+    client: &reqwest::Client,
+    mut emit: impl FnMut(BunServerStreamEvent) -> Result<(), String>,
+    mut cancel: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    if !path_and_query.starts_with('/') || path_and_query.starts_with("//") {
+        return Err("Bun request path must be an absolute path".to_string());
+    }
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    if method != reqwest::Method::GET && method != reqwest::Method::POST {
+        return Err("Bun proxy only supports GET and POST".to_string());
+    }
+    let mut request = client.request(method, format!("{origin}{path_and_query}"));
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+
+    let response = tokio::select! {
+        _ = &mut cancel => return Ok(()),
+        response = request.send() => match response {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = emit(BunServerStreamEvent::Error { message: error.to_string() });
+                return Ok(());
+            }
+        }
+    };
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    emit(BunServerStreamEvent::Headers {
+            status,
+            content_type,
+        })
+        ?;
+    let mut response = response;
+    loop {
+        let next = tokio::select! {
+            _ = &mut cancel => return Ok(()),
+            chunk = response.chunk() => chunk,
+        };
+        match next {
+            Ok(Some(chunk)) => emit(BunServerStreamEvent::Chunk {
+                    chunk: chunk.to_vec(),
+                })
+                ?,
+            Ok(None) => {
+                let _ = emit(BunServerStreamEvent::Complete);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = emit(BunServerStreamEvent::Error {
+                    message: error.to_string(),
+                });
+                return Ok(());
+            }
+        }
+    }
+}
+
 async fn bun_server_request_to(
     origin: &str,
     path_and_query: &str,
@@ -1455,15 +1612,12 @@ mod bridge_restart_tests {
                 .await
                 .unwrap();
         });
-        let client = reqwest::Client::builder()
-            .resolve(
-                "192.168.1.20",
-                format!("127.0.0.1:{port}").parse().unwrap(),
-            )
-            .build()
-            .unwrap();
+        // A `resolve` override is ignored for IP-literal hosts, so the test
+        // server is addressed through loopback directly; the proxy under test
+        // takes the origin as an argument and is host-agnostic.
+        let client = reqwest::Client::new();
         let response = bun_server_request_to(
-            &format!("http://192.168.1.20:{port}"),
+            &format!("http://127.0.0.1:{port}"),
             "/health?detail=full",
             "GET",
             None,
@@ -1475,6 +1629,108 @@ mod bridge_restart_tests {
         assert_eq!(response.body, b"{\"error\":\"offline\"}");
         assert_eq!(response.content_type.as_deref(), Some("application/json"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bun_server_stream_proxy_emits_multiple_chunks_in_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nfirst")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            socket.write_all(b"second").await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let mut events = Vec::new();
+        bun_server_request_stream_to(
+            &format!("http://127.0.0.1:{port}"),
+            "/chat/stream",
+            "GET",
+            None,
+            &client,
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        let chunks = events
+            .iter()
+            .filter_map(|event| match event {
+                BunServerStreamEvent::Chunk { chunk } => Some(chunk.as_slice()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"first");
+        assert_eq!(chunks[1], b"second");
+        assert!(matches!(events.first(), Some(BunServerStreamEvent::Headers { status: 200, .. })));
+        assert!(matches!(events.last(), Some(BunServerStreamEvent::Complete)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bun_server_stream_proxy_abort_closes_the_in_flight_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\nfirst")
+                .await
+                .unwrap();
+            let mut after_abort = [0; 1];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.read(&mut after_abort),
+            )
+            .await
+            .expect("client should close the response after cancellation")
+        });
+        let client = reqwest::Client::new();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let mut cancel_tx = Some(cancel_tx);
+        let mut saw_chunk = false;
+        bun_server_request_stream_to(
+            &format!("http://127.0.0.1:{port}"),
+            "/chat/stream",
+            "GET",
+            None,
+            &client,
+            |event| {
+                if matches!(event, BunServerStreamEvent::Chunk { .. }) {
+                    saw_chunk = true;
+                    let _ = cancel_tx.take().unwrap().send(());
+                }
+                Ok(())
+            },
+            cancel_rx,
+        )
+        .await
+        .unwrap();
+        assert!(saw_chunk);
+        let read = server.await.unwrap();
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "server should observe the connection close after abort: {read:?}"
+        );
     }
 
     #[test]
