@@ -4,6 +4,7 @@ const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
 import {
   BUN_ORIGIN_RETRY_MS,
+  bunFetch,
   bunOrigin,
   DEFAULT_BUN_ORIGIN,
   resetBunOriginForTests,
@@ -14,6 +15,7 @@ afterEach(() => {
   resetBunOriginForTests();
   invokeMock.mockReset();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('resolveBunOrigin', () => {
@@ -70,5 +72,39 @@ describe('bunOrigin', () => {
     expect(await bunOrigin()).toBe('http://192.168.1.20:19877');
     expect(await bunOrigin()).toBe('http://192.168.1.20:19877');
     expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('bunFetch', () => {
+  it('uses the native IPC proxy for a non-loopback Bun origin', async () => {
+    invokeMock.mockResolvedValueOnce('http://192.168.1.20:19877');
+    invokeMock.mockResolvedValueOnce({
+      status: 503,
+      body: Array.from(new TextEncoder().encode('{"error":"offline"}')),
+      content_type: 'application/json',
+    });
+    const fetch = vi.spyOn(globalThis, 'fetch');
+
+    const response = await bunFetch('/health?detail=full');
+
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'bun_server_request', {
+      pathAndQuery: '/health?detail=full',
+      method: 'GET',
+      body: null,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe('{"error":"offline"}');
+  });
+
+  it('keeps the documented loopback origin on the existing fetch path', async () => {
+    invokeMock.mockResolvedValueOnce('http://127.0.0.1:19877');
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('ok'));
+
+    const response = await bunFetch('/health');
+
+    expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:19877/health', {});
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(await response.text()).toBe('ok');
   });
 });

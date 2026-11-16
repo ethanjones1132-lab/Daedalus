@@ -3,6 +3,7 @@ import { formatAnsweredBy, formatAttemptLine, formatTurnReason, parseRouteAttemp
 import { useState, useEffect, useRef, useCallback, useLayoutEffect, useMemo } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
+import { bunFetch } from '../../lib/bun-origin';
 import {
   type JarvisSession, type JarvisMessage, type JarvisConfig,
   type AgentOption,
@@ -94,7 +95,6 @@ import {
   type SessionRunWrite,
 } from '../../domain/session-run-telemetry';
 import { sessionRoutingNotice } from './outcome';
-import { bunOrigin } from '../../lib/bun-origin';
 import type { MemorySourceMessage } from '../memory/MemoryTurnStatus';
 
 export type ToolApprovalRequest = {
@@ -2042,10 +2042,9 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       stopIfStale();
 
       if (submissionRef.current?.generation === sendGeneration) submissionRef.current.dispatched = true;
-      const origin = await bunOrigin();
       let response: Response;
       try {
-        response = await fetch(`${origin}/chat/stream`, {
+        response = await bunFetch('/chat/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

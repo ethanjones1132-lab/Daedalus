@@ -4,7 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { SkillCandidateAction } from '../../domain/skill-candidate-operation-state';
 import type { CandidatePerformanceResponse } from '../../domain/skill-candidate-performance';
-import { bunOrigin } from '../../lib/bun-origin';
+import { bunFetch } from '../../lib/bun-origin';
 
 /** Skill relevance gate: promotion requires a passing judge decision. */
 export const PROMOTE_EVAL_GATE = 0.75;
@@ -273,8 +273,7 @@ export async function postSkillCandidateAction(
   reason?: string,
 ): Promise<SkillCandidateActionResponse> {
   try {
-    const origin = await bunOrigin();
-    const res = await fetch(`${origin}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
+    const res = await bunFetch(`/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) }),
@@ -301,7 +300,7 @@ export async function postSkillCandidateAction(
 export async function readCandidatePerformance(candidateId: string): Promise<CandidatePerformanceResponse> {
   let res: Response;
   try {
-    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
+    res = await bunFetch(`/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
   } catch {
     return { kind: 'transport' };
   }
@@ -332,7 +331,7 @@ export function runtimeEntryLabel(entry: RuntimeEntry): string {
 }
 
 export async function readCandidates() {
-  const res = await fetch(`${await bunOrigin()}/skills/candidates`);
+  const res = await bunFetch('/skills/candidates');
   if (!res.ok) throw new Error('Candidate observation unavailable');
   const body = await res.json();
   if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');

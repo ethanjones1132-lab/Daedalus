@@ -1,5 +1,5 @@
 import { decodeSkillScore } from '../../lib/skill-score-reading';
-import { bunOrigin } from '../../lib/bun-origin';
+import { bunFetch } from '../../lib/bun-origin';
 import { projectSkillLifecycle } from './skill-model';
 import { sectionCount, listRead, projectListTally, tallyNumber } from '../../lib/list-tally';import { useFeatureMode } from '../workflows/FeatureModes';
 // ═══════════════════════════════════════════════════════════════
@@ -221,8 +221,7 @@ async function postSkillCandidateAction(
     payload = { expected_version: expectedVersion, ...(reason === undefined ? {} : { reason }) };
   }
   try {
-    const origin = await bunOrigin();
-    const res = await fetch(`${origin}/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
+    const res = await bunFetch(`/skills/candidates/${encodeURIComponent(candidateId)}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -249,7 +248,7 @@ async function postSkillCandidateAction(
 async function readCandidatePerformance(candidateId: string): Promise<CandidatePerformanceResponse> {
   let res: Response;
   try {
-    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
+    res = await bunFetch(`/skills/candidates/${encodeURIComponent(candidateId)}/performance`);
   } catch {
     return { kind: 'transport' };
   }
@@ -529,7 +528,7 @@ export function decodeSkillCandidateEvaluation(body: unknown): SkillCandidateEva
 export async function readCandidateEvaluation(candidateId: string): Promise<SkillCandidateEvaluationReadResult> {
   let res: Response;
   try {
-    res = await fetch(`${await bunOrigin()}/skills/candidates/${encodeURIComponent(candidateId)}/evaluation`);
+    res = await bunFetch(`/skills/candidates/${encodeURIComponent(candidateId)}/evaluation`);
   } catch {
     return { kind: 'transport' };
   }
@@ -1253,7 +1252,7 @@ async function readRuntimeTools() {
 }
 
 async function readCandidates() {
-  const res = await fetch(`${await bunOrigin()}/skills/candidates`);
+  const res = await bunFetch('/skills/candidates');
   if (!res.ok) throw new Error('Candidate observation unavailable');
   const body = await res.json();
   if (!Array.isArray(body?.candidates)) throw new Error('Invalid candidate observation');

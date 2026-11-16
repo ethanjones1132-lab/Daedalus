@@ -1315,6 +1315,67 @@ pub fn bun_server_origin() -> String {
     bun_origin_from(crate::wsl::get_cached_bun_url())
 }
 
+#[derive(Serialize)]
+pub struct BunServerProxyResponse {
+    status: u16,
+    body: Vec<u8>,
+    content_type: Option<String>,
+}
+
+/// Perform a UI Bun request from the Native surface so webview CSP does not
+/// need to trust arbitrary WSL or remote origins.
+#[tauri::command]
+pub async fn bun_server_request(
+    path_and_query: String,
+    method: Option<String>,
+    body: Option<String>,
+) -> Result<BunServerProxyResponse, String> {
+    bun_server_request_to(
+        &bun_server_origin(),
+        &path_and_query,
+        method.as_deref().unwrap_or("GET"),
+        body,
+        &reqwest::Client::new(),
+    )
+    .await
+}
+
+async fn bun_server_request_to(
+    origin: &str,
+    path_and_query: &str,
+    method: &str,
+    body: Option<String>,
+    client: &reqwest::Client,
+) -> Result<BunServerProxyResponse, String> {
+    if !path_and_query.starts_with('/') || path_and_query.starts_with("//") {
+        return Err("Bun request path must be an absolute path".to_string());
+    }
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?;
+    if method != reqwest::Method::GET && method != reqwest::Method::POST {
+        return Err("Bun proxy only supports GET and POST".to_string());
+    }
+    let url = format!("{origin}{path_and_query}");
+    let mut request = client.request(method, url);
+    if let Some(body) = body {
+        request = request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    Ok(BunServerProxyResponse {
+        status,
+        body,
+        content_type,
+    })
+}
+
 /// The documented default origin, shared with the status payload's fallback.
 pub const DEFAULT_BUN_ORIGIN: &str = "http://127.0.0.1:19877";
 
@@ -1374,6 +1435,46 @@ mod bridge_restart_tests {
             bun_origin_from(Some("http://127.0.0.1:19999".to_string())),
             "http://127.0.0.1:19999"
         );
+    }
+
+    #[tokio::test]
+    async fn bun_server_proxy_preserves_remote_path_query_status_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 2048];
+            let size = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.starts_with("GET /health?detail=full HTTP/1.1"));
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"error\":\"offline\"}")
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .resolve(
+                "192.168.1.20",
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            )
+            .build()
+            .unwrap();
+        let response = bun_server_request_to(
+            &format!("http://192.168.1.20:{port}"),
+            "/health?detail=full",
+            "GET",
+            None,
+            &client,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(response.body, b"{\"error\":\"offline\"}");
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        server.await.unwrap();
     }
 
     #[test]

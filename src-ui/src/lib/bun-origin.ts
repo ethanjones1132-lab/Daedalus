@@ -71,3 +71,29 @@ export async function bunOrigin(): Promise<string> {
   }
   return cached ?? DEFAULT_BUN_ORIGIN;
 }
+
+interface BunProxyResponse {
+  status: number;
+  body: number[];
+  content_type?: string | null;
+}
+
+/** Keep same-machine HTTP on fetch; route other hosts through native IPC. */
+export async function bunFetch(pathAndQuery: string, init: RequestInit = {}): Promise<Response> {
+  const origin = await bunOrigin();
+  const host = new URL(origin).hostname;
+  if (host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1') {
+    return globalThis.fetch(`${origin}${pathAndQuery}`, init);
+  }
+  if (init.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+  const result = await invoke<BunProxyResponse>('bun_server_request', {
+    pathAndQuery,
+    method: init.method ?? 'GET',
+    body: typeof init.body === 'string' ? init.body : null,
+  });
+  const bodyForbidden = result.status === 204 || result.status === 205 || result.status === 304;
+  return new Response(bodyForbidden ? null : new Uint8Array(result.body), {
+    status: result.status,
+    headers: result.content_type ? { 'Content-Type': result.content_type } : undefined,
+  });
+}

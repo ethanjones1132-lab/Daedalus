@@ -1,4 +1,4 @@
-import { bunOrigin } from '../../lib/bun-origin';
+import { bunFetch } from '../../lib/bun-origin';
 
 // Wire types live here so src-ui tsc does not compile server-jarvis (node:crypto, bun:sqlite).
 export type HarnessPurpose = 'bug_fix' | 'feature' | 'generic_audit' | 'release_prep';
@@ -87,7 +87,7 @@ export class HarnessApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await globalThis.fetch(`${await bunOrigin()}${path}`, {
+  const response = await bunFetch(path, {
     ...init,
     headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
   });
@@ -144,5 +144,4 @@ export const harnessApi = {
     return request('/harness/guides/preview', { method: 'POST', body: JSON.stringify(input) });
   },
 };
-
 
