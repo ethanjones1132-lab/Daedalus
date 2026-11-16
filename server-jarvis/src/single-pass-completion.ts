@@ -33,6 +33,13 @@ import {
 /** The existing run-error code for a model that produced no visible answer. */
 export const EMPTY_COMPLETION_ERROR_CODE = "empty_completion";
 
+/**
+ * Code for the existing `partial` outcome when the model emitted a tool call
+ * that the text parser could not turn into a call (DD-088). The call was
+ * discarded, so the turn cannot settle as a clean success.
+ */
+export const REJECTED_TOOL_CALL_ERROR_CODE = "rejected_tool_call";
+
 /** Shown when neither the turn nor the retry produced an answer (no tools). */
 export const EMPTY_ANSWER_WITHOUT_TOOLS_FALLBACK =
   "The model returned no content. This can happen due to transient model issues, provider timeouts, or empty completions on the free tier. Please try sending your message again.";
@@ -40,6 +47,10 @@ export const EMPTY_ANSWER_WITHOUT_TOOLS_FALLBACK =
 /** Shown when tools ran but neither the turn nor the retry produced an answer. */
 export const EMPTY_ANSWER_WITH_TOOL_WORK_FALLBACK =
   "I completed tool inspection, but the model returned no visible final answer after a final-answer-only retry. The streamed tool results above are preserved for review.";
+
+/** Shown when the turn's only tool call was rejected and no answer followed. */
+export const REJECTED_TOOL_CALL_FALLBACK =
+  "The model emitted a tool call that could not be parsed, so it did not run. The rejected call is shown above.";
 
 export interface SinglePassCompletion {
   /** Visible text for the terminal `result` frame (answer or honest fallback). */
@@ -56,21 +67,52 @@ export interface SinglePassCompletion {
   empty: boolean;
   /** True when tool work happened and its streamed results are preserved. */
   toolWorkPreserved: boolean;
+  /** `<tool_call>` blocks this turn discarded without executing (DD-088). */
+  rejectedToolCallCount: number;
 }
 
 /**
  * Decide the single-pass branch's honest terminal outcome.
  *
- * A non-empty answer still succeeds even after the empty-answer retry ran.
- * Only an exhausted empty outcome is non-success; its code is the existing
- * `empty_completion` vocabulary, and the fallback text stays visible.
+ * A non-empty answer still succeeds even after the empty-answer retry ran,
+ * unless the turn also discarded the only tool call it emitted. An exhausted
+ * empty outcome stays non-success; its code is the existing `empty_completion`
+ * vocabulary, and the fallback text stays visible.
  */
 export function classifySinglePassCompletion(input: {
   answer: string;
   toolExecutionCount: number;
+  /**
+   * Calls the text parser rejected as unparseable (DD-088). A discarded call
+   * with no other executed call settles `partial`, never `success`.
+   */
+  rejectedToolCallCount?: number;
 }): SinglePassCompletion {
   const toolWorkPreserved = input.toolExecutionCount > 0;
+  const rejectedToolCallCount = Math.max(0, Math.trunc(input.rejectedToolCallCount ?? 0));
+  const discardedCall = rejectedToolCallCount > 0;
+
   if (input.answer.trim().length > 0) {
+    // The answer is real, but the turn still threw away a call the model
+    // appeared to make. With no other executed call there is no successful
+    // work to stand on, so the honest outcome is the existing `partial`.
+    if (discardedCall && !toolWorkPreserved) {
+      const fields = terminalResultFields({
+        outcome: "partial",
+        errorCode: REJECTED_TOOL_CALL_ERROR_CODE,
+        repeated: false,
+      });
+      return {
+        result: input.answer,
+        subtype: fields.subtype,
+        ...(fields.code ? { code: fields.code } : {}),
+        memoryStatus: "partial",
+        errorCode: REJECTED_TOOL_CALL_ERROR_CODE,
+        empty: false,
+        toolWorkPreserved: false,
+        rejectedToolCallCount,
+      };
+    }
     const fields = terminalResultFields({ outcome: "success", repeated: false });
     return {
       result: input.answer,
@@ -79,28 +121,38 @@ export function classifySinglePassCompletion(input: {
       errorCode: null,
       empty: false,
       toolWorkPreserved,
+      rejectedToolCallCount,
     };
   }
 
   // No final answer after the retry. Tool work that already streamed is real
-  // evidence, so the turn is partial rather than a total failure; with no
-  // tool work there is nothing to show and the honest outcome is failure.
-  const outcome: TerminalRunOutcome = toolWorkPreserved ? "partial" : "failed";
+  // evidence, so the turn is partial rather than a total failure; a discarded
+  // call is also evidence of a real attempt, so it is partial too. With
+  // neither, there is nothing to show and the honest outcome is failure.
+  const outcome: TerminalRunOutcome =
+    toolWorkPreserved || discardedCall ? "partial" : "failed";
+  const errorCode = toolWorkPreserved || !discardedCall
+    ? EMPTY_COMPLETION_ERROR_CODE
+    : REJECTED_TOOL_CALL_ERROR_CODE;
+  const fallback = toolWorkPreserved
+    ? EMPTY_ANSWER_WITH_TOOL_WORK_FALLBACK
+    : discardedCall
+      ? REJECTED_TOOL_CALL_FALLBACK
+      : EMPTY_ANSWER_WITHOUT_TOOLS_FALLBACK;
   const fields = terminalResultFields({
     outcome,
-    errorCode: EMPTY_COMPLETION_ERROR_CODE,
+    errorCode,
     repeated: false,
   });
   return {
-    result: toolWorkPreserved
-      ? EMPTY_ANSWER_WITH_TOOL_WORK_FALLBACK
-      : EMPTY_ANSWER_WITHOUT_TOOLS_FALLBACK,
+    result: fallback,
     subtype: fields.subtype,
     ...(fields.code ? { code: fields.code } : {}),
-    memoryStatus: toolWorkPreserved ? "partial" : "failed",
-    errorCode: EMPTY_COMPLETION_ERROR_CODE,
+    memoryStatus: outcome === "partial" ? "partial" : "failed",
+    errorCode,
     empty: true,
     toolWorkPreserved,
+    rejectedToolCallCount,
   };
 }
 
@@ -112,6 +164,8 @@ export function classifySinglePassCompletion(input: {
 export async function finishSinglePassCompletion(input: {
   answer: string;
   toolExecutionCount: number;
+  /** Calls discarded unparsed this turn (DD-088); defaults to none. */
+  rejectedToolCallCount?: number;
   session: Pick<StreamSession, "finish">;
   recordMemoryTerminal: (
     status: MemoryTurnTerminalStatus,
@@ -122,6 +176,7 @@ export async function finishSinglePassCompletion(input: {
   const completion = classifySinglePassCompletion({
     answer: input.answer,
     toolExecutionCount: input.toolExecutionCount,
+    rejectedToolCallCount: input.rejectedToolCallCount ?? 0,
   });
   input.recordMemoryTerminal(completion.memoryStatus, completion.errorCode);
   const options: TerminalFinishOptions = {

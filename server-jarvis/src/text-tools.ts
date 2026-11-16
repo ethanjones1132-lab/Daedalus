@@ -274,6 +274,46 @@ export function textToolParseSignals(
   return { _toolParseAttempted: true, _toolParseFailed: true };
 }
 
+/** Display name for a `<tool_call>` block whose tool name cannot be recovered. */
+export const UNPARSED_TOOL_CALL_NAME = "<unparsed>";
+
+/** Rejection reason when the block never closed before the model stopped. */
+export const TRUNCATED_TOOL_CALL_ERROR =
+  "Tool call rejected: the <tool_call> block was truncated before its arguments were complete, so the tool did not run.";
+
+/** Rejection reason when a complete block still is not executable tool-call JSON. */
+export const UNPARSEABLE_TOOL_CALL_ERROR =
+  "Tool call rejected: the <tool_call> block could not be parsed into an executable call, so the tool did not run.";
+
+/** Rejection reason when the block names a tool this turn cannot dispatch. */
+export function unavailableToolCallError(name: string): string {
+  return `Tool call rejected: "${name}" is not a tool available in this turn, so the tool did not run.`;
+}
+
+/**
+ * A `<tool_call>` block the model emitted that could not become an executable
+ * call. DD-088: the turn must report it instead of silently dropping it.
+ *
+ * The record describes what the model actually wrote — it never invents a
+ * call, arguments, or a tool name that is not in the block's text.
+ */
+export type RejectedTextToolCall = {
+  /** Recovered tool name, or `<unparsed>` when the block names none. */
+  name: string;
+  /** Why the block was rejected; safe to show to the model and the user. */
+  reason: string;
+  /**
+   * Character offset (UTF-16 units) where the `<tool_call>` block starts in
+   * the text the extractor scanned — the same coordinate space as the
+   * candidate spans, i.e. after bounded internal-evidence removal.
+   */
+  start: number;
+  /** Character offset just past the block (including a closing tag). */
+  end: number;
+  /** The block body that could not be parsed, for diagnostics. */
+  raw: string;
+};
+
 /** Dispatchable tool call shape shared by native stream slots and text parse. */
 export type ResolvedToolCall = {
   id: string;
@@ -296,6 +336,8 @@ export type ResolveToolCallsFromTurnInput = {
 
 export type ResolveToolCallsFromTurnResult = {
   calls: ResolvedToolCall[];
+  /** `<tool_call>` blocks that could not be parsed into a call (DD-088). */
+  rejected: RejectedTextToolCall[];
   toolParseFlags: TextToolParseSignals;
   /** True when extractTextToolCalls ran (primary text mode or native-empty fallback). */
   textParseAttempted: boolean;
@@ -328,12 +370,14 @@ export function resolveToolCallsFromTurn(
     const extracted = extractTextToolCalls(fullText, tools);
     result = {
       calls: mapExtracted(extracted.calls),
+      rejected: extracted.rejected,
       toolParseFlags: textToolParseSignals(true, extracted.calls.length),
       textParseAttempted: true,
     };
   } else if (input.nativeCalls.length > 0) {
     result = {
       calls: input.nativeCalls,
+      rejected: [],
       toolParseFlags: textToolParseSignals(false, 0),
       textParseAttempted: false,
     };
@@ -342,12 +386,14 @@ export function resolveToolCallsFromTurn(
     const extracted = extractTextToolCalls(fullText, tools);
     result = {
       calls: mapExtracted(extracted.calls),
+      rejected: extracted.rejected,
       toolParseFlags: textToolParseSignals(true, extracted.calls.length),
       textParseAttempted: true,
     };
   } else {
     result = {
       calls: input.nativeCalls,
+      rejected: [],
       toolParseFlags: textToolParseSignals(false, 0),
       textParseAttempted: false,
     };
@@ -378,6 +424,7 @@ export function normalizeDsmlDelimiters(text: string): string {
 export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   cleanedText: string;
   calls: ParsedTextToolCall[];
+  rejected: RejectedTextToolCall[];
 } {
   const availableNames = new Set(tools.map((tool) => tool.function.name));
   // Fullwidth ｜ (U+FF5C) is a single UTF-16 unit, same as ASCII | — indices stay aligned.
@@ -385,10 +432,13 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
   const boundedInternalCleaned = stripBoundedInternalToolResults(normalizedText);
   const candidates = collectCandidates(boundedInternalCleaned, availableNames);
   const calls: ParsedTextToolCall[] = [];
+  const honouredCandidates: Candidate[] = [];
   const seen = new Set<string>();
 
   for (const candidate of candidates) {
-    for (const call of callsFromValue(candidate.value, candidate.raw, availableNames)) {
+    const candidateCalls = callsFromValue(candidate.value, candidate.raw, availableNames);
+    if (candidateCalls.length > 0) honouredCandidates.push(candidate);
+    for (const call of candidateCalls) {
       const key = `${call.name}:${JSON.stringify(call.arguments)}:${candidate.start}`;
       if (!seen.has(key)) {
         seen.add(key);
@@ -396,6 +446,13 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
       }
     }
   }
+
+  // DD-088: a protocol block that yielded no call is reported, never dropped.
+  const rejected = collectRejectedToolCallBlocks(
+    boundedInternalCleaned,
+    availableNames,
+    honouredCandidates,
+  );
 
   let cleanedText = boundedInternalCleaned;
   const spansToRemove: TextSpan[] = [];
@@ -457,7 +514,7 @@ export function extractTextToolCalls(text: string, tools: ToolDefinition[]): {
     }
   }
 
-  return { cleanedText, calls };
+  return { cleanedText, calls, rejected };
 }
 
 /** Stream sanitizer for user-visible answers (synthesizer): tags + bare tool JSON lines. */
@@ -703,6 +760,116 @@ function collectCandidates(text: string, availableNames: Set<string> = new Set()
   candidates.push(...collectDsmlCandidates(text, availableNames));
 
   return dedupeCandidates(candidates);
+}
+
+/**
+ * Recover the tool name a partial `<tool_call>` block still names. Only an
+ * explicit `name` / `tool` / `tool_name` string counts — a block that never got
+ * that far stays `<unparsed>` rather than inventing a call.
+ */
+function recoverRawToolName(body: string): string | null {
+  const match = body.match(/"(?:name|tool|tool_name)"\s*:\s*"([^"\\\r\n]{1,128})"/i);
+  const rawName = match?.[1]?.trim();
+  return rawName ? rawName : null;
+}
+
+function buildRejectedToolCall(
+  text: string,
+  blockStart: number,
+  bodyStart: number,
+  bodyEnd: number,
+  blockEnd: number,
+  closed: boolean,
+  availableNames: Set<string>,
+): RejectedTextToolCall {
+  const body = text.slice(bodyStart, bodyEnd);
+  const rawName = recoverRawToolName(body);
+  // Reuse the alias map for display only; the call itself is still rejected.
+  const normalizedName = rawName ? normalizeToolName(rawName, availableNames) : null;
+  const name = rawName ? (normalizedName ?? rawName) : UNPARSED_TOOL_CALL_NAME;
+  const reason = !closed
+    ? TRUNCATED_TOOL_CALL_ERROR
+    : rawName && !normalizedName
+      ? unavailableToolCallError(name)
+      : UNPARSEABLE_TOOL_CALL_ERROR;
+  return { name, reason, start: blockStart, end: blockEnd, raw: body };
+}
+
+/**
+ * Find `<tool_call>` protocol blocks that produced no executable call (DD-088).
+ *
+ * A block is reported only when the turn offered tools at all: with no tools
+ * offered the markup is a hallucinated echo that cleanup already strips, and
+ * reporting it would invent a rejected call. Blocks inside a markdown fence
+ * stay inert exactly as DD-087 pinned for examples. The block body is never
+ * re-parsed into a call here — this function only describes the discard.
+ */
+function collectRejectedToolCallBlocks(
+  text: string,
+  availableNames: Set<string>,
+  honouredCandidates: Candidate[],
+): RejectedTextToolCall[] {
+  if (availableNames.size === 0) return [];
+
+  const fencedRanges = findFencedBlockRanges(text);
+  const startsInsideFence = (index: number) =>
+    fencedRanges.some((range) => index >= range.start && index < range.end);
+
+  const rejected: RejectedTextToolCall[] = [];
+  const openTag = /<tool_call>/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = openTag.exec(text)) !== null) {
+    const blockStart = match.index;
+    const bodyStart = blockStart + match[0].length;
+
+    // DD-087: a fenced example is not an attempted call, even if it contains
+    // the documented tag, so it must not be reported as a rejected one.
+    if (startsInsideFence(blockStart)) continue;
+
+    const closeTag = /<\/tool_call>/gi;
+    closeTag.lastIndex = bodyStart;
+    const close = closeTag.exec(text);
+    const bodyEnd = close ? close.index : text.length;
+    const blockEnd = close ? close.index + close[0].length : text.length;
+    // Consume the whole block so a nested open tag cannot double-report.
+    openTag.lastIndex = blockEnd;
+
+    const producedCall = honouredCandidates.some(
+      (candidate) => candidate.start < blockEnd && candidate.end > blockStart,
+    );
+    if (producedCall) continue;
+
+    rejected.push(
+      buildRejectedToolCall(
+        text,
+        blockStart,
+        bodyStart,
+        bodyEnd,
+        blockEnd,
+        close !== null,
+        availableNames,
+      ),
+    );
+  }
+
+  return rejected;
+}
+
+/**
+ * The rejected call as the ordinary `ToolResult` envelope (`is_error: true`),
+ * matching the native rejected-call shape (DD-047 / DD-090) so the caller can
+ * stream it through the existing tool-result path. Nothing is executed.
+ */
+export function rejectedTextToolCallResult(rejected: RejectedTextToolCall): ToolResult {
+  return {
+    call_id: `call_${crypto.randomUUID().slice(0, 8)}`,
+    name: rejected.name,
+    output: rejected.reason,
+    is_error: true,
+    error: rejected.reason,
+    duration_ms: 0,
+  };
 }
 
 /**

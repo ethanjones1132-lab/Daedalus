@@ -149,6 +149,7 @@ import {
   hasExplicitWebSearchIntent,
   hasLocalWorkspaceToolIntent,
   isNativeToolProtocolUnsupportedError,
+  rejectedTextToolCallResult,
   resolveToolCallsFromTurn,
   textToolResultsPrompt,
   webSearchQueryFromPrompt,
@@ -5442,6 +5443,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       let forceFinalAnswerOnly = false;
       let verifiedWebSearchDone = false;
       let toolExecutionCount = 0;
+      // DD-088: `<tool_call>` blocks the model emitted that could not be
+      // parsed. They never execute, but they are reported and stop a turn
+      // with no other calls from settling as a clean success.
+      let rejectedTextCallCount = 0;
       sessionCostInfo = null;
       let prevToolCallCount = 0;  // Track tools called in previous turn for nudge logic
       lastFallbackRetries = 0;
@@ -6112,7 +6117,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
         const validCalls = activeToolCalls.filter(call => call && call.name);
         const textExtraction = validCalls.length === 0 && cfg.tools.enabled
           ? extractTextToolCalls(turnText, runtime.listTools())
-          : { cleanedText: turnText, calls: [] };
+          : { cleanedText: turnText, calls: [], rejected: [] };
         const runnableTextCalls = forceFinalAnswerOnly ? [] : textExtraction.calls;
         const fullTextBeforeTurn = fullText.slice(0, Math.max(0, fullText.length - turnText.length));
         fullText = `${fullTextBeforeTurn}${textExtraction.cleanedText}`;
@@ -6132,6 +6137,41 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           await emitVisibleText(textExtraction.cleanedText);
         }
         await completeReasoning();
+
+        // DD-088: a `<tool_call>` block the model emitted but the text parser
+        // could not turn into a call is never silently dropped. Report it
+        // through the same rejected-call envelope the native path uses
+        // (DD-047): a `tool_use` attempt and an `is_error` `tool_result`, both
+        // carrying the reason. Nothing executes and nothing counts as work.
+        if (textExtraction.rejected.length > 0) {
+          for (const rejected of textExtraction.rejected) {
+            const rejectedResult = rejectedTextToolCallResult(rejected);
+            console.warn(
+              `[Jarvis] Rejected text tool call session=${sessionId} name=${rejectedResult.name} range=${rejected.start}-${rejected.end}: ${rejected.reason}`,
+            );
+
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_use",
+              id: rejectedResult.call_id,
+              name: rejectedResult.name,
+              input: {},
+              is_error: true,
+              error: rejected.reason,
+              session_id: sessionId
+            })}\n\n`));
+
+            await writer.write(encoder.encode(`data: ${JSON.stringify({
+              type: "tool_result",
+              call_id: rejectedResult.call_id,
+              name: rejectedResult.name,
+              output: rejected.reason,
+              is_error: true,
+              session_id: sessionId
+            })}\n\n`));
+
+            rejectedTextCallCount++;
+          }
+        }
 
         // Record per-turn inference for resilience observability (per-backend retry/fallback telemetry)
         const _cfgTurn = resolveConfig(options.config);
@@ -6342,6 +6382,7 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           const completion = await finishSinglePassCompletion({
             answer: resultText,
             toolExecutionCount,
+            rejectedToolCallCount: rejectedTextCallCount,
             session,
             recordMemoryTerminal,
             route: routePlan.summary(),
