@@ -19,6 +19,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { RotateCw } from 'lucide-react';
 import {
+  AlertLine,
   Badge,
   Button,
   Page,
@@ -107,6 +108,25 @@ function Verdict({
   );
 }
 
+/**
+ * DD-086: a non-zero reap count means a child of this app could not be
+ * confirmed stopped at a stop or a quit, so a survivor may still be running.
+ * The count comes from the same `get_system_health` read the page already
+ * makes; a zero count renders nothing, because there is nothing to act on.
+ * The PID and reason for each failure are in the app log, written by
+ * `process_lifecycle::reap_failure_message`.
+ */
+function ReapFailures({ count }: { count: number }) {
+  return (
+    <AlertLine label="Stopped child processes" tone="warn" className="mb-5">
+      <span className="font-semibold">{count === 1 ? '1 child process' : `${count} child processes`}</span>{' '}
+      of this app could not be confirmed stopped at the last stop or quit. Quit again to retry the stop, or read the
+      app log where <code className="font-mono text-[11.5px]">process_lifecycle::reap_failure_message</code> records
+      the PID and reason.
+    </AlertLine>
+  );
+}
+
 function GaugeSkeleton() {
   return (
     <div className="grid grid-cols-[repeat(auto-fit,minmax(176px,1fr))] gap-3" aria-hidden="true">
@@ -152,6 +172,9 @@ export default function HealthPage() {
   }, [fetchAll]);
 
   const subsystemRows = health ? buildSubsystemRows(health, status?.active_backend, status?.bridge_enabled) : [];
+  // DD-086: derived from the health read already on this page, never a second
+  // status call. An absent or zero count is the clean case and adds no row.
+  const reapFailures = health?.supervisor?.reap_failures ?? 0;
 
   const confirmRestartReadback = useCallback(
     async (row: SubsystemRow, operationId: number) => {
@@ -255,6 +278,8 @@ export default function HealthPage() {
           <Observation name="Doctor report" resource={doctorRes} copy={defaultCopy('Doctor report')} retryLabel="Retry Doctor report" />
         </div>
       )}
+
+      {reapFailures > 0 && <ReapFailures count={reapFailures} />}
 
       <section aria-labelledby="health-subsystems" className="mb-6">
         <h2 id="health-subsystems" className="d-label mb-3">Subsystems</h2>

@@ -36,7 +36,7 @@ export function healthFor(
     claude_proxy: { running: key === 'proxy' ? running : true, port: 19878 },
     disk: { total: '100G', used: '20G', available: '80G', use_percent: '20%' },
     memory: { total_mb: 1000, available_mb: 700, used_mb: 300, used_percent: 30 },
-    supervisor: { bun_give_up: false, proxy_give_up: false, ollama_give_up: false },
+    supervisor: { bun_give_up: false, proxy_give_up: false, ollama_give_up: false, reap_failures: 0 },
     timestamp,
   };
 }

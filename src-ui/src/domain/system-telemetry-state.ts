@@ -48,6 +48,14 @@ export interface SupervisorStatus {
   proxy_give_up: boolean;
   ollama_give_up: boolean;
   llama_cpp_give_up?: boolean;
+  /**
+   * DD-084/DD-086: reap attempts that could not confirm a tracked child exited,
+   * read from the native ledger. Non-zero means a child of this app may still be
+   * running after a stop or a quit, so the health surface can no longer read like
+   * a clean one. The PID and reason for each failure are in the app log
+   * (`process_lifecycle::reap_failure_message`).
+   */
+  reap_failures?: number;
 }
 
 export interface HealthData {
@@ -147,6 +155,9 @@ function isHealthData(value: unknown): value is HealthData {
   if (typeof value.timestamp !== 'string') return false;
   if (value.supervisor !== undefined) {
     if (!isRecord(value.supervisor) || typeof value.supervisor.bun_give_up !== 'boolean' || typeof value.supervisor.proxy_give_up !== 'boolean' || typeof value.supervisor.ollama_give_up !== 'boolean') return false;
+    // DD-086 prints this count, so a value this surface cannot vouch for must
+    // not reach the row as a number-shaped string or a negative count.
+    if (value.supervisor.reap_failures !== undefined && !isNonNegativeNumber(value.supervisor.reap_failures)) return false;
   }
   if (value.llama_cpp !== undefined && (!isRecord(value.llama_cpp) || typeof value.llama_cpp.running !== 'boolean' || typeof value.llama_cpp.model !== 'string' || typeof value.llama_cpp.url !== 'string')) return false;
   return true;

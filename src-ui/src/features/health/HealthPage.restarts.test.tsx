@@ -35,6 +35,14 @@ async function openDiagnostics(name: string) {
   await screen.findByRole('button', { name: `Restart ${name}` });
 }
 
+/** The same synthetic health read, with the DD-084 reap ledger count set. */
+function healthWithReapFailures(count: number) {
+  return {
+    ...healthFor('ollama', true, 'reap'),
+    supervisor: { bun_give_up: false, proxy_give_up: false, ollama_give_up: false, reap_failures: count },
+  };
+}
+
 describe('Health page service restarts', () => {
   it.each(commands)('waits for a matching health read after a true %s result', async (name, command, key) => {
     const commandRequest = deferred();
@@ -189,5 +197,32 @@ describe('Health page service restarts', () => {
     expect(screen.getByRole('status', { name: 'Restart Ollama' })).toHaveTextContent('restart confirmed');
     expect(screen.queryByText(/stale/i)).not.toBeInTheDocument();
     expect(calls('get_system_health')).toBe(3);
+  });
+
+  it('says how many children could not be confirmed stopped and where the detail is', async () => {
+    invokeMock.mockImplementation((requested: string) =>
+      Promise.resolve(requested === 'get_system_health' ? healthWithReapFailures(2) : fixtures[requested] ?? true),
+    );
+
+    render(<HealthPage />);
+    const row = await screen.findByRole('alert', { name: 'Stopped child processes' });
+    expect(row).toHaveTextContent('2 child processes');
+    expect(row).toHaveTextContent('could not be confirmed stopped at the last stop or quit');
+    expect(row).toHaveTextContent('process_lifecycle::reap_failure_message');
+    expect(calls('get_system_health')).toBe(1);
+  });
+
+  it('adds no row when every child was confirmed stopped', async () => {
+    invokeMock.mockImplementation((requested: string) =>
+      Promise.resolve(requested === 'get_system_health' ? healthWithReapFailures(0) : fixtures[requested] ?? true),
+    );
+
+    render(<HealthPage />);
+    await screen.findByRole('article', { name: 'Bun server gauge' });
+    expect(screen.queryByRole('alert', { name: 'Stopped child processes' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/reap_failure_message/)).not.toBeInTheDocument();
+    // The clean count leaves the existing rows exactly as they were.
+    expect(within(screen.getByRole('article', { name: 'Bun server gauge' })).getByText('Running')).toBeInTheDocument();
+    expect(calls('get_system_health')).toBe(1);
   });
 });
