@@ -198,8 +198,9 @@ static BUN_TERMINATION_UNCONFIRMED: AtomicBool = AtomicBool::new(false);
 static REAP_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// How many reap attempts have ended unconfirmed in this process's lifetime.
-/// Read by `stop_all`'s summary and available to the status path so a survivor
-/// is reported instead of being mistaken for a clean quit.
+/// Read by `stop_all`'s summary and, since DD-084, by
+/// `SupervisorStatus::reap_failures` so a survivor is reported in the app's own
+/// status instead of being mistaken for a clean quit.
 pub(crate) fn reap_failure_count() -> u32 {
     REAP_FAILURES.load(Ordering::SeqCst)
 }
@@ -902,8 +903,20 @@ mod reap_failure_tests {
         spawn_managed_with_gate, ManagedProcess, Reap,
     };
 
+    /// The reap ledger is process-wide, so every test that moves it holds this
+    /// lock: a status read and the count it must mirror are never separated by a
+    /// sibling test's increment.
+    static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_ledger() -> std::sync::MutexGuard<'static, ()> {
+        LEDGER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn an_unconfirmed_reap_is_counted_and_names_the_pid() {
+        let _ledger = lock_ledger();
         let before = reap_failure_count();
         let pid = 4242;
         let confirmed = confirm_reap(ManagedProcess::BunServer, Some(pid), Reap::Unconfirmed);
@@ -930,6 +943,51 @@ mod reap_failure_tests {
         assert!(
             message.contains("BunServer"),
             "the failure log must name the service that survived: {message}"
+        );
+    }
+
+    /// DD-084: the app's own status must be able to say that a reap failed. The
+    /// status is a read of the DD-082 ledger, so a recorded failure shows up as a
+    /// non-zero count and a clean run reports the ledger as-is (zero in a process
+    /// where nothing has failed).
+    #[test]
+    fn a_recorded_reap_failure_is_reported_by_the_supervisor_status() {
+        let _ledger = lock_ledger();
+
+        // Clean half: a clean reap records nothing, and the status mirrors the
+        // ledger exactly instead of inventing a failure.
+        let clean_ledger = reap_failure_count();
+        assert!(
+            confirm_reap(ManagedProcess::Ollama, None, Reap::Clean),
+            "a clean reap confirms without recording a failure"
+        );
+        assert_eq!(
+            reap_failure_count(),
+            clean_ledger,
+            "a clean reap must not be counted as a failure"
+        );
+        assert_eq!(
+            crate::supervisor::give_up_status().reap_failures,
+            clean_ledger,
+            "a clean run must report the ledger's count, not a failure"
+        );
+
+        // Failure half: the same recorded failure DD-082 counts is what the
+        // status must report — one ledger, read in both places.
+        let pid = 4343;
+        assert!(
+            !confirm_reap(ManagedProcess::BunServer, Some(pid), Reap::Unconfirmed),
+            "an unconfirmed reap must not report success"
+        );
+        let recorded = reap_failure_count();
+        assert!(
+            recorded > clean_ledger,
+            "the recorded failure must move the ledger ({clean_ledger} -> {recorded})"
+        );
+        assert_eq!(
+            crate::supervisor::give_up_status().reap_failures,
+            recorded,
+            "a recorded reap failure must make the status report a non-zero count"
         );
     }
 

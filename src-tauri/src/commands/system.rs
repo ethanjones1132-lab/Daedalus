@@ -143,6 +143,12 @@ pub struct SupervisorStatus {
     pub bun_restart_failures: u32,
     /// Maximum consecutive failures before automatic Bun relaunch pauses.
     pub restart_limit: u32,
+    /// DD-084: reap attempts that could not confirm a tracked child exited, read
+    /// from the DD-082 ledger rather than re-derived here. Non-zero means a child
+    /// of this app may still be running after a stop or a quit, so the status can
+    /// no longer read like a clean one. The PID and reason for each failure are
+    /// in the app log (`process_lifecycle::reap_failure_message`).
+    pub reap_failures: u32,
     /// Most recent concrete error returned by Bun discovery/spawn/readiness.
     pub bun_last_error: Option<String>,
     /// Actionable summary retained after GUI-console output is unavailable.

@@ -376,6 +376,9 @@ pub fn give_up_status() -> SupervisorStatus {
         llama_cpp_give_up: LLAMA_CPP_FAILS.load(Ordering::Relaxed) >= MAX_CONSECUTIVE_RESTARTS,
         bun_restart_failures,
         restart_limit: MAX_CONSECUTIVE_RESTARTS,
+        // DD-084: read the DD-082 reap ledger, so a quit that could not confirm a
+        // child had exited is visible in the status instead of looking clean.
+        reap_failures: crate::process_lifecycle::reap_failure_count(),
         bun_diagnostic: restart_diagnostic.or(boot_diagnostic),
         bun_last_error,
     }
