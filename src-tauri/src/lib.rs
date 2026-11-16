@@ -1479,6 +1479,108 @@ mod probe_jarvis_health_tests {
         let _ = server.join();
         crate::wsl::clear_cached_bun_url();
     }
+
+    /// A stranger's 2xx: healthy and JSON, but nothing says "this Jarvis".
+    const FOREIGN_HEALTH: &str = r#"{"status":"ok","service":"vite-preview","version":"5.4.0"}"#;
+
+    /// The state this app derives from a bound port whose listener answers with
+    /// `origin`'s body: occupancy is only half the answer.
+    fn state_of_a_held_port(origin: &str) -> BunPortState {
+        bun_port_state_from(true, || bun_health_identifies(origin))
+    }
+
+    /// DD-T1: the `/health` body — not the open port — decides who is there. A
+    /// foreign 2xx must not read as this app's server, or a first run either
+    /// adopts a stranger or refuses to start for no stated reason.
+    #[test]
+    fn the_health_body_decides_who_holds_the_bun_port() {
+        // A free port is decided without spending an HTTP probe, so a cold
+        // first run never waits on one.
+        assert_eq!(
+            bun_port_state_from(false, || panic!("a free port must not be probed")),
+            BunPortState::Free,
+            "occupancy alone must not require an identity probe"
+        );
+
+        // The fixture really is a body the identifying rule rejects.
+        assert!(
+            !jarvis_health_identifies(FOREIGN_HEALTH),
+            "the foreign fixture must be a body jarvis_health_identifies rejects"
+        );
+        let (origin, server) = spawn_health_listener("200 OK", FOREIGN_HEALTH);
+        assert_eq!(
+            state_of_a_held_port(&origin),
+            BunPortState::ForeignListener,
+            "a held port whose /health does not identify this Jarvis is not ours"
+        );
+        let _ = server.join();
+
+        // This Jarvis's real /health body is ours.
+        let (origin, server) = spawn_health_listener("200 OK", OWN_HEALTH);
+        assert_eq!(
+            state_of_a_held_port(&origin),
+            BunPortState::ThisApp,
+            "an identifying /health body is this app's server"
+        );
+        let _ = server.join();
+    }
+
+    /// DD-T1: the guard's refusal comes from the identity probe, not from "the
+    /// port is held". A stub reporting a held port with a foreign body must keep
+    /// the refusal and name the stranger; a free port still spawns as today.
+    #[test]
+    fn the_start_guard_refuses_from_the_probe_not_from_occupancy() {
+        let foreign_held = bun_port_state_from(true, || false);
+        let refusal = bun_start_guard(foreign_held)
+            .expect_err("a listener that is not this app's server must be refused");
+        assert!(
+            refusal.contains("not this app's server"),
+            "the refusal must say the listener is not this app's server: {refusal}"
+        );
+        assert!(
+            refusal.contains("leaving it untouched"),
+            "the foreign listener must still be left untouched: {refusal}"
+        );
+
+        assert_eq!(
+            bun_start_guard(BunPortState::Free),
+            Ok(()),
+            "a free port must keep the existing spawn path"
+        );
+
+        let ours = bun_start_guard(bun_port_state_from(true, || true))
+            .expect_err("a listener this app does not own must never be replaced");
+        assert!(
+            ours.contains("leaving it untouched"),
+            "an identifying listener must still be left untouched: {ours}"
+        );
+        assert!(
+            !ours.contains("not this app's server"),
+            "a listener that identifies as Jarvis is not a stranger: {ours}"
+        );
+    }
+
+    /// DD-T1 wiring: the guard inside the real starter asks the injected
+    /// identity probe before it reaches the spawn, so the decision cannot fall
+    /// back to bare port occupancy.
+    #[test]
+    fn the_start_guard_takes_its_decision_from_the_identity_probe() {
+        let asked = std::cell::Cell::new(false);
+        let error = start_jarvis_server("unused-entry.ts", false, || {
+            asked.set(true);
+            BunPortState::ForeignListener
+        })
+        .expect_err("a foreign listener must stop the spawn path");
+
+        assert!(
+            asked.get(),
+            "the start guard must ask the identity probe, not port occupancy"
+        );
+        assert!(
+            error.contains("not this app's server"),
+            "the guard's refusal must name the stranger: {error}"
+        );
+    }
 }
 
 pub(crate) fn find_bun_executable() -> String {
@@ -1752,6 +1854,14 @@ pub(crate) fn bun_uses_wsl() -> bool {
 
 /// Port-only check used by the supervisor. Native desktop launches do not
 /// start `wsl.exe` just to learn that the local Bun listener is absent.
+///
+/// This answers "is anything bound", which is the right question for the
+/// supervisor's watchdog (`supervisor.rs`, restart when the port is gone) and
+/// for the doctor row (`commands/system.rs`): both report on the port, not on
+/// who owns it. Anything claiming *this* server is running — the start guard
+/// and the health payload's `bun_server.running` — must use
+/// [`probe_bun_port_state`] instead, because a stranger on the port accepts the
+/// same TCP connection (DD-T1).
 pub(crate) fn bun_server_is_listening() -> bool {
     if local_port_is_listening(BUN_SERVER_PORT) {
         return true;
@@ -1759,9 +1869,117 @@ pub(crate) fn bun_server_is_listening() -> bool {
     bun_uses_wsl() && is_wsl_port_listening(BUN_SERVER_PORT)
 }
 
+/// Who holds the Bun port, as far as this app can prove (DD-T1).
+///
+/// A bound port is not evidence of this server: a Vite preview, another app's
+/// health route, or a stale process accepts the TCP connection (and usually
+/// answers 2xx) too. Only a `/health` body that passes
+/// [`jarvis_health_identifies`] counts as this Jarvis, so a first run neither
+/// adopts a stranger nor refuses to start without saying who is in the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BunPortState {
+    /// Nothing is bound to the Bun port.
+    Free,
+    /// A listener answered `/health` with this Jarvis's identity.
+    ThisApp,
+    /// The port is bound, but the answer is not this app's server.
+    ForeignListener,
+}
+
+/// Whether this app's Jarvis is what a client would reach on the Bun origin.
+///
+/// Used by the health payload so a port held by a foreign listener is reported
+/// honestly as "not running" instead of as a live Bun server.
+pub(crate) fn bun_server_is_serving() -> bool {
+    probe_bun_port_state() == BunPortState::ThisApp
+}
+
+/// Decide the Bun port's state from occupancy *and* identity.
+///
+/// Occupancy is the cheap question [`bun_server_is_listening`] answers; identity
+/// is one `GET {origin}/health` whose body must pass
+/// [`jarvis_health_identifies`]. A free port is decided without any HTTP call,
+/// so a cold first run never waits on a probe.
+pub(crate) fn probe_bun_port_state() -> BunPortState {
+    // The origin this app reports to clients: the cached (WSL-discovered) Bun
+    // URL when one exists, otherwise the documented loopback default. Reading
+    // the cache is not discovery; no `wsl.exe` is started here.
+    let origin = crate::commands::system::bun_origin_from(crate::wsl::get_cached_bun_url());
+    bun_port_state_from(bun_server_is_listening(), || bun_health_identifies(&origin))
+}
+
+/// Pure form of [`probe_bun_port_state`]: `health_identifies` is consulted only
+/// when something actually holds the port.
+fn bun_port_state_from(
+    port_has_listener: bool,
+    health_identifies: impl FnOnce() -> bool,
+) -> BunPortState {
+    if !port_has_listener {
+        return BunPortState::Free;
+    }
+    if health_identifies() {
+        BunPortState::ThisApp
+    } else {
+        BunPortState::ForeignListener
+    }
+}
+
+/// One identifying `GET {origin}/health`.
+///
+/// A 2xx is not enough — the body must pass [`jarvis_health_identifies`] — and
+/// the whole request is bounded by a short timeout so a listener that accepts
+/// the connection and never answers cannot stall the start guard or the health
+/// snapshot. Synchronous on purpose: both callers already run on blocking
+/// threads (`spawn_blocking`), off the async IPC workers.
+fn bun_health_identifies(origin: &str) -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let Ok(response) = client
+        .get(format!("{}/health", origin.trim_end_matches('/')))
+        .send()
+    else {
+        return false;
+    };
+    response.status().is_success()
+        && response
+            .text()
+            .is_ok_and(|body| jarvis_health_identifies(&body))
+}
+
+/// The start guard's decision, taken from the identity probe rather than from
+/// port occupancy alone.
+///
+/// A held port is never adopted and its listener is never killed. The wording
+/// names what was found, so a first run that lands behind a stranger says that
+/// instead of claiming the port belongs to this app.
+fn bun_start_guard(state: BunPortState) -> Result<(), String> {
+    match state {
+        BunPortState::Free => Ok(()),
+        BunPortState::ForeignListener => Err(format!(
+            "Bun port {BUN_SERVER_PORT} is occupied by a listener that is not this app's server; leaving it untouched"
+        )),
+        // Bound by a Jarvis build, but this process owns no such child: replacing
+        // it would mean killing something this app cannot stop cleanly.
+        BunPortState::ThisApp => Err(format!(
+            "Bun port {BUN_SERVER_PORT} is occupied by a listener this app does not own; leaving it untouched"
+        )),
+    }
+}
+
+/// `port_state` is the identity probe, injected so the guard's decision can be
+/// tested without a real listener or a spawned child. It runs after any tracked
+/// child has been reaped and before the spawn, and only its answer — not bare
+/// port occupancy — decides whether this app starts its own server.
 fn start_jarvis_server(
     entry: &str,
     replace: bool,
+    port_state: impl Fn() -> BunPortState,
 ) -> Result<process_lifecycle::StartOutcome, String> {
     let entry = entry.to_string();
     // Record how this spawn will launch the server: the tracked `Child` is only
@@ -1780,11 +1998,7 @@ fn start_jarvis_server(
         replace,
         slot_launch,
         || {
-            if bun_server_is_listening() {
-                return Err(format!(
-                    "Bun port {BUN_SERVER_PORT} is occupied by a listener this app does not own; leaving it untouched"
-                ));
-            }
+            bun_start_guard(port_state())?;
             spawn_jarvis_server(&entry)
         },
     )
@@ -1812,12 +2026,13 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
         "server bundle not found (no index.js / index.ts beside the app or in the repo)".to_string()
     })?;
 
-    // 3. Replace only the child owned by this app. An unrelated listener on
-    //    :19877 is reported and left untouched.
-    let spawn_result =
-        spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
-            .await
-            .map_err(|e| format!("Task join error: {}", e))?;
+    // 3. Replace only the child owned by this app. A listener on :19877 that
+    //    does not identify as this app's server is reported and left untouched.
+    let spawn_result = spawn_blocking_on_current_runtime(move || {
+        start_jarvis_server(&server_entry, true, probe_bun_port_state)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
 
     spawn_result?;
 
@@ -1977,6 +2192,9 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
         remote_endpoint_requires_probe,
         probe_jarvis_healthy,
         |millis: u64| tokio::time::sleep(std::time::Duration::from_millis(millis)),
+        // Occupancy only: the driver decides *ordering* — spawn before probing
+        // when nothing is bound. Ownership is the start guard's question, and
+        // the guard asks `probe_bun_port_state` inside the spawn (DD-T1).
         bun_server_is_listening,
         move || {
             let spawn_clock = Arc::clone(&spawn_clock);
@@ -1984,9 +2202,11 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
                 let server_entry = find_jarvis_server()
                     .ok_or_else(|| "server-jarvis index.ts not found".to_string())?;
                 log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
-                spawn_blocking_on_current_runtime(move || start_jarvis_server(&server_entry, true))
-                    .await
-                    .map_err(|e| format!("Task join error: {}", e))??;
+                spawn_blocking_on_current_runtime(move || {
+                    start_jarvis_server(&server_entry, true, probe_bun_port_state)
+                })
+                .await
+                .map_err(|e| format!("Task join error: {}", e))??;
                 *spawn_clock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();

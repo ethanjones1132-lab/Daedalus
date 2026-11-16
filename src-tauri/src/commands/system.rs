@@ -436,8 +436,12 @@ fn system_health_snapshot(config: &crate::jarvis::types::JarvisConfig) -> Health
         None
     };
 
-    // Bun server: probe the cached health URL via crate helper if available
-    let bun_running = crate::bun_server_is_listening();
+    // Bun server: a bound port is not this server. A stranger on :19877 (a Vite
+    // preview, another app's health route) answers 2xx too, so `running`
+    // reflects the identifying `/health` probe: only a body that passes
+    // `jarvis_health_identifies` reports the Bun server up (DD-T1). The doctor
+    // row keeps the cheap port question, because it reports on the port.
+    let bun_running = crate::bun_server_is_serving();
     let llama_cpp_running =
         crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
     let proxy_required = crate::claude_proxy_enabled(config);
