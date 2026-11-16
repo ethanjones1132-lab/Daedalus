@@ -331,6 +331,7 @@ import { INFERENCE_FEEDBACK_CRON_JOB_ID, refreshInferenceFeedback } from "./self
 import { handleCronRunRequest } from "./cron-inference";
 import { handleSkillCandidateRequest } from "./skill-candidate-routes";
 import { decodeBulkSkillPromotionRequest, PromoteRequestInvalidError } from "./skill-promotion-request";
+import { observeRequestFailure } from "./request-error-log";
 
 // ── Structured Logging Override ──────────────────────────────────────────────
 const originalLog = console.log;
@@ -6866,11 +6867,26 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
   }
 }
 
+/**
+ * DD-080 (server half): the single request entrypoint. Routing is untouched;
+ * every response is handed to the failure observer, which logs one error line
+ * for a 5xx — including on the otherwise-quiet /status, /health and
+ * /health/readiness probes — and returns the response unchanged. Routine
+ * success on those paths stays silent.
+ */
 export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
-  const isNoisy = path === "/status" || path === "/health" || path === "/health/readiness";
+  const response = await routeBaseRequest(req, path);
+  return observeRequestFailure({
+    method: req.method,
+    path,
+    response,
+    elapsedMs: performance.now() - requestStart,
+  });
+}
 
+async function routeBaseRequest(req: Request, path: string): Promise<Response> {
   // Internal native-memory routes bypass general CORS/preflight handling and
   // are capability-authenticated. Unknown paths fall through untouched.
   const internalMemory = await handleNativeMemoryRequest(
@@ -7327,8 +7343,9 @@ export async function baseFetch(req: Request): Promise<Response> {
 
     return Response.json({ error: `Not found: ${req.method} ${path}` }, { status: 404 });
   } catch (err: any) {
-    const elapsed = (performance.now() - requestStart).toFixed(2);
-    if (!isNoisy) console.error(`[Jarvis API] ${req.method} ${path} -> Error: ${err.message || err} (${elapsed}ms)`);
+    // Body and status are unchanged. The 500 is returned rather than logged
+    // here: baseFetch routes every >=500 response through the failure observer,
+    // so a quiet health path can no longer fail with no line in the log.
     return Response.json({ error: err.message || String(err) }, { status: 500 });
   }
 }
