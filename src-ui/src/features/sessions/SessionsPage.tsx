@@ -16,10 +16,15 @@ import { ChatPanel } from './ChatPanel';
 import { SessionIndex, type IndexTab } from './SessionIndex';
 import { FeedTranscript, useFeedReader } from './SessionFeeds';
 import { backendLabels, backendDisplayName } from '../../lib/backend-identity';
-import { joinMissingSettings, needsBackendSetup } from '../../lib/backend-readiness';
+import { joinMissingSettings, backendNotListening, needsBackendSetup } from '../../lib/backend-readiness';
 import { useBackendReadiness } from '../system/BackendSetupNotice';
 
 const INDEX_COLLAPSED_KEY = 'jarvis-session-index-collapsed';
+
+// A local server boot spawned usually binds within seconds; a bounded re-read
+// covers that window without turning the composer into a health poll.
+const READINESS_RECHECK_MS = 2500;
+const READINESS_RECHECKS = 12;
 
 function readCollapsed(): boolean {
   try {
@@ -202,7 +207,29 @@ export default function SessionsPage() {
   // DD-060: with no usable inference backend a turn can only fail, so the
   // composer is blocked and says which setting is blank. The page remounts on
   // navigation, so returning from Settings is already a fresh read.
-  const readiness = useBackendReadiness();
+  //
+  // DD-067: boot spawns the local server fire-and-forget, so the first read can
+  // land before llama.cpp binds its port. While the probe says nothing answers
+  // yet, re-read a bounded number of times — otherwise a server that was still
+  // starting would leave the composer blocked long after it came up. Once the
+  // attempts run out the honest not-listening state stands; returning to the
+  // page is a fresh read.
+  const [readinessRefresh, setReadinessRefresh] = useState(0);
+  const readinessRefreshes = useRef(0);
+  const readiness = useBackendReadiness(readinessRefresh);
+  const readinessState = readiness?.state ?? null;
+  useEffect(() => {
+    if (readinessState !== 'not_listening') {
+      readinessRefreshes.current = 0;
+      return;
+    }
+    if (readinessRefreshes.current >= READINESS_RECHECKS) return;
+    const timer = setTimeout(() => {
+      readinessRefreshes.current += 1;
+      setReadinessRefresh((count) => count + 1);
+    }, READINESS_RECHECK_MS);
+    return () => clearTimeout(timer);
+  }, [readinessState, readinessRefresh]);
 
   // One-shot intent from another surface: navigate('sessions', { sessionId }).
   // `expandControls` additionally reveals the memory/goal control disclosure so
@@ -333,9 +360,15 @@ export default function SessionsPage() {
   const { backendLabel, modelLabel } = backendLabels(config);
   const active = sessions.find((s) => s.id === activeSession);
   const feedOpen = indexTab === 'feeds';
+  // Read the silent-port fact before `needsBackendSetup` narrows `readiness` to
+  // null in its else branch.
+  const backendSilent = backendNotListening(readiness);
+  const readinessBackendLabel = readiness ? backendDisplayName(readiness.backend) : '';
   const chatBlockedReason = needsBackendSetup(readiness)
     ? `${backendDisplayName(readiness.backend)} is missing ${joinMissingSettings(readiness.missing)}. Set it in Settings to chat.`
-    : null;
+    : backendSilent
+      ? `${readinessBackendLabel} is configured, but nothing is answering its port yet — it may still be starting.`
+      : null;
 
   return (
     <div className="flex h-full min-h-0 bg-canvas">

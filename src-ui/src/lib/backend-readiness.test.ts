@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  backendNotListening,
   joinMissingSettings,
   missingSettingText,
   needsBackendSetup,
@@ -50,6 +51,35 @@ describe('parseBackendReadiness', () => {
   it('never asks for setup when the backend is ready', () => {
     expect(needsBackendSetup({ state: 'ready', backend: 'llama_cpp', missing: [] })).toBe(false);
     expect(needsBackendSetup(null)).toBe(false);
+  });
+
+  it('reads a configured backend with a silent port as not_listening, not ready', () => {
+    // DD-067: complete settings are not an answering backend. Nothing is
+    // missing, so this is not a setup state, but a turn would still fail.
+    const parsed = parseBackendReadiness({
+      state: 'not_listening',
+      backend: 'llama_cpp',
+      missing: [],
+    });
+
+    expect(parsed).toEqual({ state: 'not_listening', backend: 'llama_cpp', missing: [] });
+    expect(needsBackendSetup(parsed)).toBe(false);
+    expect(backendNotListening(parsed)).toBe(true);
+
+    expect(backendNotListening({ state: 'ready', backend: 'llama_cpp', missing: [] })).toBe(false);
+    expect(backendNotListening({ state: 'missing_config', backend: 'llama_cpp', missing: [] })).toBe(
+      false,
+    );
+    expect(backendNotListening(null)).toBe(false);
+  });
+
+  it('keeps the state parse strict: a state this build does not know stays unreadable', () => {
+    expect(
+      parseBackendReadiness({ state: 'starting', backend: 'llama_cpp', missing: [] }),
+    ).toBeNull();
+    expect(
+      parseBackendReadiness({ state: 'NOT_LISTENING', backend: 'llama_cpp', missing: [] }),
+    ).toBeNull();
   });
 });
 

@@ -11,9 +11,11 @@
 // is the one parser/normalizer for that payload: a surface must stay silent when
 // the read fails or the payload is partial, and must never invent a setup
 // problem — a fabricated "not configured" state is just as dishonest as the
-// silent empty chat it replaces.
+// silent empty chat it replaces. The same holds in the other direction (DD-067):
+// complete settings are not proof that the backend answers, so `not_listening`
+// is a state the composer must respect rather than paper over.
 
-export type BackendReadinessState = 'ready' | 'missing_config';
+export type BackendReadinessState = 'ready' | 'missing_config' | 'not_listening';
 
 /** One blank setting that stops the active Inference backend from answering. */
 export interface MissingSetting {
@@ -29,7 +31,7 @@ export interface BackendReadiness {
   state: BackendReadinessState;
   /** The backend the derivation ran for (`llama_cpp`, `openrouter`, …). */
   backend: string;
-  /** Empty exactly when `state` is `ready`. */
+  /** The blank settings — empty for every state except `missing_config`. */
   missing: MissingSetting[];
 }
 
@@ -59,7 +61,7 @@ function parseMissingSetting(raw: unknown): MissingSetting | null {
 export function parseBackendReadiness(value: unknown): BackendReadiness | null {
   if (!isRecord(value)) return null;
   const state = value.state;
-  if (state !== 'ready' && state !== 'missing_config') return null;
+  if (state !== 'ready' && state !== 'missing_config' && state !== 'not_listening') return null;
 
   const missing: MissingSetting[] = [];
   if (Array.isArray(value.missing)) {
@@ -81,6 +83,16 @@ export function needsBackendSetup(
   readiness: BackendReadiness | null,
 ): readiness is BackendReadiness {
   return Boolean(readiness && readiness.state === 'missing_config' && readiness.missing.length > 0);
+}
+
+/**
+ * True when the settings are complete but nothing answers the backend's port
+ * (DD-067): the local server may still be starting, or it has stopped. Unlike
+ * {@link needsBackendSetup} there is no blank field to name, but a turn sent now
+ * would still fail, so the composer must not offer Send.
+ */
+export function backendNotListening(readiness: BackendReadiness | null): boolean {
+  return Boolean(readiness && readiness.state === 'not_listening');
 }
 
 /**

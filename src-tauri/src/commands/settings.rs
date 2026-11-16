@@ -119,8 +119,9 @@ pub fn get_jarvis_config(db: State<AppDb>) -> Result<JarvisConfig, String> {
 /// Boot can only `eprintln!` a blank `llama_cpp.server_path`/`model_path` that
 /// stops the local server, so a fresh install opened straight into an empty
 /// chat with no indication of what was missing. This exposes the same
-/// derivation over IPC: `ready`, or `missing_config` naming the blank settings
-/// and where they are edited.
+/// derivation over IPC: `ready`, `missing_config` naming the blank settings and
+/// where they are edited, or `not_listening` when those settings are complete
+/// but nothing answers the backend's port yet (DD-067).
 ///
 /// Env fallbacks are applied first, exactly as `start_llama_cpp_server` does,
 /// so a path supplied through `JARVIS_LLAMA_*` counts as configured.
@@ -132,7 +133,11 @@ pub fn get_backend_readiness(db: State<AppDb>) -> Result<BackendReadiness, Strin
     if readiness.backend == crate::jarvis::types::JarvisBackend::LlamaCpp {
         // Boot skips the spawn when the port already answers
         // (`start_llama_cpp_server` → `AlreadyListening`), so a server the user
-        // started by hand must not be reported as an unconfigured install.
+        // started by hand must not be reported as an unconfigured install. The
+        // same probe, read the other way, is what makes a configured install
+        // with a silent port `not_listening` instead of `ready`: boot spawns
+        // llama.cpp fire-and-forget, so nothing else can tell the shell whether
+        // a turn sent now would reach it.
         readiness = with_backend_reachable(
             readiness,
             crate::backend_port_is_listening(

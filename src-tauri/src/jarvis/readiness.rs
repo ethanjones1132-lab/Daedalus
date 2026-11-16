@@ -5,13 +5,16 @@
 //! `start_llama_cpp_server` returns an error that boot can only
 //! `eprintln!`, and the shell renders as if a backend existed. This module
 //! turns the same condition into serializable state the UI can render:
-//! either `ready`, or `missing_config` naming the exact blank settings.
+//! `ready`, `missing_config` naming the exact blank settings, or
+//! `not_listening` when the settings are complete but nothing answers the
+//! backend's port.
 //!
-//! Derivation is config-only on purpose: whether a configured backend is
-//! *running* is `jarvis_check_status`/health state. The one liveness fact that
-//! belongs here is the already-listening server boot itself accepts (see
-//! [`with_backend_reachable`]), because it changes whether a turn is
-//! attemptable at all.
+//! Derivation is config-only on purpose: which process is running is
+//! `jarvis_check_status`/health state. The one liveness fact that belongs here
+//! is the port probe boot itself uses (see [`with_backend_reachable`]), because
+//! it changes whether a turn is attemptable at all — in both directions: a
+//! server already answering makes an unconfigured install usable, and a
+//! configured backend with a closed port cannot answer a turn.
 
 use serde::Serialize;
 
@@ -31,12 +34,19 @@ pub struct MissingSetting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendReadinessState {
+    /// The active backend can answer a turn as far as this process can tell.
     Ready,
+    /// At least one required setting is blank, so the backend cannot start.
     MissingConfig,
+    /// The settings are complete, but nothing is listening on the backend's
+    /// port: the local server may still be starting, may have exited, or may
+    /// be bound elsewhere. A turn sent now would fail at the first request.
+    NotListening,
 }
 
 /// What the shell needs to decide between normal chat and a first-run setup
-/// state. `missing` is empty exactly when `state` is `Ready`.
+/// state. `missing` names the blank settings, so it is empty for every state
+/// except `MissingConfig`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BackendReadiness {
     pub state: BackendReadinessState,
@@ -112,22 +122,37 @@ pub fn derive_backend_readiness(config: &JarvisConfig) -> BackendReadiness {
 
 /// Fold in the one liveness fact boot already acts on.
 ///
-/// `start_llama_cpp_server` returns `AlreadyListening` before it looks at
-/// `server_path`/`model_path`, so a server the user started by hand is usable
-/// with blank artifact paths. Reporting `missing_config` there would block a
-/// chat that works, so the caller passes the port-probe result in.
+/// The probe is not a one-way lift into `Ready`:
+/// - `true` means a server is already answering. `start_llama_cpp_server`
+///   returns `AlreadyListening` before it looks at `server_path`/`model_path`,
+///   so a server the user started by hand is usable with blank artifact paths.
+///   Reporting `missing_config` there would block a chat that works.
+/// - `false` on a configured install means nothing is answering the port yet,
+///   so the value must stop claiming `Ready`: the turn would fail at the first
+///   request. A backend that is still `missing_config` keeps that more specific
+///   verdict, because the blank setting is the thing to fix.
 pub fn with_backend_reachable(
     readiness: BackendReadiness,
     backend_reachable: bool,
 ) -> BackendReadiness {
-    if backend_reachable && !readiness.is_ready() {
+    if backend_reachable {
+        if readiness.is_ready() {
+            readiness
+        } else {
+            BackendReadiness {
+                state: BackendReadinessState::Ready,
+                missing: Vec::new(),
+                ..readiness
+            }
+        }
+    } else if readiness.state == BackendReadinessState::MissingConfig {
+        readiness
+    } else {
         BackendReadiness {
-            state: BackendReadinessState::Ready,
+            state: BackendReadinessState::NotListening,
             missing: Vec::new(),
             ..readiness
         }
-    } else {
-        readiness
     }
 }
 
@@ -261,6 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_backend_that_is_not_listening_is_not_ready() {
+        // DD-067: complete settings are not the same as an answering backend.
+        // Boot spawns llama.cpp fire-and-forget, so the port probe is the only
+        // fact that says whether a turn sent right now can reach it.
+        let configured = derive_backend_readiness(&llama_cpp_config(
+            "C:/llama.cpp/build/bin/llama-server.exe",
+            "D:/models/qwen3.6-keep96.gguf",
+        ));
+        assert!(configured.is_ready());
+
+        let silent = with_backend_reachable(configured.clone(), false);
+        assert_eq!(silent.state, BackendReadinessState::NotListening);
+        assert!(!silent.is_ready());
+        assert!(silent.missing.is_empty(), "nothing is blank, so nothing is named");
+        assert_eq!(silent.backend, JarvisBackend::LlamaCpp);
+
+        // Not a one-way ratchet: once the server answers, the same install is
+        // ready again, and a second `true` probe changes nothing.
+        let serving = with_backend_reachable(silent.clone(), true);
+        assert_eq!(serving, configured);
+        assert!(serving.is_ready());
+        assert_eq!(with_backend_reachable(serving, true), configured);
+    }
+
+    #[test]
     fn serializes_the_state_the_shell_reads() {
         let readiness = derive_backend_readiness(&llama_cpp_config("", ""));
 
@@ -276,5 +326,14 @@ mod tests {
             serde_json::to_value(derive_backend_readiness(&llama_cpp_config("s", "m"))).unwrap();
         assert_eq!(ready["state"], "ready");
         assert!(ready["missing"].as_array().unwrap().is_empty());
+
+        let silent = serde_json::to_value(with_backend_reachable(
+            derive_backend_readiness(&llama_cpp_config("s", "m")),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(silent["state"], "not_listening");
+        assert_eq!(silent["backend"], "llama_cpp");
+        assert!(silent["missing"].as_array().unwrap().is_empty());
     }
 }

@@ -103,4 +103,5 @@ describe('application shell', () => {
     expect(notice).toHaveTextContent('llama.cpp model_path');
     expect(within(notice).getByRole('button', { name: 'Open Settings' })).toBeInTheDocument();
   });
+
 });

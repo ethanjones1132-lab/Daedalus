@@ -69,6 +69,26 @@ describe('chat while no inference backend is configured', () => {
     expect(screen.queryByRole('button', { name: 'Stop streaming' })).not.toBeInTheDocument();
   });
 
+  it('blocks Send when a configured backend is not listening', async () => {
+    // DD-067: nothing is blank, so this is not the setup band — it is the other
+    // way a first chat dies, a configured backend whose port nothing answers.
+    const NOT_LISTENING =
+      'llama.cpp is configured, but nothing is answering its port yet — it may still be starting.';
+    render(<ChatPanel {...props} chatBlockedReason={NOT_LISTENING} />);
+
+    const note = await screen.findByRole('note', { name: 'Chat setup required' });
+    expect(note).toHaveTextContent('llama.cpp is configured');
+    expect(note).toHaveTextContent('nothing is answering');
+    expect(note).toHaveTextContent('may still be starting');
+
+    const composer = screen.getByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'are you there?' } });
+
+    // Text in the box is not enough: a turn that cannot reach the backend must
+    // not be startable.
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+  });
+
   it('leaves the composer usable when a backend is configured', async () => {
     render(<ChatPanel {...props} />);
 

@@ -71,7 +71,10 @@ export function Composer({
   blockedReason = null,
 }: {
   turn: SessionTurn;
-  /** DD-060: set when no inference backend is configured; blocks sending. */
+  /**
+   * DD-060/DD-067: set when the active Inference backend cannot answer a turn —
+   * a blank setting, or a configured backend whose port is silent. Blocks Send.
+   */
   blockedReason?: string | null;
 }) {
   const { navigate } = useNavigation();
@@ -141,7 +144,7 @@ export function Composer({
             aria-label="Chat input"
             placeholder={
               blockedReason
-                ? 'Set up an inference backend in Settings to chat…'
+                ? 'Chat is blocked until the inference backend can answer…'
                 : isStreaming
                   ? 'Jarvis is thinking… (Esc to stop)'
                   : 'Ask Jarvis anything…'
