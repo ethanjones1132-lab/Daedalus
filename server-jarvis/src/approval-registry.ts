@@ -24,6 +24,8 @@ export interface ApprovalRequestDetails {
 }
 
 interface PendingApproval {
+  /** Durable audit row this pending entry settles. */
+  audit_id: string;
   resolve: (approved: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
   cleanup: () => void;
@@ -49,14 +51,29 @@ export interface ApprovalRegistry {
   resolve(callId: string, approved: boolean): boolean;
   /** Count of currently-pending approvals. */
   pending(): number;
-  /** Retrieve the durable audit record for a request id. */
+  /** Retrieve the most recent durable audit record for a call id. */
   getRecord(callId: string): ApprovalRecord | undefined;
 }
 
 export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): ApprovalRegistry {
   const store = new ApprovalStore({ dbPath: opts.dbPath });
   const pending = new Map<string, PendingApproval>();
+  // Durable audit key currently associated with each call id. Call ids are
+  // only unique within one stream turn; a later turn that legitimately reuses
+  // (or replays) a call id gets a fresh audit row (`<call_id>#<n>`) instead of
+  // colliding with the previous turn's row on the PRIMARY KEY. `resolve` and
+  // `getRecord` address the row through this map, so callers keep using plain
+  // call ids.
+  const auditIds = new Map<string, string>();
   const defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+  /** Choose the durable row id for a new request, namespacing reused ids. */
+  function auditKeyFor(callId: string): string {
+    if (!store.get(callId)) return callId;
+    let generation = 1;
+    while (store.get(`${callId}#${generation}`)) generation += 1;
+    return `${callId}#${generation}`;
+  }
 
   function settle(callId: string, approved: boolean): boolean {
     const entry = pending.get(callId);
@@ -75,11 +92,17 @@ export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): Appr
   return {
     request(details: ApprovalRequestDetails, timeoutMs: number = defaultTimeoutMs): Promise<boolean> {
       if (pending.has(details.call_id)) {
-        // Re-requesting the same call id is not expected; surface it clearly.
+        // Re-requesting a still-pending call id is not expected. Keep it a
+        // rejection rather than swallowing it: `execute()` owns the error
+        // envelope that tells the model approval was unavailable.
         return Promise.reject(new Error(`Approval already pending for ${details.call_id}`));
       }
+      // Storage failures (including a PRIMARY KEY conflict) also propagate as
+      // throws; `execute()` converts them into an `approval_unavailable`
+      // ToolResult so the turn continues instead of aborting.
+      const auditId = auditKeyFor(details.call_id);
       store.create({
-        request_id: details.call_id,
+        request_id: auditId,
         tool_name: details.tool_name,
         arguments: details.arguments,
         policy_source: details.policy_source,
@@ -87,22 +110,23 @@ export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): Appr
         surface: details.surface,
         expires_at: expiresAt(timeoutMs),
       });
+      auditIds.set(details.call_id, auditId);
       if (details.signal?.aborted) {
-        store.resolve(details.call_id, "expired");
+        store.resolve(auditId, "expired");
         return Promise.resolve(false);
       }
       return new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => {
-          store.resolve(details.call_id, "expired");
+          store.resolve(auditId, "expired");
           settle(details.call_id, false);
         }, timeoutMs);
         const cleanupSignal = details.signal
           ? registerAbortHandler(details.signal, () => {
-            store.resolve(details.call_id, "expired");
+            store.resolve(auditId, "expired");
             settle(details.call_id, false);
           })
           : () => {};
-        pending.set(details.call_id, { resolve, timer, cleanup: cleanupSignal });
+        pending.set(details.call_id, { audit_id: auditId, resolve, timer, cleanup: cleanupSignal });
       });
     },
     resolve(callId: string, approved: boolean): boolean {
@@ -110,14 +134,14 @@ export function createApprovalRegistry(opts: ApprovalRegistryOptions = {}): Appr
       const resolution = approved ? "approved" : "rejected";
       // Always update the durable record, even if the pending entry was already
       // cleared by timeout, so the audit trail reflects the operator's intent.
-      store.resolve(callId, resolution);
+      store.resolve(pending.get(callId)?.audit_id ?? auditIds.get(callId) ?? callId, resolution);
       return settle(callId, approved) || found;
     },
     pending(): number {
       return pending.size;
     },
     getRecord(callId: string): ApprovalRecord | undefined {
-      return store.get(callId);
+      return store.get(pending.get(callId)?.audit_id ?? auditIds.get(callId) ?? callId);
     },
   };
 }

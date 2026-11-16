@@ -126,4 +126,38 @@ describe("approval-registry", () => {
     const b = reg.getRecord("call-11b")!;
     expect(a.arg_hash).toBe(b.arg_hash);
   });
+
+  // ── Audit-key namespacing ─────────────────────────────────────────────────
+  // Call ids are unique per turn, not globally. A later turn that reuses an id
+  // must get its own durable row instead of colliding on the PRIMARY KEY.
+
+  test("re-requesting a still-pending call id rejects instead of inserting a second row", async () => {
+    const reg = createApprovalRegistry({ dbPath: ":memory:" });
+    const first = reg.request(details("call-dup"));
+    await expect(reg.request(details("call-dup"))).rejects.toThrow(/already pending/i);
+    expect(reg.pending()).toBe(1);
+    reg.resolve("call-dup", true);
+    expect(await first).toBe(true);
+    expect(reg.pending()).toBe(0);
+  });
+
+  test("a call id reused after its first request settled gets its own durable row", async () => {
+    const reg = createApprovalRegistry({ dbPath: ":memory:" });
+    const first = reg.request(details("call-reuse"));
+    reg.resolve("call-reuse", true);
+    expect(await first).toBe(true);
+
+    // Same id, later turn. This must not throw a PRIMARY KEY conflict.
+    const second = reg.request(details("call-reuse"));
+    expect(reg.pending()).toBe(1);
+    reg.resolve("call-reuse", false);
+    expect(await second).toBe(false);
+
+    // The decision lands on the newest row; the earlier row keeps its own.
+    const record = reg.getRecord("call-reuse")!;
+    expect(record.request_id).toMatch(/^call-reuse/);
+    expect(record.request_id).not.toBe("call-reuse");
+    expect(record.status).toBe("rejected");
+    expect(record.resolution).toBe("rejected");
+  });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { defaultConfig } from "./config";
 import type { JarvisConfig } from "./config";
 import {
@@ -7,6 +7,7 @@ import {
 } from "./tool-runtime";
 import type { ExecutionContext, ToolDefinition } from "./tool-runtime";
 import * as ToolRuntimeModule from "./tool-runtime";
+import { createApprovalRegistry } from "./approval-registry";
 
 // ─── P1-06: Jarvis Tool Runtime Contract ─────────────────────────────────────
 // Tests verify behavior through the public ToolRuntime interface only.
@@ -545,6 +546,92 @@ describe("ToolRuntime approval callback", () => {
     expect(handlerCalled).toBe(false);
     expect(result.is_error).toBe(true);
     expect(result.error).toMatch(/reject|denied|approval/i);
+  });
+
+  /** Run `fn` with console.error silenced — these paths log by design. */
+  async function withoutErrorLog<T>(fn: () => Promise<T>): Promise<T> {
+    const spy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      return await fn();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  test("ask + an approval id that is already pending returns approval_unavailable and does not run the handler", async () => {
+    // Regression (DD-090): the registry rejects a duplicate pending call id.
+    // That rejection used to escape execute(), aborting the turn with a raw
+    // error string and leaving the streamed tool card with no result.
+    const runtime = createToolRuntime();
+    const cfg = cfgWithInteractiveApproval();
+    const registry = createApprovalRegistry({ dbPath: ":memory:" });
+    const first = registry.request({
+      call_id: "a5",
+      tool_name: "gated_dup",
+      arguments: {},
+      policy_source: "tool_requires_approval",
+    });
+    let handlerCalled = false;
+    runtime.register(
+      makeDefWithFlags("gated_dup", { requires_approval: true }),
+      async () => { handlerCalled = true; return "should not run"; },
+    );
+    const ctx = makeExecutionContext("chat", cfg, {
+      requestApproval: (req) =>
+        registry.request({
+          call_id: req.call_id,
+          tool_name: req.name,
+          arguments: req.arguments,
+          policy_source: req.policy_source,
+        }),
+    });
+
+    const result = await withoutErrorLog(() =>
+      runtime.execute({ id: "a5", name: "gated_dup", arguments: {} }, ctx),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_unavailable");
+    expect(result.call_id).toBe("a5");
+    expect(result.name).toBe("gated_dup");
+    expect(result.error).toContain("gated_dup");
+    expect(result.error).toMatch(/approval could not be requested/i);
+    expect(handlerCalled).toBe(false);
+
+    // Release the deliberately-blocking first request so no timer outlives us.
+    registry.resolve("a5", false);
+    expect(await first).toBe(false);
+  });
+
+  test("ask + an approval request that throws returns approval_unavailable instead of throwing", async () => {
+    // Regression (DD-090): a failing durable audit insert (or any registry
+    // throw) used to reject out of execute() and abort the turn.
+    const runtime = createToolRuntime();
+    const cfg = cfgWithInteractiveApproval();
+    let handlerCalled = false;
+    runtime.register(
+      makeDefWithFlags("gated_broken", { requires_approval: true }),
+      async () => { handlerCalled = true; return "should not run"; },
+    );
+    const ctx = makeExecutionContext("chat", cfg, {
+      requestApproval: async () => {
+        throw new Error("SQLITE_CONSTRAINT_UNIQUE: UNIQUE constraint failed: approval_records.request_id");
+      },
+    });
+
+    const result = await withoutErrorLog(() =>
+      runtime.execute({ id: "a6", name: "gated_broken", arguments: {} }, ctx),
+    );
+
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_unavailable");
+    expect(result.call_id).toBe("a6");
+    expect(result.name).toBe("gated_broken");
+    expect(result.error).toContain("gated_broken");
+    expect(result.error).toMatch(/approval could not be requested/i);
+    // Storage text is diagnostics, not model-facing content.
+    expect(result.error).not.toContain("SQLITE");
+    expect(handlerCalled).toBe(false);
   });
 
   test("requestApproval receives the call id, name, arguments, and policy source", async () => {

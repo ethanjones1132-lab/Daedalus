@@ -464,12 +464,36 @@ export function createToolRuntime(): ToolRuntime {
           duration_ms: Date.now() - start,
         };
       }
-      const approved = await ctx.requestApproval({
-        call_id: call.id,
-        name: call.name,
-        arguments: callArguments,
-        policy_source: policy.source,
-      });
+      // The approval hook crosses the server/registry boundary: a duplicate
+      // pending call id or a durable-audit/storage failure rejects here.
+      // Approval plumbing must never abort the turn or leak raw storage text
+      // to the model, so any rejection is converted into the same envelope the
+      // rest of execute() uses. It is deliberately NOT `approval_rejected`:
+      // the user never said "no".
+      let approved = false;
+      try {
+        approved = await ctx.requestApproval({
+          call_id: call.id,
+          name: call.name,
+          arguments: callArguments,
+          policy_source: policy.source,
+        });
+      } catch (e: any) {
+        const msg = `Tool "${call.name}" could not run because approval could not be requested. The approval system is unavailable for this call.`;
+        // Arguments can carry file content, so log the failure detail only.
+        console.error(
+          `[tool-runtime] approval request failed for tool "${call.name}" call_id=${call.id}: ${boundedToolText(e?.message ?? String(e))}`,
+        );
+        return {
+          call_id: call.id,
+          name: call.name,
+          output: msg,
+          is_error: true,
+          error: msg,
+          error_code: "approval_unavailable" satisfies ToolErrorCode,
+          duration_ms: Date.now() - start,
+        };
+      }
       if (!approved) {
         const msg = `Tool "${call.name}" was rejected by the user.`;
         return {
