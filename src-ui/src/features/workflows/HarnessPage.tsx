@@ -11,9 +11,12 @@ const PURPOSES: Array<{ id: HarnessPurpose; label: string }> = [
   { id: 'release_prep', label: 'Release preparation' },
 ];
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : 'The manifest request failed.';
-}
+// The manifest lookup is a Native read, so its failure surfaces the project's own
+// sentence rather than whatever the rejecting layer said. A Native error may embed
+// store or project detail, and it explains nothing the operator can act on here:
+// the fix is always to retry the lookup against a readable project.
+const MANIFEST_READ_FAILED =
+  'Could not read saved harness manifests. The read failed or was malformed; this is not an empty list. Retry the lookup when the project is readable.';
 
 export default function HarnessPage() {
   const [state, dispatch] = useReducer(harnessReducer, initialHarnessState);
@@ -41,13 +44,19 @@ export default function HarnessPage() {
     void harnessApi.listManifests(root)
       .then((manifests) => {
         if (cancelled) return;
-        if (!Array.isArray(manifests)) throw new Error('The manifest response was unreadable; it is not an empty manifest list.');
+        if (!Array.isArray(manifests)) {
+          // A malformed body is a failed read, not an empty list, and the
+          // operator's next step is the same as after a rejection.
+          dispatch({ type: 'manifests-loaded', manifests: [] });
+          setLoadError(MANIFEST_READ_FAILED);
+          return;
+        }
         dispatch({ type: 'manifests-loaded', manifests });
       })
-      .catch((error: unknown) => {
+      .catch(() => {
         if (cancelled) return;
         dispatch({ type: 'manifests-loaded', manifests: [] });
-        setLoadError(`Could not read saved harness manifests: ${errorMessage(error)} This is not an empty list.`);
+        setLoadError(MANIFEST_READ_FAILED);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);

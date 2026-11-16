@@ -64,8 +64,22 @@ describe('HarnessPage picker route', () => {
     mount();
     fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not read saved harness manifests: offline');
-    expect(screen.getByRole('alert')).toHaveTextContent('This is not an empty list.');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Could not read saved harness manifests.');
+    expect(alert).toHaveTextContent('this is not an empty list.');
+    // The authored sentence is the whole reason; whatever the rejecting layer said
+    // may embed store or project detail and is never echoed to the operator.
+    expect(alert).not.toHaveTextContent('offline');
+    expect(screen.queryByText('No saved manifest for this project and purpose.')).not.toBeInTheDocument();
+  });
+
+  it('treats an unreadable manifest body as a failed read, not an empty list', async () => {
+    listManifests.mockResolvedValue(null as unknown as SavedHarnessManifest[]);
+    mount();
+    fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('this is not an empty list.');
     expect(screen.queryByText('No saved manifest for this project and purpose.')).not.toBeInTheDocument();
   });
 });
