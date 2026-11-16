@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
@@ -125,6 +125,96 @@ async function waitForPath(path: string, timeoutMs: number): Promise<boolean> {
   return existsSync(path);
 }
 
+/**
+ * A descendant that reports its own liveness, then performs one late write.
+ *
+ * `delayedMarkerCommand` proves absence of a late write by sleeping past the
+ * moment that write was scheduled. That wait is pinned to the test's wall
+ * clock, not to the descendant, so it is only as good as the assumption that
+ * the grandchild starts and sleeps on schedule — an assumption a loaded box
+ * breaks in both directions (it can outlive the window and pass vacuously, or
+ * never reach `ready` before the product timeout fires).
+ *
+ * This variant makes the descendant the clock: it advances a `beat` counter
+ * every `beatMs` and writes `marker` only after `beats` beats. A terminated
+ * descendant stops advancing the counter immediately, so the test can observe
+ * absence of the side effect through absence of the process that would write
+ * it, and it never has to wait out the scheduled delay.
+ */
+function heartbeatMarkerCommand(
+  ready: string,
+  beat: string,
+  marker: string,
+  beatMs: number,
+  beats: number,
+): string {
+  if (process.platform === "win32") {
+    const childScript = [
+      `Set-Content -LiteralPath ${powerShellQuote(ready)} -Value ready -NoNewline`,
+      `for ($i = 1; $i -le ${beats}; $i++) {`,
+      `  Start-Sleep -Milliseconds ${beatMs}`,
+      `  Set-Content -LiteralPath ${powerShellQuote(beat)} -Value $i -NoNewline`,
+      `}`,
+      `Set-Content -LiteralPath ${powerShellQuote(marker)} -Value late -NoNewline`,
+    ].join("\n");
+    const encodedScript = Buffer.from(childScript, "utf16le").toString("base64");
+    return [
+      `$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList '-NoProfile -NonInteractive -EncodedCommand ${encodedScript}' -PassThru -WindowStyle Hidden`,
+      `$readyPath = ${powerShellQuote(ready)}`,
+      // Generous, but shorter than the bun test budget: the parent is normally
+      // killed by the tool timeout long before this fires, and when the
+      // descendant never starts the failure must be this throw, not a harness
+      // timeout.
+      `$deadline = [DateTime]::UtcNow.AddSeconds(20)`,
+      `while (-not (Test-Path -LiteralPath $readyPath)) { if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for descendant readiness' }; Start-Sleep -Milliseconds 10 }`,
+      `Wait-Process -Id $child.Id`,
+    ].join("; ");
+  }
+
+  return [
+    `(`,
+    `  printf ready > ${shellQuote(ready)}`,
+    `  i=0`,
+    `  while [ "$i" -lt ${beats} ]; do`,
+    `    i=$((i + 1))`,
+    `    sleep ${beatMs / 1000}`,
+    `    printf '%s' "$i" > ${shellQuote(beat)}`,
+    `  done`,
+    `  printf late > ${shellQuote(marker)}`,
+    `) &`,
+    `child=$!`,
+    `for ((i = 0; i < 2000; i++)); do [ -e ${shellQuote(ready)} ] && break; sleep 0.01; done`,
+    `[ -e ${shellQuote(ready)} ] || { kill "$child" 2>/dev/null || true; exit 73; }`,
+    `wait "$child"`,
+  ].join("\n");
+}
+
+/** The descendant heartbeat, or null while it is absent or mid-write. */
+function readBeat(path: string): string | null {
+  try {
+    const value = readFileSync(path, "utf8").trim();
+    return value.length > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the descendant advanced its heartbeat away from `baseline` inside
+ * the window. An empty read is ignored because it can only be a write in
+ * flight, and the window is many multiples of the descendant's own cadence, so
+ * a survivor is seen long before the window closes.
+ */
+async function heartbeatAdvanced(path: string, baseline: string | null, windowMs: number): Promise<boolean> {
+  const deadline = Date.now() + windowMs;
+  while (Date.now() < deadline) {
+    const current = readBeat(path);
+    if (current !== null && current !== baseline) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return false;
+}
+
 describe("foreground shell outcomes", () => {
   test("non-zero exit is an error rather than successful output", async () => {
     const result = await makeShellRuntime().execute(
@@ -235,28 +325,49 @@ describe("foreground shell outcomes", () => {
   test("shell timeout terminates descendant work before delayed side effects", async () => {
     const workspace = makeWorkspace();
     const shellTool = process.platform === "win32" ? "powershell" : "bash";
+
+    // Control: the same descendant sequence really reaches its late write, so
+    // the absence assertion below cannot pass because the helper is broken
+    // instead of because termination worked.
+    const controlReady = join(workspace, "control-ready");
+    const controlBeat = join(workspace, "control-beat");
+    const controlMarker = join(workspace, "control-side-effect");
+    const control = await makeShellRuntime().execute(
+      {
+        id: "shell-timeout-control",
+        name: shellTool,
+        arguments: { command: heartbeatMarkerCommand(controlReady, controlBeat, controlMarker, 50, 12) },
+      },
+      makeShellContext({ workspace_path: workspace }),
+    );
+    expect(control.is_error).toBe(false);
+    expect(existsSync(controlMarker)).toBe(true);
+
     const ready = join(workspace, "timeout-ready");
+    const beat = join(workspace, "timeout-beat");
     const marker = join(workspace, "timeout-side-effect");
-    const pending = makeShellRuntime().execute(
+    // The descendant beats every 100ms and writes its marker only after 120
+    // beats (12s), while the timeout kills it at 5s. The marker is therefore
+    // unreachable at kill time by construction, whatever the load: the
+    // descendant can never have run 12s of beats. The 5s budget is only a
+    // startup allowance — it is not observed by the assertion.
+    const result = await makeShellRuntime().execute(
       {
         id: "shell-timeout-no-late",
         name: shellTool,
-        arguments: { command: delayedMarkerCommand(ready, marker, 3_000), timeout_ms: 1_000 },
+        arguments: { command: heartbeatMarkerCommand(ready, beat, marker, 100, 120), timeout_ms: 5_000 },
       },
       makeShellContext({ workspace_path: workspace }),
     );
 
-    const startup = await Promise.race([
-      waitForPath(ready, 5_000).then((found) => ({ ready: found })),
-      pending.then((result) => ({ result })),
-    ]);
-    expect(startup).toEqual({ ready: true });
-    const result = await pending;
-    await waitForPath(marker, 3_300);
-
     expect(result.error_code).toBe("timeout");
+    // The descendant had genuinely started before the tree was killed.
+    expect(existsSync(ready)).toBe(true);
+    // A descendant that survived the kill keeps advancing its own heartbeat; a
+    // terminated one cannot. This waits on the child, not on a fixed sleep.
+    expect(await heartbeatAdvanced(beat, readBeat(beat), 1_500)).toBe(false);
     expect(existsSync(marker)).toBe(false);
-  }, 9_000);
+  }, 30_000);
 
   test("successful empty output remains successful", async () => {
     const result = await makeShellRuntime().execute(
