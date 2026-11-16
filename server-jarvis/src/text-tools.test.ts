@@ -85,6 +85,25 @@ const tools: ToolDefinition[] = [
   },
 ];
 
+// DD-087: a write_file-shaped example needs a real write_file in the offered
+// list, otherwise the name filter alone would mask the fence bug.
+const writeTools: ToolDefinition[] = [
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description: "Write a file",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string", description: "Path" }, content: { type: "string", description: "Content" } },
+        required: ["path", "content"],
+      },
+    },
+    requires_approval: false,
+    dangerous: false,
+  },
+];
+
 function sanitizeVisibleAnswer(chunks: string[]): string {
   const sanitizer = new VisibleAnswerStreamSanitizer();
   return chunks.map((chunk) => sanitizer.push(chunk)).join("") + sanitizer.flush();
@@ -361,6 +380,45 @@ Here is the actual answer.`;
 
     expect(extractTextToolCalls(fenced, []).cleanedText).toBe(fenced);
     expect(extractTextToolCalls(`Here: ${toolJson}`, []).cleanedText).toBe("Here:");
+  });
+
+  // ── DD-087: a JSON object the model writes inside a fenced code block is an
+  // *example*, not a tool call. The documented protocol block
+  // (`<tool_call>{...}</tool_call>`) is the only executable form; a bare
+  // object in prose or a fence must not act as one. An unterminated fence
+  // runs to end of text, so an example the model never closed stays inert.
+  test("a fenced JSON example is not a tool call and stays in the text (DD-087)", () => {
+    const example = '{"name":"write_file","arguments":{"path":"notes.txt","content":"hello"}}';
+    const text = `Here is the shape I will use:\n\n\`\`\`json\n${example}\n\`\`\`\n\nThen I will call it.`;
+
+    const parsed = extractTextToolCalls(text, writeTools);
+
+    expect(parsed.calls).toHaveLength(0);
+    // Nothing is spliced out: the example remains part of the assistant text.
+    expect(parsed.cleanedText).toBe(text);
+    expect(parsed.cleanedText).toContain(example);
+  });
+
+  test("the same object inside an explicit <tool_call> block still executes (DD-087)", () => {
+    const example = '{"name":"write_file","arguments":{"path":"notes.txt","content":"hello"}}';
+    const text = `Calling it now.\n<tool_call>${example}</tool_call>`;
+
+    const parsed = extractTextToolCalls(text, writeTools);
+
+    expect(parsed.cleanedText).toBe("Calling it now.");
+    expect(parsed.calls).toHaveLength(1);
+    expect(parsed.calls[0].name).toBe("write_file");
+    expect(parsed.calls[0].arguments).toEqual({ path: "notes.txt", content: "hello" });
+  });
+
+  test("an unterminated fence runs to end of text and yields no bare-object call (DD-087)", () => {
+    const example = '{"name":"write_file","arguments":{"path":"notes.txt","content":"hello"}}';
+    const text = `The shape looks like this:\n\n\`\`\`json\n${example}\n`;
+
+    const parsed = extractTextToolCalls(text, writeTools);
+
+    expect(parsed.calls).toHaveLength(0);
+    expect(parsed.cleanedText).toBe(text);
   });
 
   test("post-turn cleanup removes cosmetic tool JSON embedded in prose while keeping the prose", () => {

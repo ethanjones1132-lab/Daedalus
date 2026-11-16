@@ -684,7 +684,17 @@ function collectCandidates(text: string, availableNames: Set<string> = new Set()
     addCandidate(match[2], start, (match.index ?? 0) + match[0].length);
   }
 
+  // Bare JSON inside a markdown fence is an *example* the model wrote, not a
+  // tool call (DD-087). An unterminated fence runs to end of text, so an
+  // example the model never closed stays inert too. The explicit
+  // `<tool_call>` and DSML paths above/below are deliberately untouched: a
+  // documented tag block still executes even inside a fence.
+  const fencedRanges = findFencedBlockRanges(text);
+  const startsInsideFence = (index: number) =>
+    fencedRanges.some((range) => index >= range.start && index < range.end);
+
   for (const object of findJsonObjects(text)) {
+    if (startsInsideFence(object.start)) continue;
     addCandidate(object.raw, object.start, object.end);
   }
 
@@ -1301,6 +1311,52 @@ function parseJsonLike(raw: string): unknown | null {
       return null;
     }
   }
+}
+
+/**
+ * Delimiter-precise fence ranges (` ``` ` … ` ``` `), opener start through
+ * closer end. Unlike `findFencedLineSpans` (whole lines, used by the cosmetic
+ * strip) this stops exactly at the closing backtick run, so prose after a
+ * closer on the same line is outside the fence, and prose before an opener is
+ * never treated as fenced. A fence is opened by a line whose first
+ * non-whitespace run is three or more backticks (optionally tagged, e.g.
+ * ` ```json `), closed by a later backtick-only line at least as long. A
+ * one-line ` ```json {...} ``` ` example counts as a complete fence, and an
+ * unterminated fence runs to end of text (DD-087: the model never closed its
+ * example, but it is still an example).
+ */
+function findFencedBlockRanges(text: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  let openStart = -1;
+  let openRunLength = 0;
+
+  for (const match of text.matchAll(/(^|\r?\n)([ \t]*)(`{3,})/g)) {
+    const delimiterStart = (match.index ?? 0) + match[1].length;
+    const runEnd = delimiterStart + match[2].length + match[3].length;
+    const lineEnd = text.indexOf("\n", runEnd);
+    const lineTail = text.slice(runEnd, lineEnd === -1 ? text.length : lineEnd).replace(/\r$/, "");
+
+    if (openStart < 0) {
+      const inlineClose = lineTail.indexOf("```");
+      if (inlineClose >= 0) {
+        ranges.push({ start: delimiterStart, end: runEnd + inlineClose + 3 });
+        continue;
+      }
+      openStart = delimiterStart;
+      openRunLength = match[3].length;
+      continue;
+    }
+
+    // Inside a fence: only a backtick-only line at least as long as the
+    // opener closes it. Anything else (a nested ` ```json ` line) is content.
+    if (match[3].length >= openRunLength && lineTail.trim() === "") {
+      ranges.push({ start: openStart, end: runEnd });
+      openStart = -1;
+    }
+  }
+
+  if (openStart >= 0) ranges.push({ start: openStart, end: text.length });
+  return ranges;
 }
 
 function findJsonObjects(text: string): Array<{ raw: string; start: number; end: number }> {
