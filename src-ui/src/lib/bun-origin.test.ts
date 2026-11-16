@@ -181,4 +181,57 @@ describe('bunFetch', () => {
       expect(invokeMock).toHaveBeenCalledWith('bun_server_request_cancel', expect.any(Object)),
     );
   });
+
+  it('rejects a non-loopback chat stream that completes before any headers', async () => {
+    type StreamEvent =
+      | { type: 'headers'; status: number; content_type?: string | null }
+      | { type: 'chunk'; chunk: number[] }
+      | { type: 'complete' }
+      | { type: 'error'; message: string };
+    let channel: Channel<StreamEvent> | undefined;
+    invokeMock.mockImplementation((command: string, args?: { onEvent?: Channel<StreamEvent> }) => {
+      if (command === 'bun_server_origin') return Promise.resolve('http://192.168.1.20:19877');
+      if (command === 'bun_server_request_stream') {
+        channel = args?.onEvent;
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+
+    const responsePromise = bunFetch('/chat/stream', { method: 'POST', body: '{}' });
+    const settled = expect(responsePromise).rejects.toThrow(/ended before it started/);
+    await vi.waitFor(() => expect(channel).toBeDefined());
+
+    channel!.onmessage({ type: 'complete' });
+
+    // Must reject with a real Error, not hang and not reject with a bare value.
+    await expect(responsePromise).rejects.toBeInstanceOf(Error);
+    await settled;
+  });
+
+  it('rejects a non-loopback chat stream that errors before any headers', async () => {
+    type StreamEvent =
+      | { type: 'headers'; status: number; content_type?: string | null }
+      | { type: 'chunk'; chunk: number[] }
+      | { type: 'complete' }
+      | { type: 'error'; message: string };
+    let channel: Channel<StreamEvent> | undefined;
+    invokeMock.mockImplementation((command: string, args?: { onEvent?: Channel<StreamEvent> }) => {
+      if (command === 'bun_server_origin') return Promise.resolve('http://192.168.1.20:19877');
+      if (command === 'bun_server_request_stream') {
+        channel = args?.onEvent;
+        return new Promise(() => {});
+      }
+      return Promise.resolve();
+    });
+
+    const responsePromise = bunFetch('/chat/stream', { method: 'POST', body: '{}' });
+    const settled = expect(responsePromise).rejects.toThrow('boom');
+    await vi.waitFor(() => expect(channel).toBeDefined());
+
+    channel!.onmessage({ type: 'error', message: 'boom' });
+
+    await expect(responsePromise).rejects.toBeInstanceOf(Error);
+    await settled;
+  });
 });

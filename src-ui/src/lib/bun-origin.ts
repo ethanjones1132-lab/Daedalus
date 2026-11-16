@@ -143,11 +143,21 @@ async function bunStreamFetch(pathAndQuery: string, init: RequestInit): Promise<
       case 'chunk':
         if (!streamFinished) streamController?.enqueue(new Uint8Array(event.chunk));
         break;
-      case 'complete':
+      case 'complete': {
         streamFinished = true;
+        // A stream that completes before any headers never produced a
+        // Response. Reject instead of leaving the caller awaiting forever: the
+        // terminal event has arrived and nothing else will settle the promise.
+        if (!responseSettled) {
+          responseSettled = true;
+          rejectResponse(new Error(
+            'bunFetch: the response ended before it started (the native channel reported complete without headers)',
+          ));
+        }
         streamController?.close();
         signal?.removeEventListener('abort', onAbort);
         break;
+      }
       case 'error': {
         streamFinished = true;
         const error = new Error(event.message);
