@@ -2265,6 +2265,46 @@ pub async fn force_restart_jarvis_server() -> Result<(), String> {
 enum StartupFailure {
     Spawn(String),
     TimedOut,
+    /// The owned Bun child exited while the start was still waiting on it
+    /// (DD-083). The payload is the exit code the OS reported, absent when the
+    /// child was terminated without one.
+    ChildExited(Option<i32>),
+}
+
+/// Operator-facing reason for a child that exited during its own start
+/// (DD-083). "It exited" and "it is slow" are different failures: reporting a
+/// dead child as a timeout sends the operator looking for a hung start that
+/// never existed.
+fn child_exited_during_start_reason(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("Bun server exited during startup (exit code {code})"),
+        None => "Bun server exited during startup without an exit code".to_string(),
+    }
+}
+
+/// Turn one liveness reading into the failure it proves, logging the reason so
+/// the operator sees it before the supervisor does (DD-083). `None` means the
+/// child has not exited and the health loop keeps waiting.
+fn exited_child_failure(liveness: ChildLiveness) -> Option<StartupFailure> {
+    let ChildLiveness::Exited(exit_code) = liveness else {
+        return None;
+    };
+    let reason = child_exited_during_start_reason(exit_code);
+    log::error!(target: "jarvis::startup", "{reason}");
+    Some(StartupFailure::ChildExited(exit_code))
+}
+
+/// What the post-spawn health loop can learn about the child it waits on
+/// (DD-083). Injected like the other effects so a test can script the exit
+/// without spawning a process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildLiveness {
+    /// The child has not exited, or its handle could not be inspected. Both
+    /// keep today's behaviour of waiting out the budget.
+    Awaiting,
+    /// The child exited; the payload is the OS exit code, absent when there is
+    /// none to report.
+    Exited(Option<i32>),
 }
 
 /// What one driven start attempt proved (DD-079).
@@ -2321,14 +2361,17 @@ impl BunServerStart {
 /// where it was (DD-073). A child left in place is still waited on for the same
 /// health budget; reaching the end of that budget while it has not exited is
 /// [`BunStartAttempt::StillStarting`], not success and not a failed start
-/// (DD-079).
-async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, M>(
+/// (DD-079). If that child exits mid-budget the wait ends immediately with
+/// [`StartupFailure::ChildExited`] instead of spending the rest of the budget on
+/// a process that is already gone (DD-083).
+async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, X, M>(
     remote_endpoint_requires_probe: bool,
     probe_healthy: P,
     delay: D,
     listener_present: L,
     spawn_owned_child: S,
     elapsed_since_spawn: E,
+    child_liveness: X,
     mark_healthy: M,
 ) -> Result<BunStartAttempt, StartupFailure>
 where
@@ -2340,6 +2383,7 @@ where
     S: Fn() -> SF,
     SF: std::future::Future<Output = Result<OwnedBunChildStart, String>>,
     E: Fn() -> u64,
+    X: Fn() -> ChildLiveness,
     M: Fn(),
 {
     const SPAWN_HEALTH_BUDGET_MS: u64 = 20_000;
@@ -2400,12 +2444,28 @@ where
     }
 
     // Wait (off the main thread) for the freshly spawned server to come up.
-    while elapsed_since_spawn() < SPAWN_HEALTH_BUDGET_MS {
+    loop {
+        if elapsed_since_spawn() >= SPAWN_HEALTH_BUDGET_MS {
+            break;
+        }
         if probe_healthy().await {
             mark_healthy();
             return Ok(BunStartAttempt::Healthy);
         }
+        // DD-083: a child that has exited can never answer `/health`, so the
+        // rest of the budget buys nothing — and a plain timeout would misreport
+        // why the start failed. Health is still trusted first, because a
+        // wrapper handle can report its exit while the server it launched is
+        // alive (a `wsl.exe` guest outlives its wrapper, DD-063).
+        if let Some(failure) = exited_child_failure(child_liveness()) {
+            return Err(failure);
+        }
         delay(500).await;
+    }
+    // The budget can run out in the same tick the child died: a dead child is
+    // never reported as a live child that is still starting, nor as a timeout.
+    if let Some(failure) = exited_child_failure(child_liveness()) {
+        return Err(failure);
     }
     if owned_start == OwnedBunChildStart::StillStarting {
         // DD-073: the child this app spawned has not exited, so this is a wait
@@ -2525,6 +2585,21 @@ pub(crate) async fn ensure_jarvis_server_started_outcome() -> BunServerStart {
                 .elapsed()
                 .as_millis() as u64
         },
+        // DD-083: the health loop watches the same tracked child it waits on,
+        // so a child that crashed during its start is reported as an exit, not
+        // as a slow start. An unreadable handle keeps the old wait: startup
+        // must not invent an exit it cannot prove.
+        || match process_lifecycle::bun_exit_status() {
+            Ok(None) => ChildLiveness::Awaiting,
+            Ok(Some(status)) => ChildLiveness::Exited(status.code()),
+            Err(error) => {
+                log::warn!(
+                    target: "jarvis::startup",
+                    "could not inspect the Bun child while waiting for /health: {error}"
+                );
+                ChildLiveness::Awaiting
+            }
+        },
         || {
             LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         },
@@ -2534,6 +2609,11 @@ pub(crate) async fn ensure_jarvis_server_started_outcome() -> BunServerStart {
         Ok(BunStartAttempt::Healthy) => BunServerStart::Healthy,
         Ok(BunStartAttempt::StillStarting) => BunServerStart::StillStarting,
         Err(StartupFailure::Spawn(error)) => BunServerStart::Failed(error),
+        Err(StartupFailure::ChildExited(exit_code)) => {
+            // DD-083: never let a dead child reach the timeout arm below — the
+            // ghost-socket diagnostic is for a child that may still be binding.
+            BunServerStart::Failed(child_exited_during_start_reason(exit_code))
+        }
         Err(StartupFailure::TimedOut) => {
             // Surface the ghost-socket case explicitly — a generic timeout leaves the
             // operator hunting EADDRINUSE in err logs with no recovery path.
@@ -3841,6 +3921,8 @@ mod bun_startup_tests {
         trace: Rc<RefCell<Vec<String>>>,
         probe_script: Rc<RefCell<VecDeque<bool>>>,
         elapsed_script: Rc<RefCell<VecDeque<u64>>>,
+        liveness_script: Rc<RefCell<VecDeque<ChildLiveness>>>,
+        liveness_calls: Rc<Cell<u32>>,
         healthy: Rc<Cell<bool>>,
     }
 
@@ -3885,6 +3967,31 @@ mod bun_startup_tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(20_001)
+        }
+
+        fn push_liveness(&self, liveness: ChildLiveness) {
+            self.liveness_script.borrow_mut().push_back(liveness);
+        }
+
+        fn liveness(&self) -> ChildLiveness {
+            self.liveness_calls.set(self.liveness_calls.get() + 1);
+            // Default: the child is alive and the loop keeps waiting, which is
+            // today's behaviour for every test that does not script an exit.
+            self.liveness_script
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(ChildLiveness::Awaiting)
+        }
+
+        fn liveness_call_count(&self) -> u32 {
+            self.liveness_calls.get()
+        }
+
+        fn probe_call_count(&self) -> usize {
+            self.snapshot()
+                .iter()
+                .filter(|event| event.as_str() == "probe")
+                .count()
         }
 
         fn snapshot(&self) -> Vec<String> {
@@ -3943,6 +4050,10 @@ mod bun_startup_tests {
             {
                 let effects = effects.clone();
                 move || effects.elapsed_ms()
+            },
+            {
+                let effects = effects.clone();
+                move || effects.liveness()
             },
             {
                 let effects = effects.clone();
@@ -4174,6 +4285,136 @@ mod bun_startup_tests {
         );
     }
 
+    /// DD-083: the post-spawn health loop must tell "it exited" from "it is
+    /// slow". A child that dies after a poll or two is a failure that names the
+    /// exit code, and the loop must stop at once instead of spending the rest
+    /// of the budget probing a process that is already gone.
+    #[tokio::test]
+    async fn an_exited_child_ends_the_start_with_its_exit_code() {
+        let effects = Effects::default();
+        // Two iterations are enough for the loop to notice: alive on the first
+        // poll, gone on the second.
+        effects.push_elapsed(0);
+        effects.push_elapsed(0);
+        effects.push_probe(false);
+        effects.push_probe(false);
+        effects.push_liveness(ChildLiveness::Awaiting);
+        effects.push_liveness(ChildLiveness::Exited(Some(7)));
+
+        let outcome = run_driver(&effects, false, false, true).await;
+
+        assert_eq!(
+            outcome,
+            Err(StartupFailure::ChildExited(Some(7))),
+            "an exited child must fail the start and carry its exit code"
+        );
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "spawn", "probe", "delay:500", "probe"],
+            "the loop must stop at the observed exit instead of burning the \
+             remaining budget"
+        );
+        assert!(
+            effects.probe_call_count() <= 2,
+            "a dead child must not be probed for a whole budget: {} probes",
+            effects.probe_call_count()
+        );
+        assert!(
+            child_exited_during_start_reason(Some(7)).contains("exit code 7"),
+            "the operator-facing reason must carry the exit code"
+        );
+    }
+
+    /// DD-083 also covers DD-073's still-starting arm: a child this app left
+    /// running that then exits is a dead child, never a "still starting" wait
+    /// and never a plain timeout.
+    #[tokio::test]
+    async fn an_exited_owned_child_is_not_reported_as_still_starting() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+        effects.push_elapsed(0);
+        effects.push_probe(false);
+        effects.push_probe(false);
+        effects.push_liveness(ChildLiveness::Awaiting);
+        // A child terminated without an exit code still exited.
+        effects.push_liveness(ChildLiveness::Exited(None));
+
+        let outcome = run_driver_with(
+            &effects,
+            false,
+            false,
+            Ok(OwnedBunChildStart::StillStarting),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            Err(StartupFailure::ChildExited(None)),
+            "an owned child that exited must not be reported as still starting"
+        );
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "still-starting", "probe", "delay:500", "probe"],
+            "the wait on an owned child must also end at its exit"
+        );
+        assert!(
+            !effects
+                .snapshot()
+                .iter()
+                .any(|event| event == "spawn"),
+            "noticing the exit must not spawn a replacement"
+        );
+    }
+
+    /// DD-083 baseline: a child that is alive and merely slow keeps today's
+    /// behaviour exactly — the whole budget is spent, then a live owned child
+    /// is `StillStarting` and a replaced spawn is `TimedOut`.
+    #[tokio::test]
+    async fn a_live_slow_child_still_spends_the_whole_budget() {
+        let live = Effects::default();
+        live.push_elapsed(0);
+        live.push_elapsed(0);
+        live.push_elapsed(20_001);
+        live.push_probe(false);
+        live.push_probe(false);
+
+        let still_starting =
+            run_driver_with(&live, false, false, Ok(OwnedBunChildStart::StillStarting)).await;
+
+        assert_eq!(
+            still_starting,
+            Ok(BunStartAttempt::StillStarting),
+            "a live owned child must keep DD-073/DD-079's still-starting result"
+        );
+        assert_eq!(
+            live.snapshot(),
+            vec!["listen", "still-starting", "probe", "delay:500", "probe", "delay:500"],
+            "a live child must be waited on for the full budget, not cut short"
+        );
+        assert!(
+            live.liveness_call_count() >= 2,
+            "the loop must consult the child's liveness on every iteration"
+        );
+
+        let fresh = Effects::default();
+        fresh.push_elapsed(0);
+        fresh.push_elapsed(20_001);
+        fresh.push_probe(false);
+
+        let timed_out = run_driver(&fresh, false, false, true).await;
+
+        assert_eq!(
+            timed_out,
+            Err(StartupFailure::TimedOut),
+            "a spawn that never answers and never exits keeps today's timeout"
+        );
+        assert_eq!(
+            fresh.snapshot(),
+            vec!["listen", "spawn", "probe", "delay:500"],
+            "a live child must not shorten the spawn budget"
+        );
+    }
+
     /// DD-073: the decision is a reading of the one existing liveness rule, so
     /// only a live child is left where it is; a dead or absent slot still
     /// spawns.
@@ -4288,6 +4529,8 @@ mod bun_boot_order_tests {
                 }
             },
             || 0u64,
+            // This trace pins boot ordering only; the child never exits here.
+            || ChildLiveness::Awaiting,
             {
                 let trace = Rc::clone(&trace);
                 move || trace.note("bun:healthy")
@@ -4300,6 +4543,7 @@ mod bun_boot_order_tests {
         .map_err(|failure| match failure {
             StartupFailure::Spawn(error) => error,
             StartupFailure::TimedOut => "Bun startup timed out".to_string(),
+            StartupFailure::ChildExited(exit_code) => child_exited_during_start_reason(exit_code),
         })
     }
 

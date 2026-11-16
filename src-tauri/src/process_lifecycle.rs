@@ -666,6 +666,26 @@ pub(crate) fn bun_ownership() -> BunOwnership {
     }
 }
 
+/// How the tracked Bun child stands for a caller that is waiting on it
+/// (DD-083): `Ok(None)` while it has not exited, `Ok(Some(status))` once it has,
+/// and `Err` when the handle cannot be inspected. A caller waiting for the child
+/// to answer `/health` needs the exit itself — the exit code is the reason the
+/// start died — which [`bun_ownership`] deliberately does not preserve.
+pub(crate) fn bun_exit_status() -> Result<Option<std::process::ExitStatus>, String> {
+    let mut children = children();
+    match children.bun_server.as_mut() {
+        None => Ok(None),
+        Some(slot) => inspect_exit_status(&mut slot.child),
+    }
+}
+
+/// One `try_wait` reading of a tracked child, keeping "has not exited" apart
+/// from "could not be inspected". Separate from the registry so the reading can
+/// be driven from a test without a global slot.
+fn inspect_exit_status(child: &mut Child) -> Result<Option<std::process::ExitStatus>, String> {
+    child.try_wait().map_err(|error| error.to_string())
+}
+
 /// Whether this process currently owns a live child in the slot. The supervisor
 /// uses this to tell "still coming up" (a child it spawned that has not opened
 /// its port yet, e.g. Ollama loading a model) from "down", so a tick does not
@@ -1060,8 +1080,9 @@ mod reap_failure_tests {
 #[cfg(all(test, windows))]
 mod windows_job_tests {
     use super::{
-        create_kill_on_close_job, hermes_tracked, reap_slot, reap_slot_with, spawn_assigned,
-        spawn_managed_tokio, stop_all, AsyncChildSlot, JobObject, Reap, Slot, SlotLaunch,
+        create_kill_on_close_job, hermes_tracked, inspect_exit_status, reap_slot, reap_slot_with,
+        spawn_assigned, spawn_managed_tokio, stop_all, AsyncChildSlot, JobObject, Reap, Slot,
+        SlotLaunch,
     };
     use std::process::{Child, Command, Stdio};
     use std::sync::{Arc, Mutex};
@@ -1118,6 +1139,50 @@ mod windows_job_tests {
         let _ = child.wait();
 
         assert!(assigned, "managed child was not assigned to its job");
+    }
+
+    /// DD-083: startup's health loop asks this reading whether the child it is
+    /// waiting on is gone, so "it exited" must never be mistaken for "it is
+    /// slow". A live child reports no exit; a child that exited reports the real
+    /// exit code, which is the reason startup puts in front of the operator.
+    #[test]
+    fn the_tracked_child_exit_status_names_the_exit_code() {
+        let mut live = Command::new("cmd")
+            .args(["/c", "ping -n 30 127.0.0.1 > NUL"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a live child");
+        let running = inspect_exit_status(&mut live);
+        let _ = live.kill();
+        let _ = live.wait();
+        assert_eq!(
+            running,
+            Ok(None),
+            "a running child must not be reported as exited"
+        );
+
+        let mut dead = Command::new("cmd")
+            .args(["/c", "exit 3"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match inspect_exit_status(&mut dead) {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                other => panic!("the short-lived child never reported an exit: {other:?}"),
+            }
+        };
+        assert_eq!(
+            status.code(),
+            Some(3),
+            "the reading must carry the child's real exit code"
+        );
     }
 
     /// DD-062: a Hermes child spawned through the managed path must join the
