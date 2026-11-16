@@ -633,8 +633,9 @@ describe('ChatPanel state machine', () => {
 });
 
 // Saved-row handoff around POST /chat/stream: one send produces exactly one
-// saved user row, and a POST that never reaches the server is retried against
-// the SAME persisted row instead of appending a second one.
+// saved user row, and a turn that failed without saving an assistant row —
+// whether the POST never reached the server or the stream died after it — is
+// retried against the SAME persisted row instead of appending a second one.
 describe('saved user row handoff around POST /chat/stream', () => {
   it('leaves exactly one saved user row after retrying a POST that never reached the server', async () => {
     let attempt = 0;
@@ -677,6 +678,52 @@ describe('saved user row handoff around POST /chat/stream', () => {
     // draft that backed it is cleared only once the retry is accepted.
     await waitFor(() => expect(composer.value).toBe(''));
     expect(screen.getAllByText('retry me once')).toHaveLength(1);
+  });
+
+  it('re-uses the saved user row when a turn dies after the POST without saving an assistant row', async () => {
+    let attempt = 0;
+    let deadController!: ReadableStreamDefaultController<Uint8Array>;
+    const deadStream = new ReadableStream<Uint8Array>({ start(value) { deadController = value; } });
+    const fetchMock = vi.fn(async () => {
+      attempt += 1;
+      if (attempt === 1) {
+        return new Response(deadStream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      return new Response('data: {"type":"result","result":"recovered answer"}\n\n', {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<ChatPanel {...props} />);
+    const composer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+
+    fireEvent.change(composer, { target: { value: 'dies after the post' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await screen.findByRole('status', { name: 'Session turn progress' });
+    await act(async () => {
+      deadController.enqueue(new TextEncoder().encode('data: {"type":"stream_event","delta":{"text":"Half an answer"}}\n\n'));
+    });
+    await waitFor(() => expect(screen.getByText('Half an answer')).toBeInTheDocument());
+    // The POST was accepted and the user row saved, then the stream died. No
+    // assistant row was persisted, so the saved user row must be handed to the
+    // retry ledger rather than stranded.
+    await act(async () => { deadController.error(new Error('connection reset by peer')); });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The turn failed.');
+    expect(composer.value).toBe('dies after the post');
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'assistant')).toHaveLength(0);
+
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    await waitFor(() => expect(screen.getByText('recovered answer')).toBeInTheDocument());
+    // Exactly ONE saved user row across both attempts, and one bubble for it.
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user')).toHaveLength(1);
+    expect(screen.getAllByText('dies after the post')).toHaveLength(1);
   });
 
   it('saves a successful turn exactly once under the server-returned row id', async () => {

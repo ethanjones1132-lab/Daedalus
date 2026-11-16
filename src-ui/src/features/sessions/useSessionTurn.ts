@@ -1699,16 +1699,26 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     let userMessageId: string | null = null;
     let inactivityTimedOut = false;
     let terminal: DecodedStreamTerminal | null = null;
+    // Set when the persisted-turn lifecycle throws, and read by its finalizer
+    // to hand a saved-but-unassisted user row to the retry ledger.
+    let turnError: unknown = null;
 
     // The final assistant text this direct turn should persist, and whether the
     // observed terminal permits persistence. Updated by the terminal frame
     // handlers below the finalizer's definition, so the finalizer reads the
     // latest values from this mutable holder. The appended DB id is returned as
     // worker data (never written to React state from the worker).
-    const assistantPersist: { text: string; allowed: boolean; done: boolean } = {
+    const assistantPersist: {
+      text: string;
+      allowed: boolean;
+      done: boolean;
+      /** True only once Native returned a saved id for the assistant row. */
+      persisted: boolean;
+    } = {
       text: '',
       allowed: false,
       done: false,
+      persisted: false,
     };
 
     // One memoized finalization per local turn, shared by every exit path.
@@ -1766,6 +1776,11 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
               }
             }
           }
+          // A saved assistant row is the only thing that makes the turn's user
+          // row unrepeatable. Record the fact as soon as Native confirms the
+          // append, so the failure handoff can tell "persisted nothing" from
+          // "persisted the answer" even when sync/capture outlive the race.
+          if (appendDbId) assistantPersist.persisted = true;
 
           let diagnostic: unknown = null;
           let syncFailed = false;
@@ -1883,11 +1898,12 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       // the SAME message instance (2026-07-03 incident 1d4727cf).
       //
       // 1b. Saved-row reuse: if the PREVIOUS attempt of this exact message in
-      // this exact Session saved its user row but the POST never reached the
-      // server (armed by the rollback handoff below), this retry re-uses that
-      // SAME persisted row instead of appending a second one. The failed
-      // attempt's visible bubbles — the user bubble bound to the reused row
-      // and its error assistant bubble — are superseded by this retry's own
+      // this exact Session saved its user row but the turn failed without
+      // saving an assistant row (the POST never reached the server, or the
+      // stream died after it — both armed by the handoff below), this retry
+      // re-uses that SAME persisted row instead of appending a second one. The
+      // failed attempt's visible bubbles — the user bubble bound to the reused
+      // row and its error assistant bubble — are superseded by this retry's own
       // optimistic bubbles and are removed first, so the transcript holds
       // exactly one bubble per saved row and the retry looks like a first
       // attempt. Only a live submission consumes the ledger; a stale/aborted
@@ -2573,12 +2589,19 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       // Stream ends without a terminal frame: an inactivity timeout is
       // timed_out; a client-side abort (user Stop that raced ahead of the
       // server's `cancelled` frame, or component teardown) is cancelled.
+      // Anything else means the stream itself broke after the response
+      // started (the reader rejected, or a transport error escaped the read
+      // loop): the turn really ran, so it is a `failed` run — never left
+      // unrecorded, which would read as a Session that never ran.
       if (requestIsCurrent() && !runAcc.outcome) {
         if (inactivityTimedOut) {
           runAcc.outcome = 'timed_out';
         } else if (controller.signal.aborted || stopRequestedRef.current) {
           runAcc.outcome = 'cancelled';
           runAcc.cancelledReason = 'client_abort';
+        } else {
+          runAcc.outcome = 'failed';
+          runAcc.partialOutput = boundedPartialOutput(streamedRawText);
         }
         if (!activityTerminalDispatched) {
           dispatchActivity({ kind: 'terminal', outcome: runAcc.outcome ?? 'failed' });
@@ -2587,12 +2610,30 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       }
       persistTerminalRun();
     }
+    } catch (turnFailure) {
+      // Remember why the turn ended so the finalizer below can tell a real
+      // failure from a completion. The error still propagates unchanged.
+      turnError = turnFailure;
+      throw turnFailure;
     } finally {
       // Safety net for setup/HTTP/body failures that occur before the read
       // loop starts. The same memoized finalizer runs, so a saved turn is
       // finalized exactly once on every exit path, including stale/aborted
       // submissions.
       await finalizeMemoryTurn();
+      // Saved-row handoff for EVERY failure path, not only the POST that never
+      // left this machine: once the user row was saved, a turn that died
+      // without saving an assistant row leaves that row stranded. Hand it to
+      // the retry ledger so the operator's retry re-uses it instead of
+      // appending a duplicate user row. An operator Stop or a stale Session
+      // abort is not a silent failure and keeps the existing behaviour.
+      if (turnError !== null && !assistantPersist.persisted) {
+        const aborted = controller.signal.aborted || stopRequestedRef.current;
+        const abortedError = turnError instanceof DOMException && turnError.name === 'AbortError';
+        if (!aborted && !abortedError) {
+          armSavedUserRowRetry(userMessageId, assistantClientMessageId);
+        }
+      }
     }
     if (inactivityTimedOut) {
       throw new Error(`Jarvis stream was inactive for ${STREAM_INACTIVITY_TIMEOUT_MS / 1000} seconds.`);

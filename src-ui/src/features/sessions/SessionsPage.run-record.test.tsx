@@ -104,6 +104,8 @@ function sseStream() {
       });
     },
     close: async () => { await act(async () => { controller.close(); }); },
+    /** The transport itself dies mid-stream, after the response started. */
+    fail: async (error: Error) => { await act(async () => { controller.error(error); }); },
   };
 }
 
@@ -342,6 +344,40 @@ describe('the Session list shows the durable run, never a local assumption', () 
     const card = row.parentElement!.parentElement!;
     await waitFor(() => expect(card).toHaveTextContent('run-y'));
     expect(card).not.toHaveTextContent("last turn's run outcome not confirmed");
+  });
+
+  it('records a mid-stream transport failure as a failed run instead of leaving the Session unrecorded', async () => {
+    const stream = sseStream();
+    await openSessions();
+    await sendTurn('inspect the workspace');
+    await stream.emit({ type: 'agent_run_id', agent_run_id: 'run-broken' });
+    await stream.emit({ type: 'stream_event', delta: { text: 'Half an answer' } });
+    await waitFor(() => expect(screen.getByText('Half an answer')).toBeInTheDocument());
+
+    // The reader rejects after the response started. The turn ran and died, so
+    // it must be durably recorded as a failed run — not dropped as if the
+    // Session never ran at all.
+    await stream.fail(new Error('connection reset by peer'));
+
+    await waitFor(() => expect(confirmation()).toHaveTextContent('Recorded run run-broken as failed.'));
+    expect(recordCalls).toHaveLength(1);
+    expect(recordCalls[0]).toMatchObject({
+      session_id: 'session-1',
+      runId: 'run-broken',
+      outcome: 'failed',
+      partialOutput: 'Half an answer',
+    });
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }));
+    await waitFor(() => {
+      const row = screen.getByText('Run ledger', { selector: 'span' });
+      const card = row.parentElement!.parentElement!;
+      expect(card).toHaveTextContent('failed');
+      expect(card).toHaveTextContent('run-broken');
+      // The Session list is honest about this real run, so it no longer claims
+      // the Session has no recorded run at all.
+      expect(card).not.toHaveTextContent('no run recorded');
+    });
   });
 
   it('opens a real route to the run history of one Session and keeps it honest', async () => {
