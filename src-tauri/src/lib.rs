@@ -1899,6 +1899,26 @@ fn unhealthy_jarvis_server_error(base: &str) -> String {
     }
 }
 
+/// The command that launches Bun natively (no WSL): program, entry, and the
+/// working directory the child inherits. Bun loads `.env` and `bunfig.toml`
+/// from its working directory, so the child must start in the install root
+/// that holds the entry `find_jarvis_server` resolved — not in whatever
+/// directory the app itself was launched from (DD-081). The root is derived
+/// from that entry alone; there is no second lookup to disagree with it.
+/// A bare entry with no parent directory keeps the inherited working
+/// directory rather than choosing one.
+fn native_bun_command(bun: &str, entry: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(bun);
+    command.arg(entry);
+    if let Some(root) = std::path::Path::new(entry)
+        .parent()
+        .filter(|root| !root.as_os_str().is_empty())
+    {
+        command.current_dir(root);
+    }
+    command
+}
+
 fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let bun = find_bun_executable();
     let is_windows = cfg!(target_os = "windows");
@@ -1941,10 +1961,11 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         // NEW: Native Windows execution using bundled/portable bun.exe + bundled server .js .
         // This path is taken for installers on new hardware (no WSL checkout needed).
         // The entry should be a .js (the one we added via tauri resources or placed next to exe).
-        let mut command = std::process::Command::new(&bun);
+        // The entry's own directory is the install root, so `.env` and
+        // `bunfig.toml` next to the bundle load deterministically (DD-081).
+        let mut command = native_bun_command(&bun, entry);
         record_bun_launch(&format!("{bun} {entry}"));
         command
-            .arg(entry)
             .env(cap_name, &cap_value)
             .env(app_name, &app_value)
             .stdout(jarvis_server_log_stdio("server-jarvis.log"))
@@ -5510,6 +5531,94 @@ mod wsl_server_command_tests {
         assert!(
             !command.contains('\''),
             "quoting $HOME would stop the guest shell expanding it: {command}"
+        );
+    }
+}
+
+/// DD-081: Bun resolves `.env` and `bunfig.toml` against its working directory,
+/// so the natively spawned server must start in the install root that holds the
+/// entry `find_jarvis_server` resolved. These tests read the `Command` the
+/// native arm actually hands to the managed spawn, not a transcript of it.
+#[cfg(test)]
+mod native_bun_working_dir_tests {
+    use super::native_bun_command;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    /// The shape `find_jarvis_server` returns: an entry inside the install.
+    fn entry_in(root: &Path) -> PathBuf {
+        root.join("server-jarvis").join("dist").join("index.js")
+    }
+
+    #[test]
+    fn the_native_bun_command_runs_from_the_directory_holding_the_entry() {
+        let entry = entry_in(Path::new("Jarvis install"));
+        let command = native_bun_command("bun.exe", entry.to_str().expect("test path is utf-8"));
+
+        assert_eq!(
+            command.get_current_dir(),
+            Some(entry.parent().expect("the entry has a directory")),
+            "Bun must load .env and bunfig.toml from the install root that holds the entry"
+        );
+        assert_eq!(command.get_program(), OsStr::new("bun.exe"));
+        assert_eq!(command.get_args().count(), 1, "the entry is the only argument");
+    }
+
+    /// The app can be started from a sibling checkout, from the exe directory,
+    /// or from any directory that also looks like an install root. None of
+    /// those may win: only the directory holding the resolved entry decides.
+    #[test]
+    fn another_candidate_root_does_not_leak_in_when_the_entry_sits_elsewhere() {
+        let inherited = std::env::current_dir().expect("the test process has a working directory");
+        let entry = entry_in(&PathBuf::from("elsewhere").join("Other Jarvis"));
+        let command = native_bun_command("bun.exe", entry.to_str().expect("test path is utf-8"));
+
+        assert_eq!(
+            command.get_current_dir(),
+            Some(entry.parent().expect("the entry has a directory")),
+            "the working directory must come from the entry, not from a second candidate root"
+        );
+        assert_ne!(
+            command.get_current_dir(),
+            Some(inherited.as_path()),
+            "the directory the app inherited must not become Bun's working directory"
+        );
+    }
+
+    /// `Path::new("index.js").parent()` is an empty path. Running the child
+    /// there would fail, so a bare entry must keep the inherited directory.
+    #[test]
+    fn a_bare_entry_keeps_the_inherited_directory() {
+        let command = native_bun_command("bun.exe", "index.js");
+        assert_eq!(
+            command.get_current_dir(),
+            None,
+            "an entry with no directory must not set an empty working directory"
+        );
+    }
+
+    /// The helper only protects the real launch if the native arm uses it, so
+    /// this reads the production body (whitespace-normalised) like the other
+    /// spawn wiring checks. The spawn itself performs boot work and cannot run
+    /// from a unit test.
+    #[test]
+    fn the_native_spawn_arm_builds_its_command_through_the_helper() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("fn spawn_jarvis_server(")
+            .expect("spawn_jarvis_server must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("/// Whether the Bun server is launched inside WSL.")
+            .map(|offset| start + offset)
+            .expect("the launch-mode doc comment must follow spawn_jarvis_server");
+        let body = SOURCE[start..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            body.contains("native_bun_command(&bun, entry)"),
+            "the native Bun arm must build its command through native_bun_command:\n{body}"
         );
     }
 }
