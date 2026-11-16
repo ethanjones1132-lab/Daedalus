@@ -3096,6 +3096,20 @@ impl TeardownEvent {
     }
 }
 
+/// Bounded rotation for the app's own log file (DD-083).
+///
+/// `tauri-plugin-log`'s defaults (2.8.0: `DEFAULT_MAX_FILE_SIZE = 40_000` with
+/// `RotationStrategy::KeepOne`) rotate the app log mid-cold-start and `KeepOne`
+/// deletes the file the run's `jarvis::startup` lines were written to — the
+/// exact evidence the packaged cold-start measurement reads. 8 MiB is 200× the
+/// default and holds a whole TRACE run's startup output with room to spare, so
+/// one boot can no longer overflow its own file. Keeping two dated archives
+/// means a later rotation cannot evict the run that just booted either, and
+/// total disk stays bounded at three files (~24 MiB) rather than growing
+/// without limit.
+const APP_LOG_MAX_FILE_BYTES: u128 = 8 * 1024 * 1024;
+const APP_LOG_ROTATED_FILES_KEPT: usize = 2;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
@@ -3166,7 +3180,14 @@ pub fn run() {
     };
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_log::Builder::default().build())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .max_file_size(APP_LOG_MAX_FILE_BYTES)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(
+                    APP_LOG_ROTATED_FILES_KEPT,
+                ))
+                .build(),
+        )
         .plugin(tauri_plugin_shell::init())
         .manage(jarvis_state)
         .manage(db)
@@ -5863,6 +5884,78 @@ mod native_bun_working_dir_tests {
         assert!(
             body.contains("native_bun_command(&bun, entry)"),
             "the native Bun arm must build its command through native_bun_command:\n{body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_log_rotation_tests {
+    use super::{APP_LOG_MAX_FILE_BYTES, APP_LOG_ROTATED_FILES_KEPT};
+
+    /// DD-083: the plugin default is a 40 000-byte cap with `KeepOne`, small
+    /// enough that a TRACE cold start rotates its own startup lines away before
+    /// the packaged probe can read them.
+    #[test]
+    fn one_verbose_cold_start_fits_before_rotation() {
+        assert!(
+            APP_LOG_MAX_FILE_BYTES >= 8 * 1024 * 1024,
+            "the app log must hold a whole TRACE cold start, not rotate mid-boot"
+        );
+        assert!(
+            APP_LOG_MAX_FILE_BYTES > 40_000,
+            "the plugin's 40 KB default is the cap this change exists to replace"
+        );
+    }
+
+    /// Raising the cap only stays safe because the archive count bounds the
+    /// log: the active file plus its kept archives.
+    #[test]
+    fn the_rotation_stays_bounded() {
+        assert!(
+            APP_LOG_ROTATED_FILES_KEPT >= 1,
+            "KeepSome(0) underflows the plugin's rotate path"
+        );
+        let worst_case = APP_LOG_MAX_FILE_BYTES * (APP_LOG_ROTATED_FILES_KEPT as u128 + 1);
+        assert!(
+            worst_case <= 32 * 1024 * 1024,
+            "the app log must stay bounded, got {worst_case} bytes"
+        );
+    }
+
+    /// The constants only matter if `run()` applies them to the plugin. The
+    /// builder needs a live Tauri app, so read the registration instead.
+    #[test]
+    fn the_log_plugin_is_registered_with_the_bounded_rotation() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let body = SOURCE.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let builder = body
+            .find("tauri_plugin_log::Builder::default()")
+            .expect("the log plugin must be registered in run()");
+        let cap = body
+            .find(".max_file_size(APP_LOG_MAX_FILE_BYTES)")
+            .expect("the log plugin must use the raised cap constant");
+        let rotation = body
+            .find("RotationStrategy::KeepSome(")
+            .expect("the log plugin must keep a bounded number of archived files");
+        // The constant is also declared above `run()`, so look for the use
+        // that closes the KeepSome call rather than the declaration.
+        let rotation_call_end = rotation
+            + body[rotation..]
+                .find("))")
+                .expect("the KeepSome call must be closed");
+        let kept = rotation
+            + body[rotation..]
+                .find("APP_LOG_ROTATED_FILES_KEPT")
+                .expect("the archive count must come from its constant");
+
+        assert!(
+            builder < cap && cap < rotation,
+            "run() must chain the raised cap onto the log plugin"
+        );
+        assert!(
+            rotation < kept && kept < rotation_call_end,
+            "the archive count constant must be KeepSome's argument"
         );
     }
 }

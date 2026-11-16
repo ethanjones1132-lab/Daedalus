@@ -4,7 +4,14 @@
 // WSL-side HTTP server on port 19877.
 // Uses OpenAI-compatible APIs for llama.cpp, Ollama, and OpenRouter.
 // Qwen3.6 keep96 via llama.cpp is the default local chat and persistent-conductor backend.
+// DD-083 post-import mark: ESM hoists the import block below, so this line
+// runs only after the whole import graph has evaluated. The pre-import mark is
+// the body of ./startup-mark, deliberately the first import: it imports
+// nothing itself, so its pre-import timestamp runs before any other module body.
 console.log(`[Jarvis startup] process entry uptime=${process.uptime()}s timeOrigin=${performance.timeOrigin}`);
+// DD-083: must stay the first import — this module's body is the earliest code
+// the child can run after the runtime loader, and it logs the child's clock.
+import "./startup-mark";
 // Task 4.3: the self-log tee must install before ANY other module logs, so
 // every line of this process's life is in the guaranteed log regardless of
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
