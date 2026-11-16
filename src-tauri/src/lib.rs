@@ -1972,6 +1972,33 @@ fn bun_start_guard(state: BunPortState) -> Result<(), String> {
     }
 }
 
+/// What the ensure path does about the Bun child this app already owns (DD-073).
+///
+/// The tracked `Child` handle is the only proof of ownership. A child that is
+/// still live has not exited, so it is a server that has not finished binding
+/// inside the start budget this call grants it — not somebody else's listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedBunChildStart {
+    /// This app owns a live Bun child: leave it alone and keep waiting.
+    StillStarting,
+    /// No live Bun child of this app's: start one exactly as before.
+    Spawn,
+}
+
+/// DD-073: liveness of the tracked Bun child decides whether ensure may spawn.
+///
+/// `live` comes from [`process_lifecycle::is_live`] — the same rule the
+/// supervisor and the Ollama arm use — so this adds no second liveness test.
+/// Replacing a live child would kill a startup already in flight and charge a
+/// give-up failure to work the app is still waiting on.
+fn owned_bun_child_start(live: bool) -> OwnedBunChildStart {
+    if live {
+        OwnedBunChildStart::StillStarting
+    } else {
+        OwnedBunChildStart::Spawn
+    }
+}
+
 /// `port_state` is the identity probe, injected so the guard's decision can be
 /// tested without a real listener or a spawned child. It runs after any tracked
 /// child has been reaped and before the spawn, and only its answer — not bare
@@ -2072,6 +2099,11 @@ enum StartupFailure {
 /// configured remote/WSL endpoint, or a WSL-launched Bun keeps the probe-first
 /// path and the open-listener second chance. The child is always verified
 /// healthy afterwards; spawning alone is not success.
+///
+/// `spawn_owned_child` reports whether it spawned a child or left a live one
+/// where it was (DD-073). A child left in place is still waited on for the same
+/// health budget, and reaching the end of that budget is not a failure while
+/// the child it belongs to has not exited.
 async fn drive_jarvis_server_start<P, PF, D, DF, L, S, SF, E, M>(
     remote_endpoint_requires_probe: bool,
     probe_healthy: P,
@@ -2088,7 +2120,7 @@ where
     DF: std::future::Future<Output = ()>,
     L: Fn() -> bool,
     S: Fn() -> SF,
-    SF: std::future::Future<Output = Result<(), String>>,
+    SF: std::future::Future<Output = Result<OwnedBunChildStart, String>>,
     E: Fn() -> u64,
     M: Fn(),
 {
@@ -2123,7 +2155,7 @@ where
         }
         log::warn!(
             target: "jarvis::startup",
-            "Bun port open but /health still failing — replacing the tracked child"
+            "Bun port open but /health still failing — handing the port over to the owned-child start"
         );
     } else if !remote_endpoint_requires_probe {
         // Closed native listener and nothing to reach outside it: the probe is
@@ -2136,9 +2168,18 @@ where
     }
 
     // Replace the tracked child once. Port listeners without an owned Child
-    // handle are never terminated by startup recovery.
-    spawn_owned_child().await.map_err(StartupFailure::Spawn)?;
-    log::info!(target: "jarvis::startup", "Bun child spawn returned");
+    // handle are never terminated by startup recovery. The effect reports
+    // whether it spawned; DD-073 leaves a live owned child in place instead.
+    let owned_start = spawn_owned_child().await.map_err(StartupFailure::Spawn)?;
+    match owned_start {
+        OwnedBunChildStart::Spawn => {
+            log::info!(target: "jarvis::startup", "Bun child spawn returned")
+        }
+        OwnedBunChildStart::StillStarting => log::info!(
+            target: "jarvis::startup",
+            "Bun child this app owns is still starting; waiting for it instead of replacing it"
+        ),
+    }
 
     // Wait (off the main thread) for the freshly spawned server to come up.
     while elapsed_since_spawn() < SPAWN_HEALTH_BUDGET_MS {
@@ -2148,9 +2189,25 @@ where
         }
         delay(500).await;
     }
+    if owned_start == OwnedBunChildStart::StillStarting {
+        // DD-073: the child this app spawned has not exited, so this is a wait
+        // that outlasted one health budget, not a failed start. Report no
+        // failure — the give-up counter must not be advanced for a child the
+        // app is still waiting on — and leave the child running, so the next
+        // ensure waits on it again instead of replacing it.
+        log::warn!(
+            target: "jarvis::startup",
+            "Bun child this app owns has not answered /health within one health budget; \
+             leaving it running"
+        );
+        return Ok(());
+    }
     Err(StartupFailure::TimedOut)
 }
 
+/// Ensure this app's Bun server is running. Its own live child is never
+/// replaced: the spawn is only reached when the tracked child has exited or no
+/// child was ever tracked (DD-073).
 pub async fn ensure_jarvis_server_started() -> Result<(), String> {
     use std::sync::atomic::{AtomicI64, Ordering};
     // Last time the server was confirmed healthy (epoch ms). A short TTL lets the
@@ -2194,11 +2251,27 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
         |millis: u64| tokio::time::sleep(std::time::Duration::from_millis(millis)),
         // Occupancy only: the driver decides *ordering* — spawn before probing
         // when nothing is bound. Ownership is the start guard's question, and
-        // the guard asks `probe_bun_port_state` inside the spawn (DD-T1).
+        // the guard asks `probe_bun_port_state` inside the spawn (DD-T1); the
+        // child this app already owns is checked first (DD-073).
         bun_server_is_listening,
         move || {
             let spawn_clock = Arc::clone(&spawn_clock);
             async move {
+                // DD-073: a Bun child this app spawned and still owns is a
+                // server that has not finished binding, not somebody else's
+                // listener. Consult the same liveness rule the supervisor and
+                // the Ollama arm use, before the spawn: `replace = true` below
+                // would reap that child and kill the start already in flight.
+                if owned_bun_child_start(process_lifecycle::is_live(
+                    process_lifecycle::ManagedProcess::BunServer,
+                )) == OwnedBunChildStart::StillStarting
+                {
+                    log::info!(
+                        target: "jarvis::startup",
+                        "Bun child this app owns has not exited; leaving it alone and waiting for it"
+                    );
+                    return Ok(OwnedBunChildStart::StillStarting);
+                }
                 let server_entry = find_jarvis_server()
                     .ok_or_else(|| "server-jarvis index.ts not found".to_string())?;
                 log::info!(target: "jarvis::startup", "Bun server entry resolved: {server_entry}");
@@ -2210,7 +2283,7 @@ pub async fn ensure_jarvis_server_started() -> Result<(), String> {
                 *spawn_clock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
-                Ok::<(), String>(())
+                Ok::<OwnedBunChildStart, String>(OwnedBunChildStart::Spawn)
             }
         },
         move || {
@@ -3416,11 +3489,12 @@ mod bun_startup_tests {
         }
     }
 
-    async fn run_driver(
+    /// Drive the production startup gate with a scripted spawn outcome.
+    async fn run_driver_with(
         effects: &Effects,
         remote_endpoint_requires_probe: bool,
         listener_open: bool,
-        spawn_succeeds: bool,
+        spawn: Result<OwnedBunChildStart, String>,
     ) -> Result<(), StartupFailure> {
         drive_jarvis_server_start(
             remote_endpoint_requires_probe,
@@ -3443,13 +3517,22 @@ mod bun_startup_tests {
                 let effects = effects.clone();
                 move || {
                     let effects = effects.clone();
+                    let spawn = spawn.clone();
                     async move {
-                        effects.note("spawn");
-                        if spawn_succeeds {
-                            effects.set_healthy(true);
-                            Ok(())
-                        } else {
-                            Err("spawn failed".to_string())
+                        match spawn {
+                            Ok(OwnedBunChildStart::Spawn) => {
+                                effects.note("spawn");
+                                effects.set_healthy(true);
+                                Ok(OwnedBunChildStart::Spawn)
+                            }
+                            Ok(OwnedBunChildStart::StillStarting) => {
+                                effects.note("still-starting");
+                                Ok(OwnedBunChildStart::StillStarting)
+                            }
+                            Err(error) => {
+                                effects.note("spawn");
+                                Err(error)
+                            }
                         }
                     }
                 }
@@ -3462,6 +3545,28 @@ mod bun_startup_tests {
                 let effects = effects.clone();
                 move || effects.note("healthy")
             },
+        )
+        .await
+    }
+
+    /// The long-standing signature: `spawn_succeeds` is a fresh spawn or a
+    /// reported spawn error, exactly as before DD-073.
+    async fn run_driver(
+        effects: &Effects,
+        remote_endpoint_requires_probe: bool,
+        listener_open: bool,
+        spawn_succeeds: bool,
+    ) -> Result<(), StartupFailure> {
+        let spawn = if spawn_succeeds {
+            Ok(OwnedBunChildStart::Spawn)
+        } else {
+            Err("spawn failed".to_string())
+        };
+        run_driver_with(
+            effects,
+            remote_endpoint_requires_probe,
+            listener_open,
+            spawn,
         )
         .await
     }
@@ -3584,6 +3689,75 @@ mod bun_startup_tests {
         );
         assert_eq!(effects.snapshot(), vec!["listen", "spawn"]);
     }
+
+    /// DD-073: a Bun child this app spawned and still owns is still starting,
+    /// not somebody else's listener. Even after one health budget without
+    /// `/health`, the ensure path must not spawn a replacement and must not
+    /// report a failure — the give-up counter must not be advanced for work the
+    /// app is still waiting on.
+    #[tokio::test]
+    async fn an_owned_child_inside_its_start_budget_is_left_alone() {
+        let effects = Effects::default();
+        // The budget is spent, and the child still never answers /health: this
+        // is exactly the case that used to be replaced by the next ensure.
+        effects.push_elapsed(0);
+        effects.push_elapsed(20_001);
+        effects.push_probe(false);
+
+        let spawn = Ok(OwnedBunChildStart::StillStarting);
+        let outcome = run_driver_with(&effects, false, false, spawn).await;
+
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "waiting on a live child must not be reported as a startup failure"
+        );
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "still-starting", "probe", "delay:500"],
+            "a live owned child must be waited on: no replacement spawn and no \
+             unconfirmed health claim"
+        );
+        assert!(
+            !effects.snapshot().iter().any(|event| event == "spawn"),
+            "the owned child must not be replaced by a second spawn"
+        );
+    }
+
+    /// DD-073 must not change the ordinary path: with no live child in the slot
+    /// the ensure path still spawns, and health is still required afterwards.
+    #[tokio::test]
+    async fn a_dead_or_absent_child_still_spawns_as_before() {
+        let effects = Effects::default();
+        effects.push_elapsed(0);
+
+        let spawn = Ok(OwnedBunChildStart::Spawn);
+        let outcome = run_driver_with(&effects, false, false, spawn).await;
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            effects.snapshot(),
+            vec!["listen", "spawn", "probe", "healthy"],
+            "without a live owned child the ensure path must spawn exactly as before"
+        );
+    }
+
+    /// DD-073: the decision is a reading of the one existing liveness rule, so
+    /// only a live child is left where it is; a dead or absent slot still
+    /// spawns.
+    #[test]
+    fn only_a_live_owned_child_is_left_where_it_is() {
+        assert_eq!(
+            owned_bun_child_start(true),
+            OwnedBunChildStart::StillStarting,
+            "a live tracked Bun child must not be replaced"
+        );
+        assert_eq!(
+            owned_bun_child_start(false),
+            OwnedBunChildStart::Spawn,
+            "a dead or absent Bun child must still be started"
+        );
+    }
 }
 
 /// DS-01 boot-order regressions: Bun (the UI's only data source) must begin its
@@ -3674,7 +3848,7 @@ mod bun_boot_order_tests {
                     async move {
                         trace.note("bun:spawn");
                         if spawn_succeeds {
-                            Ok::<(), String>(())
+                            Ok::<OwnedBunChildStart, String>(OwnedBunChildStart::Spawn)
                         } else {
                             Err("spawn failed".to_string())
                         }
@@ -4003,6 +4177,41 @@ mod owned_slot_wiring_tests {
         assert!(
             ollama.contains("process_lifecycle::launch( process_lifecycle::ManagedProcess::Ollama, false,"),
             "the Ollama start must not replace a child that is still coming up:\n{ollama}"
+        );
+    }
+
+    /// DD-073 wiring: the decision above is only real if the ensure path asks
+    /// the tracked child's liveness before it reaches the spawn. That path
+    /// performs real boot work and cannot be invoked from a unit test, so this
+    /// reads its body: it must consult `is_live` for the Bun slot, and the
+    /// check must come before `start_jarvis_server`, which reaps the tracked
+    /// child before spawning.
+    #[test]
+    fn the_ensure_path_asks_owned_liveness_before_it_spawns() {
+        let ensure = normalized_body(
+            "pub async fn ensure_jarvis_server_started(",
+            "/// Generic listener probe, used where",
+        );
+        let live_check = ensure
+            .find("process_lifecycle::is_live( process_lifecycle::ManagedProcess::BunServer")
+            .unwrap_or_else(|| {
+                panic!("the ensure path must consult the tracked Bun child's liveness:\n{ensure}")
+            });
+        let spawn = ensure
+            .find("start_jarvis_server(")
+            .expect("the ensure path must still start the server through start_jarvis_server");
+        assert!(
+            live_check < spawn,
+            "owned-child liveness must be consulted before the spawn, since the \
+             spawn replaces the tracked child:\n{ensure}"
+        );
+        assert!(
+            ensure.contains("return Ok(OwnedBunChildStart::StillStarting);"),
+            "a live owned child must be reported as still starting, not spawned over:\n{ensure}"
+        );
+        assert!(
+            !ensure.contains("ManagedProcess::Ollama"),
+            "the Bun ensure path must ask about the Bun slot, not another service:\n{ensure}"
         );
     }
 
