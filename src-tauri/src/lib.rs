@@ -3325,6 +3325,15 @@ impl TeardownEvent {
 const APP_LOG_MAX_FILE_BYTES: u128 = 8 * 1024 * 1024;
 const APP_LOG_ROTATED_FILES_KEPT: usize = 2;
 
+/// The level filter `Jarvis.log` runs at (DD-106).
+///
+/// Startup and app diagnostics are emitted at Info or above; dependency
+/// libraries emit DEBUG/TRACE chatter through the same global logger, which
+/// filled the app log without adding packaged-app evidence. Pinning the filter
+/// to Info keeps every line the app itself reports today while dropping the
+/// dependency trace noise.
+const APP_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
@@ -3397,6 +3406,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_log::Builder::default()
+                .level(APP_LOG_LEVEL)
                 .max_file_size(APP_LOG_MAX_FILE_BYTES)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(
                     APP_LOG_ROTATED_FILES_KEPT,
@@ -6389,6 +6399,47 @@ mod app_log_rotation_tests {
         assert!(
             rotation < kept && kept < rotation_call_end,
             "the archive count constant must be KeepSome's argument"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_log_filter_tests {
+    use super::APP_LOG_LEVEL;
+
+    /// DD-106: the app log records Info and above. Startup and app
+    /// diagnostics are logged at Info, while dependency DEBUG/TRACE chatter
+    /// reached the same file and buried the packaged-app evidence.
+    #[test]
+    fn the_app_log_filter_is_info() {
+        assert_eq!(
+            APP_LOG_LEVEL,
+            log::LevelFilter::Info,
+            "the app log must keep Info and above without dependency trace noise"
+        );
+    }
+
+    /// The filter constant only matters if `run()` applies it to the plugin.
+    /// The builder needs a live Tauri app, so read the registration instead.
+    #[test]
+    fn the_log_plugin_is_registered_with_the_info_filter() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let body = SOURCE.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let builder = body
+            .find("tauri_plugin_log::Builder::default()")
+            .expect("the log plugin must be registered in run()");
+        let filter = body
+            .find(".level(APP_LOG_LEVEL)")
+            .expect("the log plugin must apply the shared level filter");
+        let build = builder
+            + body[builder..]
+                .find(".build()")
+                .expect("the log plugin chain must be built");
+
+        assert!(
+            builder < filter && filter < build,
+            "run() must chain the level filter onto the log plugin builder"
         );
     }
 }
