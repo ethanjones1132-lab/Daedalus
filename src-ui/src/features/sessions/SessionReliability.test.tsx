@@ -66,6 +66,53 @@ describe('preserved local Session reliability', () => {
     expect(screen.getByText('Turn stopped before it was sent. Your draft was kept.')).toBeInTheDocument();
     expect(screen.queryByText('(stopped)')).not.toBeInTheDocument();
   });
+  it('re-uses the saved user row when Stop retires setup after the row was persisted', async () => {
+    const initial = invokeMock.getMockImplementation()!;
+    let resolveMemory!: (value: unknown) => void;
+    let memoryBlocked = false;
+    let memoryArgs: Record<string, any> = {};
+    invokeMock.mockImplementation((command, args) => {
+      if (command === 'memory_prepare_turn' && !memoryBlocked) {
+        memoryBlocked = true; memoryArgs = args;
+        return new Promise(resolve => { resolveMemory = resolve; });
+      }
+      return initial(command, args);
+    });
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const fetchMock = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({ start(value) { controller = value; } }), { headers: { 'Content-Type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const userAppends = () => invokeMock.mock.calls.filter(call => call[0] === 'append_message' && call[1]?.role === 'user');
+
+    render(<ChatPanel activeSession="session-1" setActiveSession={vi.fn()} config={null} backendLabel="Ollama" modelLabel="test" onSessionCreated={vi.fn()} />);
+    const composer = screen.getByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'One saved row' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    // The user row is persisted first, then setup blocks in memory preparation.
+    await waitFor(() => expect(memoryBlocked).toBe(true));
+    expect(userAppends()).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Stop streaming' }));
+    await act(async () => { resolveMemory(nativeMemoryFixture('memory_prepare_turn', memoryArgs)); });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop streaming' })).not.toBeInTheDocument());
+    expect(composer).toHaveValue('One saved row');
+
+    // The retry re-uses that persisted row instead of appending a second one.
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(userAppends()).toHaveLength(1);
+    await act(async () => {
+      controller.enqueue(new TextEncoder().encode([
+        'data: {"type":"stream_event","delta":{"text":"Saved answer"}}',
+        'data: {"type":"result","subtype":"success","is_error":false,"result":"Saved answer"}',
+        '',
+      ].join('\n\n')));
+      controller.close();
+    });
+    await waitFor(() => expect(screen.getByText('Saved answer')).toBeInTheDocument());
+    expect(screen.getAllByText('One saved row')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(call => call[0] === 'record_terminal_run')).toHaveLength(1);
+  });
   it('does not let an old Session Stop reply unlock a newer pending Stop', async () => {
     const stops: Array<{ sid: string; resolve: (value: boolean) => void }> = [];
     const initial = invokeMock.getMockImplementation()!;

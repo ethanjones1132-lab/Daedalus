@@ -735,7 +735,24 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   const streamAbortRef = useRef<AbortController | null>(null);
   const sendGateRef = useRef(new SendGate());
   // Owns setup from native Session creation until the HTTP request begins.
-  const submissionRef = useRef<{ generation: number; dispatched: boolean; optimisticUserId?: string } | null>(null);
+  const submissionRef = useRef<{
+    generation: number;
+    dispatched: boolean;
+    optimisticUserId?: string;
+    /**
+     * The user row this submission already persisted, published the moment
+     * `append_message` resolves. Setup (memory preparation, history, Goal
+     * binding) can still be running when the operator Stops; this tuple is how
+     * the pre-dispatch Stop branch knows a row exists to hand to the retry
+     * ledger instead of leaving it stranded.
+     */
+    savedUserRow?: {
+      sessionId: string;
+      content: string;
+      userMessageId: string;
+      assistantMessageId: string;
+    };
+  } | null>(null);
   // Saved-row reuse ledger for a POST that never reached the server. The
   // user row is persisted BEFORE `POST /chat/stream`; when that POST then
   // fails without ever starting (refused/network fetch error, or a non-OK
@@ -753,6 +770,22 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     userMessageId: string;
     assistantMessageId: string;
   } | null>(null);
+  // One arming point for that ledger. The transport handoff inside
+  // `streamFromJarvisApi` and the pre-dispatch Stop branch in `handleStop`
+  // both write the SAME tuple through this function, so a Stop can never
+  // invent a second mechanism. A missing row id arms nothing: there is no
+  // persisted row to re-use.
+  const armSavedUserRowRetry = useCallback((retry: {
+    sessionId: string;
+    content: string;
+    userMessageId: string | null | undefined;
+    assistantMessageId: string;
+  } | null) => {
+    if (!retry) return;
+    const { sessionId, content, userMessageId, assistantMessageId } = retry;
+    if (!userMessageId) return;
+    savedUserRowRetryRef.current = { sessionId, content, userMessageId, assistantMessageId };
+  }, []);
   // 2026-07-13 live incident (session 7254c3ae): a rapid second Enter-press
   // bypassed the React-state `isStreaming` guard because setState is
   // async/batched. The server-side ActiveStreamRegistry then silently
@@ -1707,22 +1740,17 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       throw new DOMException('Stale Session turn', 'AbortError');
     };
 
-    // Failure handoff for a saved user row whose POST never reached the
-    // server. The row stays persisted (no client-side row writes); the exact
-    // retry tuple is armed so the next identical send re-uses the row rather
-    // than appending a duplicate one. An operator Stop or a stale Session
-    // abort is NOT a transport failure and never arms this.
-    const armSavedUserRowRetry = (
-      rowId: string | null,
-      assistantId: string,
-    ) => {
+    // Failure handoff for this turn's saved user row. The ledger itself lives
+    // at hook scope so the pre-dispatch Stop branch arms the exact same tuple;
+    // here only the current turn's identity is bound.
+    const armThisTurnsSavedRow = (rowId: string | null) => {
       if (!rowId) return;
-      savedUserRowRetryRef.current = {
+      armSavedUserRowRetry({
         sessionId: sid,
         content: userMsg,
         userMessageId: rowId,
-        assistantMessageId: assistantId,
-      };
+        assistantMessageId: assistantClientMessageId,
+      });
     };
 
     // One stable turn identity for this submitted turn, held across every
@@ -1984,6 +2012,19 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         }
       }
 
+      // The row is now persisted (fresh or re-used). Publish it on the live
+      // submission so a Stop that retires setup before dispatch can hand it to
+      // the retry ledger — setup continues below and can take long enough for
+      // the operator to Stop first. A Stop before this point arms nothing.
+      if (userMessageId && submissionRef.current?.generation === sendGeneration) {
+        submissionRef.current.savedUserRow = {
+          sessionId: sid,
+          content: userMsg,
+          userMessageId,
+          assistantMessageId: assistantClientMessageId,
+        };
+      }
+
       // 2. Prepare native recall and load native prompt history. References
       // only; no memory text crosses the webview. A failed preparation still
       // runs ordinary inference with a typed status and no preparation
@@ -2112,7 +2153,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         // operator Stop or a stale Session abort is not a transport failure
         // and keeps the current behaviour exactly.
         if (controller.signal.aborted || stopRequestedRef.current) throw e;
-        armSavedUserRowRetry(userMessageId, assistantClientMessageId);
+        armThisTurnsSavedRow(userMessageId);
         throw e;
       }
 
@@ -2120,7 +2161,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         // Same rollback handoff for an HTTP-level rejection: the turn never
         // started, so the saved user row is handed to the retry ledger
         // instead of being duplicated by a re-append.
-        armSavedUserRowRetry(userMessageId, assistantClientMessageId);
+        armThisTurnsSavedRow(userMessageId);
         const detail = await readServerErrorMessage(response);
         const statusMessage = `Jarvis server returned ${response.status}.`;
         throw new JarvisStreamError(
@@ -2669,7 +2710,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
         const aborted = controller.signal.aborted || stopRequestedRef.current;
         const abortedError = turnError instanceof DOMException && turnError.name === 'AbortError';
         if (!aborted && !abortedError) {
-          armSavedUserRowRetry(userMessageId, assistantClientMessageId);
+          armThisTurnsSavedRow(userMessageId);
         }
       }
     }
@@ -2679,7 +2720,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
 
     if (requestIsCurrent()) finalizeAssistantMessage(sid, terminal ?? undefined);
     if (streamAbortRef.current === controller) streamAbortRef.current = null;
-  }, [appendAssistantText, applyTokenChunk, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
+  }, [appendAssistantText, applyTokenChunk, armSavedUserRowRetry, clearPendingApproval, dispatchActivity, finalizeAssistantMessage, matchesStreamSession, presentApprovalRequest, takePendingTokens]);
 
   // Phase 4.2 — bind a canonical workspace through the native command and
   // confirm the native read-back. A rejected/malformed result is never a
@@ -3071,6 +3112,13 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
   const handleStop = useCallback(async () => {
     const submission = submissionRef.current;
     if (submission && !submission.dispatched && sendGateRef.current.isCurrent(submission.generation)) {
+      // The user row may already be persisted (`append_message` resolved) while
+      // setup — memory preparation, history, Goal binding — never finished.
+      // Hand that exact row to the saved-row retry ledger so the operator's
+      // next send re-uses it instead of appending a duplicate user row. A Stop
+      // that lands before the row exists arms nothing: there is no saved row.
+      // This is not a remote cancel, so the copy below claims none.
+      if (submission.savedUserRow) armSavedUserRowRetry(submission.savedUserRow);
       // Nothing has been sent to the server yet. Retire local setup immediately;
       // the native memory finalizer can still account for a saved user row.
       sendGateRef.current.invalidate();
@@ -3119,7 +3167,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
     setReasoningText('');
     setShowReasoning(false);
     controller?.abort('Explicit Stop confirmed by the server');
-  }, [activeSession, clearPendingApproval, dispatchStopRequest, sessionId, resetStopRequest, discardPendingTokens]);
+  }, [activeSession, armSavedUserRowRetry, clearPendingApproval, dispatchStopRequest, sessionId, resetStopRequest, discardPendingTokens]);
 
   // Phase 1.1 — approve / deny the pending tool call and forward the decision
   // to the Bun server. Surface any POST error so the user can retry.
