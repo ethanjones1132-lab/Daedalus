@@ -986,12 +986,13 @@ fn spawn_claude_cli_proxy_child(
     command.args(&py.prefix_args).arg(&script.path);
     let through_wsl = matches!(script.kind, ProxyScriptKind::Wsl);
     configure_proxy_runtime(&mut command, &model, through_wsl);
-    command
-        .stdout(jarvis_server_log_stdio("claude-proxy.log"))
-        .stderr(jarvis_server_log_stdio("claude-proxy.err.log"));
+    // DD-107: the same bounded stdio logs the Bun server uses.
+    let (stdout_stdio, stdout_log) = jarvis_server_log_stdio("claude-proxy.log");
+    let (stderr_stdio, stderr_log) = jarvis_server_log_stdio("claude-proxy.err.log");
+    command.stdout(stdout_stdio).stderr(stderr_stdio);
     configure_proxy_credential(&mut command, &openrouter_api_key, through_wsl);
     crate::wsl::hide_windows_console(&mut command);
-    let child = match process_lifecycle::spawn_managed(&mut command) {
+    let mut child = match process_lifecycle::spawn_managed(&mut command) {
         Ok(c) => c,
         Err(e) => {
             log::error!(
@@ -1012,6 +1013,7 @@ fn spawn_claude_cli_proxy_child(
             return Err(format!("Claude proxy spawn failed: {e}"));
         }
     };
+    bind_child_stdio_logs(&mut child, stdout_log, stderr_log);
     println!(
         "[Jarvis] claude_cli_proxy started (PID {}, interpreter {:?} {:?}, script {}, source {:?}, model {})",
         child.id(),
@@ -1771,10 +1773,212 @@ fn open_server_log_target(
     }
 }
 
-fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
+/// DD-107: the cap for one child-stdio log file.
+///
+/// This is the same rule DD-105 applies to the JS self-log in
+/// `server-jarvis/src/self-log.ts` (`createSelfLogWriter`): one `.1` sibling,
+/// the live size tracked in memory, and a rotation or append that cannot happen
+/// never stops the writer. The cap is larger than that log's 5 MB because this
+/// file carries the whole child's stdout/stderr, not one server's own lines.
+const SERVER_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Suffix of the single rotated generation kept beside a live child-stdio log.
+const SERVER_LOG_ROTATED_SUFFIX: &str = ".1";
+
+/// Bounded, append-only writer for one child-stdio log (DD-107).
+///
+/// Mirrors `createSelfLogWriter` in `server-jarvis/src/self-log.ts`: the live
+/// file is capped at `cap` bytes, and when the next line would cross the cap the
+/// file is rotated once into a `.1` sibling — the older generation is replaced
+/// first, because Windows cannot rename onto an existing name — so the newest
+/// line starts the fresh live file and the operator keeps one archive.
+///
+/// The live size is tracked in memory: it is measured once (lazily, on the first
+/// line) and each append adds the line's own byte length, so the hot path is a
+/// comparison instead of a stat or a read of the whole file.
+///
+/// Nothing here panics or propagates an error. If the size cannot be measured,
+/// logging starts from zero; if the append fails, only that line is dropped; if
+/// the rotation fails — the `.1` name is a directory, the directory is
+/// read-only, the live path is not a file — the file keeps growing and the
+/// boundary is retried once per cap instead of once per line. A broken log must
+/// never break the child.
+struct BoundedLogWriter {
+    path: std::path::PathBuf,
+    cap: u64,
+    /// Live file size in bytes; `None` until it has been measured once.
+    size: Option<u64>,
+    /// The size at which the next line rotates. Equal to `cap` until a rotation
+    /// fails, at which point it moves one more cap ahead so a permanently
+    /// unrotatable file is retried once per cap instead of once per line.
+    rotate_at: u64,
+}
+
+impl BoundedLogWriter {
+    fn new(path: std::path::PathBuf, cap: u64) -> Self {
+        let cap = if cap > 0 { cap } else { SERVER_LOG_MAX_BYTES };
+        Self {
+            path,
+            cap,
+            size: None,
+            rotate_at: cap,
+        }
+    }
+
+    /// The writer's belief about the live file's size, in bytes.
+    fn size(&self) -> u64 {
+        self.size.unwrap_or(0)
+    }
+
+    fn ensure_size(&mut self) {
+        if self.size.is_some() {
+            return;
+        }
+        // Absent, unreadable, or not a regular file: start from the top.
+        self.size = Some(
+            std::fs::metadata(&self.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        );
+    }
+
+    /// The single `.<n>` sibling the live file rotates into — the same name a
+    /// reader finds beside the JS self-log.
+    fn rotated_path(&self) -> std::path::PathBuf {
+        let mut name = self.path.clone().into_os_string();
+        name.push(SERVER_LOG_ROTATED_SUFFIX);
+        std::path::PathBuf::from(name)
+    }
+
+    /// Rotate the live file into its `.1` sibling. `false` means the file was
+    /// left where it is and logging must continue into it.
+    fn rotate(&mut self) -> bool {
+        let previous = self.rotated_path();
+        // Windows cannot rename onto an existing name. A failure here (the name
+        // is a directory we cannot replace, the volume is read-only) is left to
+        // the rename below, which is the step that decides.
+        let _ = std::fs::remove_file(&previous);
+        if std::fs::rename(&self.path, &previous).is_err() {
+            return false;
+        }
+        self.size = Some(0);
+        self.rotate_at = self.cap;
+        true
+    }
+
+    fn append(&self, line: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(line)?;
+        Ok(())
+    }
+
+    /// Append one record, rotating first when it would cross the cap. Never
+    /// returns an error: the caller is a drain thread with no one to tell.
+    fn write(&mut self, line: &[u8]) {
+        let bytes = line.len() as u64;
+        self.ensure_size();
+        let size = self.size();
+        if size + bytes > self.rotate_at && !self.rotate() {
+            // Rotation failed: keep the line (the record wins over the bound)
+            // and back the boundary off by one cap so we do not retry on every
+            // single line.
+            self.rotate_at = size + self.cap;
+        }
+        if self.append(line).is_ok() {
+            let size = self.size() + bytes;
+            self.size = Some(size);
+            // A single line larger than the cap cannot be rotated away; move the
+            // boundary past it so it does not force a rotation on every line.
+            if size > self.rotate_at {
+                self.rotate_at = size + self.cap;
+            }
+        }
+    }
+}
+
+/// Append everything a child writes to one pipe into its bounded log.
+///
+/// One background thread per stream drains the pipe as the child writes, so a
+/// full pipe buffer can never block the server. The thread ends at EOF (the
+/// child exited or was killed) and swallows every failure inside it: logging is
+/// best-effort by design and must not take the child down with it.
+fn spawn_stdio_log_drain<R>(pipe: R, path: std::path::PathBuf)
+where
+    R: std::io::Read + Send + 'static,
+{
+    let spawned = std::thread::Builder::new()
+        .name("jarvis-stdio-log".to_string())
+        .spawn(move || {
+            use std::io::BufRead as _;
+
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut writer = BoundedLogWriter::new(path, SERVER_LOG_MAX_BYTES);
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => writer.write(&line),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        // A drain thread that cannot start would leave the pipe unread and the
+        // child blocked on a full buffer; dropping the read end here turns that
+        // into a write error the child can report, which is the lesser failure.
+        log::warn!(
+            target: "jarvis::startup",
+            "child stdio log drain could not start: {error}"
+        );
+    }
+}
+
+/// Hand a freshly spawned child's pipes to their bounded log writers (DD-107).
+///
+/// Both Bun spawn paths (WSL and direct) and the Claude proxy funnel through
+/// here, so every child's stdout/stderr is drained the same way. Taking the pipe
+/// out of the child also means the `Child` handle the lifecycle registry stores
+/// owns no reader that could go stale.
+fn bind_child_stdio_logs(
+    child: &mut std::process::Child,
+    stdout_log: Option<std::path::PathBuf>,
+    stderr_log: Option<std::path::PathBuf>,
+) {
+    if let (Some(pipe), Some(path)) = (child.stdout.take(), stdout_log) {
+        spawn_stdio_log_drain(pipe, path);
+    }
+    if let (Some(pipe), Some(path)) = (child.stderr.take(), stderr_log) {
+        spawn_stdio_log_drain(pipe, path);
+    }
+}
+
+/// Give a child a piped stdout/stderr plus the bounded log file a background
+/// thread appends it to (DD-107).
+///
+/// The file name, the directory resolution and the DD-080 fallback are exactly
+/// what they were; what changes is that the child writes into a pipe instead of
+/// a file handle, so the writer — not the child — owns the cap and the rotation.
+/// A `None` path means neither location could be opened and the child's output
+/// is discarded, after the failure has been recorded.
+fn jarvis_server_log_stdio(
+    file_name: &str,
+) -> (std::process::Stdio, Option<std::path::PathBuf>) {
     let (log_dir, fallback_dir) = jarvis_server_log_dirs();
     match open_server_log_target(&log_dir, &fallback_dir, file_name) {
-        ServerLogOpen::Primary(target) => std::process::Stdio::from(target.file),
+        ServerLogOpen::Primary(target) => {
+            // The probe already created the file and proved it writable; drop
+            // that handle so the writer's per-line append and any rotation
+            // rename never compete with it.
+            drop(target.file);
+            (std::process::Stdio::piped(), Some(target.path))
+        }
         ServerLogOpen::Fallback {
             target,
             primary_error,
@@ -1790,7 +1994,8 @@ fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
             );
             log::error!(target: "jarvis::startup", "{line}");
             eprintln!("[Jarvis] {line}");
-            std::process::Stdio::from(target.file)
+            drop(target.file);
+            (std::process::Stdio::piped(), Some(target.path))
         }
         ServerLogOpen::None {
             primary_error,
@@ -1802,7 +2007,7 @@ fn jarvis_server_log_stdio(file_name: &str) -> std::process::Stdio {
             );
             log::error!(target: "jarvis::startup", "{line}");
             eprintln!("[Jarvis] {line}");
-            std::process::Stdio::null()
+            (std::process::Stdio::null(), None)
         }
     }
 }
@@ -1930,6 +2135,13 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
     let (cap_name, cap_value, app_name, app_value) =
         crate::jarvis::memory::transport::owned_memory_env();
 
+    // DD-107: both launch paths below hand the child these same two pipes; one
+    // background thread per stream appends them to the bounded logs, so the
+    // file names and the child's own output are unchanged while the file on
+    // disk stays capped.
+    let (stdout_stdio, stdout_log) = jarvis_server_log_stdio("server-jarvis.log");
+    let (stderr_stdio, stderr_log) = jarvis_server_log_stdio("server-jarvis.err.log");
+
     let spawn_result = if launches_through_wsl {
         // Original WSL path for dev / full WSL setups.
         let cmd = wsl_server_command(&bun, entry);
@@ -1939,8 +2151,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
             .args(["--", "bash", "-lc", &cmd])
             .env(cap_name, &cap_value)
             .env(app_name, &app_value)
-            .stdout(jarvis_server_log_stdio("server-jarvis.log"))
-            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio);
         // WSL does not inherit the Windows environment; WSLENV lists the
         // variables to forward. The values are passed via `.env`, never
         // interpolated into the shell command.
@@ -1968,8 +2180,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         command
             .env(cap_name, &cap_value)
             .env(app_name, &app_value)
-            .stdout(jarvis_server_log_stdio("server-jarvis.log"))
-            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio);
         if should_hide_jarvis_server_console(is_windows, looks_like_local_bun) {
             crate::wsl::hide_windows_console(&mut command);
         }
@@ -1993,8 +2205,8 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
             .env("JARVIS_HOME", wsl_home())
             .env(cap_name, &cap_value)
             .env(app_name, &app_value)
-            .stdout(jarvis_server_log_stdio("server-jarvis.log"))
-            .stderr(jarvis_server_log_stdio("server-jarvis.err.log"));
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
         let result = process_lifecycle::spawn_managed(&mut command);
@@ -2007,7 +2219,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         );
         result
     };
-    let child = match spawn_result {
+    let mut child = match spawn_result {
         Ok(c) => c,
         Err(e) => {
             log::error!(
@@ -2018,6 +2230,9 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
             return Err(format!("Bun spawn failed: {e}"));
         }
     };
+    // One bind for every launch branch above: whichever path spawned the child,
+    // its piped stdout/stderr is drained into the same bounded logs (DD-107).
+    bind_child_stdio_logs(&mut child, stdout_log, stderr_log);
     println!("[Jarvis] Bun server spawned (PID {})", child.id());
     Ok(child)
 }
@@ -5604,6 +5819,221 @@ mod server_log_fallback_tests {
         assert!(
             !body.contains("unwrap_or_else(|_| std::process::Stdio::null())"),
             "a failed open must not silently discard the child's output:\n{body}"
+        );
+    }
+}
+
+/// DD-107: the two child-stdio logs (`server-jarvis.log`, `server-jarvis.err.log`)
+/// must stay bounded on disk with the same rule DD-105 gives the JS self-log in
+/// `server-jarvis/src/self-log.ts`: one `.1` sibling, the live size tracked in
+/// memory, and a rotation that cannot happen never stopping the writer. These
+/// drive the writer with a small cap so the boundary is reached in a couple of
+/// lines, plus one real drain thread over a cursor so the body production runs
+/// is covered without spawning a child.
+#[cfg(test)]
+mod bounded_server_log_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn unique_dir(label: &str) -> PathBuf {
+        static NEXT_DIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "jarvis-stdio-log-{label}-{}-{sequence}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    fn contents(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn rotated(live: &Path, file_name: &str) -> PathBuf {
+        live.with_file_name(format!("{file_name}.1"))
+    }
+
+    /// The cap and the sibling name are the shared rule; a reader of the live
+    /// path must find the newest generation and one archive beside it.
+    #[test]
+    fn the_stdio_log_cap_and_suffix_are_the_shared_rule() {
+        assert_eq!(
+            SERVER_LOG_MAX_BYTES,
+            10 * 1024 * 1024,
+            "the child-stdio logs are capped at the proposed 10 MB"
+        );
+        assert_eq!(
+            SERVER_LOG_ROTATED_SUFFIX, ".1",
+            "the single rotated generation must be a `.1` sibling, as DD-105 does"
+        );
+    }
+
+    /// The boundary case: the line that would cross the cap starts a fresh live
+    /// file and the older generation becomes the one `.1` sibling.
+    #[test]
+    fn a_line_past_the_cap_rotates_the_older_generation_into_one_sibling() {
+        let dir = unique_dir("rotate");
+        let live = dir.join("server-jarvis.log");
+        let mut writer = BoundedLogWriter::new(live.clone(), 32);
+
+        // 22 bytes, then 29 bytes: the second write crosses the 32-byte cap.
+        writer.write(b"first generation line\n");
+        writer.write(b"second generation stays live\n");
+
+        assert_eq!(
+            contents(&live),
+            "second generation stays live\n",
+            "the newest line must start the fresh live file"
+        );
+        assert_eq!(
+            contents(&rotated(&live, "server-jarvis.log")),
+            "first generation line\n",
+            "the previous generation must be the one `.1` sibling"
+        );
+        assert_eq!(
+            writer.size(),
+            29,
+            "the writer must track the new live size in memory instead of re-stat-ing"
+        );
+    }
+
+    /// A path that cannot rotate (the `.1` name is a directory, so remove and
+    /// rename both fail) must still keep every line and must not panic.
+    #[test]
+    fn an_unrotatable_sibling_keeps_every_line_and_never_panics() {
+        let dir = unique_dir("unrotatable");
+        let live = dir.join("server-jarvis.err.log");
+        // The `.1` name is a directory: `remove_file` cannot replace it and the
+        // rename cannot land on it, on any platform.
+        std::fs::create_dir_all(rotated(&live, "server-jarvis.err.log"))
+            .expect("create the blocking rotated name");
+
+        let mut writer = BoundedLogWriter::new(live.clone(), 16);
+        for line in ["line one\n", "line two\n", "line three\n"] {
+            writer.write(line.as_bytes());
+        }
+
+        let written = contents(&live);
+        assert_eq!(
+            written, "line one\nline two\nline three\n",
+            "a failed rotation must keep the lines, never lose them"
+        );
+        assert_eq!(
+            writer.size(),
+            written.len() as u64,
+            "a failed rotation must still track what the live file holds"
+        );
+        assert!(
+            rotated(&live, "server-jarvis.err.log").is_dir(),
+            "the unrotatable `.1` name must not be replaced or half-rewritten"
+        );
+    }
+
+    /// A single line larger than the cap cannot be rotated away: it is written
+    /// once and the boundary moves past it, so the next line does not force a
+    /// rotation. (A `while size > cap { rotate() }` writer would loop here.)
+    #[test]
+    fn a_line_larger_than_the_cap_does_not_loop() {
+        let dir = unique_dir("oversize");
+        let live = dir.join("server-jarvis.log");
+        let mut writer = BoundedLogWriter::new(live.clone(), 16);
+
+        let huge = format!("{}\n", "x".repeat(400));
+        writer.write(huge.as_bytes());
+        writer.write(b"next\n");
+
+        assert_eq!(
+            contents(&live),
+            format!("{huge}next\n"),
+            "an oversized line is written once and stays live; rotating it away \
+             after the append would loop forever"
+        );
+        assert!(
+            !rotated(&live, "server-jarvis.log").exists(),
+            "the oversized line had nowhere to rotate to, so no archive may appear"
+        );
+        assert_eq!(
+            writer.size(),
+            (huge.len() + "next\n".len()) as u64,
+            "the writer must keep counting bytes past the cap instead of resetting"
+        );
+    }
+
+    /// The drain thread production uses: what the child writes to its pipe lands
+    /// line by line in the live log, through the bounded writer.
+    #[test]
+    fn a_drained_pipe_appends_every_line_to_the_live_log() {
+        let dir = unique_dir("drain");
+        let live = dir.join("server-jarvis.log");
+        let expected = "server booted\nlistening on 1494\n";
+        spawn_stdio_log_drain(
+            std::io::Cursor::new(expected.as_bytes().to_vec()),
+            live.clone(),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let written = contents(&live);
+            if written == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drain thread must append the child's lines; the live log holds {written:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Both Bun launch paths — WSL and direct — must hand the child the piped
+    /// stdio that the bounded writer drains; wiring only one would leave that
+    /// path's log growing without bound.
+    #[test]
+    fn both_bun_spawn_paths_pipe_their_stdio_through_the_bounded_log() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("fn spawn_jarvis_server(")
+            .expect("spawn_jarvis_server must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("\n/// Whether the Bun server is launched inside WSL")
+            .map(|offset| start + offset)
+            .expect("the WSL launch rule must follow the spawn function");
+        let body = &SOURCE[start..end];
+
+        let wsl_start = body
+            .find("if launches_through_wsl")
+            .expect("the WSL branch must exist");
+        let direct_start = body
+            .find("} else if looks_like_local_bun {")
+            .expect("the direct Bun branch must exist");
+        let direct_end = body
+            .find("} else {")
+            .expect("the WSL-direct branch must exist");
+        let wsl_branch = &body[wsl_start..direct_start];
+        let direct_branch = &body[direct_start..direct_end];
+
+        for (name, branch) in [("WSL", wsl_branch), ("direct", direct_branch)] {
+            let pipes = branch.contains(".stdout(stdout_stdio)")
+                && branch.contains(".stderr(stderr_stdio)");
+            assert!(
+                pipes,
+                "the {name} spawn path must take the piped stdio the bounded writer drains:\n{branch}"
+            );
+        }
+        assert!(
+            body.contains("jarvis_server_log_stdio(\"server-jarvis.log\")")
+                && body.contains("jarvis_server_log_stdio(\"server-jarvis.err.log\")"),
+            "both child-stdio logs must keep their existing file names:\n{body}"
+        );
+        assert_eq!(
+            body.matches("bind_child_stdio_logs(").count(),
+            1,
+            "one bind after the branch covers every launch path:\n{body}"
         );
     }
 }
