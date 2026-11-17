@@ -60,6 +60,10 @@ pub use agents::*;
 pub mod system;
 pub use system::*;
 
+// DD-104: diagnostics disk/memory probe invocation and parser pins
+#[cfg(test)]
+mod system_tests;
+
 // Action registry command handlers
 pub mod action_registry;
 pub use action_registry::*;

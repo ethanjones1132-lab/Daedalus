@@ -523,21 +523,119 @@ fn native_ollama_ps_model(base_url: &str) -> Option<String> {
     parse_ollama_ps_model(&response.text().ok()?)
 }
 
+/// The `df` probe the Diagnostics disk row reads, byte for byte. Kept as one
+/// constant so the invocation and the parser stay pinned to the same format.
+pub(super) const DF_PROBE_COMMAND: &str = "df -BG --output=size,used,avail,pcent /";
+
+/// The memory probe the Diagnostics memory row reads, byte for byte.
+pub(super) const MEMINFO_PROBE_COMMAND: &str = "cat /proc/meminfo";
+
+/// How long a diagnostics shell probe may take before it is killed. WSL can be
+/// cold (VM boot, distro start), so this matches `wsl_openclaw`'s budget.
+const SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the program and argv for a plain shell probe (DD-104).
+///
+/// The disk and memory probes are shell commands (`df`, `cat /proc/meminfo`),
+/// not openclaw subcommands. `crate::wsl::wsl_openclaw` prefixes the joined
+/// args with `openclaw ` on Windows, which turns `df` into `openclaw df` and
+/// every probe into a failure the rows render as `?`/`0`. So these probes get
+/// `wsl.exe -- bash -lc "<command>"` exactly as written, with no prefix.
+///
+/// Split out so the tests can pin the argv; a regression here is invisible at
+/// runtime because both the fallback text and the failure path look "handled".
+pub(super) fn shell_probe_invocation(command: &str) -> (String, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        (
+            "wsl.exe".to_string(),
+            vec![
+                "--".to_string(),
+                "bash".to_string(),
+                "-lc".to_string(),
+                command.to_string(),
+            ],
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (
+            "bash".to_string(),
+            vec!["-lc".to_string(), command.to_string()],
+        )
+    }
+}
+
+/// Run a plain shell command inside WSL and return its stdout. Same hidden
+/// console and 30 s bound as `wsl_openclaw`, minus the `openclaw` prefix.
+fn shell_probe(command: &str) -> Result<String, String> {
+    let (program, args) = shell_probe_invocation(command);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
+    crate::wsl::hide_windows_console(&mut cmd);
+    let out = crate::wsl::command_output_timeout(cmd, SHELL_PROBE_TIMEOUT)
+        .ok_or_else(|| "wsl shell probe timed out or failed to spawn".to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "wsl shell probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Parse `df -BG --output=size,used,avail,pcent /`. The header is line one, so
+/// the data line is "  50G  20G  30G  40%".
+pub(super) fn parse_df_probe(stdout: &str) -> Option<DiskHealth> {
+    let line = stdout.lines().nth(1)?;
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    Some(DiskHealth {
+        total: parts[0].to_string(),
+        used: parts[1].to_string(),
+        available: parts[2].to_string(),
+        use_percent: parts[3].to_string(),
+    })
+}
+
+/// Parse `/proc/meminfo` into the memory row. Values are kB in the file; the
+/// row reports MB, and used/percent derive from total minus available.
+pub(super) fn parse_meminfo(stdout: &str) -> Option<MemoryHealth> {
+    let mut total_kb: Option<u64> = None;
+    let mut avail_kb: Option<u64> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<u64>().ok());
+        }
+    }
+    let (t, a) = (total_kb?, avail_kb?);
+    let used = t.saturating_sub(a);
+    let pct = (used * 100).checked_div(t).unwrap_or(0);
+    Some(MemoryHealth {
+        total_mb: t / 1024,
+        available_mb: a / 1024,
+        used_mb: used / 1024,
+        used_percent: pct as u32,
+    })
+}
+
 fn disk_health() -> DiskHealth {
-    // Best-effort: read from `df` on the WSL side; on Windows, fall back to a sane default.
-    let out = crate::wsl::wsl_openclaw(&["df", "-BG", "--output=size,used,avail,pcent", "/"]);
-    if let Ok(s) = out {
-        // Parse the second line of `df` output: " 50G  20G  30G  40% /"
-        if let Some(line) = s.lines().nth(1) {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                return DiskHealth {
-                    total: parts[0].to_string(),
-                    used: parts[1].to_string(),
-                    available: parts[2].to_string(),
-                    use_percent: parts[3].to_string(),
-                };
-            }
+    // Best-effort: read from `df` on the WSL side; fall back to "?"s when the
+    // probe or the output cannot be read. This must not go through
+    // `wsl_openclaw`, which would run `openclaw df` on Windows (DD-104).
+    if let Ok(stdout) = shell_probe(DF_PROBE_COMMAND) {
+        if let Some(disk) = parse_df_probe(&stdout) {
+            return disk;
         }
     }
     DiskHealth {
@@ -549,33 +647,10 @@ fn disk_health() -> DiskHealth {
 }
 
 fn memory_health() -> MemoryHealth {
-    // Read /proc/meminfo via WSL; fall back to "?"s.
-    let out = crate::wsl::wsl_openclaw(&["cat", "/proc/meminfo"]);
-    if let Ok(s) = out {
-        let mut total_kb: Option<u64> = None;
-        let mut avail_kb: Option<u64> = None;
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                total_kb = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse::<u64>().ok());
-            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                avail_kb = rest
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse::<u64>().ok());
-            }
-        }
-        if let (Some(t), Some(a)) = (total_kb, avail_kb) {
-            let used = t.saturating_sub(a);
-            let pct = (used * 100).checked_div(t).unwrap_or(0);
-            return MemoryHealth {
-                total_mb: t / 1024,
-                available_mb: a / 1024,
-                used_mb: used / 1024,
-                used_percent: pct as u32,
-            };
+    // Read /proc/meminfo via a plain WSL shell; fall back to zeroes.
+    if let Ok(stdout) = shell_probe(MEMINFO_PROBE_COMMAND) {
+        if let Some(memory) = parse_meminfo(&stdout) {
+            return memory;
         }
     }
     MemoryHealth {
