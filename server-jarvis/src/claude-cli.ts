@@ -921,6 +921,12 @@ export async function* streamSpawnedClaudeCli(
     const decodeState: ClaudeStreamDecodeState = { partialTextSeen: false };
     let buffer = "";
     let fullOutput = "";
+    // A `result` record is the authoritative turn outcome, but only once the
+    // child's exit status is known. Handing one to the consumer mid-stream lets
+    // a turn that is killed (or exits non-zero) afterwards be recorded as
+    // `completed`, with the later failure losing the terminal-outcome race.
+    // Hold them here and release only after a clean exit.
+    const pendingResults: ClaudeStreamEvent[] = [];
     const stdoutIterator = child.stdout[Symbol.asyncIterator]();
 
     while (true) {
@@ -948,8 +954,10 @@ export async function* streamSpawnedClaudeCli(
           for (const event of decodeClaudeCliMessage(msg, decodeState)) {
             if (event.type === "stream_event" && event.delta?.text) {
               fullOutput += event.delta.text;
-            } else if (event.type === "result" && !event.content) {
-              event.content = fullOutput;
+            } else if (event.type === "result") {
+              if (!event.content) event.content = fullOutput;
+              pendingResults.push(event);
+              continue;
             }
             yield event;
           }
@@ -1001,6 +1009,11 @@ export async function* streamSpawnedClaudeCli(
           : `Claude CLI exited with code ${exit.code ?? "unknown"}`,
       };
       return;
+    }
+    // The child exited cleanly, so its `result` records are the authoritative
+    // turn outcome after all. Only now may they reach the consumer.
+    for (const result of pendingResults) {
+      yield result;
     }
     yield { type: "message_stop", session_id: sessionId };
   } finally {
