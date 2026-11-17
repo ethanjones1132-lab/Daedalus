@@ -302,6 +302,44 @@ async function readServerErrorMessage(response: Response): Promise<string | null
   return compactServerMessage(body);
 }
 
+// DD-103 — the terminal copy for a failed turn.
+//
+// Exactly two reasons may be shown verbatim: the message of a rejection that
+// carries a stable code (the product or the server classified it, and that code
+// is rendered beside the text) and the one sentence this handler authors itself
+// when it cannot create a Session. Anything else — a `TypeError`, a refused
+// connection, a watchdog — is a transport's own words and keeps the fixed
+// sentence. Whatever is shown is reduced to its first non-blank line, trimmed,
+// bounded, and withheld entirely when it looks like a credential or a stack
+// frame, so neither can reach the operator through a turn failure.
+const TURN_FAILURE_GENERIC = 'The turn failed. Your message is kept as a draft — send it again to retry.';
+const SESSION_CREATION_FAILED = 'Could not create a Session for this message.';
+const MAX_TURN_FAILURE_REASON_CHARS = 200;
+const CREDENTIAL_SHAPED_REASON =
+  /(?:api[\s_-]?key|access[\s_-]?key|secret|password|passwd|authorization|bearer\s+\S|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|xox[abprs]-)/i;
+const STACK_FRAME_REASON = /\bat\s+[^\s(]+\s*\([^()]*:\d+:\d+\)/;
+
+function normalizeTurnFailureReason(value: string): string | null {
+  // The first non-blank line is the reason; later lines are where stacks live.
+  const firstLine = value.split(/\r?\n/).find(part => part.trim()) ?? '';
+  const compact = firstLine
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!compact) return null;
+  if (CREDENTIAL_SHAPED_REASON.test(compact) || STACK_FRAME_REASON.test(compact)) return null;
+  return compact.length > MAX_TURN_FAILURE_REASON_CHARS
+    ? `${compact.slice(0, MAX_TURN_FAILURE_REASON_CHARS)}…`
+    : compact;
+}
+
+export function turnFailureCopy(error: unknown, errorCode?: string): string {
+  if (!(error instanceof Error)) return TURN_FAILURE_GENERIC;
+  const claimed = errorCode || error.message === SESSION_CREATION_FAILED ? error.message : undefined;
+  const reason = claimed ? normalizeTurnFailureReason(claimed) : null;
+  return reason ?? TURN_FAILURE_GENERIC;
+}
+
 export const CURATED_SUGGESTIONS = ['Refine the previous answer', 'Walk me through the reasoning', 'Suggest next steps', 'Apply this to my code'];
 
 interface SessionHistoryMessage { id: string; session_id: string; role: string; content: string; tokens: number; tool_calls: string | null; created_at: string; }
@@ -2878,20 +2916,27 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
           setPendingNativeSessionId(null);
         }
         if (!newSessionId) {
-          const newSession = await invoke<JarvisSession>('jarvis_new_session', {
-            name: userMsg.slice(0, 60),
-            ...(selectedAgentId !== 'main' ? { agentId: selectedAgentId } : {}),
-          });
-          if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
-          newSessionId = newSession.id;
-          pendingNewSessionRef.current = newSession.id;
-          pendingNewSessionAgentRef.current = selectedAgentId;
-          setPendingNativeSessionId(newSession.id);
-          onSessionCreated();
+          try {
+            const newSession = await invoke<JarvisSession>('jarvis_new_session', {
+              name: userMsg.slice(0, 60),
+              ...(selectedAgentId !== 'main' ? { agentId: selectedAgentId } : {}),
+            });
+            if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
+            newSessionId = newSession.id;
+            pendingNewSessionRef.current = newSession.id;
+            pendingNewSessionAgentRef.current = selectedAgentId;
+            setPendingNativeSessionId(newSession.id);
+            onSessionCreated();
+          } catch {
+            // A Native command's own words are not the product's claim about
+            // this failure. Re-throw the authored sentence so the terminal copy
+            // can show it, and let the ordinary catch restore the draft.
+            throw new Error(SESSION_CREATION_FAILED);
+          }
         }
         if (!mountedRef.current || !sendGateRef.current.isCurrent(sendGeneration)) return;
         if (!newSessionId) {
-          throw new Error('Could not create a Session for this message.');
+          throw new Error(SESSION_CREATION_FAILED);
         }
         // A selected project must bind BEFORE the user row is appended and
         // before preparation/fetch. A binding failure preserves the draft and
@@ -2965,12 +3010,12 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       // detail — instead of leaving a plain assistant-looking message and
       // relying solely on the (dismissable, easy-to-miss) banner below.
       const errorCode = e instanceof JarvisStreamError ? e.code : undefined;
-       const errorMessage = errorCode ? String(e instanceof Error ? e.message : e) : 'The turn failed. Your message is kept as a draft — send it again to retry.';
-       setError(errorMessage);
-       if (!override) {
-         publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
-       }
-       setMessages(prev => {
+      const errorMessage = turnFailureCopy(e, errorCode);
+      setError(errorMessage);
+      if (!override) {
+        publishDraftStore(restoreFailedSessionDraft(draftStoreRef.current, submittedDraft));
+      }
+      setMessages(prev => {
         const withTokens = applyTokenChunk(prev, pending);
         const last = withTokens[withTokens.length - 1];
         if (last?.role === 'assistant' && last.isStreaming) {

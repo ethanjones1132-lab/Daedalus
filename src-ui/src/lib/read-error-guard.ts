@@ -31,15 +31,21 @@ export interface ReadErrorSite {
  *   or it only decides control flow. There is nothing to fix here.
  * - `unreachable` — the module is imported by nothing but its own test, so the
  *   value reaches no operator at all until the module is retired.
- * - `authored` — the value is the *product's own* claim about what happened, not
- *   a failing layer's diagnostics, and it is delivered beside a stable code that
- *   classifies it. The one site that qualifies is a chat turn's terminal failure:
- *   the Conductor authors the text to explain its own code, and the surface is
- *   where that explanation belongs — withholding it would leave the operator no
- *   diagnosis at all. The entry names the classifier that carries the actionable
- *   meaning, and the guard machine-checks that the file really routes the text
- *   through it. Anything a *transport* said — an HTTP body, a `TypeError`, a
- *   watchdog — is not authored and has no such entry.
+ * - `authored` — the value is a classified reason for a chat turn's terminal
+ *   failure, and the surface is where that reason belongs: withholding it would
+ *   leave the operator no diagnosis at all. The one site that qualifies is
+ *   `turnFailureCopy` in `useSessionTurn.ts` (DD-103), and it is deliberately
+ *   narrow. It may show the one-line message of a rejection that carries a stable
+ *   code (the product or the server classified it) or the one sentence the
+ *   handler authors itself when it cannot create a Session. Before that text can
+ *   render it drops to its first non-blank line, is trimmed and bounded, and is
+ *   withheld entirely when it looks like a credential or a stack frame; empty
+ *   text becomes the fixed sentence. Anything a *transport* said — a `TypeError`,
+ *   a refused connection, a watchdog — carries no code, is not the authored
+ *   sentence, and keeps the fixed sentence. The guard machine-checks that the
+ *   file really routes the terminal copy through this step, so the entry cannot
+ *   grow into a general "render the rejection's message" permission for another
+ *   read.
  * - `deferred` — the value DOES still reach a surface and nobody has fixed it
  *   yet. The entry names the Ready row that owns the fix. This is a debt, not a
  *   permission: the allowlist is closed, a new site is always undocumented, and
