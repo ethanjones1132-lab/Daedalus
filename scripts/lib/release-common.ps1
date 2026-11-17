@@ -1323,6 +1323,67 @@ function Find-JarvisInstalledBinary {
     return $null
 }
 
+function Assert-JarvisInstalledAppTarget {
+    <#
+    .SYNOPSIS
+        Prove a launch target is the app the installer produced.
+
+    .DESCRIPTION
+        The smoke launches the installed app so that /health and
+        /chat/stream answer through the same binary a user double-clicks.
+        That only means something while the target is inside the install
+        root and is not the bundled runtime beside it: launching bun.exe
+        directly would put the smoke back in front of a server no installer
+        started, and a path outside the install root is not the artifact
+        under test at all.
+
+        Throws with a stable reason instead of returning a maybe.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$AppPath,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
+    )
+    if ([string]::IsNullOrWhiteSpace($AppPath)) { throw 'launch_target_missing' }
+    $full = [IO.Path]::GetFullPath($AppPath)
+    $root = [IO.Path]::GetFullPath($InstallRoot).TrimEnd([char[]]@('\', '/')) + [IO.Path]::DirectorySeparatorChar
+    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "launch_target_not_installed:${AppPath}"
+    }
+    if (-not [string]::Equals([IO.Path]::GetExtension($full), '.exe', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "launch_target_not_executable:${AppPath}"
+    }
+    if ([IO.Path]::GetFileName($full) -ieq 'bun.exe') {
+        throw "launch_target_is_bundled_runtime:${AppPath}"
+    }
+    return $full
+}
+
+function Resolve-JarvisAppLaunchTarget {
+    <#
+    .SYNOPSIS
+        The installed app binary the smoke must launch.
+
+    .DESCRIPTION
+        Resolved from the install root by the hash the release record
+        records, the same way the install step proves the binary. There is
+        deliberately no fallback: when no installed exe matches the record
+        the launch fails here rather than borrowing a Bun from PATH, because
+        a green smoke must mean the installed app booted.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        # Narrow the candidates by file name when the record names one.
+        [string]$BinaryName = ''
+    )
+    $found = Find-JarvisInstalledBinary -InstallRoot $InstallRoot `
+        -ExpectedSha256 $ExpectedSha256 -BinaryName $BinaryName
+    if (-not $found) { throw "installed_app_binary_missing:$InstallRoot" }
+    return Assert-JarvisInstalledAppTarget -AppPath $found -InstallRoot $InstallRoot
+}
+
 function Test-JarvisHealthProvenance {
     <#
     .SYNOPSIS

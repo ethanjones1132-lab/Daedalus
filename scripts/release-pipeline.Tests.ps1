@@ -862,3 +862,71 @@ Describe 'the release pipeline is wired' {
         $deploy | Should Match 'Test-JarvisBundleProvenance'
     }
 }
+
+Describe 'the smoke launches the installed app' {
+    BeforeEach {
+        $script:launchRoot = Join-Path $TestDrive 'launch-install'
+        New-Item -ItemType Directory -Force -Path $script:launchRoot | Out-Null
+        $script:launchExe = Join-Path $script:launchRoot 'home-base.exe'
+        'the installed app binary' | Set-Content -LiteralPath $script:launchExe
+        $script:launchHash = (Get-FileHash -LiteralPath $script:launchExe -Algorithm SHA256).Hash
+    }
+
+    It 'targets the installed exe matched by the recorded hash' {
+        # A green smoke must mean the app a user double-clicks booted. The
+        # record names the staged executable (Jarvis.exe) while the installer
+        # lays the binary down under the crate name, so the hash decides.
+        $target = Resolve-JarvisAppLaunchTarget -InstallRoot $script:launchRoot `
+            -ExpectedSha256 $script:launchHash -BinaryName 'Jarvis.exe'
+        $target | Should Be $script:launchExe
+    }
+
+    It 'does not fall back to a Bun on PATH when no installed exe matches' {
+        # Pointing the smoke at a PATH Bun is the regression this covers:
+        # with no matching installed binary the launch must fail, not report
+        # health from a runtime the installer never produced.
+        $pathDir = Join-Path $TestDrive 'launch-path-bun'
+        New-Item -ItemType Directory -Force -Path $pathDir | Out-Null
+        'fixture bun bytes' | Set-Content -LiteralPath (Join-Path $pathDir 'bun.exe')
+        $savedPath = $env:PATH
+        try {
+            $env:PATH = "$pathDir;$savedPath"
+            { Resolve-JarvisAppLaunchTarget -InstallRoot $script:launchRoot -ExpectedSha256 ('A' * 64) } |
+                Should Throw 'installed_app_binary_missing'
+        } finally {
+            $env:PATH = $savedPath
+        }
+    }
+
+    It 'refuses the bundled Bun as the launch target' {
+        $bundled = Join-Path $script:launchRoot 'bun.exe'
+        'bundled bun bytes' | Set-Content -LiteralPath $bundled
+        $bundledHash = (Get-FileHash -LiteralPath $bundled -Algorithm SHA256).Hash
+        { Resolve-JarvisAppLaunchTarget -InstallRoot $script:launchRoot -ExpectedSha256 $bundledHash } |
+            Should Throw 'launch_target_is_bundled_runtime'
+    }
+
+    It 'refuses a target outside the install root' {
+        $outside = Join-Path $TestDrive 'elsewhere\Jarvis.exe'
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outside) | Out-Null
+        'not the installed app' | Set-Content -LiteralPath $outside
+        { Assert-JarvisInstalledAppTarget -AppPath $outside -InstallRoot $script:launchRoot } |
+            Should Throw 'launch_target_not_installed'
+    }
+
+    It 'starts the installed exe from the launch step, not a PATH Bun' {
+        $smoke = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'scripts\release-smoke.ps1')
+        $stepIndex = $smoke.IndexOf("Write-Step 'Launching the installed app'")
+        $stepIndex | Should BeGreaterThan 0
+        $chatIndex = $smoke.IndexOf("Sending a chat request", $stepIndex)
+        $chatIndex | Should BeGreaterThan $stepIndex
+        $launchStep = $smoke.Substring($stepIndex, $chatIndex - $stepIndex)
+        $launchStep | Should Match 'Resolve-JarvisAppLaunchTarget'
+        $launchStep | Should Match 'Start-JarvisInstalledApp -AppPath \$installedExe -InstallRoot \$InstallRoot'
+        # The summary says which process produced the health answer.
+        $smoke | Should Match 'health_source = \$healthSource'
+        $smoke | Should Not Match 'Get-Command bun'
+        $smoke | Should Not Match '\.bun\\bin\\bun\.exe'
+        $smoke | Should Not Match 'Start-JarvisServerBundle'
+    }
+}

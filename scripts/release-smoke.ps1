@@ -19,19 +19,25 @@
                    and the installed binary's hash must equal the release
                    record's app_binary hash, proving the installer carries
                    the binary the record describes.
-      3. launch  - the packaged server bundle is started on the one port the
-                   build actually binds: SERVER_PORT 19877 from
+      3. launch  - the installed app (the Jarvis.exe the installer laid down,
+                   matched by the hash the record records) is started the way
+                   a user starts it: by double-clicking. The app starts its
+                   own server with the bundled bun.exe beside the exe on the
+                   one port the build actually binds, SERVER_PORT 19877 from
                    server-jarvis/src/server-guards.ts. DD-064 removed the port
                    override, so the smoke cannot move the server to a private
                    port; instead it refuses to start while 19877 is busy, so
                    the health, provenance and chat it reads can only come from
-                   the process it started.
+                   the process tree it started. A Bun on PATH is never a
+                   launch candidate: a green smoke means the installed app
+                   booted its own server, not that a developer's runtime did.
       4. health  - /health must report the git SHA and source-tree digest
                    the release record claims. THIS is the stale-binary
                    check: it is the difference between "the file on disk is
                    the build we made" and "the build answering requests is
                    the build we made".
-      5. chat    - one /chat/stream request must reach a terminal frame.
+      5. chat    - one /chat/stream request must reach a terminal frame,
+                   answered by the same installed app.
 
     The decision functions are pure and separately testable, so the
     interesting rules (hash mismatch, stale build, missing terminal frame)
@@ -170,30 +176,38 @@ function Wait-JarvisHealth {
     throw "health_timeout:$Url ($lastError)"
 }
 
-function Start-JarvisServerBundle {
+function Start-JarvisInstalledApp {
     <#
     .SYNOPSIS
-        Launch the packaged server bundle; it binds the fixed SERVER_PORT.
+        Launch the installed Jarvis.exe -- the artifact a user double-clicks.
+
+    .DESCRIPTION
+        The app owns its server: on startup it starts the bundled bun.exe
+        beside the exe (find_bun_executable checks that directory first) and
+        that server binds the fixed SERVER_PORT. Starting the app therefore
+        starts the real process tree, and Stop-JarvisOwnedProcesses tears it
+        down again -- the app and the server it spawned.
+
+        There is no Bun-from-PATH path here on purpose: the launch target has
+        already been proven to be the installed exe, and using another
+        runtime would let a green smoke report a server the installer never
+        started.
     #>
     [CmdletBinding()]
     param(
-        [string]$BundlePath,
-        [string]$WorkingDirectory
+        [Parameter(Mandatory = $true)][string]$AppPath,
+        [Parameter(Mandatory = $true)][string]$InstallRoot
     )
-    $bunCommand = Get-Command bun -ErrorAction SilentlyContinue
-    if (-not $bunCommand) {
-        $fallback = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
-        if (-not (Test-Path -LiteralPath $fallback)) { throw 'bun_not_found' }
-        $bunPath = $fallback
-    } else {
-        $bunPath = $bunCommand.Source
+    if (-not (Test-Path -LiteralPath $AppPath -PathType Leaf)) {
+        throw "installed_app_binary_missing:$AppPath"
     }
+    $null = Assert-JarvisInstalledAppTarget -AppPath $AppPath -InstallRoot $InstallRoot
     $logDir = Join-Path $env:TEMP 'jarvis-release-smoke'
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-    $stdout = Join-Path $logDir 'server.out.log'
-    $stderr = Join-Path $logDir 'server.err.log'
-    $startedProcess = Start-Process -FilePath $bunPath -ArgumentList @('"' + $BundlePath + '"') `
-        -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
+    $stdout = Join-Path $logDir 'app.out.log'
+    $stderr = Join-Path $logDir 'app.err.log'
+    $startedProcess = Start-Process -FilePath $AppPath -WorkingDirectory $InstallRoot `
+        -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     $startedProcess | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $startedProcess.StartTime
     return $startedProcess
@@ -249,6 +263,9 @@ Add-Result 'hash' $true "installer sha256 $($hash.actual)"
 # ── 3. Fixed-port preflight and install ──────────────────────────────────────
 $installOwned = $false
 $serverProcess = $null
+$installedExe = $null
+$resolveError = $null
+$healthSource = $null
 try {
 if (-not $SkipLaunch) {
     Write-Step 'Preflighting the fixed server port'
@@ -282,12 +299,22 @@ if (-not $SkipInstall) {
         # Matched by hash: the installer lays the binary down under the
         # crate name, and the bytes it carries are the ones the release
         # record describes (the record reads them from a real install).
-        $installedExe = Find-JarvisInstalledBinary -InstallRoot $InstallRoot `
-            -ExpectedSha256 $appBinaryEntry.sha256 `
-            -BinaryName ([string]$manifest.app_binary_name)
+        # The same resolution is what the launch step starts, so the exe
+        # whose hash was proven here is the exe that must answer /health.
+        try {
+            $installedExe = Resolve-JarvisAppLaunchTarget -InstallRoot $InstallRoot `
+                -ExpectedSha256 $appBinaryEntry.sha256 `
+                -BinaryName ([string]$manifest.app_binary_name)
+        } catch {
+            $resolveError = $_.Exception.Message
+            $installedExe = $null
+        }
         if (-not $installedExe) {
-            Add-Result 'installed_binary_hash' $false "no installed binary matches the recorded sha256 $($appBinaryEntry.sha256)"
-            Die "the install does not contain the binary the release record describes"
+            $why = if ($resolveError) { $resolveError } else {
+                "no installed binary matches the recorded sha256 $($appBinaryEntry.sha256)"
+            }
+            Add-Result 'installed_binary_hash' $false $why
+            Die "the install does not contain the binary the release record describes ($why)"
         }
         Add-Result 'installed_binary_hash' $true "installed binary matches the release record ($([IO.Path]::GetFileName($installedExe)))"
     }
@@ -300,26 +327,37 @@ if (-not $SkipInstall) {
 
 # ── 4. Launch and health ─────────────────────────────────────────────────────
 if (-not $SkipLaunch) {
-    Write-Step 'Launching the packaged server'
-    $bundlePath = Join-Path $InstallRoot 'index.js'
-    if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
-        Die "packaged server bundle missing: $bundlePath"
+    # The launch step starts the artifact a user double-clicks: the installed
+    # exe whose hash the install step just proved. The app starts its own
+    # server with the bundled bun.exe beside it, so /health and /chat/stream
+    # answer through the installer's process tree and nowhere else.
+    Write-Step 'Launching the installed app'
+    if (-not $installedExe) {
+        try {
+            $installedExe = Resolve-JarvisAppLaunchTarget -InstallRoot $InstallRoot `
+                -ExpectedSha256 $appBinaryEntry.sha256 `
+                -BinaryName ([string]$manifest.app_binary_name)
+        } catch {
+            Add-Result 'launch' $false $_.Exception.Message
+            Die "the installed app could not be located: $($_.Exception.Message)"
+        }
     }
     $healthUrl = "http://127.0.0.1:$ServerPort/health"
     try {
-        $serverProcess = Start-JarvisServerBundle -BundlePath $bundlePath -WorkingDirectory (Split-Path -Parent $bundlePath)
+        $serverProcess = Start-JarvisInstalledApp -AppPath $installedExe -InstallRoot $InstallRoot
     } catch {
         Add-Result 'launch' $false $_.Exception.Message
-        Die "the packaged server could not be launched: $($_.Exception.Message)"
+        Die "the installed app could not be launched: $($_.Exception.Message)"
     }
-    Add-Result 'launch' $true "server started on port $ServerPort"
+    $healthSource = "installed_app:$([IO.Path]::GetFileName($installedExe)):pid_$($serverProcess.Id)"
+    Add-Result 'launch' $true "installed app $([IO.Path]::GetFileName($installedExe)) started (pid $($serverProcess.Id)); it owns the server on port $ServerPort"
     try {
         $health = Wait-JarvisHealth -Url $healthUrl -TimeoutSeconds $TimeoutSeconds -Process $serverProcess
     } catch {
         Add-Result 'health' $false $_.Exception.Message
-        Die "the packaged server never became healthy: $($_.Exception.Message)"
+        Die "the installed app's server never became healthy: $($_.Exception.Message)"
     }
-    Add-Result 'health' $true "server answered on port $ServerPort"
+    Add-Result 'health' $true "the installed app (pid $($serverProcess.Id)) owns the server that answered /health on port $ServerPort"
 
     Write-Step 'Verifying the running build matches the release record'
     $provenance = Test-JarvisHealthProvenance -Health $health -Manifest $manifest
@@ -344,10 +382,11 @@ if (-not $SkipLaunch) {
             Die "the chat request failed: $($_.Exception.Message)"
         }
         $outcome = Get-JarvisSseOutcome -Events $events
+        $via = "via the installed app (pid $($serverProcess.Id))"
         if ($outcome.ok) {
-            Add-Result 'chat' $true "terminal result: $($outcome.text)"
+            Add-Result 'chat' $true "terminal result: $($outcome.text) ($via)"
         } elseif ($AllowChatError -and $outcome.type -eq 'error') {
-            Add-Result 'chat' $true "terminal error tolerated: $($outcome.text)"
+            Add-Result 'chat' $true "terminal error tolerated: $($outcome.text) ($via)"
         } else {
             Add-Result 'chat' $false $outcome.reason
             Die "the chat request did not reach a successful terminal frame: $($outcome.reason)"
@@ -370,10 +409,14 @@ if (-not $SkipLaunch) {
 }
 
 $summary = [pscustomobject]@{
-    ok       = (@($results | Where-Object { -not $_.ok }).Count -eq 0)
-    version  = $manifest.version
-    git_sha  = $manifest.git_sha
-    steps    = $results.ToArray()
+    ok            = (@($results | Where-Object { -not $_.ok }).Count -eq 0)
+    version       = $manifest.version
+    git_sha       = $manifest.git_sha
+    # health_source names what produced the health answer: the installed app
+    # this smoke started, which owns the server that answered. A Bun from
+    # PATH can never appear here.
+    health_source = $healthSource
+    steps         = $results.ToArray()
 }
 $summary | ConvertTo-Json -Depth 5 | Write-Output
 
