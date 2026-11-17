@@ -96,6 +96,11 @@ import {
 } from "./claude-cli";
 import { ReasoningParser, stripReasoningFromText, type ReasoningEvent } from "./reasoning";
 import { applyCachedCompaction, getMessagesHash, type CompactionCacheEntry } from "./compaction-cache";
+// DD-102: the history fitter lives in its own module (this entrypoint binds a
+// socket at import time, so a pure function here cannot be tested) and is
+// re-exported below to keep the entrypoint's surface unchanged.
+import { CONTEXT_TOO_SMALL, ContextTooSmallError, optimizeContextWindow } from "./context-window";
+
 import {
   listOpenRouterModels,
   checkOpenRouterHealth,
@@ -1355,86 +1360,11 @@ async function compactHistory(
   ];
 }
 
-function optimizeContextWindow(
-  history: Array<{ role: string; content?: string | null; [key: string]: any }>,
-  effectiveSystemPrompt: string,
-  currentPrompt: string,
-  numCtx: number
-): Array<{ role: string; content?: string | null; [key: string]: any }> {
-  const estimateTokens = (text: string) => Math.ceil((text || "").length / 4);
-  const generationReserve = Math.min(2048, Math.floor(numCtx * 0.2));
-
-  // Find all leading system messages to pin them
-  let startIndex = 0;
-  const pinnedSystemMessages: typeof history = [];
-  while (startIndex < history.length && history[startIndex]?.role === "system") {
-    pinnedSystemMessages.push(history[startIndex]);
-    startIndex++;
-  }
-
-  let pinnedTokens = 0;
-  for (const msg of pinnedSystemMessages) {
-    pinnedTokens += estimateTokens(msg.content || "");
-  }
-
-  const baseTokens = estimateTokens(effectiveSystemPrompt) + estimateTokens(currentPrompt) + pinnedTokens;
-  const budget = numCtx - generationReserve - baseTokens;
-
-  if (budget <= 500) {
-    console.warn(`[ContextOpt] Context budget exhausted or extremely small. Clearing active history.`);
-    return pinnedSystemMessages;
-  }
-
-  // Group history messages to avoid splitting tool calls and their responses
-  const groups: Array<Array<any>> = [];
-  let currentGroup: Array<any> = [];
-
-  for (let i = startIndex; i < history.length; i++) {
-    const msg = history[i];
-    if (msg.role === "tool") {
-      // Tool responses belong to the previous assistant tool call group
-      currentGroup.push(msg);
-    } else if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
-      // Start a new group for assistant tool call
-      if (currentGroup.length > 0) {
-        groups.push(currentGroup);
-      }
-      currentGroup = [msg];
-    } else {
-      // Standard message starts a new group
-      if (currentGroup.length > 0) {
-        groups.push(currentGroup);
-      }
-      currentGroup = [msg];
-    }
-  }
-  if (currentGroup.length > 0) {
-    groups.push(currentGroup);
-  }
-
-  let usedTokens = 0;
-  const retainedGroups: Array<Array<any>> = [];
-
-  for (let i = groups.length - 1; i >= 0; i--) {
-    const group = groups[i];
-    let groupTokens = 0;
-    for (const msg of group) {
-      let msgStr = msg.content || "";
-      if (msg.tool_calls) msgStr += JSON.stringify(msg.tool_calls);
-      if (msg.tool_call_id) msgStr += msg.tool_call_id;
-      groupTokens += estimateTokens(msgStr);
-    }
-
-    if (usedTokens + groupTokens > budget) {
-      break;
-    }
-    usedTokens += groupTokens;
-    retainedGroups.unshift(group);
-  }
-
-  const retained = retainedGroups.flat();
-  return [...pinnedSystemMessages, ...retained];
-}
+// DD-102: history fitting (pinned system messages, tool-call grouping, the
+// minimal-history floor, and the `context_too_small` fail-closed result) lives
+// in ./context-window so it can be tested without binding the server socket.
+// Re-exported here so the entrypoint still exposes `optimizeContextWindow`.
+export { CONTEXT_TOO_SMALL, optimizeContextWindow };
 
 /** Thrown when the client aborts an in-flight stream — not a user-visible error. */
 class StreamCancelledError extends Error {
@@ -5532,7 +5462,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           ? (isLlamaCpp ? cfg.llama_cpp.context_window : compactProfile?.context_window ?? cfg.ollama?.options?.num_ctx ?? 16384)
           : (openRouterEffective?.context_length ?? 16384);
         const previousLength = activeHistory.length;
-        activeHistory = optimizeContextWindow(activeHistory, effectiveSystemPrompt, message, num_ctx);
+        // DD-102: the fitted result carries the turn being answered, so pass
+        // `currentPrompt` (what is actually about to be sent), not the original
+        // `message` (which is already in activeHistory on later loop passes).
+        const fitted = optimizeContextWindow(activeHistory, effectiveSystemPrompt, currentPrompt, num_ctx);
+        if (!fitted.ok) {
+          // Fail closed with a visible reason instead of sending a request
+          // whose only content is system text.
+          throw new ContextTooSmallError(fitted);
+        }
+        activeHistory = fitted.messages;
+        // The current turn now lives in activeHistory; the loop must not append
+        // it a second time, and later branches re-read it from history.
+        currentPrompt = "";
         if (activeHistory.length < previousLength) {
           console.warn(`[Jarvis] Optimizing context: truncated history from ${previousLength} to ${activeHistory.length} messages (context window: ${num_ctx})`);
         }
@@ -5559,9 +5501,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           // Non-system history
           messages.push(...activeHistory.filter(m => m.role !== "system"));
         }
-        if (currentPrompt) {
-          messages.push({ role: "user", content: currentPrompt });
-        }
+        // DD-102: the current turn was already placed in activeHistory by
+        // optimizeContextWindow (and `currentPrompt` cleared), so it is part of
+        // the non-system history pushed above — never append it twice and never
+        // send a request without it.
 
         // ── Silent tool nudge: if previous turn called tools but stopped
         // without completing the task, inject a reminder to continue.
@@ -6581,6 +6524,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       const isVisibleProgressTimeout = error?.name === "VisibleProgressTimeoutError";
       const isTurnDeadlineExceeded = error?.name === "TurnDeadlineExceededError";
       const isDegenerateStream = error?.name === "DegenerateStreamError";
+      // DD-102: the fitter refused to build a request it could not make valid.
+      const isContextTooSmall = error?.name === "ContextTooSmallError";
       const errorCode = isFirstTokenTimeout
         ? "first_token_timeout"
         : isStreamIdleTimeout
@@ -6591,6 +6536,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               ? "turn_deadline_exceeded"
               : isDegenerateStream
                 ? "degenerate_stream"
+                : isContextTooSmall
+                  ? CONTEXT_TOO_SMALL
           : undefined;
       const userFacingMsg = isFirstTokenTimeout
         ? `The model did not produce any output within the per-model first-token window. ` +
@@ -6612,6 +6559,10 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           ? `The model got stuck repeating the same phrase over and over instead of producing a real answer. ` +
             `Jarvis stopped the stalled generation instead of streaming the loop to you. ` +
             `Try again — the router will pick a different model. (${error?.model ?? "unknown model"}, stage=${error?.stage ?? "unknown"})`
+        : isContextTooSmall
+          ? `This turn was not sent: the model's context window is too small to hold the system prompt ` +
+            `plus your current message. Jarvis failed closed instead of sending a request with no user turn. ` +
+            `Raise the model's context window (num_ctx) or send a shorter message. (${error?.detail ?? errMsg})`
         : errMsg;
       console.error(`[Jarvis] Stream error session=${sessionId} code=${errorCode ?? "<generic>"}:`, userFacingMsg);
       if (orchestratorRunFinalizer) {
