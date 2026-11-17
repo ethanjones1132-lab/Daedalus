@@ -118,6 +118,34 @@ describe('Jarvis Session draft ownership', () => {
     await waitFor(() => expect(screen.queryByText('late alpha answer')).not.toBeInTheDocument());
   });
 
+  it('restores a failed first send into the created Session and leaves New empty', async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command: string, args?: { sessionId: string }) => (
+      command === 'jarvis_new_session'
+        ? { id: 'created-session', name: 'first send text', model: 'test-model', message_count: 0, created_at: '2026-09-25T00:00:00Z' }
+        : base(command, args)
+    ));
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('inference backend unreachable'); }));
+
+    render(<SessionsPage />);
+    const composer = await screen.findByLabelText('Chat input') as HTMLTextAreaElement;
+    fireEvent.change(composer, { target: { value: 'first send text' } });
+    fireEvent.keyDown(composer, { key: 'Enter' });
+
+    // Wait for the failed turn to settle, then read the composer the operator
+    // is actually looking at: the created Session's slot.
+    await screen.findByRole('alert');
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop streaming' })).not.toBeInTheDocument());
+    await waitFor(() => expect(composer).toHaveValue('first send text'));
+
+    // The submitted text followed the operator onto the Session; the New-chat
+    // slot must not keep a stranded copy.
+    await select('Alpha');
+    await waitFor(() => expect(composer).toHaveValue(''));
+    await select('New chat');
+    await waitFor(() => expect(composer).toHaveValue(''));
+  });
+
   it('preserves an identical newer draft when the original submission is accepted', async () => {
     let resolveFetch!: (response: Response) => void;
     const response = streamResponse();

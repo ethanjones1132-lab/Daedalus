@@ -16,6 +16,7 @@ import {
   createSessionDraftStore,
   getSessionDraft,
   getSessionDraftSnapshot,
+  moveSubmittedSessionDraft,
   restoreFailedSessionDraft,
   updateSessionDraft,
   type SessionDraftStore,
@@ -2821,7 +2822,7 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       setError('A turn is still streaming — please wait for it to finish before sending again.');
       return;
     }
-    const submittedDraft = getSessionDraftSnapshot(draftStoreRef.current, activeSession);
+    let submittedDraft = getSessionDraftSnapshot(draftStoreRef.current, activeSession);
     const userMsg = override ?? submittedDraft.text.trim();
     if (!userMsg || isStreaming) {
       sendInFlightRef.current.finish();
@@ -2957,6 +2958,17 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
           }
         }
         effectiveSessionId = newSessionId;
+        // DD-108 — the Session now exists, so the composer has moved to that
+        // Session's draft slot. Re-key the submitted snapshot BEFORE any throw
+        // path can restore it, otherwise a failed first send restores the text
+        // into the New-chat slot and the operator sees an empty composer. The
+        // move keeps the submitted revision, so a draft typed since the send is
+        // never overwritten by the clear/restore guard.
+        if (!override) {
+          const movedDraft = moveSubmittedSessionDraft(draftStoreRef.current, submittedDraft, newSessionId);
+          publishDraftStore(movedDraft.store);
+          submittedDraft = movedDraft.submitted;
+        }
         // Suppress the history-load effect that setActiveSession is about to
         // trigger — otherwise it overwrites the optimistic messages above with
         // the empty history of this brand-new session.

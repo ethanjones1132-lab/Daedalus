@@ -4,6 +4,7 @@ import {
   createSessionDraftStore,
   getSessionDraft,
   getSessionDraftSnapshot,
+  moveSubmittedSessionDraft,
   restoreFailedSessionDraft,
   updateSessionDraft,
 } from './session-draft-state';
@@ -71,5 +72,59 @@ describe('session draft ownership', () => {
     expect(getSessionDraft(store, null).revision).toBe(1);
     expect(getSessionDraft(store, 'Alpha').revision).toBe(1);
     expect(getSessionDraftSnapshot(store, null).key).not.toBe(getSessionDraftSnapshot(store, 'Alpha').key);
+  });
+
+  it('moves a submitted New-chat draft onto the Session the send created', () => {
+    let store = createSessionDraftStore();
+    store = updateSessionDraft(store, null, 'first send');
+    const submitted = getSessionDraftSnapshot(store, null);
+
+    const moved = moveSubmittedSessionDraft(store, submitted, 'created-session');
+    expect(getSessionDraft(moved.store, null)).toEqual({ text: '', revision: 0 });
+    expect(getSessionDraft(moved.store, 'created-session')).toEqual({ text: 'first send', revision: 1 });
+    expect(moved.submitted).toMatchObject({ key: 'created-session', sessionId: 'created-session', text: 'first send', revision: 1 });
+
+    // The moved snapshot still clears exactly the submitted revision ...
+    const cleared = clearSubmittedSessionDraft(moved.store, moved.submitted);
+    expect(getSessionDraft(cleared, 'created-session')).toEqual({ text: '', revision: 2, acceptedRevision: 1 });
+
+    // ... and still restores a failed first send into the Session slot.
+    const restored = restoreFailedSessionDraft(cleared, moved.submitted);
+    expect(getSessionDraft(restored, 'created-session')).toEqual({ text: 'first send', revision: 3 });
+    expect(getSessionDraft(restored, null).text).toBe('');
+  });
+
+  it('never moves a New-chat draft the operator has typed since submitting', () => {
+    let store = createSessionDraftStore();
+    store = updateSessionDraft(store, null, 'first send');
+    const submitted = getSessionDraftSnapshot(store, null);
+    store = updateSessionDraft(store, null, 'first send edited');
+
+    const moved = moveSubmittedSessionDraft(store, submitted, 'created-session');
+    expect(moved.store).toBe(store);
+    expect(moved.submitted).toBe(submitted);
+    expect(getSessionDraft(store, 'created-session').text).toBe('');
+    expect(getSessionDraft(store, null).text).toBe('first send edited');
+  });
+
+  it('leaves an already-drafted Session slot alone when re-keying', () => {
+    let store = createSessionDraftStore();
+    store = updateSessionDraft(store, null, 'first send');
+    const submitted = getSessionDraftSnapshot(store, null);
+    store = updateSessionDraft(store, 'created-session', 'typed on the Session');
+
+    const moved = moveSubmittedSessionDraft(store, submitted, 'created-session');
+    expect(moved.store).toBe(store);
+    expect(getSessionDraft(moved.store, 'created-session').text).toBe('typed on the Session');
+  });
+
+  it('does not re-key a snapshot that is already bound to the target Session', () => {
+    let store = createSessionDraftStore();
+    store = updateSessionDraft(store, 'Alpha', 'sent from Alpha');
+    const submitted = getSessionDraftSnapshot(store, 'Alpha');
+
+    const moved = moveSubmittedSessionDraft(store, submitted, 'Alpha');
+    expect(moved.store).toBe(store);
+    expect(moved.submitted).toBe(submitted);
   });
 });

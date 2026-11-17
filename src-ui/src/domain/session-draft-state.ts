@@ -71,6 +71,37 @@ export function clearSubmittedSessionDraft(
   };
 }
 
+/**
+ * Follow the operator onto the Session a New-chat send just created.
+ *
+ * The store is keyed by Session, so once the Session exists the composer reads
+ * that Session's slot. Re-keying the submitted snapshot (same text, same
+ * revision) keeps the submitted revision so `clearSubmittedSessionDraft` and
+ * `restoreFailedSessionDraft` stay guarded, and stops a failed first send from
+ * stranding the text in the New-chat slot. Nothing moves if the operator has
+ * since edited the submitted slot or the target slot already holds a draft.
+ */
+export function moveSubmittedSessionDraft(
+  store: SessionDraftStore,
+  submitted: SessionDraftSnapshot,
+  sessionId: string | null | undefined,
+): { store: SessionDraftStore; submitted: SessionDraftSnapshot } {
+  const targetKey = sessionDraftKey(sessionId);
+  if (targetKey === submitted.key) return { store, submitted };
+  const current = getSessionDraft(store, submitted.key);
+  const stillSubmitted = current.revision === submitted.revision
+    && current.text.trim() === submitted.text.trim();
+  if (!stillSubmitted || getSessionDraft(store, targetKey).text.trim()) return { store, submitted };
+  const nextStore: Record<string, SessionDraft> = { ...store };
+  delete nextStore[submitted.key];
+  nextStore[targetKey] = { text: submitted.text, revision: submitted.revision };
+  const normalizedSessionId = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null;
+  return {
+    store: nextStore,
+    submitted: { ...submitted, key: targetKey, sessionId: normalizedSessionId },
+  };
+}
+
 export function restoreFailedSessionDraft(
   store: SessionDraftStore,
   submitted: SessionDraftSnapshot,
