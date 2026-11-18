@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import { createTwoFilesPatch } from "diff";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import { registerFilesystemBundle, registerSearchBundle } from "./filesystem-bundle";
+import { registerFilesystemBundle, registerSearchBundle, MAX_TOOL_FILE_BYTES, READ_FILE_MAX_LINE_CHARS } from "./filesystem-bundle";
 import { defaultConfig } from "./config";
 import { hasFileBeenRead, markFileRead } from "./fs-read-cache";
 import { resolve } from "path";
@@ -532,6 +532,124 @@ describe("FilesystemBundle > read_file continuation note (2026-07-18)", () => {
     expect(full.is_error).toBe(false);
     expect(full.output).not.toContain("showing lines");
     expect(hasFileBeenRead(resolved)).toBe(true);
+  });
+});
+
+describe("FilesystemBundle > read_file byte cap (DD-112)", () => {
+  // A large synthetic file: 40k lines of ~83 bytes (~3.3 MB), well past the cap.
+  function writeHugeFile(ws: string, name = "huge.log"): { totalBytes: number } {
+    const body = Array.from(
+      { length: 40_000 },
+      (_, i) => `line ${String(i + 1).padStart(6, "0")} ${"y".repeat(70)}`,
+    ).join("\n");
+    writeFileSync(join(ws, name), body);
+    return { totalBytes: Buffer.byteLength(body, "utf-8") };
+  }
+
+  function lastShownLine(output: string): number {
+    const gutters = [...output.matchAll(/^ *(\d+) \|/gm)];
+    return Number(gutters[gutters.length - 1]?.[1] ?? "0");
+  }
+
+  test("a file larger than the byte cap returns a bounded prefix with an explicit truncation note", async () => {
+    const ws = makeTempWorkspace();
+    const { totalBytes } = writeHugeFile(ws);
+    expect(totalBytes).toBeGreaterThan(MAX_TOOL_FILE_BYTES * 2);
+
+    // limit high enough that the BYTE cap is the binding constraint.
+    const result = await makeRuntime().execute(
+      call("read_file", { path: "huge.log", limit: 100_000 }),
+      makeCtx(ws),
+    );
+
+    expect(result.is_error).toBe(false);
+    // The note states the cap, how much was read, and how much exists.
+    expect(result.output).toContain("[read_file truncated:");
+    expect(result.output).toContain(`this is a ${MAX_TOOL_FILE_BYTES}-byte prefix of ${totalBytes} bytes`);
+    // Content beyond the prefix is absent, and the whole result stays bounded.
+    expect(result.output).not.toContain("line 040000");
+    expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThan(MAX_TOOL_FILE_BYTES * 1.2);
+
+    // The note must state exactly how much of the file is missing. A byte
+    // prefix always restarts at byte 0, so it must NOT promise a continuation
+    // offset that could never reach the rest.
+    expect(result.output).toContain(
+      `the remaining ${totalBytes - MAX_TOOL_FILE_BYTES} bytes are beyond the read_file byte cap`,
+    );
+    expect(result.output).not.toContain("to continue");
+
+    // A deeper offset says it is past the readable prefix instead of printing
+    // an empty page that looks like a missing region of the file.
+    const past = await makeRuntime().execute(
+      call("read_file", { path: "huge.log", offset: lastShownLine(result.output) + 1 }),
+      makeCtx(ws),
+    );
+    expect(past.is_error).toBe(false);
+    expect(past.output).toContain("is past the readable prefix");
+    // Nothing is rendered as content, so the page cannot be mistaken for a
+    // real (empty) region of the file.
+    expect(past.output).not.toMatch(/^ *\d+ \|/m);
+  });
+
+  test("a single enormous line is capped per line and says how much was dropped", async () => {
+    const ws = makeTempWorkspace();
+    const dropped = 5_000;
+    writeFileSync(join(ws, "oneline.txt"), "z".repeat(READ_FILE_MAX_LINE_CHARS + dropped) + "\n");
+
+    const result = await makeRuntime().execute(call("read_file", { path: "oneline.txt" }), makeCtx(ws));
+
+    expect(result.is_error).toBe(false);
+    const firstLine = result.output.split("\n")[0];
+    expect(firstLine.startsWith(`     1 | ${"z".repeat(READ_FILE_MAX_LINE_CHARS)} `)).toBe(true);
+    expect(firstLine).toContain(`[+${dropped} chars truncated on this line]`);
+    expect(firstLine.includes("z".repeat(READ_FILE_MAX_LINE_CHARS + 1))).toBe(false);
+    // No run of uncapped characters survives, and the file is under the byte cap.
+    expect(result.output).not.toContain("z".repeat(READ_FILE_MAX_LINE_CHARS + 1));
+    expect(result.output).not.toContain("[read_file truncated:");
+  });
+
+  test("a first line longer than the byte cap reports both the byte cap and the line cap", async () => {
+    const ws = makeTempWorkspace();
+    const totalBytes = MAX_TOOL_FILE_BYTES + 250_000;
+    writeFileSync(join(ws, "minified.js"), "a".repeat(totalBytes));
+
+    const result = await makeRuntime().execute(call("read_file", { path: "minified.js" }), makeCtx(ws));
+
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("[read_file truncated:");
+    expect(result.output).toContain(`first line alone exceeds the ${MAX_TOOL_FILE_BYTES}-byte read cap`);
+    expect(result.output).toContain(`[+${MAX_TOOL_FILE_BYTES - READ_FILE_MAX_LINE_CHARS} chars truncated on this line]`);
+    // Bounded by the per-line cap, not by the 1.25 MB file.
+    expect(Buffer.byteLength(result.output, "utf-8")).toBeLessThan(10_000);
+  });
+
+  test("a small file is byte-for-byte what it was before the cap", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "small.txt"), "alpha\nbeta\n");
+
+    const result = await makeRuntime().execute(call("read_file", { path: "small.txt" }), makeCtx(ws));
+
+    expect(result.is_error).toBe(false);
+    expect(result.output).toBe("     1 | alpha\n     2 | beta\n     3 | ");
+  });
+
+  test("DD-112: a byte-capped read does not unlock edit_file", async () => {
+    const ws = makeTempWorkspace();
+    writeHugeFile(ws);
+    const resolved = resolve(ws, "huge.log");
+    const rt = makeRuntime();
+    const ctx = makeCtx(ws);
+
+    const read = await rt.execute(call("read_file", { path: "huge.log", limit: 100_000 }), ctx);
+    expect(read.output).toContain("[read_file truncated:");
+    expect(hasFileBeenRead(resolved)).toBe(false);
+
+    const blocked = await rt.execute(
+      call("edit_file", { path: "huge.log", old_string: "line 000001", new_string: "LINE 000001" }),
+      ctx,
+    );
+    expect(blocked.is_error).toBe(true);
+    expect(blocked.error).toContain("has not been read yet");
   });
 });
 

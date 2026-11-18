@@ -563,7 +563,11 @@ export function isTruncatedReadResult(
   if (!output) return false;
   // filesystem-bundle line-window continuation / partial-page notes
   if (toolName === "read_file") {
-    if (/\[showing lines \d+-\d+ of \d+ total/.test(output)) return true;
+    // "of 10 total" (line window) and "of at least 12048" (byte-capped prefix).
+    if (/\[showing lines \d+-\d+ of (?:at least )?\d+(?: total)?/.test(output)) return true;
+    // DD-112 byte-prefix cap: the output is a truncated prefix of the file even
+    // though every line it shows is complete.
+    if (/\[read_file truncated:/.test(output)) return true;
   }
   // prepareToolResultForContext marker (context-budget truncation)
   if (/\n\n\[\.\.\.truncated - \d+ chars removed/.test(output)) return true;

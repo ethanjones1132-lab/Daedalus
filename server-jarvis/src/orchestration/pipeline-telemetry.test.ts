@@ -281,6 +281,21 @@ describe("pipeline stage telemetry", () => {
     expect(
       isTruncatedReadResult("read_file", "    1 | short", WRITE_TURN_TOOL_RESULT_CONTEXT_CHARS),
     ).toBe(false);
+    // DD-112: a byte-capped read_file prefix is incomplete even though every
+    // line it shows is a complete line — and so is a window over such a prefix,
+    // whose line count is only a lower bound.
+    expect(
+      isTruncatedReadResult(
+        "read_file",
+        "     1 | a\n[read_file truncated: this is a 1000000-byte prefix of 2500000 bytes (40%) — call read_file with offset=2 to continue]",
+      ),
+    ).toBe(true);
+    expect(
+      isTruncatedReadResult(
+        "read_file",
+        "     1 | a\n[showing lines 1-1 of at least 12048 — call read_file with offset=2 to continue]",
+      ),
+    ).toBe(true);
 
     const workspace = mkdtempSync(join(tmpdir(), "jarvis-pipeline-c1-seed-"));
     try {

@@ -34,7 +34,7 @@ const READ_FILE_DEF: ToolDefinition = {
   type: "function",
   function: {
     name: "read_file",
-    description: "Read the contents of a single FILE (not a directory). Returns full file content with line numbers. Use this before editing any file. To list a folder's contents, use list_directory instead.",
+    description: "Read the contents of a single FILE (not a directory). Returns file content with line numbers, bounded to a prefix of the file and a per-line character cap — a truncation note in the output says when content was cut. Use this before editing any file. To list a folder's contents, use list_directory instead.",
     parameters: {
       type: "object",
       properties: {
@@ -215,6 +215,78 @@ function resolutionWasRead(resolution: { path: string; canonicalPath: string }):
   return hasFileBeenRead(resolution.path) || hasFileBeenRead(resolution.canonicalPath);
 }
 
+/**
+ * DD-112: read_file must never slurp a whole huge file into memory or into the
+ * model's context. Bound the bytes actually read to a prefix, and cap how many
+ * characters a single line may contribute.
+ *
+ * The byte cap is the SAME 1 MB per-file ceiling grep's walk already applies
+ * (see the `stats.size < MAX_TOOL_FILE_BYTES` gate in handleGrep), so read and
+ * search agree on what "too big to take whole" means.
+ */
+export const MAX_TOOL_FILE_BYTES = 1_000_000;
+/** Per-line character cap: one minified/data line must not swallow the context budget. */
+export const READ_FILE_MAX_LINE_CHARS = 2_000;
+
+/**
+ * Keep only whole UTF-8 character sequences in a byte-prefix read: if the cut
+ * landed mid-character, drop the unfinished trailing sequence so the prefix
+ * decodes without a replacement character at the cut point.
+ */
+function utf8CompletePrefix(buf: Buffer): Buffer {
+  let leadIndex = buf.length - 1;
+  let back = 0;
+  while (leadIndex >= 0 && back < 3 && (buf[leadIndex] & 0xc0) === 0x80) {
+    leadIndex--;
+    back++;
+  }
+  if (leadIndex < 0) return buf.subarray(0, 0);
+  const lead = buf[leadIndex];
+  const need = (lead & 0x80) === 0x00 ? 1
+    : (lead & 0xe0) === 0xc0 ? 2
+    : (lead & 0xf0) === 0xe0 ? 3
+    : (lead & 0xf8) === 0xf0 ? 4
+    : 1; // invalid lead byte: leave it to the decoder
+  // Complete only when every byte of the final sequence is inside the prefix.
+  return leadIndex + need <= buf.length ? buf : buf.subarray(0, leadIndex);
+}
+
+/**
+ * Read at most MAX_TOOL_FILE_BYTES from `path`. The whole-file path (file is
+ * within the cap) decodes exactly like `fs.readFile(path, "utf-8")` used to,
+ * so small reads stay byte-for-byte identical.
+ */
+async function readBytePrefix(
+  path: string,
+): Promise<{ text: string; bytesRead: number; totalBytes: number }> {
+  const handle = await fs.open(path, "r");
+  try {
+    const { size } = await handle.stat();
+    const target = Math.min(size, MAX_TOOL_FILE_BYTES);
+    const buf = Buffer.alloc(target);
+    let filled = 0;
+    while (filled < target) {
+      const { bytesRead } = await handle.read(buf, filled, target - filled, filled);
+      if (bytesRead <= 0) break;
+      filled += bytesRead;
+    }
+    const prefix = buf.subarray(0, filled);
+    const text = filled < size
+      ? utf8CompletePrefix(prefix).toString("utf-8")
+      : prefix.toString("utf-8");
+    return { text, bytesRead: filled, totalBytes: size };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Cap one line's contribution, naming exactly how much was dropped. */
+function capLineChars(line: string): string {
+  if (line.length <= READ_FILE_MAX_LINE_CHARS) return line;
+  const dropped = line.length - READ_FILE_MAX_LINE_CHARS;
+  return `${line.slice(0, READ_FILE_MAX_LINE_CHARS)} …[+${dropped} chars truncated on this line]`;
+}
+
 async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionContext): Promise<string> {
   const resolution = resolveFilesystemPath(args.path, ctx);
   const path = resolution.canonicalPath;
@@ -233,27 +305,55 @@ async function handleReadFile(args: Record<string, unknown>, ctx: ExecutionConte
 
   try {
     resolution.revalidate();
-    const content = await fs.readFile(path, "utf-8");
+    const { text, bytesRead, totalBytes } = await readBytePrefix(path);
     resolution.revalidate();
-    const lines = content.split("\n");
+    // DD-112: a prefix read is NOT the whole file. Drop the line the byte cap
+    // cut in half so a truncated line can never pass for real content — unless
+    // the file's very first line is itself longer than the cap, in which case
+    // the per-line cap reports the loss instead.
+    const byteTruncated = bytesRead < totalBytes;
+    const lastNewline = byteTruncated ? text.lastIndexOf("\n") : -1;
+    const pageText = lastNewline >= 0 ? text.slice(0, lastNewline) : text;
+    const lines = pageText.split("\n");
     const start = Math.max(0, offset - 1);
     const end = Math.min(lines.length, start + limit);
     // F1 / W4.1: only a complete whole-file read unlocks edit_file. A partial
-    // offset/limit page must not be treated as "file fully seen".
-    const coversWholeFile = start === 0 && end >= lines.length;
+    // offset/limit page — or a byte-capped prefix — must not be treated as
+    // "file fully seen".
+    const coversWholeFile = start === 0 && end >= lines.length && !byteTruncated;
     if (coversWholeFile) {
       markResolutionRead(resolution);
     }
 
-    const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${line}`);
+    const numbered = lines.slice(start, end).map((line, i) => `${(start + i + 1).toString().padStart(6)} | ${capLineChars(line)}`);
     // A cut-off read must SAY so, with the exact call that continues it —
-    // silence here previously read as "that was the whole file".
-    const continuation = end < lines.length
-      ? `\n[showing lines ${start + 1}-${end} of ${lines.length} total — call read_file with offset=${end + 1} to continue]`
-      : (start > 0
-        ? `\n[showing lines ${start + 1}-${end} of ${lines.length} total — earlier lines were not included in this call]`
-        : "");
-    return numbered.join("\n") + continuation;
+    // silence here previously read as "that was the whole file". When the byte
+    // cap stopped the read we do NOT know the file's line count, so the count
+    // must not claim to be the total.
+    const lineTotal = byteTruncated ? `at least ${lines.length}` : `${lines.length} total`;
+    const emptyPage = end <= start;
+    const continuation = emptyPage
+      // Offset past what the byte cap makes readable: say so instead of
+      // printing an empty page that looks like "no content there".
+      ? (byteTruncated
+        ? `\n[read_file: offset=${start + 1} is past the readable prefix of this file — read_file serves the first ${bytesRead} of ${totalBytes} bytes (its first ${lines.length} lines); deeper content is beyond the byte cap]`
+        : (start > 0
+          ? `\n[showing lines ${start + 1}-${end} of ${lineTotal} — earlier lines were not included in this call]`
+          : ""))
+      : (end < lines.length
+        ? `\n[showing lines ${start + 1}-${end} of ${lineTotal} — call read_file with offset=${end + 1} to continue]`
+        : (start > 0
+          ? `\n[showing lines ${start + 1}-${end} of ${lineTotal} — earlier lines were not included in this call]`
+          : ""));
+    // DD-112: the byte cap needs its own note, stating exactly how much of the
+    // file is missing. The model must never take a prefix for the whole file.
+    const percent = totalBytes > 0 ? Math.round((bytesRead / totalBytes) * 100) : 100;
+    const byteNote = byteTruncated && !emptyPage && end >= lines.length
+      ? (text.includes("\n")
+        ? `\n[read_file truncated: this is a ${bytesRead}-byte prefix of ${totalBytes} bytes (${percent}%) — the remaining ${totalBytes - bytesRead} bytes are beyond the read_file byte cap]`
+        : `\n[read_file truncated: ${bytesRead} of ${totalBytes} bytes were read (${percent}%) — the file's first line alone exceeds the ${MAX_TOOL_FILE_BYTES}-byte read cap, and lines are capped at ${READ_FILE_MAX_LINE_CHARS} chars]`)
+      : "";
+    return numbered.join("\n") + continuation + byteNote;
   } catch {
     throw new Error(`File not found: ${resolution.path}. Use glob with pattern to find the correct path before retrying.`);
   }
@@ -569,7 +669,7 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
         if (!entry.startsWith(".") && entry !== "node_modules" && entry !== ".git") {
           await walk(displayFull, childResolution.canonicalPath);
         }
-      } else if (stats.isFile() && stats.size < 1_000_000) {
+      } else if (stats.isFile() && stats.size < MAX_TOOL_FILE_BYTES) {
         try {
           childResolution.revalidate();
           const content = await fs.readFile(childResolution.canonicalPath, "utf-8");
