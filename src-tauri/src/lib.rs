@@ -1659,44 +1659,92 @@ mod probe_jarvis_health_tests {
     }
 }
 
+/// The Bun executable a Windows install falls back to when no bundled or
+/// per-user `bun.exe` exists and WSL cannot run commands on this machine: the
+/// native executable name, so the launch's `PATH` lookup fails naming `bun`
+/// instead of a guest path from a distro that is not here (DD-114).
+///
+/// The `.exe` suffix is what keeps it native: `bun_launches_through_wsl` only
+/// treats a Windows command ending in `.exe` as a native launch, so a bare
+/// `bun` would be routed back through `wsl.exe` — exactly the failure this
+/// candidate exists to avoid.
+const NATIVE_BUN_CANDIDATE: &str = "bun.exe";
+
+/// The Bun location a Windows install prefers once WSL is known to be usable.
+///
+/// This value is consumed by `bash -lc`, so `$HOME` stays unexpanded: the
+/// guest shell knows the distro home and the host must not spawn `wsl.exe`
+/// just to ask.
+const WSL_BUN_CANDIDATE: &str = "$HOME/.bun/bin/bun";
+
+/// A `bun.exe` bundled with the app, in the order an install lays it out:
+/// beside the EXE first, then the packaged `resources` and `bin` directories.
+/// `None` when this build carries no bundled Bun.
+fn bundled_bun_probe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [
+        dir.join("bun.exe"),
+        dir.join("resources").join("bun.exe"),
+        dir.join("bin").join("bun.exe"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
+}
+
+/// The standard Windows-native Bun install (`bun install` on Windows) at
+/// `%USERPROFILE%\.bun\bin\bun.exe`. `None` when this machine has none.
+fn native_bun_probe() -> Option<std::path::PathBuf> {
+    let profile = std::env::var_os("USERPROFILE")?;
+    let candidate = std::path::PathBuf::from(profile)
+        .join(".bun")
+        .join("bin")
+        .join("bun.exe");
+    candidate.exists().then_some(candidate)
+}
+
+/// Whether the app's WSL probe answered with a guest home.
+///
+/// `wsl_home` is the probe the rest of the app already uses: it asks the
+/// distro for its home and falls back to this machine's environment when
+/// `wsl.exe` cannot answer. A Windows-shaped answer therefore means WSL is not
+/// usable here, and the Bun lookup must not hand a guest path to a launcher
+/// that cannot run it (DD-114).
+fn wsl_home_is_usable(home: &str) -> bool {
+    home.starts_with('/')
+}
+
+/// The Windows Bun choice, pure over its probes (DD-114).
+///
+/// Precedence is unchanged: a bundled `bun.exe` wins, then the per-user native
+/// install, and only then WSL. The WSL candidate is returned only when the
+/// probe says WSL is usable; otherwise the native candidate is selected so the
+/// launch stays native and its failure names `bun` (DD-114).
+fn select_windows_bun(native_bun: Option<String>, wsl_usable: bool) -> String {
+    match native_bun {
+        Some(native_bun) => native_bun,
+        None if wsl_usable => WSL_BUN_CANDIDATE.to_string(),
+        None => NATIVE_BUN_CANDIDATE.to_string(),
+    }
+}
+
 pub(crate) fn find_bun_executable() -> String {
-    // NEW: Support bundled / portable Windows execution for installers on new hardware.
+    // Support bundled / portable Windows execution for installers on new hardware.
     // If a "bun.exe" is present next to the current executable (or in ./resources or ./bin next to it),
     // prefer the local one (no WSL required). This + the bundled server js in resources
     // lets the NSIS installer launch a full successful app on fresh Windows installs.
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                for candidate in [
-                    dir.join("bun.exe"),
-                    dir.join("resources").join("bun.exe"),
-                    dir.join("bin").join("bun.exe"),
-                ] {
-                    if candidate.exists() {
-                        return candidate.to_string_lossy().into_owned();
-                    }
-                }
-            }
-        }
-    }
-
     if cfg!(target_os = "windows") {
-        // Check the standard Windows-native bun installation (bun install on Windows).
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            let native_bun = std::path::PathBuf::from(profile)
-                .join(".bun")
-                .join("bin")
-                .join("bun.exe");
-            if native_bun.exists() {
-                return native_bun.to_string_lossy().into_owned();
-            }
-        }
-        // Fall back: bun lives inside WSL.  Return the WSL path; callers that
-        // run it via `wsl.exe -- bash -lc` will resolve it through WSL PATH.
-        // This value is consumed by `bash -lc` below. Avoid invoking `wsl.exe`
-        // just to expand the distro home; the shell already knows `$HOME`.
-        return "$HOME/.bun/bin/bun".to_string();
+        let native_bun = bundled_bun_probe()
+            .or_else(native_bun_probe)
+            .map(|candidate| candidate.to_string_lossy().into_owned());
+        // DD-114: a WSL path is only a candidate when WSL can actually run the
+        // command. Ask the app's existing probe only when WSL would be the
+        // answer, so a bundled or native install keeps its no-`wsl.exe`
+        // startup path (DD-049). When the probe reports this machine's own
+        // Windows home, `wsl.exe` did not answer and the native candidate is
+        // selected instead of a guest path.
+        let wsl_usable = native_bun.is_none() && wsl_home_is_usable(&wsl_home());
+        return select_windows_bun(native_bun, wsl_usable);
     }
     if std::path::Path::new("/usr/bin/bun").exists() {
         return "/usr/bin/bun".to_string();
@@ -6414,8 +6462,9 @@ mod wsl_server_command_tests {
         );
     }
 
-    /// `find_bun_executable` returns `$HOME/.bun/bin/bun` on Windows when it
-    /// cannot find a native install; the guest shell still has to expand it.
+    /// `find_bun_executable` returns `$HOME/.bun/bin/bun` on Windows when no
+    /// native install exists and WSL is usable; the guest shell still has to
+    /// expand it.
     #[test]
     fn a_wsl_relative_bun_still_expands_in_the_guest_shell() {
         let command = wsl_server_command(
@@ -6430,6 +6479,117 @@ mod wsl_server_command_tests {
         assert!(
             !command.contains('\''),
             "quoting $HOME would stop the guest shell expanding it: {command}"
+        );
+    }
+}
+
+/// DD-114: a WSL-flavoured Bun path is only a candidate when WSL itself is
+/// usable. The live lookup cannot run in a unit test (it reads this machine's
+/// EXE directory, user profile and WSL state), so these pin the pure selection
+/// seam it uses, with the same launch-mode rule the spawn path applies.
+#[cfg(test)]
+mod bun_executable_selection_tests {
+    use super::{
+        bun_launches_through_wsl, select_windows_bun, wsl_home_is_usable, NATIVE_BUN_CANDIDATE,
+        WSL_BUN_CANDIDATE,
+    };
+
+    #[test]
+    fn no_native_bun_and_no_usable_wsl_selects_the_native_candidate() {
+        // `None` is every native probe failing: neither the bundled nor the
+        // per-user `bun.exe` exists on this machine.
+        let selected = select_windows_bun(None, false);
+
+        assert_eq!(
+            selected, NATIVE_BUN_CANDIDATE,
+            "with every native probe failing and WSL unusable, the lookup must \
+             hand back the native candidate rather than a guest path"
+        );
+        assert_eq!(
+            selected, "bun.exe",
+            "the native candidate must be the native executable's name"
+        );
+        assert!(
+            !bun_launches_through_wsl(true, &selected),
+            "the native candidate must not be routed back through wsl.exe: {selected}"
+        );
+    }
+
+    #[test]
+    fn a_usable_wsl_keeps_the_previous_wsl_selection() {
+        let selected = select_windows_bun(None, true);
+
+        assert_eq!(
+            selected, WSL_BUN_CANDIDATE,
+            "a machine where the WSL probe answers keeps the guest path it had before"
+        );
+        assert!(
+            bun_launches_through_wsl(true, &selected),
+            "the WSL candidate is still launched through wsl.exe: {selected}"
+        );
+    }
+
+    /// The bundled preference is unchanged: a `bun.exe` shipped with the app or
+    /// installed per-user wins over WSL whatever the WSL probe reports.
+    #[test]
+    fn bundled_and_per_user_bun_still_win_over_wsl() {
+        let bundled = r"C:\Program Files\Jarvis\resources\bun.exe";
+        let per_user = r"C:\Users\buyer\.bun\bin\bun.exe";
+
+        assert_eq!(
+            select_windows_bun(Some(bundled.to_string()), true),
+            bundled,
+            "a bundled bun.exe must stay preferred over WSL"
+        );
+        assert_eq!(
+            select_windows_bun(Some(per_user.to_string()), true),
+            per_user,
+            "a per-user native bun.exe must stay preferred over WSL"
+        );
+        assert!(
+            !bun_launches_through_wsl(true, bundled) && !bun_launches_through_wsl(true, per_user),
+            "native executables keep launching natively"
+        );
+    }
+
+    /// Only the guest's own home proves WSL answered. The fallback `wsl_home`
+    /// uses when `wsl.exe` is silent is this machine's Windows home, which must
+    /// not be mistaken for a usable WSL.
+    #[test]
+    fn only_a_guest_home_counts_as_a_usable_wsl() {
+        assert!(wsl_home_is_usable("/home/buyer"));
+        assert!(
+            !wsl_home_is_usable(r"C:\Users\buyer"),
+            "an environment-derived Windows home means wsl.exe did not answer"
+        );
+        assert!(!wsl_home_is_usable(""));
+    }
+
+    /// The live lookup must take its WSL choice from the seam above, so the
+    /// guest path cannot come back for a machine without WSL.
+    #[test]
+    fn the_live_lookup_gates_its_wsl_candidate_on_the_probe() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("pub(crate) fn find_bun_executable() -> String {")
+            .expect("find_bun_executable must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("\n/// Where a child's stdout/stderr is written")
+            .map(|offset| start + offset)
+            .expect("the log target must follow find_bun_executable");
+        let body = &SOURCE[start..end];
+
+        assert!(
+            body.contains("select_windows_bun("),
+            "the Windows choice must come from the seam these tests pin:\n{body}"
+        );
+        assert!(
+            body.contains("wsl_home_is_usable(") && body.contains("wsl_home()"),
+            "the WSL candidate must be gated on the app's existing WSL probe:\n{body}"
+        );
+        assert!(
+            !body.contains("$HOME/.bun/bin/bun"),
+            "the guest path must come from WSL_BUN_CANDIDATE, not a literal fallback:\n{body}"
         );
     }
 }
