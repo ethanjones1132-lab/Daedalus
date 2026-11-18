@@ -6,6 +6,7 @@ pub mod jarvis;
 pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
+mod single_instance;
 pub mod supervisor;
 pub mod types;
 pub mod wsl;
@@ -3411,6 +3412,25 @@ const APP_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let instance = match single_instance::acquire() {
+        Ok(instance) => instance,
+        Err(error) => {
+            eprintln!("[jarvis::startup] {error}; refusing to start without ownership");
+            return;
+        }
+    };
+    let launch_plan = single_instance::launch_plan(instance.role());
+    if let Some(focused) =
+        single_instance::focus_handoff(instance.role(), || instance.focus_existing_window())
+    {
+        if !focused {
+            eprintln!(
+                "[jarvis::startup] second launch could not focus the existing Jarvis window"
+            );
+        }
+        return;
+    }
+
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
     let jarvis_queue = Arc::new(crate::jarvis::queue::MessageQueue::new(
         jarvis_config.clone(),
@@ -3492,10 +3512,12 @@ pub fn run() {
         .manage(jarvis_state)
         .manage(db)
         .manage(build_hermes_app_state())
-        .setup(|app| {
-            let handle = app.handle().clone();
-            if let Err(e) = spawn_bootstrap_services(handle) {
-                log::error!(target: "jarvis::startup", "failed to dispatch startup thread: {e}");
+        .setup(move |app| {
+            if launch_plan.start_bootstrap_services {
+                let handle = app.handle().clone();
+                if let Err(e) = spawn_bootstrap_services(handle) {
+                    log::error!(target: "jarvis::startup", "failed to dispatch startup thread: {e}");
+                }
             }
             Ok(())
         })
@@ -3708,13 +3730,13 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(move |_app_handle, event| {
             let teardown = match event {
                 tauri::RunEvent::ExitRequested { .. } => TeardownEvent::ExitRequested,
                 tauri::RunEvent::Exit => TeardownEvent::Exit,
                 _ => TeardownEvent::Other,
             };
-            if teardown.tears_down() {
+            if teardown.tears_down() && launch_plan.stop_owned_children {
                 // DD-077: close the supervisor's start/restart gate *before* any
                 // child is torn down. A tick already in flight would otherwise
                 // relaunch the server stop_all is reaping, leaving it running
@@ -5358,7 +5380,7 @@ mod quit_teardown_tests {
     /// assertion text cannot satisfy the wiring checks.
     fn run_callback() -> &'static str {
         let start = SOURCE
-            .find(".run(|_app_handle, event| {")
+            .find(".run(move |_app_handle, event| {")
             .expect("the app must still install a run-loop callback");
         let end = SOURCE[start..]
             .find("        });")
