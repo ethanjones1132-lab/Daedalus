@@ -519,6 +519,34 @@ pub(crate) async fn start_ollama_and_warm(model: String) {
     }
 }
 
+/// The one bounded log `llama-server`'s stdout and stderr both land in.
+///
+/// The file, its directory and the rule that a log that cannot be opened fails
+/// the start are exactly what they were — a child whose own failure output has
+/// nowhere to go is not usefully started — but the child now writes into pipes,
+/// so the bounded writer owns the cap and the rotation (DD-114).
+fn llama_server_log_stdio(
+    file_name: &str,
+) -> Result<(std::process::Stdio, std::process::Stdio, std::path::PathBuf), String> {
+    let log_dir = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".openclaw")
+        .join("jarvis")
+        .join("logs");
+    let target = try_open_server_log(&log_dir, file_name)
+        .map_err(|error| format!("could not open llama.cpp log: {error}"))?;
+    // The probe created the file and proved it writable; drop that handle so the
+    // writer's per-line append and any rotation rename never compete with it.
+    drop(target.file);
+    Ok((
+        std::process::Stdio::piped(),
+        std::process::Stdio::piped(),
+        target.path,
+    ))
+}
+
 /// Start the configured local llama.cpp server with the placement, speculation
 /// and reasoning budget from `LlamaCppConfig::server_args`. The Child is owned by
 /// the shared lifecycle manager, so switching backends or exiting Daedalus
@@ -587,35 +615,24 @@ pub(crate) async fn start_llama_cpp_server(
                 ));
             }
 
-            use std::process::{Command, Stdio};
+            use std::process::Command;
+            // DD-114: both streams keep writing to the same `llama-server.log`,
+            // but through pipes and the bounded writer, so a long-lived install
+            // cannot fill the disk with it.
+            let (stdout_stdio, stderr_stdio, log_path) =
+                llama_server_log_stdio("llama-server.log")?;
             let mut command = Command::new(&server_path);
             command.args(&server_args);
-
-            let log_dir = std::env::var_os("USERPROFILE")
-                .map(std::path::PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".openclaw")
-                .join("jarvis")
-                .join("logs");
-            std::fs::create_dir_all(&log_dir)
-                .map_err(|error| format!("could not create llama.cpp log directory: {error}"))?;
-            let log = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_dir.join("llama-server.log"))
-                .map_err(|error| format!("could not open llama.cpp log: {error}"))?;
-            let stderr = log
-                .try_clone()
-                .map_err(|error| format!("could not duplicate llama.cpp log handle: {error}"))?;
-            command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+            command.stdout(stdout_stdio).stderr(stderr_stdio);
             crate::wsl::hide_windows_console(&mut command);
-            process_lifecycle::spawn_managed(&mut command).map_err(|error| {
+            let mut child = process_lifecycle::spawn_managed(&mut command).map_err(|error| {
                 format!(
                     "failed to spawn llama-server {}: {error}",
                     server_path.display()
                 )
-            })
+            })?;
+            bind_shared_child_stdio_logs(&mut child, log_path);
+            Ok(child)
         },
     )?;
 
@@ -1911,19 +1928,59 @@ fn spawn_stdio_log_drain<R>(pipe: R, path: std::path::PathBuf)
 where
     R: std::io::Read + Send + 'static,
 {
+    spawn_shared_stdio_log_drains(vec![pipe], path);
+}
+
+/// Append several pipes of one child into the same bounded log (DD-114).
+///
+/// llama-server's stdout and stderr have always landed in one `llama-server.log`.
+/// Giving each stream its own writer would leave that file with two independent
+/// caps and two rotations racing over the same `.1` name, so the pipes share a
+/// single writer: still one live file and one archive beside it, now bounded.
+fn spawn_shared_stdio_log_drains<R>(pipes: Vec<R>, path: std::path::PathBuf)
+where
+    R: std::io::Read + Send + 'static,
+{
+    spawn_shared_stdio_log_drains_with_cap(pipes, path, SERVER_LOG_MAX_BYTES);
+}
+
+/// [`spawn_shared_stdio_log_drains`] with the cap in hand, so the rotation the
+/// shared writer performs can be driven in a test without a ten-megabyte log.
+fn spawn_shared_stdio_log_drains_with_cap<R>(
+    pipes: Vec<R>,
+    path: std::path::PathBuf,
+    cap: u64,
+) where
+    R: std::io::Read + Send + 'static,
+{
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(BoundedLogWriter::new(path, cap)));
+    for pipe in pipes {
+        spawn_pipe_drain(pipe, std::sync::Arc::clone(&writer));
+    }
+}
+
+/// Drain one pipe into a bounded writer it may share with the child's other
+/// streams. The lock is held for one line at a time, so the streams interleave
+/// exactly as they did when both wrote to the same file handle.
+fn spawn_pipe_drain<R>(pipe: R, writer: std::sync::Arc<std::sync::Mutex<BoundedLogWriter>>)
+where
+    R: std::io::Read + Send + 'static,
+{
     let spawned = std::thread::Builder::new()
         .name("jarvis-stdio-log".to_string())
         .spawn(move || {
             use std::io::BufRead as _;
 
             let mut reader = std::io::BufReader::new(pipe);
-            let mut writer = BoundedLogWriter::new(path, SERVER_LOG_MAX_BYTES);
             let mut line = Vec::new();
             loop {
                 line.clear();
                 match reader.read_until(b'\n', &mut line) {
                     Ok(0) => break,
-                    Ok(_) => writer.write(&line),
+                    Ok(_) => writer
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .write(&line),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
@@ -1938,6 +1995,24 @@ where
             "child stdio log drain could not start: {error}"
         );
     }
+}
+
+/// Hand both of one child's pipes to a single bounded log file (DD-114).
+///
+/// The child must have been spawned with `Stdio::piped()` for both streams; a
+/// stream it does not expose is simply not drained.
+fn bind_shared_child_stdio_logs(
+    child: &mut std::process::Child,
+    log_path: std::path::PathBuf,
+) {
+    let mut pipes: Vec<Box<dyn std::io::Read + Send>> = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        pipes.push(Box::new(stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        pipes.push(Box::new(stderr));
+    }
+    spawn_shared_stdio_log_drains(pipes, log_path);
 }
 
 /// Hand a freshly spawned child's pipes to their bounded log writers (DD-107).
@@ -6044,6 +6119,100 @@ mod bounded_server_log_tests {
             body.matches("bind_child_stdio_logs(").count(),
             1,
             "one bind after the branch covers every launch path:\n{body}"
+        );
+    }
+
+    /// DD-114: llama-server's stdout and stderr have always shared one
+    /// `llama-server.log`, so they must now share one bounded writer. Every
+    /// line of both streams still lands in the log, the live file never grows
+    /// past the cap, and there is still only the single `.1` archive.
+    #[test]
+    fn two_streams_sharing_one_log_stay_capped_and_keep_every_line() {
+        let dir = unique_dir("llama-shared");
+        let live = dir.join("llama-server.log");
+        let stdout = "out one\nout two\n";
+        let stderr = "err one\nerr two\n";
+        let cap = 16;
+        spawn_shared_stdio_log_drains_with_cap(
+            vec![
+                std::io::Cursor::new(stdout.as_bytes().to_vec()),
+                std::io::Cursor::new(stderr.as_bytes().to_vec()),
+            ],
+            live.clone(),
+            cap,
+        );
+
+        let expected = (stdout.len() + stderr.len()) as u64;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (live_text, rotated_text) = loop {
+            let live_text = contents(&live);
+            let rotated_text = contents(&rotated(&live, "llama-server.log"));
+            if (live_text.len() + rotated_text.len()) as u64 == expected {
+                break (live_text, rotated_text);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both drained streams must reach the log; it holds {live_text:?} + {rotated_text:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert!(
+            live_text.len() as u64 <= cap,
+            "the shared live log must stay at or under its cap, got {} bytes: {live_text:?}",
+            live_text.len()
+        );
+        assert!(
+            rotated_text.len() as u64 <= cap,
+            "the single archive must be capped too, got {} bytes: {rotated_text:?}",
+            rotated_text.len()
+        );
+        assert!(
+            !dir.join("llama-server.log.2").exists(),
+            "one `.1` generation is the contract; the shared writer must not add a second"
+        );
+        let combined = format!("{rotated_text}{live_text}");
+        for line in ["out one", "out two", "err one", "err two"] {
+            assert_eq!(
+                combined.matches(line).count(),
+                1,
+                "every line of both streams must be appended exactly once: {combined:?}"
+            );
+        }
+    }
+
+    /// DD-114: the llama.cpp spawn path must hand both streams to the shared
+    /// bounded writer and keep the same file name. Before this, the child was
+    /// given a raw append-only handle for that file, which is what let
+    /// `llama-server.log` grow without bound.
+    #[test]
+    fn the_llama_cpp_spawn_path_pipes_both_streams_through_the_shared_bounded_log() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("pub(crate) async fn start_llama_cpp_server(")
+            .expect("start_llama_cpp_server must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("pub fn reconcile_backend_services(")
+            .map(|offset| start + offset)
+            .expect("reconcile_backend_services must follow the llama.cpp start");
+        let body = &SOURCE[start..end];
+
+        assert!(
+            body.contains("llama_server_log_stdio(\"llama-server.log\")"),
+            "the llama.cpp log must keep its existing file name:\n{body}"
+        );
+        assert!(
+            body.contains(".stdout(stdout_stdio)") && body.contains(".stderr(stderr_stdio)"),
+            "both llama-server streams must take the pipes the bounded writer drains:\n{body}"
+        );
+        assert!(
+            body.contains("bind_shared_child_stdio_logs("),
+            "the spawned child's pipes must be handed to the shared bounded log:\n{body}"
+        );
+        assert!(
+            !body.contains("OpenOptions") && !body.contains("try_clone()"),
+            "a raw append-only file handle is exactly what let llama-server.log grow \
+             without bound:\n{body}"
         );
     }
 }

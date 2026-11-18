@@ -21,6 +21,13 @@
 // forever. DD-080 applies the same rule to Ollama: a child that stays alive
 // without ever opening port 11434 is counted, not reset every tick.
 //
+// DD-114 applies it to the two children whose start helper returns as soon as
+// the process is spawned: llama.cpp and the claude_cli_proxy. An `Ok` spawn is
+// not a serving backend, so a tick that finds the port still closed advances the
+// same budget a failed spawn does, and only a port that answers clears it. A
+// child that spawns fine and dies — or never binds — therefore reaches the
+// existing cap and stops being restarted.
+//
 // Boot-stage failures that never became a relaunch attempt are recorded here as
 // reasons (DD-080) so `give_up_status` — the status surface `get_system_health`
 // already exposes — can say why a packaged startup failed instead of leaving
@@ -253,6 +260,82 @@ fn proxy_tick_action(proxy_required: bool, listening: bool, owned_live: bool) ->
         return ProxyAction::Leave;
     }
     ProxyAction::Start
+}
+
+/// Why a proxy child that has not opened its port is charged to the escalation
+/// budget (DD-114).
+///
+/// The same reason DD-079/DD-080 name for Bun and Ollama: a child handle that
+/// is still alive is not a serving proxy, and "the port never opened" is the
+/// whole diagnosis. Named so the supervisor's durable log line says that
+/// instead of only showing a counter.
+const PROXY_STILL_STARTING_REASON: &str =
+    "claude_cli_proxy child is alive but has not opened its port";
+
+/// What the proxy block of one tick reports after one observation or attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyTickVerdict {
+    /// The port answered: the counter was cleared and a relaunch may be claimed.
+    Healthy,
+    /// The child did not serve: counted, never reported as a relaunch.
+    NotServing,
+}
+
+/// Record one proxy observation against the escalation budget.
+///
+/// DD-114: the port answering is the only evidence the proxy works, so it is
+/// the only observation that clears the counter. A tick that finds the port
+/// still closed — whether the child was just spawned or was already running —
+/// is counted exactly like a failed restart, so a proxy that keeps dying (or
+/// never binds) reaches the existing cap instead of being reloaded every tick.
+/// Returns the verdict plus the new count.
+fn record_proxy_tick_outcome(listening: bool) -> (ProxyTickVerdict, u32) {
+    if listening {
+        reset_failures(SupervisedService::Proxy);
+        return (ProxyTickVerdict::Healthy, 0);
+    }
+    (
+        ProxyTickVerdict::NotServing,
+        record_restart_failure(SupervisedService::Proxy, PROXY_STILL_STARTING_REASON),
+    )
+}
+
+/// Why llama.cpp that spawned but has not opened its port is charged to the
+/// escalation budget (DD-114).
+///
+/// `start_llama_cpp_server` returns as soon as the child is spawned — model
+/// loading can take far longer than one tick — so `Ok` says nothing about the
+/// server. The port is the only evidence it serves.
+const LLAMA_CPP_STILL_STARTING_REASON: &str =
+    "llama.cpp child was spawned but has not opened its port within the start budget";
+
+/// What the llama.cpp block of one tick reports after one observation or
+/// attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlamaCppTickVerdict {
+    /// The port answered: the counter was cleared and a relaunch may be claimed.
+    Serving,
+    /// The child did not serve: counted, never reported as a relaunch.
+    NotServing,
+}
+
+/// Record one llama.cpp observation against the escalation budget.
+///
+/// DD-114: `start_llama_cpp_server` returning `Ok` only means the child exists,
+/// so the counter must not be cleared there. A tick with the port still closed
+/// advances the same budget an `Err` spawn does — that is what makes the
+/// existing cap engage for a child that spawns fine and dies every tick — and
+/// only a port that answers clears it.
+/// Returns the verdict plus the new count.
+fn record_llama_cpp_tick_outcome(serving: bool) -> (LlamaCppTickVerdict, u32) {
+    if serving {
+        reset_failures(SupervisedService::LlamaCpp);
+        return (LlamaCppTickVerdict::Serving, 0);
+    }
+    (
+        LlamaCppTickVerdict::NotServing,
+        record_restart_failure(SupervisedService::LlamaCpp, LLAMA_CPP_STILL_STARTING_REASON),
+    )
 }
 
 fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
@@ -507,14 +590,44 @@ async fn tick(handle: &AppHandle) {
     // branch stops that child instead of orphaning it.
     let proxy_owned =
         crate::process_lifecycle::is_live(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
+    // Probed once: the action and the counter decision must see the same
+    // observation, or a port that opened mid-tick could be counted after the
+    // tick already decided the child was still warming (DD-114).
+    let proxy_listening = crate::claude_proxy_is_listening();
 
-    match proxy_tick_action(proxy_required, crate::claude_proxy_is_listening(), proxy_owned) {
+    match proxy_tick_action(proxy_required, proxy_listening, proxy_owned) {
         ProxyAction::StopOwned => {
             PROXY_FAILS.store(0, Ordering::Relaxed);
             crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::ClaudeProxy);
         }
         ProxyAction::Leave => {
-            PROXY_FAILS.store(0, Ordering::Relaxed);
+            // DD-114: a child left alone is only healthy when its port answers.
+            // An owned proxy that never binds is counted, exactly as DD-080
+            // counts a warming Ollama, so it reaches the give-up path instead of
+            // resetting its own budget every tick.
+            let previous = PROXY_FAILS.load(Ordering::Relaxed);
+            match record_proxy_tick_outcome(proxy_listening) {
+                (ProxyTickVerdict::Healthy, _) => {}
+                // One durable line per advance, not once per tick forever: after
+                // the cap the give-up status is the signal.
+                (ProxyTickVerdict::NotServing, next) if next > previous => {
+                    log::warn!(
+                        target: "jarvis::supervisor",
+                        "claude_cli_proxy is not serving — the child is alive but its port \
+                         is closed ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the \
+                         restart budget, not reported as a relaunch: {PROXY_STILL_STARTING_REASON}"
+                    );
+                    if next >= MAX_CONSECUTIVE_RESTARTS {
+                        log::error!(
+                            target: "jarvis::supervisor",
+                            "claude_cli_proxy never opened its port \
+                             ({next}/{MAX_CONSECUTIVE_RESTARTS}); automatic restarts are paused. \
+                             Use Restart to re-arm the budget."
+                        );
+                    }
+                }
+                (ProxyTickVerdict::NotServing, _) => {}
+            }
         }
         ProxyAction::Start => {
             let fails = PROXY_FAILS.load(Ordering::Relaxed);
@@ -526,8 +639,30 @@ async fn tick(handle: &AppHandle) {
                 match crate::restart_claude_cli_proxy(ollama_model.clone(), openrouter_api_key.clone())
                 {
                     Ok(_) => {
-                        PROXY_FAILS.store(0, Ordering::Relaxed);
-                        println!("[supervisor] claude_cli_proxy was down — relaunched.");
+                        // DD-114: the spawn returning is not the proxy serving.
+                        // Re-probe the port before claiming a relaunch or
+                        // clearing the budget.
+                        match record_proxy_tick_outcome(crate::claude_proxy_is_listening()) {
+                            (ProxyTickVerdict::Healthy, _) => {
+                                println!("[supervisor] claude_cli_proxy was down — relaunched.");
+                            }
+                            (ProxyTickVerdict::NotServing, next) => {
+                                log::warn!(
+                                    target: "jarvis::supervisor",
+                                    "claude_cli_proxy was spawned but has not opened its port \
+                                     ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the \
+                                     restart budget: {PROXY_STILL_STARTING_REASON}"
+                                );
+                                if next >= MAX_CONSECUTIVE_RESTARTS {
+                                    log::error!(
+                                        target: "jarvis::supervisor",
+                                        "claude_cli_proxy never opened its port \
+                                         ({next}/{MAX_CONSECUTIVE_RESTARTS}); automatic restarts \
+                                         are paused. Use Restart to re-arm the budget."
+                                    );
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         let next = record_restart_failure(SupervisedService::Proxy, &error);
@@ -619,11 +754,17 @@ async fn tick(handle: &AppHandle) {
     }
 
     // ── llama.cpp (only required when Gemma is the active backend) ──
-    if !is_llama_cpp || crate::backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl) {
+    // Probed once: the branch and the counter decision must see the same
+    // observation, or a port that opened mid-tick could still be counted.
+    let llama_cpp_listening =
+        crate::backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl);
+    if !is_llama_cpp {
         LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
-        if !is_llama_cpp {
-            crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::LlamaCpp);
-        }
+        crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::LlamaCpp);
+    } else if llama_cpp_listening {
+        // DD-114: the port answering is the only evidence the child serves, so
+        // it is the only observation that clears the budget.
+        let _ = record_llama_cpp_tick_outcome(true);
     } else {
         let fails = LLAMA_CPP_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
@@ -633,8 +774,42 @@ async fn tick(handle: &AppHandle) {
             }
             match crate::start_llama_cpp_server(llama_cpp_config.clone()).await {
                 Ok(_) => {
-                    LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
-                    println!("[supervisor] llama.cpp is starting or was relaunched.");
+                    // DD-114: `Ok` only means the child was spawned (or was
+                    // already running). Model loading outlasts a tick, so the
+                    // port — not the spawn — decides whether this attempt
+                    // worked. A tick with the port still closed is counted
+                    // exactly like an `Err` spawn, so a child that keeps dying
+                    // reaches the existing cap instead of being restarted every
+                    // tick.
+                    let serving = crate::backend_port_is_listening(
+                        llama_cpp_config.port,
+                        llama_cpp_uses_wsl,
+                    );
+                    match record_llama_cpp_tick_outcome(serving) {
+                        (LlamaCppTickVerdict::Serving, _) => {
+                            println!("[supervisor] llama.cpp is starting or was relaunched.");
+                        }
+                        (LlamaCppTickVerdict::NotServing, next) => {
+                            log::warn!(
+                                target: "jarvis::supervisor",
+                                "llama.cpp was spawned but port {} is still closed \
+                                 ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the \
+                                 restart budget, not reported as a relaunch: \
+                                 {LLAMA_CPP_STILL_STARTING_REASON}",
+                                llama_cpp_config.port
+                            );
+                            if next >= MAX_CONSECUTIVE_RESTARTS {
+                                log::error!(
+                                    target: "jarvis::supervisor",
+                                    "llama.cpp never opened port {} \
+                                     ({next}/{MAX_CONSECUTIVE_RESTARTS}); automatic restarts are \
+                                     paused. Last observation: {LLAMA_CPP_STILL_STARTING_REASON}. \
+                                     Use Restart to re-arm the budget.",
+                                    llama_cpp_config.port
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
                     let next = record_restart_failure(SupervisedService::LlamaCpp, &error);
@@ -857,6 +1032,176 @@ mod tests {
         );
 
         reset_failures(SupervisedService::Ollama);
+    }
+
+    /// DD-114: `start_llama_cpp_server` returns as soon as the child is
+    /// spawned — model loading outlasts a tick — so its `Ok` used to clear the
+    /// budget and a child that spawned and died was relaunched forever. A tick
+    /// whose port is still closed must count exactly like an `Err` spawn, so
+    /// the existing cap engages, and only a serving port may reset.
+    #[test]
+    fn a_llama_cpp_that_spawns_ok_but_never_serves_reaches_the_cap_and_stops_restarting() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::LlamaCpp);
+
+        // One tick after an `Ok` spawn: the child exists, the port is closed.
+        let (verdict, first) = record_llama_cpp_tick_outcome(false);
+        assert_eq!(verdict, LlamaCppTickVerdict::NotServing);
+        assert_eq!(first, 1);
+        assert_eq!(
+            LLAMA_CPP_FAILS.load(Ordering::Relaxed),
+            1,
+            "a spawn that returned Ok is not evidence the server serves: the \
+             closed port must count"
+        );
+
+        // The next ticks find the same closed port, so the budget advances
+        // instead of starting over.
+        for expected in 2..=MAX_CONSECUTIVE_RESTARTS {
+            let (verdict, next) = record_llama_cpp_tick_outcome(false);
+            assert_eq!(verdict, LlamaCppTickVerdict::NotServing);
+            assert_eq!(next, expected);
+        }
+        assert_eq!(
+            LLAMA_CPP_FAILS.load(Ordering::Relaxed),
+            MAX_CONSECUTIVE_RESTARTS
+        );
+        assert!(
+            !may_restart(LLAMA_CPP_FAILS.load(Ordering::Relaxed)),
+            "a llama.cpp that spawns Ok and never serves must reach the existing cap"
+        );
+        assert!(
+            give_up_status().llama_cpp_give_up,
+            "hitting the cap must surface as the existing llama.cpp give-up state"
+        );
+
+        // Only a serving port clears the budget.
+        let (verdict, next) = record_llama_cpp_tick_outcome(true);
+        assert_eq!(verdict, LlamaCppTickVerdict::Serving);
+        assert_eq!(next, 0);
+        assert!(!give_up_status().llama_cpp_give_up);
+
+        // Pin the wiring: after the start the tick must re-probe the port and
+        // route the counter decision through the tested seam. A bare `Ok` may
+        // not clear the counter — that is the half that fails if this reverts.
+        let production = supervisor_production_source();
+        let llama = production
+            .split_once("// ── llama.cpp")
+            .map(|(_, block)| block)
+            .expect("the llama.cpp supervisor block must keep its section marker");
+        let ok_arm = llama
+            .split_once("Ok(_) => {")
+            .and_then(|(_, rest)| rest.split_once("Err(error) =>"))
+            .map(|(arm, _)| arm)
+            .expect("the llama.cpp block must keep its Ok and Err arms");
+        let probe = ok_arm
+            .find("backend_port_is_listening(")
+            .expect("the Ok arm must re-probe the port after the spawn decides the budget");
+        let decision = ok_arm
+            .find("record_llama_cpp_tick_outcome(")
+            .unwrap_or_else(|| panic!("the Ok arm must route through the tested seam:\n{ok_arm}"));
+        assert!(
+            probe < decision,
+            "the port must be observed before the counter decision:\n{ok_arm}"
+        );
+        assert!(
+            !ok_arm.contains("LLAMA_CPP_FAILS.store(0"),
+            "a spawn that returned Ok must not clear the failure count:\n{ok_arm}"
+        );
+        assert!(
+            ok_arm.contains("LLAMA_CPP_STILL_STARTING_REASON")
+                && llama.contains("log::warn!")
+                && llama.contains("log::error!"),
+            "the counted outcome and the give-up must be named in the durable log:\n{ok_arm}"
+        );
+
+        // A closed port at the top of the block must not reset either: only the
+        // arm that saw the port answer may clear the budget.
+        let healthy_arm = llama
+            .split_once("} else if llama_cpp_listening {")
+            .and_then(|(_, rest)| rest.split_once("} else {"))
+            .map(|(arm, _)| arm)
+            .expect("the llama.cpp block must keep its listening and start arms");
+        assert!(
+            healthy_arm.contains("record_llama_cpp_tick_outcome(true)"),
+            "the listening arm must clear the budget through the tested seam:\n{healthy_arm}"
+        );
+        assert!(
+            !healthy_arm.contains("LLAMA_CPP_FAILS.store(0"),
+            "clearing the budget must stay on the serving path:\n{healthy_arm}"
+        );
+
+        reset_failures(SupervisedService::LlamaCpp);
+    }
+
+    /// DD-114: the proxy has the same shape as llama.cpp — a closed port with an
+    /// owned child used to blank the counter on every tick, and a spawn that
+    /// returned `Ok` cleared it before the port ever answered.
+    #[test]
+    fn a_proxy_that_is_alive_but_never_serving_is_counted_not_reset() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::Proxy);
+
+        for expected in 1..=MAX_CONSECUTIVE_RESTARTS {
+            let (verdict, next) = record_proxy_tick_outcome(false);
+            assert_eq!(verdict, ProxyTickVerdict::NotServing);
+            assert_eq!(next, expected);
+        }
+        assert!(
+            !may_restart(PROXY_FAILS.load(Ordering::Relaxed)),
+            "an owned proxy that never binds must reach the existing cap"
+        );
+        assert!(
+            give_up_status().proxy_give_up,
+            "hitting the cap must surface as the existing proxy give-up state"
+        );
+
+        // A listening port is the only observation that clears the budget.
+        let (verdict, next) = record_proxy_tick_outcome(true);
+        assert_eq!(verdict, ProxyTickVerdict::Healthy);
+        assert_eq!(next, 0);
+        assert!(!give_up_status().proxy_give_up);
+
+        // Pin the wiring: the Leave arm must count the unready child, and the
+        // Ok arm must re-probe the port before it claims a relaunch.
+        let production = supervisor_production_source();
+        let proxy = production
+            .split_once("// ── claude_cli_proxy")
+            .and_then(|(_, rest)| rest.split_once("// ── Ollama"))
+            .map(|(block, _)| block)
+            .expect("the proxy supervisor block must sit between its section markers");
+        let leave_arm = proxy
+            .split_once("ProxyAction::Leave =>")
+            .and_then(|(_, rest)| rest.split_once("ProxyAction::Start =>"))
+            .map(|(arm, _)| arm)
+            .expect("the proxy block must keep its Leave and Start arms");
+        assert!(
+            leave_arm.contains("record_proxy_tick_outcome("),
+            "the Leave arm must route the counter decision through the tested seam:\n{leave_arm}"
+        );
+        assert!(
+            !leave_arm.contains("PROXY_FAILS.store(0"),
+            "a proxy whose port never opened must not have its failure count reset:\n{leave_arm}"
+        );
+        let ok_arm = proxy
+            .split_once("Ok(_) => {")
+            .and_then(|(_, rest)| rest.split_once("Err(error) =>"))
+            .map(|(arm, _)| arm)
+            .expect("the proxy block must keep its Ok and Err arms");
+        assert!(
+            ok_arm.contains("claude_proxy_is_listening()"),
+            "the Ok arm must re-probe the port after the spawn:\n{ok_arm}"
+        );
+        assert!(
+            ok_arm.contains("record_proxy_tick_outcome("),
+            "the Ok arm must route through the tested seam:\n{ok_arm}"
+        );
+        assert!(
+            !ok_arm.contains("PROXY_FAILS.store(0"),
+            "a spawn that returned Ok must not clear the proxy failure count:\n{ok_arm}"
+        );
+
+        reset_failures(SupervisedService::Proxy);
     }
 
     #[test]
