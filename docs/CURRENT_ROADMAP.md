@@ -39,6 +39,8 @@ Preserve Jarvis's native architecture: Rust/Tauri Native surface, Bun server, ca
 
 **2026-11-07 settings source landing:** Ethan directed the same review/landing for Orchestration Settings, explicitly excluding live testing and verification. The source adds six-stage model/fallback controls, the cloud-helper toggle, bounded draft route diagnostics, and Native persistence/Bun acknowledgement. Source review repaired false sync reporting, cancellation ordering, local attempt attribution, and stale UI readback. Server/UI builds, server typecheck, and Rust compilation passed; no test suites, application, model, or packaged checks were executed for this landing. The [settings review record](reports/2026-11-07-orchestration-settings.md) lists the remaining in-flight conductor configuration limitation and all open acceptance gates. This supersedes the prior landing's exclusion of settings source; priority #3 remains active.
 
+**2026-11-18 Daedalus trust-boundary interruption:** Ethan directed work on loopback HTTP authentication, tool approvals, Claude CLI proxy authentication, and the fresh-checkout Cargo gate (DD-127–129). This supports safe validation of priority #3 and does not close any runtime or empirical acceptance gate. Return to priority #3 after the security and fresh-build checks.
+
 ## 1. Make memory change how Jarvis behaves
 
 ### Current implementation checkpoint

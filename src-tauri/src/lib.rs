@@ -3,6 +3,7 @@ pub mod commands;
 pub mod cron_scheduler;
 pub mod db;
 pub mod jarvis;
+mod local_api;
 pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
@@ -871,17 +872,19 @@ fn forward_env_to_wsl(command: &mut std::process::Command, required: &[&str]) {
 }
 
 fn configure_proxy_runtime(command: &mut std::process::Command, model: &str, through_wsl: bool) {
-    const RUNTIME_ENV: [&str; 4] = [
+    const RUNTIME_ENV: [&str; 5] = [
         "JARVIS_CLAUDE_PROXY_PORT",
         "JARVIS_CLAUDE_PROXY_BIND",
         "JARVIS_OLLAMA_URL",
         "JARVIS_DEFAULT_MODEL",
+        local_api::PROXY_TOKEN_ENV,
     ];
     command
         .env(RUNTIME_ENV[0], "19878")
         .env(RUNTIME_ENV[1], "127.0.0.1")
         .env(RUNTIME_ENV[2], "http://127.0.0.1:11434")
-        .env(RUNTIME_ENV[3], model);
+        .env(RUNTIME_ENV[3], model)
+        .env(local_api::PROXY_TOKEN_ENV, local_api::proxy_token());
     if through_wsl {
         forward_env_to_wsl(command, &RUNTIME_ENV);
     }
@@ -955,7 +958,6 @@ fn pids_listening_on_port(port: u16) -> Vec<u32> {
 
 /// The port the Bun server binds. Shared with `supervisor.rs`.
 pub(crate) const BUN_SERVER_PORT: u16 = 19877;
-
 /// True when `tasklist` cannot find a process for `pid` (Windows). Used to
 /// detect "ghost sockets": netstat still shows LISTENING with a PID that no
 /// longer exists, so taskkill is a no-op and every bind gets EADDRINUSE /
@@ -1464,7 +1466,9 @@ fn find_jarvis_server() -> Option<String> {
 /// 15s on a cold distro, so it only runs when this install launches Bun through
 /// WSL and all configured/loopback URLs have failed.
 async fn probe_jarvis_healthy() -> bool {
-    let client = reqwest::Client::new();
+    let Ok(client) = local_api::client().build() else {
+        return false;
+    };
     let local_candidates = crate::wsl::local_jarvis_api_candidates();
     if probe_jarvis_candidates(&client, &local_candidates).await {
         return true;
@@ -1485,13 +1489,16 @@ async fn probe_jarvis_healthy() -> bool {
 
 async fn probe_jarvis_candidates(client: &reqwest::Client, candidates: &[String]) -> bool {
     for base in candidates {
+        if !local_api::is_loopback_http(base) {
+            continue;
+        }
         let trimmed = base.trim_end_matches('/').to_string();
         let probe = format!("{}/health", trimmed);
         // A 2xx is not enough: anything else on the port (a Vite preview, a
         // stale process, some other app's health route) answers 2xx too. The
         // body must identify this Jarvis before the origin is adopted.
         let accepted = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let resp = match client.get(&probe).send().await {
+            let resp = match client.get(&probe).bearer_auth(local_api::bun_token()).send().await {
                 Ok(resp) => resp,
                 Err(_) => return false,
             };
@@ -2379,6 +2386,7 @@ fn native_bun_command(bun: &str, entry: &str) -> std::process::Command {
     {
         command.current_dir(root);
     }
+    local_api::configure_bun(&mut command, false);
     command
 }
 
@@ -2415,6 +2423,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         // variables to forward. The values are passed via `.env`, never
         // interpolated into the shell command.
         forward_env_to_wsl(&mut command, &[cap_name, app_name]);
+        local_api::configure_bun(&mut command, true);
         crate::wsl::hide_windows_console(&mut command);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
@@ -2465,6 +2474,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
             .env(app_name, &app_value)
             .stdout(stdout_stdio)
             .stderr(stderr_stdio);
+        local_api::configure_bun(&mut command, false);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
         let result = process_lifecycle::spawn_managed(&mut command);
@@ -2581,8 +2591,10 @@ fn bun_port_state_from(
 /// snapshot. Synchronous on purpose: both callers already run on blocking
 /// threads (`spawn_blocking`), off the async IPC workers.
 fn bun_health_identifies(origin: &str) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .no_proxy()
+    if !local_api::is_loopback_http(origin) {
+        return false;
+    }
+    let client = match local_api::blocking_client()
         .timeout(std::time::Duration::from_secs(2))
         .build()
     {
@@ -2591,6 +2603,7 @@ fn bun_health_identifies(origin: &str) -> bool {
     };
     let Ok(response) = client
         .get(format!("{}/health", origin.trim_end_matches('/')))
+        .bearer_auth(local_api::bun_token())
         .send()
     else {
         return false;
@@ -3613,6 +3626,11 @@ pub fn run() {
         return;
     }
 
+    if let Err(error) = local_api::handoff_bootstrap_token() {
+        eprintln!("[jarvis::startup] {error}");
+        return;
+    }
+
     let jarvis_config = Arc::new(Mutex::new(crate::jarvis::types::JarvisConfig::default()));
     let jarvis_queue = Arc::new(crate::jarvis::queue::MessageQueue::new(
         jarvis_config.clone(),
@@ -3826,6 +3844,7 @@ pub fn run() {
             skill_restore_revision,
             sync_distilled_skill_candidates,
             bun_server_origin,
+            bun_server_token,
             bun_server_request,
             bun_server_request_stream,
             bun_server_request_cancel,
@@ -4268,6 +4287,7 @@ mod startup_thread_tests {
             "JARVIS_OLLAMA_URL",
             "JARVIS_DEFAULT_MODEL",
             "JARVIS_OPENROUTER_API_KEY",
+            local_api::PROXY_TOKEN_ENV,
         ] {
             assert!(
                 forwarded.split(':').any(|name| name == required),
@@ -4291,6 +4311,11 @@ mod startup_thread_tests {
             env.get(std::ffi::OsStr::new("JARVIS_CLAUDE_PROXY_BIND")),
             Some(&Some(std::ffi::OsStr::new("127.0.0.1")))
         );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(local_api::PROXY_TOKEN_ENV)),
+            Some(&Some(std::ffi::OsStr::new(local_api::proxy_token())))
+        );
+        assert!(command.get_args().all(|arg| !arg.to_string_lossy().contains(local_api::proxy_token())));
 
         let source = include_str!("../../scripts/claude_cli_proxy.py");
         assert!(
@@ -6847,6 +6872,10 @@ mod native_bun_working_dir_tests {
         );
         assert_eq!(command.get_program(), OsStr::new("bun.exe"));
         assert_eq!(command.get_args().count(), 1, "the entry is the only argument");
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(env.get(OsStr::new(crate::local_api::BUN_HOST_ENV)), Some(&Some(OsStr::new("127.0.0.1"))));
+        assert_eq!(env.get(OsStr::new(crate::local_api::BUN_TOKEN_ENV)), Some(&Some(OsStr::new(crate::local_api::bun_token()))));
+        assert!(command.get_args().all(|arg| !arg.to_string_lossy().contains(crate::local_api::bun_token())));
     }
 
     /// The app can be started from a sibling checkout, from the exe directory,

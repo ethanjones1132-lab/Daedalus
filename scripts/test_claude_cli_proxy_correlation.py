@@ -4,14 +4,18 @@ Run: python scripts/test_claude_cli_proxy_correlation.py
 """
 from __future__ import annotations
 
+import http.client
+import json
 import logging
 import os
 import sys
+import threading
 import unittest
 import urllib.error
 import urllib.request
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
@@ -106,6 +110,59 @@ class DelegateRequestIdCorrelationTests(unittest.TestCase):
         self.assertNotIn("Authorization", field)
         os.environ["JARVIS_DELEGATE_REQUEST_ID"] = "Bearer secret-value"
         self.assertEqual(p.delegate_correlation_field(), "delegate_request_id=missing")
+
+
+class ProxyLaunchAuthenticationTests(unittest.TestCase):
+    def test_messages_require_launcher_token_and_send_only_the_upstream_key(self) -> None:
+        server = p.ThreadingHTTPServer(("127.0.0.1", 0), p.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def post(authorization=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=3)
+            headers = {"Content-Type": "application/json"}
+            if authorization is not None:
+                headers["Authorization"] = authorization
+            try:
+                connection.request("POST", "/v1/messages", json.dumps({
+                    "model": "fixture/model", "messages": [{"role": "user", "content": "ping"}],
+                }), headers)
+                response = connection.getresponse()
+                self.assertIsNone(response.getheader("Access-Control-Allow-Origin"))
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        try:
+            upstream = {
+                "local": False, "provider": "openrouter", "model": "fixture/model",
+                "base_url": "https://openrouter.ai/api/v1",
+                "completions_url": "https://openrouter.ai/api/v1/chat/completions",
+                "auth": "Bearer upstream-fixture-key", "extra_headers": {},
+            }
+            with (
+                patch.object(p, "PROXY_TOKEN", "launch-fixture-token"),
+                patch.object(p, "resolve_upstream", return_value=upstream) as resolve,
+                patch.object(p, "get_openrouter_key", return_value="upstream-fixture-key") as saved_key,
+                patch.object(p, "open_upstream_with_retry", return_value=BytesIO(b'{"choices":[{"message":{"content":"pong"}}]}')) as forward,
+            ):
+                for credential in (None, "Bearer wrong-fixture-token"):
+                    status, body = post(credential)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(body["error"]["type"], "authentication_error")
+                resolve.assert_not_called()
+                saved_key.assert_not_called()
+                forward.assert_not_called()
+                status, decoded = post("Bearer launch-fixture-token")
+                self.assertEqual(status, 200)
+                self.assertEqual(decoded["content"][0]["text"], "pong")
+                resolve.assert_called_once()
+                forward.assert_called_once()
+                self.assertEqual(forward.call_args.args[0].get_header("Authorization"), "Bearer upstream-fixture-key")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 class TransportRetryTests(unittest.TestCase):

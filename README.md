@@ -125,9 +125,7 @@ cd Daedalus
 cd server-jarvis && bun install && cd ..
 cd src-ui && bun install && cd ..
 
-cd server-jarvis && bun run dev     # terminal 1 — API on :19877
-cd src-ui        && bun run dev     # terminal 2 — UI
-cd src-tauri     && cargo tauri dev # terminal 3 — desktop shell
+cargo tauri dev                     # from the repo root; starts Vite and owns Bun
 ```
 
 | Prerequisite | For | Minimum |
@@ -137,6 +135,20 @@ cd src-tauri     && cargo tauri dev # terminal 3 — desktop shell
 | [Node.js / npm](https://nodejs.org/) | UI production build | 20+ |
 | [Ollama](https://ollama.com/) *(optional)* | local models, Phase-D rollouts | — |
 | OpenRouter / OpenCode key *(optional)* | cloud models | — |
+
+The desktop host owns the loopback Bun server and gives its webview a fresh
+launch credential over Tauri IPC. Do not start a separate Bun server before
+launching the app. Only `GET /livez` is unauthenticated. Standalone tooling
+can start its own Bun server with `scripts/launch.sh --no-tauri` and a freshly
+generated `JARVIS_SERVER_TOKEN` in the environment. Probes against that server
+use the same variable for their bearer header. The packaged smoke and cold
+start probes launch the app themselves and receive its fresh token over a
+private local pipe. Do not save these tokens in config or pass them as flags.
+
+Shell and file mutations marked approval-required need a decision in Sessions;
+HTTP probes and cron have no approval UI and cannot run them unattended.
+The separate unattended Claude delegate requires an operator opt-in
+(`JARVIS_ALLOW_UNATTENDED_CLAUDE_TOOLS=1`) and is not used for interactive chat.
 
 ### Build
 
@@ -150,6 +162,11 @@ cd src-tauri && cargo tauri build   # → target/release/bundle/nsis/Jarvis_*_x6
 # Linux / WSL
 bash build-wsl.sh
 ```
+
+`bash scripts/verify.sh --test` (or `cargo test --lib` from `src-tauri`)
+doesn't require a prebuilt executable or `dist/` files. On a clean checkout,
+Cargo uses the existing frontend build to produce missing Tauri resources;
+missing JavaScript packages are installed from the checked-in locks.
 
 ### Release
 

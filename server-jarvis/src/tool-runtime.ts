@@ -237,8 +237,7 @@ export interface ToolRuntime {
  *
  * - `"allow"`: execute without restriction.
  * - `"ask"`: interactive surface must obtain user approval before proceeding.
- *   Only returned when `ctx.interactive` and `config.tools.interactive_approval`
- *   are both true.
+ *   Approval-required tools ask on interactive surfaces regardless of settings.
  * - `"deny"`: execution blocked; a deterministic error is returned to the caller.
  */
 export type PolicyDecision = "allow" | "ask" | "deny";
@@ -271,10 +270,9 @@ export interface PolicyResult {
  * 1. `config.tools.enabled = false` → deny all tools.
  * 2. `dangerous = true` AND `sandbox_mode = 'strict'` AND `!interactive` → deny.
  * 3. Approval required (def flag OR config list) AND `!interactive` → deny.
- * 4. Approval required AND `interactive` AND `interactive_approval = true` -> ask.
- * 5. Approval required AND `interactive` AND `interactive_approval = false` -> allow.
- * 6. `dangerous = true` AND `sandbox_mode = 'strict'` AND `interactive_approval = true` -> ask.
- * 7. Otherwise -> allow.
+ * 4. Approval required AND `interactive` -> ask.
+ * 5. `dangerous = true` AND `sandbox_mode = 'strict'` AND `interactive_approval = true` -> ask.
+ * 6. Otherwise -> allow.
  */
 export function evaluatePolicy(
   def: ToolDefinition,
@@ -292,8 +290,8 @@ export function evaluatePolicy(
     };
   }
 
-  // Orchestrator / agent surfaces set this to bypass approval modals entirely.
-  if (ctx.skip_approval_gate) {
+  // Reserved for explicitly pre-authorized non-chat, non-cron callers.
+  if (ctx.skip_approval_gate && ctx.surface !== "chat" && ctx.surface !== "cron") {
     return { decision: "allow", reason: "", source: "safe" };
   }
 
@@ -318,10 +316,7 @@ export function evaluatePolicy(
     };
   }
 
-  // Approval-required in interactive context asks only when the chat surface
-  // has explicitly enabled blocking approval. With interactive approval off,
-  // Jarvis preserves the legacy passthrough path used by live chat writes.
-  if (requiresApproval && interactive && toolCfg.interactive_approval) {
+  if (requiresApproval && interactive) {
     return {
       decision: "ask",
       reason: `Tool "${name}" requires user approval`,

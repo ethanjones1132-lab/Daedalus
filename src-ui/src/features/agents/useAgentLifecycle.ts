@@ -3,7 +3,8 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { initialDiscoveryState, parseDiscoveryPayload, reduceDiscoveryState, type LifecycleAgent } from '../../domain/agent-discovery-state';
 import { canActivateLifecycle, canDeactivateLifecycle, type AgentProjection } from '../../domain/agent-lifecycle-state';
 import { useToast } from '../../design';
-import { BUN_URL, type LifecycleMutationResponse, type LifecycleOperation } from './types';
+import { bunFetch, bunGet } from '../../lib/bun-origin';
+import type { LifecycleMutationResponse, LifecycleOperation } from './types';
 
 /*
  * Agent lifecycle: discover (Bun GET /agents) -> validate -> project (native
@@ -35,7 +36,7 @@ export function useAgentLifecycle() {
     discoveryPending.current = true;
     dispatchDiscovery({ type: 'pending' });
     try {
-      const res = await fetch(`${BUN_URL}/agents`);
+      const res = await bunGet('/agents');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       // Both server shapes are accepted: the bare array (older surface) and
       // the object that also states what the Agents root is.
@@ -116,7 +117,7 @@ export function useAgentLifecycle() {
     });
     let nativeConfirmed = false;
     try {
-      const response = await fetch(`${BUN_URL}/agents/${encodeURIComponent(agent.slug)}/activate`, {
+      const response = await bunFetch(`/agents/${encodeURIComponent(agent.slug)}/activate`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ expected_source_hash: expectedSourceHash }),
@@ -159,7 +160,7 @@ export function useAgentLifecycle() {
       const next = { ...operationsRef.current };
       next[agent.slug] = { slug: agent.slug, action: 'deactivate', phase: 'reconciling' };
       publishOperations(next);
-      const response = await fetch(`${BUN_URL}/agents/${encodeURIComponent(agent.slug)}/deactivate`, { method: 'POST' });
+      const response = await bunFetch(`/agents/${encodeURIComponent(agent.slug)}/deactivate`, { method: 'POST' });
       const payload = await response.json() as LifecycleMutationResponse;
       if (!response.ok || !payload.success) throw new Error('boundary deactivation rejected');
       await reconcileLifecycle(agent.slug, 'deactivate');

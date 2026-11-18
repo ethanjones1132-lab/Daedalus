@@ -201,11 +201,26 @@ case_later_checks_still_run() {
   check_contains "summary names the failing gate" "$dir/output.log" "server test:gate"
 }
 
+case_rust_tests_do_not_require_an_existing_exe() {
+  local dir rc
+  dir="$(new_case rust-tests-clean)"
+  rm "$dir/src-tauri/target/debug/home-base.exe"
+  run_verify "$dir" --only rust --test
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    ok "cargo test gate works without a previously built debug app"
+  else
+    bad "cargo test gate works without a previously built debug app (exit $rc)"
+  fi
+  check_contains "Rust test gate runs cargo test --lib" "$dir/calls.log" "cargo test --lib"
+}
+
 echo "── verify-eval.test @ $WORK ──"
 case_server_wires_gate
 case_other_selector_skips_gate
 case_eval_failure_propagates
 case_later_checks_still_run
+case_rust_tests_do_not_require_an_existing_exe
 
 echo "────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

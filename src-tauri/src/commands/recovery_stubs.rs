@@ -44,18 +44,19 @@ use tauri::{AppHandle, State};
 /// Prefers the cached URL discovered by the health-probe in lib.rs; if it
 /// has not been resolved yet, triggers a probe/spawn and re-reads the cache.
 async fn bun_base() -> Result<String, String> {
-    if let Some(url) = crate::wsl::get_cached_bun_url() {
+    if let Some(url) = crate::wsl::get_cached_bun_url().filter(|url| crate::local_api::is_loopback_http(url)) {
         return Ok(url.trim_end_matches('/').to_string());
     }
     crate::ensure_jarvis_server_started().await?;
     crate::wsl::get_cached_bun_url()
+        .filter(|url| crate::local_api::is_loopback_http(url))
         .map(|u| u.trim_end_matches('/').to_string())
         .ok_or_else(|| "Jarvis Bun server is not reachable".to_string())
 }
 
 /// Shared reqwest client with a sane timeout, mirroring commands/models.rs.
 fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::local_api::client()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))
@@ -68,6 +69,7 @@ async fn bun_get_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, S
     let client = http_client()?;
     let resp = client
         .get(&url)
+        .bearer_auth(crate::local_api::bun_token())
         .send()
         .await
         .map_err(|e| format!("Bun server request to {} failed: {}", path, e))?;
@@ -98,6 +100,7 @@ pub async fn jarvis_invoke_skill(name: String, args: Option<Value>) -> Result<Va
 
     let resp = client
         .post(format!("{}/skills/invoke", base))
+        .bearer_auth(crate::local_api::bun_token())
         .json(&body)
         .send()
         .await
@@ -165,6 +168,7 @@ pub async fn jarvis_ping() -> Result<String, String> {
     let client = http_client()?;
     let resp = client
         .get(format!("{}/health", base))
+        .bearer_auth(crate::local_api::bun_token())
         .send()
         .await
         .map_err(|e| format!("Bun server health check failed: {}", e))?;
@@ -196,6 +200,7 @@ pub async fn jarvis_test_connection(
     let body = serde_json::json!({ "backend": backend, "config": config });
     let resp = client
         .post(format!("{}/test", base))
+        .bearer_auth(crate::local_api::bun_token())
         .json(&body)
         .send()
         .await
@@ -448,6 +453,7 @@ pub async fn jarvis_get_session_grants(
     let client = http_client()?;
     let resp = client
         .get(format!("{}/session/grants", base))
+        .bearer_auth(crate::local_api::bun_token())
         .query(&[("session_id", &session_id)])
         .send()
         .await
@@ -467,6 +473,7 @@ pub async fn jarvis_revoke_session_grant(
     let body = serde_json::json!({ "session_id": session_id, "root": root });
     let resp = client
         .post(format!("{}/session/grants/revoke", base))
+        .bearer_auth(crate::local_api::bun_token())
         .json(&body)
         .send()
         .await

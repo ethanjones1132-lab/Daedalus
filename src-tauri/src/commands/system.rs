@@ -1388,7 +1388,28 @@ pub async fn restart_bridge(
 /// documented default). Read-only; no state is created or changed.
 #[tauri::command]
 pub fn bun_server_origin() -> String {
-    bun_origin_from(crate::wsl::get_cached_bun_url())
+    bun_origin_from(
+        crate::wsl::get_cached_bun_url().filter(|url| crate::local_api::is_loopback_http(url)),
+    )
+}
+
+fn require_jarvis_webview(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let url = window.url().map_err(|e| e.to_string())?;
+    let origin = url.origin().ascii_serialization();
+    let trusted = origin == "http://tauri.localhost"
+        || (cfg!(debug_assertions) && origin == "http://localhost:5173")
+        || (url.scheme() == "tauri" && url.host_str() == Some("localhost"));
+    if window.label() != "main" || !trusted {
+        return Err("Bun credentials are restricted to the Jarvis webview".into());
+    }
+    Ok(())
+}
+
+/// Only the Jarvis webview may read the launch credential for direct fetch/SSE.
+#[tauri::command]
+pub fn bun_server_token(window: tauri::WebviewWindow) -> Result<String, String> {
+    require_jarvis_webview(&window)?;
+    Ok(crate::local_api::bun_token().to_string())
 }
 
 #[derive(Serialize)]
@@ -1402,16 +1423,19 @@ pub struct BunServerProxyResponse {
 /// need to trust arbitrary WSL or remote origins.
 #[tauri::command]
 pub async fn bun_server_request(
+    window: tauri::WebviewWindow,
     path_and_query: String,
     method: Option<String>,
     body: Option<String>,
 ) -> Result<BunServerProxyResponse, String> {
+    require_jarvis_webview(&window)?;
+    let client = crate::local_api::client().build().map_err(|e| e.to_string())?;
     bun_server_request_to(
         &bun_server_origin(),
         &path_and_query,
         method.as_deref().unwrap_or("GET"),
         body,
-        &reqwest::Client::new(),
+        &client,
     )
     .await
 }
@@ -1574,12 +1598,15 @@ fn finish_bun_server_stream_request(request_id: &str) {
 /// surface. The request id is also the cancellation key used by Stop.
 #[tauri::command]
 pub async fn bun_server_request_stream(
+    window: tauri::WebviewWindow,
     request_id: String,
     path_and_query: String,
     method: Option<String>,
     body: Option<String>,
     on_event: Channel<BunServerStreamEvent>,
 ) -> Result<(), String> {
+    require_jarvis_webview(&window)?;
+    let client = crate::local_api::client().build().map_err(|e| e.to_string())?;
     let cancel_rx = register_bun_server_stream_request(&request_id)?;
 
     let result = bun_server_request_stream_to(
@@ -1587,7 +1614,7 @@ pub async fn bun_server_request_stream(
         &path_and_query,
         method.as_deref().unwrap_or("GET"),
         body,
-        &reqwest::Client::new(),
+        &client,
         move |event| on_event.send(event).map_err(|error| error.to_string()),
         cancel_rx,
     )
@@ -1619,7 +1646,12 @@ async fn bun_server_request_stream_to(
     if method != reqwest::Method::GET && method != reqwest::Method::POST {
         return Err("Bun proxy only supports GET and POST".to_string());
     }
-    let mut request = client.request(method, format!("{origin}{path_and_query}"));
+    let mut request = client
+        .request(method, format!("{origin}{path_and_query}"))
+        .bearer_auth(crate::local_api::bun_token());
+    if path_and_query == "/chat/stream" {
+        request = request.header("X-Jarvis-Approval-UI", "1");
+    }
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1791,7 +1823,7 @@ async fn bun_server_request_to(
         return Err("Bun proxy only supports GET and POST".to_string());
     }
     let url = format!("{origin}{path_and_query}");
-    let mut request = client.request(method, url);
+    let mut request = client.request(method, url).bearer_auth(crate::local_api::bun_token());
     if let Some(body) = body {
         request = request
             .header(reqwest::header::CONTENT_TYPE, "application/json")

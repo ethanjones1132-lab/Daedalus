@@ -17,6 +17,7 @@ import "./startup-mark";
 // how the server was spawned (Tauri supervisor, deploy script, manual bun).
 import { installSelfLog, selfLogPath } from "./self-log";
 import { SERVER_PORT, guardServerBind, installRejectionGuard, resolveBindTarget } from "./server-guards";
+import { protectLocalApi, SERVER_TOKEN_ENV, takeLaunchToken } from "./local-api-auth";
 installSelfLog();
 // DD-035 / DS-30: installed right after the self-log tee (so the line is
 // captured no matter how this process was spawned) and before any async startup
@@ -24,6 +25,7 @@ installSelfLog();
 // entrypoint has many floating promises; a stray rejection must become one
 // bounded log line with the server still running, never a mid-turn shutdown.
 installRejectionGuard();
+const serverLaunchToken = takeLaunchToken(SERVER_TOKEN_ENV);
 // Native memory bootstrap must capture and strip the owned capability from
 // `process.env` before any tool runtime or child subprocess can clone it.
 import {
@@ -2384,12 +2386,19 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
           await streamWrite(`data: ${JSON.stringify(frame)}\n\n`);
         });
       }
-      // Wire the approval hook: emit a `tool_approval_request` SSE event so
-      // the Tauri runner relays it to the UI (ToolApprovalModal), then await
-      // the user's decision from the process-level registry. Auto-denies after
-      // 5 minutes so a disconnected client can never wedge the stream.
-      ctx.requestApproval = async (req) => {
-        await writer.write(
+      // Sessions handles these SSE frames directly (the Native fallback relays
+      // them). Register first so a fast decision cannot outrun the registry.
+      if (ctx.interactive && options.canRequestApproval) ctx.requestApproval = async (req) => {
+        const decision = approvalRegistry.request({
+          call_id: req.call_id,
+          tool_name: req.name,
+          arguments: req.arguments,
+          policy_source: req.policy_source,
+          session_id: sessionId,
+          surface: "chat",
+          signal: streamAbort.signal,
+        });
+        const sent = writer.write(
           encoder.encode(
             `data: ${JSON.stringify({
               type: "tool_approval_request",
@@ -2401,15 +2410,8 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             })}\n\n`,
           ),
         );
-        return approvalRegistry.request({
-          call_id: req.call_id,
-          tool_name: req.name,
-          arguments: req.arguments,
-          policy_source: req.policy_source,
-          session_id: sessionId,
-          surface: "chat",
-          signal: streamAbort.signal,
-        });
+        const [approved] = await Promise.all([decision, sent]);
+        return approved;
       };
 
       // ── Orchestrator path (PAMO-SET Phase 2) ─────────────────────
@@ -4521,7 +4523,11 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
               });
             },
           },
-          productionExecutorDelegateRuntime,
+          // Claude's autonomous executor can run its own tools without the
+          // Sessions approval UI. Never take that bypass in interactive chat.
+          !ctx.interactive && process.env.JARVIS_ALLOW_UNATTENDED_CLAUDE_TOOLS === "1"
+            ? productionExecutorDelegateRuntime
+            : undefined,
         );
         const stageStartedAt = new Map<string, number>();
         const onOrchestratorStateChange = async (state: PipelineProgressState) => {
@@ -6639,8 +6645,6 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     },
   });
 }
@@ -6697,7 +6701,9 @@ async function startBridge(): Promise<boolean> {
   }
   try {
     const bunPath = process.execPath || "bun";
-    const child = spawn(bunPath, ["run", join(__dirname, "bridge.ts")], { detached: true, stdio: "ignore" });
+    const child = spawn(bunPath, ["run", join(__dirname, "bridge.ts")], {
+      detached: true, stdio: "ignore", env: { ...process.env, [SERVER_TOKEN_ENV]: serverLaunchToken },
+    });
     bindBridgeLifecycle(child);
     bridgeProcess = child;
     child.unref();
@@ -6866,6 +6872,8 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
   }
 }
 
+const protectedFetch = protectLocalApi(serverLaunchToken, routeBaseRequest);
+
 /**
  * DD-080 (server half): the single request entrypoint. Routing is untouched;
  * every response is handed to the failure observer, which logs one error line
@@ -6876,7 +6884,7 @@ async function searchDuckDuckGo(query: string): Promise<Record<string, any>> {
 export async function baseFetch(req: Request): Promise<Response> {
   const requestStart = performance.now();
   const path = new URL(req.url).pathname;
-  const response = await routeBaseRequest(req, path);
+  const response = await protectedFetch(req, path);
   return observeRequestFailure({
     method: req.method,
     path,
@@ -6886,8 +6894,7 @@ export async function baseFetch(req: Request): Promise<Response> {
 }
 
 async function routeBaseRequest(req: Request, path: string): Promise<Response> {
-  // Internal native-memory routes bypass general CORS/preflight handling and
-  // are capability-authenticated. Unknown paths fall through untouched.
+  // The Native surface additionally authenticates with its own capability.
   const internalMemory = await handleNativeMemoryRequest(
     req,
     nativeMemoryRegistry,
@@ -6895,16 +6902,6 @@ async function routeBaseRequest(req: Request, path: string): Promise<Response> {
     goalRunRegistry,
   );
   if (internalMemory) return internalMemory;
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      },
-    });
-  }
 
   try {
     if (path === "/" && req.method === "GET") {
@@ -7156,7 +7153,13 @@ async function routeBaseRequest(req: Request, path: string): Promise<Response> {
       });
     }
     if (path === "/chat/stream" && req.method === "POST") {
-      const response = await handleChatStreamRequest(req, { stream: streamJarvis });
+      const response = await handleChatStreamRequest(req, {
+        stream: (message, sessionId, options) => streamJarvis(message, sessionId, {
+          ...options,
+          // At this point any browser Origin is already Tauri-allowlisted.
+          canRequestApproval: req.headers.has("Origin") || req.headers.get("X-Jarvis-Approval-UI") === "1",
+        }),
+      });
       if (response) return response;
     }
     if (path === "/chat/cancel" && req.method === "POST") {
@@ -7356,14 +7359,16 @@ async function routeBaseRequest(req: Request, path: string): Promise<Response> {
 // used to kill the process with a raw stack — the competing-spawn / ghost-socket
 // state recorded in the /health comment above. The guard names the host and port
 // and exits 1 on EADDRINUSE, and rethrows every other bind failure untouched.
-// The options below are unchanged; hostname is stated explicitly at Bun's
-// default (all interfaces) unless an isolated caller selects a host explicitly.
+// The listener stays on loopback even if a wider host is requested.
 // The health payload and serve() use this same effective target.
 // DD-064: the port is the fixed `SERVER_PORT` constant (19877) the native probe
 // targets. There is no env override any more: a user-set port was honoured here
 // while every native probe and hard-coded client stayed on 19877, so the app was
 // silently pointed at a port nothing listened on.
 const BIND_TARGET = resolveBindTarget(SERVER_PORT, process.env.JARVIS_SERVER_HOST);
+if (!serverLaunchToken) {
+  console.warn("[Jarvis API] No JARVIS_SERVER_TOKEN supplied; only /livez is available.");
+}
 
 // Ensure the jarvis workspace directory exists before the server starts
 // loadConfig() returns defaultConfig() untouched when no config file exists, and

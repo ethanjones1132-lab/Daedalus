@@ -10,8 +10,10 @@ import { homedir } from "os";
 import { join } from "path";
 import type { JarvisConfig } from "./config";
 import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
+import { PROXY_TOKEN_ENV, takeLaunchToken } from "./local-api-auth";
 
 const LOCAL_PROXY_BASE_URL = "http://127.0.0.1:19878";
+const proxyLaunchToken = takeLaunchToken(PROXY_TOKEN_ENV);
 /**
  * Claude CLI treats ANTHROPIC_BASE_URL as a host root and appends `/v1/messages`.
  * Config/HTTP use the OpenAI-style root `…/zen/go/v1` (+ `/messages` or
@@ -28,6 +30,7 @@ const CREDENTIAL_ENV_KEYS = new Set([
   "CLAUDE_CONFIG_DIR",
   "ANTHROPIC_API_KEY_FILE_DESCRIPTOR",
   "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+  PROXY_TOKEN_ENV,
 ]);
 
 /** Effective launch mode for a Claude CLI subprocess. `opencode_go` is resolved
@@ -135,7 +138,7 @@ export function buildLocalClaudeEnv(
     return Object.fromEntries(
       Object.entries(baseEnv).filter((entry): entry is [string, string] => {
         const [key, value] = entry;
-        if (value === undefined) return false;
+        if (value === undefined || key.toUpperCase() === PROXY_TOKEN_ENV) return false;
         if (key === "ANTHROPIC_BASE_URL" && value === LOCAL_PROXY_BASE_URL) return false;
         if (key === "CLAUDE_CONFIG_DIR" && value === LOCAL_CLAUDE_CONFIG_DIR) return false;
         return true;
@@ -162,8 +165,7 @@ export function buildLocalClaudeEnv(
   return {
     ...env,
     OPENCLAW_JARVIS: "true",
-    ANTHROPIC_API_KEY: "ollama",
-    ANTHROPIC_AUTH_TOKEN: "ollama",
+    ANTHROPIC_AUTH_TOKEN: baseEnv[PROXY_TOKEN_ENV] ?? proxyLaunchToken,
     ANTHROPIC_BASE_URL: LOCAL_PROXY_BASE_URL,
     CLAUDE_CONFIG_DIR: LOCAL_CLAUDE_CONFIG_DIR,
     CLAUDE_CODE_SIMPLE: "1",
@@ -285,6 +287,11 @@ export function buildLocalClaudeArgs(
 export interface ClaudeCliChatArgsOptions extends ClaudeCliLaunchOptions {
   claudeModel?: string;
   proxyModel: string;
+}
+
+/** The Claude inference backend is not a second, unapproved tool surface. */
+function inferenceOnlyArgs(args: string[], options: ClaudeCliLaunchOptions): string[] {
+  return [...buildLocalClaudeArgs(args, options), "--tools", "", "--strict-mcp-config"];
 }
 
 /** Project the configured auth mode onto the model argument at the chat call site. */
@@ -447,7 +454,7 @@ export async function invokeClaudeCli(
   const cliCfg = cfg.claude_cli;
 
   const launchOptions = { authMode: cliCfg.auth_mode };
-  const baseArgs = buildLocalClaudeArgs([...(cliCfg.args || [])], launchOptions);
+  const baseArgs = inferenceOnlyArgs([...(cliCfg.args || [])], launchOptions);
   if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options
 
@@ -1035,7 +1042,7 @@ export async function* streamClaudeCli(
 
   // Use provided cliArgs (which may include --append-system-prompt) or fall back to cfg defaults
   const launchOptions = { authMode: cliCfg.auth_mode };
-  const baseArgs = buildLocalClaudeArgs([...(req.cliArgs || cliCfg.args || [])], launchOptions);
+  const baseArgs = inferenceOnlyArgs([...(req.cliArgs || cliCfg.args || [])], launchOptions);
   if (req.session_id) baseArgs.push("--resume", req.session_id);
   // Note: --cwd is not a valid Claude CLI flag; cwd is set via spawn options below
 

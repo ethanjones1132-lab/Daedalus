@@ -252,7 +252,7 @@ impl NativeMemoryTransport {
     fn client(&self) -> Result<&reqwest::blocking::Client, HttpFailure> {
         self.client
             .get_or_init(|| {
-                reqwest::blocking::Client::builder()
+                crate::local_api::blocking_client()
                     .connect_timeout(std::time::Duration::from_millis(CONNECT_TIMEOUT_MS))
                     .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
                     .build()
@@ -270,6 +270,7 @@ impl NativeMemoryTransport {
 
     fn base_url() -> String {
         crate::wsl::get_cached_bun_url()
+            .filter(|url| crate::local_api::is_loopback_http(url))
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| format!("http://127.0.0.1:{}", crate::BUN_SERVER_PORT))
     }
@@ -285,6 +286,7 @@ impl NativeMemoryTransport {
             .client()?
             .post(url)
             .bearer_auth(&self.capability)
+            .header("X-Jarvis-Token", crate::local_api::bun_token())
             .json(body)
             .send()
             .map_err(|_| HttpFailure::Unavailable)?;
@@ -310,6 +312,7 @@ impl NativeMemoryTransport {
             .client()?
             .post(url)
             .bearer_auth(&self.capability)
+            .header("X-Jarvis-Token", crate::local_api::bun_token())
             .timeout(timeout)
             .json(body)
             .send()
@@ -326,6 +329,7 @@ impl NativeMemoryTransport {
             .client()?
             .get(url)
             .bearer_auth(&self.capability)
+            .header("X-Jarvis-Token", crate::local_api::bun_token())
             .send()
             .map_err(|_| HttpFailure::Unavailable)?;
         if response.status().as_u16() != expected_status {

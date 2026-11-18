@@ -17,7 +17,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Net.Http
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $ReportPath) {
@@ -25,10 +25,11 @@ if (-not $ReportPath) {
 }
 
 function Read-SseStream([string]$Url, [hashtable]$Body, [int]$Timeout) {
-    $client = [System.Net.Http.HttpClient]::new()
+    $client = New-JarvisLocalHttpClient
     $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $Url)
+        $request.Headers.Add('Authorization', (Get-JarvisLocalHeaders $Url).Authorization)
         $json = $Body | ConvertTo-Json -Depth 8 -Compress
         $request.Content = [System.Net.Http.StringContent]::new($json, [Text.Encoding]::UTF8, "application/json")
         $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
@@ -104,7 +105,7 @@ function Query-Db([string]$Sql) {
 
 # --- preflight ---
 $head = (git -C $repo rev-parse HEAD).Trim()
-$health = Invoke-RestMethod -Uri "$BaseUrl/health" -TimeoutSec 5
+$health = Invoke-RestMethod -Uri "$BaseUrl/health" -Headers (Get-JarvisLocalHeaders "$BaseUrl/health") -MaximumRedirection 0 -TimeoutSec 5
 if ($health.git_sha -ne $head) {
     throw "health_sha_mismatch:health=$($health.git_sha) head=$head"
 }

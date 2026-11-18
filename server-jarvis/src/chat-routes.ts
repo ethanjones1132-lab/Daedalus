@@ -12,6 +12,8 @@ export interface ChatStreamOptions {
   history?: ChatHistoryMessage[];
   systemPromptOverride?: string;
   surface?: SurfaceType;
+  /** Set by the authenticated transport, not by the chat request body. */
+  canRequestApproval?: boolean;
   signal?: AbortSignal;
   requestSignal?: AbortSignal;
   onComplete?: () => void;

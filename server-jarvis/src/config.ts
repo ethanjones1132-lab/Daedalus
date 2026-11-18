@@ -219,10 +219,8 @@ export interface ToolConfig {
    */
   sandbox_mode: 'strict' | 'permissive' | 'off';
   /**
-   * When true, tools whose policy resolves to "ask" in the interactive chat
-   * surface block on a real user approve/reject round-trip (a `tool_approval`
-   * event + `/tool/decision` response). When false (default), "ask" falls
-   * through to legacy passthrough so chat writes are not gated.
+   * Also ask for tools marked dangerous in strict mode. Explicitly
+   * approval-required tools always ask or are denied, regardless of this flag.
    */
   interactive_approval: boolean;
   /** Persistent filesystem roots available to every invocation. */

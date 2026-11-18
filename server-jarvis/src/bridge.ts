@@ -8,9 +8,11 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { BridgeReplayGuard, verifyBridgeEnvelope } from "./bridge-protocol";
+import { SERVER_TOKEN_ENV, takeLaunchToken } from "./local-api-auth";
 
 const CONFIG_FILE = join(homedir(), ".openclaw", "jarvis", "config.json");
-const JARVIS_API = "http://localhost:19877";
+const JARVIS_API = "http://127.0.0.1:19877";
+const serverToken = takeLaunchToken(SERVER_TOKEN_ENV);
 
 type BridgeSocket = {
   write?(data: string | ArrayBuffer | Uint8Array): void;
@@ -95,10 +97,15 @@ try {
 
             fetch(`${JARVIS_API}/chat/stream`, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${serverToken}` },
+              redirect: "error",
               body: JSON.stringify({ message: auth.envelope.payload.message, session_id: session }),
               signal: upstreamAbort.signal,
             }).then(async (res) => {
+              if (!res.ok) {
+                writeSocket(socket, JSON.stringify({ error: `Jarvis HTTP ${res.status}`, session_id: session }) + "\n");
+                return;
+              }
               const reader = res.body?.getReader();
               if (!reader) {
                 writeSocket(socket, JSON.stringify({ error: "No response body", session_id: session }) + "\n");

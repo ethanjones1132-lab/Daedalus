@@ -1,6 +1,7 @@
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ChannelsPage from './ChannelsPage';
+import { resetBunOriginForTests } from '../../lib/bun-origin';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -27,12 +28,14 @@ const response = (receipts: unknown[] = []) => new Response(JSON.stringify({ rec
 const sendResponse = () => new Response(JSON.stringify({ ok: true, receipt }));
 const row = (name = 'Alpha') => within(screen.getByRole('heading', { name }).closest('li')!);
 const writes = () => invokeMock.mock.calls.filter(([cmd]) => ['login_channel', 'logout_channel', 'remove_channel'].includes(cmd));
+const listReads = () => invokeMock.mock.calls.filter(([cmd]) => cmd === 'list_channels');
 const connectButton = (name = 'Alpha') => row(name).getByRole('button', { name: 'Verify & connect' });
 
 async function mount(rows = [alpha, beta]) {
   invokeMock.mockResolvedValueOnce(rows);
   render(<ChannelsPage />);
   await screen.findByRole('heading', { name: 'Alpha' });
+  // Finish the receipt request's Bun IPC before queuing native mutation replies.
   await screen.findByText('No delivery receipts yet.');
 }
 function confirmRemoval() {
@@ -40,7 +43,13 @@ function confirmRemoval() {
 }
 
 beforeEach(() => {
-  invokeMock.mockReset().mockRejectedValue(new Error('Unexpected native call'));
+  resetBunOriginForTests();
+  vi.stubGlobal('__TAURI_INTERNALS__', {});
+  invokeMock.mockReset().mockImplementation(async (command) => {
+    if (command === 'bun_server_origin') return 'http://127.0.0.1:19877';
+    if (command === 'bun_server_token') return 'launch-fixture-token';
+    throw new Error(`Unexpected native call: ${command}`);
+  });
   vi.stubGlobal('fetch', vi.fn().mockImplementation((input) => {
     if (String(input).endsWith('/channels/discord/receipts')) return Promise.resolve(response());
     return Promise.resolve(sendResponse());
@@ -59,8 +68,7 @@ describe('Channel row mutation coordination', () => {
     fireEvent.click(verify);
     fireEvent.click(verify);
     confirmRemoval();
-    await act(async () => {});
-    expect(writes()).toEqual([['login_channel', { id: 'a' }]]);
+    await waitFor(() => expect(writes()).toEqual([['login_channel', { id: 'a' }]]));
     expect(row().getByRole('button', { name: 'Verifying…' })).toBeDisabled();
     expect(row().getByRole('button', { name: 'Remove' })).toBeDisabled();
     expect(screen.getByText('0 stored login flags')).toBeInTheDocument();
@@ -81,13 +89,13 @@ describe('Channel row mutation coordination', () => {
     } else {
       fireEvent.click(row().getByRole('button', { name: command === 'login_channel' ? 'Verify & connect' : 'Disconnect' }));
     }
-    await act(async () => {});
-    expect(row().getByRole('alert')).toHaveTextContent(/could not.*confirmed state was kept/i);
+    expect(await row().findByRole('alert')).toHaveTextContent(/could not.*confirmed state was kept/i);
     expect(row().queryByText(/synthetic private/)).not.toBeInTheDocument();
     const retry = deferred<boolean>();
     invokeMock.mockReturnValueOnce(retry.promise);
     fireEvent.click(row().getByRole('button', { name: 'Retry' }));
     if (command === 'remove_channel') confirmRemoval();
+    await waitFor(() => expect(writes()).toHaveLength(2));
     await act(async () => { retry.reject(new Error('synthetic private native detail')); });
     expect(row().getByRole('alert')).toHaveTextContent(/could not/i);
     expect(row().queryByText(/synthetic private/)).not.toBeInTheDocument();
@@ -129,12 +137,12 @@ describe('Channel row mutation coordination', () => {
     const newRead = deferred<typeof alpha[]>();
     invokeMock.mockResolvedValueOnce(true).mockReturnValueOnce(oldRead.promise);
     fireEvent.click(connectButton());
-    await act(async () => {});
+    await waitFor(() => expect(listReads()).toHaveLength(2));
     expect(row('Beta').getByRole('button', { name: 'Remove' })).toBeEnabled();
     invokeMock.mockResolvedValueOnce(true).mockReturnValueOnce(newRead.promise);
     fireEvent.click(row('Beta').getByRole('button', { name: 'Remove' }));
     confirmRemoval();
-    await act(async () => {});
+    await waitFor(() => expect(listReads()).toHaveLength(3));
     await act(async () => { newRead.resolve([connected()]); });
     expect(row().getByRole('button', { name: 'Disconnect' })).toBeEnabled();
     expect(screen.queryByRole('heading', { name: 'Beta' })).not.toBeInTheDocument();
@@ -149,7 +157,7 @@ describe('Channel row mutation coordination', () => {
     const write = deferred<boolean>();
     invokeMock.mockReturnValueOnce(write.promise);
     fireEvent.click(connectButton());
-    await act(async () => {});
+    await waitFor(() => expect(writes()).toEqual([['login_channel', { id: 'a' }]]));
     fireEvent.click(screen.getByRole('button', { name: 'New channel' }));
     fireEvent.change(screen.getByPlaceholderText('Channel name *'), { target: { value: 'Gamma' } });
     fireEvent.change(screen.getByPlaceholderText('Discord channel ID *'), { target: { value: '456' } });

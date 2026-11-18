@@ -13,13 +13,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Net.Http
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 function Read-Sse([string]$Url, [hashtable]$Body, [int]$Timeout) {
-    $client = [System.Net.Http.HttpClient]::new()
+    $client = New-JarvisLocalHttpClient
     $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $Url)
+        $request.Headers.Add('Authorization', (Get-JarvisLocalHeaders $Url).Authorization)
         $request.Content = [System.Net.Http.StringContent]::new(($Body | ConvertTo-Json -Depth 8 -Compress), [Text.Encoding]::UTF8, 'application/json')
         $response = $client.SendAsync($request, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
         if (-not $response.IsSuccessStatusCode) { throw "stream_http_status:$([int]$response.StatusCode)" }
@@ -70,7 +71,7 @@ try {
             $runFrame = $events | Where-Object { $_.type -eq 'agent_run_id' } | Select-Object -First 1
             $runId = if ($runFrame) { [string]$runFrame.agent_run_id } else { $null }
             $health = $null
-            try { $health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5 } catch {}
+            try { $health = Invoke-RestMethod -Uri $HealthUrl -Headers (Get-JarvisLocalHeaders $HealthUrl) -MaximumRedirection 0 -TimeoutSec 5 } catch {}
             $attempts = @()
             if ($health -and $health.recent_attempts -and $runId) { $attempts = @($health.recent_attempts | Where-Object { [string]$_.run_id -eq $runId }) }
             $artifactOk = $true

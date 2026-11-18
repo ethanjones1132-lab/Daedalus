@@ -14,6 +14,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 # ── repoRoot default ──
 # There is no hardcoded repo root: a copied verifier (e.g. a worktree copy of
@@ -186,9 +187,9 @@ Write-Host "Deploy verification passed." -ForegroundColor Green
 Write-Host "`nChecking running server at $healthUrl ..."
 $health = $null
 try {
-    $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 3
+    $health = Invoke-RestMethod -Uri $healthUrl -Headers (Get-JarvisLocalHeaders $healthUrl) -MaximumRedirection 0 -TimeoutSec 3
 } catch {
-    Write-Host "[WARN] No server reachable at $healthUrl - skipping running-build check (file verification above still stands)." -ForegroundColor Yellow
+    Write-Host "[WARN] Could not authenticate or reach $healthUrl - running-build check not performed (file verification above still stands)." -ForegroundColor Yellow
 }
 
 if ($null -ne $health) {

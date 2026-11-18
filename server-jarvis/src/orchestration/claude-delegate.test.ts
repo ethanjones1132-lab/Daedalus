@@ -596,12 +596,14 @@ describe("Claude executor delegate", () => {
       allowedRoots: ["C:\\primary"],
       stageRemainingMs: 12_000,
       executable: "claude",
-      baseEnv: { ANTHROPIC_API_KEY: "must-be-scrubbed" },
+      baseEnv: { ANTHROPIC_API_KEY: "must-be-scrubbed", JARVIS_CLAUDE_PROXY_TOKEN: "launcher-test-token" },
     });
 
     expect(invocation.args).toContain("--bare");
     expect(invocation.args).not.toContain("--model");
-    expect(invocation.env.ANTHROPIC_API_KEY).toBe("ollama");
+    expect(invocation.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(invocation.env.ANTHROPIC_AUTH_TOKEN).toBe("launcher-test-token");
+    expect(invocation.env.JARVIS_CLAUDE_PROXY_TOKEN).toBeUndefined();
     expect(invocation.env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:19878");
     expect(invocation.timeoutMs).toBe(12_000);
   });

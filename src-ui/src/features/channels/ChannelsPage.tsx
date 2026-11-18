@@ -1,4 +1,5 @@
 import { listRead, projectListTally } from '../../lib/list-tally';
+import { bunFetch, bunGet } from '../../lib/bun-origin';
 import { channelProbePhase, projectChannelLiveness } from '../../domain/channel-liveness';
 import { invoke } from '@tauri-apps/api/core';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
@@ -55,7 +56,6 @@ import { useNavigation } from '../../shell/navigation';
  */
 
 const CHANNEL_TYPES = [{ value: 'discord', label: 'Discord' }];
-const BUN_URL = 'http://127.0.0.1:19877';
 const VERIFICATION_TEXT = 'Jarvis Discord connection check';
 
 function receiptValue(value: string | undefined): string {
@@ -230,7 +230,7 @@ export default function ChannelsPage() {
     receiptPending.current = true;
     dispatchReceipts({ type: 'pending' });
     try {
-      const response = await globalThis.fetch(`${BUN_URL}/channels/discord/receipts`);
+      const response = await bunGet('/channels/discord/receipts');
       if (!response.ok) {
         // Refusal with a status: fixed code, fixed copy — the raw status is a
         // server fact, not the operator's failure message.
@@ -336,7 +336,7 @@ export default function ChannelsPage() {
   const verifyDelivery = useCallback(async (channel: Channel): Promise<boolean> => {
     if (!canVerifyChannel(channel)) return false;
     try {
-      const response = await globalThis.fetch(`${BUN_URL}/channels/discord/send`, {
+      const response = await bunFetch('/channels/discord/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel_id: channelId(channel), text: VERIFICATION_TEXT }),

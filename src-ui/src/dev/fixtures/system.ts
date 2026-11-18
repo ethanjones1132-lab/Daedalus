@@ -85,6 +85,8 @@ const buildInfo = {
 };
 
 defineCommands({
+  bun_server_token: () => 'browser-fixture-token',
+  bun_server_origin: () => BUN_URL,
   jarvis_check_status: () => status(),
   get_system_health: () => systemHealth(),
   get_doctor_report: () => doctorReport,

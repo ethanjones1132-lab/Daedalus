@@ -13,6 +13,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { RotateCw } from 'lucide-react';
 import { Badge, cn, IconButton, Spinner, StatusDot, type Tone } from '../../design';
 import { usePolling } from '../../hooks/usePolling';
+import { bunGet } from '../../lib/bun-origin';
 import {
   deriveSystemTelemetryView,
   initialSystemTelemetryState,
@@ -28,7 +29,6 @@ import {
   type TelemetryServiceKey,
 } from '../../domain/system-telemetry-state';
 
-const BUN_URL = 'http://127.0.0.1:19877';
 const POLL_MS = 30_000;
 // The only automatic retry in this surface: recovery of the initial
 // direct-to-Bun read while the Bun server is still starting. 1 s, then 2 s,
@@ -271,7 +271,7 @@ export default function SystemStatusBar() {
     dispatch({ type: 'inference-pending', requestId: id });
     try {
       if (typeof globalThis.fetch !== 'function') throw new Error('Inference telemetry unavailable');
-      const response = await globalThis.fetch(`${BUN_URL}/health/inference`);
+      const response = await bunGet('/health/inference');
       if (!response.ok) throw new Error('Inference telemetry unavailable');
       dispatch({ type: 'inference-success', requestId: id, snapshot: await response.json() });
     } catch {

@@ -29,10 +29,12 @@ export const BUN_ORIGIN_RETRY_MS = 30_000;
 
 let cached: string | null = null;
 let failedAt: number | null = null;
+let tokenPromise: Promise<string> | null = null;
 
 export function resetBunOriginForTests(): void {
   cached = null;
   failedAt = null;
+  tokenPromise = null;
 }
 
 /** Pure resolution, testable without Tauri. */
@@ -192,12 +194,39 @@ async function bunStreamFetch(pathAndQuery: string, init: RequestInit): Promise<
   return response;
 }
 
-/** Keep same-machine HTTP on fetch; route other hosts through native IPC. */
-export async function bunFetch(pathAndQuery: string, init: RequestInit = {}): Promise<Response> {
+function bunServerToken(): Promise<string> {
+  return tokenPromise ??= invoke<string>('bun_server_token').then((token) => {
+    if (!token) throw new Error('Jarvis did not supply a Bun server credential');
+    return token;
+  }).catch((error: unknown) => {
+    tokenPromise = null;
+    throw error;
+  });
+}
+
+/** Ordinary and streaming fetch share the same IPC-delivered bearer token. */
+export function bunFetch(pathAndQuery: string, init: RequestInit = {}): Promise<Response> {
+  return requestBun(pathAndQuery, init);
+}
+
+export function bunGet(pathAndQuery: string): Promise<Response> {
+  // Browser-only fixtures aren't a Tauri webview; preserve native fetch's
+  // one-argument GET for them. The real server rejects unauthenticated calls.
+  if (!('__TAURI_INTERNALS__' in window)) return globalThis.fetch(`${DEFAULT_BUN_ORIGIN}${pathAndQuery}`);
+  return requestBun(pathAndQuery, {});
+}
+
+async function requestBun(pathAndQuery: string, init: RequestInit): Promise<Response> {
+  if (!pathAndQuery.startsWith('/') || pathAndQuery.startsWith('//')) {
+    throw new Error('Bun request path must be an absolute path');
+  }
   const origin = await bunOrigin();
-  const host = new URL(origin).hostname;
-  if (host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1') {
-    return globalThis.fetch(`${origin}${pathAndQuery}`, init);
+  const url = new URL(origin);
+  if (url.origin === origin && url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) {
+    if (!('__TAURI_INTERNALS__' in window)) return globalThis.fetch(`${origin}${pathAndQuery}`, init);
+    const headers = new Headers(init.headers);
+    headers.set('Authorization', `Bearer ${await bunServerToken()}`);
+    return globalThis.fetch(`${origin}${pathAndQuery}`, { ...init, headers, redirect: 'error' });
   }
   if (pathAndQuery === '/chat/stream') return bunStreamFetch(pathAndQuery, init);
   if (init.signal?.aborted) throw abortError();

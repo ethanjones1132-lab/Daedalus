@@ -401,6 +401,9 @@ pub fn run_jarvis_message(
     // client body.
     goal_binding_id: Option<String>,
 ) -> Result<(), String> {
+    if !crate::local_api::is_loopback_http(&base_url) {
+        return Err("The Bun server must use a loopback HTTP origin".into());
+    }
     // A real persisted Session/turn identity is required for memory
     // finalization; a blank Session runs ordinary relay inference only.
     let memory_turn_enabled = !session_id.is_empty();
@@ -465,7 +468,7 @@ pub fn run_jarvis_message(
                 );
             };
 
-        let client = match reqwest::blocking::Client::builder()
+        let client = match crate::local_api::blocking_client()
             .timeout(std::time::Duration::from_secs(900))
             // Bound the connect phase: a stale or wrong-interface cached URL
             // (e.g. WSL IP after a native restart) would otherwise hang the SYN
@@ -518,7 +521,13 @@ pub fn run_jarvis_message(
             request_body["source_message_id"] =
                 serde_json::Value::String(source_message_id.clone());
         }
-        let resp = match client.post(&url).json(&request_body).send() {
+        let resp = match client
+            .post(&url)
+            .bearer_auth(crate::local_api::bun_token())
+            .header("X-Jarvis-Approval-UI", "1")
+            .json(&request_body)
+            .send()
+        {
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
@@ -1987,15 +1996,14 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
     };
 
     // ── Bun server ──────────────────────────────────────────────
-    let bun_server_url =
-        crate::wsl::get_cached_bun_url().unwrap_or_else(|| "http://127.0.0.1:19877".to_string());
+    let bun_server_url = crate::commands::system::bun_server_origin();
     let bun_server_running = {
         let url = format!("{}/health", bun_server_url.trim_end_matches('/'));
-        reqwest::blocking::Client::builder()
+        crate::local_api::blocking_client()
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .ok()
-            .and_then(|c| c.get(&url).send().ok())
+            .and_then(|c| c.get(&url).bearer_auth(crate::local_api::bun_token()).send().ok())
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     };

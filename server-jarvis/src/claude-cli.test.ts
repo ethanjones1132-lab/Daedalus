@@ -20,6 +20,7 @@ describe("Claude CLI local-only launch contract", () => {
       HOME: "/home/tester",
       ANTHROPIC_API_KEY: "real-api-key",
       ANTHROPIC_AUTH_TOKEN: "real-auth-token",
+      JARVIS_CLAUDE_PROXY_TOKEN: "launcher-test-token",
       ANTHROPIC_BASE_URL: "https://api.anthropic.com",
       CLAUDE_CODE_OAUTH_TOKEN: "real-oauth-token",
       CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: "4",
@@ -28,8 +29,9 @@ describe("Claude CLI local-only launch contract", () => {
 
     expect(env.PATH).toBe("/usr/bin");
     expect(env.HOME).toBe("/home/tester");
-    expect(env.ANTHROPIC_API_KEY).toBe("ollama");
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("ollama");
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe("launcher-test-token");
+    expect(env.JARVIS_CLAUDE_PROXY_TOKEN).toBeUndefined();
     expect(env.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:19878");
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
     expect(env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR).toBeUndefined();

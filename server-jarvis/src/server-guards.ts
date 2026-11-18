@@ -16,8 +16,8 @@
 
 import { isNativeError } from "node:util/types";
 
-/** Bun's documented default hostname for `Bun.serve`. */
-export const DEFAULT_BIND_HOSTNAME = "0.0.0.0";
+/** The local API must not listen on LAN interfaces. */
+export const DEFAULT_BIND_HOSTNAME = "127.0.0.1";
 
 /**
  * The one port the Bun server binds.
@@ -160,9 +160,9 @@ export interface BindTarget {
   readonly port: number;
 }
 
-/** Resolve the effective bind target, defaulting to Bun's default hostname. */
+/** Accept only literal loopback binds; never resolve an arbitrary hostname. */
 export function resolveBindTarget(port: number, hostname: string = DEFAULT_BIND_HOSTNAME): BindTarget {
-  return { hostname: hostname.trim() || DEFAULT_BIND_HOSTNAME, port };
+  return { hostname: hostname.trim() === "::1" ? "::1" : DEFAULT_BIND_HOSTNAME, port };
 }
 
 /** `host:port` for diagnostics; IPv6 literals are bracketed. */

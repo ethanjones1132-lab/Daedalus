@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -131,8 +132,16 @@ def run_architecture(task, sample, stream_url, live):
         }).encode()
         started = time.monotonic()
         try:
+            target = urllib.parse.urlsplit(stream_url)
+            if target.scheme != "http" or target.hostname not in {"127.0.0.1", "localhost", "::1"} or target.username is not None:
+                raise ValueError("Jarvis credentials may only be sent to loopback HTTP")
+            token = os.environ.get("JARVIS_SERVER_TOKEN")
+            if not token:
+                raise ValueError("JARVIS_SERVER_TOKEN is required for live Jarvis runs")
             request = urllib.request.Request(stream_url, data=body, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(request, timeout=480) as response:
+            request.add_unredirected_header("Authorization", f"Bearer {token}")
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(request, timeout=480) as response:
                 for _ in response:
                     pass
         except Exception as exc:

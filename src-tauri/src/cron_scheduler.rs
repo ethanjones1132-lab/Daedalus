@@ -982,9 +982,13 @@ pub fn validate_cron_schedule(schedule_expr: &str) -> Result<(), String> {
 pub async fn resolve_jarvis_url(client: &Client) -> String {
     let local_candidates = crate::wsl::local_jarvis_api_candidates();
     for candidate in &local_candidates {
+        if !crate::local_api::is_loopback_http(candidate) {
+            continue;
+        }
         let probe = format!("{}/health", candidate);
         if client
             .get(&probe)
+            .bearer_auth(crate::local_api::bun_token())
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -1002,12 +1006,13 @@ pub async fn resolve_jarvis_url(client: &Client) -> String {
         .await
         .unwrap_or_default();
     for candidate in candidates {
-        if local_candidates.contains(&candidate) {
+        if local_candidates.contains(&candidate) || !crate::local_api::is_loopback_http(&candidate) {
             continue;
         }
         let probe = format!("{}/health", candidate);
         if client
             .get(&probe)
+            .bearer_auth(crate::local_api::bun_token())
             .timeout(Duration::from_secs(2))
             .send()
             .await
@@ -1359,7 +1364,9 @@ pub async fn dispatch_cron_job(
     // Each automated run gets a fresh isolated session
     let run_session = uuid::Uuid::new_v4().to_string();
 
-    let client = Client::new();
+    let client = crate::local_api::client()
+        .build()
+        .map_err(|e| CronDispatchError::Transport(e.to_string()))?;
     let base_url = resolve_jarvis_url(&client).await;
     let url = format!("{}/cron/run", base_url);
 
@@ -1382,6 +1389,7 @@ pub async fn dispatch_cron_job(
 
     let request = client
         .post(&url)
+        .bearer_auth(crate::local_api::bun_token())
         .json(&body)
         .timeout(Duration::from_secs(STREAM_TIMEOUT_SECS))
         .send();

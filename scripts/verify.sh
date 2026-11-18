@@ -90,6 +90,7 @@ fi
 
 if want server; then
   if have bun; then
+    [ -d "$ROOT/server-jarvis/node_modules" ] || run "server install" "$ROOT/server-jarvis" bun install --frozen-lockfile
     tmp="$(mktemp -d)"
     run "server build" "$ROOT/server-jarvis" bun build ./src/index.ts --outdir "$tmp" --target bun
     rm -rf "$tmp"
@@ -103,6 +104,7 @@ fi
 
 if want ui; then
   if have bun; then
+    [ -d "$ROOT/src-ui/node_modules" ] || run "ui install" "$ROOT/src-ui" bun install --frozen-lockfile
     run "ui tsc -b" "$ROOT/src-ui" bunx tsc -b
   else skip "ui (bun not found)"; fi
 fi
@@ -116,9 +118,14 @@ if want rust; then
     [ $DO_CLIPPY -eq 1 ] && run "rust clippy" "$ROOT" cargo clippy --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml" -- -D warnings
     [ $DO_TEST -eq 1 ]   && run "rust cargo test" "$ROOT" cargo test --lib --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
 
-    # Phase 2 completion criterion: a debug Tauri binary exists and isn't stale
-    # relative to the Rust source. Cheap (no rebuild) so it runs on every pass.
-    # Use --build-tauri to force a from-scratch rebuild.
+  else skip "rust (cargo not found)"; fi
+fi
+
+if [ $DO_BUILD_TAURI -eq 1 ]; then
+  if want rust && have cargo; then
+    # Only --build-tauri promises a debug application. cargo check/test --lib
+    # don't produce it, so validate freshness after the requested binary build.
+    run "tauri debug build" "$ROOT" cargo tauri build --debug --no-bundle --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
     debugExe="$ROOT/src-tauri/target/debug/home-base.exe"
     if [ -f "$debugExe" ]; then
       # Find the newest source mtime under src-tauri/src and src-tauri/Cargo.toml.
@@ -139,21 +146,12 @@ if want rust; then
       printf '    %s not found. Re-run with --build-tauri to produce it.\n' "$debugExe"
       FAIL=$((FAIL+1)); FAILED+=("rust debug binary missing")
     fi
-  else skip "rust (cargo not found)"; fi
+  else skip "tauri debug build (cargo not found)"; fi
 fi
 
 if [ $DO_BUILD -eq 1 ]; then
   if want server && have bun; then run "server dist build" "$ROOT/server-jarvis" bun run build; fi
   if want ui     && have bun; then run "ui dist build"     "$ROOT/src-ui"        bun run build; fi
-fi
-
-if [ $DO_BUILD_TAURI -eq 1 ]; then
-  if want rust && have cargo; then
-    # `--no-bundle` skips the NSIS installer (slow, not needed for a debug gate);
-    # `beforeBuildCommand` in tauri.conf.json still rebuilds server dist + UI.
-    # Pass Windows-style manifest path on MSYS hosts.
-    run "tauri debug build" "$ROOT" cargo tauri build --debug --no-bundle --manifest-path "$ROOT_WIN/src-tauri/Cargo.toml"
-  else skip "tauri debug build (cargo not found)"; fi
 fi
 
 echo "────────────────────────────────────"

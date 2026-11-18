@@ -6,6 +6,7 @@ import copy
 import ipaddress
 import json
 import math
+import os
 import socket
 import threading
 import time
@@ -342,6 +343,7 @@ def _cancel_session(
     *,
     timeout_s: float = 5.0,
     deadline_mono: float | None = None,
+    launch_token: str = "",
 ) -> bool:
     """Request cancellation, bounding the whole HTTP operation by a monotonic deadline.
 
@@ -371,6 +373,8 @@ def _cancel_session(
                 headers={"Content-Type": "application/json", "Accept": "application/json"},
                 method="POST",
             )
+            if launch_token:
+                request.add_unredirected_header("Authorization", f"Bearer {launch_token}")
             with _open_local(request, timeout=timeout) as response:
                 payload = json.loads(response.read(16_384).decode("utf-8"))
             outcome.append(isinstance(payload, dict) and payload.get("cancelled") is True)
@@ -426,6 +430,9 @@ def capture_turn(
         headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
         method="POST",
     )
+    launch_token = os.environ.get("JARVIS_SERVER_TOKEN", "")
+    if launch_token:
+        request.add_unredirected_header("Authorization", f"Bearer {launch_token}")
     output = Path(out_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     events: list[dict[str, Any]] = []
@@ -474,7 +481,8 @@ def capture_turn(
     if timed_out and observation["terminal_ms"] is None:
         observation["outcome"] = "timeout"
         observation["timeout_ms"] = wall_cap_ms
-        observation["cancel_confirmed"] = _cancel_session(base_url, session_id)
+        auth = {"launch_token": launch_token} if launch_token else {}
+        observation["cancel_confirmed"] = _cancel_session(base_url, session_id, **auth)
     elif transport_error and observation["terminal_ms"] is None:
         observation["outcome"] = "transport_failure"
         observation["transport_error"] = transport_error

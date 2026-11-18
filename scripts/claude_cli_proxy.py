@@ -18,6 +18,7 @@ proxy entirely and talk point-to-point from the Bun server (see claude-cli.ts).
 
 from __future__ import annotations
 
+import hmac
 import http.client
 import json
 import logging
@@ -39,6 +40,7 @@ LOG = logging.getLogger("jarvis.claude_cli_proxy")
 
 PORT = int(os.environ.get("JARVIS_CLAUDE_PROXY_PORT", "19878"))
 BIND_HOST = os.environ.get("JARVIS_CLAUDE_PROXY_BIND", "127.0.0.1")
+PROXY_TOKEN = os.environ.pop("JARVIS_CLAUDE_PROXY_TOKEN", "")
 OLLAMA_URL = os.environ.get("JARVIS_OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.environ.get("JARVIS_DEFAULT_MODEL", "qwen3:8b")
 CLAUDE_TIMEOUT = float(os.environ.get("JARVIS_CLAUDE_TIMEOUT", "180"))
@@ -663,24 +665,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
-    def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Content-Type, Authorization, x-api-key, anthropic-version, "
-            "x-jarvis-delegate-request-id",
-        )
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
+    def _authorize_client(self) -> bool:
+        scheme, _, presented = self.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() == "bearer" and PROXY_TOKEN and hmac.compare_digest(
+            presented.encode("utf-8"), PROXY_TOKEN.encode("utf-8")
+        ):
+            return True
+        # Refuse before reading the body or looking up the saved upstream key.
+        self.close_connection = True
+        self._write_json(401, {"type": "error", "error": {
+            "type": "authentication_error", "message": "proxy authentication required",
+        }})
+        return False
 
     def do_HEAD(self) -> None:  # noqa: N802
+        if self.path.startswith("/v1/") and not self._authorize_client():
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -702,6 +706,8 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if path == "/v1/models":
+            if not self._authorize_client():
+                return
             self._write_json(200, {
                 "data": [
                     {"id": DEFAULT_MODEL, "type": "model"},
@@ -721,6 +727,8 @@ class Handler(BaseHTTPRequestHandler):
         LOG.info("POST %s (path=%s) %s", self.path, path, correlation)
         if path != "/v1/messages":
             self._write_json(404, {"error": "not found", "path": self.path})
+            return
+        if not self._authorize_client():
             return
 
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -889,7 +897,6 @@ class Handler(BaseHTTPRequestHandler):
                                 # arrives; curl is lenient and masks this.
                                 self.send_header("Connection", "close")
                                 self.close_connection = True
-                                self.send_header("Access-Control-Allow-Origin", "*")
                                 self.end_headers()
                                 headers_sent = True
 
@@ -1070,6 +1077,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if not PROXY_TOKEN:
+        raise SystemExit("JARVIS_CLAUDE_PROXY_TOKEN is required")
+    if BIND_HOST != "127.0.0.1":
+        raise SystemExit("The Claude CLI proxy must bind to 127.0.0.1")
     # Ignore SIGPIPE so `python3 claude_cli_proxy.py | head -N` pipelines don't
     # kill the server when the reader closes early.
     sigpipe = getattr(signal, "SIGPIPE", None)

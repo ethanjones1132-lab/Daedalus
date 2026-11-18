@@ -372,7 +372,7 @@ describe("ToolRuntime permission policy", () => {
     expect(handlerRan).toBe(false);
   });
 
-  test("approval-required tool in interactive chat runs directly when interactive approval is disabled", async () => {
+  test("approval-required chat tool without a hook is denied even with interactive approval disabled", async () => {
     const runtime = createToolRuntime();
     const cfg = makeToolsCfg({ interactive_approval: false });
     let handlerRan = false;
@@ -384,9 +384,37 @@ describe("ToolRuntime permission policy", () => {
       { id: "c3b", name: "gated_passthrough", arguments: {} },
       makeExecutionContext("chat", cfg),
     );
-    expect(result.is_error).toBe(false);
-    expect(result.output).toBe("passthrough result");
-    expect(handlerRan).toBe(true);
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_required");
+    expect(result.output).toContain("this surface cannot prompt");
+    expect(handlerRan).toBe(false);
+  });
+
+  test("chat cannot skip config-required approval when interactive approval is disabled", async () => {
+    const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ interactive_approval: false, require_approval: ["gated"] });
+    let handlerRan = false;
+    runtime.register(makeDef("gated"), async () => { handlerRan = true; return "ran"; });
+    const result = await runtime.execute(
+      { id: "c3c", name: "gated", arguments: {} },
+      makeExecutionContext("chat", cfg, {
+        skip_approval_gate: true,
+        requestApproval: async () => false,
+      }),
+    );
+    expect(result.error_code).toBe("approval_rejected");
+    expect(handlerRan).toBe(false);
+  });
+
+  test("cron cannot skip approval for a tool even in permissive mode", async () => {
+    const runtime = createToolRuntime();
+    const cfg = makeToolsCfg({ sandbox_mode: "permissive", require_approval: [] });
+    runtime.register(makeDefWithFlags("shell", { requires_approval: true }), async () => "must not run");
+    const result = await runtime.execute(
+      { id: "cron-gated", name: "shell", arguments: {} },
+      makeExecutionContext("cron", cfg, { skip_approval_gate: true }),
+    );
+    expect(result.error_code).toBe("policy_denied");
   });
 
   test("approval-required tool runs when the approval hook approves", async () => {

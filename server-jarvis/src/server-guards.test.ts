@@ -340,7 +340,7 @@ describe("pure helpers", () => {
     }
 
     expect(lines.length).toBe(1);
-    expect(lines[0]).toContain("0.0.0.0:19877");
+    expect(lines[0]).toContain("127.0.0.1:19877");
     expect(lines[0]).toContain(ADDRESS_IN_USE_HINT);
     expect(exits).toEqual([1]);
     // Injected exit returned; the original error is still preserved.
@@ -385,9 +385,13 @@ describe("entrypoint wiring", () => {
 
   test("the address-in-use line names the fixed port and offers no env override", () => {
     const message = formatAddressInUseMessage(resolveBindTarget(SERVER_PORT));
-    expect(message).toContain(`0.0.0.0:${SERVER_PORT}`);
+    expect(message).toContain(`127.0.0.1:${SERVER_PORT}`);
     expect(message).toContain(ADDRESS_IN_USE_HINT);
     expect(message).not.toContain("JARVIS_SERVER_PORT");
     expect(message).not.toMatch(/set\b.*\bfree port/i);
+  });
+
+  test("an explicit LAN bind cannot widen the listener", () => {
+    expect(resolveBindTarget(SERVER_PORT, "0.0.0.0").hostname).toBe("127.0.0.1");
   });
 });

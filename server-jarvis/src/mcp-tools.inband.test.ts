@@ -16,7 +16,7 @@
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { describe, expect, test, afterEach } from "bun:test";
+import { describe, expect, test, afterEach, mock } from "bun:test";
 import {
   classifyMcpResult,
   toolMcpCallTool,
@@ -63,14 +63,16 @@ function httpServer(cfg: JarvisConfig, name = "remote") {
  * The envelope echoes the request id because mcpRequest validates it.
  */
 function stubHttpResult(result: unknown, status = 200) {
-  globalThis.fetch = (async (_input: unknown, init?: { body?: unknown }) => {
+  const fetchMock = mock(async (_input: unknown, init?: { body?: unknown }) => {
     const request = JSON.parse(String(init?.body ?? "{}"));
     return new Response(JSON.stringify({
       jsonrpc: "2.0",
       id: request.id,
       result,
     }), { status, headers: { "Content-Type": "application/json" } });
-  }) as typeof fetch;
+  });
+  globalThis.fetch = fetchMock as typeof fetch;
+  return fetchMock;
 }
 
 async function callToolError(
@@ -344,7 +346,7 @@ describe("mcp client bundle: in-band refusal settles the Tool runtime envelope",
 
     const result = await runtimeWithWorkspace(cfg).execute(
       { id: "call-1", name: "mcp_call_tool", arguments: { server: "remote", tool: "write_file" } },
-      makeExecutionContext("chat", cfg),
+      makeExecutionContext("chat", cfg, { requestApproval: async () => true }),
     );
     expect(result.is_error).toBe(true);
     expect(result.error_code).toBe("mcp_refusal");
@@ -359,11 +361,25 @@ describe("mcp client bundle: in-band refusal settles the Tool runtime envelope",
 
     const result = await runtimeWithWorkspace(cfg).execute(
       { id: "call-2", name: "mcp_call_tool", arguments: { server: "remote", tool: "deploy" } },
-      makeExecutionContext("chat", cfg),
+      makeExecutionContext("chat", cfg, { requestApproval: async () => true }),
     );
     expect(result.is_error).toBe(false);
     expect(result.error_code).toBeUndefined();
     expect(result.output).toContain("deployed cleanly");
+  });
+
+  test("mcp_call_tool without a chat approval hook is denied before contacting the remote", async () => {
+    const cfg = makeWorkspace();
+    httpServer(cfg);
+    const fetchMock = stubHttpResult({ content: [{ type: "text", text: "pong" }], isError: false });
+
+    const result = await runtimeWithWorkspace(cfg).execute(
+      { id: "call-no-approval", name: "mcp_call_tool", arguments: { server: "remote", tool: "ping" } },
+      makeExecutionContext("chat", cfg),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_required");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   test("an in-band refusal on a resource read is also an errored tool result", async () => {

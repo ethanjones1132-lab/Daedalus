@@ -1,4 +1,5 @@
 import { useCallback, useRef, useState } from 'react';
+import { bunGet } from '../../lib/bun-origin';
 import {
   decodeDirectives,
   decodeInferenceMetrics,
@@ -9,8 +10,6 @@ import {
   type ReadinessHealth,
   type RuntimeHealth,
 } from './health-format';
-
-const BUN_URL = 'http://127.0.0.1:19877';
 
 export interface RuntimeTelemetry {
   inference: InferenceMetrics | null;
@@ -40,7 +39,7 @@ const EMPTY: RuntimeTelemetryState = {
 async function getJson<T>(path: string, decode: (value: unknown) => T | null): Promise<T | null> {
   try {
     if (typeof globalThis.fetch !== 'function') return null;
-    const response = await globalThis.fetch(`${BUN_URL}${path}`);
+    const response = await bunGet(path);
     if (!response.ok) return null;
     return decode(await response.json());
   } catch {

@@ -1,7 +1,8 @@
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ChannelsPage from './ChannelsPage';
 import { ToastProvider } from '../../design';
+import { resetBunOriginForTests } from '../../lib/bun-origin';
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }));
@@ -26,9 +27,13 @@ const receipt = {
 const receiptResponse = () => new Response(JSON.stringify({ receipts: [] }));
 const deliveredResponse = () => new Response(JSON.stringify({ ok: true, receipt }));
 const fetchMock = vi.fn();
+const launchToken = 'launch-fixture-token';
 
 beforeEach(() => {
+  resetBunOriginForTests();
   invokeMock.mockReset().mockImplementation(async (command) => {
+    if (command === 'bun_server_origin') return 'http://127.0.0.1:19877';
+    if (command === 'bun_server_token') return launchToken;
     if (command === 'list_channels') return [];
     throw new Error(`unexpected native command: ${command}`);
   });
@@ -73,6 +78,7 @@ describe('Discord channel provisioning', () => {
   });
 
   it('waits for a delivered receipt before persisting the connected flag', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
     invokeMock.mockResolvedValueOnce([channel]);
     render(<ToastProvider><ChannelsPage /></ToastProvider>);
     await screen.findByRole('heading', { name: 'Newsroom' });
@@ -86,11 +92,19 @@ describe('Discord channel provisioning', () => {
     const row = channelRow();
     fireEvent.click(row.getByRole('button', { name: 'Verify & connect' }));
     expect(row.getByRole('button', { name: 'Verifying…' })).toBeDisabled();
-    const [, init] = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/channels/discord/send'))!;
+    const [, init] = await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/channels/discord/send'));
+      expect(call).toBeDefined();
+      return call!;
+    });
     expect(JSON.parse(String(init?.body))).toEqual({
       channel_id: '123', text: 'Jarvis Discord connection check',
     });
-    expect(JSON.stringify(init)).not.toMatch(/token|secret/i);
+    const headers = new Headers(init?.headers);
+    expect(headers.get('Authorization')).toBe(`Bearer ${launchToken}`);
+    // Keep the no-secret check meaningful with a Headers object and the expected Bun bearer.
+    headers.delete('Authorization');
+    expect(JSON.stringify({ ...init, headers: Array.from(headers.entries()) })).not.toMatch(/token|secret/i);
     expect(invokeMock).not.toHaveBeenCalledWith('login_channel', expect.anything());
     await act(async () => { send.resolve(deliveredResponse()); });
     await screen.findByText('1 stored login flags');
@@ -111,9 +125,9 @@ describe('Discord channel provisioning', () => {
       return Promise.resolve(response);
     });
     fireEvent.click(channelRow().getByRole('button', { name: 'Verify & connect' }));
-    await act(async () => {});
+    const alert = await channelRow().findByRole('alert');
     expect(invokeMock).not.toHaveBeenCalledWith('login_channel', expect.anything());
-    expect(channelRow().getByRole('alert')).toHaveTextContent('Delivery could not be verified. The channel was not connected.');
+    expect(alert).toHaveTextContent('Delivery could not be verified. The channel was not connected.');
     expect(channelRow().getByRole('button', { name: 'Verify & connect' })).toBeEnabled();
   });
 

@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test";
-import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
+import { describe, test, expect, mock } from "bun:test";
+import { createToolRuntime, makeExecutionContext, type ExecutionContext } from "./tool-runtime";
 import { registerTaskBundle, registerTaskControlBundle } from "./task-bundle";
 import { defaultConfig } from "./config";
 import {
@@ -16,10 +16,10 @@ function makeRuntime() {
   registerTaskBundle(rt);
   return rt;
 }
-function ctx() {
+function ctx(overrides?: Pick<ExecutionContext, "requestApproval">) {
   const cfg = defaultConfig();
   cfg.tools.enabled = true;
-  return makeExecutionContext("chat", cfg);
+  return makeExecutionContext("chat", cfg, overrides);
 }
 function call(name: string, args: Record<string, unknown>) {
   return { id: `t-${name}`, name, arguments: args };
@@ -72,6 +72,26 @@ describe("task bundle", () => {
     const props = def!.function.parameters.properties as Record<string, unknown>;
     expect(props.timeout_ms).toBeDefined();
   });
+
+  test("run_background_command without a chat approval hook is denied before invoking its handler", async () => {
+    const runtime = createToolRuntime();
+    const backgroundHandler = mock(async () => "unexpected execution");
+    // Keep the bundle's real definition, but never spawn a process in this test.
+    registerTaskBundle({
+      ...runtime,
+      register(def, handler) {
+        runtime.register(def, def.function.name === "run_background_command" ? backgroundHandler : handler);
+      },
+    });
+
+    const result = await runtime.execute(
+      call("run_background_command", { command: "echo approval-required" }),
+      ctx(),
+    );
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("approval_required");
+    expect(backgroundHandler).not.toHaveBeenCalled();
+  });
 });
 
 describe("resolveBackgroundCommandTimeoutMs", () => {
@@ -98,7 +118,7 @@ describe("run_background_command timeout (live)", () => {
     // Regression for the 65-minute Phase-D hang: a model-spawned infinite
     // loop through run_background_command must not outlive timeout_ms.
     const runtime = makeRuntime();
-    const context = ctx();
+    const context = ctx({ requestApproval: async () => true });
     // Use the host shell so the child actually starts and reaches the timeout.
     const hang = `node -e "setInterval(()=>{}, 1000)"`;
     const started = await runtime.execute(

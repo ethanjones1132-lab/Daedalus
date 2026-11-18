@@ -30,7 +30,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Net.Http
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 function Get-JsonFile([string]$Path) {
     if (-not (Test-Path $Path -PathType Leaf)) { throw "missing_file:$Path" }
@@ -51,13 +51,14 @@ function Get-ServingProcess([int]$Port) {
 }
 
 function Read-SseStream([string]$Url, [hashtable]$Body, [int]$Timeout) {
-    $client = [System.Net.Http.HttpClient]::new()
+    $client = New-JarvisLocalHttpClient
     $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new(
             [System.Net.Http.HttpMethod]::Post,
             $Url
         )
+        $request.Headers.Add('Authorization', (Get-JarvisLocalHeaders $Url).Authorization)
         $json = $Body | ConvertTo-Json -Depth 8 -Compress
         $request.Content = [System.Net.Http.StringContent]::new(
             $json,
@@ -107,8 +108,9 @@ function Get-ArtifactPresence([hashtable]$Expected) {
 
 $manifestPath = Join-Path $DeployDir '.jarvis-deploy-manifest.json'
 $manifest = Get-JsonFile $manifestPath
-$health = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
-$inferenceHealth = Invoke-RestMethod -Uri ($HealthUrl -replace '/health$', '/health/inference') -TimeoutSec 5
+$healthHeaders = Get-JarvisLocalHeaders $HealthUrl
+$health = Invoke-RestMethod -Uri $HealthUrl -Headers $healthHeaders -MaximumRedirection 0 -TimeoutSec 5
+$inferenceHealth = Invoke-RestMethod -Uri ($HealthUrl -replace '/health$', '/health/inference') -Headers $healthHeaders -MaximumRedirection 0 -TimeoutSec 5
 if ($null -eq $inferenceHealth.recent_attempts -or $null -eq $inferenceHealth.runtime) {
     throw 'inference_health_contract_missing_recent_attempts_or_runtime'
 }
@@ -129,6 +131,7 @@ if ([string]$manifest.git_sha -ne [string]$health.git_sha) {
 $authorityCheck = [ordered]@{ status = 'unknown'; code = $null }
 try {
     Invoke-WebRequest -Uri ($StreamUrl -replace '/chat/stream$', '/sessions') -Method Post `
+        -Headers (Get-JarvisLocalHeaders $StreamUrl) -MaximumRedirection 0 `
         -ContentType 'application/json' -Body '{}' -TimeoutSec 5 -UseBasicParsing | Out-Null
     $authorityCheck.status = 'unexpected_success'
 } catch {
@@ -137,7 +140,7 @@ try {
 }
 if ($authorityCheck.status -ne 'pass') { throw "session_authority_fixture_failed:$($authorityCheck.code)" }
 
-$conductorHealth = Invoke-RestMethod -Uri ($HealthUrl -replace '/health$', '/health/conductor-directives') -TimeoutSec 5
+$conductorHealth = Invoke-RestMethod -Uri ($HealthUrl -replace '/health$', '/health/conductor-directives') -Headers $healthHeaders -MaximumRedirection 0 -TimeoutSec 5
 $conductorCheck = [ordered]@{
     status = if ($null -ne $conductorHealth.records -and $null -ne $conductorHealth.by_type) { 'pass' } else { 'fail' }
     window_size = $conductorHealth.window_size
@@ -309,7 +312,7 @@ if ($CompletionIntegritySmoke) {
         }
 
         # Provenance must still match after the multi-turn work.
-        $healthAfter = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5
+        $healthAfter = Invoke-RestMethod -Uri $HealthUrl -Headers $healthHeaders -MaximumRedirection 0 -TimeoutSec 5
         if ([string]$manifest.git_sha -ne [string]$healthAfter.git_sha) {
             throw "health_manifest_sha_mismatch_post_smoke:manifest=$($manifest.git_sha) health=$($healthAfter.git_sha)"
         }

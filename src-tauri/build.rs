@@ -1,6 +1,6 @@
 mod release_resource_staging;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Embed build provenance (git SHA, dirty flag, build time) into the binary so
@@ -14,6 +14,9 @@ fn main() {
     // Rebuild when runtime resources change so the post-build copy step
     // re-stages them next to the bare release exe.
     println!("cargo:rerun-if-changed=../server-jarvis/dist/index.js");
+    println!("cargo:rerun-if-changed=../server-jarvis/dist/tokenizer.cjs");
+    println!("cargo:rerun-if-changed=../server-jarvis/dist/mcp-stdio-server.js");
+    println!("cargo:rerun-if-changed=../src-ui/dist/index.html");
     println!("cargo:rerun-if-changed=../scripts/claude_cli_proxy.py");
     println!("cargo:rerun-if-changed=../scripts/opencode_go_openai_models.json");
 
@@ -31,6 +34,10 @@ fn main() {
     println!("cargo:rustc-env=JARVIS_GIT_DIRTY={dirty}");
     println!("cargo:rustc-env=JARVIS_BUILD_UNIX={build_unix}");
 
+    // Raw Cargo (including cargo test) doesn't run Tauri CLI's
+    // beforeBuildCommand. Use the same real build when its outputs are absent.
+    ensure_frontend_resources();
+
     // Best-effort: in release builds, copy runtime resources next to the
     // produced exe. Tauri `bundle.resources` only stages files inside the
     // NSIS installer; a bare `cargo tauri build` output (target/release/home-base.exe)
@@ -42,6 +49,40 @@ fn main() {
     }
 
     tauri_build::build();
+}
+
+fn ensure_frontend_resources() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let root = manifest.parent().expect("src-tauri must be inside the checkout");
+    let outputs = [
+        "server-jarvis/dist/index.js",
+        "server-jarvis/dist/tokenizer.cjs",
+        "server-jarvis/dist/mcp-stdio-server.js",
+        "src-ui/dist/index.html",
+    ];
+    let ready = || outputs.iter().all(|path| {
+        root.join(path).metadata().is_ok_and(|file| file.is_file() && file.len() > 0)
+    });
+    if ready() {
+        return;
+    }
+    for package in ["server-jarvis", "src-ui"] {
+        let package_dir = root.join(package);
+        if !package_dir.join("node_modules").is_dir() {
+            run_bun(&package_dir, &["install", "--frozen-lockfile"]);
+        }
+    }
+    run_bun(root, &["server-jarvis/src/build-frontend.ts"]);
+    assert!(ready(), "the frontend build did not produce all Tauri resources");
+}
+
+fn run_bun(cwd: &Path, args: &[&str]) {
+    let status = Command::new("bun")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .unwrap_or_else(|error| panic!("could not start bun {args:?}: {error}"));
+    assert!(status.success(), "bun {args:?} failed: {status}");
 }
 
 fn copy_release_resources_next_to_exe() {

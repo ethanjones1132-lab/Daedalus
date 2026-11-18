@@ -64,7 +64,7 @@ fn config_readback_mismatch_result() -> ConfigSaveResult {
 }
 
 async fn chat_base_url() -> Result<String, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::local_api::client()
         .timeout(Duration::from_secs(3))
         .connect_timeout(Duration::from_secs(2))
         .build()
@@ -96,7 +96,7 @@ async fn chat_base_url() -> Result<String, String> {
 async fn probe_chat_health(client: &reqwest::Client, base_url: &str) -> bool {
     let url = format!("{}/health", base_url.trim_end_matches('/'));
     matches!(
-        client.get(url).timeout(Duration::from_secs(2)).send().await,
+        client.get(url).bearer_auth(crate::local_api::bun_token()).timeout(Duration::from_secs(2)).send().await,
         Ok(resp) if resp.status().is_success()
     )
 }
@@ -1009,16 +1009,17 @@ pub async fn cancel_chat_stream(session_id: String) -> Result<bool, String> {
     // Re-probe the Bun URL on every call (see `jarvis_send_message` for the
     // stale-cache rationale — a cancelled stream against a dead URL leaves
     // the UI pinned with no way out short of an app restart).
-    let probe_client = reqwest::Client::new();
+    let probe_client = crate::local_api::client().build().map_err(|e| e.to_string())?;
     let base = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
     let url = format!("{}/chat/cancel", base.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = crate::local_api::client()
         .timeout(std::time::Duration::from_secs(5))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to build /chat/cancel client: {e}"))?;
     let resp = client
         .post(&url)
+        .bearer_auth(crate::local_api::bun_token())
         .json(&serde_json::json!({ "session_id": session_id }))
         .send()
         .await
@@ -1167,16 +1168,17 @@ pub async fn jarvis_tool_decision(
     // Re-probe the Bun URL on every call (see `jarvis_send_message` for the
     // stale-cache rationale — a denied tool against a dead URL leaves the
     // orchestrator pinned mid-turn).
-    let probe_client = reqwest::Client::new();
+    let probe_client = crate::local_api::client().build().map_err(|e| e.to_string())?;
     let base = crate::cron_scheduler::resolve_jarvis_url(&probe_client).await;
     let url = format!("{}/tool/decision", base.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
+    let client = crate::local_api::client()
         .timeout(std::time::Duration::from_secs(5))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to build /tool/decision client: {e}"))?;
     let resp = client
         .post(&url)
+        .bearer_auth(crate::local_api::bun_token())
         .json(&serde_json::json!({ "call_id": tool_call_id, "approved": approved }))
         .send()
         .await

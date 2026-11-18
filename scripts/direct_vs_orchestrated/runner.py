@@ -11,6 +11,7 @@ import json
 import os
 import platform
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -481,11 +482,13 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def _local_json_request(url: str, *, timeout: float = 2.0) -> dict[str, Any]:
+def _local_json_request(url: str, *, timeout: float = 2.0, launch_token: str = "") -> dict[str, Any]:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("readiness probes are restricted to loopback HTTP")
     request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    if launch_token:
+        request.add_unredirected_header("Authorization", f"Bearer {launch_token}")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RejectRedirects())
     with opener.open(request, timeout=timeout) as response:
         body = response.read(4 * 1024 * 1024)
@@ -510,6 +513,7 @@ def _wait_for_json(
     timeout_s: float,
     readiness_kind: str,
     expected_alias: str | None = None,
+    launch_token: str = "",
 ) -> dict[str, Any]:
     if readiness_kind not in {"health", "config", "models"}:
         raise ValueError(f"unsupported readiness response kind: {readiness_kind}")
@@ -522,7 +526,7 @@ def _wait_for_json(
         if code is not None:
             raise RuntimeError(f"owned process {process.pid} exited before readiness (code {code})")
         try:
-            body = _local_json_request(url, timeout=1.0)
+            body = _local_json_request(url, timeout=1.0, launch_token=launch_token)
             if readiness_kind == "models":
                 models = body.get("data")
                 if isinstance(models, list) and any(isinstance(model, dict) and model.get("id") == expected_alias for model in models):
@@ -571,10 +575,11 @@ def owned_bun_server(
     bind, exits before readiness, and `_wait_for_json` reports the exit. Loopback
     bind, backend, alias, and mode config are re-proven before a trial may use it.
     """
+    launch_token = env.get("JARVIS_SERVER_TOKEN") or secrets.token_hex(32)
     with owned_processes(
         [command],
         ports=[],
-        env=[env],
+        env=[{**env, "JARVIS_SERVER_TOKEN": launch_token}],
         cwd=[cwd],
         stdout_targets=[log_stream],
         popen_factory=popen_factory,
@@ -585,6 +590,7 @@ def owned_bun_server(
             process,
             timeout_s=30.0,
             readiness_kind="health",
+            launch_token=launch_token,
         )
         _assert_bun_loopback_health(health)
         if health.get("backend") != "llama_cpp" or health.get("configured_model") != served_alias:
@@ -594,6 +600,7 @@ def owned_bun_server(
             process,
             timeout_s=5.0,
             readiness_kind="config",
+            launch_token=launch_token,
         )
         _assert_runtime_config(
             config_response,
@@ -1079,6 +1086,7 @@ def _run_capture_worker(
     workspace: Path,
     repo_root: Path = REPO_ROOT,
     popen_factory=subprocess.Popen,
+    launch_token: str = "",
 ) -> dict[str, Any]:
     """Run one capture worker under a parent deadline that includes process spawn."""
     task_path = out_path.with_suffix(".task.json")
@@ -1095,6 +1103,8 @@ def _run_capture_worker(
         "--wall-cap-ms", str(wall_cap_ms),
     ]
     environment = child_env(worker_home, workspace=workspace)
+    if launch_token:
+        environment["JARVIS_SERVER_TOKEN"] = launch_token
     # The monotonic turn deadline begins before Popen, so interpreter startup
     # and task-file loading consume the same 120-second budget as SSE capture.
     capture_started = time.monotonic()
@@ -1117,7 +1127,8 @@ def _run_capture_worker(
             stdout, _stderr = process.communicate(timeout=max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             cancellation_deadline = time.monotonic() + 5.0
-            cancel_confirmed = _cancel_session(base_url, session_id, deadline_mono=cancellation_deadline)
+            auth = {"launch_token": launch_token} if launch_token else {}
+            cancel_confirmed = _cancel_session(base_url, session_id, deadline_mono=cancellation_deadline, **auth)
             settled = False
             stdout = b""
             if cancel_confirmed:
@@ -1286,10 +1297,11 @@ def _execute_campaign(
         """Start the one SERVER_PORT server for `mode` after stopping the other."""
         process_stack = server_state["process_stack"]
         server_stack = process_stack.enter_context(contextlib.ExitStack())
+        launch_token = secrets.token_hex(32)
         process, ready = server_stack.enter_context(owned_bun_server(
             mode=mode,
             command=bun_argv,
-            env=child_env(homes / mode, workspace=fixture_dir),
+            env={**child_env(homes / mode, workspace=fixture_dir), "JARVIS_SERVER_TOKEN": launch_token},
             cwd=server_root,
             log_stream=server_state["logs"][f"bun_{mode}"],
             expected_config=configs[mode],
@@ -1307,7 +1319,7 @@ def _execute_campaign(
             "effective_config_fingerprint": _fingerprint(redact_config(ready["config"])),
         })
         manifest["readiness"] = readiness
-        server_state.update(mode=mode, process=process, row=row, stack=server_stack)
+        server_state.update(mode=mode, process=process, row=row, stack=server_stack, launch_token=launch_token)
         if manifest.get("run_status") == "starting":
             manifest["run_status"] = "ready"
         _atomic_write_json(manifest_path, manifest)
@@ -1319,7 +1331,7 @@ def _execute_campaign(
             return
         server_stack.close()
         mark_process_stopped(server_state["row"], server_state["process"])
-        server_state.update(mode=None, process=None, row=None, stack=None)
+        server_state.update(mode=None, process=None, row=None, stack=None, launch_token=None)
 
     def ensure_server(mode: str) -> dict[str, Any]:
         """Guarantee the live owned Bun server is the one started for `mode`."""
@@ -1386,6 +1398,7 @@ def _execute_campaign(
                 workspace=fixture_dir,
                 repo_root=repo_root,
                 popen_factory=popen_factory,
+                launch_token=server["launch_token"],
             )
 
         record = capture_trial(

@@ -22,6 +22,7 @@ afterEach(() => {
   invokeMock.mockReset();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('resolveBunOrigin', () => {
@@ -112,6 +113,28 @@ describe('bunFetch', () => {
     expect(fetch).toHaveBeenCalledWith('http://127.0.0.1:19877/health', {});
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(await response.text()).toBe('ok');
+  });
+
+  it('uses the IPC credential for both JSON and the streaming fetch, never in the URL', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {});
+    invokeMock.mockImplementation((command: string) => Promise.resolve(
+      command === 'bun_server_token' ? 'launch-fixture-token' : DEFAULT_BUN_ORIGIN,
+    ));
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('ok'));
+    await bunFetch('/health/readiness');
+    await bunFetch('/chat/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+
+    expect(invokeMock).toHaveBeenCalledWith('bun_server_token');
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'bun_server_token')).toHaveLength(1);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      `${DEFAULT_BUN_ORIGIN}/health/readiness`,
+      `${DEFAULT_BUN_ORIGIN}/chat/stream`,
+    ]);
+    for (const [, init] of fetch.mock.calls) {
+      expect(new Headers(init?.headers).get('Authorization')).toBe('Bearer launch-fixture-token');
+      expect(init?.redirect).toBe('error');
+    }
+    expect(new Headers(fetch.mock.calls[1][1]?.headers).get('Content-Type')).toBe('application/json');
   });
 
   it('streams a non-loopback chat response as chunks arrive', async () => {

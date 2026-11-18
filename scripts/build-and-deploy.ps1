@@ -46,6 +46,7 @@ $startedAt = Get-Date
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 . (Join-Path $PSScriptRoot 'lib\installer-selection.ps1')
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg"     -ForegroundColor Green }
@@ -281,72 +282,24 @@ Write-Ok "deploy manifest -> .jarvis-deploy-manifest.json"
 
 # ── Optional: relaunch the server so the next prompt streams immediately ──────
 if ($RestartServer) {
-    # ── Claude CLI proxy (:19878) — the delegate write path ──────────────────
-    # This deploy has always COPIED claude_cli_proxy.py to the Desktop and then
-    # done nothing with it. On 2026-07-21 the proxy stopped and nothing
-    # restarted it; the delegate (policy: delegate_first, the PRIMARY write
-    # path) kept launching the `claude` CLI with
-    # ANTHROPIC_BASE_URL=127.0.0.1:19878, getting connection refused, and
-    # terminating instantly. Writes silently fell back to a free-tier
-    # text-protocol executor that rarely emits write calls, and it took eleven
-    # days and a replay-harness rule to notice. Every deploy in between shipped
-    # a dead write path without a word. Verify it here instead.
-    # ASCII-only in console output: PS 5.1 renders non-ASCII here as mojibake.
-    Write-Step 'Verifying Claude CLI proxy (:19878 - delegate write path)'
-    $proxyPort = 19878
+    # The deployed Native surface now owns both sidecars and their credentials.
+    # Never pre-bind either port with a process the app cannot authenticate.
+    Write-Step 'Restarting deployed Jarvis and its owned services'
     $logsDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
     if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Force -Path $logsDir | Out-Null }
-    $proxyUp = [bool](Get-NetTCPConnection -State Listen -LocalPort $proxyPort -ErrorAction SilentlyContinue)
-    if ($proxyUp) {
-        Write-Ok "proxy already listening on http://127.0.0.1:$proxyPort"
-    }
-    else {
-        $python = (Get-Command python -ErrorAction SilentlyContinue).Source
-        if (-not $python) {
-            Write-Host "  [WARN] python not found on PATH - cannot start the Claude CLI proxy." -ForegroundColor Red
-            Write-Host "         The delegate write path will be DEAD: file edits will fall back to" -ForegroundColor Red
-            Write-Host "         the native executor, which writes far less reliably." -ForegroundColor Red
-        }
-        else {
-            $deployedProxy = Join-Path $desktop 'resources\claude_cli_proxy.py'
-            $proxyOut = Join-Path $logsDir "claude-proxy-stdout-$ts.log"
-            $proxyErr = Join-Path $logsDir "claude-proxy-stderr-$ts.log"
-            Start-Process -FilePath $python -ArgumentList "`"$deployedProxy`"" -WindowStyle Hidden -RedirectStandardOutput $proxyOut -RedirectStandardError $proxyErr
-            for ($i = 0; $i -lt 15; $i++) {
-                Start-Sleep -Milliseconds 500
-                if (Get-NetTCPConnection -State Listen -LocalPort $proxyPort -ErrorAction SilentlyContinue) { $proxyUp = $true; break }
-            }
-            if ($proxyUp) {
-                Write-Ok "proxy started on http://127.0.0.1:$proxyPort"
-                Write-Ok "logging to $proxyOut"
-            }
-            else {
-                Write-Host "  [WARN] proxy did not bind :$proxyPort within ~7s." -ForegroundColor Red
-                Write-Host "         The delegate write path is DEAD - file edits will fall back to" -ForegroundColor Red
-                Write-Host "         the native executor, which writes far less reliably." -ForegroundColor Red
-                Write-Host "         See $proxyErr" -ForegroundColor Red
-            }
-        }
-    }
-
-    Write-Step 'Restarting Jarvis server (bun <Desktop>\index.js on :19877)'
-    $deployedJs = Join-Path $desktop 'index.js'
-    # Server stdout/stderr previously went nowhere (Start-Process -WindowStyle
-    # Hidden with no redirection silently discards it) — that gap made a real
-    # production incident (2026-07-01 empty-completion cascade bug) much
-    # harder to diagnose than it should have been. Always capture output now,
-    # timestamped per restart so history survives across restarts instead of
-    # being overwritten.
-    $logsDir = Join-Path $env:USERPROFILE '.openclaw\jarvis\logs'
-    if (-not (Test-Path $logsDir)) { New-Item -ItemType Directory -Force -Path $logsDir | Out-Null }
-    $logOut = Join-Path $logsDir "server-stdout-$ts.log"
-    $logErr = Join-Path $logsDir "server-stderr-$ts.log"
-    Start-Process -FilePath $bun -ArgumentList "`"$deployedJs`"" -WindowStyle Hidden -RedirectStandardOutput $logOut -RedirectStandardError $logErr
+    $logOut = Join-Path $logsDir "app-stdout-$ts.log"
+    $logErr = Join-Path $logsDir "app-stderr-$ts.log"
+    $serverToken = ''
+    $app = Start-JarvisPrivateLaunch -AppPath (Join-Path $desktop 'Jarvis.exe') -WorkingDirectory $desktop `
+        -StdoutPath $logOut -StderrPath $logErr -Token ([ref]$serverToken)
+    $healthUrl = 'http://127.0.0.1:19877/health'
     $healthy = $false
     for ($i = 0; $i -lt 20; $i++) {
+        if ($app.HasExited) { break }
         Start-Sleep -Milliseconds 700
         try {
-            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:19877/health' -TimeoutSec 2 -UseBasicParsing
+            $r = Invoke-WebRequest -Uri $healthUrl -Headers (Get-JarvisLocalHeaders $healthUrl $serverToken) `
+                -MaximumRedirection 0 -TimeoutSec 2 -UseBasicParsing
             if ($r.StatusCode -eq 200) { $healthy = $true; break }
         } catch {}
     }

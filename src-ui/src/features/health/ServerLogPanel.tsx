@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { bunGet } from '../../lib/bun-origin';
 import { AlertLine, Badge, Button, Disclosure, Panel, StatusLine } from '../../design';
 import { LOG_RAW_CONTENT_NOTICE, logLevelTone, logTailBound, parseDiagnosticsLogTail, type DiagnosticsLogTail } from '../../domain/diagnostics-log-state';
 /** Read only the bounded server-owned log; never manufacture empty success. */
@@ -14,7 +15,7 @@ export default function ServerLogPanel() {
     pending.current = true; const id = ++request.current;
     setLoading(true); setFailed(false);
     try {
-      const response = await fetch('http://127.0.0.1:19877/diagnostics/log');
+      const response = await bunGet('/diagnostics/log');
       if (!response.ok) throw new Error('Unavailable log');
       const tail = parseDiagnosticsLogTail(await response.json());
       if (!tail) throw new Error('Unreadable log');

@@ -95,6 +95,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 . (Join-Path $PSScriptRoot 'lib\probe-bounded-queries.ps1')
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
@@ -320,8 +321,9 @@ $stderr = Join-Path $env:TEMP 'jarvis-cold-start.err.log'
 # ── Launch cold ──────────────────────────────────────────────────────────────
 Write-Step 'Launching the app cold'
 $before = @(Get-Process -Name $mainBinaryName -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
-$process = Start-Process -FilePath $appPath -WorkingDirectory $InstallRoot -PassThru `
-    -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+$serverToken = ''
+$process = Start-JarvisPrivateLaunch -AppPath $appPath -WorkingDirectory $InstallRoot `
+    -StdoutPath $stdout -StderrPath $stderr -Token ([ref]$serverToken)
 $process | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $process.StartTime
 Mark 'launched' @{ pid = $process.Id }
 
@@ -401,7 +403,8 @@ Write-Step 'Health'
 $healthPayload = $null
 if ($healthSeen) {
     try {
-        $healthPayload = Invoke-RestMethod -Uri 'http://127.0.0.1:19877/health' -TimeoutSec 5
+        $healthUrl = 'http://127.0.0.1:19877/health'
+        $healthPayload = Invoke-RestMethod -Uri $healthUrl -Headers (Get-JarvisLocalHeaders $healthUrl $serverToken) -MaximumRedirection 0 -TimeoutSec 5
         Write-Ok "health: version=$($healthPayload.version) git_sha=$($healthPayload.git_sha)"
     } catch {
         Write-Warn "health endpoint did not answer: $($_.Exception.Message)"

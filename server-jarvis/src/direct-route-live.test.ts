@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { SERVER_PORT } from "./server-guards";
+import { defaultConfig } from "./config";
+import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
+import { registerWebBundle } from "./web-bundle";
 
 // Real owned Bun children, with a deterministic loopback HTTP fixture in place
 // of a model. This proves dispatch/attribution, not model quality or latency.
@@ -43,6 +46,8 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
       behavior = "success";
       const requestsBeforeStartup = requests;
       const home = mkdtempSync(join(tmpdir(), "jarvis-direct-route-live-"));
+      const token = crypto.randomUUID();
+      const auth = { Authorization: `Bearer ${token}` };
       const configDir = join(home, ".openclaw", "jarvis");
       mkdirSync(configDir, { recursive: true });
       const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
@@ -68,7 +73,8 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
         env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "",
           HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"),
           LOCALAPPDATA: join(home, "AppData", "Local"), TEMP: home, TMP: home,
-          JARVIS_SERVER_PORT: String(ignoredPort), JARVIS_SERVER_HOST: "127.0.0.1" },
+          JARVIS_SERVER_PORT: String(ignoredPort), JARVIS_SERVER_HOST: "127.0.0.1",
+          JARVIS_SERVER_TOKEN: token },
       });
       const output = new Response(child.stdout).text();
       const errors = new Response(child.stderr).text();
@@ -78,7 +84,7 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
         for (let tries = 0; tries < 120; tries++) {
           if (child.exitCode !== null) throw new Error(`owned Bun exited: ${await errors}`);
           try {
-            const health = await (await fetch(`${base}/health`, { signal: AbortSignal.timeout(500) })).json() as any;
+            const health = await (await fetch(`${base}/health`, { headers: auth, signal: AbortSignal.timeout(500) })).json() as any;
             expect(health.bind_host).toBe("127.0.0.1");
             expect(health.bind_port).toBe(SERVER_PORT);
             ready = health.ok === true;
@@ -87,13 +93,45 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
           await pause(50);
         }
         expect(ready).toBe(true);
-        const config = await (await fetch(`${base}/config`)).json() as any;
+        if (!orchestrated) {
+          const liveness = await fetch(`${base}/livez`);
+          expect(liveness.status).toBe(200);
+          expect(await liveness.json()).toEqual({ ok: true });
+          for (const path of ["/config", "/health", "/health/readiness", "/internal/memory/preparations"]) {
+            expect((await fetch(`${base}${path}`)).status).toBe(401);
+          }
+          expect((await fetch(`${base}/chat/stream`, { method: "POST" })).status).toBe(401);
+          const runtime = createToolRuntime();
+          registerWebBundle(runtime);
+          const selfFetch = await runtime.execute(
+            { id: "web-fetch-self", name: "web_fetch", arguments: { url: `${base}/config` } },
+            makeExecutionContext("chat", defaultConfig()),
+          );
+          expect(selfFetch.is_error).toBe(true);
+          expect(selfFetch.output).toContain("401");
+          expect((await fetch(`${base}/config`, { headers: { Authorization: "Bearer wrong" } })).status).toBe(401);
+          const wrongOrigin = await fetch(`${base}/config`, { headers: { ...auth, Origin: "http://localhost:5174" } });
+          expect(wrongOrigin.status).toBe(403);
+          expect(wrongOrigin.headers.get("Access-Control-Allow-Origin")).toBeNull();
+          for (const origin of ["http://localhost:5173", "http://tauri.localhost"]) {
+            const preflight = await fetch(`${base}/chat/stream`, {
+              method: "OPTIONS",
+              headers: { Origin: origin, "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization, content-type" },
+            });
+            expect(preflight.status).toBe(204);
+            expect(preflight.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+            const allowed = await fetch(`${base}/health`, { headers: { ...auth, Origin: origin } });
+            expect(allowed.status).toBe(200);
+            expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+          }
+        }
+        const config = await (await fetch(`${base}/config`, { headers: auth })).json() as any;
         expect(config.orchestrator.enabled).toBe(orchestrated);
         expect(config.llama_cpp.model).toBe(alias);
         await pause(100);
         expect(requests).toBe(requestsBeforeStartup);
         const start = (session: string) => fetch(`${base}/chat/stream`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
+          method: "POST", headers: { ...auth, "Content-Type": "application/json" },
           body: JSON.stringify({ message: "Hi", session_id: session, history: [],
             config: { ...config, max_tokens: 16, temperature: 0, top_p: 1 } }), signal: AbortSignal.timeout(12_000),
         });
@@ -122,7 +160,7 @@ test("isolated real Bun turns disclose Direct success/failure/cancellation and O
         const response = start(session);
         for (let tries = 0; requests === before && tries < 100; tries++) await pause(20);
         expect(requests).toBeGreaterThan(before);
-        await fetch(`${base}/chat/cancel`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) });
+        await fetch(`${base}/chat/cancel`, { method: "POST", headers: { ...auth, "Content-Type": "application/json" }, body: JSON.stringify({ session_id: session }) });
         const cancelled = (await frames(await response)).find((frame) => frame.type === "cancelled");
         expect(cancelled?.route?.attempts).toEqual(expect.arrayContaining([
           expect.objectContaining({ provider: "llama_cpp", model: alias, answered: false }),

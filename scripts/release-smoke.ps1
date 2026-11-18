@@ -88,6 +88,7 @@ $ErrorActionPreference = 'Stop'
 $ServerPort = 19877
 
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
+. (Join-Path $PSScriptRoot 'lib\local-api.ps1')
 
 function Write-Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
@@ -101,10 +102,10 @@ function Read-JarvisSseStream {
     param(
         [string]$Url,
         [hashtable]$Body,
-        [int]$Timeout
+        [int]$Timeout,
+        [string]$Token
     )
-    Add-Type -AssemblyName System.Net.Http
-    $client = [System.Net.Http.HttpClient]::new()
+    $client = New-JarvisLocalHttpClient
     $client.Timeout = [TimeSpan]::FromSeconds($Timeout)
     $deadline = [datetime]::UtcNow.AddSeconds($Timeout)
     $response = $null
@@ -112,6 +113,7 @@ function Read-JarvisSseStream {
     try {
         $request = [System.Net.Http.HttpRequestMessage]::new(
             [System.Net.Http.HttpMethod]::Post, $Url)
+        $request.Headers.Add('Authorization', (Get-JarvisLocalHeaders $Url $Token).Authorization)
         $json = $Body | ConvertTo-Json -Depth 8 -Compress
         $request.Content = [System.Net.Http.StringContent]::new(
             $json, [System.Text.Encoding]::UTF8, 'application/json')
@@ -158,7 +160,8 @@ function Wait-JarvisHealth {
     param(
         [string]$Url,
         [int]$TimeoutSeconds,
-        $Process
+        $Process,
+        [string]$Token
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastError = 'no attempt'
@@ -167,7 +170,7 @@ function Wait-JarvisHealth {
             throw "server_exited_before_health:$($Process.ExitCode)"
         }
         try {
-            return Invoke-RestMethod -Uri $Url -TimeoutSec 5
+            return Invoke-RestMethod -Uri $Url -Headers (Get-JarvisLocalHeaders $Url $Token) -MaximumRedirection 0 -TimeoutSec 5
         } catch {
             $lastError = $_.Exception.Message
             Start-Sleep -Milliseconds 500
@@ -196,7 +199,8 @@ function Start-JarvisInstalledApp {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$AppPath,
-        [Parameter(Mandatory = $true)][string]$InstallRoot
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [ref]$Token
     )
     if (-not (Test-Path -LiteralPath $AppPath -PathType Leaf)) {
         throw "installed_app_binary_missing:$AppPath"
@@ -206,9 +210,8 @@ function Start-JarvisInstalledApp {
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $stdout = Join-Path $logDir 'app.out.log'
     $stderr = Join-Path $logDir 'app.err.log'
-    $startedProcess = Start-Process -FilePath $AppPath -WorkingDirectory $InstallRoot `
-        -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $startedProcess = Start-JarvisPrivateLaunch -AppPath $AppPath -WorkingDirectory $InstallRoot `
+        -StdoutPath $stdout -StderrPath $stderr -Token $Token
     $startedProcess | Add-Member -NotePropertyName JarvisOwnedStartTime -NotePropertyValue $startedProcess.StartTime
     return $startedProcess
 }
@@ -343,8 +346,9 @@ if (-not $SkipLaunch) {
         }
     }
     $healthUrl = "http://127.0.0.1:$ServerPort/health"
+    $serverToken = ''
     try {
-        $serverProcess = Start-JarvisInstalledApp -AppPath $installedExe -InstallRoot $InstallRoot
+        $serverProcess = Start-JarvisInstalledApp -AppPath $installedExe -InstallRoot $InstallRoot -Token ([ref]$serverToken)
     } catch {
         Add-Result 'launch' $false $_.Exception.Message
         Die "the installed app could not be launched: $($_.Exception.Message)"
@@ -352,7 +356,7 @@ if (-not $SkipLaunch) {
     $healthSource = "installed_app:$([IO.Path]::GetFileName($installedExe)):pid_$($serverProcess.Id)"
     Add-Result 'launch' $true "installed app $([IO.Path]::GetFileName($installedExe)) started (pid $($serverProcess.Id)); it owns the server on port $ServerPort"
     try {
-        $health = Wait-JarvisHealth -Url $healthUrl -TimeoutSeconds $TimeoutSeconds -Process $serverProcess
+        $health = Wait-JarvisHealth -Url $healthUrl -TimeoutSeconds $TimeoutSeconds -Process $serverProcess -Token $serverToken
     } catch {
         Add-Result 'health' $false $_.Exception.Message
         Die "the installed app's server never became healthy: $($_.Exception.Message)"
@@ -373,7 +377,7 @@ if (-not $SkipLaunch) {
         $streamUrl = "http://127.0.0.1:$ServerPort/chat/stream"
         $sessionId = [guid]::NewGuid().ToString()
         try {
-            $events = Read-JarvisSseStream -Url $streamUrl -Timeout $TimeoutSeconds -Body @{
+            $events = Read-JarvisSseStream -Url $streamUrl -Timeout $TimeoutSeconds -Token $serverToken -Body @{
                 message    = 'Reply with exactly: smoke ok.'
                 session_id = $sessionId
             }
