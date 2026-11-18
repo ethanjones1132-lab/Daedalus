@@ -2725,10 +2725,22 @@ export function useSessionTurn({ activeSession, setActiveSession, config, backen
       // the retry ledger so the operator's retry re-uses it instead of
       // appending a duplicate user row. An operator Stop or a stale Session
       // abort is not a silent failure and keeps the existing behaviour.
-      if (turnError !== null && !assistantPersist.persisted) {
-        const aborted = controller.signal.aborted || stopRequestedRef.current;
+      //
+      // DD-113 — the 90 s inactivity watchdog ends the turn by aborting this
+      // turn's OWN controller, so `signal.aborted` alone would misread it as a
+      // deliberate Stop and leave the saved user row stranded: the operator's
+      // resend after "the stream went silent" would append a second user row.
+      // An inactivity timeout is a silent failure (nothing asked for it), so it
+      // arms the ledger like any other turn that died after saving only the
+      // user row — including the variant where the cancelled body ends cleanly
+      // and no error reaches the catch below. The watchdog's abort stays
+      // distinct from both an operator Stop and a stale Session abort, which
+      // keep the existing behaviour.
+      if ((turnError !== null || inactivityTimedOut) && !assistantPersist.persisted) {
+        const deliberate = stopRequestedRef.current
+          || (controller.signal.aborted && !inactivityTimedOut);
         const abortedError = turnError instanceof DOMException && turnError.name === 'AbortError';
-        if (!aborted && !abortedError) {
+        if (!deliberate && !abortedError) {
           armThisTurnsSavedRow(userMessageId);
         }
       }
