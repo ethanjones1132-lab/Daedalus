@@ -320,6 +320,10 @@ $artifacts = @(
     @{ role = 'claude_proxy';  path = (Join-Path $versionDir 'resources\claude_cli_proxy.py') }
     @{ role = 'go_models';     path = (Join-Path $versionDir 'resources\opencode_go_openai_models.json') }
     @{ role = 'bundled_bun';   path = (Join-Path $versionDir 'bun.exe') }
+    # One file inside the staged prompts tree, beside the tree id above: the
+    # record proves the installed tree arrived, not merely that the directory
+    # was created. The server loads prompts from disk at runtime.
+    @{ role = 'prompts';       path = (Join-Path $versionDir 'prompts\coordinator.md') }
 )
 foreach ($artifact in $artifacts) {
     if (-not (Test-Path -LiteralPath $artifact.path -PathType Leaf)) {

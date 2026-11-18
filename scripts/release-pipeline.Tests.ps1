@@ -863,6 +863,86 @@ Describe 'the release pipeline is wired' {
     }
 }
 
+Describe 'the installed prompts tree is required' {
+    # The server reads prompts/*.md from disk at runtime (they are NOT compiled
+    # into index.js), so an install without its prompts cannot answer a
+    # request. The record names coordinator.md, one file inside the tree, so a
+    # tree that is missing or empty fails here instead of at the first chat.
+    BeforeEach {
+        $script:promptsInstallRoot = Join-Path $TestDrive 'installed-prompts'
+        foreach ($dir in @('resources', 'prompts')) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $script:promptsInstallRoot $dir) | Out-Null
+        }
+        $script:promptsResourceNames = [ordered]@{
+            server_bundle = 'index.js'
+            mcp_stdio     = 'mcp-stdio-server.js'
+            claude_proxy  = 'resources\claude_cli_proxy.py'
+            go_models     = 'resources\opencode_go_openai_models.json'
+            bundled_bun   = 'bun.exe'
+            prompts       = 'prompts\coordinator.md'
+        }
+        $files = foreach ($role in $script:promptsResourceNames.Keys) {
+            $path = Join-Path $script:promptsInstallRoot $script:promptsResourceNames[$role]
+            "$role expected bytes" | Set-Content -LiteralPath $path
+            [pscustomobject]@{ role = $role; sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash }
+        }
+        $script:promptsManifest = [pscustomobject]@{
+            files               = @($files)
+            prompts_tree_sha256 = ('a' * 40)
+        }
+        $script:promptsDir = Join-Path $script:promptsInstallRoot 'prompts'
+        $script:promptsCoordinator = Join-Path $script:promptsDir 'coordinator.md'
+    }
+
+    It 'accepts a complete staged install that carries the recorded prompts' {
+        (Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest).ok |
+            Should Be $true
+    }
+
+    It 'rejects a staged install with no prompts tree' {
+        Remove-Item -LiteralPath $script:promptsDir -Recurse -Force
+        $result = Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'installed_resource_mismatch:prompts'
+        $result.reason | Should Match 'artifact_missing'
+    }
+
+    It 'rejects a staged install whose prompts tree is empty' {
+        # The directory is there but holds no coordinator.md: the shape an
+        # installer with a broken prompts copy would leave behind.
+        Remove-Item -LiteralPath $script:promptsCoordinator -Force
+        $result = Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'installed_resource_mismatch:prompts'
+    }
+
+    It 'rejects the wrong coordinator.md' {
+        'a different coordinator prompt' | Set-Content -LiteralPath $script:promptsCoordinator
+        $result = Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'installed_resource_mismatch:prompts:hash_mismatch'
+    }
+
+    It 'rejects a current record that names the prompts tree but not the file it verifies' {
+        # prompts_tree_sha256 says this record describes prompts, so a missing
+        # coordinator.md entry is an incomplete record, not a legacy one.
+        $script:promptsManifest.files = @($script:promptsManifest.files | Where-Object { $_.role -ne 'prompts' })
+        $result = Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'installed_resource_record_missing:prompts'
+    }
+
+    It 'still accepts a record written before the prompts role existed' {
+        # The documented suite stages installs from records that predate the
+        # role; they name no prompts tree, so there is nothing to verify.
+        $script:promptsManifest.files = @($script:promptsManifest.files | Where-Object { $_.role -ne 'prompts' })
+        $script:promptsManifest.prompts_tree_sha256 = $null
+        Remove-Item -LiteralPath $script:promptsDir -Recurse -Force
+        (Test-JarvisInstalledResources -InstallRoot $script:promptsInstallRoot -Manifest $script:promptsManifest).ok |
+            Should Be $true
+    }
+}
+
 Describe 'the smoke launches the installed app' {
     BeforeEach {
         $script:launchRoot = Join-Path $TestDrive 'launch-install'

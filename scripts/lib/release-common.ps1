@@ -1196,10 +1196,25 @@ function Test-JarvisInstalledResources {
         # (find_bun_executable checks that directory first). An install
         # without it is an install that cannot start its server.
         bundled_bun = 'bun.exe'
+        # The server reads prompts/*.md from disk at runtime (loadPrompt looks
+        # for prompts/ beside the bundled entry; they are NOT compiled into
+        # index.js), so an install without them is an install that cannot
+        # answer a request. The role names coordinator.md, one file inside the
+        # tree: a role that verified only the directory would accept an empty
+        # prompts tree.
+        prompts = 'prompts\coordinator.md'
     }
     foreach ($role in $resources.Keys) {
         $entry = @($Manifest.files | Where-Object { $_.role -eq $role })
         if ($entry.Count -ne 1) {
+            # A record written before the prompts role existed describes no
+            # prompts tree at all: it carries neither the role nor the tree id
+            # the build records beside it. Like a record with no optional
+            # tokenizer entry, it is not failed retroactively. Every record
+            # the build writes now carries both, so a current record that
+            # names the tree but omits the file it verifies is still an error.
+            if ($role -eq 'prompts' -and $entry.Count -eq 0 -and
+                -not $Manifest.prompts_tree_sha256) { continue }
             return [pscustomobject]@{ ok = $false; reason = "installed_resource_record_missing:$role" }
         }
         $result = Test-JarvisArtifactHash -Path (Join-Path $InstallRoot $resources[$role]) -ExpectedSha256 $entry[0].sha256
