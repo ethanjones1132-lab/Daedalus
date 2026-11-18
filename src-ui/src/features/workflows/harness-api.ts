@@ -84,6 +84,16 @@ export class HarnessApiError extends Error {
     super(message);
     this.name = 'HarnessApiError';
   }
+
+  /**
+   * Whether the server classified this failure as "no such run for this project".
+   * That reason arrives only as the rejection text, so it is decided here, next to
+   * the field that holds it, rather than at a render site: a surface branches on
+   * the classified reason and never reads the raw text itself.
+   */
+  isRunNotFound(): boolean {
+    return this.message === 'run_not_found';
+  }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

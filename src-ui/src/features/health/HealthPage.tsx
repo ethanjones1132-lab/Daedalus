@@ -116,10 +116,10 @@ function Verdict({
  * The PID and reason for each failure are in the app log, written by
  * `process_lifecycle::reap_failure_message`.
  */
-function ReapFailures({ count }: { count: number }) {
+function ReapFailures({ failures }: { failures: number }) {
   return (
     <AlertLine label="Stopped child processes" tone="warn" className="mb-5">
-      <span className="font-semibold">{count === 1 ? '1 child process' : `${count} child processes`}</span>{' '}
+      <span className="font-semibold">{failures === 1 ? '1 child process' : `${failures} child processes`}</span>{' '}
       of this app could not be confirmed stopped at the last stop or quit. Quit again to retry the stop, or read the
       app log where <code className="font-mono text-[11.5px]">process_lifecycle::reap_failure_message</code> records
       the PID and reason.
@@ -279,7 +279,7 @@ export default function HealthPage() {
         </div>
       )}
 
-      {reapFailures > 0 && <ReapFailures count={reapFailures} />}
+      {reapFailures > 0 && <ReapFailures failures={reapFailures} />}
 
       <section aria-labelledby="health-subsystems" className="mb-6">
         <h2 id="health-subsystems" className="d-label mb-3">Subsystems</h2>

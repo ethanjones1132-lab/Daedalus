@@ -114,7 +114,7 @@ export default function HarnessPage() {
       }
       dispatch({ type: 'history-run-loaded', run });
     } catch (error) {
-      const message = error instanceof HarnessApiError && error.message === 'run_not_found'
+      const message = error instanceof HarnessApiError && error.isRunNotFound()
         ? 'That harness run was not found for this project. No run details are available.'
         : 'Could not read this harness run. No run details are available; retry the lookup.';
       dispatch({ type: 'history-run-error', id, message });
