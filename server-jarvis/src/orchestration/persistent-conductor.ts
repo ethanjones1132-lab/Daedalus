@@ -350,6 +350,14 @@ const runtimeFailedTargets = new Map<string, number>();
 /** F7: warm routing must fail fast before API fallback takes over. */
 export const ROUTING_TIMEOUT_MS = 20_000;
 
+/**
+ * DD-118: keep-warm is a load/retain ping, not a generation task. Both
+ * backends ask for exactly one token so a warm-up never pays for a long
+ * completion. llama.cpp previously used `max(4096, conductor.max_tokens)`,
+ * which could generate thousands of tokens on every keep-warm tick.
+ */
+const WARMUP_MAX_TOKENS = 1;
+
 export function __resetPersistentConductorCachesForTests(): void {
   cachedTarget = null;
   cachedTargetKey = "";
@@ -909,7 +917,7 @@ export class PersistentConductor {
             { role: "user", content: "Return a single short readiness response." },
           ],
           stream: false,
-          max_tokens: Math.max(4_096, this.config().max_tokens),
+          max_tokens: WARMUP_MAX_TOKENS,
           temperature: 0,
           cache_prompt: true,
         };
@@ -930,7 +938,7 @@ export class PersistentConductor {
             stream: false,
             keep_alive: "30m",
             options: {
-              num_predict: 1,
+              num_predict: WARMUP_MAX_TOKENS,
               num_ctx: this.config().num_ctx,
             },
           }),

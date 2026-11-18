@@ -449,6 +449,34 @@ describe("PersistentConductor", () => {
     expect(body?.top_p).toBe(1);
   });
 
+  test("llama.cpp warm-up is a one-token ping, matching the Ollama budget", async () => {
+    // DD-118: the llama.cpp warm-up used to request max(4096, conductor.max_tokens),
+    // so every keep-warm tick could generate thousands of tokens. Warm-up only
+    // needs the model loaded and one token generated, so it must match the
+    // Ollama path's options.num_predict: 1.
+    let body: Record<string, any> | undefined;
+    (globalThis as any).fetch = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "http://127.0.0.1:8080/v1/models") return Response.json({ data: [{ id: "gemma-test.gguf" }] });
+      if (url === "http://127.0.0.1:8080/v1/chat/completions") {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ choices: [{ message: { role: "assistant", content: "r" } }] });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    const cfg = llamaCppConfig();
+    const conductor = new PersistentConductor(() => cfg);
+    await conductor.warmUp();
+
+    expect(body?.max_tokens).toBe(1);
+    // Warm-up must stay a real chat request: same model, no stream, and the
+    // system+user readiness messages the backend needs to accept the call.
+    expect(body?.model).toBe("gemma-test.gguf");
+    expect(body?.stream).toBe(false);
+    expect(body?.messages).toHaveLength(2);
+  });
+
   test("isWarm reads llama.cpp model ids and fails open on a non-llama.cpp listing", async () => {
     const bodies: unknown[] = [
       { data: [{ id: "gemma-test.gguf" }] }, // target resolution
