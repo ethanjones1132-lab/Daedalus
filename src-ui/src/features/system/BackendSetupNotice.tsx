@@ -17,6 +17,7 @@ import { Settings2 } from 'lucide-react';
 import { AlertLine, Button } from '../../design';
 import { backendDisplayName } from '../../lib/backend-identity';
 import {
+  hasOwnSentence,
   joinMissingSettings,
   needsBackendSetup,
   parseBackendReadiness,
@@ -81,8 +82,11 @@ export default function BackendSetupNotice({ refreshKey }: BackendSetupNoticePro
       >
         <span className="font-medium text-ink">Set up the inference backend to start chatting.</span>{' '}
         <span className="text-ink-2">
-          {backend} is not configured — missing {joinMissingSettings(readiness.missing)}. Set it in
-          Settings; chat stays blocked until then.
+          {hasOwnSentence(readiness.missing) ? (
+            <>{joinMissingSettings(readiness.missing)}. Set it in Settings; chat stays blocked until then.</>
+          ) : (
+            <>{backend} is not configured — missing {joinMissingSettings(readiness.missing)}. Set it in Settings; chat stays blocked until then.</>
+          )}
         </span>
       </AlertLine>
     </div>

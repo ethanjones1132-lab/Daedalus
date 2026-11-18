@@ -15,8 +15,8 @@ import { useNavigation } from '../../shell/navigation';
 import { ChatPanel } from './ChatPanel';
 import { SessionIndex, type IndexTab } from './SessionIndex';
 import { FeedTranscript, useFeedReader } from './SessionFeeds';
-import { backendLabels, backendDisplayName } from '../../lib/backend-identity';
-import { joinMissingSettings, backendNotListening, needsBackendSetup } from '../../lib/backend-readiness';
+import { backendLabels } from '../../lib/backend-identity';
+import { backendBlockedReason } from '../../lib/backend-readiness';
 import { useBackendReadiness } from '../system/BackendSetupNotice';
 
 const INDEX_COLLAPSED_KEY = 'jarvis-session-index-collapsed';
@@ -360,15 +360,10 @@ export default function SessionsPage() {
   const { backendLabel, modelLabel } = backendLabels(config);
   const active = sessions.find((s) => s.id === activeSession);
   const feedOpen = indexTab === 'feeds';
-  // Read the silent-port fact before `needsBackendSetup` narrows `readiness` to
-  // null in its else branch.
-  const backendSilent = backendNotListening(readiness);
-  const readinessBackendLabel = readiness ? backendDisplayName(readiness.backend) : '';
-  const chatBlockedReason = needsBackendSetup(readiness)
-    ? `${backendDisplayName(readiness.backend)} is missing ${joinMissingSettings(readiness.missing)}. Set it in Settings to chat.`
-    : backendSilent
-      ? `${readinessBackendLabel} is configured, but nothing is answering its port yet — it may still be starting.`
-      : null;
+  // DD-060/DD-067/DD-115: Native readiness is the one source of the composer's
+  // blocked reason — a blank setting, a silent port, or a program that is not
+  // installed. Composer disables Send and suppresses Enter for any reason.
+  const chatBlockedReason = backendBlockedReason(readiness);
 
   return (
     <div className="flex h-full min-h-0 bg-canvas">

@@ -89,6 +89,26 @@ describe('chat while no inference backend is configured', () => {
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
   });
 
+  it('blocks Send when the selected backend\'s program is not installed', async () => {
+    // DD-115: the readiness item is the disabled reason, so a missing Ollama or
+    // Claude CLI disables Send exactly like a blank setting does.
+    const PROGRAM_MISSING =
+      'ollama was not found — install Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN. Set it in Settings to chat.';
+    render(<ChatPanel {...props} backendLabel="Ollama" chatBlockedReason={PROGRAM_MISSING} />);
+
+    const note = await screen.findByRole('note', { name: 'Chat setup required' });
+    expect(note).toHaveTextContent('ollama was not found');
+    expect(note).toHaveTextContent('install Ollama');
+
+    const composer = screen.getByLabelText('Chat input');
+    fireEvent.change(composer, { target: { value: 'are you there?' } });
+
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    fireEvent.keyDown(composer, { key: 'Enter' });
+    expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Stop streaming' })).not.toBeInTheDocument();
+  });
+
   it('leaves the composer usable when a backend is configured', async () => {
     render(<ChatPanel {...props} />);
 

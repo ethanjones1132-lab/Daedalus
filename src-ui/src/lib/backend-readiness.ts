@@ -15,9 +15,11 @@
 // complete settings are not proof that the backend answers, so `not_listening`
 // is a state the composer must respect rather than paper over.
 
+import { backendDisplayName } from './backend-identity';
+
 export type BackendReadinessState = 'ready' | 'missing_config' | 'not_listening';
 
-/** One blank setting that stops the active Inference backend from answering. */
+/** One setting (or program) that stops the active Inference backend from answering. */
 export interface MissingSetting {
   /** Canonical settings key, e.g. `llama_cpp.server_path`. */
   key: string;
@@ -25,13 +27,19 @@ export interface MissingSetting {
   label: string;
   /** Environment variable that also satisfies the field, when one exists. */
   envVar: string | null;
+  /**
+   * DD-115: the item's own sentence when the field is not merely blank — the
+   * program the backend resolves itself is absent or cannot run. It names the
+   * program, so surfaces print it verbatim instead of "missing ollama".
+   */
+  reason: string | null;
 }
 
 export interface BackendReadiness {
   state: BackendReadinessState;
   /** The backend the derivation ran for (`llama_cpp`, `openrouter`, …). */
   backend: string;
-  /** The blank settings — empty for every state except `missing_config`. */
+  /** The missing settings or programs — empty for every state except `missing_config`. */
   missing: MissingSetting[];
 }
 
@@ -51,6 +59,7 @@ function parseMissingSetting(raw: unknown): MissingSetting | null {
     key,
     label: nonBlankString(raw.label) ?? key,
     envVar: nonBlankString(raw.env_var),
+    reason: nonBlankString(raw.reason),
   };
 }
 
@@ -78,7 +87,7 @@ export function parseBackendReadiness(value: unknown): BackendReadiness | null {
   };
 }
 
-/** True when the derivation is usable and names at least one blank setting. */
+/** True when the derivation is usable and names at least one missing item. */
 export function needsBackendSetup(
   readiness: BackendReadiness | null,
 ): readiness is BackendReadiness {
@@ -96,16 +105,54 @@ export function backendNotListening(readiness: BackendReadiness | null): boolean
 }
 
 /**
- * How a missing setting is named in prose: the Settings label, plus the
- * environment variable that also satisfies it when one exists.
+ * How a missing item is named in prose: the item's own sentence when Native
+ * supplied one (DD-115, a program that was not found or cannot run), otherwise
+ * the Settings label plus the environment variable that also satisfies it.
  */
 export function missingSettingText(setting: MissingSetting): string {
+  if (setting.reason) return setting.reason;
   return setting.envVar ? `${setting.label} (or ${setting.envVar})` : setting.label;
 }
 
-/** "a", "a and b", "a, b and c" — the setup state's list of missing fields. */
+/** True when an item speaks in its own sentence rather than a field name. */
+export function hasOwnSentence(missing: MissingSetting[]): boolean {
+  return missing.some((setting) => Boolean(setting.reason));
+}
+
+/** "a", "a and b", "a, b and c" — the setup state's list of missing items. */
 export function joinMissingSettings(missing: MissingSetting[]): string {
   const names = missing.map(missingSettingText);
   if (names.length <= 1) return names[0] ?? '';
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
+/**
+ * The composer's disabled reason, derived from Native readiness so one place
+ * decides it for every session surface.
+ *
+ * A program item already reads as a sentence ("ollama was not found — install
+ * Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN"), so it is printed as-is;
+ * folding it into "X is missing …" would produce "Ollama is missing ollama was
+ * not found".
+ */
+export function backendBlockedReason(readiness: BackendReadiness | null): string | null {
+  // Returned before the predicate below: its false branch removes
+  // BackendReadiness from the union, so a later `readiness.state` read would be
+  // typed `never` (the reviewer's compile fix; tsc -b is the check that fails
+  // if this guard is removed).
+  if (readiness === null) return null;
+  // The state is read directly here: `needsBackendSetup` is a predicate whose
+  // false branch would narrow `readiness` to `never`, making the port branch
+  // below uncompilable (reviewer's compile fix; `tsc -b` is what catches a
+  // regression).
+  if (readiness.state === 'missing_config' && readiness.missing.length > 0) {
+    const missing = joinMissingSettings(readiness.missing);
+    return hasOwnSentence(readiness.missing)
+      ? `${missing}. Set it in Settings to chat.`
+      : `${backendDisplayName(readiness.backend)} is missing ${missing}. Set it in Settings to chat.`;
+  }
+  if (readiness.state === 'not_listening') {
+    return `${backendDisplayName(readiness.backend)} is configured, but nothing is answering its port yet — it may still be starting.`;
+  }
+  return null;
 }

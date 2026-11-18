@@ -87,6 +87,25 @@ fn ollama_path_separator() -> char {
     }
 }
 
+/// Every directory `PATH` names, in order, with the quotes Windows sometimes
+/// leaves around an entry removed. Shared by the Ollama and Claude lookups so
+/// there is exactly one `PATH` walk in this crate.
+fn path_directories(
+    env: &impl Fn(&str) -> Option<String>,
+    path_separator: char,
+) -> Vec<std::path::PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(path) = env("PATH") {
+        for directory in path.split(path_separator) {
+            let directory = directory.trim().trim_matches('"');
+            if !directory.is_empty() {
+                directories.push(std::path::PathBuf::from(directory));
+            }
+        }
+    }
+    directories
+}
+
 /// Every location `find_ollama_binary` searches, in priority order.
 ///
 /// Pure — it only reads injected environment values — so the Windows install
@@ -128,14 +147,11 @@ fn ollama_candidate_paths(
                 .join(executable),
         );
     }
-    if let Some(path) = env("PATH") {
-        for directory in path.split(path_separator) {
-            let directory = directory.trim().trim_matches('"');
-            if !directory.is_empty() {
-                candidates.push(std::path::PathBuf::from(directory).join(executable));
-            }
-        }
-    }
+    candidates.extend(
+        path_directories(&env, path_separator)
+            .into_iter()
+            .map(|directory| directory.join(executable)),
+    );
 
     candidates
 }
@@ -184,6 +200,124 @@ fn ollama_missing_binary_diagnostic(candidates: &[std::path::PathBuf]) -> String
         "Ollama binary not found; install Ollama, add it to PATH, or set \
          JARVIS_OLLAMA_BIN. Searched: {searched}"
     )
+}
+
+/// The executable names the Claude CLI can have on this host.
+///
+/// `resolveClaudePath` in `server-jarvis/src/claude-cli.ts` asks the OS
+/// (`where claude` / `which claude`), which honours PATHEXT: an npm install is
+/// `claude.cmd`, a native one `claude.exe`. The Rust lookup must enumerate the
+/// same names or readiness would report a working install as missing; the
+/// extensionless name covers Unix and a hand-placed shim.
+fn claude_executable_names() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["claude.exe", "claude.cmd", "claude.bat", "claude"]
+    } else {
+        &["claude"]
+    }
+}
+
+/// Pure Claude lookup seam, mirroring `resolveClaudePath`: an explicit
+/// `claude_cli.path` that exists, then `PATH` in directory order, then the Unix
+/// install dirs. The configured value that does not exist is deliberately not
+/// returned — readiness reports the miss instead of a path that cannot start.
+fn find_claude_cli_binary_with(
+    configured: &str,
+    env: &impl Fn(&str) -> Option<String>,
+    path_separator: char,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    let configured = configured.trim();
+    if !configured.is_empty()
+        && configured != "claude"
+        && exists(std::path::Path::new(configured))
+    {
+        return Some(configured.to_string());
+    }
+
+    for directory in path_directories(env, path_separator) {
+        for executable in claude_executable_names() {
+            let candidate = directory.join(executable);
+            if exists(&candidate) {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    // `resolveClaudePath`'s last resort, after PATH. Absent on Windows, where
+    // this resolves to a relative path that does not exist.
+    for fallback in ["/usr/local/bin/claude", "/usr/bin/claude"] {
+        let candidate = std::path::Path::new(fallback);
+        if exists(candidate) {
+            return Some(fallback.to_string());
+        }
+    }
+    None
+}
+
+fn find_claude_cli_binary(configured: &str) -> Option<String> {
+    find_claude_cli_binary_with(
+        configured,
+        &|key: &str| std::env::var(key).ok(),
+        ollama_path_separator(),
+        |candidate| candidate.exists(),
+    )
+}
+
+/// Would the OS start this file? `Path::exists` is not enough: a directory or a
+/// file without execute permission is present but cannot be spawned, and
+/// readiness must report that as its own setup problem (DD-115).
+///
+/// Unix has an exact cheap answer (the executable bit). On Windows
+/// `CreateProcess` only starts a PATHEXT program, so a file with any other
+/// extension is present-but-unrunnable.
+fn program_is_runnable(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(extension.as_str(), "exe" | "com" | "bat" | "cmd")
+    }
+}
+
+/// What the spawn path would find for the active backend's own executable.
+///
+/// Readiness never re-derives `PATH`: Ollama reuses `find_ollama_binary`
+/// (`spawn_ollama`'s lookup) and the Claude CLI mirrors `resolveClaudePath`,
+/// which is what the Bun server starts. Backends that spawn no looked-up
+/// program — llama.cpp starts the configured artifact path, OpenRouter is
+/// remote — are always `Present`, keeping their readiness exactly as it was.
+pub(crate) fn backend_executable_state(
+    config: &crate::jarvis::types::JarvisConfig,
+) -> crate::jarvis::readiness::BackendExecutable {
+    use crate::jarvis::readiness::BackendExecutable;
+    use crate::jarvis::types::JarvisBackend;
+
+    let found = match &config.active_backend {
+        JarvisBackend::Ollama => find_ollama_binary(),
+        JarvisBackend::ClaudeCli => find_claude_cli_binary(&config.claude_cli.path),
+        _ => return BackendExecutable::Present,
+    };
+
+    match found {
+        None => BackendExecutable::Absent,
+        Some(path) if program_is_runnable(std::path::Path::new(&path)) => BackendExecutable::Present,
+        Some(path) => BackendExecutable::NotRunnable(path),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5765,6 +5899,98 @@ mod ollama_binary_lookup_tests {
             !body.contains(r#"eprintln!("[Jarvis] Ollama startup failed"#),
             "the health surface must replace the eprintln-only failure:\n{body}"
         );
+    }
+
+    // ── DD-115: the Claude CLI lookup readiness reuses ──
+
+    fn empty_env() -> impl Fn(&str) -> Option<String> {
+        |_| None
+    }
+
+    fn on_claude_path(directory: &str, executable: &str) -> PathBuf {
+        PathBuf::from(directory).join(executable)
+    }
+
+    #[test]
+    fn an_empty_path_has_no_claude_to_find() {
+        // An install with nothing on PATH must resolve to a miss, which is what
+        // readiness turns into "claude was not found".
+        assert_eq!(
+            find_claude_cli_binary_with("", &empty_env(), ';', |_| false),
+            None
+        );
+        assert_eq!(
+            find_claude_cli_binary_with("claude", &empty_env(), ';', |_| false),
+            None
+        );
+        assert_eq!(
+            find_claude_cli_binary_with(
+                r"D:\missing\claude.exe",
+                &empty_env(),
+                ';',
+                |_| false
+            ),
+            None,
+            "a configured path that does not exist is not returned as if it could run"
+        );
+    }
+
+    #[test]
+    fn a_claude_only_on_path_is_resolved_from_a_path_entry() {
+        let claude = on_claude_path(r"C:\Tools", "claude.cmd");
+        let env = |key: &str| match key {
+            "PATH" => Some(r"C:\Empty;C:\Tools".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            find_claude_cli_binary_with("claude", &env, ';', only_files(&[claude.clone()])),
+            Some(claude.to_string_lossy().into_owned()),
+            "the npm `claude.cmd` shim must resolve, not only `claude.exe`"
+        );
+    }
+
+    #[test]
+    fn an_existing_configured_claude_path_wins_over_path() {
+        let configured = r"D:\custom\claude.exe";
+        let on_path = on_claude_path(r"C:\Tools", "claude.exe");
+        let env = |key: &str| match key {
+            "PATH" => Some(r"C:\Tools".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            find_claude_cli_binary_with(
+                configured,
+                &env,
+                ';',
+                only_files(&[PathBuf::from(configured), on_path])
+            ),
+            Some(configured.to_string()),
+            "resolveClaudePath prefers the configured path, so readiness must too"
+        );
+    }
+
+    #[test]
+    fn a_present_file_that_is_not_a_program_is_not_runnable() {
+        let dir = std::env::temp_dir().join("dd115-runnable-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let text = dir.join("ollama.txt");
+        std::fs::write(&text, b"").unwrap();
+        assert!(
+            !program_is_runnable(&text),
+            "a non-program file must not report a backend as ready"
+        );
+
+        let directory_named_like_the_program = dir.join("claude.exe");
+        std::fs::create_dir_all(&directory_named_like_the_program).unwrap();
+        assert!(
+            !program_is_runnable(&directory_named_like_the_program),
+            "a directory named like the executable cannot be spawned"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
