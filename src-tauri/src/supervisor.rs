@@ -28,6 +28,16 @@
 // child that spawns fine and dies — or never binds — therefore reaches the
 // existing cap and stops being restarted.
 //
+// DD-125 carves out a warm-up window for llama.cpp specifically: loading a
+// multi-GB GGUF legitimately outlasts several ticks, so a child this process
+// owns that is still alive but not bound yet is left alone for a bounded grace
+// (`LLAMA_CPP_WARMING_GRACE_TICKS`) instead of being charged on every tick. A
+// dead child never warms, and the grace is finite, so once it is spent a closed
+// port is counted again and the existing five-attempt cap still bounds a start
+// that never works. The grace is an allowance, not a reset: only a serving port
+// (or an explicit restart) clears it, so a child that exists forever cannot keep
+// the budget open forever.
+//
 // Boot-stage failures that never became a relaunch attempt are recorded here as
 // reasons (DD-080) so `give_up_status` — the status surface `get_system_health`
 // already exposes — can say why a packaged startup failed instead of leaving
@@ -44,6 +54,16 @@ const TICK: Duration = Duration::from_secs(20);
 const OLLAMA_PORT: u16 = 11434;
 const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 
+/// DD-125: how many ticks a live llama.cpp child may spend loading its model
+/// before a still-closed port is charged to the restart budget again.
+///
+/// Grounded in [`TICK`]: 30 ticks is ten minutes, long enough for the default
+/// multi-GB GGUF to warm from a slow disk, while the existing five-attempt cap
+/// still bounds an attempt that never works. The window is an allowance, not a
+/// reset: only a serving port clears it, so a child that stays alive forever is
+/// still counted once the grace is spent.
+const LLAMA_CPP_WARMING_GRACE_TICKS: u32 = 30;
+
 /// Consecutive-failure counters live at module scope so manual restart
 /// commands (Bun / Ollama / proxy) can clear them. Per-instance fields would
 /// be unreachable from a Tauri command — the supervisor task is the only
@@ -53,6 +73,12 @@ pub(crate) static BUN_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static PROXY_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static OLLAMA_FAILS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static LLAMA_CPP_FAILS: AtomicU32 = AtomicU32::new(0);
+
+/// DD-125: consecutive ticks a live llama.cpp child has been observed warming
+/// with its port still closed. Module scope like the failure counters so an
+/// explicit restart can re-arm it together with the budget; otherwise only the
+/// grace bound stops it from advancing.
+static LLAMA_CPP_WARMING_TICKS: AtomicU32 = AtomicU32::new(0);
 static BUN_LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Boot-stage reasons that must outlive whatever service finally came up
@@ -338,6 +364,45 @@ fn record_llama_cpp_tick_outcome(serving: bool) -> (LlamaCppTickVerdict, u32) {
     )
 }
 
+/// What the llama.cpp block of one tick should do when its port is closed
+/// (DD-125).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LlamaCppStartDecision {
+    /// A child this process owns is still loading: leave it alone this tick and
+    /// remember the warm-up tick count that was just spent.
+    LeaveWarming(u32),
+    /// Nothing is loading (no live child) or the grace is spent: take the
+    /// existing start path, whose closed port is charged to the budget.
+    Start,
+}
+
+/// Decide whether a closed llama.cpp port belongs to a model load in progress
+/// (DD-125).
+///
+/// Pure so the bound is unit-testable without a live process. `warming_ticks`
+/// is how many ticks the current warm-up has already been observed for. Only an
+/// owned live child warms: a child that died mid-load reports no live handle,
+/// so its tick goes straight to the start path and the failure counter — that is
+/// what keeps recovery bounded when the child really is broken. The grace is
+/// finite, so a live child that never binds is counted again after
+/// [`LLAMA_CPP_WARMING_GRACE_TICKS`] and still reaches the existing cap.
+fn llama_cpp_start_decision(owned_live: bool, warming_ticks: u32) -> LlamaCppStartDecision {
+    if owned_live && warming_ticks < LLAMA_CPP_WARMING_GRACE_TICKS {
+        LlamaCppStartDecision::LeaveWarming(warming_ticks + 1)
+    } else {
+        LlamaCppStartDecision::Start
+    }
+}
+
+/// Clear the DD-125 warm-up observation.
+///
+/// Called when the port answers (the load clearly worked), when the backend is
+/// switched off, and by an explicit restart so the next attempt gets the full
+/// grace. Never called merely because a child process exists.
+fn reset_llama_cpp_warming() {
+    LLAMA_CPP_WARMING_TICKS.store(0, Ordering::Relaxed);
+}
+
 fn failure_counter(service: SupervisedService) -> &'static AtomicU32 {
     match service {
         SupervisedService::Bun => &BUN_FAILS,
@@ -426,6 +491,12 @@ fn bun_diagnostic(failures: u32, last_error: Option<&str>) -> Option<String> {
 /// auto-restarting it. Called when the user forces a manual restart.
 pub(crate) fn reset_failures(service: SupervisedService) {
     failure_counter(service).store(0, Ordering::Relaxed);
+    if matches!(service, SupervisedService::LlamaCpp) {
+        // DD-125: a serving port, or a restart the user asked for, re-arms the
+        // warm-up window together with the budget so the next load gets the
+        // full grace instead of inheriting a spent one.
+        reset_llama_cpp_warming();
+    }
     if matches!(service, SupervisedService::Bun) {
         *BUN_LAST_ERROR
             .get_or_init(|| Mutex::new(None))
@@ -760,60 +831,100 @@ async fn tick(handle: &AppHandle) {
         crate::backend_port_is_listening(llama_cpp_config.port, llama_cpp_uses_wsl);
     if !is_llama_cpp {
         LLAMA_CPP_FAILS.store(0, Ordering::Relaxed);
+        reset_llama_cpp_warming();
         crate::process_lifecycle::stop(crate::process_lifecycle::ManagedProcess::LlamaCpp);
     } else if llama_cpp_listening {
         // DD-114: the port answering is the only evidence the child serves, so
-        // it is the only observation that clears the budget.
+        // it is the only observation that clears the budget. Recording it also
+        // clears the DD-125 warm-up window.
         let _ = record_llama_cpp_tick_outcome(true);
     } else {
         let fails = LLAMA_CPP_FAILS.load(Ordering::Relaxed);
         if may_restart(fails) {
-            // DD-077: no start after the app started quitting.
-            if !may_start_child() {
-                return;
-            }
-            match crate::start_llama_cpp_server(llama_cpp_config.clone()).await {
-                Ok(_) => {
-                    // DD-114: `Ok` only means the child was spawned (or was
-                    // already running). Model loading outlasts a tick, so the
-                    // port — not the spawn — decides whether this attempt
-                    // worked. A tick with the port still closed is counted
-                    // exactly like an `Err` spawn, so a child that keeps dying
-                    // reaches the existing cap instead of being restarted every
-                    // tick.
-                    let serving = crate::backend_port_is_listening(
-                        llama_cpp_config.port,
-                        llama_cpp_uses_wsl,
-                    );
-                    match record_llama_cpp_tick_outcome(serving) {
-                        (LlamaCppTickVerdict::Serving, _) => {
-                            println!("[supervisor] llama.cpp is starting or was relaunched.");
-                        }
-                        (LlamaCppTickVerdict::NotServing, next) => {
-                            log::warn!(
-                                target: "jarvis::supervisor",
-                                "llama.cpp was spawned but port {} is still closed \
-                                 ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the \
-                                 restart budget, not reported as a relaunch: \
-                                 {LLAMA_CPP_STILL_STARTING_REASON}",
-                                llama_cpp_config.port
-                            );
-                            if next >= MAX_CONSECUTIVE_RESTARTS {
-                                log::error!(
-                                    target: "jarvis::supervisor",
-                                    "llama.cpp never opened port {} \
-                                     ({next}/{MAX_CONSECUTIVE_RESTARTS}); automatic restarts are \
-                                     paused. Last observation: {LLAMA_CPP_STILL_STARTING_REASON}. \
-                                     Use Restart to re-arm the budget.",
-                                    llama_cpp_config.port
-                                );
-                            }
-                        }
+            // DD-125: a closed port with a child this process still owns may be
+            // a model load in progress. Give that child a bounded warm-up window
+            // instead of charging the budget on every tick, so a slow but
+            // healthy load is not reported as given up before it can bind.
+            let warming_ticks = LLAMA_CPP_WARMING_TICKS.load(Ordering::Relaxed);
+            let owned_live = crate::process_lifecycle::is_live(
+                crate::process_lifecycle::ManagedProcess::LlamaCpp,
+            );
+            match llama_cpp_start_decision(owned_live, warming_ticks) {
+                LlamaCppStartDecision::LeaveWarming(next) => {
+                    LLAMA_CPP_WARMING_TICKS.store(next, Ordering::Relaxed);
+                    if next == 1 {
+                        log::info!(
+                            target: "jarvis::supervisor",
+                            "llama.cpp child is alive but port {} has not opened yet; leaving \
+                             it to load (warm-up {next}/{LLAMA_CPP_WARMING_GRACE_TICKS} ticks)",
+                            llama_cpp_config.port
+                        );
                     }
                 }
-                Err(error) => {
-                    let next = record_restart_failure(SupervisedService::LlamaCpp, &error);
-                    eprintln!("[supervisor] llama.cpp restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}");
+                LlamaCppStartDecision::Start => {
+                    // Only a child that outlived the grace is worth a durable
+                    // line here; a dead child is diagnosed by the counted arm.
+                    if owned_live && warming_ticks >= LLAMA_CPP_WARMING_GRACE_TICKS {
+                        log::warn!(
+                            target: "jarvis::supervisor",
+                            "llama.cpp warm-up grace spent \
+                             ({warming_ticks}/{LLAMA_CPP_WARMING_GRACE_TICKS} ticks); port {} is \
+                             still closed, so it is counted against the restart budget again",
+                            llama_cpp_config.port
+                        );
+                    }
+                    // DD-077: no start after the app started quitting.
+                    if !may_start_child() {
+                        return;
+                    }
+                    match crate::start_llama_cpp_server(llama_cpp_config.clone()).await {
+                        Ok(_) => {
+                            // DD-114: `Ok` only means the child was spawned (or was
+                            // already running). Model loading outlasts a tick, so the
+                            // port — not the spawn — decides whether this attempt
+                            // worked. A tick with the port still closed is counted
+                            // exactly like an `Err` spawn, so a child that keeps dying
+                            // reaches the existing cap instead of being restarted every
+                            // tick.
+                            let serving = crate::backend_port_is_listening(
+                                llama_cpp_config.port,
+                                llama_cpp_uses_wsl,
+                            );
+                            match record_llama_cpp_tick_outcome(serving) {
+                                (LlamaCppTickVerdict::Serving, _) => {
+                                    println!(
+                                        "[supervisor] llama.cpp is starting or was relaunched."
+                                    );
+                                }
+                                (LlamaCppTickVerdict::NotServing, next) => {
+                                    log::warn!(
+                                        target: "jarvis::supervisor",
+                                        "llama.cpp was spawned but port {} is still closed \
+                                         ({next}/{MAX_CONSECUTIVE_RESTARTS}); counted against the \
+                                         restart budget, not reported as a relaunch: \
+                                         {LLAMA_CPP_STILL_STARTING_REASON}",
+                                        llama_cpp_config.port
+                                    );
+                                    if next >= MAX_CONSECUTIVE_RESTARTS {
+                                        log::error!(
+                                            target: "jarvis::supervisor",
+                                            "llama.cpp never opened port {} \
+                                             ({next}/{MAX_CONSECUTIVE_RESTARTS}); automatic \
+                                             restarts are paused. Last observation: \
+                                             {LLAMA_CPP_STILL_STARTING_REASON}. Use Restart to \
+                                             re-arm the budget.",
+                                            llama_cpp_config.port
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let next =
+                                record_restart_failure(SupervisedService::LlamaCpp, &error);
+                            eprintln!("[supervisor] llama.cpp restart failed ({next}/{MAX_CONSECUTIVE_RESTARTS}): {error}");
+                        }
+                    }
                 }
             }
         }
@@ -1129,6 +1240,159 @@ mod tests {
         assert!(
             !healthy_arm.contains("LLAMA_CPP_FAILS.store(0"),
             "clearing the budget must stay on the serving path:\n{healthy_arm}"
+        );
+
+        reset_failures(SupervisedService::LlamaCpp);
+    }
+
+    /// DD-125: `start_llama_cpp_server` spawns and returns; loading a large GGUF
+    /// can outlast the old five-tick budget. A live child that has not bound yet
+    /// must be left warming instead of being charged every tick, or a healthy
+    /// install is reported as given up before the server ever had a chance to
+    /// bind.
+    #[test]
+    fn a_slow_live_llama_cpp_warm_up_outlives_the_old_five_attempt_budget() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::LlamaCpp);
+        assert_eq!(LLAMA_CPP_WARMING_TICKS.load(Ordering::Relaxed), 0);
+
+        // The tick that spawned the child re-probes the port once, and that
+        // observation is the existing attempt charge (DD-114).
+        let (verdict, first) = record_llama_cpp_tick_outcome(false);
+        assert_eq!(verdict, LlamaCppTickVerdict::NotServing);
+        assert_eq!(first, 1);
+
+        // Every following tick sees the same live, unbound child. The grace is
+        // longer than the old budget, so the counter must not move past that
+        // single charge while the load is still in progress.
+        assert!(
+            LLAMA_CPP_WARMING_GRACE_TICKS > MAX_CONSECUTIVE_RESTARTS,
+            "the warm-up window must outlast the old five-tick budget"
+        );
+        let mut warming = 0;
+        for tick in 1..=LLAMA_CPP_WARMING_GRACE_TICKS {
+            match llama_cpp_start_decision(true, warming) {
+                LlamaCppStartDecision::LeaveWarming(next) => {
+                    warming = next;
+                    LLAMA_CPP_WARMING_TICKS.store(next, Ordering::Relaxed);
+                }
+                LlamaCppStartDecision::Start => {
+                    panic!("tick {tick} of a live warm-up must not restart or count the child")
+                }
+            }
+            assert_eq!(
+                LLAMA_CPP_FAILS.load(Ordering::Relaxed),
+                1,
+                "a live warm-up must not advance the restart budget"
+            );
+            assert!(
+                !give_up_status().llama_cpp_give_up,
+                "a live warm-up must not reach llama_cpp_give_up"
+            );
+        }
+        assert_eq!(warming, LLAMA_CPP_WARMING_GRACE_TICKS);
+
+        // The port answering is the evidence the load worked: it clears both
+        // the budget and the warm-up observation, so a later restart gets the
+        // full grace again instead of inheriting a spent one.
+        let (verdict, next) = record_llama_cpp_tick_outcome(true);
+        assert_eq!(verdict, LlamaCppTickVerdict::Serving);
+        assert_eq!(next, 0);
+        assert_eq!(LLAMA_CPP_WARMING_TICKS.load(Ordering::Relaxed), 0);
+        assert!(!give_up_status().llama_cpp_give_up);
+        assert_eq!(
+            llama_cpp_start_decision(true, LLAMA_CPP_WARMING_TICKS.load(Ordering::Relaxed)),
+            LlamaCppStartDecision::LeaveWarming(1),
+            "a serving port must re-arm the warm-up window for the next load"
+        );
+
+        // Pin the wiring in the production half: the closed-port arm must read
+        // owned liveness and route through the tested decision, and the warm
+        // arm must neither clear the budget nor record a failure.
+        let production = supervisor_production_source();
+        let llama = production
+            .split_once("// ── llama.cpp")
+            .map(|(_, block)| block)
+            .expect("the llama.cpp supervisor block must keep its section marker");
+        let liveness = llama
+            .find("process_lifecycle::is_live")
+            .expect("the closed-port arm must read owned liveness before deciding");
+        let decision = llama
+            .find("llama_cpp_start_decision(")
+            .expect("the closed-port arm must route through the tested decision");
+        assert!(
+            liveness < decision,
+            "owned liveness must be read before the tick decides the child is down"
+        );
+        let warming_arm = llama
+            .split_once("LlamaCppStartDecision::LeaveWarming(next) => {")
+            .and_then(|(_, rest)| rest.split_once("LlamaCppStartDecision::Start =>"))
+            .map(|(arm, _)| arm)
+            .expect("the llama.cpp block must keep its LeaveWarming and Start arms");
+        assert!(
+            !warming_arm.contains("LLAMA_CPP_FAILS.store(0")
+                && !warming_arm.contains("record_llama_cpp_tick_outcome("),
+            "warming must not count or clear the budget:\n{warming_arm}"
+        );
+        assert!(
+            llama.contains("LLAMA_CPP_WARMING_GRACE_TICKS"),
+            "the warm-up bound must stay grounded in the named grace:\n{llama}"
+        );
+
+        reset_failures(SupervisedService::LlamaCpp);
+    }
+
+    /// DD-125: the warm-up window must not turn a broken child into an endless
+    /// restart. A child that dies (no live handle) never warms, and a live child
+    /// that outlives the grace is counted again — both still reach the bounded
+    /// give-up cap.
+    #[test]
+    fn a_llama_cpp_that_dies_or_outlives_the_grace_still_reaches_the_bounded_give_up() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_failures(SupervisedService::LlamaCpp);
+
+        // A dead child never warms: its tick goes straight to the start path,
+        // even when earlier ticks of the same load were spent warming.
+        assert_eq!(
+            llama_cpp_start_decision(false, 0),
+            LlamaCppStartDecision::Start,
+            "a child that is gone is down, not warming"
+        );
+        assert_eq!(
+            llama_cpp_start_decision(false, LLAMA_CPP_WARMING_GRACE_TICKS - 1),
+            LlamaCppStartDecision::Start,
+            "a child that dies mid-load loses the warm path immediately"
+        );
+
+        // Repeated spawn-then-die ticks are DD-114's counted path and still end
+        // at the existing cap.
+        for expected in 1..=MAX_CONSECUTIVE_RESTARTS {
+            let (verdict, next) = record_llama_cpp_tick_outcome(false);
+            assert_eq!(verdict, LlamaCppTickVerdict::NotServing);
+            assert_eq!(next, expected);
+            assert_eq!(
+                LLAMA_CPP_WARMING_TICKS.load(Ordering::Relaxed),
+                0,
+                "a dead child must not accrue warm-up ticks"
+            );
+        }
+        assert!(give_up_status().llama_cpp_give_up);
+        assert!(!may_restart(LLAMA_CPP_FAILS.load(Ordering::Relaxed)));
+
+        // A live child that never binds: once the grace is spent the next tick
+        // takes the start path, so the same cap still bounds it.
+        reset_failures(SupervisedService::LlamaCpp);
+        assert_eq!(
+            llama_cpp_start_decision(true, LLAMA_CPP_WARMING_GRACE_TICKS),
+            LlamaCppStartDecision::Start,
+            "the warm-up window must be bounded, not endless"
+        );
+        for _ in 0..MAX_CONSECUTIVE_RESTARTS {
+            record_llama_cpp_tick_outcome(false);
+        }
+        assert!(
+            give_up_status().llama_cpp_give_up,
+            "a live child whose grace is spent must still reach the bounded give-up path"
         );
 
         reset_failures(SupervisedService::LlamaCpp);
