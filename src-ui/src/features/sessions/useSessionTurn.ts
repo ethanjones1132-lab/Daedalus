@@ -311,13 +311,32 @@ async function readServerErrorMessage(response: Response): Promise<string | null
 // when it cannot create a Session. Anything else — a `TypeError`, a refused
 // connection, a watchdog — is a transport's own words and keeps the fixed
 // sentence. Whatever is shown is reduced to its first non-blank line, trimmed,
-// bounded, and withheld entirely when it looks like a credential or a stack
-// frame, so neither can reach the operator through a turn failure.
+// bounded, and withheld entirely when it carries token-shaped material or a
+// stack frame, so neither can reach the operator through a turn failure.
 const TURN_FAILURE_GENERIC = 'The turn failed. Your message is kept as a draft — send it again to retry.';
 const SESSION_CREATION_FAILED = 'Could not create a Session for this message.';
 const MAX_TURN_FAILURE_REASON_CHARS = 200;
-const CREDENTIAL_SHAPED_REASON =
-  /(?:api[\s_-]?key|access[\s_-]?key|secret|password|passwd|authorization|bearer\s+\S|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|xox[abprs]-)/i;
+// DD-110 — the *name* of a credential is not the credential. The server's own
+// sentence ("Authentication failed (401): the inference provider rejected the
+// API key. Check your OpenRouter API key in Settings.") says "API key" so the
+// operator knows which setting to open; withholding it on that word alone
+// replaced the one actionable line of a first-run rejection with "send it
+// again to retry". What is still withheld is material: a provider key prefix,
+// a bearer token, a value assigned to a credential name, or a long hex/base64
+// run of key length. A reason that only names a credential now survives.
+const CREDENTIAL_SHAPED_REASON = new RegExp(
+  [
+    String.raw`bearer\s+\S`,
+    String.raw`sk-[A-Za-z0-9_-]{8,}`,
+    String.raw`ghp_[A-Za-z0-9]{8,}`,
+    String.raw`xox[abprs]-`,
+    String.raw`(?:api|access)[\s_-]?key\s*[:=]\s*\S+`,
+    String.raw`\b(?:secret|password|passwd|authorization|token)\s*[:=]\s*\S+`,
+    String.raw`[A-Fa-f0-9]{32,}`,
+    String.raw`[A-Za-z0-9+/]{40,}={0,2}`,
+  ].join('|'),
+  'i',
+);
 const STACK_FRAME_REASON = /\bat\s+[^\s(]+\s*\([^()]*:\d+:\d+\)/;
 
 function normalizeTurnFailureReason(value: string): string | null {
