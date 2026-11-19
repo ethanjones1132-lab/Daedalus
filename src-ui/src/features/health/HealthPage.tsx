@@ -76,7 +76,7 @@ const LEVEL_TONE: Record<HealthLevel, Tone> = {
 };
 
 function isConfirmable(key: string): key is ConfirmableRestartKey {
-  return key === 'ollama' || key === 'bun' || key === 'proxy';
+  return key === 'ollama' || key === 'bun' || key === 'proxy' || key === 'llama_cpp';
 }
 
 /** The masthead sentence: the same derivation the global banner shows. */
@@ -208,9 +208,12 @@ export default function HealthPage() {
       invalidateHealth();
       setRestartState((current) => reduceServiceRestartState(current, { type: 'start', key: row.key }));
       try {
-        const result = await invoke<boolean>(row.command);
+        // The `jarvis_restart_*` handlers answer with the restart-required
+        // boolean. llama.cpp's backend reconcile answers with nothing, so a
+        // resolved call is already the success case there (DD-133).
+        const result = await invoke<boolean | undefined>(row.command, row.commandArgs);
         if (operationId !== restartOperation.current) return;
-        if (result !== true) {
+        if (row.commandAnswer !== 'void' && result !== true) {
           setRestartState((current) => reduceServiceRestartState(current, { type: 'command-false', key: row.key }));
           info(`${row.name} restart not required; no restart was performed.`, 'Restart');
           return;

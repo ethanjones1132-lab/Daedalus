@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import HealthPage from './HealthPage';
 import { resetSharedBuildProvenanceStores } from '../../domain/build-provenance';
@@ -84,8 +84,8 @@ describe('Health page verdict and gauges', () => {
     expect(within(llamaGauge).getByText('Running')).toBeInTheDocument();
     expect(within(llamaGauge).getByText('Required by the active Inference backend')).toBeInTheDocument();
     expect(within(llamaGauge).getByText('http://127.0.0.1:8080')).toBeInTheDocument();
-    // The Bun server owns the llama.cpp process lifecycle: no restart command to call.
-    expect(screen.queryByRole('button', { name: 'Restart llama.cpp' })).not.toBeInTheDocument();
+    // llama.cpp restarts through the existing backend reconcile command.
+    expect(within(llamaGauge).getByRole('button', { name: 'Restart llama.cpp' })).toBeInTheDocument();
 
     const ollama = gauge('Ollama');
     expect(within(ollama).getByText('Stopped')).toBeInTheDocument();
@@ -117,6 +117,57 @@ describe('Health page verdict and gauges', () => {
     expect(screen.getByText('Offline')).toBeInTheDocument();
     expect(within(gauge('llama.cpp')).getByText('Stopped')).toBeInTheDocument();
     clock.mockRestore();
+  });
+
+  it('offers a capped llama.cpp the Restart its copy names and clears the pause once health confirms', async () => {
+    const llama: JarvisStatus = {
+      ...status,
+      active_backend: 'llama_cpp',
+      ollama_running: false,
+      llama_cpp_running: false,
+      model_available: true,
+    };
+    const cappedHealth = {
+      ...healthFor('ollama', true),
+      ollama: { running: false, model: null, url: 'http://127.0.0.1:11434' },
+      llama_cpp: { running: false, model: 'gemma', url: 'http://127.0.0.1:8080' },
+      supervisor: { bun_give_up: false, proxy_give_up: false, ollama_give_up: false, llama_cpp_give_up: true, reap_failures: 0 },
+    };
+    const healthyHealth = {
+      ...cappedHealth,
+      llama_cpp: { ...cappedHealth.llama_cpp, running: true },
+      supervisor: { ...cappedHealth.supervisor, llama_cpp_give_up: false },
+    };
+    let reconcileAskedForLlama = false;
+    invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === 'jarvis_switch_backend') {
+        reconcileAskedForLlama = args?.backend === 'llama_cpp';
+        return Promise.resolve(undefined);
+      }
+      if (command === 'get_system_health') {
+        return Promise.resolve(reconcileAskedForLlama ? healthyHealth : cappedHealth);
+      }
+      const table: Record<string, unknown> = {
+        jarvis_check_status: llama,
+        get_doctor_report: doctor,
+        get_build_info: cleanBuild,
+      };
+      return Promise.resolve(table[command] ?? true);
+    });
+
+    render(<HealthPage />);
+    const cappedGauge = await screen.findByRole('article', { name: 'llama.cpp gauge' });
+    expect(within(cappedGauge).getByText('auto-restart paused')).toBeInTheDocument();
+
+    fireEvent.click(within(cappedGauge).getByRole('button', { name: 'Restart llama.cpp' }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('status', { name: 'Restart llama.cpp' })).toHaveTextContent('restart confirmed'),
+    );
+    expect(reconcileAskedForLlama).toBe(true);
+    const confirmedGauge = screen.getByRole('article', { name: 'llama.cpp gauge' });
+    expect(within(confirmedGauge).getByText('Running')).toBeInTheDocument();
+    expect(within(confirmedGauge).queryByText('auto-restart paused')).not.toBeInTheDocument();
   });
 
   it('prints the requirement for every gauge and flags a paused supervisor on a stopped service', async () => {

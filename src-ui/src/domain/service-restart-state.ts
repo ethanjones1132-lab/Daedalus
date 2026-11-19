@@ -23,12 +23,13 @@ export type ServiceRestartEvent =
   | { type: 'readback-mismatch'; key: string }
   | { type: 'dismiss' };
 
-export type ConfirmableRestartKey = 'ollama' | 'bun' | 'proxy';
+export type ConfirmableRestartKey = 'ollama' | 'bun' | 'proxy' | 'llama_cpp';
 
 export interface RestartHealthObservation {
   ollama?: { running?: boolean };
   bun_server?: { running?: boolean };
   claude_proxy?: { running?: boolean };
+  llama_cpp?: { running?: boolean };
 }
 
 export function initialServiceRestartState(): ServiceRestartState {
@@ -69,5 +70,6 @@ export function restartServiceRunning(
 ): boolean {
   if (key === 'ollama') return health.ollama?.running === true;
   if (key === 'bun') return health.bun_server?.running === true;
+  if (key === 'llama_cpp') return health.llama_cpp?.running === true;
   return health.claude_proxy?.running === true;
 }

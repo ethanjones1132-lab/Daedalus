@@ -36,6 +36,7 @@ describe('service restart state', () => {
     ['ollama', { ollama: { running: true } }],
     ['bun', { bun_server: { running: true } }],
     ['proxy', { claude_proxy: { running: true } }],
+    ['llama_cpp', { llama_cpp: { running: true } }],
   ] as const)('recognizes a confirmed %s observation', (key, health) => {
     expect(restartServiceRunning(key, health as never)).toBe(true);
   });

@@ -10,8 +10,10 @@ import type { ServiceRestartState } from '../../domain/service-restart-state';
 /*
  * Subsystem gauges. The restart commands are invoked verbatim, so each key maps
  * directly to a Tauri handler (src-tauri/src/lib.rs invoke_handler!,
- * recovery_stubs.rs). `llama_cpp` has no restart command: the Bun server owns
- * its process lifecycle, so its gauge reports state and requirement only.
+ * recovery_stubs.rs). `llama_cpp` has no one-off restart handler, so its row
+ * reuses the existing backend reconcile (`jarvis_switch_backend`) — the native
+ * path that (re)starts the configured llama-server (DD-133). That handler
+ * answers with no value, unlike the `jarvis_restart_*` ones.
  */
 export type SubsystemKey = 'bun' | 'bridge' | 'ollama' | 'llama_cpp' | 'proxy';
 
@@ -21,6 +23,14 @@ export interface SubsystemRow {
   up: boolean;
   detail: string;
   command: string | null;
+  /** Arguments for `command`; only llama.cpp's backend reconcile takes any. */
+  commandArgs?: Record<string, unknown>;
+  /**
+   * What a resolved `command` means. The `jarvis_restart_*` handlers answer
+   * with the restart-required boolean; `jarvis_switch_backend` answers with no
+   * value, so there a resolved promise is the success signal (DD-133).
+   */
+  commandAnswer?: 'required' | 'void';
   /**
    * The supervisor hit `MAX_CONSECUTIVE_RESTARTS` consecutive spawn failures
    * and stopped auto-restarting. While the service is also down, the gauge
@@ -60,7 +70,12 @@ export function buildSubsystemRows(health: HealthData, activeBackend: unknown, b
       name: 'llama.cpp',
       up: health.llama_cpp?.running === true,
       detail: health.llama_cpp?.url ?? ':8080',
-      command: null,
+      // The existing native path that relaunches the configured llama-server.
+      // It also switches the active backend, so it is offered only while
+      // llama.cpp is the backend being served (DD-133).
+      command: backend === 'llama_cpp' ? 'jarvis_switch_backend' : null,
+      commandArgs: { backend: 'llama_cpp' },
+      commandAnswer: 'void',
       giveUp: health.supervisor?.llama_cpp_give_up === true,
       requirement: backend === 'unknown' ? 'unknown' : backend === 'llama_cpp' ? 'required' : 'not_required',
     });
@@ -147,7 +162,9 @@ export function SubsystemGauges({
                   <Badge
                     tone="warn"
                     size="xs"
-                    title="Supervisor hit the consecutive-restart limit and stopped trying. Use Restart to clear the backoff and resume auto-restart."
+                    title={row.command
+                      ? 'Supervisor hit the consecutive-restart limit and stopped trying. Use Restart to clear the backoff and resume auto-restart.'
+                      : 'Supervisor hit the consecutive-restart limit and stopped trying.'}
                   >
                     auto-restart paused
                   </Badge>
