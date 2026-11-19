@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import { createTwoFilesPatch } from "diff";
 import { createToolRuntime, makeExecutionContext } from "./tool-runtime";
 import type { ToolRuntime, ExecutionContext } from "./tool-runtime";
-import { registerFilesystemBundle, registerSearchBundle, MAX_TOOL_FILE_BYTES, READ_FILE_MAX_LINE_CHARS } from "./filesystem-bundle";
+import { registerFilesystemBundle, registerSearchBundle, MAX_TOOL_FILE_BYTES, READ_FILE_MAX_LINE_CHARS, GREP_FILE_MAX_BYTES } from "./filesystem-bundle";
 import { defaultConfig } from "./config";
 import { hasFileBeenRead, markFileRead } from "./fs-read-cache";
 import { resolve } from "path";
@@ -482,6 +482,68 @@ describe("FilesystemBundle > grep on a single file (2026-07-18)", () => {
     );
     expect(result.is_error).toBe(true);
     expect(result.error).toContain("glob");
+  });
+});
+
+describe("FilesystemBundle > grep on a single file stops at the byte cap (DD-130)", () => {
+  // A multi-hundred-megabyte bundle must never be loaded whole by one grep.
+  // The cap is GREP_FILE_MAX_BYTES (1 MB); build a file just past it and put
+  // the needle strictly beyond the cap so only an over-cap read could see it.
+  function writeFilePastCap(ws: string): void {
+    const fillerLine = `${"x".repeat(1024)}\n`; // 1025 bytes
+    const filler = fillerLine.repeat(Math.ceil(GREP_FILE_MAX_BYTES / fillerLine.length) + 1);
+    writeFileSync(join(ws, "bundle.bin"), `${filler}NEEDLE_AFTER_CAP\n`);
+  }
+
+  test("a match beyond the cap is not found and the result says truncated", async () => {
+    const ws = makeTempWorkspace();
+    writeFilePastCap(ws);
+    expect(readFileSync(join(ws, "bundle.bin"), "utf-8")).toContain("NEEDLE_AFTER_CAP");
+
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "NEEDLE_AFTER_CAP", path: "bundle.bin", output_mode: "content" }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).not.toContain("No matches found");
+    expect(result.output).toContain("truncated");
+    expect(result.output).toContain(String(GREP_FILE_MAX_BYTES));
+  });
+
+  test("files_with_matches beyond the cap is not reported as a plain miss", async () => {
+    const ws = makeTempWorkspace();
+    writeFilePastCap(ws);
+
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "NEEDLE_AFTER_CAP", path: "bundle.bin" }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("truncated");
+    expect(result.output).not.toBe("No matches found");
+  });
+
+  test("a match inside the cap is still reported, with the truncation noted", async () => {
+    const ws = makeTempWorkspace();
+    writeFilePastCap(ws);
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "x{100}", path: "bundle.bin", output_mode: "content", head_limit: 2 }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toContain("1:");
+    expect(result.output).toContain("truncated");
+  });
+
+  test("a small file that genuinely has no match still says so, without a truncation note", async () => {
+    const ws = makeTempWorkspace();
+    writeFileSync(join(ws, "small.txt"), "alpha\nbeta\n");
+    const result = await makeRuntime().execute(
+      call("grep", { pattern: "gamma", path: "small.txt", output_mode: "content" }),
+      makeCtx(ws),
+    );
+    expect(result.is_error).toBe(false);
+    expect(result.output).toBe("No matches found");
   });
 });
 

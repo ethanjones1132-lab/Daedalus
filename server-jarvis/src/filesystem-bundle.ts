@@ -229,6 +229,15 @@ export const MAX_TOOL_FILE_BYTES = 1_000_000;
 export const READ_FILE_MAX_LINE_CHARS = 2_000;
 
 /**
+ * DD-130: grep on a single FILE reads at most this many bytes. It is the same
+ * 1 MB ceiling the directory walk already applies (`stats.size <
+ * MAX_TOOL_FILE_BYTES`), so single-file and directory grep agree on what is
+ * too big to take whole — and a multi-hundred-megabyte bundle can never be
+ * loaded into memory by one grep call.
+ */
+export const GREP_FILE_MAX_BYTES = MAX_TOOL_FILE_BYTES;
+
+/**
  * Keep only whole UTF-8 character sequences in a byte-prefix read: if the cut
  * landed mid-character, drop the unfinished trailing sequence so the prefix
  * decodes without a replacement character at the cut point.
@@ -252,17 +261,19 @@ function utf8CompletePrefix(buf: Buffer): Buffer {
 }
 
 /**
- * Read at most MAX_TOOL_FILE_BYTES from `path`. The whole-file path (file is
- * within the cap) decodes exactly like `fs.readFile(path, "utf-8")` used to,
- * so small reads stay byte-for-byte identical.
+ * Read at most `maxBytes` (default MAX_TOOL_FILE_BYTES) from `path`. The
+ * whole-file path (file is within the cap) decodes exactly like
+ * `fs.readFile(path, "utf-8")` used to, so small reads stay byte-for-byte
+ * identical.
  */
 async function readBytePrefix(
   path: string,
+  maxBytes: number = MAX_TOOL_FILE_BYTES,
 ): Promise<{ text: string; bytesRead: number; totalBytes: number }> {
   const handle = await fs.open(path, "r");
   try {
     const { size } = await handle.stat();
-    const target = Math.min(size, MAX_TOOL_FILE_BYTES);
+    const target = Math.min(size, maxBytes);
     const buf = Buffer.alloc(target);
     let filled = 0;
     while (filled < target) {
@@ -619,21 +630,40 @@ async function handleGrep(args: Record<string, unknown>, ctx: ExecutionContext):
   const searchStat = await fs.stat(operationRoot).catch(() => null);
   rootResolution.revalidate();
   if (searchStat?.isFile()) {
+    const displayPath = (args.path as string) || searchPath;
+    let prefix: { text: string; bytesRead: number; totalBytes: number };
     try {
       rootResolution.revalidate();
-      const content = await fs.readFile(operationRoot, "utf-8");
+      prefix = await readBytePrefix(operationRoot, GREP_FILE_MAX_BYTES);
       rootResolution.revalidate();
-      if (outputMode === "files_with_matches") {
-        return regex.test(content) ? (args.path as string) : "No matches found";
-      }
-      const lines = content.split("\n");
+    } catch (err) {
+      // DD-130: a read failure is NOT "no matches". The old catch-all turned
+      // every I/O error into an empty verdict, so callers concluded the
+      // pattern was absent from a file nobody had actually read.
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`grep could not read ${displayPath}: ${detail}`);
+    }
+    const { text, bytesRead, totalBytes } = prefix;
+    const truncated = bytesRead < totalBytes;
+    // The byte cap can cut the final line in half; never report or match
+    // against that fragment as if it were whole content.
+    const searchable = truncated && text.includes("\n")
+      ? text.slice(0, text.lastIndexOf("\n"))
+      : text;
+    if (outputMode === "files_with_matches") {
+      if (regex.test(searchable)) return displayPath;
+    } else {
+      const lines = searchable.split("\n");
       for (let i = 0; i < lines.length && results.length < headLimit; i++) {
         if (regex.test(lines[i])) results.push(`${i + 1}: ${lines[i].trim()}`);
       }
-      return results.join("\n") || "No matches found";
-    } catch {
-      return "No matches found";
     }
+    if (!truncated) return results.join("\n") || "No matches found";
+    // DD-130: the cap stopped the search, so a bare "No matches found" would
+    // claim a completeness we never had. State the truncation, the cap, and
+    // exactly how much of the file went unsearched.
+    const note = `[grep truncated: searched the first ${bytesRead} of ${totalBytes} bytes of ${displayPath} — the remaining ${totalBytes - bytesRead} bytes are beyond the ${GREP_FILE_MAX_BYTES}-byte grep cap and were NOT searched]`;
+    return [...results, note].join("\n");
   }
   if (!searchStat?.isDirectory()) {
     throw new Error(`Path not found: ${searchPath}. Use glob with pattern "**" from the workspace root to find the correct path.`);
