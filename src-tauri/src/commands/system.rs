@@ -525,14 +525,27 @@ fn native_ollama_ps_model(base_url: &str) -> Option<String> {
 
 /// The `df` probe the Diagnostics disk row reads, byte for byte. Kept as one
 /// constant so the invocation and the parser stay pinned to the same format.
+///
+/// DD-118: this is now only the WSL fallback. On Windows the row is read with
+/// the Windows API, so a native install never spawns a shell from the footer
+/// poll.
 pub(super) const DF_PROBE_COMMAND: &str = "df -BG --output=size,used,avail,pcent /";
 
-/// The memory probe the Diagnostics memory row reads, byte for byte.
+/// The memory probe the Diagnostics memory row reads, byte for byte. Only used
+/// as the WSL fallback for the same reason as [`DF_PROBE_COMMAND`].
 pub(super) const MEMINFO_PROBE_COMMAND: &str = "cat /proc/meminfo";
 
 /// How long a diagnostics shell probe may take before it is killed. WSL can be
 /// cold (VM boot, distro start), so this matches `wsl_openclaw`'s budget.
 const SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a WSL diagnostics answer stays usable (DD-118).
+///
+/// The footer polls `get_system_health` every 30 s, and a WSL diagnostics probe
+/// is a `wsl.exe` spawn that can cost seconds on a cold distro. The answer is
+/// therefore cached and replayed across polls instead of being re-probed on
+/// every tick; after this window it is refreshed once, not per tick.
+pub(super) const WSL_DIAGNOSTIC_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Build the program and argv for a plain shell probe (DD-104).
 ///
@@ -584,6 +597,252 @@ fn shell_probe(command: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+// ── Native (Windows API) disk and memory readings (DD-118) ──
+//
+// The footer's disk and memory rows describe the machine this app runs on. On
+// Windows that machine is reachable with two `kernel32` calls, so a native
+// install reads them directly instead of spawning `wsl.exe` — which on a cold
+// distro cost up to the 30 s probe budget on every 30 s poll. The `df` /
+// `/proc/meminfo` shell probes stay behind as the fallback for a non-Windows
+// host and for a Windows host whose native read fails, and that fallback is
+// cached.
+//
+// There is deliberately no "is this a WSL install?" switch in front of the
+// native read: answering that question with the app's own `wsl_home()` helper
+// can itself spawn `wsl.exe` (the cost this part removes), and the volume the
+// native read reports is the one this app and its state actually live on. A
+// WSL-side reading is kept as the fallback, not as the primary.
+
+/// One cached WSL diagnostics answer, with the instant it was fetched.
+pub(super) struct WslDiagnostic {
+    pub(super) fetched_at: std::time::Instant,
+    pub(super) value: Result<String, String>,
+}
+
+fn wsl_diagnostic_cache() -> &'static StdMutex<HashMap<&'static str, WslDiagnostic>> {
+    static CACHE: OnceLock<StdMutex<HashMap<&'static str, WslDiagnostic>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Run a WSL diagnostics probe at most once per [`WSL_DIAGNOSTIC_TTL`].
+///
+/// Both answers are cached: a repeated failure is exactly the case that would
+/// otherwise pay a full `wsl.exe` timeout on every poll, so a broken WSL is not
+/// re-probed every 30 s either.
+pub(super) fn cached_wsl_diagnostic(
+    command: &'static str,
+    probe: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    cached_wsl_diagnostic_in(
+        wsl_diagnostic_cache(),
+        WSL_DIAGNOSTIC_TTL,
+        command,
+        std::time::Instant::now(),
+        probe,
+    )
+}
+
+/// Seam for [`cached_wsl_diagnostic`]: the cache, its lifetime and the clock are
+/// passed in so the reuse rule is pinned without spawning a process.
+pub(super) fn cached_wsl_diagnostic_in(
+    cache: &StdMutex<HashMap<&'static str, WslDiagnostic>>,
+    ttl: std::time::Duration,
+    command: &'static str,
+    now: std::time::Instant,
+    probe: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    // The cache lock is released before the probe runs: a cold `wsl.exe` can
+    // take seconds, and no other reader should wait behind it.
+    let cached = {
+        let cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .get(command)
+            .filter(|entry| now.saturating_duration_since(entry.fetched_at) < ttl)
+            .map(|entry| entry.value.clone())
+    };
+    if let Some(value) = cached {
+        return value;
+    }
+    let value = probe();
+    cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(
+            command,
+            WslDiagnostic {
+                fetched_at: now,
+                value: value.clone(),
+            },
+        );
+    value
+}
+
+/// `MEMORYSTATUSEX` from `winbase.h`.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MemoryStatusEx {
+    dwLength: u32,
+    dwMemoryLoad: u32,
+    ullTotalPhys: u64,
+    ullAvailPhys: u64,
+    ullTotalPageFile: u64,
+    ullAvailPageFile: u64,
+    ullTotalVirtual: u64,
+    ullAvailVirtual: u64,
+    ullAvailExtendedVirtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetDiskFreeSpaceExW(
+        directory_name: *const u16,
+        free_bytes_available_to_caller: *mut u64,
+        total_bytes: *mut u64,
+        total_free_bytes: *mut u64,
+    ) -> i32;
+    fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+}
+
+/// Where the volume holding this install lives: the native home from the
+/// environment, else the system drive, else the usual Windows system volume.
+/// Derived from the environment on purpose — learning the install mode must not
+/// spawn `wsl.exe` (DD-023, DD-118).
+#[cfg(target_os = "windows")]
+fn disk_volume_roots() -> Vec<String> {
+    let mut roots = Vec::new();
+    let home = crate::get_home_dir();
+    if !home.trim().is_empty() {
+        roots.push(home);
+    }
+    if let Ok(drive) = std::env::var("SystemDrive") {
+        let drive = drive.trim().trim_end_matches('\\').to_string();
+        if !drive.is_empty() {
+            roots.push(format!("{drive}\\"));
+        }
+    }
+    roots.push("C:\\".to_string());
+    roots
+}
+
+/// Disk usage of `root` via `GetDiskFreeSpaceExW`, in `df`'s terms: `used` is
+/// the bytes not free on the volume, `available` is what this caller may use.
+#[cfg(target_os = "windows")]
+fn disk_usage_for_root(root: &str) -> Option<DiskHealth> {
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+    // SAFETY: `wide` is NUL-terminated and outlives the call, and the three out
+    // pointers are distinct, aligned, initialised stack slots.
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut free) };
+    if ok == 0 || total == 0 {
+        return None;
+    }
+    Some(disk_health_from_bytes(total, free, available))
+}
+
+/// Native disk reading. `None` when the Windows API could not answer, so the
+/// caller falls back to the (cached) WSL diagnostic instead of inventing totals.
+#[cfg(target_os = "windows")]
+pub(super) fn native_disk_usage() -> Option<DiskHealth> {
+    disk_volume_roots()
+        .iter()
+        .find_map(|root| disk_usage_for_root(root))
+}
+
+/// There is no Windows API off Windows; the platform's own shell probe answers.
+#[cfg(not(target_os = "windows"))]
+pub(super) fn native_disk_usage() -> Option<DiskHealth> {
+    None
+}
+
+/// Pure byte-to-row form, so the arithmetic is testable without the OS.
+pub(super) fn disk_health_from_bytes(total: u64, free: u64, available: u64) -> DiskHealth {
+    if total == 0 {
+        return DiskHealth {
+            total: "?".to_string(),
+            used: "?".to_string(),
+            available: "?".to_string(),
+            use_percent: "?".to_string(),
+        };
+    }
+    let used = total.saturating_sub(free);
+    let percent = (used.saturating_mul(100) / total).min(100);
+    DiskHealth {
+        total: format_disk_size(total),
+        used: format_disk_size(used),
+        available: format_disk_size(available.min(total)),
+        use_percent: format!("{percent}%"),
+    }
+}
+
+/// A size in the same shape `df -BG` prints (`50G`), with MB below one gigabyte
+/// so a small volume is never rounded down to a bare `0G`.
+pub(super) fn format_disk_size(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    if bytes >= GB {
+        format!("{}G", bytes / GB)
+    } else {
+        format!("{}M", bytes / MB)
+    }
+}
+
+/// Native memory reading via `GlobalMemoryStatusEx`. `None` when the call fails,
+/// so the caller can fall back rather than report a zeroed record as measured.
+#[cfg(target_os = "windows")]
+pub(super) fn native_memory_usage() -> Option<MemoryHealth> {
+    let mut status = MemoryStatusEx {
+        dwLength: std::mem::size_of::<MemoryStatusEx>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is a live, correctly sized and aligned `MEMORYSTATUSEX`
+    // whose `dwLength` names its own size, as the API requires.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some(memory_health_from_bytes(
+        status.ullTotalPhys,
+        status.ullAvailPhys,
+    ))
+}
+
+/// There is no Windows API off Windows; the platform's own shell probe answers.
+#[cfg(not(target_os = "windows"))]
+pub(super) fn native_memory_usage() -> Option<MemoryHealth> {
+    None
+}
+
+/// Pure byte-to-row form, matching the MB units the `/proc/meminfo` path reports.
+pub(super) fn memory_health_from_bytes(total: u64, available: u64) -> MemoryHealth {
+    const MB: u64 = 1024 * 1024;
+    if total == 0 {
+        return MemoryHealth {
+            total_mb: 0,
+            available_mb: 0,
+            used_mb: 0,
+            used_percent: 0,
+        };
+    }
+    let available = available.min(total);
+    let used = total.saturating_sub(available);
+    let used_percent = (used.saturating_mul(100) / total).min(100);
+    MemoryHealth {
+        total_mb: total / MB,
+        available_mb: available / MB,
+        used_mb: used / MB,
+        used_percent: used_percent as u32,
+    }
+}
+
 /// Parse `df -BG --output=size,used,avail,pcent /`. The header is line one, so
 /// the data line is "  50G  20G  30G  40%".
 pub(super) fn parse_df_probe(stdout: &str) -> Option<DiskHealth> {
@@ -630,10 +889,25 @@ pub(super) fn parse_meminfo(stdout: &str) -> Option<MemoryHealth> {
 }
 
 fn disk_health() -> DiskHealth {
-    // Best-effort: read from `df` on the WSL side; fall back to "?"s when the
-    // probe or the output cannot be read. This must not go through
-    // `wsl_openclaw`, which would run `openclaw df` on Windows (DD-104).
-    if let Ok(stdout) = shell_probe(DF_PROBE_COMMAND) {
+    // DD-118: a native install reads the volume with the Windows API and never
+    // spawns a shell. The WSL `df` probe below is the fallback only, and it is
+    // cached so the 30 s footer poll does not pay a `wsl.exe` spawn each tick.
+    disk_health_with(native_disk_usage, || {
+        cached_wsl_diagnostic(DF_PROBE_COMMAND, || shell_probe(DF_PROBE_COMMAND))
+    })
+}
+
+/// Seam for [`disk_health`]: `native` is the platform reading, and `wsl_probe`
+/// is consulted only when that reading is unavailable. A `?` row means neither
+/// answered, never that the poll skipped the question.
+pub(super) fn disk_health_with(
+    native: impl FnOnce() -> Option<DiskHealth>,
+    wsl_probe: impl FnOnce() -> Result<String, String>,
+) -> DiskHealth {
+    if let Some(disk) = native() {
+        return disk;
+    }
+    if let Ok(stdout) = wsl_probe() {
         if let Some(disk) = parse_df_probe(&stdout) {
             return disk;
         }
@@ -647,8 +921,23 @@ fn disk_health() -> DiskHealth {
 }
 
 fn memory_health() -> MemoryHealth {
-    // Read /proc/meminfo via a plain WSL shell; fall back to zeroes.
-    if let Ok(stdout) = shell_probe(MEMINFO_PROBE_COMMAND) {
+    // Same rule as `disk_health`: the Windows API first, and a cached WSL
+    // `/proc/meminfo` read only when the native reading is unavailable.
+    memory_health_with(native_memory_usage, || {
+        cached_wsl_diagnostic(MEMINFO_PROBE_COMMAND, || shell_probe(MEMINFO_PROBE_COMMAND))
+    })
+}
+
+/// Seam for [`memory_health`]; see [`disk_health_with`]. A zeroed record means
+/// neither source answered, never that the machine has no memory.
+pub(super) fn memory_health_with(
+    native: impl FnOnce() -> Option<MemoryHealth>,
+    wsl_probe: impl FnOnce() -> Result<String, String>,
+) -> MemoryHealth {
+    if let Some(memory) = native() {
+        return memory;
+    }
+    if let Ok(stdout) = wsl_probe() {
         if let Some(memory) = parse_meminfo(&stdout) {
             return memory;
         }

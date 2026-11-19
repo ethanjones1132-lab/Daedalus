@@ -2,12 +2,13 @@
 // the one Native reports in two different "unreadable" conventions. The disk
 // probe in the same command answers an unreadable probe with the string `"?"`;
 // the memory probe answers with a zeroed record — `total_mb: 0, available_mb: 0,
-// used_mb: 0, used_percent: 0` — after a `cat /proc/meminfo` that cannot run on
-// any host where `wsl_openclaw` is not a WSL call. That zero is a sentinel for
-// *not measured*, and both mounted readers took it as a real reading: the
-// Overview printed `0.0%` in the same muted tone as a real number, and the top
-// bar printed an emerald `MEM 0%` chip — the reading that most strongly says
-// nothing is wrong here.
+// used_mb: 0, used_percent: 0`. (DD-118: on Windows both rows are read with the
+// Windows API, and the shell probes these sentinels came from are only the
+// fallback, so a sentinel now means neither source answered.) That zero is a
+// sentinel for *not measured*, and both mounted readers took it as a real
+// reading: the Overview printed `0.0%` in the same muted tone as a real number,
+// and the top bar printed an emerald `MEM 0%` chip — the reading that most
+// strongly says nothing is wrong here.
 //
 // This module is where that verdict is derived, so the two surfaces cannot
 // disagree about the same field. `total_mb` is the discriminator the record
