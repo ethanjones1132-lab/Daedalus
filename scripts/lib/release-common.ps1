@@ -811,9 +811,9 @@ function Test-JarvisArtifactHash {
 # gate. `Start-Process -Wait`, `& exe` and a bare WaitForExit with no argument
 # all wait for as long as the child lives; `Wait-Process -Timeout` reports a
 # timeout only as an error on the error stream, which callers swallow. The
-# three helpers below are the single bounded implementation: WaitForExit(ms)
-# is the hard bound, and a timeout always fails its step with one line that
-# names the step and quotes the last line the child wrote.
+# helpers below are the single bounded implementation: WaitForExit(ms) is the
+# hard bound, and a timeout always fails its step with one line that names the
+# step and quotes the last line the child wrote.
 
 function Get-JarvisChildOutputTail {
     <#
@@ -882,8 +882,8 @@ function Wait-JarvisChildExit {
         of passing it.
 
     .PARAMETER Process
-        The process Start-Process returned. $null means no child was started,
-        which is a timeout too.
+        The process Start-JarvisChildProcess returned. $null means no child was
+        started, which is a timeout too.
 
     .PARAMETER Step
         The pipeline step, e.g. 'install'. It names the diagnostic and the
@@ -936,6 +936,138 @@ function Wait-JarvisChildExit {
     return $true
 }
 
+function ConvertFrom-JarvisChildArgument {
+    # Inverse of the quoting callers already apply (Format-JarvisChildArgument).
+    # ProcessStartInfo.ArgumentList quotes for itself, so a value that still
+    # carries one outer pair of quotes would reach the child with those quote
+    # characters as part of the argument.
+    param([string]$Value)
+    if ($Value.Length -ge 2 -and $Value[0] -eq '"' -and $Value[$Value.Length - 1] -eq '"') {
+        return $Value.Substring(1, $Value.Length - 2).Replace('\"', '"')
+    }
+    return $Value
+}
+
+function Start-JarvisChildProcess {
+    <#
+    .SYNOPSIS
+        Start one child through a Process object that keeps its exit code.
+
+    .DESCRIPTION
+        DD-142: `Start-Process -PassThru` cannot answer ExitCode. The object it
+        returns loses the handle the code is read from: after WaitForExit(ms)
+        returns $true, ExitCode, Handle and a fresh GetProcessById($p.Id) all
+        stay empty. Starting the child through
+        [System.Diagnostics.Process]::Start keeps the handle, so WaitForExit(ms)
+        followed by ExitCode is the real code - 0 for a clean step, 128 for a
+        failed git, never $null.
+
+        Standard output and standard error are drained asynchronously into the
+        log files the caller names, so output keeps arriving while the child
+        runs and the timeout diagnostic can quote it. A blocking ReadToEnd
+        after the wait would deadlock on a chatty child, which is why the
+        drains start before the wait.
+
+    .OUTPUTS
+        [pscustomobject]@{ process; streams; copies }: the Process object to
+        hand to Wait-JarvisChildExit, the log streams, and the drain tasks to
+        pass to Complete-JarvisChildOutput.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$ArgumentList = @(),
+        [string]$WorkingDirectory = '',
+        [string]$StandardOutputPath = '',
+        [string]$StandardErrorPath = ''
+    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $psi.WorkingDirectory = $WorkingDirectory
+    }
+    # ArgumentList exists on PowerShell 6+ only. On 5.1 fall back to Arguments,
+    # which joins with single spaces and adds no quoting of its own - the same
+    # contract Start-Process had, so callers keep pre-quoting their paths.
+    if ($null -ne $psi.PSObject.Properties['ArgumentList']) {
+        foreach ($argument in @($ArgumentList)) {
+            [void]$psi.ArgumentList.Add((ConvertFrom-JarvisChildArgument ([string]$argument)))
+        }
+    } else {
+        $psi.Arguments = (@($ArgumentList) -join ' ')
+    }
+    $share = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+    $stdoutStream = $null
+    $stderrStream = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($StandardOutputPath)) {
+            $psi.RedirectStandardOutput = $true
+            # Unbuffered: a line the child has written is already in the log
+            # when a timeout diagnostic reads it, not sitting in a buffer.
+            $stdoutStream = [IO.FileStream]::new($StandardOutputPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, $share, 1)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($StandardErrorPath)) {
+            $psi.RedirectStandardError = $true
+            $stderrStream = [IO.FileStream]::new($StandardErrorPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, $share, 1)
+        }
+    } catch {
+        foreach ($stream in @($stdoutStream, $stderrStream)) {
+            if ($stream) { try { $stream.Dispose() } catch { } }
+        }
+        throw
+    }
+    try {
+        $process = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        foreach ($stream in @($stdoutStream, $stderrStream)) {
+            if ($stream) { try { $stream.Dispose() } catch { } }
+        }
+        throw
+    }
+    $copies = @()
+    try {
+        if ($stdoutStream) { $copies += $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream) }
+        if ($stderrStream) { $copies += $process.StandardError.BaseStream.CopyToAsync($stderrStream) }
+    } catch {
+        if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        foreach ($stream in @($stdoutStream, $stderrStream)) {
+            if ($stream) { try { $stream.Dispose() } catch { } }
+        }
+        throw
+    }
+    return [pscustomobject]@{
+        process = $process
+        streams = (@($stdoutStream, $stderrStream) | Where-Object { $_ })
+        copies  = @($copies)
+    }
+}
+
+function Complete-JarvisChildOutput {
+    <#
+    .SYNOPSIS
+        Let the child's output reach its log files, then close the logs.
+
+    .DESCRIPTION
+        The drains Start-JarvisChildProcess started finish once the child's
+        pipes close. The wait is bounded so a grandchild that still holds a
+        pipe cannot hold the step open; a task that cannot finish contributes
+        whatever it already wrote. Safe to call twice (normal path and the
+        finally that kills a timed-out child).
+    #>
+    [CmdletBinding()]
+    param($Child)
+    if (-not $Child) { return }
+    $tasks = @($Child.copies)
+    if ($tasks.Count -gt 0) {
+        try { [void][System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]$tasks, 5000) } catch { }
+    }
+    foreach ($stream in @($Child.streams)) {
+        if ($stream) { try { $stream.Dispose() } catch { } }
+    }
+}
+
 function Invoke-JarvisBoundedChild {
     <#
     .SYNOPSIS
@@ -945,10 +1077,12 @@ function Invoke-JarvisBoundedChild {
         `Start-Process -Wait` and a bare `& exe` wait for the child with no
         bound at all: a child that never exits hangs the caller, and in the
         release test suite that hangs the gate. This runs the child, waits
-        through Wait-JarvisChildExit (WaitForExit(ms)) and returns its exit
-        code and output. On timeout the one-line diagnostic is thrown and the
-        child is killed, so a hung child cannot outlive the step that started
-        it.
+        through Wait-JarvisChildExit (WaitForExit(ms)) and returns its real
+        exit code and output. The child is started through Process.Start
+        (DD-142) so the wait keeps the handle the code is read from: a failed
+        step reports its code instead of $null. On timeout the one-line
+        diagnostic is thrown and the child is killed, so a hung child cannot
+        outlive the step that started it.
 
     .OUTPUTS
         [pscustomobject]@{ step; exit_code; output } where output is the
@@ -968,22 +1102,14 @@ function Invoke-JarvisBoundedChild {
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $stdout = Join-Path $logDir 'stdout.log'
     $stderr = Join-Path $logDir 'stderr.log'
-    $start = @{
-        FilePath               = $FilePath
-        ArgumentList           = $ArgumentList
-        PassThru               = $true
-        NoNewWindow            = $true
-        RedirectStandardOutput = $stdout
-        RedirectStandardError  = $stderr
-    }
-    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
-        $start.WorkingDirectory = $WorkingDirectory
-    }
-    $process = $null
+    $child = $null
     try {
-        $process = Start-Process @start
-        $null = Wait-JarvisChildExit -Process $process -Step $Step -TimeoutMs $TimeoutMs `
+        $child = Start-JarvisChildProcess -FilePath $FilePath -ArgumentList $ArgumentList `
+            -WorkingDirectory $WorkingDirectory -StandardOutputPath $stdout -StandardErrorPath $stderr
+        $null = Wait-JarvisChildExit -Process $child.process -Step $Step -TimeoutMs $TimeoutMs `
             -OutputPaths @($stdout, $stderr) -Context $FilePath
+        # The logs are only complete once the drains have finished.
+        Complete-JarvisChildOutput -Child $child
         $output = @()
         if (Test-Path -LiteralPath $stdout) {
             $output += @(Get-Content -LiteralPath $stdout -Encoding UTF8 -ErrorAction SilentlyContinue |
@@ -993,10 +1119,16 @@ function Invoke-JarvisBoundedChild {
             $output += @(Get-Content -LiteralPath $stderr -Encoding UTF8 -ErrorAction SilentlyContinue |
                 Where-Object { $null -ne $_ })
         }
-        return [pscustomobject]@{ step = $Step; exit_code = $process.ExitCode; output = $output }
+        return [pscustomobject]@{ step = $Step; exit_code = $child.process.ExitCode; output = $output }
     } finally {
-        if ($process -and -not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        if ($child) {
+            if (-not $child.process.HasExited) {
+                Stop-Process -Id $child.process.Id -Force -ErrorAction SilentlyContinue
+            }
+            Complete-JarvisChildOutput -Child $child
+            # Release the OS handle so a killed child is actually gone, not a
+            # process object held open by this call.
+            try { $child.process.Dispose() } catch { }
         }
         Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -1040,7 +1172,7 @@ function Install-JarvisRelease {
         $parent = Split-Path -Parent $parent
     }
     New-Item -ItemType Directory -Path $InstallRoot | Out-Null
-    $process = $null
+    $child = $null
     # The installer is silent, but not necessarily mute: whatever it does say
     # is the last output line a timeout diagnostic can quote.
     $logDir = Join-Path $env:TEMP 'jarvis-release-smoke'
@@ -1050,19 +1182,25 @@ function Install-JarvisRelease {
     Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
     try {
         # /D must be last and unquoted, including when the directory has spaces.
-        $process = Start-Process -FilePath $InstallerPath -ArgumentList @('/S', "/D=$InstallRoot") -PassThru -WindowStyle Hidden `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        $child = Start-JarvisChildProcess -FilePath $InstallerPath -ArgumentList @('/S', "/D=$InstallRoot") `
+            -StandardOutputPath $stdout -StandardErrorPath $stderr
         # DD-126: the install is a child wait like any other. It is bounded by
         # WaitForExit(ms) inside Wait-JarvisChildExit, so a hung installer fails
         # this step with a diagnostic instead of holding the gate open.
-        $null = Wait-JarvisChildExit -Process $process -Step 'install' -TimeoutMs ($TimeoutSeconds * 1000) `
+        # DD-142: the child is started through Process.Start, so ExitCode is
+        # the installer's real code rather than $null.
+        $null = Wait-JarvisChildExit -Process $child.process -Step 'install' -TimeoutMs ($TimeoutSeconds * 1000) `
             -OutputPaths @($stdout, $stderr) -Context $InstallRoot
-        if ($process.ExitCode -ne 0) { throw "install_failed:exit_$($process.ExitCode)" }
+        Complete-JarvisChildOutput -Child $child
+        if ($child.process.ExitCode -ne 0) { throw "install_failed:exit_$($child.process.ExitCode)" }
     } catch {
-        if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        if ($child -and -not $child.process.HasExited) { Stop-Process -Id $child.process.Id -Force -ErrorAction SilentlyContinue }
+        Complete-JarvisChildOutput -Child $child
         # This path was validated and created above; it did not exist on entry.
         Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
         throw
+    } finally {
+        if ($child) { try { $child.process.Dispose() } catch { } }
     }
     return $InstallRoot
 }
@@ -1478,14 +1616,25 @@ function Remove-JarvisReleaseInstall {
     )
     $uninstaller = Join-Path $InstallRoot 'uninstall.exe'
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { return $false }
-    $process = Start-Process -FilePath $uninstaller -ArgumentList @('/S') -PassThru
+    $child = Start-JarvisChildProcess -FilePath $uninstaller -ArgumentList @('/S')
     # DD-126: bounded like the install. The timeout still reports
     # uninstall_timeout with the scratch root, and now also says what the
     # uninstaller last printed.
-    $null = Wait-JarvisChildExit -Process $process -Step 'uninstall' -TimeoutMs ($TimeoutSeconds * 1000) `
-        -Context $InstallRoot
-    if ($process.ExitCode -ne 0) {
-        throw "uninstall_failed:exit_$($process.ExitCode)"
+    # DD-142: Process.Start keeps the handle, so ExitCode is the uninstaller's
+    # real code rather than $null. A timeout kills it on the way out.
+    try {
+        $null = Wait-JarvisChildExit -Process $child.process -Step 'uninstall' -TimeoutMs ($TimeoutSeconds * 1000) `
+            -Context $InstallRoot
+        Complete-JarvisChildOutput -Child $child
+        if ($child.process.ExitCode -ne 0) {
+            throw "uninstall_failed:exit_$($child.process.ExitCode)"
+        }
+    } finally {
+        if (-not $child.process.HasExited) {
+            Stop-Process -Id $child.process.Id -Force -ErrorAction SilentlyContinue
+        }
+        Complete-JarvisChildOutput -Child $child
+        try { $child.process.Dispose() } catch { }
     }
     return $true
 }

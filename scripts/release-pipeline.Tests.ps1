@@ -62,6 +62,58 @@ function New-JarvisGitFixture {
     return $root
 }
 
+Describe 'the bounded child runner' {
+    # DD-142: Invoke-JarvisBoundedChild read ExitCode off the object that
+    # Start-Process -PassThru returns, and that object never carries the code:
+    # a clean child reported $null instead of 0, and a failing child's code was
+    # never real. The child is now started through Process.Start, which keeps
+    # the handle, and these cases pin the code as well as the bounded wait.
+
+    It 'returns exit code 0 for a child that succeeds' {
+        $git = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $git) { throw 'git_missing' }
+        $result = Invoke-JarvisBoundedChild -FilePath $git.Source -ArgumentList @('--version') `
+            -Step 'git_version' -TimeoutMs 30000
+        # Pre-fix this is $null, so a clean step was reported failed by callers
+        # that compare the code to zero.
+        $result.exit_code | Should Be 0
+    }
+
+    It 'returns the real non-zero exit code instead of $null' {
+        $git = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $git) { throw 'git_missing' }
+        $missing = Join-Path $TestDrive ('missing-repository-' + [guid]::NewGuid().ToString('N'))
+        $result = Invoke-JarvisBoundedChild -FilePath $git.Source `
+            -ArgumentList @('-C', (Format-JarvisChildArgument $missing), 'status') `
+            -Step 'git_status' -TimeoutMs 30000 -MergeStandardError
+        # git cannot enter the directory, so it exits 128 before touching a
+        # repository. Pre-fix this is $null, and a failed step could read as
+        # anything the caller happened to compare it to.
+        $result.exit_code | Should Be 128
+        $result.exit_code | Should Not BeNullOrEmpty
+    }
+
+    It 'throws the bounded timeout and kills a child that never exits' {
+        $shell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        if (-not $shell) { throw 'powershell_missing' }
+        $childPidFile = Join-Path $TestDrive ('timed-out-child-' + [guid]::NewGuid().ToString('N') + '.pid')
+        # The child reports its own pid first, then outlives any short bound.
+        $command = "Set-Content -LiteralPath '$childPidFile' -Value `$PID; Start-Sleep -Seconds 120"
+        $started = Get-Date
+        { Invoke-JarvisBoundedChild -FilePath $shell.Source `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', (Format-JarvisChildArgument $command)) `
+            -Step 'never_exits' -TimeoutMs 5000 } | Should Throw 'never_exits_timeout'
+        # The bound, not the child's 120 seconds, ended the wait.
+        ((Get-Date) - $started).TotalSeconds | Should BeLessThan 60
+        if (-not (Test-Path -LiteralPath $childPidFile)) { throw 'timed_out_child_did_not_start' }
+        $childPid = [int](Get-Content -LiteralPath $childPidFile -Raw)
+        # Bounded observation that the kill took effect; if the child survived
+        # this wait, the assertion below fails instead of hanging.
+        try { $null = Wait-Process -Id $childPid -Timeout 10 -ErrorAction Stop } catch { }
+        @(Get-Process -Id $childPid -ErrorAction SilentlyContinue).Count | Should Be 0
+    }
+}
+
 Describe 'source tree digest' {
     It 'produces a 64 character uppercase hex digest' {
         $digest = Get-JarvisSourceTreeSha256 -RepoRoot $repoRoot
