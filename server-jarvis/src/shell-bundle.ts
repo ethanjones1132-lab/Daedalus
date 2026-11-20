@@ -19,8 +19,9 @@ const DEFAULT_SHELL_TIMEOUT_MS = 30_000;
  * `C:\Windows\System32\bash.exe` is deliberately EXCLUDED and filtered below:
  * on Windows that path is the WSL launcher, so a command sent there runs in a
  * different filesystem namespace where the workspace path does not resolve.
- * A bare `spawn("bash")` finds it via PATH on many machines, which is why the
- * resolution is explicit rather than left to PATH lookup.
+ * A bare `spawn("bash")` finds it via PATH on many machines, so when no Git
+ * Bash is installed we resolve PATH ourselves and refuse the launcher loudly
+ * instead of handing the WSL interpreter to the model as if it were bash.
  */
 const WINDOWS_BASH_CANDIDATES = [
   "C:\\Program Files\\Git\\bin\\bash.exe",
@@ -29,30 +30,122 @@ const WINDOWS_BASH_CANDIDATES = [
   "C:\\Program Files (x86)\\Git\\usr\\bin\\bash.exe",
 ];
 
-function isWslLauncher(candidate: string): boolean {
-  return /\\system32\\bash\.exe$/i.test(candidate);
+const CONFIGURED_WSL_REASON =
+  "tools.bash_path points at the WSL launcher (System32\\bash.exe). " +
+  "Set it to a Git Bash executable, or clear it to auto-resolve.";
+
+const PATH_WSL_REASON =
+  "bash on PATH resolves to the WSL launcher (System32\\bash.exe), not Git Bash. " +
+  "The bash tool requires Git Bash on Windows. Install Git Bash, or set tools.bash_path to a Git Bash executable.";
+
+const NO_GIT_BASH_REASON =
+  "No Git Bash found on Windows: no Git Bash in the standard install locations and no usable bash on PATH. " +
+  "The bash tool requires Git Bash. Install Git Bash, or set tools.bash_path to a Git Bash executable.";
+
+/** Where a successful resolution came from. Exported for pinning. */
+export type BashProgramSource = "configured" | "candidate" | "path" | "posix-fallback";
+
+/**
+ * The result of inspecting the bash interpreter. Callers use `resolved` to
+ * distinguish "no usable interpreter" (surface `reason`) from a resolved
+ * `program`; `resolveBashProgram` throws on the former for existing callers.
+ */
+export type BashProgramResolution =
+  | { resolved: true; program: string; source: BashProgramSource }
+  | { resolved: false; reason: string; wslLauncherPath?: string };
+
+/** Injectable seams so resolution can be pinned without host installs. */
+export interface BashProgramDeps {
+  platform?: NodeJS.Platform;
+  exists?: (candidate: string) => boolean;
+  env?: Record<string, string | undefined>;
 }
 
-/** Resolve the interpreter for the `bash` tool. Exported for pinning. */
-export function resolveBashProgram(cfg: { tools?: { bash_path?: string } }): string {
+function isWslLauncher(candidate: string): boolean {
+  // Accept either separator: configured values and PATH entries can be written
+  // with forward slashes even on Windows.
+  return /\\system32\\bash\.exe$/i.test(candidate.replace(/\//g, "\\"));
+}
+
+function unquotePathEntry(entry: string): string {
+  const trimmed = entry.trim();
+  return trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')
+    ? trimmed.slice(1, -1)
+    : trimmed;
+}
+
+function joinPath(platform: NodeJS.Platform, dir: string, leaf: string): string {
+  const separator = platform === "win32" ? "\\" : "/";
+  return `${dir.replace(/[\\/]+$/, "")}${separator}${leaf}`;
+}
+
+/** First `bash` a bare spawn would find on PATH, if any. */
+function findBashOnPath(
+  platform: NodeJS.Platform,
+  env: Record<string, string | undefined>,
+  exists: (candidate: string) => boolean,
+): string | undefined {
+  const pathValue = env.PATH ?? env.Path ?? env.path ?? "";
+  const delimiter = platform === "win32" ? ";" : ":";
+  const leaf = platform === "win32" ? "bash.exe" : "bash";
+  for (const rawEntry of pathValue.split(delimiter)) {
+    const entry = unquotePathEntry(rawEntry);
+    if (!entry) continue;
+    const candidate = joinPath(platform, entry, leaf);
+    if (exists(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** Inspect the interpreter for the `bash` tool without throwing. */
+export function inspectBashProgram(
+  cfg: { tools?: { bash_path?: string } },
+  deps: BashProgramDeps = {},
+): BashProgramResolution {
+  const platform = deps.platform ?? process.platform;
+  const exists = deps.exists ?? existsSync;
+  const env = deps.env ?? process.env;
+
   const configured = cfg.tools?.bash_path?.trim();
   if (configured) {
     if (isWslLauncher(configured)) {
-      throw new Error(
-        "tools.bash_path points at the WSL launcher (System32\\bash.exe). " +
-          "Set it to a Git Bash executable, or clear it to auto-resolve.",
-      );
+      return { resolved: false, reason: CONFIGURED_WSL_REASON, wslLauncherPath: configured };
     }
-    return configured;
+    return { resolved: true, program: configured, source: "configured" };
   }
 
-  if (process.platform === "win32") {
-    const found = WINDOWS_BASH_CANDIDATES.find((c) => !isWslLauncher(c) && existsSync(c));
-    if (found) return found;
+  // POSIX is unchanged: `bash` on PATH is the expected interpreter.
+  if (platform !== "win32") {
+    return { resolved: true, program: "bash", source: "posix-fallback" };
   }
 
-  // POSIX, or Windows with no Git Bash installed: fall back to PATH lookup.
-  return "bash";
+  const found = WINDOWS_BASH_CANDIDATES.find((c) => !isWslLauncher(c) && exists(c));
+  if (found) return { resolved: true, program: found, source: "candidate" };
+
+  // No Git Bash install: resolve what a bare spawn would actually run so the
+  // WSL launcher is refused here rather than silently executed.
+  const onPath = findBashOnPath(platform, env, exists);
+  if (onPath) {
+    if (isWslLauncher(onPath)) {
+      return { resolved: false, reason: PATH_WSL_REASON, wslLauncherPath: onPath };
+    }
+    return { resolved: true, program: onPath, source: "path" };
+  }
+
+  return { resolved: false, reason: NO_GIT_BASH_REASON };
+}
+
+/**
+ * Resolve the interpreter for the `bash` tool. Throws with the same shaped
+ * error as the configured-WSL path when no usable Git Bash exists.
+ */
+export function resolveBashProgram(
+  cfg: { tools?: { bash_path?: string } },
+  deps: BashProgramDeps = {},
+): string {
+  const resolution = inspectBashProgram(cfg, deps);
+  if (!resolution.resolved) throw new Error(resolution.reason);
+  return resolution.program;
 }
 
 function shellTimeout(
