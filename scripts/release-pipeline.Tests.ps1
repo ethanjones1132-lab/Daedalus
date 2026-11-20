@@ -1,6 +1,39 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
+function Format-JarvisChildArgument {
+    # Start-Process joins -ArgumentList with single spaces and adds no quoting
+    # of its own, so an argument that contains a space has to arrive quoted.
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    if ($Value -match '[\s"]') { return '"' + $Value.Replace('"', '\"') + '"' }
+    return $Value
+}
+
+function Invoke-JarvisFixtureGit {
+    <#
+    .SYNOPSIS
+        Run one git command for a fixture, with a hard timeout.
+
+    .DESCRIPTION
+        DD-126: `& git` waits for the child with no bound at all. A git that
+        stops answering would hang the release gate instead of failing the
+        fixture, so every fixture command goes through the bounded runner.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Repository,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Step,
+        [switch]$MergeStandardError
+    )
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) { throw 'git_fixture_git_missing' }
+    $quoted = @('-C', (Format-JarvisChildArgument $Repository))
+    foreach ($argument in @($Arguments)) { $quoted += Format-JarvisChildArgument $argument }
+    return Invoke-JarvisBoundedChild -FilePath $git.Source -ArgumentList $quoted `
+        -Step $Step -TimeoutMs 60000 -MergeStandardError:$MergeStandardError
+}
+
 function New-JarvisGitFixture {
     param([Parameter(Mandatory = $true)][string]$Name, [switch]$WithPrompts)
 
@@ -14,16 +47,18 @@ function New-JarvisGitFixture {
         New-Item -ItemType Directory -Force -Path $prompts | Out-Null
         'fixture prompt' | Set-Content -LiteralPath (Join-Path $prompts 'system.md')
     }
-    & git -C $root init --quiet
-    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_init_failed' }
-    & git -C $root config user.name 'Pester Fixture'
-    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_config_failed' }
-    & git -C $root config user.email 'pester-fixture@example.invalid'
-    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_config_failed' }
-    & git -C $root add --all
-    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_add_failed' }
-    & git -C $root commit --quiet -m 'fixture'
-    if ($LASTEXITCODE -ne 0) { throw 'git_fixture_commit_failed' }
+    $steps = @(
+        @{ arguments = @('init', '--quiet'); failure = 'git_fixture_init_failed' }
+        @{ arguments = @('config', 'user.name', '"Pester Fixture"'); failure = 'git_fixture_config_failed' }
+        @{ arguments = @('config', 'user.email', 'pester-fixture@example.invalid'); failure = 'git_fixture_config_failed' }
+        @{ arguments = @('add', '--all'); failure = 'git_fixture_add_failed' }
+        @{ arguments = @('commit', '--quiet', '-m', 'fixture'); failure = 'git_fixture_commit_failed' }
+    )
+    foreach ($step in $steps) {
+        $result = Invoke-JarvisFixtureGit -Repository $root -Arguments $step.arguments `
+            -Step "git_$($step.arguments[0])"
+        if ($result.exit_code -ne 0) { throw $step.failure }
+    }
     return $root
 }
 

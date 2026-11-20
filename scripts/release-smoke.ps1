@@ -44,6 +44,13 @@
     are covered by scripts/release-pipeline.Tests.ps1 without needing an
     installer, a certificate or an inference backend.
 
+    Every child this script waits on is bounded (DD-126): the install and the
+    uninstall through Wait-JarvisChildExit (WaitForExit(ms)), the app's
+    bootstrap pipe through a connect deadline, the owned-process teardown
+    through CleanupDeadline, and the health and chat reads through their own
+    deadlines. A step that runs out of budget prints one line naming the step
+    and the last line the child wrote, then fails. It never blocks.
+
 .PARAMETER ManifestPath
     The jarvis-release.json written by release-build.ps1.
 
@@ -404,7 +411,15 @@ if (-not $SkipLaunch) {
 
 } finally {
     try {
-        if ($serverProcess) { Stop-JarvisOwnedProcesses -Process $serverProcess }
+        if ($serverProcess) {
+            # DD-126: teardown is a child wait too. The CIM enumeration that
+            # finds the server the app spawned must not outlive the smoke's
+            # own verdict, so it gets a deadline; a lost query warns instead
+            # of turning a finished run into a hang.
+            Stop-JarvisOwnedProcesses -Process $serverProcess -CleanupDeadline ((Get-Date).AddSeconds(20))
+        }
+    } catch {
+        Write-Warn "owned process teardown failed: $($_.Exception.Message)"
     } finally {
         if ($installOwned) {
             Remove-JarvisReleaseScratchInstall -InstallRoot $InstallRoot
