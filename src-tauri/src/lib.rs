@@ -8,6 +8,7 @@ pub mod notifications;
 pub mod parsers;
 mod process_lifecycle;
 mod single_instance;
+mod startup_readiness;
 pub mod supervisor;
 pub mod types;
 pub mod wsl;
@@ -2427,6 +2428,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         crate::wsl::hide_windows_console(&mut command);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        startup_readiness::note_sidecar_spawn_issued();
         let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
@@ -2454,6 +2456,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         }
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        startup_readiness::note_sidecar_spawn_issued();
         let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
@@ -2477,6 +2480,7 @@ fn spawn_jarvis_server(entry: &str) -> Result<std::process::Child, String> {
         local_api::configure_bun(&mut command, false);
         let spawn_started = std::time::Instant::now();
         log::info!(target: "jarvis::startup", "Bun Command::spawn starting; monotonic={:?}", spawn_started);
+        startup_readiness::note_sidecar_spawn_issued();
         let result = process_lifecycle::spawn_managed(&mut command);
         let spawn_returned = std::time::Instant::now();
         log::info!(
@@ -3087,6 +3091,7 @@ pub(crate) async fn ensure_jarvis_server_started_outcome() -> BunServerStart {
             }
         },
         || {
+            startup_readiness::note_server_healthy();
             LAST_HEALTHY_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
         },
     )
@@ -3483,6 +3488,11 @@ async fn bootstrap_services(handle: tauri::AppHandle) {
     // required service and relaunch it under the bounded supervisor policy.
     crate::supervisor::spawn_supervisor(handle.clone());
 
+    // DD-140: everything boot does is done here. `bootstrap_services` never
+    // actually returns — the cron scheduler loop below owns this thread for the
+    // rest of the process lifetime — so this is the "bootstrap returning" stage.
+    startup_readiness::note_bootstrap_returned();
+
     // The scheduler loop owns this dedicated runtime after boot completes.
     crate::cron_scheduler::start_cron_scheduler(handle).await;
 }
@@ -3607,6 +3617,7 @@ const APP_LOG_LEVEL: log::LevelFilter = log::LevelFilter::Info;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_readiness::note_process_start();
     let instance = match single_instance::acquire() {
         Ok(instance) => instance,
         Err(error) => {
@@ -3709,6 +3720,17 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_shell::init())
+        // DD-140: the first finished page load of the main webview is the
+        // earliest "the window actually shows the app" point the app exposes.
+        // The window itself is created and shown from tauri.conf.json before
+        // the run loop starts, so the boot order is untouched.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Finished
+                && webview.label() == "main"
+            {
+                startup_readiness::note_window_shown();
+            }
+        })
         .manage(jarvis_state)
         .manage(db)
         .manage(build_hermes_app_state())
