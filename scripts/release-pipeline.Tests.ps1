@@ -114,6 +114,114 @@ Describe 'the bounded child runner' {
     }
 }
 
+Describe 'the bounded child wait' {
+    # DD-126 follow-up: the deadline itself has to be pinned, not just the
+    # runner that happens to use it. Wait-JarvisChildExit is the single hard
+    # bound, so a child that does not exit must fail its step inside the budget
+    # with one line naming the step and quoting the last thing the child wrote.
+    # The children below sleep far longer than the budget, which is what makes
+    # a removed bound visible: the wait then returns only when the child ends.
+
+    It 'fails a child that does not exit inside its budget and quotes its last output' {
+        $shell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        if (-not $shell) { throw 'powershell_missing' }
+        $stdout = Join-Path $TestDrive ('wait-child-' + [guid]::NewGuid().ToString('N') + '.log')
+        $marker = 'wait-child-still-running'
+        $command = "[Console]::Out.WriteLine('$marker'); [Console]::Out.Flush(); Start-Sleep -Seconds 30"
+        $child = Start-JarvisChildProcess -FilePath $shell.Source `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', (Format-JarvisChildArgument $command)) `
+            -StandardOutputPath $stdout
+        try {
+            # The diagnostic can only quote the child's line once the child has
+            # written it, so wait (bounded) for the log to carry it before the
+            # step's own budget starts.
+            $deadline = (Get-Date).AddSeconds(10)
+            while ((Get-Date) -lt $deadline) {
+                if ((Test-Path -LiteralPath $stdout) -and
+                    ((Get-JarvisChildOutputTail -Path @($stdout)) -eq $marker)) { break }
+                Start-Sleep -Milliseconds 50
+            }
+            $started = Get-Date
+            $message = $null
+            try {
+                $null = Wait-JarvisChildExit -Process $child.process -Step 'pinned_wait' `
+                    -TimeoutMs 300 -OutputPaths @($stdout)
+            } catch {
+                $message = $_.Exception.Message
+            }
+            # The 300ms bound, not the child's 30 seconds, ended the wait.
+            ((Get-Date) - $started).TotalSeconds | Should BeLessThan 10
+            # With the bound removed this is $null: the wait returns after the
+            # child exits instead of throwing.
+            $message | Should Not BeNullOrEmpty
+            $message | Should Match '^pinned_wait_timeout:pinned_wait after 300ms \(last output: wait-child-still-running\)$'
+            # One line, so no later log line can bury the reason.
+            $message.Contains("`n") | Should Be $false
+        } finally {
+            if ($child -and -not $child.process.HasExited) {
+                Stop-Process -Id $child.process.Id -Force -ErrorAction SilentlyContinue
+            }
+            Complete-JarvisChildOutput -Child $child
+            try { $child.process.Dispose() } catch { }
+        }
+    }
+
+    It 'throws the timeout diagnostic and kills a child that never exits instead of returning' {
+        $shell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        if (-not $shell) { throw 'powershell_missing' }
+        # A unique token in the child's command line makes the kill observable
+        # without racing the child for a file it may never get to write.
+        $childMarker = 'bounded-child-' + [guid]::NewGuid().ToString('N')
+        $command = "[Console]::Out.WriteLine('$childMarker'); [Console]::Out.Flush(); Start-Sleep -Seconds 30"
+        $started = Get-Date
+        $result = $null
+        $message = $null
+        try {
+            $result = Invoke-JarvisBoundedChild -FilePath $shell.Source `
+                -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', (Format-JarvisChildArgument $command)) `
+                -Step 'pinned_bounded' -TimeoutMs 300
+        } catch {
+            $message = $_.Exception.Message
+        }
+        # The 300ms bound, not the child's 30 seconds, ended the call.
+        ((Get-Date) - $started).TotalSeconds | Should BeLessThan 10
+        # A bound that is removed would wait the child out and return here.
+        $result | Should BeNullOrEmpty
+        $message | Should Match '^pinned_bounded_timeout:pinned_bounded:'
+        $message | Should Match ' after 300ms \(last output: .*\)$'
+        # Bounded observation that the kill took effect: if the child survived,
+        # the token stays in a live command line and the assertion fails.
+        # This process must come back with a command line first, so "no
+        # survivor" cannot mean "the query returned nothing".
+        ((Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue).CommandLine) |
+            Should Not BeNullOrEmpty
+        $deadline = (Get-Date).AddSeconds(10)
+        $survivors = @()
+        while ($true) {
+            $survivors = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($childMarker) })
+            if ($survivors.Count -eq 0 -or (Get-Date) -ge $deadline) { break }
+            Start-Sleep -Milliseconds 100
+        }
+        $survivors.Count | Should Be 0
+    }
+
+    It 'returns the exit code and output of a child that exits inside its budget' {
+        # The bound must not swallow the success path: a child that finishes in
+        # time still returns its own code and the lines it wrote.
+        $shell = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        if (-not $shell) { throw 'powershell_missing' }
+        $command = "[Console]::Out.WriteLine('bounded-child-finished'); [Console]::Out.Flush(); exit 7"
+        $result = Invoke-JarvisBoundedChild -FilePath $shell.Source `
+            -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', (Format-JarvisChildArgument $command)) `
+            -Step 'pinned_finished' -TimeoutMs 15000
+        $result | Should Not BeNullOrEmpty
+        $result.step | Should Be 'pinned_finished'
+        $result.exit_code | Should Be 7
+        (@($result.output) -contains 'bounded-child-finished') | Should Be $true
+    }
+}
+
 Describe 'source tree digest' {
     It 'produces a 64 character uppercase hex digest' {
         $digest = Get-JarvisSourceTreeSha256 -RepoRoot $repoRoot
