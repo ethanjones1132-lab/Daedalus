@@ -47,6 +47,16 @@ Rules the script keeps:
 If an input is missing in the main checkout too, the script exits 1, names the
 directory, and prints the build command above instead of guessing.
 
+For the full Rust gate (`cargo test --lib`) on Windows, `scripts/verify-rust.ps1`
+builds both inputs from source in the current checkout (no copy from another
+worktree) and runs the tests in one command:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-rust.ps1
+```
+
+See `release-pipeline.md` ("Checking the Rust crate in a fresh worktree").
+
 ## Checking the script itself
 
 The script finds the repo through git, so run it from inside a checkout — a

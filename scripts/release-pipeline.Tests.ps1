@@ -1045,3 +1045,177 @@ Describe 'the smoke launches the installed app' {
         $smoke | Should Not Match 'Start-JarvisServerBundle'
     }
 }
+
+Describe 'compiling the Rust crate in a fresh worktree' {
+    # `cargo test --lib` cannot run in a freshly cloned worktree. Tauri's build
+    # script and generate_context!() need two gitignored inputs - the server
+    # bundle under server-jarvis/dist and src-ui/dist (frontendDist) - that only
+    # a frontend build produces. scripts/verify-rust.ps1 is the one command that
+    # produces them and runs the tests, so a reviewer has a gate check.
+    #
+    # Every test here drives it with batch stubs for bun and cargo: the stub
+    # records its working directory and argv and exits with a chosen code, so
+    # nothing here builds, compiles or touches a real toolchain.
+
+    function New-VerifyRustFixture {
+        param([switch]$WithBuildOutputs)
+
+        $root = Join-Path ([IO.Path]::GetTempPath()) ('verify-rust-fixture-' + [guid]::NewGuid().ToString('N'))
+        foreach ($relative in @('server-jarvis\dist', 'src-ui\dist', 'src-tauri')) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $root $relative) | Out-Null
+        }
+        "[package]`nname = `"fixture`"`nversion = `"1.0.0`"" |
+            Set-Content -LiteralPath (Join-Path $root 'src-tauri\Cargo.toml')
+        if ($WithBuildOutputs) {
+            'server bundle' | Set-Content -LiteralPath (Join-Path $root 'server-jarvis\dist\index.js')
+            'tokenizer' | Set-Content -LiteralPath (Join-Path $root 'server-jarvis\dist\tokenizer.cjs')
+            'mcp stdio' | Set-Content -LiteralPath (Join-Path $root 'server-jarvis\dist\mcp-stdio-server.js')
+            '<!doctype html>' | Set-Content -LiteralPath (Join-Path $root 'src-ui\dist\index.html')
+        }
+        return $root
+    }
+
+    function New-VerifyRustStub {
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)][string]$Name,
+            [int]$ExitCode = 0
+        )
+
+        # A batch stub, not bun or cargo. `%CD%` and `%*` are what let the
+        # tests assert the step ran in the right package with the right argv.
+        @(
+            '@echo off'
+            ('echo {0} %CD% ^| %* >> "%VERIFY_RUST_STUB_LOG%"' -f $Name)
+            ('exit /b {0}' -f $ExitCode)
+        ) | Set-Content -LiteralPath $Path
+        return $Path
+    }
+
+    function Invoke-VerifyRust {
+        param(
+            [Parameter(Mandatory = $true)][string]$VerifyScript,
+            [Parameter(Mandatory = $true)][string]$RepoRoot,
+            [Parameter(Mandatory = $true)][string]$Bun,
+            [Parameter(Mandatory = $true)][string]$Cargo,
+            [Parameter(Mandatory = $true)][string]$StubLog
+        )
+
+        # Exactly the command the help text and docs give a reviewer.
+        $env:VERIFY_RUST_STUB_LOG = $StubLog
+        try {
+            return & powershell -NoProfile -ExecutionPolicy Bypass -File $VerifyScript `
+                -RepoRoot $RepoRoot -BunCommand $Bun -CargoCommand $Cargo 2>&1 | Out-String
+        } finally {
+            Remove-Item Env:\VERIFY_RUST_STUB_LOG -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'is one command the docs give a reviewer for a fresh gate worktree' {
+        $verify = Join-Path $repoRoot 'scripts\verify-rust.ps1'
+        $verify | Should Exist
+
+        $source = Get-Content -Raw -LiteralPath $verify
+        $source | Should Match 'NoProfile -ExecutionPolicy Bypass -File scripts\\verify-rust\.ps1'
+        $source | Should Match 'VERIFY-RUST: FAIL'
+
+        $docs = Get-Content -Raw -LiteralPath (Join-Path $repoRoot 'docs\release-pipeline.md')
+        $docs | Should Match 'verify-rust\.ps1'
+        $docs | Should Match 'NoProfile -ExecutionPolicy Bypass'
+    }
+
+    It 'builds both Tauri inputs and runs cargo test --lib in src-tauri' {
+        $fixture = New-VerifyRustFixture -WithBuildOutputs
+        try {
+            $stubLog = Join-Path $fixture 'stub-calls.log'
+            $bun = New-VerifyRustStub -Path (Join-Path $fixture 'stub-bun.cmd') -Name 'bun'
+            $cargo = New-VerifyRustStub -Path (Join-Path $fixture 'stub-cargo.cmd') -Name 'cargo'
+
+            $output = Invoke-VerifyRust -VerifyScript (Join-Path $repoRoot 'scripts\verify-rust.ps1') `
+                -RepoRoot $fixture -Bun $bun -Cargo $cargo -StubLog $stubLog
+            $exitCode = $LASTEXITCODE
+
+            $exitCode | Should Be 0
+            $output | Should Match 'VERIFY-RUST: PASS'
+
+            # The batch stub echoes its argv with a trailing space, so trim before
+            # matching against the anchored patterns below.
+            $calls = @(Get-Content -LiteralPath $stubLog -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.Trim() })
+
+            # Both dists come from the projects' own build scripts, not from a
+            # hand-rolled bun build line in this script.
+            @($calls | Where-Object { $_ -match '^bun .*server-jarvis \| run build$' }).Count | Should Be 1
+            @($calls | Where-Object { $_ -match '^bun .*src-ui \| run build$' }).Count | Should Be 1
+
+            # The cargo step exists, runs in src-tauri, and asks for the lib
+            # tests only. If the step is removed this count is 0 and the test
+            # fails.
+            $cargoCalls = @($calls | Where-Object { $_ -match '^cargo ' })
+            $cargoCalls.Count | Should Be 1
+            $cargoCalls[0] | Should Match '^cargo .*src-tauri \| test --lib$'
+        } finally {
+            Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'exits non-zero when cargo test exits non-zero' {
+        $fixture = New-VerifyRustFixture -WithBuildOutputs
+        try {
+            $stubLog = Join-Path $fixture 'stub-calls.log'
+            $bun = New-VerifyRustStub -Path (Join-Path $fixture 'stub-bun.cmd') -Name 'bun'
+            $cargo = New-VerifyRustStub -Path (Join-Path $fixture 'stub-cargo.cmd') -Name 'cargo' -ExitCode 7
+
+            $output = Invoke-VerifyRust -VerifyScript (Join-Path $repoRoot 'scripts\verify-rust.ps1') `
+                -RepoRoot $fixture -Bun $bun -Cargo $cargo -StubLog $stubLog
+            $exitCode = $LASTEXITCODE
+
+            $exitCode | Should Not Be 0
+            $output | Should Match 'VERIFY-RUST: FAIL - cargo test --lib failed'
+        } finally {
+            Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails when the build produced no server bundle' {
+        $fixture = New-VerifyRustFixture
+        try {
+            $stubLog = Join-Path $fixture 'stub-calls.log'
+            $bun = New-VerifyRustStub -Path (Join-Path $fixture 'stub-bun.cmd') -Name 'bun'
+            $cargo = New-VerifyRustStub -Path (Join-Path $fixture 'stub-cargo.cmd') -Name 'cargo'
+
+            $output = Invoke-VerifyRust -VerifyScript (Join-Path $repoRoot 'scripts\verify-rust.ps1') `
+                -RepoRoot $fixture -Bun $bun -Cargo $cargo -StubLog $stubLog
+            $exitCode = $LASTEXITCODE
+
+            $exitCode | Should Not Be 0
+            $output | Should Match 'build_output_missing: server-jarvis\\dist\\index\.js'
+            # The Rust step is not reached, so the failure names the input the
+            # reviewer has to produce, not a cargo error they cannot act on.
+            $cargoCalls = @(Get-Content -LiteralPath $stubLog -ErrorAction SilentlyContinue |
+                Where-Object { $_ -match '^cargo ' })
+            $cargoCalls.Count | Should Be 0
+        } finally {
+            Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'fails when the build produced no ui bundle' {
+        $fixture = New-VerifyRustFixture -WithBuildOutputs
+        try {
+            Remove-Item -LiteralPath (Join-Path $fixture 'src-ui\dist\index.html') -Force
+            $stubLog = Join-Path $fixture 'stub-calls.log'
+            $bun = New-VerifyRustStub -Path (Join-Path $fixture 'stub-bun.cmd') -Name 'bun'
+            $cargo = New-VerifyRustStub -Path (Join-Path $fixture 'stub-cargo.cmd') -Name 'cargo'
+
+            $output = Invoke-VerifyRust -VerifyScript (Join-Path $repoRoot 'scripts\verify-rust.ps1') `
+                -RepoRoot $fixture -Bun $bun -Cargo $cargo -StubLog $stubLog
+            $exitCode = $LASTEXITCODE
+
+            $exitCode | Should Not Be 0
+            $output | Should Match 'build_output_missing: src-ui\\dist\\index\.html'
+        } finally {
+            Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}

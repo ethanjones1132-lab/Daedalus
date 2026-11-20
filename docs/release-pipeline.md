@@ -260,6 +260,45 @@ existing state. It refuses a preexisting listener, checks ownership before
 crediting the Bun server, and terminates only its own proven process tree.
 It is not a clean-profile test; uncertain orphan ancestry is preserved.
 
+## Checking the Rust crate in a fresh worktree
+
+`cargo test --lib` does not run in a freshly cloned worktree. Tauri's build
+script and `tauri::generate_context!()` (`src-tauri/src/lib.rs`,
+`src-tauri/build.rs`) need two gitignored inputs that only a frontend build
+produces:
+
+| Input | Produced by |
+|---|---|
+| `server-jarvis/dist/index.js` (plus `tokenizer.cjs`, `mcp-stdio-server.js`) | `server-jarvis/src/build-frontend.ts`, the same bundler `beforeBuildCommand` calls |
+| `src-ui/dist` (`frontendDist`) | the `src-ui` `build` script (`tsc -b && vite build`) |
+
+`scripts/verify-rust.ps1` produces both and runs the library tests. It is the
+one command a reviewer needs in a fresh gate worktree:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-rust.ps1
+```
+
+Run it from the worktree it should verify. It installs the two packages'
+dependencies when `node_modules/` is absent (`bun install --frozen-lockfile`),
+builds through each project's own `build` script, then runs
+`cargo test --lib` in `src-tauri`. It writes only inside that checkout, and
+only gitignored outputs (`node_modules/`, `dist/`, `src-tauri/target/`), so it
+leaves nothing to commit.
+
+Step output is captured and repeated only for the step that failed, so a green
+run ends with one line:
+
+```
+VERIFY-RUST: PASS - rust lib tests passed (123s)
+```
+
+A failure ends with `VERIFY-RUST: FAIL - <why>`, shows the failed step's output,
+and exits non-zero, so it can be a gate check in a shell, a script or a CI
+step. `-RepoRoot` points it at another checkout; `-BunCommand` and
+`-CargoCommand` let `scripts/release-pipeline.Tests.ps1` drive it with stubs
+instead of spending a cargo build inside Pester.
+
 ## Tests
 
 `scripts/release-pipeline.Tests.ps1` and `scripts/release-review.Tests.ps1` cover the decisions the pipeline
