@@ -1461,6 +1461,48 @@ describe("pipeline stage telemetry", () => {
     expect(listCalls[1]?.output).toContain("choose a NEW target");
   });
 
+  test("identical read_file calls in one executor step both return the file contents", async () => {
+    const rows: StageRun[] = [];
+    const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };
+    const runtime = createToolRuntime();
+    let readRuns = 0;
+    runtime.register(toolDefinition("read_file"), async () => {
+      readRuns++;
+      return "export const answer = 42;";
+    });
+    const ctx = makeExecutionContext("agent", defaultConfig(), { workspace_path: process.cwd() });
+    let executorTurns = 0;
+    const callModel = async (_messages: unknown[], options: { stageLabel?: string } = {}) => {
+      if (options.stageLabel === "executor" && executorTurns++ === 0) {
+        return {
+          content: "read the file twice",
+          tool_calls: [
+            toolCallWithArgs("read_file", { path: "src/answer.ts" }),
+            toolCallWithArgs("read_file", { path: "src/answer.ts" }),
+          ],
+        };
+      }
+      if (options.stageLabel === "executor") return { content: "done" };
+      if (options.stageLabel === "synthesizer") return { content: "The answer is 42." };
+      return { content: "unexpected" };
+    };
+
+    const executor = new PipelineExecutor(callModel as any, runtime, ctx, collector);
+    const result = await executor.execute(
+      "read src/answer.ts twice",
+      ["executor", "synthesizer"],
+      "run-duplicate-read-contents",
+      () => {},
+      { executionProfile: "read_only" },
+    );
+
+    expect(readRuns).toBe(1);
+    const reads = (result.toolCalls ?? []).filter((call) => call.name === "read_file");
+    expect(reads).toHaveLength(2);
+    expect(reads[0]?.output).toContain("export const answer = 42;");
+    expect(reads[1]?.output).toContain("export const answer = 42;");
+  });
+
   test("a write tool invalidates duplicate read-only deflection within the executor stage", async () => {
     const rows: StageRun[] = [];
     const collector: StageRunRecorder = { recordStageRun: (row) => rows.push(row) };

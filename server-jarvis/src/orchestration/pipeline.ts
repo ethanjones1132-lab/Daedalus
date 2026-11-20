@@ -584,8 +584,8 @@ export function isTruncatedReadResult(
 }
 
 export function duplicateToolCallDeflection(call: ToolCall, firstOutput: string | undefined): ToolResult {
-  const previous = firstOutput && firstOutput.trim().length > 0
-    ? ` Serving the cached result of that identical call below — do not repeat it again; use offset/limit or a new target for anything more.\n${firstOutput}`
+  const previous = firstOutput !== undefined
+    ? ` Serving the cached result of that identical call below — do not repeat it again; choose a NEW target only for anything beyond these contents.\n${firstOutput}`
     : "\nchoose a NEW target instead of repeating the same read-only call.";
   return {
     call_id: call.id,
@@ -1529,6 +1529,13 @@ export class PipelineExecutor {
       this.publishToolTrace({ kind: "use", call });
     }
     const readOnlyOutputCache = duplicateReadOnlyOutputs;
+    // Calls in one read-only batch execute concurrently. Share the first
+    // execution's result with an identical call in that same batch instead
+    // of treating the not-yet-populated cache as a cache miss.
+    const inFlightReadOnlyOutputs = new Map<
+      string,
+      Promise<{ cacheEntry: ReadOnlyCacheEntry; result: ToolResult }>
+    >();
     const cacheInvalidatingTools = new Set([
       ...WRITE_EFFECT_TOOLS,
       ...this.runtime.listTools()
@@ -1579,14 +1586,43 @@ export class PipelineExecutor {
                 deflected: true,
               };
             }
-            readOnlyOutputCache.set(duplicateKey, { output: "", truncated: false });
-            const result = await this.runToolCall(entry.raw, options, entry.call);
-            const text = toolResultModelText(result);
-            const truncated = result.is_error
-              ? false
-              : isTruncatedReadResult(entry.call.name, text);
-            readOnlyOutputCache.set(duplicateKey, { output: text, truncated });
-            return { entry, result, duplicateKey, deflected: false };
+            const pending = inFlightReadOnlyOutputs.get(duplicateKey);
+            if (pending) {
+              const shared = await pending;
+              if (!shared.cacheEntry.truncated) {
+                if (shared.cacheEntry.output.trim().length > 0) {
+                  this.markReadLedgerForCall(entry.call, shared.cacheEntry.output);
+                }
+                return {
+                  entry,
+                  result: duplicateToolCallDeflection(entry.call, shared.cacheEntry.output),
+                  duplicateKey,
+                  deflected: true,
+                };
+              }
+            }
+            const execution = (async () => {
+              const result = await this.runToolCall(entry.raw, options, entry.call);
+              const text = toolResultModelText(result);
+              const truncated = result.is_error
+                ? false
+                : isTruncatedReadResult(entry.call.name, text);
+              const cacheEntry = { output: text, truncated };
+              readOnlyOutputCache.set(duplicateKey, cacheEntry);
+              return { cacheEntry, result };
+            })();
+            inFlightReadOnlyOutputs.set(duplicateKey, execution);
+            try {
+              const executed = await execution;
+              return {
+                entry,
+                result: executed.result,
+                duplicateKey,
+                deflected: false,
+              };
+            } finally {
+              inFlightReadOnlyOutputs.delete(duplicateKey);
+            }
           }
           const result = await this.runToolCall(entry.raw, options, entry.call);
           return { entry, result, duplicateKey: undefined, deflected: false };
