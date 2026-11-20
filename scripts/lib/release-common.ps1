@@ -411,6 +411,202 @@ function Get-JarvisReleaseVersion {
     return $distinct[0]
 }
 
+# ── WebView2 install mode ────────────────────────────────────────────────────
+# bundle.windows.webviewInstallMode decides what the NSIS installer does about
+# the WebView2 runtime. When the key is absent Tauri silently falls back to its
+# implicit default (downloadBootstrapper, with silent=true), so nothing in the
+# tree or in the release record says how a machine without WebView2 is
+# provisioned. The release states the mode explicitly (embedBootstrapper: the
+# small bootstrapper, not the ~130 MB offline installer) and the build refuses
+# a config that quietly reverted to the default. See docs/release-pipeline.md.
+
+function Get-JarvisWebViewInstallMode {
+    <#
+    .SYNOPSIS
+        The explicit WebView2 install mode in a tauri.conf.json.
+
+    .DESCRIPTION
+        Returns an object with `ok`, `mode`, `key`, `config` and `reason`.
+        `ok` is false when the config cannot be read, when the key is absent,
+        or when it is left at Tauri's implicit default; `reason` then names
+        both the file and the key so the fix is obvious.
+
+        `webviewInstallMode` is normally an object
+        ({ "type": "embedBootstrapper" }) but Tauri also accepts the bare mode
+        string in some positions, so both shapes are read. Only the mode is
+        interpreted here; `silent` and `fixedRuntime` paths are Tauri's
+        business.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    # Tauri's documented default when the key is absent:
+    # { "silent": true, "type": "downloadBootstrapper" }.
+    $implicitDefault = 'downloadBootstrapper'
+    $key = 'bundle.windows.webviewInstallMode'
+
+    $result = [pscustomobject]@{
+        ok     = $false
+        mode   = $null
+        key    = $key
+        config = $ConfigPath
+        reason = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        $result.reason = "webview_install_mode_config_missing:${ConfigPath}:${key}"
+        return $result
+    }
+
+    try {
+        $config = Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
+    } catch {
+        $result.reason = "webview_install_mode_config_unreadable:${ConfigPath}:${key}:$($_.Exception.Message)"
+        return $result
+    }
+
+    $windows = $null
+    if ($config -and $config.PSObject.Properties['bundle'] -and $config.bundle) {
+        $bundle = $config.bundle
+        if ($bundle.PSObject.Properties['windows'] -and $bundle.windows) {
+            $windows = $bundle.windows
+        }
+    }
+
+    $node = $null
+    if ($windows -and $windows.PSObject.Properties['webviewInstallMode']) {
+        $node = $windows.PSObject.Properties['webviewInstallMode'].Value
+    }
+    if ($null -eq $node) {
+        $result.reason = "webview_install_mode_missing:${ConfigPath}:${key}"
+        return $result
+    }
+
+    $mode = $null
+    if ($node -is [string]) {
+        $mode = $node.Trim()
+    } elseif ($node.PSObject.Properties['type']) {
+        $mode = [string]$node.type
+    }
+    if ([string]::IsNullOrWhiteSpace($mode)) {
+        $result.reason = "webview_install_mode_unreadable:${ConfigPath}:${key}:expected_type"
+        return $result
+    }
+    if ($mode -eq $implicitDefault) {
+        $result.reason = "webview_install_mode_implicit_default:${ConfigPath}:${key}:${mode}"
+        return $result
+    }
+
+    $result.mode = $mode
+    $result.ok = $true
+    return $result
+}
+
+function Test-JarvisWebViewInstallModeRecorded {
+    <#
+    .SYNOPSIS
+        Check that a release record names the installer and its WebView2 mode.
+
+    .DESCRIPTION
+        The build can only be trusted to have shipped what the config asked
+        for if the record says so. This reads the record the pipeline already
+        writes (jarvis-release.json) and requires:
+
+          * the schema is the one this tree writes;
+          * it carries an `installer` file entry with a name;
+          * `installer_name` is not blank;
+          * `webview_install_mode` states a mode;
+          * when `ExpectedMode` is given, that mode is the one recorded.
+
+        Returns an object with `ok`, `mode`, `installer_name` and `reason`;
+        `reason` is prefixed with `webview_install_mode_record_` so a failure
+        names the record and the key rather than just saying "no".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $Manifest,
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath,
+        [string]$ExpectedMode,
+        # Optional. When given, the record must name this exact file.
+        [string]$InstallerPath
+    )
+
+    $result = [pscustomobject]@{
+        ok             = $false
+        mode           = $null
+        installer_name = $null
+        reason         = $null
+    }
+
+    if (-not $Manifest -or -not $Manifest.PSObject.Properties['schema']) {
+        $result.reason = "release_manifest_malformed:${ManifestPath}:schema"
+        return $result
+    }
+    if ([string]$Manifest.schema -ne (Get-JarvisReleaseSchema)) {
+        $result.reason = "release_manifest_malformed:${ManifestPath}:schema=$($Manifest.schema)"
+        return $result
+    }
+    if (-not $Manifest.PSObject.Properties['files']) {
+        $result.reason = "release_manifest_malformed:${ManifestPath}:files"
+        return $result
+    }
+
+    $entries = @($Manifest.files)
+    if (-not ($entries | Where-Object { $_ -and $_.role -eq 'installer' })) {
+        $result.reason = "webview_install_mode_record_installer_missing:${ManifestPath}:files[role=installer]"
+        return $result
+    }
+
+    $recordedName = ''
+    if ($Manifest.PSObject.Properties['installer_name']) {
+        $recordedName = [string]$Manifest.installer_name
+    }
+    if ([string]::IsNullOrWhiteSpace($recordedName)) {
+        $recordedName = [string](@($entries | Where-Object { $_ -and $_.role -eq 'installer' })[0].name)
+    }
+    if ([string]::IsNullOrWhiteSpace($recordedName)) {
+        $result.reason = "webview_install_mode_record_installer_missing:${ManifestPath}:installer_name"
+        return $result
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($InstallerPath)) {
+        $wanted = [IO.Path]::GetFullPath($InstallerPath)
+        $matched = $false
+        foreach ($entry in $entries) {
+            if (-not $entry -or [string]::IsNullOrWhiteSpace($entry.path)) { continue }
+            $resolved = Resolve-JarvisManifestPath -ManifestPath $ManifestPath -ArtifactPath ([string]$entry.path)
+            if ([IO.Path]::GetFullPath($resolved) -eq $wanted) { $matched = $true; break }
+        }
+        if (-not $matched) {
+            $result.reason = "webview_install_mode_record_installer_mismatch:${ManifestPath}:$wanted"
+            return $result
+        }
+    }
+
+    $recordedMode = ''
+    if ($Manifest.PSObject.Properties['webview_install_mode']) {
+        $recordedMode = [string]$Manifest.webview_install_mode
+    }
+    if ([string]::IsNullOrWhiteSpace($recordedMode)) {
+        $result.reason = "webview_install_mode_record_missing:${ManifestPath}:webview_install_mode:installer=$recordedName"
+        return $result
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedMode) -and $recordedMode -ne $ExpectedMode) {
+        $result.reason = "webview_install_mode_record_mismatch:${ManifestPath}:webview_install_mode=${recordedMode}:expected=${ExpectedMode}"
+        return $result
+    }
+
+    $result.ok = $true
+    $result.mode = $recordedMode
+    $result.installer_name = $recordedName
+    return $result
+}
+
 # ── Server bundle ────────────────────────────────────────────────────────────
 # The bundle build itself is NOT here. It lives in
 # server-jarvis/src/build-frontend.ts, because Tauri's beforeBuildCommand

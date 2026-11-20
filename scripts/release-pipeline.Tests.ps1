@@ -1,4 +1,4 @@
-$repoRoot = Split-Path -Parent $PSScriptRoot
+﻿$repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
 function Format-JarvisChildArgument {
@@ -1269,5 +1269,110 @@ Describe 'compiling the Rust crate in a fresh worktree' {
         } finally {
             Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+Describe 'webview install mode' {
+    # DD-116: the installer must state how it provisions WebView2. With the key
+    # absent Tauri silently falls back to downloadBootstrapper, so the config is
+    # refused at that implicit default and the chosen mode is read explicitly.
+
+    BeforeEach {
+        $script:config = Join-Path $TestDrive 'tauri.conf.json'
+    }
+
+    It 'fails when bundle.windows.webviewInstallMode is absent, naming the key' {
+        '{ "bundle": { "windows": {} } }' |
+            Set-Content -LiteralPath $script:config -Encoding utf8
+        $result = Get-JarvisWebViewInstallMode -ConfigPath $script:config
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_missing'
+        $result.reason | Should Match ([regex]::Escape('bundle.windows.webviewInstallMode'))
+    }
+
+    It 'fails when the key is left at the implicit downloadBootstrapper default' {
+        '{ "bundle": { "windows": { "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true } } } }' |
+            Set-Content -LiteralPath $script:config -Encoding utf8
+        $result = Get-JarvisWebViewInstallMode -ConfigPath $script:config
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_implicit_default'
+    }
+
+    It 'reads the declared mode from the object shape' {
+        '{ "bundle": { "windows": { "webviewInstallMode": { "type": "embedBootstrapper" } } } }' |
+            Set-Content -LiteralPath $script:config -Encoding utf8
+        $result = Get-JarvisWebViewInstallMode -ConfigPath $script:config
+        $result.ok | Should Be $true
+        $result.mode | Should Be 'embedBootstrapper'
+        $result.config | Should Be $script:config
+    }
+
+    It 'reads the declared mode from the bare string shape' {
+        '{ "bundle": { "windows": { "webviewInstallMode": "embedBootstrapper" } } }' |
+            Set-Content -LiteralPath $script:config -Encoding utf8
+        $result = Get-JarvisWebViewInstallMode -ConfigPath $script:config
+        $result.ok | Should Be $true
+        $result.mode | Should Be 'embedBootstrapper'
+    }
+
+    It 'fails when the config file is missing' {
+        $result = Get-JarvisWebViewInstallMode -ConfigPath (Join-Path $TestDrive 'absent.json')
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_config_missing'
+    }
+}
+
+Describe 'webview install mode in the release record' {
+    # The build can only be trusted to have shipped the mode the config asked
+    # for if the record says so beside the installer it names.
+
+    BeforeEach {
+        $script:artifact = Join-Path $TestDrive 'Jarvis_1.0.0_x64-setup.exe'
+        'installer bytes' | Out-File -LiteralPath $script:artifact -Encoding utf8
+        $script:manifestPath = Join-Path $TestDrive 'jarvis-release.json'
+        $script:record = [pscustomobject]@{
+            schema               = 'jarvis.release/1'
+            installer_name       = 'Jarvis_1.0.0_x64-setup.exe'
+            webview_install_mode = 'embedBootstrapper'
+            files                = @(
+                [pscustomobject]@{
+                    role = 'installer'
+                    name = 'Jarvis_1.0.0_x64-setup.exe'
+                    path = 'Jarvis_1.0.0_x64-setup.exe'
+                }
+            )
+        }
+    }
+
+    It 'accepts a record that names the installer and its mode' {
+        $result = Test-JarvisWebViewInstallModeRecorded -Manifest $script:record `
+            -ManifestPath $script:manifestPath -ExpectedMode 'embedBootstrapper'
+        $result.ok | Should Be $true
+        $result.mode | Should Be 'embedBootstrapper'
+        $result.installer_name | Should Be 'Jarvis_1.0.0_x64-setup.exe'
+    }
+
+    It 'fails when the record omits the mode' {
+        $script:record.webview_install_mode = ''
+        $result = Test-JarvisWebViewInstallModeRecorded -Manifest $script:record `
+            -ManifestPath $script:manifestPath -ExpectedMode 'embedBootstrapper'
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_record_missing'
+    }
+
+    It 'fails when the recorded mode disagrees with the config' {
+        $result = Test-JarvisWebViewInstallModeRecorded -Manifest $script:record `
+            -ManifestPath $script:manifestPath -ExpectedMode 'offlineInstaller'
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_record_mismatch'
+    }
+
+    It 'fails when the expected installer is not the recorded one' {
+        $other = Join-Path $TestDrive 'Jarvis_0.9.0_x64-setup.exe'
+        'other bytes' | Out-File -LiteralPath $other -Encoding utf8
+        $result = Test-JarvisWebViewInstallModeRecorded -Manifest $script:record `
+            -ManifestPath $script:manifestPath -InstallerPath $other
+        $result.ok | Should Be $false
+        $result.reason | Should Match 'webview_install_mode_record_installer_mismatch'
     }
 }

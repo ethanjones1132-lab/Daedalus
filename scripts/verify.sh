@@ -7,8 +7,8 @@
 # is a handful of lines and a red run shows exactly what broke and nothing else.
 #
 # Usage:
-#   ./scripts/verify.sh                    fast: proxy, server build+test+typecheck+eval gate, ui typecheck, rust check
-#   ./scripts/verify.sh --only rust        one subsystem: proxy | server | ui | rust
+#   ./scripts/verify.sh                    fast: proxy, webview install mode, server build+test+typecheck+eval gate, ui typecheck, rust check
+#   ./scripts/verify.sh --only rust        one subsystem: proxy | server | ui | rust | webview
 #   ./scripts/verify.sh --test             also compile+run the Rust tests
 #   ./scripts/verify.sh --clippy           also run cargo clippy -D warnings
 #   ./scripts/verify.sh --build            also produce artifacts (server dist + ui vite build)
@@ -86,6 +86,16 @@ if want proxy; then
   if have python3; then
     run "proxy py_compile" "$ROOT" python3 -m py_compile scripts/claude_cli_proxy.py
   else skip "proxy (python3 not found)"; fi
+fi
+
+if want webview || [ -z "$ONLY" ]; then
+  # DD-116: the NSIS installer must state how it provisions WebView2. The mode
+  # lives in tauri.conf.json and is recorded in jarvis-release.json; this is the
+  # Windows-side check for a built release. A source-only tree reports SKIP.
+  if have pwsh || have powershell.exe; then
+    PS_BIN="$(command -v pwsh || command -v powershell.exe)"
+    run "webview install mode" "$ROOT" "$PS_BIN" -NoProfile -ExecutionPolicy Bypass -File "$ROOT_WIN/scripts/verify-webview-install-mode.ps1"
+  else skip "webview install mode (powershell not found)"; fi
 fi
 
 if want server; then

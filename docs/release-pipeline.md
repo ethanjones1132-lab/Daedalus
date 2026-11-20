@@ -76,6 +76,7 @@ digest, and every shipped artifact with its SHA-256 and size:
   ],
   "prompts_tree_sha256": "…",
   "installer_name": "Jarvis_1.0.0_x64-setup.exe",
+  "webview_install_mode": "embedBootstrapper",
   "signed": true,
   "signature_status": "Valid",
   "signature_subject": "CN=…"
@@ -89,6 +90,40 @@ Artifact paths in the record are **relative to the release directory**, so
 the record stays portable and does not carry the build machine's directory
 layout into a published release. `Resolve-JarvisManifestPath` resolves one
 back against the directory the record lives in.
+
+### WebView2 install mode
+
+`bundle.windows.webviewInstallMode` in `src-tauri/tauri.conf.json` states how
+the NSIS installer provisions the WebView2 runtime. It is set explicitly to
+`{ "type": "embedBootstrapper" }`: the bootstrapper is embedded in the
+installer (a couple of MB) and downloads the runtime only if the machine does
+not already have it. The `offlineInstaller` mode would add roughly 130 MB to
+the installer and is deliberately not chosen — that is a size decision for
+the owner, not a default.
+
+The mode is not left to Tauri's implicit fallback. With the key absent Tauri
+silently uses `downloadBootstrapper`, so nothing says how a bare machine is
+provisioned. `release-build.ps1` therefore refuses to build a config whose
+`bundle.windows.webviewInstallMode` is missing or left at that default, and
+the release record carries the chosen mode as `webview_install_mode` beside
+`installer_name`.
+
+`scripts/verify-webview-install-mode.ps1` is the standalone check for an
+already-built release. It reads the config (failing with the file and the
+`bundle.windows.webviewInstallMode` key), then reads the newest
+`dist/release/<version>/jarvis-release.json` and requires it to name the
+installer and the same mode. A source-only run has no record and reports
+`SKIP`; a record that exists but omits the mode, or disagrees with the
+config, fails. `scripts/verify.sh` runs it on Windows; the same decisions
+are covered by `scripts/release-pipeline.Tests.ps1` everywhere.
+
+**Operator note:** the app has no separate "WebView2 is missing" message of
+its own — the packaging layer owns that failure. When the runtime is absent
+and the embedded bootstrapper cannot fetch it (no network, blocked host,
+installation refused), setup fails with a WebView2/runtime installation
+error and the app is not installed. It does not complete and then start with
+a blank window that looks like an app bug. See `.github/workflows` for the
+release job; do not treat a WebView2 setup failure as a signing failure.
 
 ### The app binary is read from a real install
 
@@ -246,6 +281,7 @@ needs an operator-approved packaged run before its runtime claims are proven.
 | Claim | Status |
 |---|---|
 | The build identity is folded into the server bundle | enforced by build-time checks; helper fixtures tested |
+| The installer states its WebView2 mode | enforced at build time and recorded in the release record; config/record helpers tested |
 | The installer's hash matches the record | enforced by the smoke; matching/tampered-file fixtures tested |
 | The installed binary matches the record | enforced by the smoke; binary matching tested with fixtures; real revised installer run pending |
 | The running installed server matches the record | installed-resource hash helpers tested; actual installed runtime `/health` proof pending |

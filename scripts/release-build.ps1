@@ -125,6 +125,22 @@ try {
 }
 Write-Ok "version $version (frontend, backend, sidecar and installer agree)"
 
+# ── WebView2 install mode ────────────────────────────────────────────────────
+# The installer has to state how it provisions WebView2. Tauri treats an
+# absent bundle.windows.webviewInstallMode as its implicit downloadBootstrapper
+# default, which leaves a machine without WebView2 depending on a download at
+# install time and leaves the release record unable to say what shipped. The
+# config states embedBootstrapper (the small bootstrapper; the ~130 MB
+# offlineInstaller is a size decision not taken here) and this refuses to
+# build a config that quietly reverted to the default. The mode is recorded
+# below and the written record is checked back. See docs/release-pipeline.md.
+Write-Step 'Checking the WebView2 install mode'
+$webviewMode = Get-JarvisWebViewInstallMode -ConfigPath (Join-Path $RepoRoot 'src-tauri\tauri.conf.json')
+if (-not $webviewMode.ok) {
+    Die $webviewMode.reason
+}
+Write-Ok "$($webviewMode.key) = $($webviewMode.mode)"
+
 # ── Build ────────────────────────────────────────────────────────────────────
 # The build identity travels to the frontend build through the environment
 # and is folded in with `bun build --define`. See
@@ -340,6 +356,7 @@ $manifest = New-JarvisReleaseManifest `
         prompts_tree_sha256  = $promptsTreeSha
         installer_name       = $installer.Name
         app_binary_name      = "$mainBinaryName.exe"
+        webview_install_mode = $webviewMode.mode
         signed               = $signed
         signature_status     = $(if ($signatureStatus) { $signatureStatus.status } else { $null })
         signature_subject    = $(if ($signatureStatus) { $signatureStatus.subject } else { $null })
@@ -348,6 +365,18 @@ $manifest = New-JarvisReleaseManifest `
 $written = Write-JarvisReleaseManifest -Manifest $manifest -Path $manifestPath
 Write-Ok "release record -> $($written.manifest)"
 Write-Ok "checksums       -> $($written.sums)"
+
+# Read the record back: the config check above proves what was ASKED for, this
+# proves the record a publisher will read says the same thing.
+$recordedWebview = Test-JarvisWebViewInstallModeRecorded `
+    -Manifest (Read-JarvisReleaseManifest -Path $written.manifest) `
+    -ManifestPath $written.manifest `
+    -ExpectedMode $webviewMode.mode `
+    -InstallerPath $stagedInstaller
+if (-not $recordedWebview.ok) {
+    Die $recordedWebview.reason
+}
+Write-Ok "webview_install_mode $($recordedWebview.mode) recorded for $($recordedWebview.installer_name)"
 
 Write-Host "`nRelease artifacts:" -ForegroundColor White
 foreach ($file in $manifest.files) {
