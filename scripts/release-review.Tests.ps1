@@ -1,6 +1,113 @@
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'lib\release-common.ps1')
 
+# ── Real child fixtures ─────────────────────────────────────────────────────
+# DD-126: the release teardown starts its uninstaller through
+# [System.Diagnostics.Process]::Start (inside Start-JarvisChildProcess), so a
+# `Mock Start-Process` is never called and a test built on one observes
+# nothing. These helpers compile one real child executable that the production
+# path actually starts; its behaviour comes from a mode file named
+# "<exe>.mode" beside it:
+#
+#   exit:<code>      exit with that code (the code the test observes is the
+#                    real exit code of a real process)
+#   sleep:<ms>       stay alive for that long, then exit 0
+#   install:<mode>   act as the installer: create the /D= root, copy itself to
+#                    <root>\uninstall.exe and give that copy <mode>
+#
+# The compiler is the in-box .NET Framework one, so no toolchain is required
+# beyond what runs Windows PowerShell.
+
+function Get-JarvisChildStub {
+    $source = @'
+using System;
+using System.Globalization;
+using System.IO;
+using System.Threading;
+
+public static class JarvisChildStub
+{
+    public static int Main(string[] args)
+    {
+        string self = System.Reflection.Assembly.GetEntryAssembly().Location;
+        string mode = "exit:0";
+        string modePath = self + ".mode";
+        if (File.Exists(modePath)) { mode = File.ReadAllText(modePath).Trim(); }
+        if (mode.StartsWith("install:", StringComparison.OrdinalIgnoreCase))
+        {
+            string root = null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i].StartsWith("/D=", StringComparison.OrdinalIgnoreCase)) { root = args[i].Substring(3); }
+            }
+            if (!String.IsNullOrEmpty(root))
+            {
+                Directory.CreateDirectory(root);
+                string uninstaller = Path.Combine(root, "uninstall.exe");
+                File.Copy(self, uninstaller, true);
+                File.WriteAllText(uninstaller + ".mode", mode.Substring("install:".Length));
+            }
+            return 0;
+        }
+        if (mode.StartsWith("sleep:", StringComparison.OrdinalIgnoreCase))
+        {
+            int milliseconds;
+            if (Int32.TryParse(mode.Substring("sleep:".Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out milliseconds))
+            {
+                Thread.Sleep(milliseconds);
+            }
+            return 0;
+        }
+        if (mode.StartsWith("exit:", StringComparison.OrdinalIgnoreCase))
+        {
+            int code;
+            if (Int32.TryParse(mode.Substring("exit:".Length), NumberStyles.Integer, CultureInfo.InvariantCulture, out code)) { return code; }
+        }
+        return 0;
+    }
+}
+'@
+    # One compile per test process. The directory is keyed by the source digest
+    # so a changed stub can never be shadowed by a stale build.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($source)) |
+            ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
+    }
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("jarvis-child-stub-$($digest.Substring(0, 12))-$PID")
+    $exe = Join-Path $dir 'JarvisChildStub.exe'
+    if (Test-Path -LiteralPath $exe) { return $exe }
+    $cscCandidates = @()
+    try {
+        $cscCandidates += Join-Path ([System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()) 'csc.exe'
+    } catch { }
+    $cscCandidates += Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    $cscCandidates += Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    $csc = $cscCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+    if (-not $csc) { throw 'child_stub_compiler_missing' }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $sourcePath = Join-Path $dir 'JarvisChildStub.cs'
+    Set-Content -LiteralPath $sourcePath -Value $source -Encoding ASCII
+    $compileOutput = & $csc /nologo /target:exe "/out:$exe" $sourcePath 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+        throw "child_stub_compile_failed:$compileOutput"
+    }
+    return $exe
+}
+
+function New-JarvisChildFixture {
+    # Places a real, startable child at $Path with the given behaviour mode.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Mode = 'exit:0'
+    )
+    Copy-Item -LiteralPath (Get-JarvisChildStub) -Destination $Path -Force
+    Set-Content -LiteralPath "$Path.mode" -Value $Mode -Encoding ASCII
+    return $Path
+}
+
 Describe 'PFX password propagation' {
     It 'passes the supplied password to certificate inspection before import' {
         $pfx = Join-Path $TestDrive 'dummy.pfx'
@@ -73,9 +180,9 @@ Describe 'release install teardown' {
     It 'throws with the scratch root when the uninstaller is still running after its timeout' {
         $root = Join-Path $TestDrive 'hung-uninstall'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
-        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
-        Mock Start-Process { [pscustomobject]@{ HasExited = $false; ExitCode = $null } }
-        Mock Wait-Process { }
+        # A real uninstaller child that outlives the budget: only the
+        # pipeline's own bounded wait can end this without hanging the gate.
+        New-JarvisChildFixture -Path (Join-Path $root 'uninstall.exe') -Mode 'sleep:30000' | Out-Null
 
         $message = ''
         try { Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1 | Out-Null }
@@ -87,21 +194,20 @@ Describe 'release install teardown' {
     It 'distinguishes a nonzero uninstaller exit code' {
         $root = Join-Path $TestDrive 'failed-uninstall'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
-        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
-        Mock Start-Process { [pscustomobject]@{ HasExited = $true; ExitCode = 17 } }
-        Mock Wait-Process { }
+        # 17 is the real exit code of the child the pipeline started. The
+        # budget is generous so a first-run antivirus scan cannot turn this
+        # into a timeout; the point is the code, not the bound.
+        New-JarvisChildFixture -Path (Join-Path $root 'uninstall.exe') -Mode 'exit:17' | Out-Null
 
-        { Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1 } | Should Throw 'uninstall_failed:exit_17'
+        { Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 15 } | Should Throw 'uninstall_failed:exit_17'
     }
 
     It 'returns true after a clean zero-exit uninstall' {
         $root = Join-Path $TestDrive 'clean-uninstall'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
-        'fixture' | Set-Content -LiteralPath (Join-Path $root 'uninstall.exe')
-        Mock Start-Process { [pscustomobject]@{ HasExited = $true; ExitCode = 0 } }
-        Mock Wait-Process { }
+        New-JarvisChildFixture -Path (Join-Path $root 'uninstall.exe') -Mode 'exit:0' | Out-Null
 
-        (Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 1) | Should Be $true
+        (Remove-JarvisReleaseInstall -InstallRoot $root -TimeoutSeconds 15) | Should Be $true
     }
 
     It 'keeps the missing-uninstaller false path' {
@@ -120,6 +226,32 @@ Describe 'release install teardown' {
 
         ($warnings -join "`n") | Should Match 'scratch uninstall failed'
         (Test-Path -LiteralPath $root) | Should Be $false
+    }
+}
+
+Describe 'teardown child launch seam' {
+    It 'starts the uninstaller through Start-JarvisChildProcess and never through Start-Process' {
+        # DD-126: the teardown fixtures above only observe the pipeline while
+        # Remove-JarvisReleaseInstall launches its child through the bounded
+        # helper. A reintroduced Start-Process call would leave those fixtures
+        # unobserved and this suite green for no reason.
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot 'lib\release-common.ps1'), [ref]$tokens, [ref]$parseErrors)
+        $parseErrors | Should BeNullOrEmpty
+        $teardown = @($ast.FindAll({
+            param($node)
+            ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and
+                ($node.Name -eq 'Remove-JarvisReleaseInstall')
+        }, $true))
+        $teardown.Count | Should Be 1
+        $commands = @($teardown[0].FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true) | ForEach-Object { $_.GetCommandName() })
+        ($commands -contains 'Start-JarvisChildProcess') | Should Be $true
+        ($commands -contains 'Start-Process') | Should Be $false
     }
 }
 
@@ -199,7 +331,10 @@ exit 0
 
 Describe 'scratch install ownership' {
     BeforeEach {
-        Mock Start-Process { throw 'installer_must_not_run_for_unsafe_root' }
+        # DD-126: the release path starts a child only through
+        # Start-JarvisChildProcess, so that is the seam that proves nothing was
+        # launched. A Start-Process mock is never called any more.
+        Mock Start-JarvisChildProcess { throw 'installer_must_not_run_for_unsafe_root' }
     }
 
     It 'preserves an existing nonempty directory when refusing an install' {
@@ -214,13 +349,13 @@ Describe 'scratch install ownership' {
     It 'refuses a relative install root before creating or launching anything' {
         Mock New-Item { throw 'unexpected_directory_creation' }
         { Install-JarvisRelease -InstallerPath 'fake.exe' -InstallRoot 'relative-review-scratch' } | Should Throw 'install_root_not_absolute'
-        Assert-MockCalled Start-Process -Scope It -Times 0 -Exactly
+        Assert-MockCalled Start-JarvisChildProcess -Scope It -Times 0 -Exactly
     }
 
     It 'refuses a directory outside the temporary scratch tree' {
         Mock New-Item { throw 'unexpected_directory_creation' }
         { Install-JarvisRelease -InstallerPath 'fake.exe' -InstallRoot 'C:\jarvis-review-must-not-create' } | Should Throw 'install_root_not_scratch'
-        Assert-MockCalled Start-Process -Scope It -Times 0 -Exactly
+        Assert-MockCalled Start-JarvisChildProcess -Scope It -Times 0 -Exactly
     }
 }
 
@@ -231,11 +366,12 @@ Describe 'cold-start listener ownership' {
         # DD-095: the preflight queries the listener through a bounded runspace,
         # so a stubbed Get-NetTCPConnection in this process never reaches it.
         # Hold a real loopback listener on the fixed port instead; the probe
-        # must still refuse before it creates anything.
+        # must still refuse before it creates anything (the probe dot-sources
+        # release-common, so a global Start-Process stub could not guard the
+        # launch either).
         @"
 `$listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 19877)
 try { `$listener.Start() } catch { }
-function global:Start-Process { throw 'unexpected_probe_launch' }
 & '$PSScriptRoot\probe-cold-start.ps1' -InstallerPath fake.exe -InstallRoot '$root'
 `$probeExit = `$LASTEXITCODE
 `$listener.Stop()
@@ -292,7 +428,9 @@ Describe 'failed smoke teardown and body deadlines' {
     It 'removes its own scratch install when the installed binary check fails' {
         $root = Join-Path $TestDrive 'smoke-owned-install'
         $installer = Join-Path $TestDrive 'fake-installer.exe'
-        'dummy installer bytes' | Set-Content -LiteralPath $installer
+        # A real installer child that exits 0 and lays nothing down: the smoke
+        # must fail its own binary check and remove the scratch install it owns.
+        New-JarvisChildFixture -Path $installer -Mode 'exit:0' | Out-Null
         $manifestPath = Join-Path $TestDrive 'smoke-record.json'
         @{
             schema = 'jarvis.release/1'; version = '1.0.0'; git_sha = ('a' * 40)
@@ -304,9 +442,6 @@ Describe 'failed smoke teardown and body deadlines' {
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath
         $runner = Join-Path $TestDrive 'smoke-runner.ps1'
         @"
-function global:Get-NetTCPConnection { }
-function global:Start-Process { [pscustomobject]@{ HasExited = `$true; ExitCode = 0 } }
-function global:Wait-Process { }
 & '$PSScriptRoot\release-smoke.ps1' -ManifestPath '$manifestPath' -InstallRoot '$root'
 exit `$LASTEXITCODE
 "@ | Set-Content -LiteralPath $runner
@@ -397,28 +532,14 @@ Describe 'release publication source selection' {
 Describe 'cold-start scratch cleanup when uninstall throws' {
     It 'removes the scratch install and keeps the probe exit code when uninstall throws' {
         $root = Join-Path $TestDrive 'probe-throwing-uninstall'
+        $installer = Join-Path $TestDrive 'probe-throwing-uninstall-installer.exe'
+        # A real installer child that lays down a real uninstaller which fails,
+        # so the probe's scratch teardown hits the throw the release path
+        # reports, after the probe has already decided its exit code.
+        New-JarvisChildFixture -Path $installer -Mode 'install:exit:17' | Out-Null
         $runner = Join-Path $TestDrive 'probe-throwing-uninstall-runner.ps1'
         @"
-function global:Get-NetTCPConnection { }
-function global:Start-Process {
-    param(`$FilePath, `$ArgumentList, [switch]`$PassThru, `$WindowStyle, `$RedirectStandardOutput, `$RedirectStandardError, `$WorkingDirectory)
-    `$installRoot = `$null
-    if (`$ArgumentList) {
-        foreach (`$a in @(`$ArgumentList)) {
-            if (`$a -is [string] -and `$a -like '/D=*') { `$installRoot = `$a.Substring(3) }
-        }
-    }
-    if (`$installRoot) {
-        if (-not (Test-Path -LiteralPath `$installRoot)) { New-Item -ItemType Directory -Force -Path `$installRoot | Out-Null }
-        'x' | Set-Content -LiteralPath (Join-Path `$installRoot 'uninstall.exe')
-    }
-    if (`$FilePath -like '*uninstall.exe') {
-        return [pscustomobject]@{ HasExited = `$false; ExitCode = `$null; Id = 999; StartTime = [datetime]::Now }
-    }
-    return [pscustomobject]@{ HasExited = `$true; ExitCode = 0; Id = 123; StartTime = [datetime]::Now }
-}
-function global:Wait-Process { param(`$Timeout, [switch]`$ErrorAction) }
-& '$PSScriptRoot\probe-cold-start.ps1' -InstallerPath 'fake.exe' -InstallRoot '$root'
+& '$PSScriptRoot\probe-cold-start.ps1' -InstallerPath '$installer' -InstallRoot '$root'
 exit `$LASTEXITCODE
 "@ | Set-Content -LiteralPath $runner
         $output = & powershell -NoProfile -ExecutionPolicy Bypass -File $runner 2>&1 | Out-String
@@ -433,7 +554,7 @@ Describe 'smoke scratch cleanup when uninstall throws' {
     It 'removes the scratch install and keeps the smoke exit code when uninstall throws' {
         $root = Join-Path $TestDrive 'smoke-throwing-uninstall'
         $installer = Join-Path $TestDrive 'throwing-uninstall-installer.exe'
-        'dummy installer bytes' | Set-Content -LiteralPath $installer
+        New-JarvisChildFixture -Path $installer -Mode 'install:exit:17' | Out-Null
         $manifestPath = Join-Path $TestDrive 'throwing-uninstall-record.json'
         @{
             schema = 'jarvis.release/1'; version = '1.0.0'; git_sha = ('a' * 40)
@@ -445,25 +566,6 @@ Describe 'smoke scratch cleanup when uninstall throws' {
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath
         $runner = Join-Path $TestDrive 'smoke-throwing-uninstall-runner.ps1'
         @"
-function global:Get-NetTCPConnection { }
-function global:Start-Process {
-    param(`$FilePath, `$ArgumentList, [switch]`$PassThru, `$WindowStyle, `$RedirectStandardOutput, `$RedirectStandardError, `$WorkingDirectory)
-    `$installRoot = `$null
-    if (`$ArgumentList) {
-        foreach (`$a in @(`$ArgumentList)) {
-            if (`$a -is [string] -and `$a -like '/D=*') { `$installRoot = `$a.Substring(3) }
-        }
-    }
-    if (`$installRoot) {
-        if (-not (Test-Path -LiteralPath `$installRoot)) { New-Item -ItemType Directory -Force -Path `$installRoot | Out-Null }
-        'x' | Set-Content -LiteralPath (Join-Path `$installRoot 'uninstall.exe')
-    }
-    if (`$FilePath -like '*uninstall.exe') {
-        return [pscustomobject]@{ HasExited = `$false; ExitCode = `$null; Id = 999; StartTime = [datetime]::Now }
-    }
-    return [pscustomobject]@{ HasExited = `$true; ExitCode = 0; Id = 123; StartTime = [datetime]::Now }
-}
-function global:Wait-Process { param(`$Timeout, [switch]`$ErrorAction) }
 & '$PSScriptRoot\release-smoke.ps1' -ManifestPath '$manifestPath' -InstallRoot '$root' -SkipLaunch -SkipChat
 exit `$LASTEXITCODE
 "@ | Set-Content -LiteralPath $runner
