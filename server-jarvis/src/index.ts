@@ -93,6 +93,7 @@ import {
   streamClaudeCli,
   isClaudeCliAvailable,
   compactTurnHistoryForCli,
+  claudeCliPostResultErrorAction,
   claudeCliSupportsNoSessionPersistence,
   configuredCliForcesResume,
 } from "./claude-cli";
@@ -2323,8 +2324,21 @@ async function streamJarvis(message: string, sessionId: string, options: StreamJ
             if (resumedSessionId) {
               cliSessionMap.delete(sessionId);
             }
-            recordMemoryTerminal("failed", "claude_cli_error");
-            if (session.noteOutcome()) {
+            // A delivered `result` frame is the authoritative turn outcome, so a
+            // signal kill during teardown must not rewrite it. The frame's
+            // subtype is the only code-like field the decoder emits.
+            const errorAction = claudeCliPostResultErrorAction(memoryTerminalRecorded, {
+              code: evt.subtype ?? null,
+            });
+            if (errorAction.warn) {
+              console.warn(
+                `[Jarvis] Claude CLI error after the authoritative turn outcome was recorded - stored outcome kept session=${sessionId} code=${errorAction.code}`,
+              );
+            }
+            if (errorAction.statusWrite) {
+              recordMemoryTerminal(errorAction.statusWrite, "claude_cli_error");
+            }
+            if (errorAction.forward && session.noteOutcome()) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ ...evt, session_id: sessionId, turn_id: memoryTurnId })}\n\n`));
             }
           } else if (evt.type === "result") {

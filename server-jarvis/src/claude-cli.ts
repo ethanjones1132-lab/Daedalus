@@ -878,6 +878,37 @@ export function claudeCliExitStatusFromProcess(proc: {
   return { code: proc.exitCode ?? null, signal: proc.signalCode ?? null };
 }
 
+/**
+ * What the terminal `error` branch must do for one CLI stream event.
+ *
+ * A `result` record already delivered to the consumer is the authoritative
+ * turn outcome: the model finished its answer, so a signal kill during CLI
+ * teardown must not rewrite it (`forward: false`, `statusWrite: null`). The
+ * contradiction stays observable through `warn` instead of vanishing.
+ *
+ * Before the outcome is recorded the error is a real mid-turn failure and must
+ * still forward and record `failed` (DD-092).
+ */
+export interface ClaudeCliPostResultErrorAction {
+  /** Emit the error frame to the UI. */
+  forward: boolean;
+  /** Terminal status to record, or `null` when the outcome is already stored. */
+  statusWrite: "failed" | null;
+  /** Log the one warning that names the contradiction. */
+  warn: boolean;
+  /** The error code to name in the warning; never empty. */
+  code: string;
+}
+
+export function claudeCliPostResultErrorAction(
+  alreadyRecorded: boolean,
+  evt: { code?: string | null },
+): ClaudeCliPostResultErrorAction {
+  const code = evt.code ?? "claude_cli_error";
+  if (alreadyRecorded) return { forward: false, statusWrite: null, warn: true, code };
+  return { forward: true, statusWrite: "failed", warn: false, code };
+}
+
 function claudeCliChunkText(value: unknown): Uint8Array | string | undefined {
   if (value instanceof Uint8Array || typeof value === "string") return value;
   return undefined;
