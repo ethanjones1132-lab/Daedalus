@@ -22,7 +22,7 @@ const STAGE_TARGET_PROVIDERS: &[&str] = &[
     "opencode_go",
     "vllm",
 ];
-const DEFAULT_LLAMA_MODEL: &str = "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf";
+const DEFAULT_LLAMA_MODEL: &str = "Inkling-2-Mini-UD-IQ3_XXS.gguf";
 const DEFAULT_LLAMA_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 const DEFAULT_OLLAMA_MODEL: &str = "qwen3.5-9b:latest";
 const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";

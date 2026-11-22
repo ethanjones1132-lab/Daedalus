@@ -113,12 +113,14 @@ export interface LlamaCppConfig {
   server_path: string;
   model_path: string;
   /**
-   * Separate MTP draft head (`-md`). Blank uses the MTP layer embedded in the
-   * model GGUF, which is how the Qwen3.6 keep96 slice ships.
+   * Separate MTP draft head (`-md`). Blank means no separate head. The shipped
+   * Inkling-2-Mini profile disables speculation entirely, so it stays blank.
    */
   mtp_path: string;
   port: number;
+  /** Context window (`-c`). */
   context_window: number;
+  /** `--reasoning-budget`. */
   reasoning_budget: number;
   /** MoE expert layers kept on the CPU (`--n-cpu-moe`). */
   n_cpu_moe: number;
@@ -128,6 +130,24 @@ export interface LlamaCppConfig {
   spec_type: string;
   /** `--spec-draft-n-max`. */
   spec_draft_n_max: number;
+  /** KV cache type for both K and V (`-ctk` / `-ctv`); always emitted. */
+  cache_type: string;
+  /** `-ot` tensor override, e.g. `blk\.(0|1)\.ffn_.*_exps\.=CPU`; blank keeps every tensor on the GPU. */
+  override_tensor: string;
+  /** Generation threads (`-t`); 0 omits the flag. */
+  threads: number;
+  /** Batch threads (`-tb`); 0 omits the flag. */
+  batch_threads: number;
+  /** `--chat-template-kwargs` `reasoning_effort` (low / medium / high); blank omits the flag. */
+  reasoning_effort: string;
+  /** `--no-host`: keep mmapped weights out of host buffers. */
+  no_host: boolean;
+  /** `--no-repack`: skip weight repacking while loading. */
+  no_repack: boolean;
+  /** `--cache-prompt`. */
+  cache_prompt: boolean;
+  /** `--cache-reuse` value; null/absent omits the flag. */
+  cache_reuse: number | null;
 }
 
 /**
@@ -308,8 +328,10 @@ export interface ConductorConfig {
   temperature: number;
   top_p: number;
   top_k: number;
+  /** Min-p sampling floor; 0 disables it (the Inkling-2-Mini conductor profile). */
+  min_p: number;
   max_tokens: number;
-  /** Context window budget for the warm conductor prefix (Gemma 4 supports 128K). */
+  /** Context window budget for the warm conductor prefix (matches the llama-server window). */
   num_ctx: number;
   /** Fall back to the API coordinator pool when local inference fails. */
   fallback_to_api: boolean;
@@ -713,24 +735,37 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
       max_retries: 3,
       timeout_ms: 60000,
     },
-    // Qwen3.6-35B-A3B UD-IQ2_M keep96 on the 8 GB RTX 4060: every layer on
-    // the GPU, embedded MTP stacked with n-gram lookup, thinking off. Measured
-    // on llama.cpp master 836d571 at 274 tok/s and 101/117 on tier2b
-    // (2026-10-04 speed lab; settled over swap108/add108 on 2026-10-06).
+    // Inkling-2-Mini (UD-IQ3_XXS) with its measured "Agent" profile: 57344
+    // tokens of context, f16 KV cache (q5_0/q8_0 take a slow dequant fallback
+    // on this model), every layer offloaded with the experts of the looped
+    // layers 6-14 kept on the GPU (`-ot`) and the rest on the CPU
+    // (`--n-cpu-moe 0`), batch 512, six generation and batch threads, thinking
+    // capped at reasoning_effort "medium", and no speculation. Inkling needs
+    // Unsloth's llama.cpp fork (b12588) as server_path; mainline llama-server
+    // cannot load it.
     llama_cpp: {
       base_url: "http://127.0.0.1:8080/v1",
-      model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+      model: "Inkling-2-Mini-UD-IQ3_XXS.gguf",
       // Machine-specific paths ship blank; see LlamaCppConfig.
       server_path: "",
       model_path: "",
       mtp_path: "",
       port: 8080,
-      context_window: 16384,
-      reasoning_budget: 0,
+      context_window: 57344,
+      reasoning_budget: 2048,
       n_cpu_moe: 0,
-      batch_size: 1024,
-      spec_type: "draft-mtp,ngram-mod",
-      spec_draft_n_max: 2,
+      batch_size: 512,
+      spec_type: "",
+      spec_draft_n_max: 0,
+      cache_type: "f16",
+      override_tensor: "blk\\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
+      threads: 6,
+      batch_threads: 6,
+      reasoning_effort: "medium",
+      no_host: true,
+      no_repack: true,
+      cache_prompt: true,
+      cache_reuse: 0,
     },
     // Secondary OpenAI-compatible providers. Keys are intentionally blank in
     // source (no secrets committed) — they are written to the live config.json
@@ -851,20 +886,23 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
         in_turn_driver: {
           enabled: true,
         },
-        model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+        model: "Inkling-2-Mini-UD-IQ3_XXS.gguf",
         fallback_model: "",
         base_url: "http://127.0.0.1:8080/v1",
         output_mode: "tool_call",
-        // keep96's best measured sampling (2026-10-04 sweep): the model card's
-        // 0.7 / 0.8 / top-k 20 cost 6-8 tier2b points.
-        temperature: 0.2,
-        top_p: 0.95,
-        top_k: 40,
+        // Inkling-2-Mini's measured "Agent" sampling: temperature 1.0 /
+        // top_p 1.0 / top_k 0 / min_p 0. The keep96 values (0.2 / 0.95 /
+        // top-k 40) made it loop.
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 0,
+        min_p: 0,
         // 700 structurally truncated multi-stage replan decisions (2026-07-16
         // incident memory) — routing itself stays capped by per-call
         // numPredict, so the wider ceiling only helps the bigger decisions.
         max_tokens: 4096,
-        num_ctx: 16384,
+        // Matches the llama-server context window in `llama_cpp`.
+        num_ctx: 57344,
         fallback_to_api: true,
         keep_warm: true,
         // 10m left Qwythos cold under GPU thrash; 3m keep-warm for first-turn readiness.
@@ -923,7 +961,7 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
         thrift: { dead_tool_suppression: true, achieved_effect_early_stop: true },
       },
     },
-    system_prompt: `You are Jarvis, a local AI coding assistant running on Qwen3.6-35B-A3B (keep96) via llama.cpp.
+    system_prompt: `You are Jarvis, a local AI coding assistant running on Inkling-2-Mini (UD-IQ3_XXS) via llama.cpp.
 Workspace: \`/home/ethan/.openclaw/agents/coderclaw/workspace/home-base\`.
 
 ## Tool Protocol (No native tool support. Always emit this format for file/shell/web operations):
@@ -1077,9 +1115,50 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
   return out;
 }
 
+/**
+ * Values a stored `llama_cpp` block gets for the fields it predates.
+ *
+ * These mirror the Rust `LlamaCppConfig` serde defaults
+ * (`src-tauri/src/jarvis/types.rs`). Only the fields a row can genuinely
+ * predate appear here: `batch_size`, `spec_type`, `spec_draft_n_max` and
+ * `cache_type` were added after the first installs, so `deepMerge` must not
+ * fill them from `defaultConfig()` (which now ships the Inkling-2-Mini
+ * profile). A pre-change install keeps launching exactly the server it
+ * launched before (q8_0 KV cache, no `-ot`, no thread flags, no
+ * chat-template-kwargs, no `--no-host`/`--no-repack`/prompt-cache flags).
+ *
+ * `model`/`context_window`/`reasoning_budget` are absent on purpose: every
+ * saved row has always written them, so a missing value means a fresh block
+ * that must take the current default.
+ */
+export const LEGACY_LLAMA_CPP_DEFAULTS: Readonly<Record<string, unknown>> = {
+  batch_size: 1024,
+  spec_type: "draft-mtp,ngram-mod",
+  spec_draft_n_max: 2,
+  cache_type: "q8_0",
+  override_tensor: "",
+  threads: 0,
+  batch_threads: 0,
+  reasoning_effort: "",
+  no_host: false,
+  no_repack: false,
+  cache_prompt: false,
+  cache_reuse: null,
+};
+
+function applyLegacyLlamaCppFields(stored: unknown, merged: LlamaCppConfig): void {
+  if (!stored || typeof stored !== "object" || Array.isArray(stored)) return;
+  const block = stored as Record<string, unknown>;
+  const target = merged as unknown as Record<string, unknown>;
+  for (const [key, value] of Object.entries(LEGACY_LLAMA_CPP_DEFAULTS)) {
+    if (!Object.prototype.hasOwnProperty.call(block, key)) target[key] = value;
+  }
+}
+
 export function normalizeConfig(raw: any, options: NormalizeConfigOptions = {}): JarvisConfig {
   const home = options.home ?? homedir();
   const merged = deepMerge(defaultConfig(home), raw);
+  applyLegacyLlamaCppFields(raw?.llama_cpp, merged.llama_cpp);
   // deepMerge treats null/undefined as non-overriding for ordinary config.
   // Preserve explicit comparison-policy presence so malformed values remain
   // visible to validation and fail closed at request construction.

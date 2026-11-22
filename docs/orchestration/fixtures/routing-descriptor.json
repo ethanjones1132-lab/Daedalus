@@ -175,7 +175,7 @@
     }
   },
   "expected_sha256": "e5a9bd419a60a3bec62889fd06ec3d56040a248233dcd1fea168d61317380891",
-  "expected_default_sha256": "28ba8d3f89751f2a7fe30224cca8a1f7d755c576b3e05ef29f759771bcdc917b",
+  "expected_default_sha256": "813ca023362d3a0f72fa59df4a614022b191eb7578d012c113961caf02cdb07b",
   "expected_default_descriptor": {
     "descriptor_version": 1,
     "backend": "llama_cpp",
@@ -188,7 +188,7 @@
       },
       "llama_cpp": {
         "base_url": "http://127.0.0.1:8080/v1",
-        "model": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf"
+        "model": "Inkling-2-Mini-UD-IQ3_XXS.gguf"
       },
       "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
@@ -224,7 +224,7 @@
     },
     "conductor": {
       "enabled": true,
-      "model": "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+      "model": "Inkling-2-Mini-UD-IQ3_XXS.gguf",
       "fallback_model": "",
       "base_url": "http://127.0.0.1:8080/v1",
       "kv_backend": "llama_cpp",

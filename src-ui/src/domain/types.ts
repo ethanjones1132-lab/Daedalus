@@ -99,6 +99,15 @@ export interface JarvisConfig {
     batch_size?: number;
     spec_type?: string;
     spec_draft_n_max?: number;
+    cache_type?: string;
+    override_tensor?: string;
+    threads?: number;
+    batch_threads?: number;
+    reasoning_effort?: string;
+    no_host?: boolean;
+    no_repack?: boolean;
+    cache_prompt?: boolean;
+    cache_reuse?: number | null;
   };
   opencode_zen: {
     base_url: string;

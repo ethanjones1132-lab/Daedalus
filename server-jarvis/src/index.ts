@@ -3,7 +3,7 @@
 // ═══════════════════════════════════════════════════════════════
 // WSL-side HTTP server on port 19877.
 // Uses OpenAI-compatible APIs for llama.cpp, Ollama, and OpenRouter.
-// Qwen3.6 keep96 via llama.cpp is the default local chat and persistent-conductor backend.
+// Inkling-2-Mini (UD-IQ3_XXS) via llama.cpp is the default local chat and persistent-conductor backend.
 // DD-083 post-import mark: ESM hoists the import block below, so this line
 // runs only after the whole import graph has evaluated. The pre-import mark is
 // the body of ./startup-mark, deliberately the first import: it imports

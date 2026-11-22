@@ -259,8 +259,9 @@ describe("PersistentConductor", () => {
     expect(result.model).toBe("gemma4:e2b");
     expect(generateBody).toMatchObject({ model: "gemma4:e2b", prompt: "", keep_alive: "30m" });
     // 2026-07-18: default num_ctx raised 8192→16384 (supervision digests +
-    // session prefixes were crowding the old window).
-    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 16_384 });
+    // session prefixes were crowding the old window). DD-144: the shipped
+    // conductor now matches the Inkling-2-Mini llama-server window (57344).
+    expect(generateBody?.options).toMatchObject({ num_predict: 1, num_ctx: 57_344 });
   });
 
   test("default warmUp stays pending past 30s and accepts a 54.4s cold load", async () => {
@@ -401,8 +402,13 @@ describe("PersistentConductor", () => {
     expect(body?.model).toBe("gemma-test.gguf");
     expect(body?.response_format?.type).toBe("json_schema");
     expect(body?.max_tokens).toBe(4_096);
-    expect(body?.temperature).toBe(0.2);
-    expect(body?.top_p).toBe(0.95);
+    // DD-144: the llama.cpp conductor passes the shipped sampling through, so
+    // Inkling-2-Mini runs at temperature 1.0 / top_p 1.0 / top_k 0 / min_p 0
+    // instead of inheriting llama-server's top_k 40.
+    expect(body?.temperature).toBe(1);
+    expect(body?.top_p).toBe(1);
+    expect(body?.top_k).toBe(0);
+    expect(body?.min_p).toBe(0);
   });
 
   test("applies comparison generation settings to the final llama.cpp route body", async () => {

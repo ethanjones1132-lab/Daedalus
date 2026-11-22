@@ -220,48 +220,136 @@ pub struct OpenRouterConfig {
 #[serde(default)]
 pub struct LlamaCppConfig {
     pub base_url: String,
+    /// Serving alias (`--alias`). A stored row keeps the alias it saved; a
+    /// missing one takes the current default.
     pub model: String,
     pub server_path: String,
     pub model_path: String,
-    /// Separate MTP draft head (`-md`). Blank uses the MTP layer embedded in
-    /// the model GGUF, which is how the Qwen3.6 keep96 slice ships.
+    /// Separate MTP draft head (`-md`). Blank means no separate head. The
+    /// shipped Inkling-2-Mini profile disables speculation entirely, so this
+    /// stays blank there.
     pub mtp_path: String,
     pub port: u16,
+    /// Context window (`-c`).
     pub context_window: u32,
+    /// `--reasoning-budget`.
     pub reasoning_budget: u32,
-    /// MoE expert layers kept on the CPU (`--n-cpu-moe`).
+    /// MoE expert layers kept on the CPU (`--n-cpu-moe`). The Inkling-2-Mini
+    /// profile keeps this at 0 and places experts with `override_tensor`.
     pub n_cpu_moe: u32,
     /// Logical and physical batch size (`-b` / `-ub`).
+    #[serde(default = "legacy_default_batch_size")]
     pub batch_size: u32,
-    /// `--spec-type` value, e.g. `draft-mtp,ngram-mod`. Blank disables speculation.
+    /// `--spec-type` value, e.g. `draft-mtp,ngram-mod`. Blank disables
+    /// speculation, which is the Inkling-2-Mini default (its DSpark draft head
+    /// and the n-gram lookup both measured slower than plain decoding).
+    #[serde(default = "legacy_default_spec_type")]
     pub spec_type: String,
     /// `--spec-draft-n-max`.
+    #[serde(default = "legacy_default_spec_draft_n_max")]
     pub spec_draft_n_max: u32,
+    /// KV cache type for both K and V (`-ctk` / `-ctv`). Always emitted.
+    /// q5_0/q8_0 take a slow per-token dequant path on Inkling-2-Mini, so the
+    /// shipped default is f16.
+    #[serde(default = "legacy_default_cache_type")]
+    pub cache_type: String,
+    /// `-ot` tensor override, e.g. `blk\.(0|1)\.ffn_.*_exps\.=CPU`. Blank keeps
+    /// every tensor on the GPU. Inkling-2-Mini keeps the experts of its looped
+    /// layers 6-14 on the GPU and offloads the rest.
+    #[serde(default)]
+    pub override_tensor: String,
+    /// Generation threads (`-t`). 0 omits the flag and lets llama-server decide.
+    #[serde(default)]
+    pub threads: u32,
+    /// Batch threads (`-tb`). 0 omits the flag.
+    #[serde(default)]
+    pub batch_threads: u32,
+    /// `--chat-template-kwargs` `reasoning_effort` value (low / medium / high).
+    /// Blank omits the flag and keeps the template's own default (high for
+    /// Inkling-2-Mini, which over-thinks).
+    #[serde(default)]
+    pub reasoning_effort: String,
+    /// `--no-host`: keep mmapped weights out of host buffers (16 GB machines).
+    #[serde(default)]
+    pub no_host: bool,
+    /// `--no-repack`: skip weight repacking while the model loads.
+    #[serde(default)]
+    pub no_repack: bool,
+    /// `--cache-prompt`.
+    #[serde(default)]
+    pub cache_prompt: bool,
+    /// `--cache-reuse` value. `None` omits the flag; `Some(0)` is what the
+    /// Inkling-2-Mini profile passes explicitly.
+    #[serde(default)]
+    pub cache_reuse: Option<u32>,
+}
+
+// Serde defaults for a *missing* field in a stored `llama_cpp` row. Only the
+// fields a row can genuinely predate get them: `batch_size`, `spec_type` and
+// `spec_draft_n_max` were added after the first installs, so a row saved then
+// must keep the values the launcher used for it (1024, `draft-mtp,ngram-mod`,
+// 2) instead of silently picking up the Inkling-2-Mini defaults.
+// `Default::default()` (a fresh install) uses the Inkling-2-Mini profile, and a
+// missing `model`/`context_window`/`reasoning_budget` takes that profile too,
+// because every saved row has always written those.
+fn legacy_default_batch_size() -> u32 {
+    1024
+}
+
+fn legacy_default_spec_type() -> String {
+    "draft-mtp,ngram-mod".to_string()
+}
+
+fn legacy_default_spec_draft_n_max() -> u32 {
+    2
+}
+
+fn legacy_default_cache_type() -> String {
+    "q8_0".to_string()
 }
 
 impl Default for LlamaCppConfig {
-    /// Qwen3.6-35B-A3B UD-IQ2_M keep96 on the 8 GB RTX 4060: every layer on the
-    /// GPU, embedded MTP stacked with n-gram lookup, thinking off. Measured on
-    /// llama.cpp master 836d571 at 274 tok/s and 101/117 on tier2b (2026-10-04
-    /// speed lab; settled over swap108/add108 on 2026-10-06).
+    /// Inkling-2-Mini (UD-IQ3_XXS) with its measured "Agent" profile: 57344
+    /// tokens of context, f16 KV cache (q5_0/q8_0 take a slow dequant fallback
+    /// on this model), every layer offloaded with the experts of the looped
+    /// layers 6-14 kept on the GPU through an `-ot` override and the rest on the
+    /// CPU (`--n-cpu-moe 0`), batch 512, six generation and batch threads,
+    /// thinking capped by `reasoning_effort = medium` (the template defaults to
+    /// high, which over-thinks), and no speculation at all (its DSpark draft
+    /// head and n-gram lookup both measured slower). Sampling is the conductor's
+    /// business: temperature 1.0 / top_p 1.0 / top_k 0 / min_p 0, because the
+    /// keep96 sampling made Inkling loop.
+    ///
+    /// Inkling-2-Mini only loads in Unsloth's llama.cpp fork (b12588), so
+    /// `server_path` has to point at that build; mainline llama-server cannot
+    /// load it. Artifact locations are machine-specific, so source ships them
+    /// blank: each install sets them in Settings (persisted as the `llama_cpp`
+    /// row of the app settings table) or through the JARVIS_LLAMA_* environment
+    /// variables; see `with_env_fallbacks`.
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
-            model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf".to_string(),
-            // Artifact locations are machine-specific, so source ships them
-            // blank. Each install sets them in Settings (persisted as the
-            // `llama_cpp` row of the app settings table) or through the
-            // JARVIS_LLAMA_* environment variables; see `with_env_fallbacks`.
+            model: "Inkling-2-Mini-UD-IQ3_XXS.gguf".to_string(),
             server_path: String::new(),
             model_path: String::new(),
             mtp_path: String::new(),
             port: 8080,
-            context_window: 16384,
-            reasoning_budget: 0,
+            context_window: 57344,
+            reasoning_budget: 2048,
             n_cpu_moe: 0,
-            batch_size: 1024,
-            spec_type: "draft-mtp,ngram-mod".to_string(),
-            spec_draft_n_max: 2,
+            batch_size: 512,
+            spec_type: String::new(),
+            spec_draft_n_max: 0,
+            cache_type: "f16".to_string(),
+            override_tensor: r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU"
+                .to_string(),
+            threads: 6,
+            batch_threads: 6,
+            reasoning_effort: "medium".to_string(),
+            no_host: true,
+            no_repack: true,
+            cache_prompt: true,
+            cache_reuse: Some(0),
         }
     }
 }
@@ -302,13 +390,22 @@ impl LlamaCppConfig {
     /// whether `mtp_path` names an existing file; a configured head that is
     /// missing drops `draft-mtp` so the server still starts with the rest of
     /// the speculation stack.
+    ///
+    /// Every optional flag is emitted only when its field is set, so a row saved
+    /// before those fields existed produces the same argument vector it always
+    /// did. `cache_type` is the exception: it always emits `-ctk`/`-ctv` (a
+    /// blank value falls back to the legacy `q8_0`).
     pub fn server_args(&self, mtp_head_exists: bool) -> Vec<String> {
         let port = self.port.to_string();
         let n_cpu_moe = self.n_cpu_moe.to_string();
         let context = self.context_window.to_string();
         let batch = self.batch_size.to_string();
         let budget = self.reasoning_budget.to_string();
-        let fixed: [&str; 32] = [
+        let cache_type = match self.cache_type.trim() {
+            "" => "q8_0",
+            value => value,
+        };
+        let mut args: Vec<String> = [
             "-m",
             self.model_path.trim(),
             "--alias",
@@ -321,30 +418,86 @@ impl LlamaCppConfig {
             "99",
             "--n-cpu-moe",
             n_cpu_moe.as_str(),
-            "-c",
-            context.as_str(),
-            "-ctk",
-            "q8_0",
-            "-ctv",
-            "q8_0",
-            "--flash-attn",
-            "on",
-            "-b",
-            batch.as_str(),
-            "-ub",
-            batch.as_str(),
-            // -np > 1 is not supported with MTP
-            "-np",
-            "1",
-            "--jinja",
-            "--reasoning-budget",
-            budget.as_str(),
-            "--no-webui",
-            // The default 8 GiB host prompt cache starves a 16 GB machine.
-            "--cache-ram",
-            "0",
-        ];
-        let mut args: Vec<String> = fixed.iter().map(|arg| arg.to_string()).collect();
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+
+        let override_tensor = self.override_tensor.trim();
+        if !override_tensor.is_empty() {
+            args.extend(["-ot".to_string(), override_tensor.to_string()]);
+        }
+
+        args.extend(
+            [
+                "-c",
+                context.as_str(),
+                "-ctk",
+                cache_type,
+                "-ctv",
+                cache_type,
+                "--flash-attn",
+                "on",
+            ]
+            .iter()
+            .map(|arg| arg.to_string()),
+        );
+
+        if self.threads > 0 {
+            args.extend(["-t".to_string(), self.threads.to_string()]);
+        }
+        if self.batch_threads > 0 {
+            args.extend(["-tb".to_string(), self.batch_threads.to_string()]);
+        }
+
+        args.extend(
+            [
+                // -np > 1 is not supported with MTP
+                "-b",
+                batch.as_str(),
+                "-ub",
+                batch.as_str(),
+                "-np",
+                "1",
+                "--jinja",
+                "--reasoning-budget",
+                budget.as_str(),
+            ]
+            .iter()
+            .map(|arg| arg.to_string()),
+        );
+
+        let reasoning_effort = self.reasoning_effort.trim();
+        if !reasoning_effort.is_empty() {
+            args.extend([
+                "--chat-template-kwargs".to_string(),
+                format!("{{\"reasoning_effort\":\"{reasoning_effort}\"}}"),
+            ]);
+        }
+
+        args.extend(
+            [
+                "--no-webui",
+                // The default 8 GiB host prompt cache starves a 16 GB machine.
+                "--cache-ram",
+                "0",
+            ]
+            .iter()
+            .map(|arg| arg.to_string()),
+        );
+
+        if self.no_host {
+            args.push("--no-host".to_string());
+        }
+        if self.no_repack {
+            args.push("--no-repack".to_string());
+        }
+        if self.cache_prompt {
+            args.push("--cache-prompt".to_string());
+        }
+        if let Some(cache_reuse) = self.cache_reuse {
+            args.extend(["--cache-reuse".to_string(), cache_reuse.to_string()]);
+        }
 
         let mtp_configured = !self.mtp_path.trim().is_empty();
         let spec: Vec<&str> = self
@@ -389,24 +542,47 @@ mod llama_cpp_config_tests {
     }
 
     #[test]
-    fn default_launches_keep96_placement_with_embedded_mtp_and_ngram() {
+    fn default_launches_the_inkling_agent_profile() {
         let config = LlamaCppConfig {
-            model_path: "keep96.gguf".to_string(),
+            model_path: "inkling.gguf".to_string(),
             ..LlamaCppConfig::default()
         };
         let args = config.server_args(false);
+        assert_eq!(flag(&args, "-m"), Some("inkling.gguf"));
+        assert_eq!(flag(&args, "--alias"), Some("Inkling-2-Mini-UD-IQ3_XXS.gguf"));
+        assert_eq!(flag(&args, "-ngl"), Some("99"));
         assert_eq!(flag(&args, "--n-cpu-moe"), Some("0"));
-        assert_eq!(flag(&args, "-b"), Some("1024"));
-        assert_eq!(flag(&args, "-ub"), Some("1024"));
-        assert_eq!(flag(&args, "--reasoning-budget"), Some("0"));
-        assert_eq!(flag(&args, "--cache-ram"), Some("0"));
-        assert_eq!(flag(&args, "--spec-type"), Some("draft-mtp,ngram-mod"));
-        assert_eq!(flag(&args, "--spec-draft-n-max"), Some("2"));
         assert_eq!(
-            flag(&args, "--alias"),
-            Some("Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf")
+            flag(&args, "-ot"),
+            Some(r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU")
         );
-        assert!(!args.iter().any(|arg| arg == "-md"));
+        assert_eq!(flag(&args, "-c"), Some("57344"));
+        assert_eq!(flag(&args, "-ctk"), Some("f16"));
+        assert_eq!(flag(&args, "-ctv"), Some("f16"));
+        // llama-server's long form of `-fa`; the short form would change the
+        // argument vector legacy rows already launch with.
+        assert_eq!(flag(&args, "--flash-attn"), Some("on"));
+        assert_eq!(flag(&args, "-b"), Some("512"));
+        assert_eq!(flag(&args, "-ub"), Some("512"));
+        assert_eq!(flag(&args, "-t"), Some("6"));
+        assert_eq!(flag(&args, "-tb"), Some("6"));
+        assert_eq!(flag(&args, "-np"), Some("1"));
+        assert!(args.iter().any(|arg| arg == "--jinja"));
+        assert_eq!(flag(&args, "--reasoning-budget"), Some("2048"));
+        assert_eq!(
+            flag(&args, "--chat-template-kwargs"),
+            Some(r#"{"reasoning_effort":"medium"}"#)
+        );
+        assert!(args.iter().any(|arg| arg == "--no-host"));
+        assert!(args.iter().any(|arg| arg == "--no-repack"));
+        assert!(args.iter().any(|arg| arg == "--cache-prompt"));
+        assert_eq!(flag(&args, "--cache-ram"), Some("0"));
+        assert_eq!(flag(&args, "--cache-reuse"), Some("0"));
+        // No speculation: Inkling's DSpark draft head and n-gram lookup both
+        // measured slower than plain decoding.
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--spec-type" || arg == "-md" || arg == "--spec-draft-n-max"));
     }
 
     #[test]
@@ -415,6 +591,8 @@ mod llama_cpp_config_tests {
             model_path: "gemma.gguf".to_string(),
             mtp_path: "mtp-gemma.gguf".to_string(),
             n_cpu_moe: 16,
+            spec_type: "draft-mtp,ngram-mod".to_string(),
+            spec_draft_n_max: 2,
             ..LlamaCppConfig::default()
         };
         let present = config.server_args(true);
@@ -437,14 +615,90 @@ mod llama_cpp_config_tests {
         assert!(!args.iter().any(|arg| arg == "--spec-type" || arg == "-md"));
     }
 
+    /// Pre-change row, verbatim from an install that saved llama.cpp settings
+    /// before the Inkling-2-Mini default. Every field it does not carry has to
+    /// deserialize to the value it had before, not to the new default.
+    const STORED_PRE_CHANGE_ROW: &str = r#"{"base_url":"http://127.0.0.1:8080/v1","model":"m","server_path":"s","model_path":"p","mtp_path":"","port":8080,"context_window":16384,"reasoning_budget":0}"#;
+
     #[test]
-    fn stored_row_without_placement_fields_takes_defaults() {
-        let stored = r#"{"base_url":"http://127.0.0.1:8080/v1","model":"m","server_path":"s","model_path":"p","mtp_path":"","port":8080,"context_window":16384,"reasoning_budget":0}"#;
-        let config: LlamaCppConfig = serde_json::from_str(stored).unwrap();
+    fn stored_row_without_placement_fields_keeps_the_legacy_values() {
+        let config: LlamaCppConfig = serde_json::from_str(STORED_PRE_CHANGE_ROW).unwrap();
         assert_eq!(config.n_cpu_moe, 0);
         assert_eq!(config.batch_size, 1024);
         assert_eq!(config.spec_type, "draft-mtp,ngram-mod");
         assert_eq!(config.spec_draft_n_max, 2);
+        // Fields the row predates are the legacy no-ops, not the Inkling profile.
+        assert_eq!(config.cache_type, "q8_0");
+        assert_eq!(config.override_tensor, "");
+        assert_eq!(config.threads, 0);
+        assert_eq!(config.batch_threads, 0);
+        assert_eq!(config.reasoning_effort, "");
+        assert!(!config.no_host);
+        assert!(!config.no_repack);
+        assert!(!config.cache_prompt);
+        assert_eq!(config.cache_reuse, None);
+    }
+
+    #[test]
+    fn block_without_model_or_window_takes_the_current_defaults() {
+        // A fresh block (paths only) is not a pre-change row: the fields every
+        // saved row has always written fall back to the Inkling-2-Mini default.
+        let stored = r#"{"server_path":"s","model_path":"p"}"#;
+        let config: LlamaCppConfig = serde_json::from_str(stored).unwrap();
+        assert_eq!(config.model, "Inkling-2-Mini-UD-IQ3_XXS.gguf");
+        assert_eq!(config.context_window, 57344);
+        assert_eq!(config.reasoning_budget, 2048);
+        assert_eq!(config.threads, 0);
+        assert!(!config.no_host);
+    }
+
+    #[test]
+    fn stored_pre_change_row_launches_byte_identical_args() {
+        // Exactly what the launcher emitted for this row before DD-144: q8_0
+        // KV, no `-ot`, no thread flags, no chat-template-kwargs, no new flags.
+        let config: LlamaCppConfig = serde_json::from_str(STORED_PRE_CHANGE_ROW).unwrap();
+        let expected: Vec<String> = [
+            "-m",
+            "p",
+            "--alias",
+            "m",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8080",
+            "-ngl",
+            "99",
+            "--n-cpu-moe",
+            "0",
+            "-c",
+            "16384",
+            "-ctk",
+            "q8_0",
+            "-ctv",
+            "q8_0",
+            "--flash-attn",
+            "on",
+            "-b",
+            "1024",
+            "-ub",
+            "1024",
+            "-np",
+            "1",
+            "--jinja",
+            "--reasoning-budget",
+            "0",
+            "--no-webui",
+            "--cache-ram",
+            "0",
+            "--spec-type",
+            "draft-mtp,ngram-mod",
+            "--spec-draft-n-max",
+            "2",
+        ]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+        assert_eq!(config.server_args(false), expected);
     }
 
     #[test]

@@ -1351,6 +1351,11 @@ export class PersistentConductor {
           max_tokens: Math.max(4_096, conductor.max_tokens),
           temperature: options.temperature ?? conductor.temperature,
           top_p: conductor.top_p,
+          // llama-server's own top_k default (40) made Inkling-2-Mini loop, so
+          // the conductor profile's top_k/min_p have to reach this transport
+          // too, not just the Ollama options block.
+          top_k: conductor.top_k,
+          min_p: conductor.min_p ?? 0,
           cache_prompt: true,
           response_format: {
             type: "json_schema",

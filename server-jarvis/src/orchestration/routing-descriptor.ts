@@ -83,7 +83,7 @@ export function createRoutingDescriptor(
       },
       llama_cpp: {
         base_url: llamaBaseUrl,
-        model: cfg.llama_cpp?.model || "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+        model: cfg.llama_cpp?.model || "Inkling-2-Mini-UD-IQ3_XXS.gguf",
       },
       openrouter: {
         base_url: cfg.openrouter?.base_url || "https://openrouter.ai/api/v1",
@@ -101,7 +101,7 @@ export function createRoutingDescriptor(
     fallback_chains: fallbackChains,
     conductor: {
       enabled: conductor?.enabled !== false,
-      model: conductor?.model || "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+      model: conductor?.model || "Inkling-2-Mini-UD-IQ3_XXS.gguf",
       fallback_model: conductor?.fallback_model || "",
       base_url: conductor?.base_url || llamaBaseUrl,
       kv_backend: conductor?.kv_backend || "llama_cpp",

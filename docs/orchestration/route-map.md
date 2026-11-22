@@ -22,7 +22,7 @@ An **Agent** is the identity and its Runtime projection; an **orchestrator pool 
 `server-jarvis/src/config.ts:665–714` defines:
 
 - `active_backend`: `llama_cpp`.
-- `llama_cpp.model`: `Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf`; machine-specific executable/model paths are blank.
+- `llama_cpp.model`: `Inkling-2-Mini-UD-IQ3_XXS.gguf`, launched with the measured "Agent" profile (57344 context, f16 KV, `-ot` expert placement, reasoning_effort medium, no speculation); machine-specific executable/model paths are blank.
 - `ollama.model`: `qwen3.5-9b:latest`.
 - `openrouter.model`: `cohere/north-mini-code:free`; fallback enabled, paid configured fallback tail disabled, retries three.
 - `orchestrator.enabled`: **true** (`server-jarvis/src/config.ts:807`).

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync
 import { tmpdir } from "os";
 import { join } from "path";
 import { InvalidConfigError, defaultConfig, loadConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
-import { hasStageRouteOverride, resolveStageRoute } from "./orchestration/stage-route-policy";
+import { hasStageRouteOverride, resolveStageRoute, validateStageRouteConfig } from "./orchestration/stage-route-policy";
 
 describe("normalizeSettingMutation", () => {
   test("rejects an unknown key", () => {
@@ -333,6 +333,86 @@ describe("llama.cpp artifact paths", () => {
     expect(cfg.llama_cpp.model_path).toBe("X:/models/model.gguf");
     expect(cfg.llama_cpp.mtp_path).toBe("");
     expect(validateConfig({ ...cfg, active_backend: "llama_cpp" }).warnings.some((w) => w.includes("llama.cpp"))).toBe(false);
+  });
+});
+
+describe("llama.cpp default profile", () => {
+  test("defaultConfig ships the Inkling-2-Mini Agent profile", () => {
+    const cfg = defaultConfig();
+    expect(cfg.llama_cpp.model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+    expect(cfg.llama_cpp.base_url).toBe("http://127.0.0.1:8080/v1");
+    expect(cfg.llama_cpp.port).toBe(8080);
+    expect(cfg.llama_cpp.context_window).toBe(57344);
+    expect(cfg.llama_cpp.reasoning_budget).toBe(2048);
+    expect(cfg.llama_cpp.cache_type).toBe("f16");
+    expect(cfg.llama_cpp.n_cpu_moe).toBe(0);
+    expect(cfg.llama_cpp.override_tensor).toContain("ffn_.*_exps\\.=CPU");
+    expect(cfg.llama_cpp.batch_size).toBe(512);
+    expect(cfg.llama_cpp.threads).toBe(6);
+    expect(cfg.llama_cpp.batch_threads).toBe(6);
+    expect(cfg.llama_cpp.reasoning_effort).toBe("medium");
+    expect(cfg.llama_cpp.no_host).toBe(true);
+    expect(cfg.llama_cpp.no_repack).toBe(true);
+    expect(cfg.llama_cpp.cache_prompt).toBe(true);
+    expect(cfg.llama_cpp.cache_reuse).toBe(0);
+    // Speculation is off for this model, and the conductor carries its sampling.
+    expect(cfg.llama_cpp.spec_type).toBe("");
+    expect(cfg.orchestrator.conductor.model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+    expect(cfg.orchestrator.conductor.temperature).toBe(1);
+    expect(cfg.orchestrator.conductor.top_p).toBe(1);
+    expect(cfg.orchestrator.conductor.top_k).toBe(0);
+    expect(cfg.orchestrator.conductor.min_p).toBe(0);
+    expect(cfg.orchestrator.conductor.num_ctx).toBe(57344);
+  });
+
+  test("the default config validates against the new llama.cpp model name", () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "llama_cpp";
+    const validation = validateConfig(cfg);
+    expect(validation.errors).toEqual([]);
+    expect(validateStageRouteConfig(cfg.orchestrator, cfg.llama_cpp.model)).toEqual([]);
+  });
+
+  test("a stored pre-change llama.cpp block keeps the legacy launch values", () => {
+    // Same shape an install saved before the Inkling-2-Mini default: no
+    // cache_type / -ot / thread / reasoning_effort / no_host / cache flags.
+    const stored = {
+      llama_cpp: {
+        base_url: "http://127.0.0.1:8080/v1",
+        model: "Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf",
+        server_path: "X:/llama/llama-server.exe",
+        model_path: "X:/models/keep96.gguf",
+        mtp_path: "",
+        port: 8080,
+        context_window: 16384,
+        reasoning_budget: 0,
+        n_cpu_moe: 0,
+        batch_size: 1024,
+        spec_type: "draft-mtp,ngram-mod",
+        spec_draft_n_max: 2,
+      },
+    };
+    const cfg = normalizeConfig(stored);
+    expect(cfg.llama_cpp.model).toBe("Qwen3.6-35B-A3B-UD-IQ2_M-keep96.gguf");
+    expect(cfg.llama_cpp.cache_type).toBe("q8_0");
+    expect(cfg.llama_cpp.override_tensor).toBe("");
+    expect(cfg.llama_cpp.threads).toBe(0);
+    expect(cfg.llama_cpp.batch_threads).toBe(0);
+    expect(cfg.llama_cpp.reasoning_effort).toBe("");
+    expect(cfg.llama_cpp.no_host).toBe(false);
+    expect(cfg.llama_cpp.no_repack).toBe(false);
+    expect(cfg.llama_cpp.cache_prompt).toBe(false);
+    expect(cfg.llama_cpp.cache_reuse).toBeNull();
+    expect(cfg.llama_cpp.spec_type).toBe("draft-mtp,ngram-mod");
+  });
+
+  test("a paths-only llama.cpp block takes the current model defaults", () => {
+    // Not a pre-change row: the fields every saved row carries fall back to the
+    // shipped Inkling-2-Mini profile rather than the keep96 values.
+    const cfg = normalizeConfig({ llama_cpp: { server_path: "X:/llama/llama-server.exe", model_path: "X:/models/inkling.gguf" } });
+    expect(cfg.llama_cpp.model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+    expect(cfg.llama_cpp.context_window).toBe(57344);
+    expect(cfg.llama_cpp.reasoning_budget).toBe(2048);
   });
 });
 
