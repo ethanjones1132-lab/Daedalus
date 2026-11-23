@@ -25,6 +25,8 @@ export interface HarnessControllerInput {
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
   runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean } | void>;
   runChecker: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<{ passed: boolean }>;
+  /** Pre-generated run id so a caller can address the run before the loop settles. */
+  run_id?: string;
   signal?: AbortSignal;
   now?: () => number;
   /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes. */
@@ -62,7 +64,8 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
   const startedAt = now();
   const deadlineAt = startedAt + (input.deadline_ms ?? 30 * 60 * 1000);
   if (!Number.isFinite(deadlineAt) || deadlineAt <= startedAt) throw new Error("deadline_ms must be a positive finite duration");
-  const run = input.store.createRun({ project_root: input.manifest.project_root, manifest_id: input.manifest.id, manifest_hash: manifestHash(input.manifest) });
+  const run = input.store.createRun({ id: input.run_id, project_root: input.manifest.project_root,
+    manifest_id: input.manifest.id, manifest_hash: manifestHash(input.manifest) });
   const abort = new AbortController();
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   let reason: HarnessStopReason = "max_rounds";

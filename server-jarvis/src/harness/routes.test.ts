@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { HarnessStore } from "./store";
-import { handleHarnessRequest } from "./routes";
+import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
 import { validateManifest, type HarnessManifest } from "./manifest";
 
@@ -16,14 +16,36 @@ function manifest(id = "bug-fix", root = ROOT): HarnessManifest {
   };
 }
 
-function setup() {
+function setup(execution?: HarnessExecution) {
   const store = new HarnessStore({ dbPath: ":memory:" });
   const request = (path: string, method = "GET", body?: unknown) => handleHarnessRequest(new Request(`http://local${path}`, {
     method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
-  }), { store, resolveKnownProjectRoot: (root) => root === ROOT || root === "/alias" ? ROOT : root === "/other" ? "/other" : null });
+  }), { store, resolveKnownProjectRoot: (root) => root === ROOT || root === "/alias" ? ROOT : root === "/other" ? "/other" : null,
+    ...(execution ? { execution } : {}) });
   return { store, request };
 }
 const payload = async (response: Response | null) => response!.json();
+
+const zeroBatch = {
+  counter_vector: { typecheck: 0 },
+  sensors: [{ sensor_id: "typecheck", status: "zero" as const, counter: 0, exit_code: 0 }],
+};
+
+function execution(overrides: Partial<HarnessExecution> = {}): HarnessExecution {
+  return {
+    admission: { acquire: async () => ({ release() {} }) },
+    runMaker: async () => ({}),
+    runChecker: async () => ({ passed: true }),
+    sensors: async () => zeroBatch,
+    ...overrides,
+  };
+}
+
+/** A maker that stays in flight until the run is cancelled. */
+const waitingMaker: HarnessExecution["runMaker"] = async ({ signal }) => {
+  if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+  return {};
+};
 
 describe("harness routes", () => {
   test("lists templates, each validated when bound to a canonical project root", async () => {
@@ -77,5 +99,45 @@ describe("harness routes", () => {
     expect(history.runs.map((run: { id: string }) => run.id)).toEqual([one.id]);
     expect((await request(`/harness/runs/${one.id}?project_root=${encodeURIComponent(ROOT)}`))?.status).toBe(200);
     expect((await request(`/harness/runs/${one.id}?project_root=%2Fother`))?.status).toBe(404);
+  });
+
+  test("starts a run through the controller and reads it back through the run routes", async () => {
+    const { request } = setup(execution());
+    expect((await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 }))?.status).toBe(201);
+    const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" });
+    expect(started?.status).toBe(202);
+    const { run_id } = await payload(started);
+    expect(typeof run_id).toBe("string");
+    const history = await payload(await request(`/harness/runs?project_root=${encodeURIComponent(ROOT)}`));
+    expect(history.runs.map((run: { id: string }) => run.id)).toContain(run_id);
+    const read = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
+    expect(read.run.id).toBe(run_id);
+    expect((await request(`/harness/runs/${run_id}?project_root=%2Fother`))?.status).toBe(404);
+  });
+
+  test("cancels an in-flight run and settles it with the existing cancelled stop reason", async () => {
+    const { request } = setup(execution({ runMaker: waitingMaker }));
+    await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    const cancelled = await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT });
+    expect(cancelled?.status).toBe(200);
+    expect((await payload(cancelled)).stop_reason).toBe("cancelled");
+    const read = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
+    const stops = read.run.events.filter((event: { event_type: string }) => event.event_type === "stopped");
+    expect(stops.map((event: { payload: { stop_reason: string } }) => event.payload.stop_reason)).toEqual(["cancelled"]);
+  });
+
+  test("refuses unknown and already-cancelled run ids without touching the stored run", async () => {
+    const { request } = setup(execution({ runMaker: waitingMaker }));
+    await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    expect((await request(`/harness/runs/${crypto.randomUUID()}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(404);
+    expect((await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(200);
+    expect((await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(409);
+    const read = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
+    expect(read.run.id).toBe(run_id);
+    expect(read.run.events.filter((event: { event_type: string }) => event.event_type === "stopped")).toHaveLength(1);
+    const history = await payload(await request(`/harness/runs?project_root=${encodeURIComponent(ROOT)}`));
+    expect(history.runs.filter((run: { id: string }) => run.id === run_id)).toHaveLength(1);
   });
 });

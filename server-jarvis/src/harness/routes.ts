@@ -1,13 +1,32 @@
 import { renderHarnessGuides } from "../orchestration/harness-guides";
+import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessStopReason } from "./controller";
 import { validateManifest, type HarnessManifest } from "./manifest";
 import { HarnessStore } from "./store";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
+
+/** Injected execution boundaries for a run. The loop itself stays in `runHarness`. */
+export interface HarnessExecution {
+  sensors: HarnessControllerInput["sensors"];
+  runMaker: HarnessControllerInput["runMaker"];
+  runChecker: HarnessControllerInput["runChecker"];
+  admission: HarnessAdmission;
+}
 
 export interface HarnessRouteOptions {
   store?: HarnessStore;
   /** Return an app-known canonical project root, or null for an unknown root. */
   resolveKnownProjectRoot?: (root: string) => string | null;
+  /** Required to start a run; absent means this server cannot execute a harness yet. */
+  execution?: HarnessExecution;
 }
+
+interface ActiveHarnessRun {
+  controller: AbortController;
+  done: Promise<{ run_id: string; stop_reason: HarnessStopReason; rounds: number }>;
+}
+
+/** Ids of started-but-unsettled runs, so cancel can address them while the loop runs. */
+const activeRuns = new Map<string, ActiveHarnessRun>();
 
 function jsonError(error: string, status: number, extra: Record<string, unknown> = {}): Response {
   return Response.json({ error, ...extra }, { status });
@@ -121,6 +140,66 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
         rubric: manifest.checker.rubric });
       return Response.json({ guides_rendered: true, ...rendered });
     } catch (error) { return jsonError(String(error), 400); }
+  }
+
+  if (path === "/harness/runs" && req.method === "POST") {
+    const body = await req.json().catch(() => null) as Record<string, unknown> | null;
+    const rootValue = projectRootFrom(url, body ?? undefined);
+    if (typeof rootValue !== "string") return jsonError("project_root is required", 400);
+    const root = resolveRoot(rootValue);
+    if (!root) return jsonError("unknown_project_root", 404);
+    let candidate: HarnessManifest | undefined;
+    if (typeof body?.manifest_id === "string") {
+      candidate = store.getManifest(root, body.manifest_id)?.manifest;
+    } else if (body?.manifest !== undefined) {
+      const checked = validateManifest(body.manifest);
+      if (!checked.ok) return jsonError("invalid_manifest", 400, { errors: checked.errors });
+      if (checked.manifest.project_root !== root) return jsonError("project_root mismatch", 400);
+      candidate = checked.manifest;
+    } else return jsonError("manifest_id or manifest is required", 400);
+    if (!candidate) return jsonError("manifest_not_found", 404);
+    const deadline = body?.deadline_ms;
+    if (deadline !== undefined && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0)) {
+      return jsonError("deadline_ms must be a positive finite number", 400);
+    }
+    const execution = options.execution;
+    if (!execution) return jsonError("harness_execution_unavailable", 503);
+    const runId = crypto.randomUUID();
+    const controller = new AbortController();
+    // runHarness creates the run before its first await, so the id is durable by
+    // the time this response is written and the existing GET routes can read it.
+    const controllerInput: HarnessControllerInput = {
+      manifest: candidate, store, run_id: runId, signal: controller.signal,
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    };
+    if (typeof deadline === "number") controllerInput.deadline_ms = deadline;
+    const done = runHarness(controllerInput).finally(() => { activeRuns.delete(runId); });
+    activeRuns.set(runId, { controller, done });
+    // A start failure after the id is returned is visible as settled run evidence;
+    // never let it surface as an unhandled rejection.
+    done.catch(() => {});
+    return Response.json({ run_id: runId }, { status: 202 });
+  }
+
+  const cancelMatch = path.match(/^\/harness\/runs\/([^/]+)\/cancel$/);
+  if (cancelMatch && req.method === "POST") {
+    const body = await req.json().catch(() => null) as Record<string, unknown> | null;
+    const rootValue = projectRootFrom(url, body ?? undefined);
+    if (typeof rootValue !== "string") return jsonError("project_root is required", 400);
+    const root = resolveRoot(rootValue);
+    if (!root) return jsonError("unknown_project_root", 404);
+    let id: string;
+    try { id = decodeURIComponent(cancelMatch[1]); } catch { return jsonError("invalid run id", 400); }
+    const run = store.getRun(id);
+    if (!run || run.project_root !== root) return jsonError("run_not_found", 404);
+    const active = activeRuns.get(id);
+    if (!active) return jsonError("run_not_running", 409);
+    // Drop the entry before awaiting so a second cancel is refused, not queued.
+    activeRuns.delete(id);
+    active.controller.abort();
+    const settled = await active.done.catch(() => undefined);
+    if (!settled) return jsonError("run_settlement_failed", 500, { run_id: id });
+    return Response.json({ run_id: id, stop_reason: settled.stop_reason });
   }
 
   if (path === "/harness/runs" && req.method === "GET") {

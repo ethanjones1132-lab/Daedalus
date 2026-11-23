@@ -98,6 +98,13 @@ describe("runHarness", () => {
     await resultWithReason("checker_rejected", { runChecker: async () => ({ passed: false }) });
   });
 
+  test("creates the run with a caller-supplied id so it can be addressed while in flight", async () => {
+    const setup = deps({ run_id: "run-in-flight" });
+    const result = await runHarness(setup.input);
+    expect(result.run_id).toBe("run-in-flight");
+    expect(setup.store.getRun("run-in-flight")?.id).toBe("run-in-flight");
+  });
+
   test("refuses same-agent checker before creating a run", async () => {
     const setup = deps(); setup.input.manifest.checker.agent_id = "maker";
     await expect(runHarness(setup.input)).rejects.toThrow(/differ from maker/);
