@@ -18,11 +18,15 @@ function deferred() {
   return { promise, resolve, reject };
 }
 let requests: ReturnType<typeof deferred>[];
+/** What `get_backend_readiness` answers; DD-111 tests set a missing_file record. */
+let readinessAck: unknown = null;
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
   requests = [];
+  readinessAck = null;
   vi.mocked(invoke).mockReset();
-  vi.mocked(invoke).mockImplementation(() => {
+  vi.mocked(invoke).mockImplementation((command: string) => {
+    if (command === 'get_backend_readiness') return Promise.resolve(readinessAck);
     const request = deferred();
     requests.push(request);
     return request.promise;
@@ -63,7 +67,10 @@ describe('HealthBanner observation state', () => {
       'Health recovered: all services required by the active inference backend (openrouter) are running.',
     );
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
-    expect(vi.mocked(invoke).mock.calls).toEqual([['jarvis_check_status'], ['jarvis_check_status']]);
+    // Readiness is asked alongside status; only the status polls are counted.
+    expect(
+      vi.mocked(invoke).mock.calls.filter(([command]) => command === 'jarvis_check_status'),
+    ).toEqual([['jarvis_check_status'], ['jarvis_check_status']]);
   });
 
   it('retains explicitly stale details through failure and pending retry, then self-hides on health', async () => {
@@ -284,5 +291,32 @@ describe('HealthBanner llama_cpp backend', () => {
     expect(screen.getByRole('listitem', { name: 'llama.cpp server is not running and required by the active inference backend.' })).toBeInTheDocument();
     expect(screen.getByRole('listitem', { name: 'Ollama is not running and not required by the active inference backend.' })).toBeInTheDocument();
     expect(screen.getByRole('listitem', { name: /llama\.cpp server/ })).toHaveTextContent('(:8080)');
+  });
+
+  it('names an unusable artifact path instead of claiming the backend may still be starting', async () => {
+    // DD-111: a configured server_path that is not a file can never bind the
+    // port, so waiting is not the answer the band should give.
+    readinessAck = {
+      state: 'missing_file',
+      backend: 'llama_cpp',
+      missing: [
+        {
+          key: 'llama_cpp.server_path',
+          label: 'llama.cpp server_path',
+          env_var: 'JARVIS_LLAMA_SERVER_PATH',
+          path: 'C:/tools/llama-server',
+        },
+      ],
+    };
+    await mount();
+    await settle(0, { ...llamaCpp, llama_cpp_running: false });
+    // The readiness read follows the status snapshot.
+    await act(async () => {});
+
+    expect(screen.queryByText('Starting')).not.toBeInTheDocument();
+    expect(screen.getByText('Offline')).toBeInTheDocument();
+    expect(announcement()).toHaveTextContent('llama.cpp server_path');
+    expect(announcement()).toHaveTextContent('C:/tools/llama-server');
+    expect(announcement()).not.toHaveTextContent('still loading');
   });
 });

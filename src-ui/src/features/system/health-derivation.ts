@@ -8,6 +8,8 @@
 // so both go through `deriveHealthPresentation`.
 
 import type { JarvisStatus } from '../../domain/types';
+import { backendDisplayName } from '../../lib/backend-identity';
+import { joinMissingSettings, type BackendReadiness } from '../../lib/backend-readiness';
 
 export type HealthLevel = 'ok' | 'starting' | 'warn' | 'down' | 'unavailable';
 
@@ -53,8 +55,21 @@ export function backendOk(s: JarvisStatus): boolean {
   return false;
 }
 
-function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: number): HealthLevel {
+function overallLevel(
+  s: JarvisStatus,
+  fetchError: string | null,
+  mountedForMs: number,
+  artifactFault: string | null,
+): HealthLevel {
   if (fetchError) return 'unavailable';
+  /*
+   * DD-111: a configured artifact path that is not a file can never start,
+   * however long we wait, so the startup grace is not honest here. The band
+   * says Offline naming the fault instead of "the local model is still
+   * loading". An already-answering port never reaches this point — Native
+   * returns Ready before it looks at the files.
+   */
+  if (artifactFault && !backendOk(s)) return 'down';
   /*
    * A cold start is the normal case: native spawns the Inference backend in the
    * background and the first poll fires immediately, long before the model can
@@ -77,9 +92,19 @@ function overallLevel(s: JarvisStatus, fetchError: string | null, mountedForMs: 
   return 'ok';
 }
 
-function summaryFor(s: JarvisStatus, level: HealthLevel, fetchError: string | null): string {
+function summaryFor(
+  s: JarvisStatus,
+  level: HealthLevel,
+  fetchError: string | null,
+  artifactFault: string | null,
+): string {
   if (fetchError) return 'Health observation is unavailable.';
   if (level === 'down') {
+    // DD-111: name the usable-looking setting and the exact path, the same
+    // sentence the composer prints for the same fault.
+    if (artifactFault) {
+      return `${backendDisplayName(s.active_backend)} cannot start: ${artifactFault}.`;
+    }
     if (!backendOk(s)) return `Backend "${s.active_backend ?? ''}" is unreachable`;
     return 'Status check failed';
   }
@@ -113,16 +138,37 @@ export interface HealthPresentation {
   summary: string;
 }
 
+/**
+ * DD-111: the sentence for a configured artifact path that is not a file.
+ * Native already decided the state; this only formats the item, so the band
+ * names the same setting and path as the composer.
+ */
+function backendArtifactFault(readiness: BackendReadiness | null): string | null {
+  if (!readiness || readiness.state !== 'missing_file' || readiness.missing.length === 0) {
+    return null;
+  }
+  return joinMissingSettings(readiness.missing);
+}
+
+/**
+ * `readiness` is Native's artifact verdict (DD-111). It is optional so a
+ * surface that has not read it keeps today's behaviour; when supplied, an
+ * unusable path is reported as its own fault rather than as a backend that may
+ * still be starting.
+ */
 export function deriveHealthPresentation(
   status: JarvisStatus,
   fetchError: string | null,
   mountedForMs: number,
+  readiness: BackendReadiness | null = null,
 ): HealthPresentation {
-  const level = overallLevel(status, fetchError, mountedForMs);
+  const artifactFault = backendArtifactFault(readiness);
+  const level = overallLevel(status, fetchError, mountedForMs, artifactFault);
   return {
     level,
     label: level === 'ok' ? 'Ready' : LABELS[level],
-    summary: level === 'ok' ? 'All systems ready' : summaryFor(status, level, fetchError),
+    summary:
+      level === 'ok' ? 'All systems ready' : summaryFor(status, level, fetchError, artifactFault),
   };
 }
 

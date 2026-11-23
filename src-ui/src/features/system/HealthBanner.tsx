@@ -20,7 +20,8 @@ import {
   recoverAnnouncement,
   type HealthSubsystemState,
 } from '../../domain/health-banner-subsystems';
-import { deriveHealthPresentation, recordFirstHealthObservation, type HealthLevel } from './health-derivation';
+import { deriveHealthPresentation, backendOk, recordFirstHealthObservation, type HealthLevel } from './health-derivation';
+import { useBackendReadiness } from './BackendSetupNotice';
 
 export { deriveHealthPresentation, STARTUP_GRACE_MS } from './health-derivation';
 
@@ -65,6 +66,12 @@ export default function HealthBanner() {
   const [observation, dispatch] = useReducer(reduceRegistryState<JarvisStatus>, initialRegistryState<JarvisStatus>());
   const requestIdRef = useRef(0);
   const { snapshot: status, loading, error } = observation;
+  // DD-111: while the backend is not answering, ask Native whether the cause is
+  // a configured path that is not a file. A healthy backend's port already
+  // proves its artifacts were usable, so no extra probe runs then. The status
+  // snapshot is the refresh key, so a poll re-reads the verdict and the band
+  // cannot keep naming a path the operator already fixed.
+  const readiness = useBackendReadiness(status && !backendOk(status) ? status : null);
   const [expanded, setExpanded] = useState(false);
   // A focused Retry disappears with the band the moment its read recovers.
   // Without a hand-off the browser strands focus on the document body, so the
@@ -86,7 +93,12 @@ export default function HealthBanner() {
   usePolling(fetchStatus, 15000, [fetchStatus]);
 
   const presentation = status
-    ? deriveHealthPresentation(status, error ? 'unavailable' : null, Date.now() - mountedAtRef.current)
+    ? deriveHealthPresentation(
+        status,
+        error ? 'unavailable' : null,
+        Date.now() - mountedAtRef.current,
+        readiness,
+      )
     : { level: 'unavailable' as const, label: 'Unavailable', summary: 'Health observation is unavailable.' };
   const level = presentation.level;
   const style = level === 'ok' ? null : BAND_STYLES[level];

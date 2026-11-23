@@ -13,11 +13,18 @@
 // problem — a fabricated "not configured" state is just as dishonest as the
 // silent empty chat it replaces. The same holds in the other direction (DD-067):
 // complete settings are not proof that the backend answers, so `not_listening`
-// is a state the composer must respect rather than paper over.
+// is a state the composer must respect rather than paper over. DD-111 adds a
+// third fault: a configured path that is not a file (`missing_file`), which
+// names the path so the composer and the health band cannot describe it as a
+// backend that may still be starting.
 
 import { backendDisplayName } from './backend-identity';
 
-export type BackendReadinessState = 'ready' | 'missing_config' | 'not_listening';
+export type BackendReadinessState =
+  | 'ready'
+  | 'missing_config'
+  | 'missing_file'
+  | 'not_listening';
 
 /** One setting (or program) that stops the active Inference backend from answering. */
 export interface MissingSetting {
@@ -33,13 +40,22 @@ export interface MissingSetting {
    * program, so surfaces print it verbatim instead of "missing ollama".
    */
   reason: string | null;
+  /**
+   * DD-111: the configured artifact path that is not a file. A blank setting
+   * has none; an unusable one names the exact path, so every surface prints the
+   * same one.
+   */
+  path: string | null;
 }
 
 export interface BackendReadiness {
   state: BackendReadinessState;
   /** The backend the derivation ran for (`llama_cpp`, `openrouter`, …). */
   backend: string;
-  /** The missing settings or programs — empty for every state except `missing_config`. */
+  /**
+   * The missing settings or programs — empty for every state except
+   * `missing_config` and `missing_file`.
+   */
   missing: MissingSetting[];
 }
 
@@ -60,6 +76,7 @@ function parseMissingSetting(raw: unknown): MissingSetting | null {
     label: nonBlankString(raw.label) ?? key,
     envVar: nonBlankString(raw.env_var),
     reason: nonBlankString(raw.reason),
+    path: nonBlankString(raw.path),
   };
 }
 
@@ -70,7 +87,14 @@ function parseMissingSetting(raw: unknown): MissingSetting | null {
 export function parseBackendReadiness(value: unknown): BackendReadiness | null {
   if (!isRecord(value)) return null;
   const state = value.state;
-  if (state !== 'ready' && state !== 'missing_config' && state !== 'not_listening') return null;
+  if (
+    state !== 'ready' &&
+    state !== 'missing_config' &&
+    state !== 'missing_file' &&
+    state !== 'not_listening'
+  ) {
+    return null;
+  }
 
   const missing: MissingSetting[] = [];
   if (Array.isArray(value.missing)) {
@@ -91,7 +115,11 @@ export function parseBackendReadiness(value: unknown): BackendReadiness | null {
 export function needsBackendSetup(
   readiness: BackendReadiness | null,
 ): readiness is BackendReadiness {
-  return Boolean(readiness && readiness.state === 'missing_config' && readiness.missing.length > 0);
+  return Boolean(
+    readiness &&
+      (readiness.state === 'missing_config' || readiness.state === 'missing_file') &&
+      readiness.missing.length > 0,
+  );
 }
 
 /**
@@ -106,17 +134,21 @@ export function backendNotListening(readiness: BackendReadiness | null): boolean
 
 /**
  * How a missing item is named in prose: the item's own sentence when Native
- * supplied one (DD-115, a program that was not found or cannot run), otherwise
- * the Settings label plus the environment variable that also satisfies it.
+ * supplied one (DD-115, a program that was not found or cannot run), the
+ * setting plus the exact path that is not a file (DD-111), otherwise the
+ * Settings label plus the environment variable that also satisfies it.
  */
 export function missingSettingText(setting: MissingSetting): string {
   if (setting.reason) return setting.reason;
+  if (setting.path) {
+    return `${setting.label} points to ${setting.path}, which is not a file`;
+  }
   return setting.envVar ? `${setting.label} (or ${setting.envVar})` : setting.label;
 }
 
 /** True when an item speaks in its own sentence rather than a field name. */
 export function hasOwnSentence(missing: MissingSetting[]): boolean {
-  return missing.some((setting) => Boolean(setting.reason));
+  return missing.some((setting) => Boolean(setting.reason || setting.path));
 }
 
 /** "a", "a and b", "a, b and c" — the setup state's list of missing items. */
@@ -131,9 +163,10 @@ export function joinMissingSettings(missing: MissingSetting[]): string {
  * decides it for every session surface.
  *
  * A program item already reads as a sentence ("ollama was not found — install
- * Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN"), so it is printed as-is;
- * folding it into "X is missing …" would produce "Ollama is missing ollama was
- * not found".
+ * Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN"), and so does an unusable
+ * artifact ("llama.cpp server_path points to …, which is not a file"), so both
+ * are printed as-is; folding them into "X is missing …" would produce "Ollama
+ * is missing ollama was not found".
  */
 export function backendBlockedReason(readiness: BackendReadiness | null): string | null {
   // Returned before the predicate below: its false branch removes
@@ -145,7 +178,10 @@ export function backendBlockedReason(readiness: BackendReadiness | null): string
   // false branch would narrow `readiness` to `never`, making the port branch
   // below uncompilable (reviewer's compile fix; `tsc -b` is what catches a
   // regression).
-  if (readiness.state === 'missing_config' && readiness.missing.length > 0) {
+  if (
+    (readiness.state === 'missing_config' || readiness.state === 'missing_file') &&
+    readiness.missing.length > 0
+  ) {
     const missing = joinMissingSettings(readiness.missing);
     return hasOwnSentence(readiness.missing)
       ? `${missing}. Set it in Settings to chat.`

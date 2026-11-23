@@ -33,7 +33,7 @@ export const BACKEND_SETUP_NOTICE_LABEL = 'Inference backend setup';
  * filling the field clears the notice. A failed read keeps the last known
  * state (or none at all on a cold read); it never invents "ready".
  */
-export function useBackendReadiness(refreshKey?: number | string): BackendReadiness | null {
+export function useBackendReadiness(refreshKey?: unknown): BackendReadiness | null {
   const [readiness, setReadiness] = useState<BackendReadiness | null>(null);
   useEffect(() => {
     let live = true;

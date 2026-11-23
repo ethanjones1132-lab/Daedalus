@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { deriveHealthPresentation, markStalePresentation, STARTUP_GRACE_MS } from './health-derivation';
 import type { JarvisStatus } from '../../domain/types';
+import type { BackendReadiness } from '../../lib/backend-readiness';
 
 const healthy: JarvisStatus = {
   ollama_running: false,
@@ -79,6 +80,68 @@ describe('backend startup grace', () => {
       summary: 'Starting Bun server — tools and skills are warming up',
     });
     expect(deriveHealthPresentation(noBun, null, STARTUP_GRACE_MS + 1).level).toBe('warn');
+  });
+});
+
+describe('an unusable artifact is its own fault (DD-111)', () => {
+  const unreachable: JarvisStatus = { ...healthy, llama_cpp_running: false };
+  const missingServer: BackendReadiness = {
+    state: 'missing_file',
+    backend: 'llama_cpp',
+    missing: [
+      {
+        key: 'llama_cpp.server_path',
+        label: 'llama.cpp server_path',
+        envVar: 'JARVIS_LLAMA_SERVER_PATH',
+        reason: null,
+        path: 'C:/tools/llama-server',
+      },
+    ],
+  };
+
+  it('reads Offline naming the setting and path, even inside the startup grace', () => {
+    // The path is a filesystem fact, not a timing one: waiting cannot fix it,
+    // so the band must never say the backend may still be starting.
+    const presentation = deriveHealthPresentation(unreachable, null, 0, missingServer);
+
+    expect(presentation.level).toBe('down');
+    expect(presentation.label).toBe('Offline');
+    expect(presentation.summary).toContain('cannot start');
+    expect(presentation.summary).toContain('llama.cpp server_path');
+    expect(presentation.summary).toContain('C:/tools/llama-server');
+    expect(presentation.summary).not.toContain('still loading');
+    expect(presentation.summary).not.toContain('starting up');
+  });
+
+  it('keeps the ordinary startup grace for a blank setting', () => {
+    const blank: BackendReadiness = {
+      state: 'missing_config',
+      backend: 'llama_cpp',
+      missing: [
+        {
+          key: 'llama_cpp.server_path',
+          label: 'llama.cpp server_path',
+          envVar: 'JARVIS_LLAMA_SERVER_PATH',
+          reason: null,
+          path: null,
+        },
+      ],
+    };
+
+    expect(deriveHealthPresentation(unreachable, null, 0, blank)).toMatchObject({
+      level: 'starting',
+      summary: 'The local model is still loading — the Inference backend is starting up',
+    });
+  });
+
+  it('still reads Ready when the port already answers', () => {
+    // Boot returns AlreadyListening before it looks at the files, so a serving
+    // backend is usable whatever a stale readiness record says.
+    expect(deriveHealthPresentation(healthy, null, 0, missingServer)).toMatchObject({
+      level: 'ok',
+      label: 'Ready',
+      summary: 'All systems ready',
+    });
   });
 });
 

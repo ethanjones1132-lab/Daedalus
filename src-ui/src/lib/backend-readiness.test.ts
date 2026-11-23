@@ -27,6 +27,7 @@ describe('parseBackendReadiness', () => {
           label: 'llama.cpp server_path',
           envVar: 'JARVIS_LLAMA_SERVER_PATH',
           reason: null,
+          path: null,
         },
       ],
     });
@@ -45,9 +46,43 @@ describe('parseBackendReadiness', () => {
     });
 
     expect(parsed?.missing).toEqual([
-      { key: 'ollama.executable', label: 'ollama executable', envVar: 'JARVIS_OLLAMA_BIN', reason },
+      { key: 'ollama.executable', label: 'ollama executable', envVar: 'JARVIS_OLLAMA_BIN', reason, path: null },
     ]);
     expect(needsBackendSetup(parsed)).toBe(true);
+  });
+
+  it('reads an unusable artifact as missing_file carrying the setting and path', () => {
+    // DD-111: a configured path that is not a file is its own fault. The path
+    // travels beside the setting so both the composer and the health band can
+    // print the same one.
+    const parsed = parseBackendReadiness({
+      state: 'missing_file',
+      backend: 'llama_cpp',
+      missing: [
+        {
+          key: 'llama_cpp.server_path',
+          label: 'llama.cpp server_path',
+          env_var: 'JARVIS_LLAMA_SERVER_PATH',
+          path: 'C:/tools/llama-server.exe',
+        },
+      ],
+    });
+
+    expect(parsed).toEqual({
+      state: 'missing_file',
+      backend: 'llama_cpp',
+      missing: [
+        {
+          key: 'llama_cpp.server_path',
+          label: 'llama.cpp server_path',
+          envVar: 'JARVIS_LLAMA_SERVER_PATH',
+          reason: null,
+          path: 'C:/tools/llama-server.exe',
+        },
+      ],
+    });
+    expect(needsBackendSetup(parsed)).toBe(true);
+    expect(backendNotListening(parsed)).toBe(false);
   });
 
   it('treats an unreadable answer as no claim at all', () => {
@@ -69,7 +104,7 @@ describe('parseBackendReadiness', () => {
     });
 
     expect(parsed?.missing).toEqual([
-      { key: 'llama_cpp.model_path', label: 'llama_cpp.model_path', envVar: null, reason: null },
+      { key: 'llama_cpp.model_path', label: 'llama_cpp.model_path', envVar: null, reason: null, path: null },
     ]);
   });
 
@@ -116,11 +151,26 @@ describe('missing-setting prose', () => {
         label: 'llama.cpp server_path',
         envVar: 'JARVIS_LLAMA_SERVER_PATH',
         reason: null,
+        path: null,
       }),
     ).toBe('llama.cpp server_path (or JARVIS_LLAMA_SERVER_PATH)');
     expect(
-      missingSettingText({ key: 'openrouter.api_key', label: 'OpenRouter API key', envVar: null, reason: null }),
+      missingSettingText({ key: 'openrouter.api_key', label: 'OpenRouter API key', envVar: null, reason: null, path: null }),
     ).toBe('OpenRouter API key');
+  });
+
+  it('names an unusable artifact\'s setting and exact path', () => {
+    // DD-111: the sentence must not read as an unconfigured backend — the field
+    // is set, it just points at something that is not a file.
+    expect(
+      missingSettingText({
+        key: 'llama_cpp.server_path',
+        label: 'llama.cpp server_path',
+        envVar: 'JARVIS_LLAMA_SERVER_PATH',
+        reason: null,
+        path: 'C:/tools/llama-server.exe',
+      }),
+    ).toBe('llama.cpp server_path points to C:/tools/llama-server.exe, which is not a file');
   });
 
   it('prefers a program\'s own sentence over the field label', () => {
@@ -130,14 +180,15 @@ describe('missing-setting prose', () => {
         label: 'ollama executable',
         envVar: 'JARVIS_OLLAMA_BIN',
         reason: 'ollama was not found — install Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN',
+        path: null,
       }),
     ).toBe('ollama was not found — install Ollama, add it to PATH, or set JARVIS_OLLAMA_BIN');
   });
 
   it('joins one, two and three fields as prose', () => {
-    const one = [{ key: 'a', label: 'a', envVar: null, reason: null }];
-    const two = [...one, { key: 'b', label: 'b', envVar: null, reason: null }];
-    const three = [...two, { key: 'c', label: 'c', envVar: null, reason: null }];
+    const one = [{ key: 'a', label: 'a', envVar: null, reason: null, path: null }];
+    const two = [...one, { key: 'b', label: 'b', envVar: null, reason: null, path: null }];
+    const three = [...two, { key: 'c', label: 'c', envVar: null, reason: null, path: null }];
 
     expect(joinMissingSettings(one)).toBe('a');
     expect(joinMissingSettings(two)).toBe('a and b');
@@ -175,12 +226,40 @@ describe('the composer\'s blocked reason', () => {
           label: 'llama.cpp server_path',
           envVar: 'JARVIS_LLAMA_SERVER_PATH',
           reason: null,
+          path: null,
         },
       ],
     });
 
     expect(blocked).toBe(
       'llama.cpp is missing llama.cpp server_path (or JARVIS_LLAMA_SERVER_PATH). Set it in Settings to chat.',
+    );
+  });
+
+  it('names an unusable artifact\'s setting and path instead of a starting backend', () => {
+    // DD-111: Send stays disabled, and the reason is the path that is not a
+    // file — never "it may still be starting". The health band prints the same
+    // path for the same fault.
+    const blocked = backendBlockedReason(
+      parseBackendReadiness({
+        state: 'missing_file',
+        backend: 'llama_cpp',
+        missing: [
+          {
+            key: 'llama_cpp.model_path',
+            label: 'llama.cpp model_path',
+            env_var: 'JARVIS_LLAMA_MODEL_PATH',
+            path: 'D:/models/not-installed.gguf',
+          },
+        ],
+      }),
+    );
+
+    expect(blocked).toContain('llama.cpp model_path');
+    expect(blocked).toContain('D:/models/not-installed.gguf');
+    expect(blocked).not.toContain('still starting');
+    expect(blocked).toBe(
+      'llama.cpp model_path points to D:/models/not-installed.gguf, which is not a file. Set it in Settings to chat.',
     );
   });
 
