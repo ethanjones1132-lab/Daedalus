@@ -46,6 +46,10 @@ function waitWithAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+function isPassingSensorResult(result: HarnessSensorBatch["sensors"][number]): boolean {
+  return result.status === "zero" && Number.isInteger(result.counter) && result.counter === 0 && result.exit_code === 0;
+}
+
 function vectorImproved(previous: HarnessRoundInput["counter_vector"] | undefined, current: HarnessRoundInput["counter_vector"]): boolean {
   if (!previous) return false;
   const comparable = Object.keys(current).filter((key) => typeof previous[key] === "number" && typeof current[key] === "number");
@@ -98,17 +102,37 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       const round = input.store.appendRound({ run_id: run.id, round_number: roundNumber, counter_vector: batch.counter_vector });
       for (const result of batch.sensors) {
-        const isZero = result.status === "zero" && Number.isInteger(result.counter) && result.counter === 0 && result.exit_code === 0;
+        const isZero = isPassingSensorResult(result);
         const status: HarnessSensorResultInput["status"] = isZero ? "passed" : result.status === "not_applicable" ? "not_applicable" : "failed";
         input.store.appendSensorResult({ run_id: run.id, round_id: round.id, sensor_id: result.sensor_id, status,
           counter: result.counter, exit_code: result.exit_code ?? null, stdout: result.stdout ?? "", stderr: result.stderr ?? "" });
       }
-      const required = input.manifest.sensors.filter((sensor) => sensor.required);
-      const allRequiredZero = required.length > 0 && required.every((sensor) => {
-        const result = batch.sensors.find((entry) => entry.sensor_id === sensor.id);
-        return result?.status === "zero" && Number.isInteger(result.counter) && result.counter === 0 && result.exit_code === 0;
+      // A round settles only on complete evidence: every sensor the manifest asked
+      // for must have reported, and every reported sensor must have passed. Optional
+      // sensors (`required: false`) are in that set, so one failing optional sensor
+      // cannot pass silently. The one exemption is a sensor the manifest itself
+      // declares unavailable: its `not_applicable` result is a known evidence gap,
+      // not a check that was silently skipped. (A command sensor skipped as
+      // `not_applicable` — e.g. no stored baseline — does block.)
+      const declaredSensors = new Map(input.manifest.sensors.map((sensor) => [sensor.id, sensor] as const));
+      const blocking = batch.sensors.filter((result) => {
+        if (isPassingSensorResult(result)) return false;
+        return result.status !== "not_applicable" || declaredSensors.get(result.sensor_id)?.kind !== "unavailable";
       });
-      if (allRequiredZero) {
+      const reported = new Set(batch.sensors.map((result) => result.sensor_id));
+      const missing = input.manifest.sensors.filter((sensor) => !reported.has(sensor.id));
+      const evidenceComplete = blocking.length === 0 && missing.length === 0;
+      // A manifest with no required sensors (and none at all, like generic_audit)
+      // has no computational gate of its own, so the checker is what settles it.
+      // With no enabled checker, only a passing required sensor may settle a pass;
+      // otherwise nothing claims one and the loop works on or exhausts its rounds.
+      const hasPassingRequiredSensor = input.manifest.sensors.some((sensor) => {
+        if (!sensor.required) return false;
+        const result = batch.sensors.find((entry) => entry.sensor_id === sensor.id);
+        return result !== undefined && isPassingSensorResult(result);
+      });
+      const settleReady = evidenceComplete && (input.manifest.checker.enabled || hasPassingRequiredSensor);
+      if (settleReady) {
         if (input.manifest.checker.enabled) {
           try {
             const checkedByAgent = await waitWithAbort(input.runChecker({ manifest: input.manifest, signal: abort.signal }), abort.signal);

@@ -119,4 +119,75 @@ describe("runHarness", () => {
     await resultWithReason("approval_denied", { sensors: async () => ({ counter_vector: { tests: null },
       sensors: [{ sensor_id: "tests", status: "unapproved", counter: null }] }) });
   });
+
+  test("a manifest with no required sensors still reaches the checker and settles on its acceptance", async () => {
+    const item = manifest(); item.sensors = [];
+    let checks = 0;
+    const { result } = await resultWithReason("passed", {
+      manifest: item,
+      sensors: async () => ({ counter_vector: {}, sensors: [] }),
+      runChecker: async () => { checks++; return { passed: true }; },
+    });
+    expect(checks).toBe(1);
+    expect(result.rounds).toBe(1);
+  });
+
+  test("a manifest with no required sensors settles checker_rejected when the checker rejects", async () => {
+    const item = manifest(); item.sensors = [];
+    let checks = 0;
+    await resultWithReason("checker_rejected", {
+      manifest: item,
+      sensors: async () => ({ counter_vector: {}, sensors: [] }),
+      runChecker: async () => { checks++; return { passed: false }; },
+    });
+    expect(checks).toBe(1);
+  });
+
+  test("a failing optional sensor blocks the pass instead of passing silently", async () => {
+    const item = manifest();
+    item.sensors = [...item.sensors, { id: "lint", kind: "command", command_id: "bun_typecheck", args: [], timeout_ms: 1000,
+      zero_threshold: 0, failure_message: "lint fails", required: false }];
+    let checks = 0;
+    const { result } = await resultWithReason("no_progress", {
+      manifest: item,
+      runChecker: async () => { checks++; return { passed: true }; },
+      sensors: async () => ({ counter_vector: { tests: 0, lint: 1 }, sensors: [
+        { sensor_id: "tests", status: "zero", counter: 0, exit_code: 0 },
+        { sensor_id: "lint", status: "nonzero", counter: 1, exit_code: 1 },
+      ] }),
+    });
+    expect(result.stop_reason).not.toBe("passed");
+    expect(checks).toBe(0);
+  });
+
+  test("an unavailable sensor's not_applicable result does not block a pass", async () => {
+    const item = manifest();
+    item.sensors = [...item.sensors, { id: "publishing", kind: "unavailable", args: [], timeout_ms: 1,
+      zero_threshold: 0, failure_message: "unavailable", required: false }];
+    const { result } = await resultWithReason("passed", {
+      manifest: item,
+      sensors: async () => ({ counter_vector: { tests: 0, publishing: "not_applicable" }, sensors: [
+        { sensor_id: "tests", status: "zero", counter: 0, exit_code: 0 },
+        { sensor_id: "publishing", status: "not_applicable", counter: null },
+      ] }),
+    });
+    expect(result.rounds).toBe(1);
+  });
+
+  test("a command sensor skipped as not_applicable blocks the pass", async () => {
+    const item = manifest();
+    item.sensors = [...item.sensors, { id: "typecheck", kind: "command", command_id: "bun_typecheck", args: [], timeout_ms: 1000,
+      zero_threshold: 0, failure_message: "typecheck has no baseline", required: false }];
+    let checks = 0;
+    const { result } = await resultWithReason("no_progress", {
+      manifest: item,
+      runChecker: async () => { checks++; return { passed: true }; },
+      sensors: async () => ({ counter_vector: { tests: 0, typecheck: "not_applicable" }, sensors: [
+        { sensor_id: "tests", status: "zero", counter: 0, exit_code: 0 },
+        { sensor_id: "typecheck", status: "not_applicable", counter: null },
+      ] }),
+    });
+    expect(result.stop_reason).not.toBe("passed");
+    expect(checks).toBe(0);
+  });
 });
