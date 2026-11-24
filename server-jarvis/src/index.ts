@@ -84,7 +84,9 @@ import { createLifecycleService, validateLifecycleSnapshot, type LifecycleServic
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
-import { handleHarnessRequest } from "./harness/routes";
+import { createHarnessExecution } from "./harness/execution";
+import { handleHarnessRequest, type HarnessExecution } from "./harness/routes";
+import { HarnessStore } from "./harness/store";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
 import { logReadResponse, readLogTail } from "./log-read";
 import { effectiveOllamaUrl, checkOllamaHealth, checkOllamaModelSupportsTools, resolveWindowsHostIP, resolveDesiredOllamaModel } from "./ollama";
@@ -6907,6 +6909,48 @@ export async function baseFetch(req: Request): Promise<Response> {
   });
 }
 
+/**
+ * DD-150: the server's harness execution boundaries. Built on the first harness
+ * request so importing this module performs no filesystem work, and memoized so
+ * background admission stays one server-wide lane instead of one per request.
+ * The maker reuses the orchestration single-stage executor
+ * (`productionExecutorDelegateRuntime` → `runClaudeDelegate`) for one tool-loop
+ * turn in the manifest's project root; the checker is a single reviewer-role
+ * model call. Each resolves its agent from the manifest id through the
+ * orchestration pool (executor / reviewer for the templates' generic ids).
+ * Binding Inkling as the maker is DD-151.
+ */
+let harnessExecution: HarnessExecution | undefined;
+function serverHarnessExecution(): HarnessExecution {
+  if (harnessExecution) return harnessExecution;
+  harnessExecution = createHarnessExecution({
+    store: new HarnessStore(),
+    agents: normalizeConfig(loadConfig()).orchestrator.agents,
+    runMakerTurn: async ({ cwd, prompt, signal }) => {
+      const result = await productionExecutorDelegateRuntime.run({
+        config: normalizeConfig(loadConfig()),
+        prompt,
+        sessionId: crypto.randomUUID(),
+        allowedRoots: [cwd],
+        stageRemainingMs: 15 * 60_000,
+        profile: "full",
+        writeEffectRequired: true,
+        nativeNoWrite: false,
+        signal,
+      });
+      return { ok: result.ok, narrative: result.narrative };
+    },
+    callModel: async ({ prompt, signal }) => {
+      const answer = await makeCallModel(normalizeConfig(loadConfig()), "reviewer")(
+        [{ role: "user", content: prompt }],
+        { stageAbort: signal },
+      );
+      return { text: answer.content ?? "" };
+    },
+  });
+  return harnessExecution;
+}
+
 async function routeBaseRequest(req: Request, path: string): Promise<Response> {
   // The Native surface additionally authenticates with its own capability.
   const internalMemory = await handleNativeMemoryRequest(
@@ -7346,12 +7390,19 @@ async function routeBaseRequest(req: Request, path: string): Promise<Response> {
     if (tuningResponse) return tuningResponse;
 
     const harnessResponse = await handleHarnessRequest(req, {
+      execution: serverHarnessExecution(),
       resolveKnownProjectRoot: (root) => {
-        const knownRoot = normalizeConfig(loadConfig()).jarvis_path;
+        // App-known roots: the workspace plus every persistent configured root.
+        const cfg = normalizeConfig(loadConfig());
+        const knownRoots = [cfg.jarvis_path, ...cfg.tools.allowed_roots];
         try {
-          const canonicalKnownRoot = realpathSync(knownRoot);
           const canonicalRequestedRoot = realpathSync(root);
-          return canonicalRequestedRoot === canonicalKnownRoot ? canonicalKnownRoot : null;
+          for (const knownRoot of knownRoots) {
+            try {
+              if (realpathSync(knownRoot) === canonicalRequestedRoot) return canonicalRequestedRoot;
+            } catch { /* a configured root that is not on disk cannot authorize anything */ }
+          }
+          return null;
         } catch { return null; }
       },
     });
