@@ -249,13 +249,14 @@ pub struct LlamaCppConfig {
     #[serde(default = "legacy_default_spec_draft_n_max")]
     pub spec_draft_n_max: u32,
     /// KV cache type for both K and V (`-ctk` / `-ctv`). Always emitted.
-    /// q5_0/q8_0 take a slow per-token dequant path on Inkling-2-Mini, so the
-    /// shipped default is f16.
+    /// q5_0/q8_0 take a slow per-token dequant path on Inkling-2-Mini, and the
+    /// AgentFast profile's q4_0 cache leaves VRAM for the 6-17 expert
+    /// placement, so q4_0 is the shipped default.
     #[serde(default = "legacy_default_cache_type")]
     pub cache_type: String,
     /// `-ot` tensor override, e.g. `blk\.(0|1)\.ffn_.*_exps\.=CPU`. Blank keeps
-    /// every tensor on the GPU. Inkling-2-Mini keeps the experts of its looped
-    /// layers 6-14 on the GPU and offloads the rest.
+    /// every tensor on the GPU. The Inkling-2-Mini AgentFast profile keeps the
+    /// experts of its looped layers 6-17 on the GPU and offloads the rest.
     #[serde(default)]
     pub override_tensor: String,
     /// Generation threads (`-t`). 0 omits the flag and lets llama-server decide.
@@ -288,8 +289,8 @@ pub struct LlamaCppConfig {
 // fields a row can genuinely predate get them: `batch_size`, `spec_type` and
 // `spec_draft_n_max` were added after the first installs, so a row saved then
 // must keep the values the launcher used for it (1024, `draft-mtp,ngram-mod`,
-// 2) instead of silently picking up the Inkling-2-Mini defaults.
-// `Default::default()` (a fresh install) uses the Inkling-2-Mini profile, and a
+// 2) instead of silently picking up the Inkling-2-Mini AgentFast defaults.
+// `Default::default()` (a fresh install) uses the AgentFast profile, and a
 // missing `model`/`context_window`/`reasoning_budget` takes that profile too,
 // because every saved row has always written those.
 fn legacy_default_batch_size() -> u32 {
@@ -309,23 +310,27 @@ fn legacy_default_cache_type() -> String {
 }
 
 impl Default for LlamaCppConfig {
-    /// Inkling-2-Mini (UD-IQ3_XXS) with its measured "Agent" profile: 57344
-    /// tokens of context, f16 KV cache (q5_0/q8_0 take a slow dequant fallback
-    /// on this model), every layer offloaded with the experts of the looped
-    /// layers 6-14 kept on the GPU through an `-ot` override and the rest on the
-    /// CPU (`--n-cpu-moe 0`), batch 512, six generation and batch threads,
+    /// Inkling-2-Mini (UD-IQ3_XXS) with its measured "AgentFast" profile:
+    /// 57344 tokens of context, q4_0 KV cache (q5_0/q8_0 take a slow dequant
+    /// fallback on this model, and q4_0 leaves VRAM for the expert placement),
+    /// every layer offloaded with the experts of the looped layers 6-17 kept on
+    /// the GPU through an `-ot` override and the rest on the CPU
+    /// (`--n-cpu-moe 0`), batch 512, eight generation and six batch threads,
     /// thinking capped by `reasoning_effort = medium` (the template defaults to
     /// high, which over-thinks), and no speculation at all (its DSpark draft
     /// head and n-gram lookup both measured slower). Sampling is the conductor's
     /// business: temperature 1.0 / top_p 1.0 / top_k 0 / min_p 0, because the
     /// keep96 sampling made Inkling loop.
     ///
-    /// Inkling-2-Mini only loads in Unsloth's llama.cpp fork (b12588), so
-    /// `server_path` has to point at that build; mainline llama-server cannot
-    /// load it. Artifact locations are machine-specific, so source ships them
-    /// blank: each install sets them in Settings (persisted as the `llama_cpp`
-    /// row of the app settings table) or through the JARVIS_LLAMA_* environment
-    /// variables; see `with_env_fallbacks`.
+    /// Inkling-2-Mini only loads in Unsloth's llama.cpp fork (b12651, engine
+    /// directory `llama-unsloth-b12651`), so `server_path` has to point at that
+    /// build; mainline llama-server cannot load it. That build's portable zip
+    /// ships without the `cudart`/`cublas` DLLs, so the installer has to bundle
+    /// them alongside it; this profile does not address packaging. Artifact
+    /// locations are machine-specific, so source ships them blank: each install
+    /// sets them in Settings (persisted as the `llama_cpp` row of the app
+    /// settings table) or through the JARVIS_LLAMA_* environment variables; see
+    /// `with_env_fallbacks`.
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
@@ -340,10 +345,10 @@ impl Default for LlamaCppConfig {
             batch_size: 512,
             spec_type: String::new(),
             spec_draft_n_max: 0,
-            cache_type: "f16".to_string(),
-            override_tensor: r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU"
+            cache_type: "q4_0".to_string(),
+            override_tensor: r"blk\.(0|1|2|3|4|5|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU"
                 .to_string(),
-            threads: 6,
+            threads: 8,
             batch_threads: 6,
             reasoning_effort: "medium".to_string(),
             no_host: true,
@@ -541,8 +546,18 @@ mod llama_cpp_config_tests {
             .map(String::as_str)
     }
 
+    /// The measured "AgentFast" placement: the q4_0 KV cache leaves room for
+    /// the experts of looped layers 6-17 to stay on the GPU, while layers 0-5
+    /// and 18-23 keep theirs on the CPU.
+    const AGENT_FAST_OVERRIDE_TENSOR: &str =
+        r"blk\.(0|1|2|3|4|5|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU";
+
+    /// The DD-144 "Agent" placement the shipped default used before DD-145.
+    const AGENT_OVERRIDE_TENSOR: &str =
+        r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU";
+
     #[test]
-    fn default_launches_the_inkling_agent_profile() {
+    fn default_launches_the_inkling_agent_fast_profile() {
         let config = LlamaCppConfig {
             model_path: "inkling.gguf".to_string(),
             ..LlamaCppConfig::default()
@@ -552,19 +567,21 @@ mod llama_cpp_config_tests {
         assert_eq!(flag(&args, "--alias"), Some("Inkling-2-Mini-UD-IQ3_XXS.gguf"));
         assert_eq!(flag(&args, "-ngl"), Some("99"));
         assert_eq!(flag(&args, "--n-cpu-moe"), Some("0"));
-        assert_eq!(
-            flag(&args, "-ot"),
-            Some(r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU")
+        assert_eq!(flag(&args, "-ot"), Some(AGENT_FAST_OVERRIDE_TENSOR));
+        // The pre-DD-145 6-14 placement must not survive as the default.
+        assert!(
+            !args.iter().any(|arg| arg == AGENT_OVERRIDE_TENSOR),
+            "default server_args still carries the DD-144 6-14 expert placement: {args:?}"
         );
         assert_eq!(flag(&args, "-c"), Some("57344"));
-        assert_eq!(flag(&args, "-ctk"), Some("f16"));
-        assert_eq!(flag(&args, "-ctv"), Some("f16"));
+        assert_eq!(flag(&args, "-ctk"), Some("q4_0"));
+        assert_eq!(flag(&args, "-ctv"), Some("q4_0"));
         // llama-server's long form of `-fa`; the short form would change the
         // argument vector legacy rows already launch with.
         assert_eq!(flag(&args, "--flash-attn"), Some("on"));
         assert_eq!(flag(&args, "-b"), Some("512"));
         assert_eq!(flag(&args, "-ub"), Some("512"));
-        assert_eq!(flag(&args, "-t"), Some("6"));
+        assert_eq!(flag(&args, "-t"), Some("8"));
         assert_eq!(flag(&args, "-tb"), Some("6"));
         assert_eq!(flag(&args, "-np"), Some("1"));
         assert!(args.iter().any(|arg| arg == "--jinja"));
@@ -699,6 +716,26 @@ mod llama_cpp_config_tests {
         .map(|arg| arg.to_string())
         .collect();
         assert_eq!(config.server_args(false), expected);
+    }
+
+    /// A row saved after DD-144 but before DD-145 names the DD-144 "Agent"
+    /// values (f16 KV, experts of layers 6-14 on the GPU, six threads). Only
+    /// `Default::default()` moves to AgentFast; a stored row keeps its own
+    /// launch vector.
+    #[test]
+    fn stored_agent_profile_row_keeps_its_own_launch_values() {
+        let stored = concat!(
+            r#"{"base_url":"http://127.0.0.1:8080/v1","model":"m","server_path":"s","model_path":"p","mtp_path":"","port":8080,"context_window":57344,"reasoning_budget":2048,"n_cpu_moe":0,"batch_size":512,"spec_type":"","spec_draft_n_max":0,"cache_type":"f16","#,
+            r#""override_tensor":"blk\\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU","threads":6,"batch_threads":6,"reasoning_effort":"medium","no_host":true,"no_repack":true,"cache_prompt":true,"cache_reuse":0}"#,
+        );
+        let config: LlamaCppConfig = serde_json::from_str(stored).unwrap();
+        let args = config.server_args(false);
+        assert_eq!(flag(&args, "-ctk"), Some("f16"));
+        assert_eq!(flag(&args, "-ctv"), Some("f16"));
+        assert_eq!(flag(&args, "-ot"), Some(AGENT_OVERRIDE_TENSOR));
+        assert_eq!(flag(&args, "-t"), Some("6"));
+        assert_eq!(flag(&args, "-tb"), Some("6"));
+        assert!(!args.iter().any(|arg| arg == AGENT_FAST_OVERRIDE_TENSOR));
     }
 
     #[test]

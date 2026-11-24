@@ -735,14 +735,17 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
       max_retries: 3,
       timeout_ms: 60000,
     },
-    // Inkling-2-Mini (UD-IQ3_XXS) with its measured "Agent" profile: 57344
-    // tokens of context, f16 KV cache (q5_0/q8_0 take a slow dequant fallback
-    // on this model), every layer offloaded with the experts of the looped
-    // layers 6-14 kept on the GPU (`-ot`) and the rest on the CPU
-    // (`--n-cpu-moe 0`), batch 512, six generation and batch threads, thinking
-    // capped at reasoning_effort "medium", and no speculation. Inkling needs
-    // Unsloth's llama.cpp fork (b12588) as server_path; mainline llama-server
-    // cannot load it.
+    // Inkling-2-Mini (UD-IQ3_XXS) with its measured "AgentFast" profile: 57344
+    // tokens of context, q4_0 KV cache (q5_0/q8_0 take a slow dequant fallback
+    // on this model, and q4_0 leaves VRAM for the expert placement), every layer
+    // offloaded with the experts of the looped layers 6-17 kept on the GPU
+    // (`-ot`) and the rest on the CPU (`--n-cpu-moe 0`), batch 512, eight
+    // generation and six batch threads, thinking capped at reasoning_effort
+    // "medium", and no speculation. Inkling needs Unsloth's llama.cpp fork
+    // (b12651, engine directory `llama-unsloth-b12651`) as server_path; mainline
+    // llama-server cannot load it. That build's portable zip ships without the
+    // `cudart`/`cublas` DLLs, so the installer has to bundle them; this config
+    // does not address packaging.
     llama_cpp: {
       base_url: "http://127.0.0.1:8080/v1",
       model: "Inkling-2-Mini-UD-IQ3_XXS.gguf",
@@ -757,9 +760,9 @@ export function defaultConfig(home: string = homedir()): JarvisConfig {
       batch_size: 512,
       spec_type: "",
       spec_draft_n_max: 0,
-      cache_type: "f16",
-      override_tensor: "blk\\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
-      threads: 6,
+      cache_type: "q4_0",
+      override_tensor: "blk\\.(0|1|2|3|4|5|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
+      threads: 8,
       batch_threads: 6,
       reasoning_effort: "medium",
       no_host: true,
@@ -1123,7 +1126,7 @@ export function ensureDelegateFloorTools(configured: readonly string[] | undefin
  * predate appear here: `batch_size`, `spec_type`, `spec_draft_n_max` and
  * `cache_type` were added after the first installs, so `deepMerge` must not
  * fill them from `defaultConfig()` (which now ships the Inkling-2-Mini
- * profile). A pre-change install keeps launching exactly the server it
+ * AgentFast profile). A pre-change install keeps launching exactly the server it
  * launched before (q8_0 KV cache, no `-ot`, no thread flags, no
  * chat-template-kwargs, no `--no-host`/`--no-repack`/prompt-cache flags).
  *

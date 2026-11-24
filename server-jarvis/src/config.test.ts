@@ -337,18 +337,22 @@ describe("llama.cpp artifact paths", () => {
 });
 
 describe("llama.cpp default profile", () => {
-  test("defaultConfig ships the Inkling-2-Mini Agent profile", () => {
+  test("defaultConfig ships the Inkling-2-Mini AgentFast profile", () => {
     const cfg = defaultConfig();
     expect(cfg.llama_cpp.model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
     expect(cfg.llama_cpp.base_url).toBe("http://127.0.0.1:8080/v1");
     expect(cfg.llama_cpp.port).toBe(8080);
     expect(cfg.llama_cpp.context_window).toBe(57344);
     expect(cfg.llama_cpp.reasoning_budget).toBe(2048);
-    expect(cfg.llama_cpp.cache_type).toBe("f16");
+    expect(cfg.llama_cpp.cache_type).toBe("q4_0");
     expect(cfg.llama_cpp.n_cpu_moe).toBe(0);
-    expect(cfg.llama_cpp.override_tensor).toContain("ffn_.*_exps\\.=CPU");
+    // The DD-145 measured placement: experts of looped layers 6-17 on the GPU.
+    expect(cfg.llama_cpp.override_tensor).toBe(
+      "blk\\.(0|1|2|3|4|5|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
+    );
+    expect(cfg.llama_cpp.override_tensor).not.toContain("|15|16|17|18|");
     expect(cfg.llama_cpp.batch_size).toBe(512);
-    expect(cfg.llama_cpp.threads).toBe(6);
+    expect(cfg.llama_cpp.threads).toBe(8);
     expect(cfg.llama_cpp.batch_threads).toBe(6);
     expect(cfg.llama_cpp.reasoning_effort).toBe("medium");
     expect(cfg.llama_cpp.no_host).toBe(true);
@@ -406,13 +410,54 @@ describe("llama.cpp default profile", () => {
     expect(cfg.llama_cpp.spec_type).toBe("draft-mtp,ngram-mod");
   });
 
+  test("a stored Agent-profile llama.cpp block keeps its DD-144 launch values", () => {
+    // Saved after DD-144, before DD-145: f16 KV, experts of layers 6-14 on the
+    // GPU, six threads. Only a fresh default moves to AgentFast.
+    const stored = {
+      llama_cpp: {
+        base_url: "http://127.0.0.1:8080/v1",
+        model: "Inkling-2-Mini-UD-IQ3_XXS.gguf",
+        server_path: "X:/llama/llama-server.exe",
+        model_path: "X:/models/inkling.gguf",
+        mtp_path: "",
+        port: 8080,
+        context_window: 57344,
+        reasoning_budget: 2048,
+        n_cpu_moe: 0,
+        batch_size: 512,
+        spec_type: "",
+        spec_draft_n_max: 0,
+        cache_type: "f16",
+        override_tensor: "blk\\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
+        threads: 6,
+        batch_threads: 6,
+        reasoning_effort: "medium",
+        no_host: true,
+        no_repack: true,
+        cache_prompt: true,
+        cache_reuse: 0,
+      },
+    };
+    const cfg = normalizeConfig(stored);
+    expect(cfg.llama_cpp.cache_type).toBe("f16");
+    expect(cfg.llama_cpp.override_tensor).toBe(
+      "blk\\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\\.ffn_.*_exps\\.=CPU",
+    );
+    expect(cfg.llama_cpp.threads).toBe(6);
+    expect(cfg.llama_cpp.batch_threads).toBe(6);
+  });
+
   test("a paths-only llama.cpp block takes the current model defaults", () => {
     // Not a pre-change row: the fields every saved row carries fall back to the
-    // shipped Inkling-2-Mini profile rather than the keep96 values.
+    // shipped Inkling-2-Mini AgentFast profile rather than the keep96 values.
     const cfg = normalizeConfig({ llama_cpp: { server_path: "X:/llama/llama-server.exe", model_path: "X:/models/inkling.gguf" } });
     expect(cfg.llama_cpp.model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
     expect(cfg.llama_cpp.context_window).toBe(57344);
     expect(cfg.llama_cpp.reasoning_budget).toBe(2048);
+    // Placement fields the block predates still take the legacy no-ops; the
+    // AgentFast values belong to a fresh `defaultConfig()` only.
+    expect(cfg.llama_cpp.cache_type).toBe("q8_0");
+    expect(cfg.llama_cpp.threads).toBe(0);
   });
 });
 
