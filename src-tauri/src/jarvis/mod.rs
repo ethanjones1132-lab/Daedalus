@@ -1,4 +1,5 @@
 pub mod bridge;
+pub mod gpu_fit;
 pub mod hermes;
 pub mod learning;
 pub mod memory;

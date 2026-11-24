@@ -259,6 +259,12 @@ pub struct LlamaCppConfig {
     /// experts of its looped layers 6-17 on the GPU and offloads the rest.
     #[serde(default)]
     pub override_tensor: String,
+    /// Let the launch fit the shipped AgentFast `-ot` expert range to the
+    /// measured shared-GPU-memory spill (DD-146). On by default; off leaves
+    /// `override_tensor` exactly as stored. An operator's own `-ot` value is
+    /// never revised, whether this is on or off.
+    #[serde(default = "default_auto_fit")]
+    pub auto_fit: bool,
     /// Generation threads (`-t`). 0 omits the flag and lets llama-server decide.
     #[serde(default)]
     pub threads: u32,
@@ -309,6 +315,13 @@ fn legacy_default_cache_type() -> String {
     "q8_0".to_string()
 }
 
+/// `auto_fit` for a stored row that predates DD-146. Fitting stays on for those
+/// rows too, but it can only ever revise the shipped AgentFast `-ot` value, so
+/// a legacy placement or an operator's own override still launches untouched.
+fn default_auto_fit() -> bool {
+    true
+}
+
 impl Default for LlamaCppConfig {
     /// Inkling-2-Mini (UD-IQ3_XXS) with its measured "AgentFast" profile:
     /// 57344 tokens of context, q4_0 KV cache (q5_0/q8_0 take a slow dequant
@@ -348,6 +361,7 @@ impl Default for LlamaCppConfig {
             cache_type: "q4_0".to_string(),
             override_tensor: r"blk\.(0|1|2|3|4|5|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU"
                 .to_string(),
+            auto_fit: true,
             threads: 8,
             batch_threads: 6,
             reasoning_effort: "medium".to_string(),
