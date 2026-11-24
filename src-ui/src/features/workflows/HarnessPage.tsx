@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useReducer, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Button, Page, PageHeader } from '../../design';
 import { harnessReducer, initialHarnessState } from '../../domain/harness-state';
-import type { HarnessPurpose, HarnessRun, SavedHarnessManifest } from './harness-api';
+import type { HarnessPurpose, HarnessRun, HarnessSensor, SavedHarnessManifest } from './harness-api';
 import { HarnessApiError, harnessApi } from './harness-api';
 
 const PURPOSES: Array<{ id: HarnessPurpose; label: string }> = [
@@ -18,6 +18,17 @@ const PURPOSES: Array<{ id: HarnessPurpose; label: string }> = [
 const MANIFEST_READ_FAILED =
   'Could not read saved harness manifests. The read failed or was malformed; this is not an empty list. Retry the lookup when the project is readable.';
 
+// How often an in-flight run is re-read while this page is open. The timer is
+// owned by the page and cleared with it, so nothing polls after the operator
+// leaves, and nothing starts a run except the click.
+const LIVE_POLL_MS = 2000;
+
+const LIVE_READ_FAILED =
+  'Could not read this harness run from the server. Its rounds and events are not shown; retry the read. No stop reason is claimed.';
+
+const START_FAILED =
+  'Could not start a harness run. No run was created and no result is claimed; retry when the server answers.';
+
 export default function HarnessPage() {
   const [state, dispatch] = useReducer(harnessReducer, initialHarnessState);
   const [projectRoot, setProjectRoot] = useState('');
@@ -27,6 +38,10 @@ export default function HarnessPage() {
   const [reloadKey, setReloadKey] = useState(0);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // A second tap before React re-renders would otherwise post a second start or
+  // cancel for the same click target.
+  const startInFlight = useRef(false);
+  const cancelInFlight = useRef(false);
 
   useEffect(() => {
     const root = projectRoot.trim();
@@ -89,6 +104,27 @@ export default function HarnessPage() {
     return () => { cancelled = true; };
   }, [projectRoot]);
 
+  // A run shown in the panel belongs to the project that started it. Typing a
+  // different root clears the panel rather than letting it read as this root's.
+  useEffect(() => {
+    dispatch({ type: 'live-reset' });
+  }, [projectRoot]);
+
+  // Re-read an in-flight run's own record while this page is open. The timer
+  // lives and dies with the page and with the run's unsettled phase.
+  useEffect(() => {
+    const runId = state.live.runId;
+    if (!runId || state.live.phase !== 'running') return;
+    const root = projectRoot.trim();
+    if (!root) return;
+    let cancelled = false;
+    const timer = setInterval(() => {
+      if (cancelled) return;
+      void readLiveRun(root, runId);
+    }, LIVE_POLL_MS);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [state.live.runId, state.live.phase, projectRoot]);
+
   const manifests = useMemo(
     () => state.manifests.filter((saved) => saved.manifest.purpose === purpose),
     [state.manifests, purpose],
@@ -108,7 +144,7 @@ export default function HarnessPage() {
     dispatch({ type: 'history-run-selected', id });
     try {
       const run = await harnessApi.getRun(root, id);
-      if (!run || run.id !== id || run.project_root !== root || !Array.isArray(run.rounds) || !Array.isArray(run.events)) {
+      if (!isReadableRun(run, id, root)) {
         dispatch({ type: 'history-run-error', id, message: 'Could not read this harness run. The response was malformed; no run details are available.' });
         return;
       }
@@ -118,6 +154,79 @@ export default function HarnessPage() {
         ? 'That harness run was not found for this project. No run details are available.'
         : 'Could not read this harness run. No run details are available; retry the lookup.';
       dispatch({ type: 'history-run-error', id, message });
+    }
+  }
+
+  // Every round and event on the panel comes through this read; the start
+  // route only returns an id.
+  async function readLiveRun(root: string, runId: string) {
+    try {
+      const run = await harnessApi.getRun(root, runId);
+      if (!isReadableRun(run, runId, root)) {
+        dispatch({ type: 'live-read-failed', runId, message: LIVE_READ_FAILED });
+        return;
+      }
+      dispatch({ type: 'live-loaded', run });
+    } catch (error) {
+      const message = error instanceof HarnessApiError && error.isRunNotFound()
+        ? 'That harness run was not found for this project. No rounds or events are available for it.'
+        : LIVE_READ_FAILED;
+      dispatch({ type: 'live-read-failed', runId, message });
+    }
+  }
+
+  async function startLiveRun() {
+    const root = projectRoot.trim();
+    const manifestId = selected?.manifest.id;
+    if (!root || !manifestId || startInFlight.current || state.live.phase === 'starting' || state.live.phase === 'running') return;
+    startInFlight.current = true;
+    dispatch({ type: 'live-starting' });
+    try {
+      const started = await harnessApi.startRun({ projectRoot: root, manifestId });
+      if (!started || typeof started.run_id !== 'string' || started.run_id.length === 0) {
+        dispatch({ type: 'live-start-failed', message: 'The start response did not name a run. No run is shown; retry the start.' });
+        return;
+      }
+      dispatch({ type: 'live-started', runId: started.run_id });
+      void readLiveRun(root, started.run_id);
+    } catch (error) {
+      if (error instanceof HarnessApiError && error.isExecutionUnavailable()) {
+        // The server's own refusal: no execution is wired into it, and no run
+        // exists to read. Render that state instead of retrying or guessing.
+        dispatch({ type: 'live-start-refused' });
+        return;
+      }
+      dispatch({ type: 'live-start-failed', message: START_FAILED });
+    } finally {
+      startInFlight.current = false;
+    }
+  }
+
+  async function cancelLiveRun() {
+    const root = projectRoot.trim();
+    const runId = state.live.runId;
+    if (!root || !runId || cancelInFlight.current || state.live.cancelStatus === 'cancelling') return;
+    cancelInFlight.current = true;
+    dispatch({ type: 'live-cancelling' });
+    try {
+      const result = await harnessApi.cancelRun(root, runId);
+      if (!result || result.run_id !== runId || typeof result.stop_reason !== 'string') {
+        dispatch({ type: 'live-cancel-failed', message: 'The cancel response did not confirm this run. No cancel is claimed; check the run again.' });
+        return;
+      }
+      dispatch({ type: 'live-cancelled', runId, stopReason: result.stop_reason });
+      // The server answers after the run settled, so a fresh read carries the
+      // stopped event that belongs with this stop reason.
+      void readLiveRun(root, runId);
+    } catch (error) {
+      if (error instanceof HarnessApiError && error.isRunNotRunning()) {
+        dispatch({ type: 'live-not-running' });
+        void readLiveRun(root, runId);
+        return;
+      }
+      dispatch({ type: 'live-cancel-failed', message: 'Could not cancel this harness run. It may still be running; retry the cancel. No stopped state is claimed.' });
+    } finally {
+      cancelInFlight.current = false;
     }
   }
 
@@ -290,7 +399,7 @@ export default function HarnessPage() {
           {selected && (
             <div className="mt-4 space-y-4 rounded-lg border border-line bg-raised p-4">
               <p role="status" className="text-[12px] text-ink-2">
-                Manifest selected. This page does not start harness runs; saved runs below are read-only.
+                Manifest selected. Start a harness run from the live run panel below; run history stays read-only.
               </p>
               {state.dirty.guides && (
                 <p className="text-[12px] text-ink-2">
@@ -346,6 +455,112 @@ export default function HarnessPage() {
               </div>
             </div>
           )}
+        </section>
+
+        <section className="rounded-xl border border-line bg-panel p-5" aria-labelledby="harness-live-heading">
+          <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 id="harness-live-heading" className="text-[15px] font-medium text-ink">Live run</h2>
+              <p className="mt-1 text-[12px] text-ink-3">
+                {selected
+                  ? `${selected.manifest.project_kind} · ${selected.manifest.template_family} · ${selected.manifest.id}`
+                  : 'No manifest selected.'}
+              </p>
+            </div>
+            {state.live.phase === 'running' ? (
+              <Button size="xs" onClick={() => void cancelLiveRun()} disabled={state.live.cancelStatus === 'cancelling'}>
+                {state.live.cancelStatus === 'cancelling' ? 'Cancelling…' : 'Cancel run'}
+              </Button>
+            ) : selected ? (
+              <Button size="xs" onClick={() => void startLiveRun()} disabled={state.live.phase === 'starting'}>
+                {state.live.phase === 'starting' ? 'Starting…' : 'Start harness run'}
+              </Button>
+            ) : null}
+          </div>
+
+          {state.live.phase === 'idle' && !state.live.startRefusal && !state.live.startError && (
+            <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">
+              {selected
+                ? 'Nothing has been started from this page yet. Start a run to watch its rounds and events as the server records them.'
+                : 'Select a manifest above to start a harness run. No run has been started from this page.'}
+            </p>
+          )}
+          {state.live.phase === 'starting' && (
+            <p role="status" className="py-4 text-[13px] text-ink-3">Starting the harness run…</p>
+          )}
+          {state.live.startRefusal === 'execution_unavailable' && (
+            <div role="alert" className="space-y-2 rounded-lg border border-err/30 bg-err-wash p-4 text-[13px] text-err">
+              <p>This server cannot start a harness yet: it has no harness execution wired in. No run was created, and no rounds or results exist for one.</p>
+              <p className="text-[12px]">The start was refused with <span className="font-mono">harness_execution_unavailable</span> (HTTP 503).</p>
+            </div>
+          )}
+          {state.live.startError && (
+            <p role="alert" className="rounded-lg border border-err/30 bg-err-wash p-4 text-[13px] text-err">{state.live.startError}</p>
+          )}
+
+          {state.live.runId && (() => {
+            const run = state.live.detail;
+            const matchingManifest = run
+              ? state.manifests.find((saved) => saved.manifest.id === run.manifest_id && saved.manifest_hash === run.manifest_hash)
+              : undefined;
+            const sensorsById = new Map(matchingManifest?.manifest.sensors.map((sensor) => [sensor.id, sensor] as const) ?? []);
+            return (
+              <div className="space-y-3" aria-label="Live harness run">
+                <div>
+                  <p className="text-[13px] font-medium text-ink">Run <span className="font-mono text-[11px]">{state.live.runId}</span></p>
+                  <p className="mt-1 text-[12px] text-ink-3">
+                    {run
+                      ? `${run.status} · manifest id ${run.manifest_id} · ${run.rounds.length} ${run.rounds.length === 1 ? 'round' : 'rounds'} · ${run.events.length} ${run.events.length === 1 ? 'event' : 'events'} · started ${run.created_at}`
+                      : 'Reading the run from the server…'}
+                  </p>
+                </div>
+                {state.live.phase === 'running' && (
+                  <p role="status" className="text-[12px] text-ink-2">
+                    Run in flight. Its rounds and events are read from the server while this page is open.
+                  </p>
+                )}
+                {state.live.stopReason && (
+                  <p role="status" className="rounded-lg border border-line bg-raised p-3 text-[13px] text-ink-2">Stop reason: {state.live.stopReason}</p>
+                )}
+                {state.live.cancelStatus === 'cancelled' && (
+                  <p className="text-[12px] text-ink-2">The server accepted the cancel and the run settled.</p>
+                )}
+                {state.live.cancelStatus === 'not_running' && (
+                  <p role="alert" className="rounded-lg border border-err/30 bg-err-wash p-3 text-[13px] text-err">
+                    That harness run is not running on this server, so there was nothing to cancel. No cancel is claimed; the run's recorded state is read from its own route.
+                  </p>
+                )}
+                {state.live.cancelStatus === 'error' && state.live.cancelError && (
+                  <p role="alert" className="rounded-lg border border-err/30 bg-err-wash p-3 text-[13px] text-err">{state.live.cancelError}</p>
+                )}
+                {state.live.detailStatus === 'error' && state.live.detailError && (
+                  <div role="alert" className="space-y-3 rounded-lg border border-err/30 bg-err-wash p-3 text-[13px] text-err">
+                    <p>{state.live.detailError}</p>
+                    <Button
+                      size="xs"
+                      onClick={() => {
+                        const root = projectRoot.trim();
+                        const runId = state.live.runId;
+                        if (!root || !runId) return;
+                        dispatch({ type: 'live-read-loading', runId });
+                        void readLiveRun(root, runId);
+                      }}
+                    >
+                      Check the run again
+                    </Button>
+                  </div>
+                )}
+                {run && (
+                  <>
+                    <h3 className="text-[13px] font-medium text-ink">Live rounds</h3>
+                    <RunRounds run={run} sensorsById={sensorsById} />
+                    <h3 className="text-[13px] font-medium text-ink">Live events</h3>
+                    <RunEvents events={run.events} />
+                  </>
+                )}
+              </div>
+            );
+          })()}
         </section>
 
         <section className="rounded-xl border border-line bg-panel p-5" aria-labelledby="harness-history-heading">
@@ -407,53 +622,87 @@ export default function HarnessPage() {
             return (
               <div className="mt-4 space-y-3" aria-label="Selected run details">
                 <h3 className="text-[13px] font-medium text-ink">Run rounds</h3>
-                {run.rounds.length === 0 ? (
-                  <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">This run has no rounds recorded yet.</p>
-                ) : (
-                  <ol className="space-y-3">
-                    {[...run.rounds].sort((a, b) => a.round_number - b.round_number).map((round) => {
-                      const statuses = round.sensor_results.map((result) => result.status);
-                      const hasNonZeroValue = round.sensor_results.some((result) => typeof result.counter === 'number' && result.counter > 0);
-                      const outcome = statuses.length === 0 ? 'No sensor results recorded'
-                        : statuses.includes('failed') ? 'Failed'
-                          : hasNonZeroValue ? 'Non-zero sensor value'
-                          : statuses.every((status) => status === 'passed') ? 'Passed'
-                            : statuses.every((status) => status === 'not_applicable') ? 'Not applicable'
-                              : 'Mixed sensor results';
-                      return (
-                        <li key={round.id} className="rounded-lg border border-line bg-raised p-4">
-                          <h4 className="text-[13px] font-medium text-ink">Round {round.round_number} · {outcome}</h4>
-                          {round.sensor_results.length === 0 ? (
-                            <p className="mt-2 text-[12px] text-ink-3">No sensor results recorded for this round.</p>
-                          ) : (
-                            <ul className="mt-3 space-y-3">
-                              {round.sensor_results.map((result) => {
-                                const sensor = sensorsById.get(result.sensor_id);
-                                const displayedStatus = result.status === 'passed' && typeof result.counter === 'number' && result.counter > 0
-                                  ? 'Non-zero value (reported passed)'
-                                  : result.status;
-                                return (
-                                  <li key={result.id} className="border-t border-line pt-3 text-[12px]">
-                                    <p className="font-medium text-ink">{result.sensor_id} · {displayedStatus}</p>
-                                    <p className="mt-1 text-ink-3">Result ID: <span className="font-mono">{result.id}</span> · Value: {result.counter ?? 'Not recorded'} · Zero threshold: {sensor ? sensor.zero_threshold : 'Unavailable for this manifest hash'}</p>
-                                    {result.stdout && <BoundedOutput label="stdout" value={result.stdout} truncated={result.stdout_truncated} />}
-                                    {result.stderr && <BoundedOutput label="stderr" value={result.stderr} truncated={result.stderr_truncated} />}
-                                  </li>
-                                );
-                              })}
-                            </ul>
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ol>
-                )}
+                <RunRounds run={run} sensorsById={sensorsById} />
               </div>
             );
           })()}
         </section>
       </section>
     </Page>
+  );
+}
+
+/** A run read from GET /harness/runs/:id must name itself and carry both collections. */
+function isReadableRun(run: HarnessRun | null | undefined, id: string, root: string): run is HarnessRun {
+  return Boolean(run) && run!.id === id && run!.project_root === root
+    && Array.isArray(run!.rounds) && Array.isArray(run!.events);
+}
+
+function RunRounds({ run, sensorsById }: { run: HarnessRun; sensorsById: Map<string, HarnessSensor> }) {
+  if (run.rounds.length === 0) {
+    return <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">This run has no rounds recorded yet.</p>;
+  }
+  return (
+    <ol className="space-y-3">
+      {[...run.rounds].sort((a, b) => a.round_number - b.round_number).map((round) => {
+        const statuses = round.sensor_results.map((result) => result.status);
+        const hasNonZeroValue = round.sensor_results.some((result) => typeof result.counter === 'number' && result.counter > 0);
+        const outcome = statuses.length === 0 ? 'No sensor results recorded'
+          : statuses.includes('failed') ? 'Failed'
+            : hasNonZeroValue ? 'Non-zero sensor value'
+            : statuses.every((status) => status === 'passed') ? 'Passed'
+              : statuses.every((status) => status === 'not_applicable') ? 'Not applicable'
+                : 'Mixed sensor results';
+        return (
+          <li key={round.id} className="rounded-lg border border-line bg-raised p-4">
+            <h4 className="text-[13px] font-medium text-ink">Round {round.round_number} · {outcome}</h4>
+            {round.sensor_results.length === 0 ? (
+              <p className="mt-2 text-[12px] text-ink-3">No sensor results recorded for this round.</p>
+            ) : (
+              <ul className="mt-3 space-y-3">
+                {round.sensor_results.map((result) => {
+                  const sensor = sensorsById.get(result.sensor_id);
+                  const displayedStatus = result.status === 'passed' && typeof result.counter === 'number' && result.counter > 0
+                    ? 'Non-zero value (reported passed)'
+                    : result.status;
+                  return (
+                    <li key={result.id} className="border-t border-line pt-3 text-[12px]">
+                      <p className="font-medium text-ink">{result.sensor_id} · {displayedStatus}</p>
+                      <p className="mt-1 text-ink-3">Result ID: <span className="font-mono">{result.id}</span> · Value: {result.counter ?? 'Not recorded'} · Zero threshold: {sensor ? sensor.zero_threshold : 'Unavailable for this manifest hash'}</p>
+                      {result.stdout && <BoundedOutput label="stdout" value={result.stdout} truncated={result.stdout_truncated} />}
+                      {result.stderr && <BoundedOutput label="stderr" value={result.stderr} truncated={result.stderr_truncated} />}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+/** The run's own event log, in the order the server returns it. */
+function RunEvents({ events }: { events: HarnessRun['events'] }) {
+  if (events.length === 0) {
+    return <p className="rounded-lg border border-line bg-raised p-4 text-[13px] text-ink-3">This run has no events recorded yet.</p>;
+  }
+  return (
+    <ol className="space-y-2">
+      {events.map((event) => {
+        const payload = typeof event.payload === 'object' && event.payload !== null
+          ? event.payload as Record<string, unknown>
+          : null;
+        const stopReason = typeof payload?.stop_reason === 'string' ? payload.stop_reason : null;
+        return (
+          <li key={event.id} className="rounded-lg border border-line bg-raised p-3 text-[12px]">
+            <p className="font-medium text-ink">{event.event_type}</p>
+            <p className="mt-1 text-ink-3">{event.created_at}{stopReason ? ` · stop_reason: ${stopReason}` : ''}</p>
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 

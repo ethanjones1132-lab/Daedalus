@@ -85,4 +85,67 @@ describe('harness state', () => {
     expect(state.runHistory).toEqual([]);
     expect(state.selectedHistoryRun).toBeNull();
   });
+
+  it('holds a started run only after the server names it and settles it from its stopped event', () => {
+    let state = harnessReducer(initialHarnessState, { type: 'live-starting' });
+    expect(state.live.phase).toBe('starting');
+    expect(state.live.runId).toBeNull();
+    state = harnessReducer(state, { type: 'live-started', runId: 'r1' });
+    expect(state.live.phase).toBe('running');
+    expect(state.live.runId).toBe('r1');
+    expect(state.live.detail).toBeNull();
+    expect(state.live.detailStatus).toBe('loading');
+    state = harnessReducer(state, {
+      type: 'live-loaded',
+      run: {
+        ...run('r1', '2026-01-01'), status: 'running',
+        events: [{ id: 'e1', run_id: 'r1', event_type: 'stopped', payload: { stop_reason: 'cancelled' }, created_at: '2026-01-01T00:01:00.000Z' }],
+      },
+    });
+    expect(state.live.detail?.id).toBe('r1');
+    expect(state.live.detail?.status).toBe('running');
+    expect(state.live.phase).toBe('settled');
+    expect(state.live.stopReason).toBe('cancelled');
+  });
+
+  it('keeps an execution refusal as its own state with no run to show', () => {
+    const state = harnessReducer(initialHarnessState, { type: 'live-start-refused' });
+    expect(state.live.startRefusal).toBe('execution_unavailable');
+    expect(state.live.phase).toBe('idle');
+    expect(state.live.runId).toBeNull();
+    expect(state.live.detail).toBeNull();
+    expect(state.live.stopReason).toBeNull();
+
+    const failed = harnessReducer(initialHarnessState, { type: 'live-start-failed', message: 'No run.' });
+    expect(failed.live.startError).toBe('No run.');
+    expect(failed.live.runId).toBeNull();
+  });
+
+  it('settles on an accepted cancel but never invents a stop reason for run_not_running', () => {
+    let state = harnessReducer(initialHarnessState, { type: 'live-started', runId: 'r1' });
+    state = harnessReducer(state, { type: 'live-cancelling' });
+    expect(state.live.cancelStatus).toBe('cancelling');
+    state = harnessReducer(state, { type: 'live-cancelled', runId: 'r1', stopReason: 'cancelled' });
+    expect(state.live.cancelStatus).toBe('cancelled');
+    expect(state.live.phase).toBe('settled');
+    expect(state.live.stopReason).toBe('cancelled');
+
+    let other = harnessReducer(initialHarnessState, { type: 'live-started', runId: 'r2' });
+    other = harnessReducer(other, { type: 'live-not-running' });
+    expect(other.live.cancelStatus).toBe('not_running');
+    expect(other.live.stopReason).toBeNull();
+    expect(other.live.phase).toBe('running');
+  });
+
+  it('ignores a stale read for another run and never downgrades a settled run', () => {
+    const started = harnessReducer(initialHarnessState, { type: 'live-started', runId: 'r1' });
+    expect(harnessReducer(started, { type: 'live-loaded', run: run('other', '2026-01-01') })).toBe(started);
+
+    let settled = harnessReducer(started, { type: 'live-cancelled', runId: 'r1', stopReason: 'cancelled' });
+    settled = harnessReducer(settled, { type: 'live-loaded', run: run('r1', '2026-01-01') });
+    expect(settled.live.phase).toBe('settled');
+    expect(settled.live.stopReason).toBe('cancelled');
+
+    expect(harnessReducer(settled, { type: 'live-reset' }).live).toEqual(initialHarnessState.live);
+  });
 });

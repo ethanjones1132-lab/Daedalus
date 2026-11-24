@@ -4,12 +4,13 @@ import { NavigationProvider } from '../../shell/navigation';
 import HarnessPage from './HarnessPage';
 import { HarnessApiError, type HarnessRun, type SavedHarnessManifest } from './harness-api';
 
-const { listManifests, listRuns, getRun, updateManifest } = vi.hoisted(() => ({
+const { listManifests, listRuns, getRun, updateManifest, startRun, cancelRun } = vi.hoisted(() => ({
   listManifests: vi.fn(), listRuns: vi.fn(), getRun: vi.fn(), updateManifest: vi.fn(),
+  startRun: vi.fn(), cancelRun: vi.fn(),
 }));
 vi.mock('./harness-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./harness-api')>();
-  return { ...actual, harnessApi: { ...actual.harnessApi, listManifests, listRuns, getRun, updateManifest } };
+  return { ...actual, harnessApi: { ...actual.harnessApi, listManifests, listRuns, getRun, updateManifest, startRun, cancelRun } };
 });
 
 const savedManifest: SavedHarnessManifest = {
@@ -63,6 +64,8 @@ afterEach(() => {
   listRuns.mockReset();
   getRun.mockReset();
   updateManifest.mockReset();
+  startRun.mockReset();
+  cancelRun.mockReset();
 });
 
 beforeEach(() => {
@@ -92,7 +95,7 @@ describe('HarnessPage picker route', () => {
     expect(manifest).toHaveAttribute('aria-pressed', 'false');
     fireEvent.click(manifest);
     expect(manifest).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByText(/This page does not start harness runs/)).toBeInTheDocument();
+    expect(screen.getByText(/Start a harness run from the live run panel/)).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: 'Rules' })).toBeInTheDocument();
   });
 
@@ -238,5 +241,95 @@ describe('HarnessPage picker route', () => {
       { ...savedManifest.manifest, guides: { ...savedManifest.manifest.guides, rules: ['kept rule'] } },
       4,
     );
+  });
+});
+
+const runningRun: HarnessRun = {
+  ...savedRun,
+  id: 'run-live',
+  status: 'running',
+  rounds: [{
+    ...savedRun.rounds[0],
+    id: 'round-live',
+    run_id: 'run-live',
+    sensor_results: [{ ...savedRun.rounds[0].sensor_results[0], id: 'result-live', run_id: 'run-live', round_id: 'round-live' }],
+  }],
+  events: [],
+};
+
+async function selectManifestAndRoot() {
+  fireEvent.change(screen.getByRole('textbox', { name: 'Project root' }), { target: { value: 'C:/projects/one' } });
+  fireEvent.click(await screen.findByRole('button', { name: /typescript · typescript_node/ }));
+}
+
+describe('HarnessPage live run panel', () => {
+  it('starts the selected manifest, shows the returned run id, and reads the run from its GET route', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    startRun.mockResolvedValue({ run_id: 'run-live' });
+    getRun.mockResolvedValue(runningRun);
+    mount();
+    await selectManifestAndRoot();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start harness run' }));
+
+    expect(await screen.findByText('run-live')).toBeInTheDocument();
+    expect(startRun).toHaveBeenCalledWith({ projectRoot: 'C:/projects/one', manifestId: 'manifest-1' });
+    expect(getRun).toHaveBeenCalledWith('C:/projects/one', 'run-live');
+    // The rounds shown are the ones GET returned, not anything the panel made up.
+    expect(await screen.findByText('Round 1 · Failed')).toBeInTheDocument();
+    expect(screen.getByText('tests · failed')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel run' })).toBeInTheDocument();
+  });
+
+  it('cancels an in-flight run and shows the cancelled stop reason the server returned', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    startRun.mockResolvedValue({ run_id: 'run-live' });
+    getRun.mockResolvedValue(runningRun);
+    cancelRun.mockResolvedValue({ run_id: 'run-live', stop_reason: 'cancelled' });
+    mount();
+    await selectManifestAndRoot();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start harness run' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel run' }));
+
+    expect(cancelRun).toHaveBeenCalledWith('C:/projects/one', 'run-live');
+    expect(await screen.findByText('Stop reason: cancelled')).toBeInTheDocument();
+    expect(screen.getByText('The server accepted the cancel and the run settled.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Start harness run' })).toBeInTheDocument();
+  });
+
+  it('renders the 503 execution refusal as its own state and never fabricates a run', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    startRun.mockRejectedValue(new HarnessApiError('harness_execution_unavailable', 503, 'harness_execution_unavailable'));
+    mount();
+    await selectManifestAndRoot();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start harness run' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('This server cannot start a harness yet');
+    expect(alert).toHaveTextContent('harness_execution_unavailable');
+    expect(getRun).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Stop reason:/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Round 1 · Failed')).not.toBeInTheDocument();
+  });
+
+  it('renders 409 run_not_running as its own state without claiming a cancel', async () => {
+    listManifests.mockResolvedValue([savedManifest]);
+    startRun.mockResolvedValue({ run_id: 'run-live' });
+    getRun.mockResolvedValue(runningRun);
+    cancelRun.mockRejectedValue(new HarnessApiError('run_not_running', 409, 'run_not_running'));
+    mount();
+    await selectManifestAndRoot();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start harness run' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel run' }));
+
+    expect(await screen.findByText(/not running on this server/)).toBeInTheDocument();
+    expect(screen.queryByText('The server accepted the cancel and the run settled.')).not.toBeInTheDocument();
+    // The re-read still shows only the run's own evidence; no stop reason is invented.
+    expect(getRun).toHaveBeenCalledWith('C:/projects/one', 'run-live');
+    expect(screen.queryByText(/Stop reason:/)).not.toBeInTheDocument();
   });
 });
