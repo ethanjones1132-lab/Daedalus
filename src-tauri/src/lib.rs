@@ -684,6 +684,36 @@ fn llama_server_log_stdio(
     ))
 }
 
+/// The argv an actual llama-server spawn uses: DD-146's fit picks the GPU expert
+/// range from this machine's shared-memory spill, then the fitted config's
+/// `server_args` turns it into the argument vector (DD-147).
+///
+/// Called from inside the launch closure, so only a real spawn runs the probe:
+/// a supervisor tick that finds the child already running never re-probes, and
+/// the probe's own `nvidia-smi`/`Get-Counter` timeouts keep it bounded. Tests
+/// inject a recorded probe through [`llama_cpp_server_args_with_probe`].
+fn llama_cpp_server_args(
+    config: &crate::jarvis::types::LlamaCppConfig,
+    mtp_head_exists: bool,
+) -> Vec<String> {
+    llama_cpp_server_args_with_probe(
+        config,
+        mtp_head_exists,
+        &crate::jarvis::gpu_fit::SystemSharedGpuMemoryProbe,
+    )
+}
+
+/// [`llama_cpp_server_args`] with an injected probe, the same seam
+/// `gpu_fit::fit_with_probe` exposes, so the spawn's argv can be pinned without
+/// a GPU.
+fn llama_cpp_server_args_with_probe(
+    config: &crate::jarvis::types::LlamaCppConfig,
+    mtp_head_exists: bool,
+    probe: &dyn crate::jarvis::gpu_fit::SharedGpuMemoryProbe,
+) -> Vec<String> {
+    crate::jarvis::gpu_fit::fit_with_probe(config, probe).server_args(mtp_head_exists)
+}
+
 /// Start the configured local llama.cpp server with the placement, speculation
 /// and reasoning budget from `LlamaCppConfig::server_args`. The Child is owned by
 /// the shared lifecycle manager, so switching backends or exiting Daedalus
@@ -739,8 +769,6 @@ pub(crate) async fn start_llama_cpp_server(
             mtp_path.display()
         );
     }
-    let server_args = config.server_args(mtp_head_exists);
-
     let outcome = process_lifecycle::launch(
         process_lifecycle::ManagedProcess::LlamaCpp,
         false,
@@ -751,6 +779,13 @@ pub(crate) async fn start_llama_cpp_server(
                     config.port
                 ));
             }
+
+            // DD-147: fit the shipped AgentFast `-ot` expert range to the spill
+            // this spawn will hit. Built inside the closure, not before
+            // `launch`, so a supervisor tick that finds the child already
+            // running does not probe again; a probe that cannot answer leaves
+            // the argv exactly as it was (DD-146's fail-open rule).
+            let server_args = llama_cpp_server_args(&config, mtp_head_exists);
 
             use std::process::Command;
             // DD-114: both streams keep writing to the same `llama-server.log`,
@@ -6632,6 +6667,134 @@ mod bounded_server_log_tests {
             !body.contains("OpenOptions") && !body.contains("try_clone()"),
             "a raw append-only file handle is exactly what let llama-server.log grow \
              without bound:\n{body}"
+        );
+    }
+}
+
+/// DD-147: the chosen GPU expert range must actually reach the spawn. These
+/// drive the same argv builder the launch closure uses, with a recorded probe,
+/// so no GPU or PowerShell is needed.
+#[cfg(test)]
+mod llama_cpp_fit_wiring_tests {
+    use super::*;
+    use crate::jarvis::gpu_fit::{
+        fit_with_probe, SharedGpuMemoryProbe, AGENT_FAST_OVERRIDE_TENSOR,
+    };
+    use crate::jarvis::types::LlamaCppConfig;
+
+    /// 6-17 becomes 6-16: `17` joins the CPU half of the `-ot` list.
+    const ONE_LAYER_DROPPED: &str =
+        r"blk\.(0|1|2|3|4|5|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU";
+
+    /// 1000 MiB, above DD-146's 300 MiB threshold.
+    struct SpilledProbe;
+
+    impl SharedGpuMemoryProbe for SpilledProbe {
+        fn shared_spill_mib(&self) -> Option<u64> {
+            Some(1000)
+        }
+    }
+
+    /// Missing binary, no NVIDIA adapter, timeout or garbage.
+    struct UnavailableProbe;
+
+    impl SharedGpuMemoryProbe for UnavailableProbe {
+        fn shared_spill_mib(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn launch_config() -> LlamaCppConfig {
+        LlamaCppConfig {
+            model_path: "inkling.gguf".to_string(),
+            ..LlamaCppConfig::default()
+        }
+    }
+
+    fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn a_spilled_reading_reaches_the_spawn_as_the_widened_ot_list() {
+        let args = llama_cpp_server_args_with_probe(&launch_config(), false, &SpilledProbe);
+        assert_eq!(flag(&args, "-ot"), Some(ONE_LAYER_DROPPED));
+    }
+
+    #[test]
+    fn an_unavailable_probe_spawns_the_unchanged_agent_fast_argv() {
+        let config = launch_config();
+        // The pre-change spawn built exactly `config.server_args(mtp_head_exists)`.
+        let expected = config.server_args(false);
+        let args = llama_cpp_server_args_with_probe(&config, false, &UnavailableProbe);
+
+        assert_eq!(args, expected, "an unanswered probe must not change the argv");
+        assert_eq!(flag(&args, "-ot"), Some(AGENT_FAST_OVERRIDE_TENSOR));
+    }
+
+    #[test]
+    fn auto_fit_off_and_an_operator_ot_keep_their_own_values() {
+        let mut off = launch_config();
+        off.auto_fit = false;
+        let expected = off.server_args(false);
+        let args = llama_cpp_server_args_with_probe(&off, false, &SpilledProbe);
+        assert_eq!(args, expected, "auto_fit = false must not be fitted");
+        assert_eq!(flag(&args, "-ot"), Some(AGENT_FAST_OVERRIDE_TENSOR));
+
+        let mut operator = launch_config();
+        operator.override_tensor =
+            r"blk\.(0|1|2|3|4|5|15|16|17|18|19|20|21|22|23)\.ffn_.*_exps\.=CPU".to_string();
+        let expected = operator.server_args(false);
+        let args = llama_cpp_server_args_with_probe(&operator, false, &SpilledProbe);
+        assert_eq!(args, expected, "an operator's own -ot must not be fitted");
+        assert_eq!(
+            flag(&args, "-ot"),
+            Some(operator.override_tensor.as_str())
+        );
+    }
+
+    #[test]
+    fn the_fit_runs_once_per_spawn_so_a_second_build_does_not_drop_a_layer() {
+        let config = launch_config();
+        let first = llama_cpp_server_args_with_probe(&config, false, &SpilledProbe);
+        let second = llama_cpp_server_args_with_probe(&config, false, &SpilledProbe);
+        assert_eq!(first, second);
+        assert_eq!(flag(&first, "-ot"), Some(ONE_LAYER_DROPPED));
+
+        // Re-fitting the fitted config is a no-op: only the shipped AgentFast
+        // `-ot` value is ever revised, so a second pass cannot drop another layer.
+        let fitted = fit_with_probe(&config, &SpilledProbe);
+        let refit = fit_with_probe(&fitted, &SpilledProbe);
+        assert_eq!(refit.override_tensor, ONE_LAYER_DROPPED);
+    }
+
+    #[test]
+    fn the_spawn_builds_its_argv_through_the_fit_exactly_once() {
+        const SOURCE: &str = include_str!("lib.rs");
+        let start = SOURCE
+            .find("pub(crate) async fn start_llama_cpp_server(")
+            .expect("start_llama_cpp_server must exist in lib.rs");
+        let end = SOURCE[start..]
+            .find("pub fn reconcile_backend_services(")
+            .map(|offset| start + offset)
+            .expect("reconcile_backend_services must follow the llama.cpp start");
+        let body = &SOURCE[start..end];
+
+        assert_eq!(
+            body.matches("llama_cpp_server_args(").count(),
+            1,
+            "the spawn must build its argv through the one fitted builder:\n{body}"
+        );
+        assert!(
+            !body.contains(".server_args("),
+            "the spawn must not build argv from the unfitted config:\n{body}"
+        );
+        assert!(
+            !body.contains("gpu_fit::fit("),
+            "the fit must run inside the command build, not a second time:\n{body}"
         );
     }
 }
