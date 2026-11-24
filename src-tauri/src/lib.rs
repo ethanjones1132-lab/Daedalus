@@ -1560,7 +1560,8 @@ fn jarvis_health_identifies(body: &str) -> bool {
 mod probe_jarvis_health_tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// `set_cached_bun_url` is process-global, so these probes take turns.
     fn cache_lock() -> &'static Mutex<()> {
@@ -1568,9 +1569,15 @@ mod probe_jarvis_health_tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    /// A one-shot loopback stand-in for whatever is listening on a Jarvis port.
-    /// It answers the first request with `status` and `body` over real HTTP, so
-    /// the probe is exercised end to end instead of against a stub client.
+    /// A loopback stand-in for whatever is listening on a Jarvis port.
+    ///
+    /// It answers the first *complete* HTTP request with `status` and `body`
+    /// over real HTTP, so the probe is exercised end to end instead of against
+    /// a stub client. Connections that never send a request are ignored and
+    /// must not consume the fixture: an accepted socket inherits the
+    /// listener's non-blocking mode on Windows, so a read issued before the
+    /// request arrives would otherwise answer and close with the request still
+    /// unread, which Windows turns into a reset that discards the response.
     fn spawn_health_listener(
         status: &'static str,
         body: &'static str,
@@ -1583,28 +1590,64 @@ mod probe_jarvis_health_tests {
         let addr = listener.local_addr().expect("read loopback address");
         let handle = std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
+            let served = Arc::new(AtomicBool::new(false));
+            while !served.load(Ordering::SeqCst) {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
-                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        return;
+                        let served = Arc::clone(&served);
+                        std::thread::spawn(move || {
+                            // Windows propagates the listener's non-blocking
+                            // mode to the accepted socket; force this one
+                            // blocking so the request head is drained before
+                            // the response (and the close) is written.
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                            if !read_http_request_head(&mut stream) {
+                                // A port scan, a preflight connect, or any
+                                // client that sends nothing is not the probe.
+                                return;
+                            }
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                            served.store(true, Ordering::SeqCst);
+                        });
                     }
-                    Err(_) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    Err(_) => return,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
                 }
             }
         });
         (format!("http://127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// Read a full request head (`\r\n\r\n` terminated), returning `false` for
+    /// a connection that sent nothing or an incomplete head.
+    fn read_http_request_head(stream: &mut std::net::TcpStream) -> bool {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => return false,
+                Ok(size) => {
+                    request.extend_from_slice(&chunk[..size]);
+                    if request.windows(4).any(|window| window == &b"\r\n\r\n"[..]) {
+                        return true;
+                    }
+                    if request.len() > 16 * 1024 {
+                        return false;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
     }
 
     async fn probe_one(candidate: &str) -> bool {
@@ -1740,6 +1783,31 @@ mod probe_jarvis_health_tests {
             BunPortState::ThisApp,
             "an identifying /health body is this app's server"
         );
+        let _ = server.join();
+    }
+
+    /// DD-148: a connection that sends no request must not consume the
+    /// health fixture. The old fixture answered the first *connection* rather
+    /// than the first *request*: under a full parallel suite anything that
+    /// connects to the ephemeral port first (a preflight, a scanner, a retry)
+    /// took the one answer, so the real identity probe reached a closed port
+    /// and reported this app's own listener as a stranger. The first half of
+    /// the pair never noticed because it expects `false`.
+    #[test]
+    fn a_silent_connection_does_not_consume_the_health_fixture() {
+        let (origin, server) = spawn_health_listener("200 OK", OWN_HEALTH);
+
+        // Connect but send nothing, so the fixture accepts this socket first.
+        let stray = std::net::TcpStream::connect(origin.trim_start_matches("http://"))
+            .expect("open a stray loopback connection");
+
+        assert_eq!(
+            state_of_a_held_port(&origin),
+            BunPortState::ThisApp,
+            "a silent connection must not be mistaken for the /health probe"
+        );
+
+        drop(stray);
         let _ = server.join();
     }
 
@@ -2594,11 +2662,18 @@ fn bun_port_state_from(
 /// the connection and never answers cannot stall the start guard or the health
 /// snapshot. Synchronous on purpose: both callers already run on blocking
 /// threads (`spawn_blocking`), off the async IPC workers.
+///
+/// The client is [`local_api::blocking_client`], which is already
+/// `.no_proxy()`: a loopback probe must never be answered by a proxy inherited
+/// from the environment. Pooling is disabled and the request asks for
+/// `Connection: close` so a connection made for one origin cannot be reused to
+/// probe a different origin's port.
 fn bun_health_identifies(origin: &str) -> bool {
     if !local_api::is_loopback_http(origin) {
         return false;
     }
     let client = match local_api::blocking_client()
+        .pool_max_idle_per_host(0)
         .timeout(std::time::Duration::from_secs(2))
         .build()
     {
@@ -2607,6 +2682,7 @@ fn bun_health_identifies(origin: &str) -> bool {
     };
     let Ok(response) = client
         .get(format!("{}/health", origin.trim_end_matches('/')))
+        .header(reqwest::header::CONNECTION, "close")
         .bearer_auth(local_api::bun_token())
         .send()
     else {
