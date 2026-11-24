@@ -157,6 +157,23 @@ describe("harness routes", () => {
     expect(stops.map((event: { payload: { stop_reason: string } }) => event.payload.stop_reason)).toEqual(["cancelled"]);
   });
 
+  test("settles a crashed run as run_failed and never as a normal round cap", async () => {
+    const { store, request } = setup(execution());
+    await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
+    store.appendRound = () => { throw new Error("disk full"); };
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    let stoppedReason: string | undefined;
+    for (let attempt = 0; attempt < 200 && !stoppedReason; attempt++) {
+      await Bun.sleep(5);
+      const stopped = (store.getRun(run_id)?.events ?? []).find((event) => event.event_type === "stopped");
+      if (stopped && typeof stopped.payload === "object" && stopped.payload !== null && "stop_reason" in stopped.payload) {
+        stoppedReason = (stopped.payload as { stop_reason?: string }).stop_reason;
+      }
+    }
+    expect(stoppedReason).toBe("run_failed");
+    expect(stoppedReason).not.toBe("max_rounds");
+  });
+
   test("refuses unknown and already-cancelled run ids without touching the stored run", async () => {
     const { request } = setup(execution({ runMaker: waitingMaker }));
     await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });

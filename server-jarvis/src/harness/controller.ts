@@ -1,7 +1,21 @@
 import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import type { HarnessRoundInput, HarnessSensorResultInput, HarnessStore } from "./store";
 
-export type HarnessStopReason = "passed" | "max_rounds" | "cancelled" | "approval_denied" | "no_progress" | "maker_failed" | "checker_rejected" | "deadline";
+export type HarnessStopReason = "passed" | "max_rounds" | "cancelled" | "approval_denied" | "no_progress" | "maker_failed" | "checker_rejected" | "deadline" | "run_failed";
+
+export interface HarnessRunResult {
+  run_id: string;
+  stop_reason: HarnessStopReason;
+  rounds: number;
+  /**
+   * True when an aborted step outlived the bounded settle wait. The stop payload
+   * carries the same fact so a stored record never reads as a clean settle.
+   */
+  abandoned?: boolean;
+}
+
+/** How long an aborted step gets to return before the run records it as abandoned. */
+const DEFAULT_ABANDON_WAIT_MS = 2000;
 
 export interface HarnessSensorBatch {
   counter_vector: HarnessRoundInput["counter_vector"];
@@ -31,7 +45,25 @@ export interface HarnessControllerInput {
   now?: () => number;
   /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes. */
   deadline_ms?: number;
+  /**
+   * Bounded wait for a step that was abandoned by an abort, before its lease is
+   * released and the stop event is written. Defaults to 2000ms; never unbounded.
+   */
+  abandon_wait_ms?: number;
   admission: HarnessAdmission;
+}
+
+/**
+ * Waits for steps abandoned by an abort, no longer than `ceilingMs`. Resolves
+ * true when a step is still running and must be recorded as abandoned.
+ */
+async function waitForAbandoned(pending: Set<Promise<unknown>>, ceilingMs: number): Promise<boolean> {
+  if (pending.size === 0) return false;
+  const settled = Promise.allSettled([...pending]).then(() => true as const);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), ceilingMs); });
+  try { return (await Promise.race([settled, expired])) === false; }
+  finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 function waitWithAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -58,7 +90,7 @@ function vectorImproved(previous: HarnessRoundInput["counter_vector"] | undefine
 }
 
 /** Runs a maker/sensor/checker loop with app-owned durable evidence and injected execution boundaries. */
-export async function runHarness(input: HarnessControllerInput): Promise<{ run_id: string; stop_reason: HarnessStopReason; rounds: number }> {
+export async function runHarness(input: HarnessControllerInput): Promise<HarnessRunResult> {
   const checked = validateManifest(input.manifest);
   if (!checked.ok) throw new Error(`Invalid harness manifest: ${checked.errors.join("; ")}`);
   if (input.manifest.checker.enabled && input.manifest.checker.agent_id === input.manifest.maker_agent_id) {
@@ -68,12 +100,26 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
   const startedAt = now();
   const deadlineAt = startedAt + (input.deadline_ms ?? 30 * 60 * 1000);
   if (!Number.isFinite(deadlineAt) || deadlineAt <= startedAt) throw new Error("deadline_ms must be a positive finite duration");
+  const abandonWaitMs = input.abandon_wait_ms ?? DEFAULT_ABANDON_WAIT_MS;
+  if (!Number.isFinite(abandonWaitMs) || abandonWaitMs < 0) throw new Error("abandon_wait_ms must be a non-negative finite duration");
   const run = input.store.createRun({ id: input.run_id, project_root: input.manifest.project_root,
     manifest_id: input.manifest.id, manifest_hash: manifestHash(input.manifest) });
   const abort = new AbortController();
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   let reason: HarnessStopReason = "max_rounds";
   let rounds = 0;
+  let abandoned = false;
+  let failure: string | undefined;
+  // Aborting rejects the wait at each step but leaves the maker/sensor/checker
+  // promise in flight. Track it so the finally can wait for it (bounded) before
+  // it frees the admission lease and claims the run stopped.
+  const pending = new Set<Promise<unknown>>();
+  const track = <T>(work: Promise<T>): Promise<T> => {
+    pending.add(work);
+    const forget = () => { pending.delete(work); };
+    work.then(forget, forget);
+    return work;
+  };
   const onAbort = () => abort.abort();
   input.signal?.addEventListener("abort", onAbort, { once: true });
   if (input.signal?.aborted) abort.abort();
@@ -92,12 +138,12 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
       rounds = roundNumber;
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       let maker: Awaited<ReturnType<typeof input.runMaker>>;
-      try { maker = await waitWithAbort(input.runMaker({ manifest: input.manifest, round: roundNumber, signal: abort.signal }), abort.signal); }
+      try { maker = await waitWithAbort(track(input.runMaker({ manifest: input.manifest, round: roundNumber, signal: abort.signal })), abort.signal); }
       catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "maker_failed"; break; }
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       if (maker?.failed) { reason = "maker_failed"; break; }
       let batch: HarnessSensorBatch;
-      try { batch = await waitWithAbort(input.sensors({ manifest: input.manifest, signal: abort.signal }), abort.signal); }
+      try { batch = await waitWithAbort(track(input.sensors({ manifest: input.manifest, signal: abort.signal })), abort.signal); }
       catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "no_progress"; break; }
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       const round = input.store.appendRound({ run_id: run.id, round_number: roundNumber, counter_vector: batch.counter_vector });
@@ -135,7 +181,7 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
       if (settleReady) {
         if (input.manifest.checker.enabled) {
           try {
-            const checkedByAgent = await waitWithAbort(input.runChecker({ manifest: input.manifest, signal: abort.signal }), abort.signal);
+            const checkedByAgent = await waitWithAbort(track(input.runChecker({ manifest: input.manifest, signal: abort.signal })), abort.signal);
             if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
             reason = checkedByAgent.passed ? "passed" : "checker_rejected";
           } catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "checker_rejected"; }
@@ -149,11 +195,18 @@ export async function runHarness(input: HarnessControllerInput): Promise<{ run_i
       previous = batch.counter_vector;
       if (roundNumber === input.manifest.loop.max_rounds) reason = "max_rounds";
     }
+  } catch (error) {
+    // A store write or another round-body throw is a failed run, not a cap.
+    reason = "run_failed";
+    failure = error instanceof Error ? error.message : String(error);
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     input.signal?.removeEventListener("abort", onAbort);
+    abandoned = await waitForAbandoned(pending, abandonWaitMs);
     lease?.release();
-    input.store.appendEvent({ run_id: run.id, event_type: "stopped", payload: { stop_reason: reason, rounds } });
+    input.store.appendEvent({ run_id: run.id, event_type: "stopped", payload: {
+      stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
+    } });
   }
-  return { run_id: run.id, stop_reason: reason, rounds };
+  return { run_id: run.id, stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}) };
 }

@@ -79,6 +79,71 @@ describe("runHarness", () => {
     expect(sensorCalls).toBe(0);
   });
 
+  test("waits for an aborted maker before releasing the lease and recording the stop", async () => {
+    const abort = new AbortController();
+    let makerSettled = false;
+    let leaseReleased = false;
+    let releasedAfterMaker = false;
+    let notifyStarted!: () => void;
+    const makerStarted = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    let finishMaker!: () => void;
+    const makerWork = new Promise<void>((resolve) => { finishMaker = resolve; });
+    const setup = deps({
+      signal: abort.signal,
+      admission: { acquire: async () => ({ release() { leaseReleased = true; releasedAfterMaker = makerSettled; } }) },
+      runMaker: async () => { notifyStarted(); await makerWork; makerSettled = true; return {}; },
+    });
+    const run = runHarness(setup.input);
+    await makerStarted;
+    abort.abort();
+    let resolvedEarly = false;
+    run.then(() => { resolvedEarly = true; });
+    await Bun.sleep(20);
+    expect(resolvedEarly).toBe(false);
+    expect(leaseReleased).toBe(false);
+    finishMaker();
+    const result = await run;
+    expect(result.stop_reason).toBe("cancelled");
+    expect(result.abandoned).toBeUndefined();
+    expect(leaseReleased).toBe(true);
+    expect(releasedAfterMaker).toBe(true);
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "cancelled", rounds: 1 });
+  });
+
+  test("records the abandoning fact when an aborted maker outlives the bounded wait", async () => {
+    const abort = new AbortController();
+    let notifyStarted!: () => void;
+    const makerStarted = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const setup = deps({
+      signal: abort.signal,
+      abandon_wait_ms: 25,
+      runMaker: async () => { notifyStarted(); await new Promise<void>(() => {}); },
+    });
+    const run = runHarness(setup.input);
+    await makerStarted;
+    const startedAt = Date.now();
+    abort.abort();
+    const result = await run;
+    expect(result.stop_reason).toBe("cancelled");
+    expect(result.abandoned).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "cancelled", rounds: 1, abandoned: true });
+  });
+
+  test("records run_failed, never max_rounds, when the store throws mid-round", async () => {
+    const setup = deps();
+    setup.store.appendRound = () => { throw new Error("disk full"); };
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("run_failed");
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "run_failed", rounds: 1, error: "disk full" });
+  });
+
   test("records a deadline reached during a maker round", async () => {
     let time = 100;
     const { result, sensorCalls } = await resultWithReason("deadline", {

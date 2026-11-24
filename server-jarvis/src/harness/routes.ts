@@ -1,6 +1,6 @@
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { getHarnessCommand } from "./commands";
-import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessStopReason } from "./controller";
+import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessRunResult } from "./controller";
 import { validateManifest, type HarnessManifest } from "./manifest";
 import { HarnessStore } from "./store";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
@@ -23,7 +23,7 @@ export interface HarnessRouteOptions {
 
 interface ActiveHarnessRun {
   controller: AbortController;
-  done: Promise<{ run_id: string; stop_reason: HarnessStopReason; rounds: number }>;
+  done: Promise<HarnessRunResult>;
 }
 
 /** Ids of started-but-unsettled runs, so cancel can address them while the loop runs. */
@@ -199,9 +199,11 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
     if (typeof deadline === "number") controllerInput.deadline_ms = deadline;
     const done = runHarness(controllerInput).finally(() => { activeRuns.delete(runId); });
     activeRuns.set(runId, { controller, done });
-    // A start failure after the id is returned is visible as settled run evidence;
-    // never let it surface as an unhandled rejection.
-    done.catch(() => {});
+    // A round-body failure settles the run as `run_failed` and writes its own
+    // stop event inside the controller. Only failures before that evidence can
+    // exist (invalid manifest, unreadable store) still reject here; log them so
+    // they are visible rather than surfacing as an unhandled rejection.
+    done.catch((error) => { console.error(`[Harness] run ${runId} could not settle:`, error); });
     return Response.json({ run_id: runId }, { status: 202 });
   }
 
@@ -223,7 +225,7 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
     active.controller.abort();
     const settled = await active.done.catch(() => undefined);
     if (!settled) return jsonError("run_settlement_failed", 500, { run_id: id });
-    return Response.json({ run_id: id, stop_reason: settled.stop_reason });
+    return Response.json({ run_id: id, stop_reason: settled.stop_reason, ...(settled.abandoned ? { abandoned: true } : {}) });
   }
 
   if (path === "/harness/runs" && req.method === "GET") {
