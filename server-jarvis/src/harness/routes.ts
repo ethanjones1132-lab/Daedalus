@@ -1,4 +1,5 @@
 import { renderHarnessGuides } from "../orchestration/harness-guides";
+import { getHarnessCommand } from "./commands";
 import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessStopReason } from "./controller";
 import { validateManifest, type HarnessManifest } from "./manifest";
 import { HarnessStore } from "./store";
@@ -114,6 +115,29 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
     if (revision !== 0) return jsonError("expected_revision must be 0 for create", 400);
     try { return Response.json(store.saveManifest(manifest, 0), { status: 201 }); }
     catch (error) { return jsonError(String(error), /Stale manifest revision/.test(String(error)) ? 409 : 400); }
+  }
+
+  // The only writer of an approval row. The client names the manifest it saw;
+  // the hash it sends must equal the stored manifest's hash, so an approval can
+  // never be bound to a hash the server did not compute itself.
+  if (path === "/harness/approvals" && req.method === "POST") {
+    const body = await req.json().catch(() => null) as Record<string, unknown> | null;
+    if (typeof body?.project_root !== "string" || typeof body.manifest_id !== "string" ||
+        typeof body.manifest_hash !== "string" || typeof body.command_id !== "string") {
+      return jsonError("project_root, manifest_id, manifest_hash, and command_id are required", 400);
+    }
+    const root = resolveRoot(body.project_root);
+    if (!root) return jsonError("unknown_project_root", 404);
+    const saved = store.getManifest(root, body.manifest_id);
+    if (!saved) return jsonError("manifest_not_found", 404);
+    if (!getHarnessCommand(body.command_id)) return jsonError("unknown_command", 400);
+    if (saved.manifest_hash !== body.manifest_hash) return jsonError("manifest_hash_mismatch", 400);
+    const decision = body.decision;
+    if (decision !== "approved" && decision !== "denied") return jsonError("decision must be approved or denied", 400);
+    const approval = store.recordApproval({ command_id: body.command_id, project_root: root,
+      manifest_hash: saved.manifest_hash, decision });
+    return Response.json({ approval: { id: approval.id, command_id: approval.command_id, project_root: approval.project_root,
+      manifest_hash: approval.manifest_hash, decision: approval.decision, decided_at: approval.decided_at } }, { status: 201 });
   }
 
   if (path === "/harness/guides/preview" && req.method === "POST") {

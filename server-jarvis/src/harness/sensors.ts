@@ -73,9 +73,6 @@ export async function runSensors(input: {
     if (sensor.kind === "unavailable") {
       status = "not_applicable";
       reason = "sensor is marked unavailable";
-    } else if (sensor.baseline === undefined) {
-      status = "not_applicable";
-      reason = "sensor has no stored baseline";
     } else if (signal?.aborted) {
       status = "failed";
       reason = "sensor run aborted before execution";
@@ -85,10 +82,15 @@ export async function runSensors(input: {
         status = "failed";
         reason = "sensor command is not in the server-owned catalog";
       } else {
+        // A denial always stands; an absent approval row blocks only when the
+        // manifest requires one. The binding itself is still
+        // (command_id, project_root, manifest_hash).
         const approval = store.findApproval(command.command_id, manifest.project_root, hash);
-        if (approval?.decision !== "approved") {
+        const denied = approval?.decision === "denied";
+        const missingApproval = approval === undefined && manifest.approval.required_for_new_commands;
+        if (denied || missingApproval) {
           status = "unapproved";
-          reason = approval?.decision === "denied" ? "command approval was denied" : "matching command approval is required";
+          reason = denied ? "command approval was denied" : "matching command approval is required";
         } else {
           const controller = new AbortController();
           let timedOut = false;
@@ -122,7 +124,9 @@ export async function runSensors(input: {
               reason = parsed.error;
             } else {
               counter = parsed.counter;
-              improved = counter < sensor.baseline;
+              // A sensor with no stored baseline still runs; the loop's first
+              // pass becomes its comparison point instead of a skipped check.
+              improved = sensor.baseline === undefined ? null : counter < sensor.baseline;
               status = exitCode === 0 && counter === 0 && counter <= sensor.zero_threshold ? "zero" : "nonzero";
               if (status === "nonzero") reason = sensor.failure_message;
             }

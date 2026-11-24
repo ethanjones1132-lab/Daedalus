@@ -5,6 +5,7 @@ import { manifestHash, type HarnessManifest } from "./manifest";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import type { SensorSpawn } from "./sensors";
 import { HarnessStore } from "./store";
+import { instantiateHarnessTemplate } from "./templates";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 
 const ROOT = "/workspace/harness-fixture";
@@ -51,6 +52,8 @@ interface HarnessFixtureOptions {
   diff?: string;
   narrative?: string;
   deps?: Partial<HarnessExecutionDeps>;
+  /** Seed an approved row for every sensor command (default true). */
+  autoApprove?: boolean;
 }
 
 function setupHarness(options: HarnessFixtureOptions) {
@@ -61,7 +64,7 @@ function setupHarness(options: HarnessFixtureOptions) {
     checkerPrompts: [] as Array<{ prompt: string; agent: HarnessAgentRef }>,
   };
   const store = new HarnessStore({ dbPath: ":memory:" });
-  for (const commandId of new Set(options.manifest.sensors.flatMap((sensor) => sensor.command_id ? [sensor.command_id] : []))) {
+  if (options.autoApprove ?? true) for (const commandId of new Set(options.manifest.sensors.flatMap((sensor) => sensor.command_id ? [sensor.command_id] : []))) {
     store.recordApproval({
       command_id: commandId, project_root: options.manifest.project_root,
       manifest_hash: manifestHash(options.manifest), decision: "approved",
@@ -233,5 +236,58 @@ describe("harness execution", () => {
       sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
     });
     expect(result.stop_reason).toBe("checker_rejected");
+  });
+
+  test("(f) a saved template with a route-recorded approval runs its baseline-free sensor and settles passed", async () => {
+    const manifest = instantiateHarnessTemplate("typescript_node_bug_fix", ROOT)!;
+    expect(manifest.sensors[0]?.baseline).toBeUndefined();
+    // No auto-approved row: the route below is the only writer.
+    const { state, store, execution } = setupHarness({ manifest, autoApprove: false, initialErrors: 0, deps: { briefValues: { task: "Fix the failing typecheck" } } });
+    store.saveManifest(manifest, 0);
+    const approved = await routeRequest(store)("/harness/approvals", "POST", {
+      project_root: ROOT, manifest_id: manifest.id, manifest_hash: manifestHash(manifest),
+      command_id: "bun_typecheck", decision: "approved",
+    });
+    expect(approved?.status).toBe(201);
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-template",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("passed");
+    expect(result.rounds).toBe(1);
+    expect(state.spawns).toContain("bun run typecheck");
+    const run = store.getRun("run-template");
+    expect(run?.rounds[0]?.counter_vector).toEqual({ typecheck: 0 });
+    expect(run?.rounds[0]?.sensor_results[0]).toMatchObject({ sensor_id: "typecheck", status: "passed", counter: 0, exit_code: 0 });
+  });
+
+  test("(g) a template run without an approval still settles approval_denied and spawns nothing", async () => {
+    const manifest = instantiateHarnessTemplate("typescript_node_bug_fix", ROOT)!;
+    const { state, store, execution } = setupHarness({ manifest, autoApprove: false, deps: { briefValues: { task: "Fix the failing typecheck" } } });
+    store.saveManifest(manifest, 0);
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-template-unapproved",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("approval_denied");
+    expect(result.rounds).toBe(1);
+    expect(state.spawns.filter((command) => command.startsWith("bun "))).toEqual([]);
+  });
+
+  test("(h) with the approval flag off, a template run needs no approval row and still reaches the checker", async () => {
+    const manifest = instantiateHarnessTemplate("typescript_node_bug_fix", ROOT)!;
+    manifest.approval.required_for_new_commands = false;
+    const { state, store, execution } = setupHarness({ manifest, autoApprove: false, initialErrors: 0, deps: { briefValues: { task: "Fix the failing typecheck" } } });
+    store.saveManifest(manifest, 0);
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-template-open",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("passed");
+    expect(state.spawns).toContain("bun run typecheck");
+    expect(store.findApproval("bun_typecheck", ROOT, manifestHash(manifest))).toBeUndefined();
   });
 });

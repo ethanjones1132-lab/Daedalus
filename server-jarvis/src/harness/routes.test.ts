@@ -73,6 +73,36 @@ describe("harness routes", () => {
     expect((await request("/harness/manifests/bug-fix", "PUT", { manifest: updated, expected_revision: 1 }))?.status).toBe(409);
   });
 
+  test("records an approval only for a known root, catalogued command, stored hash, and valid decision", async () => {
+    const { store, request } = setup();
+    const created = await payload(await request("/harness/manifests/from-template", "POST",
+      { template_id: "typescript_node_bug_fix", project_root: ROOT, expected_revision: 0 }));
+    const storedHash: string = created.manifest_hash;
+    const base = { project_root: ROOT, manifest_id: created.manifest.id, manifest_hash: storedHash, command_id: "bun_typecheck" };
+
+    expect((await request("/harness/approvals", "POST", { ...base, command_id: "arbitrary_shell", decision: "approved" }))?.status).toBe(400);
+    expect((await request("/harness/approvals", "POST", { ...base, decision: "maybe" }))?.status).toBe(400);
+    expect((await request("/harness/approvals", "POST", { ...base, manifest_hash: "0".repeat(64), decision: "approved" }))?.status).toBe(400);
+    expect((await request("/harness/approvals", "POST", { ...base, project_root: "/unknown", decision: "approved" }))?.status).toBe(404);
+    expect((await request("/harness/approvals", "POST", { ...base, manifest_id: "not-a-manifest", decision: "approved" }))?.status).toBe(404);
+    // A rejected request writes nothing.
+    expect(store.findApproval("bun_typecheck", ROOT, storedHash)).toBeUndefined();
+    expect(store.findApproval("arbitrary_shell", ROOT, storedHash)).toBeUndefined();
+
+    const recorded = await request("/harness/approvals", "POST", { ...base, decision: "approved" });
+    expect(recorded?.status).toBe(201);
+    const { approval } = await payload(recorded);
+    expect(approval).toMatchObject({ command_id: "bun_typecheck", project_root: ROOT, manifest_hash: storedHash, decision: "approved" });
+    expect(typeof approval.id).toBe("string");
+    expect(typeof approval.decided_at).toBe("string");
+    expect(approval).not.toHaveProperty("secret");
+    expect(store.findApproval("bun_typecheck", ROOT, storedHash)?.decision).toBe("approved");
+
+    // A denial is recorded against the same binding and is not turned into an approval.
+    expect((await request("/harness/approvals", "POST", { ...base, decision: "denied" }))?.status).toBe(201);
+    expect(store.findApproval("bun_typecheck", ROOT, storedHash)?.decision).toBe("denied");
+  });
+
   test("returns validator errors for invalid manifests and refuses unknown roots", async () => {
     const { request } = setup();
     const bad = { ...manifest(), sensors: [{ ...manifest().sensors[0], command_id: "arbitrary_shell" }] };

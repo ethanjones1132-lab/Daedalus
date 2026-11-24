@@ -88,15 +88,62 @@ describe("runSensors", () => {
     expect(result.sensors[0]?.status).toBe("unapproved");
   });
 
-  test("reports missing baseline as not_applicable, not green", async () => {
+  test("runs a command sensor with no stored baseline and reports its real counter", async () => {
     const missingBaseline = sensor("tests");
     delete missingBaseline.baseline;
     const item = manifest(missingBaseline);
     let calls = 0;
-    const result = await runSensors({ manifest: item, store: setup(item), spawn: async () => { calls++; return { stdout: "errors: 0", stderr: "", exitCode: 0 }; } });
-    expect(calls).toBe(0);
-    expect(result.counter_vector.tests).toBe("not_applicable");
-    expect(result.sensors[0]).toMatchObject({ status: "not_applicable", reason: "sensor has no stored baseline" });
+    const result = await runSensors({ manifest: item, store: setup(item), spawn: async () => {
+      calls++; return { stdout: "errors: 3", stderr: "", exitCode: 1 };
+    } });
+    expect(calls).toBe(1);
+    expect(result.counter_vector.tests).toBe(3);
+    expect(result.sensors[0]).toMatchObject({ status: "nonzero", counter: 3, baseline: null, improved: null });
     expect(result.all_zero).toBe(false);
+  });
+
+  test("a baseline-free sensor still applies the zero rule and its zero_threshold", async () => {
+    const missingBaseline = sensor("tests");
+    delete missingBaseline.baseline;
+    missingBaseline.zero_threshold = 2;
+    const item = manifest(missingBaseline);
+    const green = await runSensors({ manifest: item, store: setup(item), spawn: async () => ({ stdout: "errors: 0", stderr: "", exitCode: 0 }) });
+    expect(green.sensors[0]).toMatchObject({ status: "zero", counter: 0 });
+    expect(green.counter_vector.tests).toBe(0);
+    expect(green.all_zero).toBe(true);
+    // Zero still means a parsed integer 0 with exit 0; a threshold above zero
+    // never turns a nonzero counter green.
+    for (const counter of [1, 2]) {
+      const nonzero = await runSensors({ manifest: item, store: setup(item), spawn: async () => ({ stdout: `errors: ${counter}`, stderr: "", exitCode: 0 }) });
+      expect(nonzero.sensors[0]).toMatchObject({ status: "nonzero", counter });
+      expect(nonzero.all_zero).toBe(false);
+    }
+  });
+
+  test("does not require an approval row when the manifest does not require approvals", async () => {
+    const item = manifest(sensor("tests"));
+    item.approval.required_for_new_commands = false;
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    let calls = 0;
+    const result = await runSensors({ manifest: item, store, spawn: async () => {
+      calls++; return { stdout: "errors: 0", stderr: "", exitCode: 0 };
+    } });
+    expect(calls).toBe(1);
+    expect(result.sensors[0]?.status).toBe("zero");
+    expect(result.all_zero).toBe(true);
+    expect(store.findApproval("bun_test", item.project_root, manifestHash(item))).toBeUndefined();
+  });
+
+  test("a recorded denial still blocks a sensor even when approvals are optional", async () => {
+    const item = manifest(sensor("tests"));
+    item.approval.required_for_new_commands = false;
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    store.recordApproval({ command_id: "bun_test", project_root: item.project_root, manifest_hash: manifestHash(item), decision: "denied" });
+    let calls = 0;
+    const result = await runSensors({ manifest: item, store, spawn: async () => {
+      calls++; return { stdout: "errors: 0", stderr: "", exitCode: 0 };
+    } });
+    expect(calls).toBe(0);
+    expect(result.sensors[0]).toMatchObject({ status: "unapproved", reason: "command approval was denied" });
   });
 });
