@@ -769,7 +769,7 @@ function plannedRowKey(
   return { campaignId: manifest.campaignId, manifestHash: manifest.manifestHash, task, seed, arm };
 }
 
-function outcomeRowFromRollout(
+export function outcomeRowFromRollout(
   manifest: FrozenLearningEvalManifest,
   fixture: LearningEvalHeldOutTask,
   seed: number,
@@ -798,9 +798,11 @@ function outcomeRowFromRollout(
     reward: outcome.reward,
     rewardBreakdown: outcome.breakdown,
     rewardHardZero: outcome.breakdown.hardZero,
-    verifiedTargetWrite: outcome.breakdown.hardZero
-      ? false
-      : outcome.breakdown.creditedWritePaths.length > 0,
+    // Write credit is a measurement from before/after fingerprints, not a
+    // reward-policy verdict. A B2 hard zero says the *check* was declined; it
+    // must not erase a target-path write the breakdown already credited. The
+    // no-write case still reports false because creditedWritePaths stays empty.
+    verifiedTargetWrite: outcome.breakdown.creditedWritePaths.length > 0,
     creditedWritePaths: [...outcome.breakdown.creditedWritePaths],
     durationMs: outcome.durationMs,
     modelCalls: telemetry?.modelCalls ?? null,
