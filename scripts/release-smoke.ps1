@@ -37,7 +37,11 @@
                    the build we made" and "the build answering requests is
                    the build we made".
       5. chat    - one /chat/stream request must reach a terminal frame,
-                   answered by the same installed app.
+                   answered by the same installed app. The chat step records
+                   its outcome as data (answer / error_tolerated / failed):
+                   -AllowChatError turns a terminal error frame into a
+                   passing but visibly tolerated outcome, never into an
+                   answer.
 
     The decision functions are pure and separately testable, so the
     interesting rules (hash mismatch, stale build, missing terminal frame)
@@ -77,9 +81,11 @@ param(
     [switch]$SkipLaunch,
     [switch]$SkipChat,
 
-    # Treat a chat terminal frame of type 'error' as a pass. For a release
-    # build the packaging is what is under test; inference credentials are
-    # a separate concern with a separate owner.
+    # Tolerate a chat terminal frame of type 'error': the run still exits 0,
+    # but the outcome is recorded as 'error_tolerated' with the error class
+    # and text, never as 'answer'. For a release build the packaging is what
+    # is under test; inference credentials are a separate concern with a
+    # separate owner.
     [switch]$AllowChatError,
 
     [int]$TimeoutSeconds = 120
@@ -223,13 +229,104 @@ function Start-JarvisInstalledApp {
     return $startedProcess
 }
 
+function Resolve-JarvisChatOutcome {
+    <#
+    .SYNOPSIS
+        Decide what the chat step records for one /chat/stream response.
+
+    .DESCRIPTION
+        The chat step has three outcomes, not two:
+
+          answer           a terminal 'result' frame: the published installer
+                           actually answered a chat.
+          error_tolerated  a terminal 'error' frame while -AllowChatError is
+                           set. The step still passes and the run still exits
+                           0, but the outcome is recorded as its own value with
+                           the terminal error text, so a reader can see that
+                           the published installer never answered a chat.
+          failed           a terminal error without the flag, a 'cancelled'
+                           frame, or no terminal frame at all.
+
+        Each failing outcome names its class (chat_terminal_error,
+        chat_terminal_cancelled, chat_no_terminal_event) so the record says
+        why the request did not produce an answer.
+
+        Pure: it takes the Get-JarvisSseOutcome record and the caller's
+        intent and returns the decision. No I/O and no exit, so
+        scripts/release-smoke.Tests.ps1 drives every case without an
+        installer, a network port or an inference backend.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$SseOutcome,
+        [switch]$AllowChatError
+    )
+
+    $type = if ($null -ne $SseOutcome) { [string]$SseOutcome.type } else { '' }
+    $text = if ($null -ne $SseOutcome) { [string]$SseOutcome.text } else { '' }
+    $answered = ($null -ne $SseOutcome) -and [bool]$SseOutcome.ok
+
+    if ($answered) {
+        return [pscustomobject]@{
+            outcome     = 'answer'
+            ok          = $true
+            exit_code   = 0
+            error_class = $null
+            type        = $type
+            text        = $text
+            reason      = $null
+        }
+    }
+
+    if ($type -eq 'error') {
+        $errorClass = 'chat_terminal_error'
+        $reason = 'terminal_error'
+        if ($AllowChatError) {
+            # Tolerated, not answered: the step passes but the outcome keeps
+            # saying that the terminal frame was an error.
+            return [pscustomobject]@{
+                outcome     = 'error_tolerated'
+                ok          = $true
+                exit_code   = 0
+                error_class = $errorClass
+                type        = $type
+                text        = $text
+                reason      = $reason
+            }
+        }
+    } elseif ($type -eq 'cancelled') {
+        $errorClass = 'chat_terminal_cancelled'
+        $reason = 'terminal_cancelled'
+    } else {
+        $errorClass = 'chat_no_terminal_event'
+        $reason = 'no_terminal_event'
+    }
+
+    return [pscustomobject]@{
+        outcome     = 'failed'
+        ok          = $false
+        exit_code   = 1
+        error_class = $errorClass
+        type        = $type
+        text        = $text
+        reason      = $reason
+    }
+}
+
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 $results = [System.Collections.Generic.List[object]]::new()
-function Add-Result([string]$Step, [bool]$Ok, [string]$Detail) {
-    $results.Add([pscustomobject]@{ step = $Step; ok = $Ok; detail = $Detail })
+function Add-Result([string]$Step, [bool]$Ok, [string]$Detail, [string]$Outcome = '', [string]$ErrorClass = '', [string]$Text = '') {
+    # outcome/error_class/text are written only by a step that classifies its
+    # result (the chat step does); every other step keeps the original
+    # step/ok/detail shape.
+    $entry = [ordered]@{ step = $Step; ok = $Ok; detail = $Detail }
+    if ($Outcome) { $entry['outcome'] = $Outcome }
+    if ($ErrorClass) { $entry['error_class'] = $ErrorClass }
+    if ($Text) { $entry['text'] = $Text }
+    $results.Add([pscustomobject]$entry)
     if ($Ok) { Write-Ok "$Step - $Detail" } else { Write-Host "  [FAIL] $Step - $Detail" -ForegroundColor Red }
 }
 
@@ -276,6 +373,12 @@ $serverProcess = $null
 $installedExe = $null
 $resolveError = $null
 $healthSource = $null
+# The chat step's recorded outcome. 'not_run' is the honest value when the
+# step was skipped; the three real outcomes come from
+# Resolve-JarvisChatOutcome.
+$chatOutcome = 'not_run'
+$chatErrorClass = $null
+$chatError = $null
 try {
 if (-not $SkipLaunch) {
     Write-Step 'Preflighting the fixed server port'
@@ -393,14 +496,25 @@ if (-not $SkipLaunch) {
             Die "the chat request failed: $($_.Exception.Message)"
         }
         $outcome = Get-JarvisSseOutcome -Events $events
+        $decision = Resolve-JarvisChatOutcome -SseOutcome $outcome -AllowChatError:$AllowChatError
+        $chatOutcome = $decision.outcome
+        $chatErrorClass = $decision.error_class
+        $chatError = if ($decision.outcome -eq 'answer') { $null } else { [string]$decision.text }
         $via = "via the installed app (pid $($serverProcess.Id))"
-        if ($outcome.ok) {
-            Add-Result 'chat' $true "terminal result: $($outcome.text) ($via)"
-        } elseif ($AllowChatError -and $outcome.type -eq 'error') {
-            Add-Result 'chat' $true "terminal error tolerated: $($outcome.text) ($via)"
+        if ($decision.exit_code -ne 0) {
+            Add-Result 'chat' $false "$($decision.error_class): $($decision.reason)" `
+                -Outcome 'failed' -ErrorClass $decision.error_class -Text $decision.text
+            Die "the chat request did not reach a successful terminal frame: $($decision.reason)"
+        }
+        if ($decision.outcome -eq 'answer') {
+            Add-Result 'chat' $true "outcome answer; terminal result: $($decision.text) ($via)" `
+                -Outcome 'answer' -Text $decision.text
         } else {
-            Add-Result 'chat' $false $outcome.reason
-            Die "the chat request did not reach a successful terminal frame: $($outcome.reason)"
+            # A tolerated terminal error is a passing step, not an answer: the
+            # recorded outcome and error text are what tell a manifest reader
+            # that the published installer never answered a chat.
+            Add-Result 'chat' $true "outcome error_tolerated; terminal error: $($decision.text) ($via)" `
+                -Outcome 'error_tolerated' -ErrorClass $decision.error_class -Text $decision.text
         }
     } else {
         Write-Warn 'skipping chat (-SkipChat)'
@@ -435,7 +549,15 @@ $summary = [pscustomobject]@{
     # this smoke started, which owns the server that answered. A Bun from
     # PATH can never appear here.
     health_source = $healthSource
-    steps         = $results.ToArray()
+    # The chat step's outcome as data. 'answer' is the only value that means
+    # the installed app answered a chat; 'error_tolerated' means the caller
+    # let a terminal error pass, and chat_error keeps its text, so the record
+    # cannot be mistaken for a real answer. 'not_run' means the step was
+    # skipped (-SkipChat).
+    chat_outcome     = $chatOutcome
+    chat_error_class = $chatErrorClass
+    chat_error       = $chatError
+    steps            = $results.ToArray()
 }
 $summary | ConvertTo-Json -Depth 5 | Write-Output
 
