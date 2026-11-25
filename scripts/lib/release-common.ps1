@@ -1996,6 +1996,22 @@ function Get-JarvisSseOutcome {
     <#
     .SYNOPSIS
         The terminal frame of a /chat/stream response, if there is one.
+
+    .DESCRIPTION
+        `ok` says only that a terminal `result` frame arrived; it is not a
+        verdict on the turn. The server publishes the verdict on that same
+        frame (server-jarvis/src/stream-emitter.ts `finish`, decided by
+        server-jarvis/src/orchestration/terminal-outcome.ts): `subtype` is
+        'success' for a real answer, and 'error' or 'partial' for a turn that
+        failed, with `code` naming why (for example `turn_deadline` or
+        `no_progress_repetition`). The empty-answer fallback path in
+        server-jarvis/src/index.ts finishes as `failed` and still emits its
+        friendly retry notice as the frame's `result` text, so a caller that
+        looked only at the frame's `type` would record that notice as an
+        answer.
+
+        Both `subtype` and `code` are carried out here (DD-167) so the
+        caller can refuse to record a failed turn as an answer.
     #>
     [CmdletBinding()]
     param(
@@ -2003,18 +2019,31 @@ function Get-JarvisSseOutcome {
     )
     $terminal = @($Events | Where-Object { $_.type -in @('result', 'error', 'cancelled') })
     if ($terminal.Count -eq 0) {
-        return [pscustomobject]@{ ok = $false; reason = 'no_terminal_event'; type = $null; text = $null }
+        return [pscustomobject]@{
+            ok      = $false
+            reason  = 'no_terminal_event'
+            type    = $null
+            subtype = $null
+            code    = $null
+            text    = $null
+        }
     }
     $last = $terminal[-1]
     $text = if ($null -ne $last.result) { [string]$last.result }
             elseif ($null -ne $last.error) { [string]$last.error }
             else { '' }
     $isResult = ([string]$last.type -eq 'result')
+    # A frame that never carried the field keeps $null rather than an invented
+    # value; the decision layer treats anything but 'success' as not an answer.
+    $subtype = if ($null -ne $last.subtype) { [string]$last.subtype } else { $null }
+    $code = if ($null -ne $last.code) { [string]$last.code } else { $null }
     return [pscustomobject]@{
-        ok     = $isResult
-        reason = $(if ($isResult) { $null } else { "terminal_$($last.type)" })
-        type   = [string]$last.type
-        text   = $text
+        ok      = $isResult
+        reason  = $(if ($isResult) { $null } else { "terminal_$($last.type)" })
+        type    = [string]$last.type
+        subtype = $subtype
+        code    = $code
+        text    = $text
     }
 }
 

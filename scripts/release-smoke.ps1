@@ -39,8 +39,9 @@
       5. chat    - one /chat/stream request must reach a terminal frame,
                    answered by the same installed app. The chat step records
                    its outcome as data (answer / error_tolerated / failed):
-                   -AllowChatError turns a terminal error frame into a
-                   passing but visibly tolerated outcome, never into an
+                   -AllowChatError turns a terminal error frame, or a terminal
+                   result frame whose own subtype says the turn failed, into
+                   a passing but visibly tolerated outcome, never into an
                    answer.
 
     The decision functions are pure and separately testable, so the
@@ -81,11 +82,11 @@ param(
     [switch]$SkipLaunch,
     [switch]$SkipChat,
 
-    # Tolerate a chat terminal frame of type 'error': the run still exits 0,
-    # but the outcome is recorded as 'error_tolerated' with the error class
-    # and text, never as 'answer'. For a release build the packaging is what
-    # is under test; inference credentials are a separate concern with a
-    # separate owner.
+    # Tolerate a terminal 'error' frame, or a terminal 'result' frame whose own
+    # subtype is 'error'/'partial': the run still exits 0, but the outcome is
+    # recorded as 'error_tolerated' with the error class, code and text, never
+    # as 'answer'. For a release build the packaging is what is under test;
+    # inference credentials are a separate concern with a separate owner.
     [switch]$AllowChatError,
 
     [int]$TimeoutSeconds = 120
@@ -237,19 +238,32 @@ function Resolve-JarvisChatOutcome {
     .DESCRIPTION
         The chat step has three outcomes, not two:
 
-          answer           a terminal 'result' frame: the published installer
-                           actually answered a chat.
-          error_tolerated  a terminal 'error' frame while -AllowChatError is
-                           set. The step still passes and the run still exits
-                           0, but the outcome is recorded as its own value with
-                           the terminal error text, so a reader can see that
-                           the published installer never answered a chat.
-          failed           a terminal error without the flag, a 'cancelled'
-                           frame, or no terminal frame at all.
+          answer           a terminal 'result' frame whose own subtype is
+                           'success': the published installer actually answered
+                           a chat.
+          error_tolerated  a terminal 'error' frame, or a terminal 'result'
+                           frame whose subtype says the turn failed, while
+                           -AllowChatError is set. The step still passes and
+                           the run still exits 0, but the outcome is recorded
+                           as its own value with the frame's code and text, so
+                           a reader can see that the published installer never
+                           answered a chat.
+          failed           the same non-success frames without the flag, a
+                           'cancelled' frame, or no terminal frame at all.
+
+        A 'result' frame is not an answer by virtue of its type alone (DD-167).
+        The server publishes the whole truth on that frame: subtype 'error' or
+        'partial' with a code (for example turn_deadline) means the turn
+        failed, and the empty-answer fallback path even finishes a failed turn
+        with its friendly retry notice as the result text. So only
+        subtype 'success' is an answer; a result frame with any other subtype,
+        including no subtype at all, never records one.
 
         Each failing outcome names its class (chat_terminal_error,
-        chat_terminal_cancelled, chat_no_terminal_event) so the record says
-        why the request did not produce an answer.
+        chat_terminal_cancelled, chat_no_terminal_event,
+        chat_result_subtype_error, chat_result_subtype_partial,
+        chat_result_subtype_unknown) so the record says why the request did not
+        produce an answer.
 
         Pure: it takes the Get-JarvisSseOutcome record and the caller's
         intent and returns the decision. No I/O and no exit, so
@@ -263,8 +277,13 @@ function Resolve-JarvisChatOutcome {
     )
 
     $type = if ($null -ne $SseOutcome) { [string]$SseOutcome.type } else { '' }
+    $subtype = if ($null -ne $SseOutcome) { [string]$SseOutcome.subtype } else { '' }
+    $code = if ($null -ne $SseOutcome) { [string]$SseOutcome.code } else { '' }
     $text = if ($null -ne $SseOutcome) { [string]$SseOutcome.text } else { '' }
-    $answered = ($null -ne $SseOutcome) -and [bool]$SseOutcome.ok
+    # `ok` on the parser record means a terminal 'result' frame arrived. It is
+    # not a verdict: the verdict is the frame's own subtype.
+    $isResultFrame = ($null -ne $SseOutcome) -and [bool]$SseOutcome.ok
+    $answered = $isResultFrame -and ($subtype -eq 'success')
 
     if ($answered) {
         return [pscustomobject]@{
@@ -273,8 +292,44 @@ function Resolve-JarvisChatOutcome {
             exit_code   = 0
             error_class = $null
             type        = $type
+            subtype     = $subtype
+            code        = $(if ($code) { $code } else { $null })
             text        = $text
             reason      = $null
+        }
+    }
+
+    if ($isResultFrame) {
+        # A terminal result frame whose subtype is not 'success': the turn
+        # failed even though a result frame arrived. Never an answer.
+        $subtypeSlug = if ($subtype) { ($subtype -replace '[^A-Za-z0-9_-]', '_') } else { 'unknown' }
+        $errorClass = "chat_result_subtype_$subtypeSlug"
+        $reason = "terminal_result_subtype_$subtypeSlug"
+        if ($AllowChatError) {
+            # Tolerated, not answered: the step passes but the outcome keeps
+            # saying that the terminal frame was not a success.
+            return [pscustomobject]@{
+                outcome     = 'error_tolerated'
+                ok          = $true
+                exit_code   = 0
+                error_class = $errorClass
+                type        = $type
+                subtype     = $subtype
+                code        = $(if ($code) { $code } else { $null })
+                text        = $text
+                reason      = $reason
+            }
+        }
+        return [pscustomobject]@{
+            outcome     = 'failed'
+            ok          = $false
+            exit_code   = 1
+            error_class = $errorClass
+            type        = $type
+            subtype     = $subtype
+            code        = $(if ($code) { $code } else { $null })
+            text        = $text
+            reason      = $reason
         }
     }
 
@@ -290,6 +345,8 @@ function Resolve-JarvisChatOutcome {
                 exit_code   = 0
                 error_class = $errorClass
                 type        = $type
+                subtype     = $(if ($subtype) { $subtype } else { $null })
+                code        = $(if ($code) { $code } else { $null })
                 text        = $text
                 reason      = $reason
             }
@@ -308,6 +365,8 @@ function Resolve-JarvisChatOutcome {
         exit_code   = 1
         error_class = $errorClass
         type        = $type
+        subtype     = $(if ($subtype) { $subtype } else { $null })
+        code        = $(if ($code) { $code } else { $null })
         text        = $text
         reason      = $reason
     }
@@ -378,6 +437,7 @@ $healthSource = $null
 # Resolve-JarvisChatOutcome.
 $chatOutcome = 'not_run'
 $chatErrorClass = $null
+$chatErrorCode = $null
 $chatError = $null
 try {
 if (-not $SkipLaunch) {
@@ -499,10 +559,19 @@ if (-not $SkipLaunch) {
         $decision = Resolve-JarvisChatOutcome -SseOutcome $outcome -AllowChatError:$AllowChatError
         $chatOutcome = $decision.outcome
         $chatErrorClass = $decision.error_class
+        # The server names the cause on the frame (turn_deadline,
+        # no_progress_repetition, ...). Keep it beside the class and text so a
+        # scan of the record says why a non-answer ended the way it did.
+        $chatErrorCode = $decision.code
         $chatError = if ($decision.outcome -eq 'answer') { $null } else { [string]$decision.text }
         $via = "via the installed app (pid $($serverProcess.Id))"
         if ($decision.exit_code -ne 0) {
-            Add-Result 'chat' $false "$($decision.error_class): $($decision.reason)" `
+            # A terminal result frame that is not subtype success lands here:
+            # the frame arrived, the turn failed, and the record must not call
+            # it an answer.
+            $failure = "$($decision.error_class): $($decision.reason)"
+            if ($decision.code) { $failure = "$failure [$($decision.code)]" }
+            Add-Result 'chat' $false $failure `
                 -Outcome 'failed' -ErrorClass $decision.error_class -Text $decision.text
             Die "the chat request did not reach a successful terminal frame: $($decision.reason)"
         }
@@ -511,9 +580,14 @@ if (-not $SkipLaunch) {
                 -Outcome 'answer' -Text $decision.text
         } else {
             # A tolerated terminal error is a passing step, not an answer: the
-            # recorded outcome and error text are what tell a manifest reader
-            # that the published installer never answered a chat.
-            Add-Result 'chat' $true "outcome error_tolerated; terminal error: $($decision.text) ($via)" `
+            # recorded outcome, error class, code and text are what tell a
+            # manifest reader that the published installer never answered a
+            # chat.
+            $toleratedDetail = "outcome error_tolerated; terminal $($decision.type)"
+            if ($decision.subtype) { $toleratedDetail = "$toleratedDetail/$($decision.subtype)" }
+            if ($decision.code) { $toleratedDetail = "$toleratedDetail [$($decision.code)]" }
+            $toleratedDetail = "$toleratedDetail $($decision.text) ($via)"
+            Add-Result 'chat' $true $toleratedDetail `
                 -Outcome 'error_tolerated' -ErrorClass $decision.error_class -Text $decision.text
         }
     } else {
@@ -550,12 +624,16 @@ $summary = [pscustomobject]@{
     # PATH can never appear here.
     health_source = $healthSource
     # The chat step's outcome as data. 'answer' is the only value that means
-    # the installed app answered a chat; 'error_tolerated' means the caller
-    # let a terminal error pass, and chat_error keeps its text, so the record
-    # cannot be mistaken for a real answer. 'not_run' means the step was
-    # skipped (-SkipChat).
+    # the installed app answered a chat: a terminal 'result' frame whose
+    # subtype is not 'success' is a failed turn even though the frame arrived,
+    # so it records 'error_tolerated' (passing, with -AllowChatError) or
+    # 'failed', never 'answer'. chat_error_code keeps the server's own cause
+    # (turn_deadline, no_progress_repetition, ...) and chat_error its text, so
+    # the record cannot be mistaken for a real answer. 'not_run' means the
+    # step was skipped (-SkipChat).
     chat_outcome     = $chatOutcome
     chat_error_class = $chatErrorClass
+    chat_error_code  = $chatErrorCode
     chat_error       = $chatError
     steps            = $results.ToArray()
 }
