@@ -449,8 +449,14 @@ fn system_health_snapshot(config: &crate::jarvis::types::JarvisConfig) -> Health
     // `jarvis_health_identifies` reports the Bun server up (DD-T1). The doctor
     // row keeps the cheap port question, because it reports on the port.
     let bun_running = crate::bun_server_is_serving();
+    // llama.cpp: the same identity rule as Bun above. A bound port is not a
+    // llama.cpp server — a Vite preview or another app on :8080 accepts the
+    // connection too — so `running` reflects the identifying `/v1/models` or
+    // `/health` probe (`llama_cpp_server_is_serving`), not port occupancy. The
+    // doctor row below keeps the cheap port question, because it reports on the
+    // port.
     let llama_cpp_running =
-        crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
+        crate::llama_cpp_server_is_serving(config.llama_cpp.port, llama_cpp_uses_wsl);
     let proxy_required = crate::claude_proxy_enabled(config);
     let proxy_running = proxy_required && crate::claude_proxy_is_listening();
 
@@ -1023,6 +1029,9 @@ pub async fn get_doctor_report(
         config.active_backend,
         crate::jarvis::types::JarvisBackend::LlamaCpp
     );
+    // The doctor row reports on the port, so it keeps the cheap port question.
+    // Whether the listener is actually llama.cpp is the health grid's job
+    // (`llama_cpp_server_is_serving`); this row says the port is bound.
     let llama_cpp_running =
         crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
     checks.push(DoctorCheck {

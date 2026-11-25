@@ -726,13 +726,22 @@ pub(crate) async fn start_llama_cpp_server(
     // A server that is already listening (started by this process earlier or
     // by the user by hand) is usable even when no artifact paths are set.
     // Env fallbacks are applied first only so the launch mode can be read from
-    // the resolved command; the early return is unchanged.
+    // the resolved command; the early return itself depends on identity, not
+    // only on the port being bound.
     let config = config.with_env_fallbacks();
     // DD-049: `llama-server` is spawned directly from `server_path`. A Windows
     // `.exe` never listens inside WSL, so do not spawn `wsl.exe` to find out.
     let uses_wsl = command_uses_wsl(Some(config.server_path.as_str()));
-    if backend_port_is_listening(config.port, uses_wsl) {
-        return Ok(process_lifecycle::StartOutcome::AlreadyListening);
+    // A bound port is not a llama.cpp server: a Vite preview, another app, or a
+    // stale process accepts the TCP connection too. Only a listener that answers
+    // as llama.cpp is adopted (the manual-server case the early return protects);
+    // an unidentified listener is named and left untouched rather than treated
+    // as this backend.
+    if let Some(outcome) = llama_cpp_spawn_decision(
+        probe_llama_cpp_port_state(config.port, uses_wsl),
+        config.port,
+    )? {
+        return Ok(outcome);
     }
 
     if config.server_path.trim().is_empty() {
@@ -3321,6 +3330,208 @@ fn backend_port_is_listening_with(
     uses_wsl && probe_wsl(port)
 }
 
+/// Who holds the llama.cpp port, as far as this app can prove.
+///
+/// A bound port is not evidence of a llama.cpp server: a Vite preview, another
+/// app, or a stale process accepts the connection (and often answers 2xx) too.
+/// Only a listener whose body passes [`llama_cpp_body_identifies`] counts as
+/// this backend, so a fresh install neither adopts a stranger nor posts the
+/// first chat to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LlamaCppPortState {
+    /// Nothing is bound to the configured llama.cpp port.
+    Free,
+    /// A listener answered `/v1/models` or `/health` as a llama.cpp server.
+    ThisServer,
+    /// The port is bound, but the answer is not a llama.cpp server's.
+    ForeignListener,
+}
+
+/// Decide the llama.cpp port's state from occupancy *and* identity.
+///
+/// Occupancy is the cheap question [`backend_port_is_listening`] answers;
+/// identity is one bounded HTTP probe ([`llama_cpp_health_identifies`]). A free
+/// port is decided without any HTTP call, so a cold first run never waits on a
+/// probe. Synchronous on purpose, next to the port probe it refines: callers
+/// already perform that blocking probe and need no async client here.
+pub(crate) fn probe_llama_cpp_port_state(port: u16, uses_wsl: bool) -> LlamaCppPortState {
+    llama_cpp_port_state_with(
+        port,
+        uses_wsl,
+        backend_port_is_listening,
+        llama_cpp_health_identifies,
+    )
+}
+
+/// Pure form of [`probe_llama_cpp_port_state`]: identity is consulted only when
+/// something actually holds the port, so tests can inject both answers without
+/// opening a socket.
+fn llama_cpp_port_state_with(
+    port: u16,
+    uses_wsl: bool,
+    port_listening: impl FnOnce(u16, bool) -> bool,
+    identity: impl FnOnce(u16, bool) -> bool,
+) -> LlamaCppPortState {
+    if !port_listening(port, uses_wsl) {
+        return LlamaCppPortState::Free;
+    }
+    if identity(port, uses_wsl) {
+        LlamaCppPortState::ThisServer
+    } else {
+        LlamaCppPortState::ForeignListener
+    }
+}
+
+/// Whether an identified llama.cpp server answers the configured port.
+///
+/// Used by the health grid so a port held by a foreign listener is reported
+/// honestly as "not running" instead of as a live llama.cpp server.
+pub(crate) fn llama_cpp_server_is_serving(port: u16, uses_wsl: bool) -> bool {
+    llama_cpp_server_is_serving_with(
+        port,
+        uses_wsl,
+        backend_port_is_listening,
+        llama_cpp_health_identifies,
+    )
+}
+
+/// Pure form of [`llama_cpp_server_is_serving`], the seam the health tests drive.
+fn llama_cpp_server_is_serving_with(
+    port: u16,
+    uses_wsl: bool,
+    port_listening: impl FnOnce(u16, bool) -> bool,
+    identity: impl FnOnce(u16, bool) -> bool,
+) -> bool {
+    llama_cpp_port_state_with(port, uses_wsl, port_listening, identity)
+        == LlamaCppPortState::ThisServer
+}
+
+/// The spawn path's decision taken from the port state, never from occupancy
+/// alone.
+///
+/// `Some(AlreadyListening)` adopts only an identified llama.cpp server; a
+/// foreign listener is named and refused so the first chat is never posted to
+/// it and no second server is silently started on the same port. `None` means
+/// the port is free and the caller may spawn.
+fn llama_cpp_spawn_decision(
+    state: LlamaCppPortState,
+    port: u16,
+) -> Result<Option<process_lifecycle::StartOutcome>, String> {
+    match state {
+        LlamaCppPortState::ThisServer => {
+            Ok(Some(process_lifecycle::StartOutcome::AlreadyListening))
+        }
+        LlamaCppPortState::ForeignListener => Err(format!(
+            "llama.cpp port {port} is held by a process that does not answer as llama.cpp; refusing to use it"
+        )),
+        LlamaCppPortState::Free => Ok(None),
+    }
+}
+
+/// One identifying llama.cpp probe, through the same launch-mode gate as the
+/// port probe: a native Windows `llama-server.exe` never pays for `wsl.exe`,
+/// while a WSL-launched server may still be identified inside the guest.
+fn llama_cpp_health_identifies(port: u16, uses_wsl: bool) -> bool {
+    llama_cpp_health_identifies_with(
+        port,
+        uses_wsl,
+        native_llama_cpp_health_identifies,
+        wsl_llama_cpp_health_identifies,
+    )
+}
+
+/// Pure form of [`llama_cpp_health_identifies`], the seam these tests drive.
+fn llama_cpp_health_identifies_with(
+    port: u16,
+    uses_wsl: bool,
+    probe_local: impl FnOnce(u16) -> bool,
+    probe_wsl: impl FnOnce(u16) -> bool,
+) -> bool {
+    if probe_local(port) {
+        return true;
+    }
+    uses_wsl && probe_wsl(port)
+}
+
+/// Does this body come from a llama.cpp server?
+///
+/// `GET /health` on `llama-server` answers `{"status":"ok"}`, while the
+/// OpenAI-compatible `GET /v1/models` answers `{"object":"list","data":[...]}`.
+/// Older/router-shaped payloads use a `models` array instead of `data`, so both
+/// arrays count. Anything else — an HTML page, an unrelated JSON object — is a
+/// stranger and must not be adopted.
+fn llama_cpp_body_identifies(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("status").and_then(|value| value.as_str()) == Some("ok") {
+        return true;
+    }
+    ["data", "models"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(|value| value.is_array()))
+}
+
+/// The native identifying probe: `/v1/models` first, then `/health`, each
+/// bounded by a short timeout. A 2xx is not enough — the body must pass
+/// [`llama_cpp_body_identifies`] — and the client is `.no_proxy()` so a loopback
+/// probe is never answered by a proxy inherited from the environment.
+fn native_llama_cpp_health_identifies(port: u16) -> bool {
+    let Ok(client) = local_api::blocking_client()
+        .pool_max_idle_per_host(0)
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    let base = format!("http://127.0.0.1:{port}");
+    for path in ["/v1/models", "/health"] {
+        let Ok(response) = client
+            .get(format!("{base}{path}"))
+            .header(reqwest::header::CONNECTION, "close")
+            .send()
+        else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        if response
+            .text()
+            .is_ok_and(|body| llama_cpp_body_identifies(&body))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The WSL identifying probe. `python3` is the same helper the WSL port probe
+/// already relies on; it prints every body it can fetch so the same
+/// [`llama_cpp_body_identifies`] decision is made in Rust, not in a one-liner.
+fn wsl_llama_cpp_health_identifies(port: u16) -> bool {
+    if !cfg!(target_os = "windows") {
+        return false;
+    }
+
+    let script = format!(
+        "import urllib.request\nfor path in ('/v1/models','/health'):\n try:\n  with urllib.request.urlopen('http://127.0.0.1:{port}'+path,timeout=1) as r:\n   print(r.read().decode('utf-8','replace'))\n except Exception:\n  pass"
+    );
+    let mut cmd = std::process::Command::new("wsl.exe");
+    cmd.args(["--", "python3", "-c", script.as_str()]);
+    crate::wsl::command_output_timeout(cmd, std::time::Duration::from_secs(4))
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .any(llama_cpp_body_identifies)
+        })
+        .unwrap_or(false)
+}
+
 /// The current user's home directory, derived from this machine's environment.
 ///
 /// A missing variable is never filled in with a hardcoded user path: an empty
@@ -5506,6 +5717,155 @@ mod local_backend_probe_tests {
             !llama.contains("is_port_listening(") && !llama.contains("is_wsl_port_listening("),
             "the llama.cpp boot path must not use the unconditional probe, which \
              spawns wsl.exe even for a native backend:\n{llama}"
+        );
+    }
+}
+
+/// DD-162 regressions: a process that merely holds the llama.cpp port is not a
+/// llama.cpp server. Occupancy is adopted only when the identity probe passes;
+/// otherwise the listener is refused by name and kept out of the readiness and
+/// health surfaces. The decision seams take injected probes, so no socket is
+/// opened here and the existing port-probe tests keep their seams.
+#[cfg(test)]
+mod llama_cpp_identity_tests {
+    use super::*;
+
+    const UNIDENTIFIED_ERROR: &str =
+        "llama.cpp port 8080 is held by a process that does not answer as llama.cpp; refusing to use it";
+
+    #[test]
+    fn an_unidentified_listener_is_never_adopted_as_llama_cpp() {
+        // Old behaviour: `backend_port_is_listening` alone returned true and
+        // `start_llama_cpp_server` returned AlreadyListening for this listener.
+        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| false);
+
+        assert_eq!(state, LlamaCppPortState::ForeignListener);
+        assert_eq!(
+            llama_cpp_spawn_decision(state, 8080),
+            Err(UNIDENTIFIED_ERROR.to_string()),
+            "the spawn path must name the port holder instead of adopting it"
+        );
+    }
+
+    #[test]
+    fn an_identified_llama_cpp_listener_is_still_adopted() {
+        // The manual-server case the early return in start_llama_cpp_server
+        // protects must keep working.
+        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| true);
+
+        assert_eq!(state, LlamaCppPortState::ThisServer);
+        assert_eq!(
+            llama_cpp_spawn_decision(state, 8080),
+            Ok(Some(crate::process_lifecycle::StartOutcome::AlreadyListening))
+        );
+    }
+
+    #[test]
+    fn a_free_port_is_left_for_the_spawn() {
+        let state = llama_cpp_port_state_with(
+            8080,
+            false,
+            |_, _| false,
+            |_, _| panic!("identity must not be probed on a free port"),
+        );
+
+        assert_eq!(state, LlamaCppPortState::Free);
+        assert_eq!(llama_cpp_spawn_decision(state, 8080), Ok(None));
+    }
+
+    #[test]
+    fn the_health_grid_never_reports_an_unidentified_listener_as_running() {
+        assert!(!llama_cpp_server_is_serving_with(
+            8080,
+            false,
+            |_, _| true,
+            |_, _| false
+        ));
+        assert!(
+            llama_cpp_server_is_serving_with(8080, false, |_, _| true, |_, _| true),
+            "an identified llama.cpp server must still report running"
+        );
+    }
+
+    #[test]
+    fn llama_cpp_identity_accepts_the_server_shapes_and_rejects_strangers() {
+        assert!(llama_cpp_body_identifies(r#"{"status":"ok"}"#));
+        assert!(llama_cpp_body_identifies(
+            r#"{"object":"list","data":[{"id":"local"}]}"#
+        ));
+        assert!(llama_cpp_body_identifies(
+            r#"{"models":[{"name":"local"}]}"#
+        ));
+
+        assert!(!llama_cpp_body_identifies(
+            r#"{"name":"vite","version":"5.0"}"#
+        ));
+        assert!(!llama_cpp_body_identifies("<html>hello</html>"));
+        assert!(!llama_cpp_body_identifies(""));
+    }
+
+    #[test]
+    fn a_native_launch_never_runs_the_wsl_identity_probe() {
+        let wsl_probes = std::cell::Cell::new(0);
+        let identified = llama_cpp_health_identifies_with(
+            8080,
+            false,
+            |_| false,
+            |_| {
+                wsl_probes.set(wsl_probes.get() + 1);
+                true
+            },
+        );
+
+        assert!(!identified);
+        assert_eq!(
+            wsl_probes.get(),
+            0,
+            "a native llama-server.exe must not spawn wsl.exe to identify itself"
+        );
+    }
+
+    #[test]
+    fn a_wsl_launch_may_still_identify_inside_the_guest() {
+        assert!(llama_cpp_health_identifies_with(
+            8080,
+            true,
+            |_| false,
+            |_| true
+        ));
+        assert!(!llama_cpp_health_identifies_with(
+            8080,
+            true,
+            |_| false,
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn the_spawn_early_return_and_health_grid_use_the_identity_probe() {
+        // Pin the production wiring, not just the pure decision: reverting
+        // either surface to `backend_port_is_listening` would adopt a stranger
+        // again even though the seams above stayed correct.
+        const LIB: &str = include_str!("lib.rs");
+        let start = LIB
+            .find("pub(crate) async fn start_llama_cpp_server(")
+            .expect("start_llama_cpp_server must exist");
+        let end = LIB[start..]
+            .find("pub fn reconcile_backend_services(")
+            .map(|offset| start + offset)
+            .expect("reconcile_backend_services must follow the llama.cpp start");
+        let spawn = &LIB[start..end];
+        assert!(
+            spawn.contains("probe_llama_cpp_port_state(config.port, uses_wsl)"),
+            "the spawn early return must be gated on identity:\n{spawn}"
+        );
+
+        const HEALTH: &str = include_str!("commands/system.rs");
+        assert!(
+            HEALTH.contains(
+                "crate::llama_cpp_server_is_serving(config.llama_cpp.port, llama_cpp_uses_wsl)"
+            ),
+            "the health grid's llama_cpp_running must come from the identity probe"
         );
     }
 }

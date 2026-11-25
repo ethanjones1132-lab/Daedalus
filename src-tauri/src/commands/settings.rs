@@ -1,5 +1,7 @@
 use crate::db::AppDb;
-use crate::jarvis::readiness::{derive_backend_readiness, with_backend_reachable, BackendReadiness};
+use crate::jarvis::readiness::{
+    derive_backend_readiness, with_backend_port_conflict, with_backend_reachable, BackendReadiness,
+};
 use crate::jarvis::types::JarvisConfig;
 use std::collections::HashMap;
 use tauri::State;
@@ -131,20 +133,26 @@ pub fn get_backend_readiness(db: State<AppDb>) -> Result<BackendReadiness, Strin
     config.llama_cpp = config.llama_cpp.clone().with_env_fallbacks();
     let mut readiness = derive_backend_readiness(&config);
     if readiness.backend == crate::jarvis::types::JarvisBackend::LlamaCpp {
-        // Boot skips the spawn when the port already answers
-        // (`start_llama_cpp_server` → `AlreadyListening`), so a server the user
-        // started by hand must not be reported as an unconfigured install. The
-        // same probe, read the other way, is what makes a configured install
-        // with a silent port `not_listening` instead of `ready`: boot spawns
-        // llama.cpp fire-and-forget, so nothing else can tell the shell whether
-        // a turn sent now would reach it.
-        readiness = with_backend_reachable(
-            readiness,
-            crate::backend_port_is_listening(
-                config.llama_cpp.port,
-                crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str())),
-            ),
-        );
+        // Boot skips the spawn only when an *identified* llama.cpp server
+        // already answers the port (`start_llama_cpp_server` →
+        // `AlreadyListening`), so a server the user started by hand must not be
+        // reported as an unconfigured install. Occupancy alone is not enough: a
+        // stranger on the port is refused by boot, so it must not read as ready
+        // either. The same probe, read the other way, is what makes a configured
+        // install with a silent port `not_listening` instead of `ready`: boot
+        // spawns llama.cpp fire-and-forget, so nothing else can tell the shell
+        // whether a turn sent now would reach it.
+        let port = config.llama_cpp.port;
+        let uses_wsl = crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
+        readiness = match crate::probe_llama_cpp_port_state(port, uses_wsl) {
+            crate::LlamaCppPortState::ThisServer => {
+                with_backend_reachable(readiness, true)
+            }
+            crate::LlamaCppPortState::Free => with_backend_reachable(readiness, false),
+            crate::LlamaCppPortState::ForeignListener => {
+                with_backend_port_conflict(readiness, port)
+            }
+        };
     }
     Ok(readiness)
 }

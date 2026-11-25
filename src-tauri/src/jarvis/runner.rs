@@ -1934,8 +1934,10 @@ pub fn check_jarvis_status(config: &JarvisConfig) -> JarvisStatus {
         crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
     let ollama_running = crate::backend_port_is_listening(11434, ollama_uses_wsl);
 
+    // A bound port is not a llama.cpp server: an unidentified listener on it is
+    // refused by boot, so status must not report it as running either.
     let llama_cpp_running =
-        crate::backend_port_is_listening(config.llama_cpp.port, llama_cpp_uses_wsl);
+        crate::llama_cpp_server_is_serving(config.llama_cpp.port, llama_cpp_uses_wsl);
 
     let model_available = if is_ollama && ollama_running {
         let url = config.ollama.base_url.clone();
@@ -2092,8 +2094,16 @@ mod proxy_status_tests {
             "status must not use the unconditional WSL port check"
         );
         assert!(
-            body.matches("crate::backend_port_is_listening(").count() >= 2,
-            "Ollama and llama.cpp status probes must both use the launch-mode-aware check"
+            body.contains(
+                "crate::backend_port_is_listening(11434, ollama_uses_wsl)"
+            ),
+            "the Ollama status probe must use the launch-mode-aware check"
+        );
+        assert!(
+            body.contains(
+                "crate::llama_cpp_server_is_serving(config.llama_cpp.port, llama_cpp_uses_wsl)"
+            ),
+            "llama.cpp status must report an identified server, not mere port occupancy"
         );
         assert!(
             body.contains("crate::bun_uses_wsl()"),

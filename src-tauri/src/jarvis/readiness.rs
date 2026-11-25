@@ -8,14 +8,16 @@
 //! `ready`, `missing_config` naming the exact blank setting or the program
 //! that could not be found/run, `missing_file` when a configured artifact path
 //! is not a file (DD-111), or `not_listening` when the settings are complete
-//! but nothing answers the backend's port.
+//! but nothing answers the backend's port — or when the port is held by a
+//! listener that does not answer as llama.cpp (DD-162).
 //!
 //! Derivation is config-only on purpose: which process is running is
 //! `jarvis_check_status`/health state. The one liveness fact that belongs here
-//! is the port probe boot itself uses (see [`with_backend_reachable`]), because
-//! it changes whether a turn is attemptable at all — in both directions: a
-//! server already answering makes an unconfigured install usable, and a
-//! configured backend with a closed port cannot answer a turn.
+//! is the identified-server probe boot itself uses (see
+//! [`with_backend_reachable`]), because it changes whether a turn is attemptable
+//! at all — in both directions: a server already answering makes an unconfigured
+//! install usable, and a configured backend with a closed port cannot answer a
+//! turn.
 
 use serde::Serialize;
 
@@ -77,15 +79,17 @@ pub enum BackendReadinessState {
     /// bind its port, so it must not read as a backend that may still be
     /// starting (DD-111).
     MissingFile,
-    /// The settings are complete, but nothing is listening on the backend's
-    /// port: the local server may still be starting, may have exited, or may
-    /// be bound elsewhere. A turn sent now would fail at the first request.
+    /// The settings are complete, but nothing llama.cpp answers the backend's
+    /// port: the local server may still be starting, may have exited, or the
+    /// port may be held by a listener that does not answer as llama.cpp (DD-162,
+    /// named in `missing`). A turn sent now would fail at the first request.
     NotListening,
 }
 
 /// What the shell needs to decide between normal chat and a first-run setup
 /// state. `missing` names the setting or program that is unavailable, so it is
-/// empty for every state except `MissingConfig` and `MissingFile`.
+/// empty for every state except `MissingConfig`, `MissingFile`, and (DD-162)
+/// `NotListening` when the port is held by a listener that is not llama.cpp.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BackendReadiness {
     pub state: BackendReadinessState,
@@ -270,11 +274,15 @@ fn missing_executable(
 
 /// Fold in the one liveness fact boot already acts on.
 ///
-/// The probe is not a one-way lift into `Ready`:
-/// - `true` means a server is already answering. `start_llama_cpp_server`
-///   returns `AlreadyListening` before it looks at `server_path`/`model_path`,
-///   so a server the user started by hand is usable with blank artifact paths.
-///   Reporting `missing_config` there would block a chat that works.
+/// `backend_reachable` means *identified*, not merely "the port is open": boot
+/// adopts a listener only when `crate::llama_cpp_server_is_serving` passes, so
+/// the caller must pass that same answer. The probe is not a one-way lift into
+/// `Ready`:
+/// - `true` means an identified llama.cpp server is already answering.
+///   `start_llama_cpp_server` returns `AlreadyListening` before it looks at
+///   `server_path`/`model_path`, so a server the user started by hand is usable
+///   with blank artifact paths. Reporting `missing_config` there would block a
+///   chat that works.
 /// - `false` on a configured install means nothing is answering the port yet,
 ///   so the value must stop claiming `Ready`: the turn would fail at the first
 ///   request. A backend that is still `missing_config` or `missing_file` keeps
@@ -305,6 +313,44 @@ pub fn with_backend_reachable(
             missing: Vec::new(),
             ..readiness
         }
+    }
+}
+
+/// Readiness for a llama.cpp port held by a listener that does not answer as
+/// llama.cpp.
+///
+/// An unidentified listener is not adoptable (`start_llama_cpp_server` refuses
+/// it by name), so the install must not read as `Ready`. The state becomes
+/// `NotListening` — or keeps a more specific `missing_config`/`missing_file`
+/// verdict that the operator still has to fix — and the `missing` list gains an
+/// item naming the port conflict, so the setup band and the composer can say
+/// what is actually in the way.
+pub fn with_backend_port_conflict(
+    readiness: BackendReadiness,
+    port: u16,
+) -> BackendReadiness {
+    let state = if matches!(
+        readiness.state,
+        BackendReadinessState::MissingConfig | BackendReadinessState::MissingFile
+    ) {
+        readiness.state
+    } else {
+        BackendReadinessState::NotListening
+    };
+    let mut missing = readiness.missing;
+    missing.push(MissingSetting {
+        key: "llama_cpp.port",
+        label: "llama.cpp port",
+        env_var: None,
+        reason: Some(format!(
+            "port {port} is held by a process that does not answer as llama.cpp; refusing to use it"
+        )),
+        path: None,
+    });
+    BackendReadiness {
+        state,
+        backend: readiness.backend,
+        missing,
     }
 }
 
@@ -489,6 +535,50 @@ mod tests {
         let serving = with_backend_reachable(silent, true);
         assert!(serving.is_ready());
         assert!(serving.missing.is_empty());
+    }
+
+    #[test]
+    fn an_unidentified_listener_never_reads_as_ready_and_names_the_port() {
+        // DD-162: boot refuses a stranger on the port instead of returning
+        // AlreadyListening, so readiness must not lift it to Ready.
+        let dir = scratch("foreign-listener");
+        let configured = derive_backend_readiness(&ready_llama_cpp_config(&dir));
+        assert!(configured.is_ready());
+
+        let readiness = with_backend_port_conflict(configured, 8080);
+
+        assert_eq!(readiness.state, BackendReadinessState::NotListening);
+        assert!(!readiness.is_ready());
+        assert_eq!(missing_keys(&readiness), vec!["llama_cpp.port"]);
+        assert_eq!(readiness.missing[0].label, "llama.cpp port");
+        assert_eq!(
+            readiness.missing[0].reason.as_deref(),
+            Some(
+                "port 8080 is held by a process that does not answer as llama.cpp; refusing to use it"
+            )
+        );
+    }
+
+    #[test]
+    fn a_port_conflict_keeps_a_more_specific_missing_config_verdict() {
+        // The operator still has blank fields to fix, so that verdict wins; the
+        // port conflict is added rather than replacing what is already wrong.
+        let readiness =
+            with_backend_port_conflict(derive_backend_readiness(&llama_cpp_config("", "")), 8080);
+
+        assert_eq!(readiness.state, BackendReadinessState::MissingConfig);
+        assert_eq!(
+            missing_keys(&readiness),
+            vec![
+                "llama_cpp.server_path",
+                "llama_cpp.model_path",
+                "llama_cpp.port"
+            ]
+        );
+        assert!(readiness.missing[2]
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("port 8080")));
     }
 
     #[test]
