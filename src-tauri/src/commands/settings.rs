@@ -1,6 +1,7 @@
 use crate::db::AppDb;
 use crate::jarvis::readiness::{
-    derive_backend_readiness, with_backend_port_conflict, with_backend_reachable, BackendReadiness,
+    derive_backend_readiness, with_backend_loading, with_backend_port_conflict,
+    with_backend_reachable, BackendReadiness,
 };
 use crate::jarvis::types::JarvisConfig;
 use std::collections::HashMap;
@@ -116,6 +117,26 @@ pub fn get_jarvis_config(db: State<AppDb>) -> Result<JarvisConfig, String> {
     load_jarvis_config(&db)
 }
 
+/// Fold the llama.cpp port state into readiness.
+///
+/// Pure so the mapping can be pinned without a live port (DD-166). Boot adopts
+/// both llama.cpp states — a serving server and one that is still loading its
+/// model (DD-165) — but only a serving one may read as `Ready`: a turn sent to a
+/// loading server is answered `503 Loading model` (see
+/// `crate::jarvis::readiness::with_backend_loading`).
+fn readiness_for_llama_cpp_port(
+    readiness: BackendReadiness,
+    port: u16,
+    state: crate::LlamaCppPortState,
+) -> BackendReadiness {
+    match state {
+        crate::LlamaCppPortState::ThisServer => with_backend_reachable(readiness, true),
+        crate::LlamaCppPortState::ThisServerLoading => with_backend_loading(readiness, port),
+        crate::LlamaCppPortState::Free => with_backend_reachable(readiness, false),
+        crate::LlamaCppPortState::ForeignListener => with_backend_port_conflict(readiness, port),
+    }
+}
+
 /// Inference-backend readiness for the shell's first-run setup state (DD-060).
 ///
 /// Boot can only `eprintln!` a blank `llama_cpp.server_path`/`model_path` that
@@ -133,26 +154,22 @@ pub fn get_backend_readiness(db: State<AppDb>) -> Result<BackendReadiness, Strin
     config.llama_cpp = config.llama_cpp.clone().with_env_fallbacks();
     let mut readiness = derive_backend_readiness(&config);
     if readiness.backend == crate::jarvis::types::JarvisBackend::LlamaCpp {
-        // Boot skips the spawn only when an *identified* llama.cpp server
-        // already answers the port (`start_llama_cpp_server` →
-        // `AlreadyListening`), so a server the user started by hand must not be
-        // reported as an unconfigured install. Occupancy alone is not enough: a
-        // stranger on the port is refused by boot, so it must not read as ready
-        // either. The same probe, read the other way, is what makes a configured
-        // install with a silent port `not_listening` instead of `ready`: boot
-        // spawns llama.cpp fire-and-forget, so nothing else can tell the shell
-        // whether a turn sent now would reach it.
+        // Boot skips the spawn when an *identified* llama.cpp server already
+        // answers the port (`start_llama_cpp_server` → `AlreadyListening`) —
+        // serving, or still loading its model (DD-165). That second case must
+        // not be reported as ready to chat (DD-166): the adoption probe keeps
+        // the distinction. Occupancy alone is not enough: a stranger on the
+        // port is refused by boot, so it must not read as ready either. A
+        // configured install with a silent port is `not_listening`: boot spawns
+        // llama.cpp fire-and-forget, so nothing else can tell the shell whether
+        // a turn sent now would reach it.
         let port = config.llama_cpp.port;
         let uses_wsl = crate::command_uses_wsl(Some(config.llama_cpp.server_path.as_str()));
-        readiness = match crate::probe_llama_cpp_port_state(port, uses_wsl) {
-            crate::LlamaCppPortState::ThisServer => {
-                with_backend_reachable(readiness, true)
-            }
-            crate::LlamaCppPortState::Free => with_backend_reachable(readiness, false),
-            crate::LlamaCppPortState::ForeignListener => {
-                with_backend_port_conflict(readiness, port)
-            }
-        };
+        readiness = readiness_for_llama_cpp_port(
+            readiness,
+            port,
+            crate::probe_llama_cpp_port_state(port, uses_wsl),
+        );
     }
     Ok(readiness)
 }
@@ -578,6 +595,71 @@ mod tests {
         assert!(
             production.contains("default_jarvis_workspace_path()"),
             "the config loader must use the shared fresh-install default"
+        );
+    }
+
+    #[test]
+    fn a_loading_llama_cpp_server_is_adopted_but_not_ready_to_chat() {
+        // DD-166: boot adopts a loading server (DD-165), but the shell must not
+        // offer a chat the backend answers with `503 Loading model`. The same
+        // mapping must still lift a serving server to Ready.
+        let ready = BackendReadiness {
+            state: crate::jarvis::readiness::BackendReadinessState::Ready,
+            backend: JarvisBackend::LlamaCpp,
+            missing: Vec::new(),
+        };
+
+        let loading = readiness_for_llama_cpp_port(
+            ready.clone(),
+            8080,
+            crate::LlamaCppPortState::ThisServerLoading,
+        );
+        assert_eq!(
+            loading.state,
+            crate::jarvis::readiness::BackendReadinessState::NotListening
+        );
+        assert!(!loading.is_ready());
+        assert_eq!(loading.missing.len(), 1);
+        assert_eq!(loading.missing[0].key, "llama_cpp.port");
+        assert!(
+            loading.missing[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("503 Loading model")),
+            "the verdict must say the load is what blocks the turn"
+        );
+
+        let serving = readiness_for_llama_cpp_port(
+            ready.clone(),
+            8080,
+            crate::LlamaCppPortState::ThisServer,
+        );
+        assert!(serving.is_ready());
+        assert!(serving.missing.is_empty());
+
+        // Neither a silent port nor a stranger may read as ready, and only the
+        // stranger is called a port conflict.
+        let silent = readiness_for_llama_cpp_port(
+            ready.clone(),
+            8080,
+            crate::LlamaCppPortState::Free,
+        );
+        assert!(!silent.is_ready());
+        assert!(silent.missing.is_empty());
+
+        let foreign = readiness_for_llama_cpp_port(
+            ready,
+            8080,
+            crate::LlamaCppPortState::ForeignListener,
+        );
+        assert!(!foreign.is_ready());
+        assert_eq!(foreign.missing[0].key, "llama_cpp.port");
+        assert!(
+            foreign.missing[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("does not answer as llama.cpp")),
+            "a loading server must not be described as a stranger on the port"
         );
     }
 

@@ -15,9 +15,10 @@
 //! `jarvis_check_status`/health state. The one liveness fact that belongs here
 //! is the identified-server probe boot itself uses (see
 //! [`with_backend_reachable`]), because it changes whether a turn is attemptable
-//! at all — in both directions: a server already answering makes an unconfigured
-//! install usable, and a configured backend with a closed port cannot answer a
-//! turn.
+//! at all — in every direction: a server already serving makes an unconfigured
+//! install usable, a configured backend with a closed port cannot answer a turn,
+//! and a server that is still loading its model is adopted by boot but is not
+//! ready to chat yet (DD-166, [`with_backend_loading`]).
 
 use serde::Serialize;
 
@@ -82,14 +83,18 @@ pub enum BackendReadinessState {
     /// The settings are complete, but nothing llama.cpp answers the backend's
     /// port: the local server may still be starting, may have exited, or the
     /// port may be held by a listener that does not answer as llama.cpp (DD-162,
-    /// named in `missing`). A turn sent now would fail at the first request.
+    /// named in `missing`). Since DD-166 it is also the verdict for a llama.cpp
+    /// server that is still loading its model: boot adopts it and waits, but a
+    /// turn sent now would get `503 Loading model`, so the shell must not offer
+    /// Send yet.
     NotListening,
 }
 
 /// What the shell needs to decide between normal chat and a first-run setup
 /// state. `missing` names the setting or program that is unavailable, so it is
-/// empty for every state except `MissingConfig`, `MissingFile`, and (DD-162)
-/// `NotListening` when the port is held by a listener that is not llama.cpp.
+/// empty for every state except `MissingConfig`, `MissingFile`, and `NotListening`
+/// when the port is held by a listener that is not llama.cpp (DD-162) or by this
+/// backend while it still loads its model (DD-166).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BackendReadiness {
     pub state: BackendReadinessState,
@@ -274,16 +279,19 @@ fn missing_executable(
 
 /// Fold in the one liveness fact boot already acts on.
 ///
-/// `backend_reachable` means *identified*, not merely "the port is open": boot
-/// adopts a listener only when `crate::llama_cpp_server_is_serving` passes, so
-/// the caller must pass that same answer. The probe is not a one-way lift into
-/// `Ready`:
-/// - `true` means an identified llama.cpp server is already answering.
+/// `backend_reachable` means *serving*, not merely "the port is open". Boot's
+/// adoption probe (`crate::probe_llama_cpp_port_state`) accepts a llama.cpp
+/// listener that is serving **or** still loading its model (DD-165), so
+/// `crate::LlamaCppPortState::ThisServerLoading` must not be passed here: a
+/// loading server is adopted and waited for, but it cannot answer a turn yet, so
+/// its readiness is [`with_backend_loading`] (DD-166). For a serving server the
+/// probe is not a one-way lift into `Ready`:
+/// - `true` means an identified llama.cpp server is already serving.
 ///   `start_llama_cpp_server` returns `AlreadyListening` before it looks at
 ///   `server_path`/`model_path`, so a server the user started by hand is usable
 ///   with blank artifact paths. Reporting `missing_config` there would block a
 ///   chat that works.
-/// - `false` on a configured install means nothing is answering the port yet,
+/// - `false` on a configured install means nothing is serving the port yet,
 ///   so the value must stop claiming `Ready`: the turn would fail at the first
 ///   request. A backend that is still `missing_config` or `missing_file` keeps
 ///   that more specific verdict, because the blank field or the unusable path
@@ -344,6 +352,42 @@ pub fn with_backend_port_conflict(
         env_var: None,
         reason: Some(format!(
             "port {port} is held by a process that does not answer as llama.cpp; refusing to use it"
+        )),
+        path: None,
+    });
+    BackendReadiness {
+        state,
+        backend: readiness.backend,
+        missing,
+    }
+}
+
+/// Readiness for a llama.cpp port held by this backend while it still loads its
+/// model (DD-166).
+///
+/// Boot adopts a loading server and waits for it (DD-165), so this is neither a
+/// foreign port conflict nor `Ready`: a turn sent now is answered
+/// `503 Loading model`. The verdict is the state the shell already understands
+/// for a port that must not offer Send — `NotListening` — and `missing` gains an
+/// item naming the load, so a surface can say why instead of guessing. A
+/// `missing_config`/`missing_file` verdict keeps its more specific state because
+/// the operator still has that to fix.
+pub fn with_backend_loading(readiness: BackendReadiness, port: u16) -> BackendReadiness {
+    let state = if matches!(
+        readiness.state,
+        BackendReadinessState::MissingConfig | BackendReadinessState::MissingFile
+    ) {
+        readiness.state
+    } else {
+        BackendReadinessState::NotListening
+    };
+    let mut missing = readiness.missing;
+    missing.push(MissingSetting {
+        key: "llama_cpp.port",
+        label: "llama.cpp port",
+        env_var: None,
+        reason: Some(format!(
+            "port {port} answers as llama.cpp but is still loading its model; a message sent now would be answered with 503 Loading model"
         )),
         path: None,
     });
@@ -579,6 +623,79 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("port 8080")));
+    }
+
+    #[test]
+    fn a_loading_llama_cpp_server_is_not_ready_and_names_the_load() {
+        // DD-166: boot adopts a loading server (DD-165), but a turn sent now is
+        // answered `503 Loading model`, so readiness must not lift it to Ready —
+        // and must not call it a foreign port conflict either.
+        let dir = scratch("loading-model");
+        let configured = derive_backend_readiness(&ready_llama_cpp_config(&dir));
+        assert!(configured.is_ready());
+
+        let loading = with_backend_loading(configured, 8080);
+
+        assert_eq!(loading.state, BackendReadinessState::NotListening);
+        assert!(!loading.is_ready());
+        assert_eq!(loading.backend, JarvisBackend::LlamaCpp);
+        assert_eq!(missing_keys(&loading), vec!["llama_cpp.port"]);
+        let reason = loading.missing[0]
+            .reason
+            .as_deref()
+            .expect("the waiting item carries its own sentence");
+        assert!(
+            reason.contains("port 8080") && reason.contains("503 Loading model"),
+            "the item must name the port and why a turn cannot be sent: {reason}"
+        );
+        assert!(
+            !reason.contains("does not answer as llama.cpp"),
+            "a loading server is this backend, not a stranger on the port: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_loading_server_keeps_a_more_specific_missing_config_verdict() {
+        // The operator still has blank fields to fix, so that verdict wins; the
+        // load is added rather than replacing what is already wrong.
+        let readiness =
+            with_backend_loading(derive_backend_readiness(&llama_cpp_config("", "")), 8080);
+
+        assert_eq!(readiness.state, BackendReadinessState::MissingConfig);
+        assert_eq!(
+            missing_keys(&readiness),
+            vec![
+                "llama_cpp.server_path",
+                "llama_cpp.model_path",
+                "llama_cpp.port"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_readiness_seam_documents_that_boot_adopts_a_loading_server() {
+        // DD-166: the seam's doc used to say boot adopts only when
+        // `crate::llama_cpp_server_is_serving` passes. Boot adopts a serving OR
+        // loading server (DD-165), and this doc is where a future caller learns
+        // which verdict belongs to each case.
+        const SOURCE: &str = include_str!("readiness.rs");
+        let start = SOURCE
+            .find("/// Fold in the one liveness fact boot already acts on.")
+            .expect("with_backend_reachable must keep its doc");
+        let end = SOURCE[start..]
+            .find("pub fn with_backend_reachable(")
+            .map(|offset| start + offset)
+            .expect("the doc must stay attached to with_backend_reachable");
+        let doc = &SOURCE[start..end];
+        assert!(
+            doc.contains("Loading") && doc.contains("with_backend_loading"),
+            "the seam must document that boot adopts Serving OR Loading and that \
+             a loading server is not Ready:\n{doc}"
+        );
+        assert!(
+            !doc.contains("only when `crate::llama_cpp_server_is_serving` passes"),
+            "the stale adoption claim must not return:\n{doc}"
+        );
     }
 
     #[test]

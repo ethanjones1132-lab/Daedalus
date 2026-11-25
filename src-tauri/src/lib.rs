@@ -3365,16 +3365,22 @@ impl LlamaCppIdentity {
 ///
 /// A bound port is not evidence of a llama.cpp server: a Vite preview, another
 /// app, or a stale process accepts the connection (and often answers 2xx) too.
-/// Only a listener the identity probe ([`llama_cpp_health_identifies`]) accepts
+/// Only a listener the identity probe ([`llama_cpp_identity`]) accepts
 /// as llama.cpp — serving, or still loading its model — counts as this backend,
 /// so a fresh install neither adopts a stranger nor posts the first chat to it.
+/// The two llama.cpp cases stay distinct (DD-166): boot adopts both, but only a
+/// serving server can answer a turn, so readiness must not lift a loading one
+/// to `Ready`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LlamaCppPortState {
     /// Nothing is bound to the configured llama.cpp port.
     Free,
-    /// A listener answered `/health` or `/v1/models` as a llama.cpp server,
-    /// either serving or while still loading its model.
+    /// A listener answered as a llama.cpp server that is ready to serve chat.
     ThisServer,
+    /// A listener answered as a llama.cpp server that is still loading its
+    /// model. Boot adopts it and waits (DD-165); a turn sent now would get
+    /// `503 Loading model`, so it is not ready.
+    ThisServerLoading,
     /// The port is bound, but the answer is not a llama.cpp server's.
     ForeignListener,
 }
@@ -3382,18 +3388,21 @@ pub(crate) enum LlamaCppPortState {
 /// Decide the llama.cpp port's state from occupancy *and* identity.
 ///
 /// Occupancy is the cheap question [`backend_port_is_listening`] answers;
-/// identity is one bounded HTTP probe ([`llama_cpp_health_identifies`]) that
+/// identity is one bounded HTTP probe ([`llama_cpp_identity`]) that
 /// also accepts a loading server's `503` — boot must adopt it and wait instead
-/// of refusing the port. A free port is decided without any HTTP call, so a cold
-/// first run never waits on a probe. Synchronous on purpose, next to the port
-/// probe it refines: callers already perform that blocking probe and need no
-/// async client here.
+/// of refusing the port. The probe's own three-way answer is kept
+/// ([`LlamaCppIdentity`]), so a caller that has to decide whether a turn can be
+/// attempted now can tell a serving server from one that is still loading
+/// without a second HTTP call (DD-166). A free port is decided without any HTTP
+/// call, so a cold first run never waits on a probe. Synchronous on purpose,
+/// next to the port probe it refines: callers already perform that blocking
+/// probe and need no async client here.
 pub(crate) fn probe_llama_cpp_port_state(port: u16, uses_wsl: bool) -> LlamaCppPortState {
     llama_cpp_port_state_with(
         port,
         uses_wsl,
         backend_port_is_listening,
-        llama_cpp_health_identifies,
+        llama_cpp_identity,
     )
 }
 
@@ -3404,15 +3413,15 @@ fn llama_cpp_port_state_with(
     port: u16,
     uses_wsl: bool,
     port_listening: impl FnOnce(u16, bool) -> bool,
-    identity: impl FnOnce(u16, bool) -> bool,
+    identity: impl FnOnce(u16, bool) -> LlamaCppIdentity,
 ) -> LlamaCppPortState {
     if !port_listening(port, uses_wsl) {
         return LlamaCppPortState::Free;
     }
-    if identity(port, uses_wsl) {
-        LlamaCppPortState::ThisServer
-    } else {
-        LlamaCppPortState::ForeignListener
+    match identity(port, uses_wsl) {
+        LlamaCppIdentity::Serving => LlamaCppPortState::ThisServer,
+        LlamaCppIdentity::Loading => LlamaCppPortState::ThisServerLoading,
+        LlamaCppIdentity::Foreign => LlamaCppPortState::ForeignListener,
     }
 }
 
@@ -3462,16 +3471,17 @@ fn llama_cpp_server_is_serving_with(
 /// alone.
 ///
 /// `Some(AlreadyListening)` adopts only an identified llama.cpp server — one
-/// serving or one still loading its model; a foreign listener is named and
-/// refused so the first chat is never posted to it and no second server is
-/// silently started on the same port. `None` means the port is free and the
-/// caller may spawn.
+/// serving, or one still loading its model (DD-165; DD-166 only separates the
+/// latter for readiness, without changing adoption). A foreign listener is
+/// named and refused so the first chat is never posted to it and no second
+/// server is silently started on the same port. `None` means the port is free
+/// and the caller may spawn.
 fn llama_cpp_spawn_decision(
     state: LlamaCppPortState,
     port: u16,
 ) -> Result<Option<process_lifecycle::StartOutcome>, String> {
     match state {
-        LlamaCppPortState::ThisServer => {
+        LlamaCppPortState::ThisServer | LlamaCppPortState::ThisServerLoading => {
             Ok(Some(process_lifecycle::StartOutcome::AlreadyListening))
         }
         LlamaCppPortState::ForeignListener => Err(format!(
@@ -3511,14 +3521,6 @@ fn llama_cpp_identity_with(
     } else {
         LlamaCppIdentity::Foreign
     }
-}
-
-/// Whether this backend answers the configured port — serving, or still loading.
-///
-/// Boot adopts such a listener instead of refusing the port; readiness is a
-/// separate question ([`llama_cpp_server_is_serving`]).
-fn llama_cpp_health_identifies(port: u16, uses_wsl: bool) -> bool {
-    llama_cpp_identity(port, uses_wsl).is_llama_cpp()
 }
 
 /// A two-state probe answer in the three-state classifier's terms, for the
@@ -5921,7 +5923,9 @@ mod llama_cpp_identity_tests {
     fn an_unidentified_listener_is_never_adopted_as_llama_cpp() {
         // Old behaviour: `backend_port_is_listening` alone returned true and
         // `start_llama_cpp_server` returned AlreadyListening for this listener.
-        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| false);
+        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| {
+            LlamaCppIdentity::Foreign
+        });
 
         assert_eq!(state, LlamaCppPortState::ForeignListener);
         assert_eq!(
@@ -5935,12 +5939,36 @@ mod llama_cpp_identity_tests {
     fn an_identified_llama_cpp_listener_is_still_adopted() {
         // The manual-server case the early return in start_llama_cpp_server
         // protects must keep working.
-        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| true);
+        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| {
+            LlamaCppIdentity::Serving
+        });
 
         assert_eq!(state, LlamaCppPortState::ThisServer);
         assert_eq!(
             llama_cpp_spawn_decision(state, 8080),
             Ok(Some(crate::process_lifecycle::StartOutcome::AlreadyListening))
+        );
+    }
+
+    #[test]
+    fn a_loading_llama_cpp_listener_is_adopted_but_the_port_state_says_loading() {
+        // DD-166: DD-165's adoption rule must not change — boot still returns
+        // AlreadyListening and waits — but readiness must be able to tell this
+        // apart from a server that can answer a turn now.
+        let state = llama_cpp_port_state_with(8080, false, |_, _| true, |_, _| {
+            LlamaCppIdentity::Loading
+        });
+
+        assert_eq!(state, LlamaCppPortState::ThisServerLoading);
+        assert_ne!(
+            state,
+            LlamaCppPortState::ThisServer,
+            "a loading server must not read as a serving one"
+        );
+        assert_eq!(
+            llama_cpp_spawn_decision(state, 8080),
+            Ok(Some(crate::process_lifecycle::StartOutcome::AlreadyListening)),
+            "boot must still adopt a loading server and wait for it"
         );
     }
 
