@@ -10,6 +10,9 @@ import type { OrchestratorAgent } from "../orchestration/agent-pool";
 
 const ROOT = "/workspace/harness-fixture";
 
+/** The commit the run started from, as the fake `git rev-parse HEAD` reports it. */
+const RUN_BASE = "0123456789abcdef0123456789abcdef01234567";
+
 const AGENTS: OrchestratorAgent[] = [
   {
     id: "executor-agent", provider: "opencode_go", model_id: "executor-model",
@@ -74,7 +77,9 @@ function setupHarness(options: HarnessFixtureOptions) {
   const spawn: SensorSpawn = async ({ executable, args }) => {
     state.spawns.push(`${executable} ${args.join(" ")}`);
     if (executable === "git") {
+      if (args.includes("rev-parse")) return { stdout: `${RUN_BASE}\n`, stderr: "", exitCode: 0 };
       if (args.includes("status")) return { stdout: " M src/index.ts", stderr: "", exitCode: 0 };
+      if (args.includes("ls-files")) return { stdout: "", stderr: "", exitCode: 0 };
       return { stdout: options.diff ?? "+const fixed = true;", stderr: "", exitCode: 0 };
     }
     return { stdout: `errors: ${state.errors}`, stderr: "", exitCode: state.errors === 0 ? 0 : 1 };
@@ -225,6 +230,83 @@ describe("harness execution", () => {
     expect(checker.prompt).not.toContain("MAKER-TRANSCRIPT-SECRET");
     expect(checker.prompt).not.toContain(state.makerTurns[0]!.prompt);
     expect(checker.agent.model_id).toBe("reviewer-model");
+  });
+
+  test("a commit made after the run started appears in the checker's diff", async () => {
+    const manifest = fixtureManifest();
+    const committedDiff = "+const fromCommit = true;";
+    const spawns: string[] = [];
+    const spawn: SensorSpawn = async ({ executable, args }) => {
+      spawns.push(`${executable} ${args.join(" ")}`);
+      if (executable !== "git") return { stdout: "errors: 0", stderr: "", exitCode: 0 };
+      if (args.includes("rev-parse")) return { stdout: `${RUN_BASE}\n`, stderr: "", exitCode: 0 };
+      if (args.includes("status")) return { stdout: "", stderr: "", exitCode: 0 };
+      if (args.includes("ls-files")) return { stdout: "", stderr: "", exitCode: 0 };
+      if (args.includes(`${RUN_BASE}..HEAD`)) return { stdout: committedDiff, stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    const { state, store, execution } = setupHarness({ manifest, initialErrors: 0, deps: { spawn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-committed",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("passed");
+    expect(state.checkerPrompts).toHaveLength(1);
+    expect(state.checkerPrompts[0]!.prompt).toContain(committedDiff);
+    expect(spawns).toContain(`git --no-pager diff --no-color --no-ext-diff ${RUN_BASE}..HEAD`);
+  });
+
+  test("an untracked new file's content appears in the checker's diff, not only its path", async () => {
+    const manifest = fixtureManifest();
+    const untrackedFile = "src/new-file.ts";
+    const content = "+export const added = true;";
+    const spawn: SensorSpawn = async ({ executable, args }) => {
+      if (executable !== "git") return { stdout: "errors: 0", stderr: "", exitCode: 0 };
+      if (args.includes("rev-parse")) return { stdout: `${RUN_BASE}\n`, stderr: "", exitCode: 0 };
+      if (args.includes("status")) return { stdout: `?? ${untrackedFile}`, stderr: "", exitCode: 0 };
+      if (args.includes("ls-files")) return { stdout: `${untrackedFile}\u0000`, stderr: "", exitCode: 0 };
+      if (args.includes("--no-index")) {
+        return {
+          stdout: `diff --git a/dev/null b/${untrackedFile}\n--- /dev/null\n+++ b/${untrackedFile}\n${content}`,
+          stderr: "",
+          exitCode: 1,
+        };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    };
+    const { state, store, execution } = setupHarness({ manifest, initialErrors: 0, deps: { spawn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-untracked",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("passed");
+    expect(state.checkerPrompts).toHaveLength(1);
+    expect(state.checkerPrompts[0]!.prompt).toContain(`Untracked file: ${untrackedFile}`);
+    expect(state.checkerPrompts[0]!.prompt).toContain(content);
+  });
+
+  test("a git failure during evidence collection records an error and cannot settle passed", async () => {
+    const manifest = fixtureManifest();
+    const noChangesSentence = "(no tracked changes were found in the project root)";
+    const spawn: SensorSpawn = async ({ executable, args }) => {
+      if (executable !== "git") return { stdout: "errors: 0", stderr: "", exitCode: 0 };
+      if (args.includes("rev-parse")) return { stdout: `${RUN_BASE}\n`, stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "fatal: not a git repository", exitCode: 128 };
+    };
+    const { state, store, execution } = setupHarness({ manifest, initialErrors: 0, deps: { spawn } });
+
+    await expect(execution.runChecker({ manifest, signal: new AbortController().signal }))
+      .rejects.toThrow(/harness evidence collection failed.*git status --porcelain/);
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-git-failure",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(result.stop_reason).toBe("checker_rejected");
+    expect(state.checkerPrompts).toHaveLength(0);
+    expect(state.checkerPrompts.some((checker) => checker.prompt.includes(noChangesSentence))).toBe(false);
   });
 
   test("a checker that does not accept settles checker_rejected", async () => {

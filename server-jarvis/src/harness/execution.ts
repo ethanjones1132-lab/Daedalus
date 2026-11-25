@@ -330,34 +330,162 @@ async function safeSpawn(
   }
 }
 
-/** Working-tree diff of the run's project root, bounded for the checker prompt. */
+/** The commit HEAD pointed at when the run's first maker turn began. */
+interface RunDiffBase {
+  commit?: string;
+  error?: string;
+}
+
+/** A failed git call while reading evidence; never reported as "no changes". */
+interface CollectedRunDiff {
+  text: string;
+  errors: string[];
+}
+
+/** Cap on untracked files read one-by-one, so a large untracked tree stays bounded. */
+const UNTRACKED_DIFF_FILE_LIMIT = 20;
+
+function describeGitFailure(label: string, result: SensorSpawnResult | undefined): string {
+  if (!result) return `${label} could not be run`;
+  const detail = result.stderr.trim() || result.stdout.trim();
+  return `${label} exited ${result.exitCode}${detail ? `: ${detail.slice(0, 200)}` : ""}`;
+}
+
+/** HEAD at run start, so commits made by the run are part of the checker's evidence. */
+async function captureRunBase(
+  spawn: SensorSpawn,
+  cwd: string,
+  signal: AbortSignal,
+): Promise<RunDiffBase> {
+  const head = await safeSpawn(spawn, {
+    executable: "git",
+    args: ["--no-pager", "rev-parse", "HEAD"],
+    cwd,
+    signal,
+  });
+  if (!head) return { error: "git rev-parse HEAD could not be run" };
+  if (head.exitCode !== 0) return { error: describeGitFailure("git rev-parse HEAD", head) };
+  const commit = head.stdout.trim();
+  if (!/^[0-9a-f]{7,64}$/i.test(commit)) {
+    return { error: "git rev-parse HEAD did not print a commit hash" };
+  }
+  return { commit };
+}
+
+/**
+ * Content of files git does not track yet. `status --porcelain` only names
+ * them (and collapses a new directory to one entry), so each file is diffed
+ * against the null device, bounded by the same prompt budget as the tracked diff.
+ */
+async function collectUntrackedDiff(
+  spawn: SensorSpawn,
+  cwd: string,
+  signal: AbortSignal,
+  maxChars: number,
+  usedChars: number,
+): Promise<{ sections: string[]; errors: string[] }> {
+  const listed = await safeSpawn(spawn, {
+    executable: "git",
+    args: ["--no-pager", "ls-files", "--others", "--exclude-standard", "-z"],
+    cwd,
+    signal,
+  });
+  if (!listed) return { sections: [], errors: ["git ls-files --others could not be run"] };
+  if (listed.exitCode !== 0) {
+    return { sections: [], errors: [describeGitFailure("git ls-files --others", listed)] };
+  }
+  const paths = listed.stdout.split("\u0000").filter((path) => path.length > 0);
+  const sections: string[] = [];
+  const errors: string[] = [];
+  let used = usedChars;
+  for (let index = 0; index < paths.length; index++) {
+    if (used >= maxChars) break;
+    if (index >= UNTRACKED_DIFF_FILE_LIMIT) {
+      sections.push(`[${paths.length - index} more untracked files omitted]`);
+      break;
+    }
+    const path = paths[index]!;
+    const content = await safeSpawn(spawn, {
+      executable: "git",
+      args: [
+        "--no-pager", "diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null", path,
+      ],
+      cwd,
+      signal,
+    });
+    // `--no-index` exits 1 when the two inputs differ, which is the normal case here.
+    if (!content) {
+      errors.push(`git diff --no-index for untracked "${path}" could not be run`);
+      continue;
+    }
+    if (content.exitCode !== 0 && content.exitCode !== 1) {
+      errors.push(describeGitFailure(`git diff --no-index for untracked "${path}"`, content));
+      continue;
+    }
+    if (!content.stdout.trim()) continue;
+    const section = `Untracked file: ${path}\n${content.stdout.trim()}`;
+    sections.push(section);
+    used += section.length + 2;
+  }
+  return { sections, errors };
+}
+
+/**
+ * Evidence for the checker: changed paths, the working-tree diff, the committed
+ * range since the run began, and the content of untracked files. Bounded for the
+ * checker prompt. A git call that fails is returned as an error, not folded into
+ * an empty-diff sentence.
+ */
 async function collectRunDiff(
   spawn: SensorSpawn,
   cwd: string,
   signal: AbortSignal,
   maxChars: number,
-): Promise<string> {
+  base: RunDiffBase | undefined,
+): Promise<CollectedRunDiff> {
   const sections: string[] = [];
+  const errors: string[] = [];
+  if (base?.error) errors.push(base.error);
   const status = await safeSpawn(spawn, {
     executable: "git",
     args: ["--no-pager", "status", "--porcelain"],
     cwd,
     signal,
   });
-  if (status?.exitCode === 0 && status.stdout.trim()) {
-    sections.push(`Changed paths:\n${status.stdout.trim()}`);
-  }
+  if (!status) errors.push("git status --porcelain could not be run");
+  else if (status.exitCode !== 0) errors.push(describeGitFailure("git status --porcelain", status));
+  else if (status.stdout.trim()) sections.push(`Changed paths:\n${status.stdout.trim()}`);
   const diff = await safeSpawn(spawn, {
     executable: "git",
     args: ["--no-pager", "diff", "--no-color", "--no-ext-diff", "HEAD"],
     cwd,
     signal,
   });
-  if (diff?.exitCode === 0 && diff.stdout.trim()) sections.push(diff.stdout.trim());
+  if (!diff) errors.push("git diff HEAD could not be run");
+  else if (diff.exitCode !== 0) errors.push(describeGitFailure("git diff HEAD", diff));
+  else if (diff.stdout.trim()) sections.push(diff.stdout.trim());
+  if (base?.commit) {
+    const committed = await safeSpawn(spawn, {
+      executable: "git",
+      args: ["--no-pager", "diff", "--no-color", "--no-ext-diff", `${base.commit}..HEAD`],
+      cwd,
+      signal,
+    });
+    if (!committed) errors.push(`git diff ${base.commit}..HEAD could not be run`);
+    else if (committed.exitCode !== 0) {
+      errors.push(describeGitFailure(`git diff ${base.commit}..HEAD`, committed));
+    } else if (committed.stdout.trim()) {
+      sections.push(`Committed since run start:\n${committed.stdout.trim()}`);
+    }
+  }
+  const untracked = await collectUntrackedDiff(spawn, cwd, signal, maxChars, sections.join("\n\n").length);
+  sections.push(...untracked.sections);
+  errors.push(...untracked.errors);
   if (signal.aborted) throw new Error("harness aborted");
   const text = sections.join("\n\n");
-  if (!text) return "(no tracked changes were found in the project root)";
-  return text.length > maxChars ? `${text.slice(0, maxChars)}\n[diff truncated]` : text;
+  if (errors.length > 0) return { text, errors };
+  if (!text) return { text: "(no tracked changes were found in the project root)", errors };
+  return { text: text.length > maxChars ? `${text.slice(0, maxChars)}\n[diff truncated]` : text, errors };
 }
 
 function backgroundAdmission(): HarnessAdmission {
@@ -383,6 +511,10 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   // The controller passes the same manifest object to both hooks for a run, so
   // each run's last sensor failures follow the run rather than a global key.
   const latestFailures = new WeakMap<HarnessManifest, string[]>();
+  // Same keying for the commit the run started from. The first maker turn is the
+  // earliest execution hook the run reaches, so HEAD is sampled there (before the
+  // maker changes anything) and the checker diffs that range on top of HEAD.
+  const runBases = new WeakMap<HarnessManifest, RunDiffBase>();
 
   const sensors: HarnessControllerInput["sensors"] = async ({ manifest, signal }) => {
     const batch = await runSensorBatch({
@@ -400,6 +532,9 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     const agent = resolveAgent(agents, manifest.maker_agent_id, "executor");
     if (!agent) {
       throw new Error(`no executor agent is available for harness maker "${manifest.maker_agent_id}"`);
+    }
+    if (round === 1 && manifest.checker.enabled) {
+      runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
     }
     const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues);
     const turn = await deps.runMakerTurn({
@@ -419,9 +554,17 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
     }
-    const diff = await collectRunDiff(spawn, manifest.project_root, signal, diffMaxChars);
+    const base = runBases.get(manifest);
+    runBases.delete(manifest);
+    const evidence = await collectRunDiff(spawn, manifest.project_root, signal, diffMaxChars, base);
+    // A failed evidence read is not a verdict and must not reach the checker as
+    // "nothing changed". Throwing keeps the run off the `passed` path; the
+    // controller's own checker-failure handling records that the check failed.
+    if (evidence.errors.length > 0) {
+      throw new Error(`harness evidence collection failed: ${evidence.errors.join("; ")}`);
+    }
     const answer = await deps.callModel({
-      prompt: checkerPrompt(manifest, diff, briefValues),
+      prompt: checkerPrompt(manifest, evidence.text, briefValues),
       agent: agentRef(agent),
       signal,
     });
