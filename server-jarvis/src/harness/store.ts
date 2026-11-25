@@ -147,6 +147,26 @@ export interface HarnessApproval extends HarnessApprovalInput { id: string; deci
 export interface HarnessEventInput { id?: string; run_id: string; event_type: string; payload: unknown }
 export interface HarnessEvent { id: string; run_id: string; event_type: string; payload: unknown; created_at: string }
 
+/**
+ * A run's terminal status is not a stored column that gets updated: the append-only
+ * `stopped` event is the record. Derive the status on read so a settled run never
+ * reads back as still running, while leaving the stored row untouched.
+ */
+export function deriveRunStatus(
+  events: ReadonlyArray<Pick<HarnessEvent, "event_type" | "payload">>,
+  storedStatus: string,
+): string {
+  const stopped = [...events].reverse().find((event) => event.event_type === "stopped");
+  if (!stopped) return storedStatus;
+  const payload = stopped.payload;
+  const stopReason = payload && typeof payload === "object" && "stop_reason" in payload
+    ? (payload as { stop_reason?: unknown }).stop_reason
+    : undefined;
+  if (stopReason === "passed") return "passed";
+  if (stopReason === "cancelled") return "cancelled";
+  return "failed";
+}
+
 /** Durable app-owned manifest and append-only run evidence store. */
 export class HarnessStore {
   private readonly dbPath: string;
@@ -318,13 +338,15 @@ export class HarnessStore {
       }));
       const events = db.query("SELECT id, run_id, event_type, payload_json, created_at FROM harness_events WHERE run_id = ? ORDER BY created_at, rowid")
         .all(id) as Array<{ id: string; run_id: string; event_type: string; payload_json: string; created_at: string }>;
+      const mappedEvents = events.map((event) => ({ id: event.id, run_id: event.run_id, event_type: event.event_type,
+        payload: JSON.parse(event.payload_json) as unknown, created_at: event.created_at }));
       return {
         ...row,
+        status: deriveRunStatus(mappedEvents, row.status),
         rounds: rounds.map((round) => ({ id: round.id, run_id: round.run_id, round_number: round.round_number,
           counter_vector: JSON.parse(round.counter_vector_json) as HarnessRoundInput["counter_vector"], created_at: round.created_at,
           sensor_results: results.filter((result) => result.round_id === round.id) })),
-        events: events.map((event) => ({ id: event.id, run_id: event.run_id, event_type: event.event_type,
-          payload: JSON.parse(event.payload_json) as unknown, created_at: event.created_at })),
+        events: mappedEvents,
       };
     } finally { db.close(); }
   }

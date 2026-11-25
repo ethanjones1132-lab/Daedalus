@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { HarnessStore } from "./store";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { HarnessStore, deriveRunStatus } from "./store";
 import type { HarnessManifest } from "./manifest";
 
 function manifest(root: string, id = "bugfix"): HarnessManifest {
@@ -84,5 +88,78 @@ describe("HarnessStore", () => {
     expect(methods).toContain("appendSensorResult");
     expect(methods).toContain("appendEvent");
     expect(methods.some((name) => /^(update|delete|remove)(Round|SensorResult|Event)/i.test(name))).toBe(false);
+  });
+
+  test("deriveRunStatus maps a stopped event's stop reason onto the run status", () => {
+    const stopped = (reason: string) => [{ event_type: "stopped", payload: { stop_reason: reason } }];
+    expect(deriveRunStatus([], "running")).toBe("running");
+    expect(deriveRunStatus(stopped("passed"), "running")).toBe("passed");
+    expect(deriveRunStatus(stopped("cancelled"), "running")).toBe("cancelled");
+    for (const reason of ["max_rounds", "no_progress", "approval_denied", "maker_failed", "checker_rejected", "deadline", "run_failed"]) {
+      expect(deriveRunStatus(stopped(reason), "running")).toBe("failed");
+    }
+  });
+
+  test("a run settled as passed reads back passed from getRun and listRuns", () => {
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    const run = store.createRun({ project_root: "/workspace/one", manifest_id: "bugfix", manifest_hash: "hash" });
+    store.appendEvent({ run_id: run.id, event_type: "stopped", payload: { stop_reason: "passed", rounds: 1 } });
+    expect(store.getRun(run.id)?.status).toBe("passed");
+    expect(store.listRuns("/workspace/one").map(({ status }) => status)).toEqual(["passed"]);
+    // The events that carry the fact are still returned exactly as recorded.
+    expect(store.getRun(run.id)?.events.map(({ event_type, payload }) => ({ event_type, payload })))
+      .toEqual([{ event_type: "stopped", payload: { stop_reason: "passed", rounds: 1 } }]);
+  });
+
+  test("a cancelled run reads back cancelled and every other stop reason reads back failed", () => {
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    const reasons: Array<[string, string]> = [
+      ["cancelled", "cancelled"],
+      ["max_rounds", "failed"],
+      ["no_progress", "failed"],
+      ["approval_denied", "failed"],
+      ["maker_failed", "failed"],
+      ["checker_rejected", "failed"],
+      ["deadline", "failed"],
+      ["run_failed", "failed"],
+    ];
+    for (const [reason, expected] of reasons) {
+      const run = store.createRun({ project_root: "/workspace/one", manifest_id: "bugfix", manifest_hash: "hash" });
+      store.appendEvent({ run_id: run.id, event_type: "stopped", payload: { stop_reason: reason, rounds: 1 } });
+      expect(store.getRun(run.id)?.status).toBe(expected);
+    }
+    expect(store.listRuns("/workspace/one").map(({ status }) => status).sort())
+      .toEqual(["cancelled", "failed", "failed", "failed", "failed", "failed", "failed", "failed"]);
+  });
+
+  test("a run with no stopped event still reads back running", () => {
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    const run = store.createRun({ project_root: "/workspace/one", manifest_id: "bugfix", manifest_hash: "hash" });
+    store.appendEvent({ run_id: run.id, event_type: "round_started", payload: { rounds: 1 } });
+    expect(store.getRun(run.id)?.status).toBe("running");
+    expect(store.listRuns("/workspace/one").map(({ status }) => status)).toEqual(["running"]);
+  });
+
+  test("reading a settled run derives its status without rewriting the stored row", () => {
+    const dir = mkdtempSync(join(tmpdir(), "harness-store-"));
+    try {
+      const dbPath = join(dir, "state.db");
+      const store = new HarnessStore({ dbPath });
+      const run = store.createRun({ project_root: "/workspace/one", manifest_id: "bugfix", manifest_hash: "hash" });
+      store.appendEvent({ run_id: run.id, event_type: "stopped", payload: { stop_reason: "passed", rounds: 1 } });
+      expect(store.getRun(run.id)?.status).toBe("passed");
+      expect(store.listRuns("/workspace/one").map(({ status }) => status)).toEqual(["passed"]);
+
+      const db = new Database(dbPath, { readonly: true });
+      try {
+        expect(db.query("SELECT status FROM harness_runs WHERE id = ?").get(run.id)).toEqual({ status: "running" });
+        expect(db.query("SELECT COUNT(*) AS count FROM harness_events WHERE run_id = ?").get(run.id)).toEqual({ count: 1 });
+      } finally { db.close(); }
+    } finally {
+      // Windows can hold a just-closed sqlite file for a moment; retry, and never fail the
+      // assertion above because a temp dir could not be removed.
+      try { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); }
+      catch { /* a leftover temp dir must not fail the test */ }
+    }
   });
 });
