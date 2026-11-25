@@ -3330,18 +3330,50 @@ fn backend_port_is_listening_with(
     uses_wsl && probe_wsl(port)
 }
 
+/// What an identifying probe learned about whoever answers the llama.cpp port.
+///
+/// A `llama-server` is this backend both while it serves and while it loads the
+/// GGUF: until the weights are in it answers `503` with
+/// `{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}`
+/// (or `{"status":"loading model"}`), then `200 {"status":"ok"}`. Adoption needs
+/// the wider question ([`Self::is_llama_cpp`]); the health grid needs the
+/// narrower one ([`Self::is_serving`]), so a loading server is adopted and
+/// waited for but never reported as running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LlamaCppIdentity {
+    /// A llama.cpp server that is ready to serve chat requests.
+    Serving,
+    /// A llama.cpp server that answered while still loading its model.
+    Loading,
+    /// Not a llama.cpp server.
+    Foreign,
+}
+
+impl LlamaCppIdentity {
+    /// Adoptable: a serving server, or one that will serve once the model loads.
+    fn is_llama_cpp(&self) -> bool {
+        *self != Self::Foreign
+    }
+
+    /// Ready now: only a serving server may be reported as running.
+    fn is_serving(&self) -> bool {
+        *self == Self::Serving
+    }
+}
+
 /// Who holds the llama.cpp port, as far as this app can prove.
 ///
 /// A bound port is not evidence of a llama.cpp server: a Vite preview, another
 /// app, or a stale process accepts the connection (and often answers 2xx) too.
-/// Only a listener whose body passes [`llama_cpp_body_identifies`] counts as
-/// this backend, so a fresh install neither adopts a stranger nor posts the
-/// first chat to it.
+/// Only a listener the identity probe ([`llama_cpp_health_identifies`]) accepts
+/// as llama.cpp — serving, or still loading its model — counts as this backend,
+/// so a fresh install neither adopts a stranger nor posts the first chat to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LlamaCppPortState {
     /// Nothing is bound to the configured llama.cpp port.
     Free,
-    /// A listener answered `/v1/models` or `/health` as a llama.cpp server.
+    /// A listener answered `/health` or `/v1/models` as a llama.cpp server,
+    /// either serving or while still loading its model.
     ThisServer,
     /// The port is bound, but the answer is not a llama.cpp server's.
     ForeignListener,
@@ -3350,10 +3382,12 @@ pub(crate) enum LlamaCppPortState {
 /// Decide the llama.cpp port's state from occupancy *and* identity.
 ///
 /// Occupancy is the cheap question [`backend_port_is_listening`] answers;
-/// identity is one bounded HTTP probe ([`llama_cpp_health_identifies`]). A free
-/// port is decided without any HTTP call, so a cold first run never waits on a
-/// probe. Synchronous on purpose, next to the port probe it refines: callers
-/// already perform that blocking probe and need no async client here.
+/// identity is one bounded HTTP probe ([`llama_cpp_health_identifies`]) that
+/// also accepts a loading server's `503` — boot must adopt it and wait instead
+/// of refusing the port. A free port is decided without any HTTP call, so a cold
+/// first run never waits on a probe. Synchronous on purpose, next to the port
+/// probe it refines: callers already perform that blocking probe and need no
+/// async client here.
 pub(crate) fn probe_llama_cpp_port_state(port: u16, uses_wsl: bool) -> LlamaCppPortState {
     llama_cpp_port_state_with(
         port,
@@ -3382,37 +3416,56 @@ fn llama_cpp_port_state_with(
     }
 }
 
-/// Whether an identified llama.cpp server answers the configured port.
+/// Whether an identified llama.cpp server is *serving* on the configured port.
 ///
 /// Used by the health grid so a port held by a foreign listener is reported
-/// honestly as "not running" instead of as a live llama.cpp server.
+/// honestly as "not running" instead of as a live llama.cpp server. A llama.cpp
+/// server that is still loading its model is deliberately excluded: the spawn
+/// path adopts it ([`probe_llama_cpp_port_state`]), but a turn sent now would
+/// still be answered with `503 Loading model`.
 pub(crate) fn llama_cpp_server_is_serving(port: u16, uses_wsl: bool) -> bool {
-    llama_cpp_server_is_serving_with(
-        port,
-        uses_wsl,
-        backend_port_is_listening,
-        llama_cpp_health_identifies,
-    )
+    llama_cpp_server_serves_with(port, uses_wsl, backend_port_is_listening, llama_cpp_identity)
 }
 
 /// Pure form of [`llama_cpp_server_is_serving`], the seam the health tests drive.
+///
+/// Only [`LlamaCppIdentity::Serving`] counts, so a loading server is adopted but
+/// never reported ready.
+fn llama_cpp_server_serves_with(
+    port: u16,
+    uses_wsl: bool,
+    port_listening: impl FnOnce(u16, bool) -> bool,
+    identity: impl FnOnce(u16, bool) -> LlamaCppIdentity,
+) -> bool {
+    port_listening(port, uses_wsl) && identity(port, uses_wsl).is_serving()
+}
+
+/// Boolean form of [`llama_cpp_server_serves_with`], kept for the health tests
+/// that inject yes/no answers: `true` is a serving llama.cpp answer.
+#[cfg(test)]
 fn llama_cpp_server_is_serving_with(
     port: u16,
     uses_wsl: bool,
     port_listening: impl FnOnce(u16, bool) -> bool,
     identity: impl FnOnce(u16, bool) -> bool,
 ) -> bool {
-    llama_cpp_port_state_with(port, uses_wsl, port_listening, identity)
-        == LlamaCppPortState::ThisServer
+    llama_cpp_server_serves_with(port, uses_wsl, port_listening, |port, uses_wsl| {
+        if identity(port, uses_wsl) {
+            LlamaCppIdentity::Serving
+        } else {
+            LlamaCppIdentity::Foreign
+        }
+    })
 }
 
 /// The spawn path's decision taken from the port state, never from occupancy
 /// alone.
 ///
-/// `Some(AlreadyListening)` adopts only an identified llama.cpp server; a
-/// foreign listener is named and refused so the first chat is never posted to
-/// it and no second server is silently started on the same port. `None` means
-/// the port is free and the caller may spawn.
+/// `Some(AlreadyListening)` adopts only an identified llama.cpp server — one
+/// serving or one still loading its model; a foreign listener is named and
+/// refused so the first chat is never posted to it and no second server is
+/// silently started on the same port. `None` means the port is free and the
+/// caller may spawn.
 fn llama_cpp_spawn_decision(
     state: LlamaCppPortState,
     port: u16,
@@ -3428,32 +3481,77 @@ fn llama_cpp_spawn_decision(
     }
 }
 
-/// One identifying llama.cpp probe, through the same launch-mode gate as the
-/// port probe: a native Windows `llama-server.exe` never pays for `wsl.exe`,
-/// while a WSL-launched server may still be identified inside the guest.
-fn llama_cpp_health_identifies(port: u16, uses_wsl: bool) -> bool {
-    llama_cpp_health_identifies_with(
+/// The identifying probe for this launch mode: a native Windows
+/// `llama-server.exe` never pays for `wsl.exe`, while a WSL-launched server may
+/// still be identified inside the guest.
+fn llama_cpp_identity(port: u16, uses_wsl: bool) -> LlamaCppIdentity {
+    llama_cpp_identity_with(
         port,
         uses_wsl,
-        native_llama_cpp_health_identifies,
-        wsl_llama_cpp_health_identifies,
+        native_llama_cpp_identity,
+        wsl_llama_cpp_identity,
     )
 }
 
-/// Pure form of [`llama_cpp_health_identifies`], the seam these tests drive.
+/// Pure form of [`llama_cpp_identity`]: the local probe decides first, and the
+/// guest is consulted only for a WSL launch, so a native server never pays for
+/// `wsl.exe`.
+fn llama_cpp_identity_with(
+    port: u16,
+    uses_wsl: bool,
+    probe_local: impl FnOnce(u16) -> LlamaCppIdentity,
+    probe_wsl: impl FnOnce(u16) -> LlamaCppIdentity,
+) -> LlamaCppIdentity {
+    let local = probe_local(port);
+    if local.is_llama_cpp() {
+        return local;
+    }
+    if uses_wsl {
+        probe_wsl(port)
+    } else {
+        LlamaCppIdentity::Foreign
+    }
+}
+
+/// Whether this backend answers the configured port — serving, or still loading.
+///
+/// Boot adopts such a listener instead of refusing the port; readiness is a
+/// separate question ([`llama_cpp_server_is_serving`]).
+fn llama_cpp_health_identifies(port: u16, uses_wsl: bool) -> bool {
+    llama_cpp_identity(port, uses_wsl).is_llama_cpp()
+}
+
+/// A two-state probe answer in the three-state classifier's terms, for the
+/// boolean launch-gate seam below: `true` is an identified llama.cpp answer.
+#[cfg(test)]
+fn identified_as_state(identified: bool) -> LlamaCppIdentity {
+    if identified {
+        LlamaCppIdentity::Serving
+    } else {
+        LlamaCppIdentity::Foreign
+    }
+}
+
+/// Boolean form of [`llama_cpp_identity_with`], the seam the launch-gate tests
+/// drive: they inject yes/no probes, so this projection keeps their shape while
+/// the gate itself stays the production one.
+#[cfg(test)]
 fn llama_cpp_health_identifies_with(
     port: u16,
     uses_wsl: bool,
     probe_local: impl FnOnce(u16) -> bool,
     probe_wsl: impl FnOnce(u16) -> bool,
 ) -> bool {
-    if probe_local(port) {
-        return true;
-    }
-    uses_wsl && probe_wsl(port)
+    llama_cpp_identity_with(
+        port,
+        uses_wsl,
+        |port| identified_as_state(probe_local(port)),
+        |port| identified_as_state(probe_wsl(port)),
+    )
+    .is_llama_cpp()
 }
 
-/// Does this body come from a llama.cpp server?
+/// Does this 2xx body show a llama.cpp server that is serving?
 ///
 /// `GET /health` on `llama-server` answers `{"status":"ok"}`, while the
 /// OpenAI-compatible `GET /v1/models` answers `{"object":"list","data":[...]}`.
@@ -3475,20 +3573,73 @@ fn llama_cpp_body_identifies(body: &str) -> bool {
         .any(|key| object.get(*key).is_some_and(|value| value.is_array()))
 }
 
-/// The native identifying probe: `/v1/models` first, then `/health`, each
-/// bounded by a short timeout. A 2xx is not enough — the body must pass
-/// [`llama_cpp_body_identifies`] — and the client is `.no_proxy()` so a loopback
-/// probe is never answered by a proxy inherited from the environment.
-fn native_llama_cpp_health_identifies(port: u16) -> bool {
+/// Is this the body `llama-server` answers with while its model still loads?
+///
+/// Upstream answers `503` with
+/// `{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}`
+/// from every endpoint it has not opened yet, and some builds answer `/health`
+/// with `{"status":"loading model"}`. Both shapes are explicitly about a model
+/// load of this backend; a stranger's 503 (an HTML error page, an unrelated
+/// JSON object) matches neither and is still refused.
+fn llama_cpp_loading_body_identifies(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("status").and_then(|value| value.as_str()) == Some("loading model") {
+        return true;
+    }
+    object
+        .get("error")
+        .and_then(|value| value.as_object())
+        .is_some_and(|error| {
+            error.get("type").and_then(|value| value.as_str()) == Some("unavailable_error")
+                && error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("loading model"))
+        })
+}
+
+/// Classify one HTTP answer from the llama.cpp port.
+///
+/// The loading payload ([`llama_cpp_loading_body_identifies`]) identifies this
+/// backend on any status, because that is exactly the `503` a loading server
+/// answers. Otherwise only a 2xx with a serving shape counts as serving, so a
+/// `503` HTML page or an unrelated JSON object is never adopted.
+fn llama_cpp_response_identity(status: u16, body: &str) -> LlamaCppIdentity {
+    if llama_cpp_loading_body_identifies(body) {
+        return LlamaCppIdentity::Loading;
+    }
+    if (200..300).contains(&status) && llama_cpp_body_identifies(body) {
+        LlamaCppIdentity::Serving
+    } else {
+        LlamaCppIdentity::Foreign
+    }
+}
+
+/// The native identifying probe: `/health` first, then `/v1/models`, each
+/// bounded by a short timeout.
+///
+/// `/health` is the endpoint that separates serving from loading, so its body is
+/// read even when the status is not a success: while the GGUF loads it answers
+/// `503` with a [`llama_cpp_loading_body_identifies`] payload, and discarding
+/// that answer as "non-2xx" is what made boot refuse a server that was merely
+/// still starting. `/v1/models` is the fallback for builds without `/health`. The
+/// client is `.no_proxy()` so a loopback probe is never answered by a proxy
+/// inherited from the environment.
+fn native_llama_cpp_identity(port: u16) -> LlamaCppIdentity {
     let Ok(client) = local_api::blocking_client()
         .pool_max_idle_per_host(0)
         .timeout(std::time::Duration::from_secs(2))
         .build()
     else {
-        return false;
+        return LlamaCppIdentity::Foreign;
     };
     let base = format!("http://127.0.0.1:{port}");
-    for path in ["/v1/models", "/health"] {
+    for path in ["/health", "/v1/models"] {
         let Ok(response) = client
             .get(format!("{base}{path}"))
             .header(reqwest::header::CONNECTION, "close")
@@ -3496,40 +3647,73 @@ fn native_llama_cpp_health_identifies(port: u16) -> bool {
         else {
             continue;
         };
-        if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let Ok(body) = response.text() else {
             continue;
-        }
-        if response
-            .text()
-            .is_ok_and(|body| llama_cpp_body_identifies(&body))
-        {
-            return true;
+        };
+        let identity = llama_cpp_response_identity(status, &body);
+        if identity.is_llama_cpp() {
+            return identity;
         }
     }
-    false
+    LlamaCppIdentity::Foreign
+}
+
+/// The WSL probe's answer, decided in Rust from the lines `python3` printed.
+///
+/// Each line is one JSON object `{"status": <code>, "body": <text>}`; encoding
+/// the body inside JSON keeps even a pretty-printed payload on one line, and
+/// carrying the status lets the same [`llama_cpp_response_identity`] decision
+/// apply to a `503` loading body. The lines arrive in probe order (`/health`,
+/// then `/v1/models`) and the first identifying answer decides, exactly as in
+/// [`native_llama_cpp_identity`]: `/v1/models` can already list the model while
+/// `/health` still says loading, so the earlier loading answer must win and the
+/// server must not be reported as serving.
+fn wsl_llama_cpp_identity_from_output(stdout: &str) -> LlamaCppIdentity {
+    for line in stdout.lines() {
+        let Ok(answer) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(status) = answer.get("status").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        let Ok(status) = u16::try_from(status) else {
+            continue;
+        };
+        let Some(body) = answer.get("body").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let identity = llama_cpp_response_identity(status, body);
+        if identity.is_llama_cpp() {
+            return identity;
+        }
+    }
+    LlamaCppIdentity::Foreign
 }
 
 /// The WSL identifying probe. `python3` is the same helper the WSL port probe
-/// already relies on; it prints every body it can fetch so the same
-/// [`llama_cpp_body_identifies`] decision is made in Rust, not in a one-liner.
-fn wsl_llama_cpp_health_identifies(port: u16) -> bool {
+/// already relies on; it prints the status and body of every answer, including
+/// the `503` a loading server returns, so the same
+/// [`llama_cpp_response_identity`] decision is made in Rust, not in a one-liner.
+fn wsl_llama_cpp_identity(port: u16) -> LlamaCppIdentity {
     if !cfg!(target_os = "windows") {
-        return false;
+        return LlamaCppIdentity::Foreign;
     }
 
     let script = format!(
-        "import urllib.request\nfor path in ('/v1/models','/health'):\n try:\n  with urllib.request.urlopen('http://127.0.0.1:{port}'+path,timeout=1) as r:\n   print(r.read().decode('utf-8','replace'))\n except Exception:\n  pass"
+        "import json, urllib.request, urllib.error\nfor path in ('/health','/v1/models'):\n try:\n  with urllib.request.urlopen('http://127.0.0.1:{port}'+path,timeout=1) as r:\n   print(json.dumps({{'status': r.getcode(), 'body': r.read().decode('utf-8','replace')}}))\n except urllib.error.HTTPError as e:\n  print(json.dumps({{'status': e.code, 'body': e.read().decode('utf-8','replace')}}))\n except Exception:\n  pass"
     );
     let mut cmd = std::process::Command::new("wsl.exe");
     cmd.args(["--", "python3", "-c", script.as_str()]);
     crate::wsl::command_output_timeout(cmd, std::time::Duration::from_secs(4))
         .map(|out| {
-            out.status.success()
-                && String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .any(llama_cpp_body_identifies)
+            if out.status.success() {
+                wsl_llama_cpp_identity_from_output(&String::from_utf8_lossy(&out.stdout))
+            } else {
+                LlamaCppIdentity::Foreign
+            }
         })
-        .unwrap_or(false)
+        .unwrap_or(LlamaCppIdentity::Foreign)
 }
 
 /// The current user's home directory, derived from this machine's environment.
@@ -5802,6 +5986,158 @@ mod llama_cpp_identity_tests {
         ));
         assert!(!llama_cpp_body_identifies("<html>hello</html>"));
         assert!(!llama_cpp_body_identifies(""));
+    }
+
+    #[test]
+    fn a_loading_llama_cpp_answer_still_identifies_as_this_server() {
+        // DD-165: the `/health` shape the defect missed — a 503 whose body names
+        // the model load, not a 2xx carrying the "ok" status.
+        assert_eq!(
+            llama_cpp_response_identity(503, r#"{"status":"loading model"}"#),
+            LlamaCppIdentity::Loading
+        );
+        // The OpenAI-shaped 503 every other endpoint answers while loading.
+        assert_eq!(
+            llama_cpp_response_identity(
+                503,
+                r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#
+            ),
+            LlamaCppIdentity::Loading
+        );
+
+        let loading = llama_cpp_identity_with(8080, true, |_| LlamaCppIdentity::Loading, |_| {
+            LlamaCppIdentity::Foreign
+        });
+        assert!(
+            loading.is_llama_cpp(),
+            "a loading server must pass the identity probe boot adopts on"
+        );
+    }
+
+    #[test]
+    fn a_stranger_answering_503_is_still_refused() {
+        assert_eq!(
+            llama_cpp_response_identity(503, "<html>503 Service Unavailable</html>"),
+            LlamaCppIdentity::Foreign
+        );
+        assert_eq!(
+            llama_cpp_response_identity(503, r#"{"name":"vite","version":"5.0"}"#),
+            LlamaCppIdentity::Foreign
+        );
+        assert!(!llama_cpp_identity_with(
+            8080,
+            true,
+            |_| LlamaCppIdentity::Foreign,
+            |_| LlamaCppIdentity::Foreign
+        )
+        .is_llama_cpp());
+    }
+
+    /// One line of the WSL probe's stdout: the status and body of one answer.
+    fn wsl_answer(status: u16, body: &str) -> String {
+        serde_json::json!({ "status": status, "body": body }).to_string()
+    }
+
+    #[test]
+    fn the_wsl_probe_reads_a_loading_body_behind_a_503() {
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(&wsl_answer(503, r#"{"status":"loading model"}"#)),
+            LlamaCppIdentity::Loading
+        );
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(&wsl_answer(200, r#"{"status":"ok"}"#)),
+            LlamaCppIdentity::Serving
+        );
+
+        // `/health` still loading while `/v1/models` already lists a model: the
+        // first (probe-ordered) identifying answer must win, so the loading
+        // server is not reported as serving.
+        let mixed = format!(
+            "{}\n{}",
+            wsl_answer(503, r#"{"status":"loading model"}"#),
+            wsl_answer(200, r#"{"object":"list","data":[{"id":"local"}]}"#)
+        );
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(&mixed),
+            LlamaCppIdentity::Loading
+        );
+
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(&wsl_answer(
+                503,
+                "<html>503 Service Unavailable</html>"
+            )),
+            LlamaCppIdentity::Foreign
+        );
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(&wsl_answer(
+                503,
+                r#"{"name":"vite","version":"5.0"}"#
+            )),
+            LlamaCppIdentity::Foreign
+        );
+        assert_eq!(
+            wsl_llama_cpp_identity_from_output(""),
+            LlamaCppIdentity::Foreign
+        );
+    }
+
+    #[test]
+    fn a_loading_server_is_adopted_but_never_reported_as_serving() {
+        let loading = llama_cpp_identity_with(8080, false, |_| LlamaCppIdentity::Loading, |_| {
+            LlamaCppIdentity::Foreign
+        });
+        assert_eq!(loading, LlamaCppIdentity::Loading);
+        assert!(
+            loading.is_llama_cpp(),
+            "the spawn path adopts a loading server instead of refusing the port"
+        );
+        assert!(!loading.is_serving());
+
+        // The health grid asks the narrower question: the loading 503 itself
+        // must never read as a serving server.
+        assert!(!llama_cpp_server_serves_with(
+            8080,
+            true,
+            |_, _| true,
+            |_, _| llama_cpp_response_identity(503, r#"{"status":"loading model"}"#)
+        ));
+        assert!(llama_cpp_server_serves_with(
+            8080,
+            true,
+            |_, _| true,
+            |_, _| LlamaCppIdentity::Serving
+        ));
+        assert!(!llama_cpp_server_serves_with(
+            8080,
+            true,
+            |_, _| false,
+            |_, _| LlamaCppIdentity::Serving
+        ));
+    }
+
+    #[test]
+    fn the_native_probe_classifies_the_body_of_a_non_success_answer() {
+        // Pin the probe's wiring, not just the classifier: skipping a non-2xx
+        // answer before reading its body is the exact defect DD-165 fixes.
+        const LIB: &str = include_str!("lib.rs");
+        let start = LIB
+            .find("fn native_llama_cpp_identity(")
+            .expect("native_llama_cpp_identity must exist");
+        let end = LIB[start..]
+            .find("fn wsl_llama_cpp_identity_from_output(")
+            .map(|offset| start + offset)
+            .expect("the WSL classifier must follow the native probe");
+        let probe = &LIB[start..end];
+        assert!(
+            probe.contains("let status = response.status().as_u16();")
+                && probe.contains("llama_cpp_response_identity(status, &body)"),
+            "the native probe must classify every answer from its status and body:\n{probe}"
+        );
+        assert!(
+            !probe.contains("!response.status().is_success()"),
+            "a 503 loading answer must not be discarded before its body is read:\n{probe}"
+        );
     }
 
     #[test]
