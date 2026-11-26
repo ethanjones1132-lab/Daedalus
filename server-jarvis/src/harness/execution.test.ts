@@ -323,6 +323,17 @@ describe("harness execution", () => {
     expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
   });
 
+  test("a run's own brief values override the execution's default values", async () => {
+    const manifest = fixtureManifest();
+    manifest.guides.brief_template = "Do {{task}}";
+    const { state, execution } = setupHarness({ manifest, initialErrors: 0, deps: { briefValues: { task: "EXECUTION-DEFAULT" } } });
+
+    await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal, briefValues: { task: "PER-RUN-TASK" } });
+
+    expect(state.makerTurns[0]?.prompt).toContain("Do PER-RUN-TASK");
+    expect(state.makerTurns[0]?.prompt).not.toContain("EXECUTION-DEFAULT");
+  });
+
   test("a maker turn's reported spend reaches the run record through the execution seam", async () => {
     const manifest = fixtureManifest();
     const { store, execution } = setupHarness({ manifest, makerCostUsd: 0.25 });

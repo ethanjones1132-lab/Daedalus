@@ -191,18 +191,31 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
       candidate = checked.manifest;
     } else return jsonError("manifest_id or manifest is required", 400);
     if (!candidate) return jsonError("manifest_not_found", 404);
+    const values = body?.brief_values;
+    if (values !== undefined && (!values || typeof values !== "object" || Array.isArray(values) || Object.values(values).some((v) => typeof v !== "string"))) return jsonError("brief_values must be a string map", 400);
+    const briefValues = (values ?? {}) as Record<string, string>;
     const deadline = body?.deadline_ms;
     if (deadline !== undefined && (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0)) {
       return jsonError("deadline_ms must be a positive finite number", 400);
     }
     const execution = options.execution;
     if (!execution) return jsonError("harness_execution_unavailable", 503);
+    // A run whose brief cannot be filled must not be admitted. Render the brief
+    // before the run record exists so the refusal can name the missing
+    // placeholder and no 202 is sent for a run that cannot render its brief.
+    try {
+      renderHarnessGuides({ rules: candidate.guides.rules.join("\n"), briefTemplate: candidate.guides.brief_template,
+        briefValues, skills: candidate.guides.skills, references: candidate.guides.references,
+        bannedDefaults: candidate.guides.banned_defaults, role: "maker", rubric: candidate.checker.rubric });
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : String(error), 400);
+    }
     const runId = crypto.randomUUID();
     const controller = new AbortController();
     // runHarness creates the run before its first await, so the id is durable by
     // the time this response is written and the existing GET routes can read it.
     const controllerInput: HarnessControllerInput = {
-      manifest: candidate, store, run_id: runId, signal: controller.signal,
+      manifest: candidate, store, run_id: runId, signal: controller.signal, briefValues,
       sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
     };
     if (execution.agents) controllerInput.agents = execution.agents;

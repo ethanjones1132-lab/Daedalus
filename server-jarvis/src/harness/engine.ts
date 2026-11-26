@@ -276,8 +276,12 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       const beforeMaker = roundStop();
       if (beforeMaker) { reason = beforeMaker; break; }
       let maker: Awaited<ReturnType<typeof input.runMaker>>;
-      try { maker = await wait(input.runMaker({ manifest, round: rounds, signal: abort.signal })); }
-      catch { reason = elapsedStop() ?? "maker_failed"; break; }
+      try {
+        maker = await wait(input.runMaker({
+          manifest, round: rounds, signal: abort.signal,
+          ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
+        }));
+      } catch { reason = elapsedStop() ?? "maker_failed"; break; }
       const roundCost = maker?.cost_usd;
       if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) addCost(roundCost);
       const afterMaker = elapsedStop();
@@ -320,7 +324,10 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       if (evidenceComplete && manifest.checker.enabled && !policy.skip_checker) {
         try {
           // The trusted execution boundary owns model selection and the independent verdict.
-          const verdict = await wait(input.runChecker({ manifest, signal: abort.signal }));
+          const verdict = await wait(input.runChecker({
+            manifest, signal: abort.signal,
+            ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
+          }));
           reason = roundStop() ?? (verdict.passed ? "passed" : "checker_rejected");
         } catch (error) { reason = stepFailure(error); }
         break;

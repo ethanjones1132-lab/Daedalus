@@ -32,18 +32,41 @@ export interface HarnessAdmission {
   acquire(input: { workClass: "background"; signal: AbortSignal; deadlineAt: number }): Promise<{ release(): void }>;
 }
 
+/** The per-run values that fill a manifest's brief template. */
+export type HarnessBriefValues = Record<string, string>;
+
+export interface HarnessMakerInput {
+  manifest: HarnessManifest;
+  round: number;
+  signal: AbortSignal;
+  /**
+   * Values this run's brief is filled from, owned by the run rather than the
+   * execution boundary, so concurrent runs never share a brief.
+   */
+  briefValues?: HarnessBriefValues;
+}
+
+export interface HarnessCheckerInput {
+  manifest: HarnessManifest;
+  signal: AbortSignal;
+  /** This run's brief values, paired with the maker turn's for the same run. */
+  briefValues?: HarnessBriefValues;
+}
+
 export interface HarnessControllerInput {
   manifest: HarnessManifest;
   store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
-  runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean; cost_usd?: number } | void>;
+  runMaker: (input: HarnessMakerInput) => Promise<{ failed?: boolean; continue?: boolean; cost_usd?: number } | void>;
   /** The actual model for a maker that runs outside the delegate pool. */
   localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
-  runChecker: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<{ passed: boolean }>;
+  runChecker: (input: HarnessCheckerInput) => Promise<{ passed: boolean }>;
   /** Agent pool used to resolve the maker/checker model families. Defaults to the shipped pool. */
   agents?: readonly OrchestratorAgent[];
   /** Pre-generated run id so a caller can address the run before the loop settles. */
   run_id?: string;
+  /** Values for this run's brief template, threaded into its maker and checker prompts. */
+  briefValues?: HarnessBriefValues;
   signal?: AbortSignal;
   now?: () => number;
   /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes; clamped to MAX_DEADLINE_MS. */

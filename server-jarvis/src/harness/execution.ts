@@ -568,7 +568,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   const getConfig = deps.getConfig ?? loadConfig;
   const hasNamedMaker = agents.some((agent) => agent.enabled && agent.id === INKLING_MAKER_ID);
   const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig; useDelegate: boolean; delegateFamilies: Set<string> }>();
-  const briefValues = deps.briefValues ?? {};
+  const defaultBriefValues = deps.briefValues ?? {};
   const diffMaxChars = deps.diffMaxChars ?? HARNESS_DIFF_MAX_CHARS;
   // The controller passes the same manifest object to both hooks for a run, so
   // each run's last sensor failures follow the run rather than a global key.
@@ -599,9 +599,9 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     return batch;
   };
 
-  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal }) => {
+  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal, briefValues }) => {
     const local = localMakerFor(manifest, signal);
-    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues);
+    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues ?? defaultBriefValues);
     if (local && !local.useDelegate) {
       if (round === 1 && manifest.checker.enabled) {
         runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
@@ -667,7 +667,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
 
   // The controller and manifest validation already refuse a checker equal to the
   // maker; that rule is untouched here.
-  const runChecker: HarnessControllerInput["runChecker"] = async ({ manifest, signal }) => {
+  const runChecker: HarnessControllerInput["runChecker"] = async ({ manifest, signal, briefValues }) => {
     const agent = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
@@ -686,7 +686,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       throw new Error(`harness evidence collection failed: ${evidence.errors.join("; ")}`);
     }
     const answer = await deps.callModel({
-      prompt: checkerPrompt(manifest, evidence.text, briefValues),
+      prompt: checkerPrompt(manifest, evidence.text, briefValues ?? defaultBriefValues),
       agent: agentRef(agent),
       signal,
       ...(excludeFamilies.length > 0 ? { excludeFamilies } : {}),

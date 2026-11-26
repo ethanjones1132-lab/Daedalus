@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
-import { createHarnessExecution } from "./execution";
+import { defaultConfig } from "../config";
+import { createHarnessExecution, type HarnessMakerTurn } from "./execution";
 import { HarnessStore } from "./store";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import { recordHarnessMakerEvent } from "./inkling-maker";
@@ -49,6 +50,44 @@ const waitingMaker: HarnessExecution["runMaker"] = async ({ signal }) => {
   if (!signal.aborted) await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
   return {};
 };
+
+/** A live execution whose maker turn records every prompt it receives. */
+const promptAgents: OrchestratorAgent[] = [
+  {
+    id: "maker", provider: "opencode_go", model_id: "executor-model",
+    capabilities: { code: 8, reasoning: 7, speed: 6, cost: 5, json_reliability: 7 },
+    default_for: ["executor"], enabled: true,
+  },
+  {
+    id: "checker", provider: "opencode_go", model_id: "reviewer-model",
+    capabilities: { code: 7, reasoning: 8, speed: 6, cost: 5, json_reliability: 7 },
+    default_for: ["reviewer"], enabled: true,
+  },
+];
+
+function captureMakerPrompts(makerTurn: HarnessMakerTurn) {
+  const prompts: string[] = [];
+  const execution = createHarnessExecution({
+    store: new HarnessStore({ dbPath: ":memory:" }),
+    agents: promptAgents,
+    // Diff/base probes stay offline; a prompt is recorded before any evidence.
+    spawn: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    runMakerTurn: async (input) => {
+      prompts.push(input.prompt);
+      return makerTurn(input);
+    },
+    makerDelegate: {
+      config: () => {
+        const config = defaultConfig();
+        config.claude_cli.delegate.model = "minimax-m3";
+        return config;
+      },
+      isAvailable: async () => true,
+    },
+    callModel: async () => ({ text: "ACCEPT\nThe diff matches the brief." }),
+  });
+  return { prompts, execution };
+}
 
 describe("harness routes", () => {
   test("lists templates, each validated when bound to a canonical project root", async () => {
@@ -137,7 +176,7 @@ describe("harness routes", () => {
   test("starts a run through the controller and reads it back through the run routes", async () => {
     const { request } = setup(execution());
     expect((await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 }))?.status).toBe(201);
-    const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" });
+    const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix", brief_values: { task: "Fix the bug" } });
     expect(started?.status).toBe(202);
     const { run_id } = await payload(started);
     expect(typeof run_id).toBe("string");
@@ -147,6 +186,70 @@ describe("harness routes", () => {
     expect(read.run.id).toBe(run_id);
     expect((await request(`/harness/runs/${run_id}?project_root=%2Fother`))?.status).toBe(404);
   });
+
+  test("fills a run's brief template from brief_values in that run's maker prompt", async () => {
+    const { prompts, execution: live } = captureMakerPrompts(async () => ({ ok: true }));
+    const { request } = setup(live);
+    expect((await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 }))?.status).toBe(201);
+
+    const started = await request("/harness/runs", "POST",
+      { project_root: ROOT, manifest_id: "bug-fix", brief_values: { task: "Fix the flaky login test" } });
+    expect(started?.status).toBe(202);
+
+    for (let attempt = 0; attempt < 200 && prompts.length === 0; attempt++) await Bun.sleep(5);
+    expect(prompts.length).toBeGreaterThan(0);
+    for (const prompt of prompts) {
+      expect(prompt).toContain("Fix the flaky login test");
+      expect(prompt).not.toContain("{{task}}");
+    }
+  });
+
+  test("refuses a start whose brief template still has an unfilled placeholder and creates no run", async () => {
+    const { store, request } = setup(execution());
+    expect((await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 }))?.status).toBe(201);
+
+    for (const briefValues of [undefined, { other: "not the task" }] as const) {
+      const response = await request("/harness/runs", "POST",
+        { project_root: ROOT, manifest_id: "bug-fix", ...(briefValues ? { brief_values: briefValues } : {}) });
+      expect(response?.status).toBe(400);
+      expect(String((await payload(response)).error)).toContain("task");
+    }
+    expect(store.listRuns(ROOT)).toHaveLength(0);
+  });
+
+  test("two concurrent runs see only their own brief_values", async () => {
+    const bothMakersStarted = Promise.withResolvers<void>();
+    let startedMakers = 0;
+    const { prompts, execution: live } = captureMakerPrompts(async () => {
+      if (++startedMakers === 2) bothMakersStarted.resolve();
+      // Overlap the two maker turns, but never let a run that never starts its
+      // second maker hang the suite: the assertions below fail instead.
+      await Promise.race([bothMakersStarted.promise, Bun.sleep(500)]);
+      return { ok: true };
+    });
+    const { request } = setup(live);
+    const alpha = manifest("alpha-run");
+    alpha.guides.rules = ["ALPHA-RUN"];
+    const beta = manifest("beta-run");
+    beta.guides.rules = ["BETA-RUN"];
+
+    const [alphaStart, betaStart] = await Promise.all([
+      request("/harness/runs", "POST", { project_root: ROOT, manifest: alpha, brief_values: { task: "ALPHA-TASK" } }),
+      request("/harness/runs", "POST", { project_root: ROOT, manifest: beta, brief_values: { task: "BETA-TASK" } }),
+    ]);
+    expect(alphaStart?.status).toBe(202);
+    expect(betaStart?.status).toBe(202);
+
+    await bothMakersStarted.promise;
+    const alphaPrompt = prompts.find((prompt) => prompt.includes("ALPHA-RUN"));
+    const betaPrompt = prompts.find((prompt) => prompt.includes("BETA-RUN"));
+    expect(alphaPrompt).toBeDefined();
+    expect(betaPrompt).toBeDefined();
+    expect(alphaPrompt).toContain("ALPHA-TASK");
+    expect(alphaPrompt).not.toContain("BETA-TASK");
+    expect(betaPrompt).toContain("BETA-TASK");
+    expect(betaPrompt).not.toContain("ALPHA-TASK");
+  }, 3_000);
 
   test("refuses a same-family maker/checker from the live config pool instead of the shipped defaults", async () => {
     const item = manifest();
@@ -181,7 +284,7 @@ describe("harness routes", () => {
       const { store, request } = setup(live);
       await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
 
-      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: item.id });
+      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Fix the bug" } });
 
       expect(started?.status).toBe(202);
       const { run_id } = await payload(started);
@@ -211,7 +314,7 @@ describe("harness routes", () => {
       return {};
     } }));
     const starts = await Promise.all(["read_file", "edit_file"].map(async (tool) => {
-      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest: manifest(tool) });
+      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest: manifest(tool), brief_values: { task: "Fix the bug" } });
       expect(started?.status).toBe(202);
       const { run_id } = await payload(started);
       return { run_id, tool };
@@ -229,7 +332,7 @@ describe("harness routes", () => {
   test("cancels an in-flight run and settles it with the existing cancelled stop reason", async () => {
     const { request } = setup(execution({ runMaker: waitingMaker }));
     await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
-    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix", brief_values: { task: "Fix the bug" } }));
     const cancelled = await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT });
     expect(cancelled?.status).toBe(200);
     expect((await payload(cancelled)).stop_reason).toBe("cancelled");
@@ -242,7 +345,7 @@ describe("harness routes", () => {
     const { store, request } = setup(execution());
     await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
     store.appendRound = () => { throw new Error("disk full"); };
-    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix", brief_values: { task: "Fix the bug" } }));
     let stoppedReason: string | undefined;
     for (let attempt = 0; attempt < 200 && !stoppedReason; attempt++) {
       await Bun.sleep(5);
@@ -258,7 +361,7 @@ describe("harness routes", () => {
   test("refuses unknown and already-cancelled run ids without touching the stored run", async () => {
     const { request } = setup(execution({ runMaker: waitingMaker }));
     await request("/harness/manifests", "POST", { manifest: manifest(), expected_revision: 0 });
-    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix" }));
+    const { run_id } = await payload(await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: "bug-fix", brief_values: { task: "Fix the bug" } }));
     expect((await request(`/harness/runs/${crypto.randomUUID()}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(404);
     expect((await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(200);
     expect((await request(`/harness/runs/${run_id}/cancel`, "POST", { project_root: ROOT }))?.status).toBe(409);
