@@ -280,6 +280,35 @@ describe("runHarness", () => {
     expect((error as Error).message).toContain(item.checker.agent_id);
   });
 
+  test("checks families against the supplied pool, not the shipped defaults that would look independent", async () => {
+    const item = manifest();
+    item.maker_agent_id = "go-deepseek-v4-flash";
+    item.checker.agent_id = "or-ling-flash";
+    // The shipped pool resolves these two ids to DeepSeek and Ling, so the pair
+    // would pass there. The live config the run's models come from has both ids
+    // on DeepSeek, and that is the pool the independence rule must use.
+    const liveAgents: OrchestratorAgent[] = [
+      {
+        id: "go-deepseek-v4-flash", provider: "opencode_go", model_id: "deepseek-v4-flash",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 0.85, json_reliability: 0.9 },
+        default_for: ["executor"], enabled: true,
+      },
+      {
+        id: "or-ling-flash", provider: "openrouter", model_id: "deepseek-v4-pro",
+        capabilities: { code: 0.93, reasoning: 0.9, speed: 0.7, cost: 0.7, json_reliability: 0.85 },
+        default_for: ["reviewer"], enabled: true,
+      },
+    ];
+    const setup = deps({ manifest: item, agents: liveAgents });
+
+    const error = await runHarness(setup.input).then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/same model family/);
+    expect((error as Error).message).toContain(item.maker_agent_id);
+    expect((error as Error).message).toContain(item.checker.agent_id);
+  });
+
   test("records maker failure and admission denial once", async () => {
     await resultWithReason("maker_failed", { runMaker: async () => { throw new Error("failed"); } });
     await resultWithReason("approval_denied", { admission: { acquire: async () => { throw new Error("denied"); } } });

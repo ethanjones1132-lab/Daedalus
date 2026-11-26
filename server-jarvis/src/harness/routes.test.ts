@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import { createHarnessExecution } from "./execution";
 import { HarnessStore } from "./store";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
@@ -143,6 +145,56 @@ describe("harness routes", () => {
     const read = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
     expect(read.run.id).toBe(run_id);
     expect((await request(`/harness/runs/${run_id}?project_root=%2Fother`))?.status).toBe(404);
+  });
+
+  test("refuses a same-family maker/checker from the live config pool instead of the shipped defaults", async () => {
+    const item = manifest();
+    item.maker_agent_id = "go-deepseek-v4-flash";
+    item.checker.agent_id = "or-ling-flash";
+    // The shipped pool resolves these ids to DeepSeek and Ling, so a route that
+    // ignored the live config would start the run. The live pool below is the
+    // one the run's models actually come from, and both ids are DeepSeek there.
+    const liveAgents: OrchestratorAgent[] = [
+      {
+        id: "go-deepseek-v4-flash", provider: "opencode_go", model_id: "deepseek-v4-flash",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 0.85, json_reliability: 0.9 },
+        default_for: ["executor"], enabled: true,
+      },
+      {
+        id: "or-ling-flash", provider: "openrouter", model_id: "deepseek-v4-pro",
+        capabilities: { code: 0.93, reasoning: 0.9, speed: 0.7, cost: 0.7, json_reliability: 0.85 },
+        default_for: ["reviewer"], enabled: true,
+      },
+    ];
+    const logged: string[] = [];
+    const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      logged.push(args.map((arg) => String(arg)).join(" "));
+    });
+    try {
+      const live = createHarnessExecution({
+        store: new HarnessStore({ dbPath: ":memory:" }),
+        agents: liveAgents,
+        runMakerTurn: async () => ({ ok: true }),
+        callModel: async () => ({ text: "ACCEPT\nLooks independent." }),
+      });
+      const { store, request } = setup(live);
+      await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
+
+      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: item.id });
+
+      expect(started?.status).toBe(202);
+      const { run_id } = await payload(started);
+      await Bun.sleep(5);
+      // The family check runs before the run record exists, so a refused pair
+      // leaves no run behind for the GET routes.
+      expect(store.getRun(run_id)).toBeUndefined();
+      const message = logged.join("\n");
+      expect(message).toMatch(/same model family/);
+      expect(message).toContain(item.maker_agent_id);
+      expect(message).toContain(item.checker.agent_id);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   test("cancels an in-flight run and settles it with the existing cancelled stop reason", async () => {

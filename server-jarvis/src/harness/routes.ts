@@ -1,3 +1,4 @@
+import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { getHarnessCommand } from "./commands";
 import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessRunResult } from "./controller";
@@ -11,6 +12,12 @@ export interface HarnessExecution {
   runMaker: HarnessControllerInput["runMaker"];
   runChecker: HarnessControllerInput["runChecker"];
   admission: HarnessAdmission;
+  /**
+   * The agent pool the run's models actually come from, carried so the
+   * controller's maker/checker family check sees the live config rather than
+   * the shipped defaults. Absent means the caller has no pool to supply.
+   */
+  agents?: readonly OrchestratorAgent[];
 }
 
 export interface HarnessRouteOptions {
@@ -196,6 +203,7 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
       manifest: candidate, store, run_id: runId, signal: controller.signal,
       sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
     };
+    if (execution.agents) controllerInput.agents = execution.agents;
     if (typeof deadline === "number") controllerInput.deadline_ms = deadline;
     const done = runHarness(controllerInput).finally(() => { activeRuns.delete(runId); });
     activeRuns.set(runId, { controller, done });

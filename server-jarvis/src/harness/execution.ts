@@ -665,5 +665,9 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     runMaker,
     runChecker,
     admission: deps.admission ?? backgroundAdmission(),
+    // The pool resolved above is what the maker and checker actually run on, so
+    // the route can carry it into the controller's family check instead of
+    // letting the controller fall back to the shipped defaults.
+    agents,
   };
 }
