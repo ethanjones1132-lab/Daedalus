@@ -35,8 +35,20 @@
                    the release record claims. THIS is the stale-binary
                    check: it is the difference between "the file on disk is
                    the build we made" and "the build answering requests is
-                   the build we made".
-      5. chat    - one /chat/stream request must reach a terminal frame,
+                   the build we made". /health is liveness only: Bun answers
+                   as soon as it serves requests, not when a model can answer.
+      5. readiness - /health/readiness must report that the engine which will
+                   answer the chat is ready before a chat is attempted
+                   (DD-168). The wait is bounded by -ChatReadyTimeoutSeconds
+                   and records the signal it waited on, the last state
+                   observed and the elapsed time. A signal that says the
+                   engine is configured never to come up (disabled, no model
+                   configured) fails at once instead of spending the budget.
+                   Without -AllowChatError a not-ready engine fails the smoke
+                   before the chat; with it the not-ready outcome is recorded
+                   as data and the chat's terminal error stays tolerated
+                   exactly as before (DD-EO15).
+      6. chat    - one /chat/stream request must reach a terminal frame,
                    answered by the same installed app. The chat step records
                    its outcome as data (answer / error_tolerated / failed):
                    -AllowChatError turns a terminal error frame, or a terminal
@@ -45,16 +57,17 @@
                    answer.
 
     The decision functions are pure and separately testable, so the
-    interesting rules (hash mismatch, stale build, missing terminal frame)
-    are covered by scripts/release-pipeline.Tests.ps1 without needing an
-    installer, a certificate or an inference backend.
+    interesting rules (hash mismatch, stale build, missing terminal frame,
+    engine never ready) are covered by scripts/release-smoke.Tests.ps1 and
+    scripts/release-pipeline.Tests.ps1 without needing an installer, a
+    certificate or an inference backend.
 
     Every child this script waits on is bounded (DD-126): the install and the
     uninstall through Wait-JarvisChildExit (WaitForExit(ms)), the app's
     bootstrap pipe through a connect deadline, the owned-process teardown
-    through CleanupDeadline, and the health and chat reads through their own
-    deadlines. A step that runs out of budget prints one line naming the step
-    and the last line the child wrote, then fails. It never blocks.
+    through CleanupDeadline, and the health, readiness and chat reads through
+    their own deadlines. A step that runs out of budget prints one line naming
+    the step and the last line the child wrote, then fails. It never blocks.
 
 .PARAMETER ManifestPath
     The jarvis-release.json written by release-build.ps1.
@@ -88,6 +101,14 @@ param(
     # as 'answer'. For a release build the packaging is what is under test;
     # inference credentials are a separate concern with a separate owner.
     [switch]$AllowChatError,
+
+    # DD-168: the budget for the engine readiness wait between health and
+    # chat. Large enough for a first model load on a cold install. The wait
+    # does not spend this budget when the readiness snapshot says the engine
+    # is disabled or configured with no model to load; that is decided at
+    # once. With -AllowChatError a not-ready engine is recorded as data and
+    # the smoke still sends the chat (DD-EO15) rather than failing here.
+    [int]$ChatReadyTimeoutSeconds = 240,
 
     [int]$TimeoutSeconds = 120
 )
@@ -191,6 +212,348 @@ function Wait-JarvisHealth {
         }
     }
     throw "health_timeout:$Url ($lastError)"
+}
+
+function Get-JarvisReadinessProbe {
+    <#
+    .SYNOPSIS
+        One bounded read of /health/readiness, returned as an envelope.
+
+    .DESCRIPTION
+        /health is liveness: Bun answers requests. /health/readiness is the
+        engine snapshot the app publishes about the model that will answer a
+        chat (enabled/state pending|warming|ready|degraded|disabled, model,
+        error). The envelope keeps the HTTP status separate from the body so
+        the decision layer can tell a route this build does not expose (404)
+        from a server that has not answered yet (status 0) or a 5xx while it
+        boots.
+
+        The client comes from lib/local-api.ps1 (New-JarvisLocalHttpClient and
+        Get-JarvisLocalHeaders); this function adds no second HTTP path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$Token
+    )
+    # Resolved before the try: a missing/invalid credential is a caller bug,
+    # not a readiness state, and must not be polled away as a timeout.
+    $headers = Get-JarvisLocalHeaders $Url $Token
+    $client = New-JarvisLocalHttpClient
+    $client.Timeout = [TimeSpan]::FromSeconds(5)
+    $request = $null
+    $response = $null
+    try {
+        $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+        $request.Headers.Add('Authorization', $headers.Authorization)
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        $status = [int]$response.StatusCode
+        $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        $body = $null
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            try { $body = $text | ConvertFrom-Json } catch { $body = $null }
+        }
+        return [pscustomobject]@{ status = $status; body = $body; error = $null }
+    } catch {
+        return [pscustomobject]@{ status = 0; body = $null; error = $_.Exception.Message }
+    } finally {
+        if ($response) { $response.Dispose() }
+        if ($request) { $request.Dispose() }
+        $client.Dispose()
+    }
+}
+
+function Get-JarvisReadinessMember {
+    <#
+    .SYNOPSIS
+        Read one member from a JSON-shaped object (PSCustomObject or hashtable).
+    #>
+    param($InputObject, [string]$Name)
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $null
+    }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Test-JarvisReadinessTerminalError {
+    <#
+    .SYNOPSIS
+        Does a degraded readiness error describe a state waiting cannot fix?
+
+    .DESCRIPTION
+        A degraded snapshot can be transient (a warm-up that timed out and may
+        be retried, a model server that is still starting) or hopeless (the
+        configured model or file is missing). Only the second kind is a
+        "never ready" answer; everything else keeps polling inside the budget.
+    #>
+    param([string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return [bool]($Message -match '(?i)\bmissing\b|\babsent\b|not\s+configured|unconfigured|no\s+model|not\s+served|no\s+such\s+file|\benoent\b|does\s+not\s+exist|not\s+found')
+}
+
+function Resolve-JarvisChatReadiness {
+    <#
+    .SYNOPSIS
+        Turn one readiness probe into ready / keep waiting / a final outcome.
+
+    .DESCRIPTION
+        The decision the wait needs, as data:
+
+          ready        the engine snapshot says 'ready'; the signal is
+                       readiness_state:ready and a chat can be attempted.
+          not ready    a probe that has not reached the server yet, or a
+                       pending/warming/transiently degraded state. Not ready,
+                       not terminal: the wait keeps polling inside the budget.
+          not_ready    the app says the engine is configured never to come up
+                       (disabled / no model configured), the route is absent,
+                       the credential is refused, or a degraded snapshot names
+                       an unloadable engine. Waiting cannot change any of
+                       those, so this is terminal and immediate (DD-168).
+          timeout      the budget ran out while the signal was still not
+                       ready; the last observed state is carried along.
+          unreachable  the budget ran out without /health/readiness ever
+                       answering.
+
+        -AllowChatError (DD-EO15, 2026-11-25) does not turn a not-ready engine
+        into an answer: it makes the readiness step a passing, recorded
+        outcome (proceed = $true, exit_code = 0) so the smoke can still send
+        the chat, whose terminal error stays tolerated exactly as before.
+        Without it, a terminal not-ready/timeout/unreachable outcome fails the
+        smoke before any chat is sent (proceed = $false, exit_code = 1).
+
+        Pure: no HTTP, no clock, no exit, so scripts/release-smoke.Tests.ps1
+        drives every state without a port or a backend.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Probe,
+        [int]$ElapsedMs = 0,
+        [switch]$TimedOut,
+        [switch]$AllowChatError
+    )
+
+    $status = 200
+    $body = $Probe
+    $probeError = ''
+    if ($null -eq $Probe) {
+        $status = 0
+    } elseif ($null -ne (Get-JarvisReadinessMember $Probe 'status')) {
+        $status = [int](Get-JarvisReadinessMember $Probe 'status')
+        $body = Get-JarvisReadinessMember $Probe 'body'
+        $probeError = [string](Get-JarvisReadinessMember $Probe 'error')
+    }
+
+    $ready = $false
+    $terminal = $false
+    $unreachable = $false
+    $state = 'unknown'
+    $signal = 'readiness_state:unknown'
+    $detail = 'no probe result'
+    $errorClass = $null
+
+    if ($status -eq 0) {
+        # No HTTP answer yet: the server or its route may still be coming up.
+        $unreachable = $true
+        $state = 'probe_error'
+        $signal = 'readiness_http:unreachable'
+        $detail = if ($probeError) { $probeError } else { 'no response from /health/readiness' }
+    } elseif ($status -eq 404 -or $status -eq 405) {
+        # The server answered but has no readiness route: waiting cannot add
+        # one to a build that does not expose it.
+        $terminal = $true
+        $state = 'signal_unavailable'
+        $signal = 'readiness_state:absent'
+        $detail = "GET /health/readiness answered HTTP $status; this build exposes no readiness snapshot"
+        $errorClass = 'chat_ready_signal_unavailable'
+    } elseif ($status -eq 401 -or $status -eq 403) {
+        $terminal = $true
+        $state = 'signal_unauthorized'
+        $signal = "readiness_http:$status"
+        $detail = "GET /health/readiness answered HTTP $status; the launch credential is not accepted"
+        $errorClass = 'chat_ready_signal_unauthorized'
+    } elseif ($status -lt 200 -or $status -ge 300) {
+        # 5xx and the rest: the server is up enough to answer, but not with a
+        # readiness snapshot. Keep polling inside the budget.
+        $state = 'probe_error'
+        $signal = "readiness_http:$status"
+        $detail = "GET /health/readiness answered HTTP $status"
+    } else {
+        $conductor = Get-JarvisReadinessMember $body 'conductor'
+        if ($null -eq $conductor) {
+            # A liveness body (/health) is not a readiness body. Never ready,
+            # and never going to become one by polling it again.
+            $terminal = $true
+            $state = 'signal_unavailable'
+            $signal = 'readiness_state:absent'
+            $detail = 'the 200 response carried no conductor readiness snapshot (liveness is not readiness)'
+            $errorClass = 'chat_ready_signal_unavailable'
+        } else {
+            $enabled = Get-JarvisReadinessMember $conductor 'enabled'
+            $conductorState = [string](Get-JarvisReadinessMember $conductor 'state')
+            $model = [string](Get-JarvisReadinessMember $conductor 'model')
+            $conductorError = [string](Get-JarvisReadinessMember $conductor 'error')
+            if ([string]::IsNullOrWhiteSpace($conductorState)) { $conductorState = 'unknown' }
+
+            if ($enabled -eq $false -or $conductorState -eq 'disabled') {
+                # The app itself says the engine is configured never to come
+                # up: no model will be loaded, so the budget is not spent.
+                $terminal = $true
+                $state = 'disabled'
+                $signal = 'readiness_state:disabled'
+                $detail = "the app reports no engine to wait for (enabled=$enabled, state=$conductorState); no model is configured to load"
+                $errorClass = 'chat_ready_no_model_configured'
+            } elseif ($conductorState -eq 'ready') {
+                $ready = $true
+                $terminal = $true
+                $state = 'ready'
+                $signal = 'readiness_state:ready'
+                $detail = if ($model) { "engine model '$model' reports ready" } else { 'engine readiness reports ready' }
+            } elseif ($conductorState -eq 'degraded' -and (Test-JarvisReadinessTerminalError $conductorError)) {
+                $terminal = $true
+                $state = 'degraded'
+                $signal = 'readiness_state:degraded'
+                $detail = "engine readiness degraded with an unloadable configuration: $conductorError"
+                $errorClass = 'chat_ready_engine_missing'
+            } else {
+                # pending, warming, a transient degraded state, or a state a
+                # later build adds: not ready yet, still worth waiting for.
+                $state = $conductorState
+                $signal = "readiness_state:$conductorState"
+                $detail = if ($conductorError) { "state $conductorState ($conductorError)" } else { "state $conductorState" }
+            }
+        }
+    }
+
+    if ($ready) {
+        return [pscustomobject]@{
+            ready = $true; terminal = $true; proceed = $true; ok = $true; exit_code = 0
+            outcome = 'ready'; state = $state; signal = $signal; detail = $detail
+            error_class = $null; elapsed_ms = $ElapsedMs
+        }
+    }
+
+    if ($TimedOut) {
+        $terminal = $true
+        if ($unreachable) {
+            $outcome = 'unreachable'
+            $errorClass = 'chat_ready_unreachable'
+            $detail = "never became ready and never answered /health/readiness ($detail)"
+        } else {
+            $outcome = 'timeout'
+            $errorClass = 'chat_ready_timeout'
+            $detail = "not ready after $ElapsedMs ms; last observed state '$state' ($detail)"
+        }
+    } elseif ($terminal) {
+        $outcome = 'not_ready'
+    } else {
+        # Still worth waiting: this is an observation, not a verdict.
+        return [pscustomobject]@{
+            ready = $false; terminal = $false; proceed = $false; ok = $false; exit_code = 1
+            outcome = $(if ($unreachable) { 'unreachable' } else { 'not_ready' })
+            state = $state; signal = $signal; detail = $detail
+            error_class = $null; elapsed_ms = $ElapsedMs
+        }
+    }
+
+    # A terminal not-ready decision. -AllowChatError records it and proceeds to
+    # the chat; without the flag the smoke fails here, before the chat.
+    $tolerate = [bool]$AllowChatError
+    return [pscustomobject]@{
+        ready = $false; terminal = $true
+        proceed = $tolerate; ok = $tolerate
+        exit_code = $(if ($tolerate) { 0 } else { 1 })
+        outcome = $outcome; state = $state; signal = $signal; detail = $detail
+        error_class = $errorClass; elapsed_ms = $ElapsedMs
+    }
+}
+
+function Wait-JarvisChatReady {
+    <#
+    .SYNOPSIS
+        Wait, inside one budget, for the engine that answers chat to be ready.
+
+    .DESCRIPTION
+        Polls the readiness probe until Resolve-JarvisChatReadiness says ready,
+        the signal says no wait can help, or the budget runs out. The result
+        says which outcome happened (ready / not_ready / timeout /
+        unreachable), which signal was observed last, the last state, how many
+        polls it took and how long it took, so a model that needed 60 s to load
+        is distinguishable from one that was never coming.
+
+        The clock, the wait and the probe are injectable so the offline tests
+        can drive sequences (warming -> ready, never ready, timeout) without
+        sleeping for minutes or opening a port; production uses Get-Date,
+        Start-Sleep and Get-JarvisReadinessProbe.
+
+        -AllowChatError is passed through to the decision, so a not-ready
+        engine becomes a recorded, passing outcome here rather than a thrown
+        failure (DD-EO15). An owned process that exits during the wait is
+        still reported immediately (`server_exited_before_chat_ready`), like
+        Wait-JarvisHealth does.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [int]$TimeoutSeconds = 240,
+        [string]$Token,
+        [scriptblock]$Probe,
+        [int]$PollMilliseconds = 1000,
+        [scriptblock]$Now,
+        [scriptblock]$Wait,
+        [switch]$AllowChatError,
+        $Process
+    )
+    if (-not $Probe) {
+        $Probe = { param($ReadyUrl, $ReadyToken) Get-JarvisReadinessProbe -Url $ReadyUrl -Token $ReadyToken }
+    }
+    if (-not $Now) { $Now = { Get-Date } }
+    if (-not $Wait) { $Wait = { param($Milliseconds) Start-Sleep -Milliseconds $Milliseconds } }
+
+    $startedAt = & $Now
+    $deadline = $startedAt.AddSeconds([Math]::Max(0, $TimeoutSeconds))
+    $attempts = 0
+    $lastProbe = $null
+    $lastVerdict = $null
+
+    while ((& $Now) -lt $deadline) {
+        if ($Process -and $Process.HasExited) {
+            throw "server_exited_before_chat_ready:$($Process.ExitCode)"
+        }
+        $attempts++
+        $lastProbe = & $Probe $Url $Token
+        $elapsedMs = [int](((& $Now) - $startedAt).TotalMilliseconds)
+        $verdict = Resolve-JarvisChatReadiness -Probe $lastProbe -ElapsedMs $elapsedMs `
+            -AllowChatError:$AllowChatError
+        $lastVerdict = $verdict
+        if ($verdict.ready -or $verdict.terminal) {
+            return [pscustomobject]@{
+                outcome = $verdict.outcome; ready = $verdict.ready; terminal = $verdict.terminal
+                proceed = $verdict.proceed; ok = $verdict.ok; exit_code = $verdict.exit_code
+                state = $verdict.state; signal = $verdict.signal; detail = $verdict.detail
+                error_class = $verdict.error_class; elapsed_ms = $elapsedMs; attempts = $attempts
+            }
+        }
+        & $Wait $PollMilliseconds
+    }
+
+    $elapsedMs = [int](((& $Now) - $startedAt).TotalMilliseconds)
+    $verdict = Resolve-JarvisChatReadiness -Probe $lastProbe -ElapsedMs $elapsedMs `
+        -TimedOut -AllowChatError:$AllowChatError
+    $detail = if ($lastVerdict) {
+        "$($verdict.detail); last signal $($lastVerdict.signal)"
+    } else {
+        "$($verdict.detail); no probe completed"
+    }
+    return [pscustomobject]@{
+        outcome = $verdict.outcome; ready = $verdict.ready; terminal = $verdict.terminal
+        proceed = $verdict.proceed; ok = $verdict.ok; exit_code = $verdict.exit_code
+        state = $verdict.state; signal = $verdict.signal; detail = $detail
+        error_class = $verdict.error_class; elapsed_ms = $elapsedMs; attempts = $attempts
+    }
 }
 
 function Start-JarvisInstalledApp {
@@ -439,6 +802,15 @@ $chatOutcome = 'not_run'
 $chatErrorClass = $null
 $chatErrorCode = $null
 $chatError = $null
+# The readiness step's record (DD-168): the outcome value, the signal it
+# waited on, the last state it observed, elapsed ms and the failure class.
+# 'not_run' means the chat step was skipped, so nothing waited for an engine.
+$readinessOutcome = 'not_run'
+$readinessSignal = $null
+$readinessState = $null
+$readinessElapsedMs = $null
+$readinessErrorClass = $null
+$readinessDetail = $null
 try {
 if (-not $SkipLaunch) {
     Write-Step 'Preflighting the fixed server port'
@@ -541,7 +913,59 @@ if (-not $SkipLaunch) {
     }
     Add-Result 'provenance' $true "running build is $($health.git_sha)"
 
-    # ── 5. Chat ───────────────────────────────────────────────────────────────
+    # ── 5. Chat readiness ────────────────────────────────────────────────────
+    if (-not $SkipChat) {
+        # /health above proved liveness and provenance only: Bun answers as
+        # soon as it serves requests, not when a model can answer. DD-168:
+        # wait (bounded) for the app's own engine snapshot before opening the
+        # chat stream, and record which signal satisfied the wait.
+        Write-Step 'Waiting for the chat engine to become ready'
+        $readinessUrl = "http://127.0.0.1:$ServerPort/health/readiness"
+        try {
+            $readiness = Wait-JarvisChatReady -Url $readinessUrl `
+                -TimeoutSeconds $ChatReadyTimeoutSeconds `
+                -Token $serverToken -Process $serverProcess `
+                -AllowChatError:$AllowChatError
+        } catch {
+            $readinessOutcome = 'unreachable'
+            $readinessSignal = 'readiness_http:unreachable'
+            $readinessState = 'probe_error'
+            $readinessErrorClass = 'chat_ready_probe_failed'
+            $readinessDetail = $_.Exception.Message
+            Add-Result 'chat-ready' $false $_.Exception.Message `
+                -Outcome 'unreachable' -ErrorClass 'chat_ready_probe_failed'
+            Die "the chat readiness wait failed: $($_.Exception.Message)"
+        }
+        $readinessOutcome = $readiness.outcome
+        $readinessSignal = $readiness.signal
+        $readinessState = $readiness.state
+        $readinessElapsedMs = [int]$readiness.elapsed_ms
+        $readinessErrorClass = $readiness.error_class
+        $readinessDetail = $readiness.detail
+        if (-not $readiness.proceed) {
+            # Without -AllowChatError a never-ready engine fails the smoke
+            # here, before the chat, with the signal and the last state it saw.
+            Add-Result 'chat-ready' $false ("{0} after {1} ms; last observed state '{2}'; signal {3}; {4}" -f
+                $readiness.outcome, $readiness.elapsed_ms, $readiness.state, $readiness.signal, $readiness.detail) `
+                -Outcome $readiness.outcome -ErrorClass $readiness.error_class
+            Die "the chat engine never became ready ($($readiness.outcome), signal $($readiness.signal), last state '$($readiness.state)', $($readiness.elapsed_ms) ms): $($readiness.detail)"
+        }
+        if ($readiness.ready) {
+            Add-Result 'chat-ready' $true ("ready after {0} ms ({1} polls); signal {2}; last observed state '{3}'" -f
+                $readiness.elapsed_ms, $readiness.attempts, $readiness.signal, $readiness.state) `
+                -Outcome 'ready'
+        } else {
+            # -AllowChatError (DD-EO15): the not-ready engine is recorded as
+            # data and the smoke still sends the chat, whose terminal error is
+            # tolerated exactly as before. This changes no exit code on the
+            # CI path.
+            Add-Result 'chat-ready' $true ("{0} after {1} ms; signal {2}; last observed state '{3}'; proceeding because -AllowChatError; the chat's terminal error stays tolerated" -f
+                $readiness.outcome, $readiness.elapsed_ms, $readiness.signal, $readiness.state) `
+                -Outcome $readiness.outcome -ErrorClass $readiness.error_class
+        }
+    }
+
+    # ── 6. Chat ───────────────────────────────────────────────────────────────
     if (-not $SkipChat) {
         Write-Step 'Sending a chat request'
         $streamUrl = "http://127.0.0.1:$ServerPort/chat/stream"
@@ -635,7 +1059,22 @@ $summary = [pscustomobject]@{
     chat_error_class = $chatErrorClass
     chat_error_code  = $chatErrorCode
     chat_error       = $chatError
-    steps            = $results.ToArray()
+    # DD-168: the readiness wait that precedes the chat. On a run that reached
+    # a ready engine this is 'ready'; with -AllowChatError a never-ready engine
+    # records 'not_ready' / 'timeout' / 'unreachable' here and the smoke still
+    # proceeds to the chat whose own error is tolerated. readiness_signal says
+    # which signal satisfied (or was last seen by) the wait, readiness_state is
+    # the last state the app reported, readiness_elapsed_ms how long the wait
+    # took, readiness_error_class names a terminal failure, and
+    # readiness_detail keeps the observed text. 'not_run' means the chat step
+    # was skipped, so nothing waited for an engine.
+    readiness_outcome     = $readinessOutcome
+    readiness_signal      = $readinessSignal
+    readiness_state       = $readinessState
+    readiness_elapsed_ms  = $readinessElapsedMs
+    readiness_error_class = $readinessErrorClass
+    readiness_detail      = $readinessDetail
+    steps                 = $results.ToArray()
 }
 $summary | ConvertTo-Json -Depth 5 | Write-Output
 
