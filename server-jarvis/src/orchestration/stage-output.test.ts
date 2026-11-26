@@ -38,6 +38,29 @@ describe("parseReviewerVerdict", () => {
   test("unknown verdict falls back to PARTIAL/MISSING substrings at the caller", () => {
     expect(parseReviewerVerdict("Review notes: PARTIAL coverage remains")).toBe("unknown");
   });
+
+  test("a plain leading verdict is the unambiguous form", () => {
+    expect(parseReviewerVerdict("ACCEPT\nEvidence matches the brief.")).toBe("accept");
+    expect(parseReviewerVerdict("REJECT\nEvidence does not match the brief.")).toBe("reject");
+  });
+
+  test("a negated ACCEPT is not an acceptance", () => {
+    expect(parseReviewerVerdict("I cannot ACCEPT this")).not.toBe("accept");
+    expect(parseReviewerVerdict("I cannot ACCEPT this")).toBe("reject");
+  });
+
+  test("an ACCEPT contradicted by a REJECT is a rejection", () => {
+    expect(parseReviewerVerdict("ACCEPT? no, REJECT")).toBe("reject");
+  });
+
+  test("a conditional ACCEPT is not an acceptance", () => {
+    expect(parseReviewerVerdict("would ACCEPT if fixed")).not.toBe("accept");
+    expect(parseReviewerVerdict("would ACCEPT if fixed")).toBe("reject");
+  });
+
+  test("a lone non-negated ACCEPT with a negative-sounding rationale still passes", () => {
+    expect(parseReviewerVerdict("Verdict: ACCEPT — no issues found")).toBe("accept");
+  });
 });
 
 describe("stage-output renderers", () => {

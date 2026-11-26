@@ -320,6 +320,21 @@ describe("harness execution", () => {
     expect(result.stop_reason).toBe("checker_rejected");
   });
 
+  test("a checker that refuses to ACCEPT does not settle passed", async () => {
+    const manifest = fixtureManifest();
+    const { state, store, execution } = setupHarness({
+      manifest, initialErrors: 0, checkerAnswer: "I cannot ACCEPT it",
+    });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-checker-refused",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+    expect(state.checkerPrompts).toHaveLength(1);
+    expect(result.stop_reason).toBe("checker_rejected");
+    expect(result.stop_reason).not.toBe("passed");
+  });
+
   test("(f) a saved template with a route-recorded approval runs its baseline-free sensor and settles passed", async () => {
     const manifest = instantiateHarnessTemplate("typescript_node_bug_fix", ROOT)!;
     expect(manifest.sensors[0]?.baseline).toBeUndefined();

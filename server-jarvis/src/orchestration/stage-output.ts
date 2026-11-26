@@ -75,13 +75,61 @@ export interface ReviewerStageOutput {
 
 export type ReviewerVerdict = "accept" | "reject" | "unknown";
 
-/** Parse the reviewer's leading verdict per prompts/modes/reviewer.md. */
+/** Sentence/clause boundaries used to judge a verdict token's own context. */
+const VERDICT_CLAUSE_BREAK = /[.!?;:\n]/;
+
+/**
+ * Words that negate or hedge an ACCEPT before it in the same clause. `n't`
+ * covers can't/won't/don't/isn't; "cannot" needs its own entry because there
+ * is no word boundary between "can" and "not".
+ */
+const CONTRADICTION_BEFORE =
+  /\b(?:not|never|no|cannot|would|could|should|might|if|unless|whether)\b|n['’]t\b/i;
+
+/**
+ * Words that turn a stated ACCEPT into a question, condition or reversal.
+ * Bare "no" is deliberately absent: "ACCEPT — no issues found" is a normal
+ * acceptance rationale.
+ */
+const CONTRADICTION_AFTER =
+  /^\s*\?|\b(?:not|never|cannot|would|could|should|might|if|unless|whether|but|however)\b|n['’]t\b/i;
+
+/** The clause text immediately before and after the verdict token at `index`. */
+function verdictClause(text: string, index: number): { before: string; after: string } {
+  const tokenEnd = index + "ACCEPT".length;
+  let start = index;
+  while (start > 0 && !VERDICT_CLAUSE_BREAK.test(text[start - 1]!)) start--;
+  let end = tokenEnd;
+  while (end < text.length && !VERDICT_CLAUSE_BREAK.test(text[end]!)) end++;
+  return { before: text.slice(start, index), after: text.slice(tokenEnd, end) };
+}
+
+/**
+ * Parse the reviewer's leading verdict per prompts/modes/reviewer.md.
+ *
+ * Only an unambiguous acceptance passes: the leading token, or a lone ACCEPT
+ * that is neither negated/hedged before it nor contradicted after it, and that
+ * no REJECT anywhere contradicts. A negated, hedged or contradicted ACCEPT is
+ * a refusal; text that names neither verdict is `unknown`.
+ */
 export function parseReviewerVerdict(feedback: string): ReviewerVerdict {
   const head = feedback.trimStart().slice(0, 200).toUpperCase();
-  if (/^\**\s*ACCEPT\b/.test(head)) return "accept";
+
+  // A leading REJECT is explicit, whatever follows it.
   if (/^\**\s*REJECT\b/.test(head)) return "reject";
-  if (/\bREJECT\b/.test(head) && !/\bACCEPT\b/.test(head)) return "reject";
-  if (/\bACCEPT\b/.test(head) && !/\bREJECT\b/.test(head)) return "accept";
+
+  const accepts = [...head.matchAll(/\bACCEPT\b/g)];
+  const namesReject = /\bREJECT\b/.test(head);
+  const leadingAccept = /^\**\s*ACCEPT\b/.test(head);
+
+  if (!namesReject && (leadingAccept || accepts.length === 1)) {
+    const { before, after } = verdictClause(head, accepts[0]!.index!);
+    if (!CONTRADICTION_BEFORE.test(before) && !CONTRADICTION_AFTER.test(after)) return "accept";
+  }
+
+  // A REJECT token, or an ACCEPT that its own clause negates or hedges, is a
+  // refusal; only text that names neither verdict is ambiguous.
+  if (namesReject || accepts.length > 0) return "reject";
   return "unknown";
 }
 
