@@ -6918,6 +6918,8 @@ export async function baseFetch(req: Request): Promise<Response> {
  * turn in the manifest's project root; the checker is a single model call
  * pinned to the agent resolved from the manifest id through the orchestration
  * pool (executor / reviewer for the templates' generic ids), not a fixed role.
+ * The harness resolves "auto" to a concrete, available delegate model before
+ * that runtime launches, so the CLI never receives `--model auto`.
  * Binding Inkling as the maker is DD-151.
  */
 let harnessExecution: HarnessExecution | undefined;
@@ -6926,9 +6928,16 @@ function serverHarnessExecution(): HarnessExecution {
   harnessExecution = createHarnessExecution({
     store: new HarnessStore(),
     agents: normalizeConfig(loadConfig()).orchestrator.agents,
-    runMakerTurn: async ({ cwd, prompt, signal }) => {
+    makerDelegate: {
+      // Fresh per turn, matching the old per-turn load. An "auto" delegate
+      // model is resolved to a concrete, available id inside the harness.
+      config: () => normalizeConfig(loadConfig()),
+      isAvailable: (config) =>
+        productionExecutorDelegateRuntime.availability.isAvailable(config),
+    },
+    runMakerTurn: async ({ cwd, prompt, config, signal }) => {
       const result = await productionExecutorDelegateRuntime.run({
-        config: normalizeConfig(loadConfig()),
+        config,
         prompt,
         sessionId: crypto.randomUUID(),
         allowedRoots: [cwd],

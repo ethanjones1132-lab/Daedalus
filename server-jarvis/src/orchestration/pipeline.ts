@@ -156,6 +156,7 @@ import {
   sanitizeDelegateDiagnosticText,
   type RunClaudeDelegateInput,
 } from "./claude-delegate";
+import { resolveAvailableDelegateModel } from "./delegate-model-resolve";
 import {
   clearDelegateThrash,
   DEFAULT_THRASH_TTL_MS,
@@ -2596,30 +2597,17 @@ export class PipelineExecutor {
         proxyAvailable: true,
         benchedModels: getBenchedDelegateModels(),
       });
-      let modelSelection: DelegateModelSelection | undefined;
-      let delegateConfig: typeof this.ctx.config | undefined;
-      for (const candidate of candidates) {
-        const cfg = {
-          ...this.ctx.config,
-          claude_cli: {
-            ...this.ctx.config.claude_cli,
-            delegate: {
-              ...this.ctx.config.claude_cli.delegate,
-              model: candidate.model,
-            },
-          },
-        };
-        let available = false;
-        try {
-          available = await delegateRuntime.availability.isAvailable(cfg);
-        } catch (error) {
+      const resolved = await resolveAvailableDelegateModel({
+        config: this.ctx.config,
+        candidates,
+        isAvailable: (cfg) => delegateRuntime.availability.isAvailable(cfg),
+        onAvailabilityError: (candidate, error) => {
           console.warn(
             `[Pipeline] delegate availability error for model=${candidate.model}: ` +
             `${error instanceof Error ? error.message : String(error)}`,
           );
-          continue;
-        }
-        if (!available) {
+        },
+        onUnavailable: (candidate) => {
           console.warn(
             `[Pipeline] delegate unavailable for model=${candidate.model} ` +
             `(${candidate.reason}); trying next candidate`,
@@ -2632,15 +2620,13 @@ export class PipelineExecutor {
             decision_source: "deterministic_reflex",
             reason: `${candidate.reason} model=${candidate.model}`,
           });
-          continue;
-        }
-        modelSelection = candidate;
-        delegateConfig = cfg;
-        break;
-      }
+        },
+      });
+      const modelSelection: DelegateModelSelection | undefined = resolved.resolution?.selection;
+      const delegateConfig: JarvisConfig | undefined = resolved.resolution?.config;
       if (!modelSelection || !delegateConfig) {
         console.warn(
-          `[Pipeline] delegate skipped: no available CLI model among ${candidates.map((c) => c.model).join(",")}`,
+          `[Pipeline] delegate skipped: no available CLI model among ${resolved.tried.join(",")}`,
         );
         this.collector.recordDirective?.({
           id: `dir_${crypto.randomUUID()}`,

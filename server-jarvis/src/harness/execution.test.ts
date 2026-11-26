@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { runHarness } from "./controller";
 import { createCheckerModelCall, createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
 import { defaultConfig, type JarvisConfig } from "../config";
@@ -9,6 +9,9 @@ import type { SensorSpawn } from "./sensors";
 import { HarnessStore } from "./store";
 import { instantiateHarnessTemplate } from "./templates";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import { __setDelegateWriteScoreboardStoreForTests } from "../orchestration/delegate-model-select";
+import { __resetModelHealthForTests } from "../orchestration/model-health";
+import { SelfTuningStore } from "../self-tuning/store";
 
 const ROOT = "/workspace/harness-fixture";
 
@@ -75,11 +78,23 @@ interface HarnessFixtureOptions {
   makerCostUsd?: number;
 }
 
+/** A maker delegate whose pin is already concrete, so no resolution is needed. */
+function pinnedMakerDelegate(): HarnessExecutionDeps["makerDelegate"] {
+  return {
+    config: () => {
+      const cfg = defaultConfig();
+      cfg.claude_cli.delegate.model = "minimax-m3";
+      return cfg;
+    },
+    isAvailable: async () => true,
+  };
+}
+
 function setupHarness(options: HarnessFixtureOptions) {
   const state = {
     errors: options.initialErrors ?? 2,
     spawns: [] as string[],
-    makerTurns: [] as Array<{ prompt: string; round: number; agent: HarnessAgentRef }>,
+    makerTurns: [] as Array<{ prompt: string; round: number; agent: HarnessAgentRef; model: string; config: JarvisConfig }>,
     checkerPrompts: [] as Array<{ prompt: string; agent: HarnessAgentRef }>,
   };
   const store = new HarnessStore({ dbPath: ":memory:" });
@@ -101,8 +116,8 @@ function setupHarness(options: HarnessFixtureOptions) {
     return { stdout: `errors: ${state.errors}`, stderr: "", exitCode: state.errors === 0 ? 0 : 1 };
   };
 
-  const runMakerTurn: HarnessMakerTurn = async ({ prompt, round, agent }) => {
-    state.makerTurns.push({ prompt, round, agent });
+  const runMakerTurn: HarnessMakerTurn = async ({ prompt, round, agent, config }) => {
+    state.makerTurns.push({ prompt, round, agent, model: config.claude_cli.delegate.model, config });
     const fixPerRound = options.fixPerRound ?? 1;
     state.errors = Math.max(0, state.errors - fixPerRound);
     return {
@@ -122,6 +137,7 @@ function setupHarness(options: HarnessFixtureOptions) {
     agents: AGENTS,
     spawn,
     runMakerTurn,
+    makerDelegate: pinnedMakerDelegate(),
     callModel,
     now: () => 0,
     ...options.deps,
@@ -213,6 +229,100 @@ describe("harness execution", () => {
     expect(result.stop_reason).toBe("passed");
     expect(result.rounds).toBe(2);
     expect(store.getRun("run-spend")?.cost_usd).toBeCloseTo(0.5);
+  });
+
+  describe("maker delegate model resolution", () => {
+    beforeEach(() => {
+      // Keep candidate ranking independent of the host's persisted bench state.
+      __resetModelHealthForTests();
+      __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
+    });
+
+    afterEach(() => {
+      // Restore the default store so no later test file inherits this one.
+      __setDelegateWriteScoreboardStoreForTests(null);
+      __resetModelHealthForTests();
+    });
+
+    test("resolves an auto delegate model to a concrete id before the maker turn", async () => {
+      const manifest = fixtureManifest();
+      const autoConfig = defaultConfig();
+      autoConfig.claude_cli.delegate.model = "auto";
+      const probes: string[] = [];
+      const { state, execution } = setupHarness({
+        manifest,
+        deps: {
+          makerDelegate: {
+            config: () => autoConfig,
+            isAvailable: async (config) => {
+              probes.push(config.claude_cli.delegate.model);
+              return true;
+            },
+          },
+        },
+      });
+
+      await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal });
+
+      const turn = state.makerTurns[0]!;
+      expect(turn.model).not.toBe("auto");
+      expect(turn.model.trim().length).toBeGreaterThan(0);
+      expect(turn.config.claude_cli.delegate.model).toBe(turn.model);
+      // The probe itself must also never see the unresolved pin.
+      expect(probes).not.toContain("auto");
+    });
+
+    test("fails clearly instead of launching when no delegate model is available", async () => {
+      const manifest = fixtureManifest();
+      const autoConfig = defaultConfig();
+      autoConfig.claude_cli.delegate.model = "auto";
+      const probes: string[] = [];
+      const { state, execution } = setupHarness({
+        manifest,
+        deps: {
+          makerDelegate: {
+            config: () => autoConfig,
+            isAvailable: async (config) => {
+              probes.push(config.claude_cli.delegate.model);
+              return false;
+            },
+          },
+        },
+      });
+
+      await expect(
+        execution.runMaker({ manifest, round: 1, signal: new AbortController().signal }),
+      ).rejects.toThrow(/no delegate model is available for the harness maker \(tried: /);
+      expect(probes.length).toBeGreaterThan(0);
+      expect(probes).not.toContain("auto");
+      expect(state.makerTurns).toHaveLength(0);
+    });
+
+    test("passes a concrete delegate pin through without probing", async () => {
+      const manifest = fixtureManifest();
+      let probes = 0;
+      const { state, execution } = setupHarness({
+        manifest,
+        deps: {
+          makerDelegate: {
+            config: () => {
+              const cfg = defaultConfig();
+              cfg.claude_cli.delegate.model = "deepseek-v4-pro";
+              return cfg;
+            },
+            isAvailable: async () => {
+              probes += 1;
+              return false;
+            },
+          },
+        },
+      });
+
+      await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal });
+
+      expect(probes).toBe(0);
+      expect(state.makerTurns[0]?.model).toBe("deepseek-v4-pro");
+    });
   });
 
   test("(c) a scripted maker that changes nothing settles no_progress", async () => {

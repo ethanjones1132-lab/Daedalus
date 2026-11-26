@@ -17,8 +17,10 @@
  * index.ts's native tool loop is inline in `streamJarvis`.
  *
  * The resolved maker/checker agent is carried on every call so DD-151 can bind
- * the pool's maker (Inkling) without changing this contract. Nothing here binds
- * a model or changes a pool default.
+ * the pool's maker (Inkling) without changing this contract. The maker's
+ * delegate model is resolved and probed here (shared resolver with the
+ * pipeline), so an "auto" pin becomes a concrete id before the CLI launch; no
+ * pool default is changed.
  *
  * Every boundary that reaches the outside world — command spawn, executor turn,
  * model call, clock — is injected so tests run with fakes: no network, GPU or
@@ -33,6 +35,11 @@ import {
   DEFAULT_ORCHESTRATOR_AGENTS,
   type OrchestratorAgent,
 } from "../orchestration/agent-pool";
+import { resolveAvailableDelegateModel } from "../orchestration/delegate-model-resolve";
+import {
+  enumerateDelegateModelCandidates,
+  getBenchedDelegateModels,
+} from "../orchestration/delegate-model-select";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
 import { resolveHarnessAgent, agentFamily, type HarnessAgentRef } from "./agents";
@@ -58,6 +65,12 @@ export interface HarnessMakerTurnInput {
   agent: HarnessAgentRef;
   round: number;
   signal: AbortSignal;
+  /**
+   * The delegate config this turn must launch with. Its
+   * `claude_cli.delegate.model` is always a concrete id: an "auto" pin was
+   * resolved and probed before the turn reached this boundary.
+   */
+  config: JarvisConfig;
 }
 
 /** One maker round: an executor tool loop for a turn. `ok: false` fails the round. */
@@ -80,11 +93,24 @@ export interface HarnessModelCallInput {
 /** One agent call (the checker). Never a tool loop. */
 export type HarnessModelCall = (input: HarnessModelCallInput) => Promise<{ text: string }>;
 
+/** The config source and launch probe the maker's delegate resolution needs. */
+export interface HarnessMakerDelegate {
+  /** Fresh config for this turn; an "auto" delegate model is resolved from it. */
+  config: () => JarvisConfig;
+  /** Launch readiness for one candidate config (already pinned to its model). */
+  isAvailable: (config: JarvisConfig) => Promise<boolean>;
+}
+
 export interface HarnessExecutionDeps {
   /** Approval lookup, bound to (command_id, project root, manifest hash). */
   store: Pick<HarnessStore, "findApproval">;
   /** The single-stage executor tool loop reused for a maker round. */
   runMakerTurn: HarnessMakerTurn;
+  /**
+   * Resolves the delegate model before the maker's CLI launch. Required so an
+   * unresolved "auto" can never reach the command line.
+   */
+  makerDelegate: HarnessMakerDelegate;
   /** The agent call used for the checker. */
   callModel: HarnessModelCall;
   /** Direct command spawn; defaults to execFile with no shell. */
@@ -513,6 +539,38 @@ function backgroundAdmission(): HarnessAdmission {
   };
 }
 
+/**
+ * Resolve the maker's delegate config before a turn launches the CLI. A
+ * concrete pin passes through untouched (existing behaviour); "auto" or an
+ * empty pin is enumerated through the shared selection rules and probed, so the
+ * runtime only ever receives a concrete, available id. When nothing is
+ * available the turn fails with the tried ids instead of launching "auto".
+ */
+async function resolveMakerDelegateConfig(maker: HarnessMakerDelegate): Promise<JarvisConfig> {
+  const config = maker.config();
+  const configured = config.claude_cli.delegate.model.trim();
+  if (configured && configured.toLowerCase() !== "auto") return config;
+  const candidates = enumerateDelegateModelCandidates({
+    configuredModel: config.claude_cli.delegate.model,
+    thrashCount: 0,
+    hasOpenCodeGoKey: Boolean(config.opencode_go.api_key?.trim()),
+    proxyAvailable: true,
+    benchedModels: getBenchedDelegateModels(),
+  });
+  const resolved = await resolveAvailableDelegateModel({
+    config,
+    candidates,
+    isAvailable: maker.isAvailable,
+  });
+  const resolution = resolved.resolution;
+  if (!resolution) {
+    throw new Error(
+      `no delegate model is available for the harness maker (tried: ${resolved.tried.join(", ")})`,
+    );
+  }
+  return resolution.config;
+}
+
 /** Build the server's harness execution boundaries from injected dependencies. */
 export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecution {
   const spawn = deps.spawn ?? defaultSpawn;
@@ -544,6 +602,16 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (!agent) {
       throw new Error(`no executor agent is available for harness maker "${manifest.maker_agent_id}"`);
     }
+    // Resolve before the first side effect of the turn so a missing model is a
+    // clear failure, not a CLI launch with "--model auto". The message is also
+    // logged because the controller records only the maker_failed stop reason.
+    const config = await resolveMakerDelegateConfig(deps.makerDelegate).catch((error) => {
+      console.error(
+        `[Harness] maker delegate resolution failed: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    });
     if (round === 1 && manifest.checker.enabled) {
       runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
     }
@@ -554,6 +622,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       agent: agentRef(agent),
       round,
       signal,
+      config,
     });
     const cost = typeof turn.cost_usd === "number" ? { cost_usd: turn.cost_usd } : {};
     return turn.ok ? cost : { failed: true, ...cost };
