@@ -61,6 +61,12 @@ export interface ExecutorStageOutput {
   /** Actual provider/model used by the final native candidate, for bounded escalation. */
   modelKey?: string;
   /**
+   * Spend the provider reported for this turn, in US dollars, when the CLI
+   * emitted a result frame carrying `total_cost_usd`. Absent when unreported;
+   * never inferred. Consumed by the harness budget cap.
+   */
+  cost_usd?: number;
+  /**
    * Persistable Claude-delegate process diagnostics (request id, exit code,
    * sanitized stderr tail). Never put this on SSE or final_output.
    */

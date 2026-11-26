@@ -63,7 +63,7 @@ export interface HarnessMakerTurnInput {
 /** One maker round: an executor tool loop for a turn. `ok: false` fails the round. */
 export type HarnessMakerTurn = (
   input: HarnessMakerTurnInput,
-) => Promise<{ ok: boolean; narrative?: string }>;
+) => Promise<{ ok: boolean; narrative?: string; cost_usd?: number }>;
 
 export interface HarnessModelCallInput {
   prompt: string;
@@ -177,6 +177,7 @@ function scratchSensorStore(
     manifest_id: manifest.id,
     manifest_hash: "",
     status: "scratch",
+    cost_usd: 0,
     created_at: createdAt,
     rounds: [],
     events: [],
@@ -554,7 +555,8 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       round,
       signal,
     });
-    return turn.ok ? {} : { failed: true };
+    const cost = typeof turn.cost_usd === "number" ? { cost_usd: turn.cost_usd } : {};
+    return turn.ok ? cost : { failed: true, ...cost };
   };
 
   // The controller and manifest validation already refuse a checker equal to the

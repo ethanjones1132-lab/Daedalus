@@ -72,6 +72,40 @@ describe("HarnessStore", () => {
     expect(store.getRun(run.id)?.rounds[0]?.sensor_results[0]?.stdout_truncated).toBe(true);
   });
 
+  test("accumulates reported spend on the run record", () => {
+    const store = new HarnessStore({ dbPath: ":memory:" });
+    const run = store.createRun({ project_root: "/workspace/one", manifest_id: "bugfix", manifest_hash: "hash" });
+    expect(store.getRun(run.id)?.cost_usd).toBe(0);
+    expect(store.addRunCost({ run_id: run.id, cost_usd: 0.25 })).toBeCloseTo(0.25);
+    expect(store.addRunCost({ run_id: run.id, cost_usd: 0.5 })).toBeCloseTo(0.75);
+    expect(store.getRun(run.id)?.cost_usd).toBeCloseTo(0.75);
+    const listed = store.listRuns("/workspace/one");
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.cost_usd).toBeCloseTo(0.75);
+  });
+
+  test("adds the spend counter to a database created before the column existed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "harness-store-"));
+    try {
+      const dbPath = join(dir, "state.db");
+      const old = new Database(dbPath, { create: true });
+      try {
+        old.exec(`CREATE TABLE harness_runs (id TEXT PRIMARY KEY, project_root TEXT NOT NULL, manifest_id TEXT NOT NULL,
+          manifest_hash TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL)`);
+        old.prepare("INSERT INTO harness_runs (id, project_root, manifest_id, manifest_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+          .run("old-run", "/workspace/one", "bugfix", "hash", "running", new Date(0).toISOString());
+      } finally { old.close(); }
+
+      const store = new HarnessStore({ dbPath });
+      expect(store.getRun("old-run")?.cost_usd).toBe(0);
+      expect(store.addRunCost({ run_id: "old-run", cost_usd: 0.4 })).toBeCloseTo(0.4);
+      expect(store.getRun("old-run")?.cost_usd).toBeCloseTo(0.4);
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); }
+      catch { /* a leftover temp dir must not fail the test */ }
+    }
+  });
+
   test("lists manifests and runs only for the requested project root", () => {
     const store = new HarnessStore({ dbPath: ":memory:" });
     store.saveManifest(manifest("/workspace/one"), 0);

@@ -32,6 +32,7 @@ const HARNESS_SCHEMA = `
     manifest_id TEXT NOT NULL,
     manifest_hash TEXT NOT NULL,
     status TEXT NOT NULL,
+    cost_usd REAL NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_harness_runs_project ON harness_runs(project_root, created_at);
@@ -82,6 +83,18 @@ function serverStateDbPath(): string {
   return path;
 }
 
+/**
+ * `CREATE TABLE IF NOT EXISTS` never adds a column to a database that predates
+ * it, so the spend counter is added in place on first open. An existing run's
+ * spend starts at 0, which is what a run that was never measured did spend.
+ */
+function ensureRunCostColumn(db: Database): void {
+  const columns = db.query("PRAGMA table_info(harness_runs)").all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "cost_usd")) {
+    db.exec("ALTER TABLE harness_runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0");
+  }
+}
+
 function boundedOutput(output: string): { value: string; truncated: boolean } {
   const bytes = Buffer.from(output, "utf8");
   if (bytes.byteLength <= MAX_OUTPUT_BYTES) return { value: output, truncated: false };
@@ -111,6 +124,8 @@ export interface HarnessRun {
   manifest_id: string;
   manifest_hash: string;
   status: string;
+  /** Spend reported by the delegate across the run's rounds, in US dollars. */
+  cost_usd: number;
   created_at: string;
   rounds: HarnessRound[];
   events: HarnessEvent[];
@@ -136,6 +151,8 @@ export interface HarnessSensorResultInput {
 export interface HarnessSensorResult extends Omit<HarnessSensorResultInput, "id" | "stdout" | "stderr"> {
   id: string; stdout: string; stdout_truncated: boolean; stderr: string; stderr_truncated: boolean; created_at: string;
 }
+/** One round's reported spend, added to the run's running total. */
+export interface HarnessRunCostInput { run_id: string; cost_usd: number }
 export interface HarnessApprovalInput {
   command_id: string;
   project_root: string;
@@ -164,6 +181,8 @@ export function deriveRunStatus(
     : undefined;
   if (stopReason === "passed") return "passed";
   if (stopReason === "cancelled") return "cancelled";
+  // Every other stop — max_rounds, no_progress, budget_exceeded, run_failed and
+  // the rest — is a real stop that did not pass, so the run status reads failed.
   return "failed";
 }
 
@@ -179,6 +198,7 @@ export class HarnessStore {
       if (!this.memoryDb) {
         const db = new Database(":memory:");
         db.exec(HARNESS_SCHEMA);
+        ensureRunCostColumn(db);
         db.close = () => {};
         this.memoryDb = db;
       }
@@ -186,6 +206,7 @@ export class HarnessStore {
     }
     const db = new Database(this.dbPath, { create: true });
     db.exec(HARNESS_SCHEMA);
+    ensureRunCostColumn(db);
     return db;
   }
 
@@ -244,10 +265,10 @@ export class HarnessStore {
   createRun(input: HarnessRunInput): HarnessRun {
     if (!isCanonicalRoot(input.project_root)) throw new Error("project_root must be an absolute canonical path");
     const db = this.open();
-    const run = { ...input, id: input.id ?? newId(), status: input.status ?? "running", created_at: now() };
+    const run = { ...input, id: input.id ?? newId(), status: input.status ?? "running", cost_usd: 0, created_at: now() };
     try {
-      db.prepare("INSERT INTO harness_runs (id, project_root, manifest_id, manifest_hash, status, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-        .run(run.id, run.project_root, run.manifest_id, run.manifest_hash, run.status, run.created_at);
+      db.prepare("INSERT INTO harness_runs (id, project_root, manifest_id, manifest_hash, status, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .run(run.id, run.project_root, run.manifest_id, run.manifest_hash, run.status, run.cost_usd, run.created_at);
       return { ...run, rounds: [], events: [] };
     } finally { db.close(); }
   }
@@ -278,6 +299,23 @@ export class HarnessStore {
         .run(result.id, result.run_id, result.round_id, result.sensor_id, result.status, result.counter ?? null,
           result.exit_code ?? null, result.stdout, Number(result.stdout_truncated), result.stderr, Number(result.stderr_truncated), result.created_at);
       return result;
+    } finally { db.close(); }
+  }
+
+  /**
+   * Add one round's reported spend to the run's running total and return it.
+   * This counter is the only mutable field on a run row: status stays derived
+   * from the append-only `stopped` event, while spend accrues round by round so
+   * a run that never settles still shows what it cost.
+   */
+  addRunCost(input: HarnessRunCostInput): number {
+    if (!Number.isFinite(input.cost_usd) || input.cost_usd < 0) throw new Error("cost_usd must be a non-negative finite number");
+    const db = this.open();
+    try {
+      db.prepare("UPDATE harness_runs SET cost_usd = cost_usd + ? WHERE id = ?").run(input.cost_usd, input.run_id);
+      const row = db.query("SELECT cost_usd FROM harness_runs WHERE id = ?").get(input.run_id) as { cost_usd: number } | null;
+      if (!row) throw new Error(`Unknown harness run ${input.run_id}`);
+      return row.cost_usd;
     } finally { db.close(); }
   }
 
@@ -324,7 +362,7 @@ export class HarnessStore {
   getRun(id: string): HarnessRun | undefined {
     const db = this.open();
     try {
-      const row = db.query("SELECT id, project_root, manifest_id, manifest_hash, status, created_at FROM harness_runs WHERE id = ?")
+      const row = db.query("SELECT id, project_root, manifest_id, manifest_hash, status, cost_usd, created_at FROM harness_runs WHERE id = ?")
         .get(id) as Omit<HarnessRun, "rounds" | "events"> | null;
       if (!row) return undefined;
       const rounds = db.query("SELECT id, run_id, round_number, counter_vector_json, created_at FROM harness_rounds WHERE run_id = ? ORDER BY round_number")

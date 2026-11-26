@@ -3,7 +3,7 @@ import { agentFamily, resolveHarnessAgent } from "./agents";
 import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import type { HarnessRoundInput, HarnessSensorResultInput, HarnessStore } from "./store";
 
-export type HarnessStopReason = "passed" | "max_rounds" | "cancelled" | "approval_denied" | "no_progress" | "maker_failed" | "checker_rejected" | "deadline" | "run_failed";
+export type HarnessStopReason = "passed" | "max_rounds" | "cancelled" | "approval_denied" | "no_progress" | "maker_failed" | "checker_rejected" | "deadline" | "run_failed" | "budget_exceeded";
 
 export interface HarnessRunResult {
   run_id: string;
@@ -46,9 +46,9 @@ export interface HarnessAdmission {
 
 export interface HarnessControllerInput {
   manifest: HarnessManifest;
-  store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent">;
+  store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
-  runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean } | void>;
+  runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean; cost_usd?: number } | void>;
   runChecker: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<{ passed: boolean }>;
   /** Agent pool used to resolve the maker/checker model families. Defaults to the shipped pool. */
   agents?: readonly OrchestratorAgent[];
@@ -142,6 +142,10 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
   let rounds = 0;
   let abandoned = false;
   let failure: string | undefined;
+  // Spend reported per maker round, accumulated on the run. A manifest without
+  // a cap still records it; only the stop check is gated on the cap.
+  const maxCostUsd = input.manifest.max_cost_usd;
+  let spentUsd = 0;
   // Aborting rejects the wait at each step but leaves the maker/sensor/checker
   // promise in flight. Track it so the finally can wait for it (bounded) before
   // it frees the admission lease and claims the run stopped.
@@ -167,11 +171,24 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
       .map((sensor) => [sensor.id, sensor.baseline!]));
     let previous: HarnessRoundInput["counter_vector"] | undefined = Object.keys(baselines).length ? baselines : undefined;
     if (lease) for (let roundNumber = 1; roundNumber <= input.manifest.loop.max_rounds; roundNumber++) {
+      // The cap is settled between rounds: once the reported spend reaches it,
+      // the next round never starts. Cancellation and the deadline keep their
+      // own precedence when they have already fired.
+      if (maxCostUsd !== undefined && spentUsd >= maxCostUsd) {
+        reason = input.signal?.aborted ? "cancelled" : abort.signal.aborted || now() >= deadlineAt ? "deadline" : "budget_exceeded";
+        break;
+      }
       rounds = roundNumber;
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       let maker: Awaited<ReturnType<typeof input.runMaker>>;
       try { maker = await waitWithAbort(track(input.runMaker({ manifest: input.manifest, round: roundNumber, signal: abort.signal })), abort.signal); }
       catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "maker_failed"; break; }
+      // A returned turn reports what it spent, even when it failed or the run is
+      // about to stop, so the run record holds the cost that was actually paid.
+      const roundCost = maker?.cost_usd;
+      if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) {
+        spentUsd = input.store.addRunCost({ run_id: run.id, cost_usd: roundCost });
+      }
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       if (maker?.failed) { reason = "maker_failed"; break; }
       let batch: HarnessSensorBatch;
@@ -250,7 +267,8 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
     abandoned = await waitForAbandoned(pending, abandonWaitMs);
     lease?.release();
     input.store.appendEvent({ run_id: run.id, event_type: "stopped", payload: {
-      stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
+      stop_reason: reason, rounds, ...(spentUsd > 0 ? { cost_usd: spentUsd } : {}),
+      ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
     } });
   }
   return { run_id: run.id, stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}) };

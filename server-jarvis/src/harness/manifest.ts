@@ -40,6 +40,11 @@ export interface HarnessManifest {
   sensors: HarnessSensor[];
   loop: { max_rounds: number; abort_on_no_progress: boolean };
   approval: { required_for_new_commands: boolean };
+  /**
+   * Optional per-run spend cap in US dollars. Absent means no spend cap, so
+   * every manifest written before this field existed keeps its behaviour.
+   */
+  max_cost_usd?: number;
 }
 
 export type ManifestValidationResult =
@@ -97,7 +102,7 @@ export function validateManifest(input: unknown): ManifestValidationResult {
   const errors: string[] = [];
   if (!isRecord(input)) return { ok: false, errors: ["manifest must be an object"] };
   const value = input;
-  rejectUnknownKeys(value, ["schema_version", "id", "project_root", "project_kind", "purpose", "template_family", "guides", "maker_agent_id", "checker", "sensors", "loop", "approval"], "manifest", errors);
+  rejectUnknownKeys(value, ["schema_version", "id", "project_root", "project_kind", "purpose", "template_family", "guides", "maker_agent_id", "checker", "sensors", "loop", "approval", "max_cost_usd"], "manifest", errors);
 
   if (value.schema_version !== HARNESS_SCHEMA_VERSION) errors.push("schema_version must be 1");
   if (!isString(value.id) || !value.id.trim()) errors.push("id must be a non-empty string");
@@ -164,6 +169,13 @@ export function validateManifest(input: unknown): ManifestValidationResult {
     errors.push("loop.max_rounds must be an integer from 1 through 5");
   }
   if (!isRecord(loop) || typeof loop.abort_on_no_progress !== "boolean") errors.push("loop.abort_on_no_progress must be boolean");
+  // Optional, but when present it must be usable as a spend cap: a positive
+  // finite number. Zero or a negative value would stop the run before its first
+  // round, which is never what a manifest author meant to declare.
+  if (value.max_cost_usd !== undefined &&
+      (typeof value.max_cost_usd !== "number" || !Number.isFinite(value.max_cost_usd) || value.max_cost_usd <= 0)) {
+    errors.push("max_cost_usd must be a positive finite number");
+  }
   if (isRecord(value.approval)) rejectUnknownKeys(value.approval, ["required_for_new_commands"], "approval", errors);
   if (!isRecord(value.approval) || typeof value.approval.required_for_new_commands !== "boolean") errors.push("approval.required_for_new_commands must be boolean");
 

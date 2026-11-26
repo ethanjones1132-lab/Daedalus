@@ -71,6 +71,8 @@ interface HarnessFixtureOptions {
   deps?: Partial<HarnessExecutionDeps>;
   /** Seed an approved row for every sensor command (default true). */
   autoApprove?: boolean;
+  /** Spend each scripted maker turn reports on its result, when set. */
+  makerCostUsd?: number;
 }
 
 function setupHarness(options: HarnessFixtureOptions) {
@@ -103,7 +105,11 @@ function setupHarness(options: HarnessFixtureOptions) {
     state.makerTurns.push({ prompt, round, agent });
     const fixPerRound = options.fixPerRound ?? 1;
     state.errors = Math.max(0, state.errors - fixPerRound);
-    return { ok: true, narrative: options.narrative ?? "maker narrative" };
+    return {
+      ok: true,
+      narrative: options.narrative ?? "maker narrative",
+      ...(options.makerCostUsd !== undefined ? { cost_usd: options.makerCostUsd } : {}),
+    };
   };
 
   const callModel: HarnessModelCall = async ({ prompt, agent }) => {
@@ -193,6 +199,20 @@ describe("harness execution", () => {
     expect(state.makerTurns[1]?.prompt).toContain("Harness round 2 of 3.");
     expect(state.makerTurns[1]?.prompt).toContain("typecheck (nonzero, counter 1)");
     expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
+  });
+
+  test("a maker turn's reported spend reaches the run record through the execution seam", async () => {
+    const manifest = fixtureManifest();
+    const { store, execution } = setupHarness({ manifest, makerCostUsd: 0.25 });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-spend",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("passed");
+    expect(result.rounds).toBe(2);
+    expect(store.getRun("run-spend")?.cost_usd).toBeCloseTo(0.5);
   });
 
   test("(c) a scripted maker that changes nothing settles no_progress", async () => {

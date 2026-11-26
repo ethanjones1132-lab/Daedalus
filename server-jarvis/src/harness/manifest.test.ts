@@ -48,6 +48,16 @@ describe("harness manifest v1", () => {
     rejected((m) => { m.sensors[0].command_id = "bun_test"; m.sensors[0].args = ["../outside"]; }, "safe strings");
   });
   test("rejects max_rounds outside 1..5", () => rejected((m) => { m.loop.max_rounds = 6; }, "max_rounds"));
+  test("accepts an optional positive max_cost_usd and leaves it absent by default", () => {
+    expect(validateManifest(fixture()).ok).toBe(true);
+    expect(validateManifest(fixture({ max_cost_usd: 2.5 })).ok).toBe(true);
+  });
+  test("rejects a max_cost_usd that is not a positive finite number", () => {
+    rejected((m) => { m.max_cost_usd = 0; }, "max_cost_usd must be a positive finite number");
+    rejected((m) => { m.max_cost_usd = -0.01; }, "max_cost_usd must be a positive finite number");
+    rejected((m) => { m.max_cost_usd = Number.POSITIVE_INFINITY; }, "max_cost_usd must be a positive finite number");
+    rejected((m) => { m.max_cost_usd = Number.NaN; }, "max_cost_usd must be a positive finite number");
+  });
   test("rejects checker identity matching maker", () => rejected((m) => { m.checker.agent_id = m.maker_agent_id; }, "must differ"));
   test("rejects non-absolute or non-canonical project roots", () => {
     rejected((m) => { m.project_root = "relative/project"; }, "absolute canonical");

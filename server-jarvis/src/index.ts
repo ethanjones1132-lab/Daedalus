@@ -6938,7 +6938,7 @@ function serverHarnessExecution(): HarnessExecution {
         nativeNoWrite: false,
         signal,
       });
-      return { ok: result.ok, narrative: result.narrative };
+      return { ok: result.ok, narrative: result.narrative, ...(typeof result.cost_usd === "number" ? { cost_usd: result.cost_usd } : {}) };
     },
     callModel: async ({ prompt, agent, signal, excludeFamilies }) =>
       createCheckerModelCall(normalizeConfig(loadConfig()), agent, { excludeFamilies })({ prompt, agent, signal }),

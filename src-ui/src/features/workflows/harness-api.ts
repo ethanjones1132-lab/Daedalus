@@ -34,6 +34,8 @@ export interface HarnessManifest {
   sensors: HarnessSensor[];
   loop: { max_rounds: number; abort_on_no_progress: boolean };
   approval: { required_for_new_commands: boolean };
+  /** Optional per-run spend cap in US dollars; absent means no spend cap. */
+  max_cost_usd?: number;
 }
 export interface HarnessSensorResult {
   id: string;
@@ -55,6 +57,8 @@ export interface HarnessRun {
   manifest_id: string;
   manifest_hash: string;
   status: string;
+  /** Spend reported by the delegate for this run, in US dollars. */
+  cost_usd?: number;
   created_at: string;
   rounds: Array<{ id: string; run_id: string; round_number: number; counter_vector: Record<string, number | null | 'not_applicable'>; created_at: string; sensor_results: HarnessSensorResult[] }>;
   events: Array<{ id: string; run_id: string; event_type: string; payload: unknown; created_at: string }>;

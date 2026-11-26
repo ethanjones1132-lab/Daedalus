@@ -1450,9 +1450,13 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
           : undefined,
       };
     };
+    /** Spend the CLI reported on its result frame; kept even when the turn fails. */
+    let reportedCostUsd: number | undefined;
     const withDiagnostics = (result: ExecutorStageOutput): ExecutorStageOutput => ({
       ...result,
       diagnostics: stageDiagnostics(),
+      // Only what the CLI itself reported; an unreported turn stays absent.
+      ...(reportedCostUsd !== undefined ? { cost_usd: reportedCostUsd } : {}),
     });
     const deliveredPrompt = invocation.promptForDelivery ?? input.prompt;
     const launchPromise = input.processFactory({
@@ -1541,6 +1545,11 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               input.onTextDelta?.(event.delta.text);
             }
             else if (event.type === "result") {
+              // The result record is also the only place the CLI reports spend.
+              // Record it before judging the outcome: a failed turn still cost.
+              if (typeof event.cost_usd === "number" && Number.isFinite(event.cost_usd)) {
+                reportedCostUsd = event.cost_usd;
+              }
               // Mirror the native CLI rule (index.ts): the result record is the
               // authoritative turn outcome, and an `error*` subtype fails the
               // turn even when `is_error` is unset. Error text is failure

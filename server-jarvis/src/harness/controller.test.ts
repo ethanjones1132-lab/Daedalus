@@ -313,6 +313,49 @@ describe("runHarness", () => {
     expect(checks).toBe(1);
   });
 
+  test("stops with budget_exceeded before the round that would follow the cap", async () => {
+    const item = manifest();
+    item.max_cost_usd = 0.1;
+    let sensorCall = 0;
+    let makers = 0;
+    const setup = deps({
+      manifest: item,
+      runMaker: async () => { makers++; return { cost_usd: 0.06 }; },
+      sensors: async () => failing(5 - sensorCall++),
+    });
+
+    const result = await runHarness(setup.input);
+
+    // Rounds one and two spend 0.06 each; the cap is crossed by round two, so
+    // round three never starts and the spend it would have incurred never does.
+    expect(result.stop_reason).toBe("budget_exceeded");
+    expect(result.rounds).toBe(2);
+    expect(makers).toBe(2);
+    const run = setup.store.getRun(result.run_id);
+    expect(run?.cost_usd).toBeCloseTo(0.12);
+    const stopped = run?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toMatchObject({ stop_reason: "budget_exceeded", rounds: 2 });
+    expect((stopped[0]?.payload as { cost_usd?: number }).cost_usd).toBeCloseTo(0.12);
+  });
+
+  test("a manifest with no spend cap runs to its round cap and still records spend", async () => {
+    const item = manifest();
+    item.loop.max_rounds = 2;
+    let sensorCall = 0;
+    const setup = deps({
+      manifest: item,
+      runMaker: async () => ({ cost_usd: 0.5 }),
+      sensors: async () => failing(5 - sensorCall++),
+    });
+
+    const result = await runHarness(setup.input);
+
+    expect(result.stop_reason).toBe("max_rounds");
+    expect(result.rounds).toBe(2);
+    expect(setup.store.getRun(result.run_id)?.cost_usd).toBeCloseTo(1);
+  });
+
   test("a failing optional sensor blocks the pass instead of passing silently", async () => {
     const item = manifest();
     item.sensors = [...item.sensors, { id: "lint", kind: "command", command_id: "bun_typecheck", args: [], timeout_ms: 1000,

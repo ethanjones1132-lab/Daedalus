@@ -2183,6 +2183,39 @@ describe("Claude executor delegate", () => {
     expect(result.narrative).not.toMatch(/exited without emitting stream events/i);
   });
 
+  test("carries the result frame's reported spend out of the delegate, even on a failed turn", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const result = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      snapshotFactory: { capture: async () => [snapshot] },
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            result: "execution failed mid-turn",
+            total_cost_usd: 0.037,
+          };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.cost_usd).toBeCloseTo(0.037);
+  });
+
   test("CLI failure narrative scrubs credential-bearing detail", async () => {
     const config = testConfig();
     const snapshot: DelegateRootSnapshot = {
