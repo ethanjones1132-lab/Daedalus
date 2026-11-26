@@ -965,6 +965,36 @@ export async function* streamSpawnedClaudeCli(
     // `completed`, with the later failure losing the terminal-outcome race.
     // Hold them here and release only after a clean exit.
     const pendingResults: ClaudeStreamEvent[] = [];
+    // One line's worth of decoded stream events, shared by the live loop and
+    // the end-of-stream leftover so there is exactly one parse path. Mutates
+    // `fullOutput` and `pendingResults`; the caller decides when to yield.
+    const decodeLine = (line: string): ClaudeStreamEvent[] => {
+      const events: ClaudeStreamEvent[] = [];
+      const trimmed = line.trim();
+      if (!trimmed) return events;
+
+      try {
+        const msg: ClaudeCliMessage = JSON.parse(trimmed);
+        for (const event of decodeClaudeCliMessage(msg, decodeState)) {
+          if (event.type === "stream_event" && event.delta?.text) {
+            fullOutput += event.delta.text;
+          } else if (event.type === "result") {
+            if (!event.content) event.content = fullOutput;
+            pendingResults.push(event);
+            continue;
+          }
+          events.push(event);
+        }
+      } catch {
+        // Non-JSON line — treat as plain text
+        if (trimmed.length > 0) {
+          fullOutput += trimmed + "\n";
+          events.push({ type: "stream_event", delta: { text: trimmed + "\n" } });
+        }
+      }
+      return events;
+    };
+
     const stdoutIterator = child.stdout[Symbol.asyncIterator]();
 
     while (true) {
@@ -984,28 +1014,7 @@ export async function* streamSpawnedClaudeCli(
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        try {
-          const msg: ClaudeCliMessage = JSON.parse(trimmed);
-          for (const event of decodeClaudeCliMessage(msg, decodeState)) {
-            if (event.type === "stream_event" && event.delta?.text) {
-              fullOutput += event.delta.text;
-            } else if (event.type === "result") {
-              if (!event.content) event.content = fullOutput;
-              pendingResults.push(event);
-              continue;
-            }
-            yield event;
-          }
-        } catch {
-          // Non-JSON line — treat as plain text
-          if (trimmed.length > 0) {
-            fullOutput += trimmed + "\n";
-            yield { type: "stream_event", delta: { text: trimmed + "\n" } };
-          }
-        }
+        for (const event of decodeLine(line)) yield event;
       }
     }
 
@@ -1047,6 +1056,15 @@ export async function* streamSpawnedClaudeCli(
           : `Claude CLI exited with code ${exit.code ?? "unknown"}`,
       };
       return;
+    }
+    // The stream is done and the child exited cleanly, so a final record that
+    // never got its newline is still a complete answer: parse it through the
+    // same per-line path, then clear it. An abort, a signal kill or a timeout
+    // returned above and deliberately drops it instead — a half-written line
+    // is not an answer (DD-170).
+    if (buffer) {
+      for (const event of decodeLine(buffer)) yield event;
+      buffer = "";
     }
     // The child exited cleanly, so its `result` records are the authoritative
     // turn outcome after all. Only now may they reach the consumer.

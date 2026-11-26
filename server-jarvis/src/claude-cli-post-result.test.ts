@@ -4,6 +4,8 @@ import { join } from "path";
 import {
   claudeCliPostResultErrorAction,
   normalizeClaudeCliExit,
+  streamSpawnedClaudeCli,
+  type ClaudeCliSpawnedChild,
   type ClaudeStreamEvent,
 } from "./claude-cli";
 import { StreamSession } from "./stream-emitter";
@@ -88,6 +90,75 @@ function applyErrorFrame(
   }
   if (action.forward && session.noteOutcome()) forwarded.push(evt);
   return { forwarded, warnings };
+}
+
+/** A spawned child whose stdout/stderr are scripted and fully available. */
+function scriptedChild(
+  stdoutChunks: string[],
+  exit: number | { code: number | null; signal: string | null },
+): ClaudeCliSpawnedChild {
+  const stream = (chunks: string[]): AsyncIterable<unknown> => ({
+    async *[Symbol.asyncIterator]() {
+      for (const chunk of chunks) yield chunk;
+    },
+  });
+  return {
+    waitUntilSpawned: async () => undefined,
+    stdout: stream(stdoutChunks),
+    stderr: stream([]),
+    kill() {},
+    waitForExit: async () => exit,
+  };
+}
+
+/** Safety net so a stream bug fails the suite instead of hanging it. */
+async function withSuiteDeadline<T>(promise: Promise<T>, ms = 2_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`suite safety deadline: no outcome after ${ms}ms`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function collectFrames(spawned: ClaudeCliSpawnedChild): Promise<ClaudeStreamEvent[]> {
+  const seen: ClaudeStreamEvent[] = [];
+  for await (const event of streamSpawnedClaudeCli(spawned, 5_000, "sess", undefined, () => {})) {
+    seen.push(event);
+  }
+  return seen;
+}
+
+/** Apply the direct-CLI branch's ordering to a whole frame sequence. */
+function recordSequence(events: ClaudeStreamEvent[]): {
+  store: TurnStore;
+  session: StreamSession;
+  released: ClaudeStreamEvent[];
+  warnings: string[];
+} {
+  const store = createStore();
+  const session = createSession();
+  const released: ClaudeStreamEvent[] = [];
+  const warnings: string[] = [];
+  for (const evt of events) {
+    if (evt.type === "message_stop") {
+      session.noteTerminal();
+    } else if (evt.type === "error") {
+      const applied = applyErrorFrame(store, session, evt);
+      released.push(...applied.forwarded);
+      warnings.push(...applied.warnings);
+    } else if (evt.type === "result") {
+      released.push(...applyResultFrame(store, session, evt));
+    } else {
+      released.push(evt);
+    }
+  }
+  return { store, session, released, warnings };
 }
 
 describe("Claude CLI error after an authoritative result frame", () => {
@@ -216,5 +287,63 @@ describe("Claude CLI error after an authoritative result frame", () => {
     expect(source).toContain(
       "[Jarvis] Claude CLI error after the authoritative turn outcome was recorded",
     );
+  });
+});
+
+/**
+ * DD-170: a turn's last record can arrive without its trailing newline. When
+ * the stream is done and the child exited cleanly, that leftover is a complete
+ * line and must be decoded through the same path; after a kill it is a
+ * half-written line and stays discarded.
+ */
+describe("DD-170: the final record and the clean-exit/abort split", () => {
+  test("clean exit: a result record without its trailing newline still ends the turn with the answer", async () => {
+    const events = await withSuiteDeadline(collectFrames(scriptedChild(
+      [
+        '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the answer"}}}\n',
+        // The CLI's last write never got its newline.
+        '{"type":"result","subtype":"success","is_error":false}',
+      ],
+      0,
+    )));
+
+    const { store, session, released, warnings } = recordSequence(events);
+
+    // Without the leftover parse there is no result frame, so the direct-CLI
+    // branch records nothing and `ensureTerminal()` emits
+    // `stream_ended_without_outcome` instead of the answer.
+    expect(store.status).toBe("completed");
+    expect(store.errorCode).toBeNull();
+    expect(session.hasOutcome()).toBe(true);
+    expect(warnings).toHaveLength(0);
+
+    const results = released.filter((frame) => frame.type === "result");
+    expect(results).toHaveLength(1);
+    // The answer is the stream's text, backfilled exactly like a full line.
+    expect(results[0].content).toBe("the answer");
+
+    // The clean-exit frame order matches a newline-terminated record.
+    expect(events.map((event) => event.type).slice(-2)).toEqual(["result", "message_stop"]);
+  });
+
+  test("abort/kill: the same unterminated record is still discarded, and the kill names the failure", async () => {
+    const events = await withSuiteDeadline(collectFrames(scriptedChild(
+      [
+        '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"half a line"}}}\n',
+        '{"type":"result","subtype":"success","is_error":false}',
+      ],
+      { code: null, signal: "SIGKILL" },
+    )));
+
+    const { store, released } = recordSequence(events);
+
+    // A half-written line is not an answer: the leftover never becomes a frame.
+    expect(events.some((event) => event.type === "result")).toBe(false);
+    expect(released.some((frame) => frame.type === "result")).toBe(false);
+    expect(store.status).toBe("failed");
+
+    const errors = released.filter((frame) => frame.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].error).toContain("SIGKILL");
   });
 });
