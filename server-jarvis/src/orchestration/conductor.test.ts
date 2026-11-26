@@ -648,6 +648,53 @@ describe("LiveConductor owned-runtime-loop directives (Task 5)", () => {
     }
   });
 
+  test("reviewer answer without an explicit ACCEPT does not mark_verified", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "medium", "run-reviewer-no-verdict");
+    const planItem = {
+      id: "pi_no_verdict",
+      title: "Unclear item",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "reviewer",
+      "completed",
+      "I checked the change and it looks reasonable enough.",
+      ["synthesizer"],
+      { planItem, writeIntent: true },
+    );
+    expect(directive.type).not.toBe("mark_verified");
+    expect(directive.type).toBe("start_repair_chain");
+    if (directive.type === "start_repair_chain") {
+      expect(directive.reason).toMatch(/ACCEPT/);
+    }
+  });
+
+  test("reviewer 'no issues' without ACCEPT does not mark_verified", async () => {
+    const { conductor } = makeConductor();
+    conductor.setContext("general", "medium", "run-reviewer-no-issues");
+    const planItem = {
+      id: "pi_no_issues",
+      title: "Unverified item",
+      dependsOn: [] as string[],
+      acceptanceChecks: [] as Array<{ id: string; description: string }>,
+      status: "active" as const,
+      repairCycleCount: 0,
+    };
+    const directive = await conductor.afterStage(
+      "reviewer",
+      "completed",
+      "No issues found with the implementation.",
+      ["synthesizer"],
+      { planItem, writeIntent: true },
+    );
+    expect(directive.type).not.toBe("mark_verified");
+    expect(directive.type).toBe("start_repair_chain");
+  });
+
   test("repair-cycle backstop emits block_item", async () => {
     const { conductor } = makeConductor({ max_tool_errors_before_reroute: 3 }, async () => ({
       content: '{"directive":"continue"}',

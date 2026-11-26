@@ -16,7 +16,6 @@ import {
   decideRepairChain,
   gradeViaDirectDiff,
   mergeRepairChainIntoRemaining,
-  reviewerFeedbackIsInsufficient,
   shouldEscalateToReviewer,
   DEFAULT_MAX_CONSECUTIVE_FAILURES,
   DEFAULT_MAX_REPAIR_CYCLES,
@@ -466,8 +465,8 @@ export class LiveConductor {
    * Owned-runtime-loop verdict path (Task 5).
    * - Executor completed + low complexity → direct-diff grade → mark_verified or continue
    * - Executor completed + medium/high (or reviewer_pass checks) → escalate_reviewer
-   * - Reviewer completed + accept → mark_verified (reviewer_mediated)
-   * - Reviewer completed + insufficient → start_repair_chain (deterministic; no model)
+   * - Reviewer completed + explicit accept → mark_verified (reviewer_mediated)
+   * - Reviewer completed + reject or no verdict → start_repair_chain (deterministic; no model)
    * - Backstop via consecutiveToolErrors / repairCycleCount → block_item
    *
    * Returns null when the runtime-loop has nothing to say (fall through to
@@ -483,24 +482,24 @@ export class LiveConductor {
     const item = this.resolvePlanItem(evidence);
     if (!item) return null;
 
-    // --- Reviewer stage: accept → verify; insufficient → automatic repair chain ---
+    // --- Reviewer stage: explicit ACCEPT → verify; anything else → repair chain ---
     if (stage === "reviewer" && outcome === "completed") {
-      const insufficient = reviewerFeedbackIsInsufficient(output);
-      if (!insufficient) {
-        const verdict = parseReviewerVerdict(output);
-        if (verdict === "accept" || !this.hasIssuesHeuristic(output)) {
-          return {
-            type: "mark_verified",
-            itemId: item.id,
-            evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:reviewer:${item.id}`,
-            evidenceSummary: output.slice(0, 240),
-            grounding: this.buildStageGrounding(evidence, true),
-            gradingMode: "reviewer_mediated",
-            reason: "reviewer accepted — mark verified and advance",
-          };
-        }
+      const verdict = parseReviewerVerdict(output);
+      if (verdict === "accept") {
+        return {
+          type: "mark_verified",
+          itemId: item.id,
+          evidenceRef: evidence.evidenceRef ?? `${this.runId || "run"}:reviewer:${item.id}`,
+          evidenceSummary: output.slice(0, 240),
+          grounding: this.buildStageGrounding(evidence, true),
+          gradingMode: "reviewer_mediated",
+          reason: "reviewer accepted — mark verified and advance",
+        };
       }
 
+      // DD-198: only an explicit ACCEPT verifies an item. A REJECT *or* an
+      // answer that names no verdict at all is insufficient — absence of issue
+      // words is not an approval. Both take the deterministic repair chain.
       const decision = decideRepairChain({
         reviewerHasIssues: true,
         writeIntent: evidence.writeIntent === true,
@@ -513,18 +512,23 @@ export class LiveConductor {
             : DEFAULT_MAX_CONSECUTIVE_FAILURES,
       });
 
+      const verdictGap =
+        verdict === "unknown"
+          ? "reviewer answer named no verdict — an explicit ACCEPT is required"
+          : "reviewer rejected the work";
+
       if (decision.backstop) {
         return {
           type: "block_item",
           itemId: item.id,
-          reason: decision.reason,
+          reason: `${verdictGap}; ${decision.reason}`,
         };
       }
       if (decision.fire) {
         return {
           type: "start_repair_chain",
           itemId: item.id,
-          reason: decision.reason,
+          reason: `${verdictGap}; ${decision.reason}`,
           flaggedIssues: output.slice(0, 400),
           newRemaining: mergeRepairChainIntoRemaining(
             remainingQueue,
@@ -603,11 +607,6 @@ export class LiveConductor {
     }
     if (this.planContract) return getActivePlanItem(this.planContract);
     return undefined;
-  }
-
-  private hasIssuesHeuristic(reviewText: string): boolean {
-    const normalized = reviewText.toUpperCase();
-    return normalized.includes("PARTIAL") || normalized.includes("MISSING");
   }
 
   private async supervise(digest: SupervisionDigest): Promise<ConductorDirective> {
