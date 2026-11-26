@@ -55,8 +55,11 @@ const optionalFilter = {
 export const HARNESS_COMMANDS: readonly HarnessCommand[] = [
   { command_id: "bun_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
   { command_id: "bun_test", executable: "bun", fixed_args: ["test"], args_schema: optionalFilter, default_timeout_ms: 180_000, parse: parseCounter },
-  { command_id: "npm_typecheck", executable: "npm", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
-  { command_id: "vitest_run", executable: "vitest", fixed_args: ["run"], args_schema: optionalFilter, default_timeout_ms: 180_000, parse: parseCounter },
+  // `npm` and `vitest` are .cmd shims on Windows and execFile cannot launch
+  // them without a shell. Bun is a real executable on every platform and runs
+  // the package's own `typecheck` script, or provides vitest through `bun x`.
+  { command_id: "npm_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
+  { command_id: "vitest_run", executable: "bun", fixed_args: ["x", "vitest", "run"], args_schema: optionalFilter, default_timeout_ms: 180_000, parse: parseCounter },
   { command_id: "cargo_fmt_check", executable: "cargo", fixed_args: ["fmt", "--check"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
   { command_id: "cargo_check", executable: "cargo", fixed_args: ["check"], args_schema: noArgs, default_timeout_ms: 300_000, parse: parseCounter },
   { command_id: "cargo_test", executable: "cargo", fixed_args: ["test"], args_schema: optionalFilter, default_timeout_ms: 600_000, parse: parseCounter },
