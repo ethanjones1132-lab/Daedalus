@@ -761,12 +761,25 @@ async function runModelPrompt(
   signal?: AbortSignal,
 ): Promise<string> {
   const abort = new AbortController();
+  // Two independent stop paths feed the same in-flight fetch:
+  //  - `timedOut`: this request outlived its own `timeoutMs` (inner timer).
+  //  - `outerAborted`: the caller's signal fired — a runtime timeout
+  //    (`TOOL_TIMEOUT_REASON`) or a cancellation. Both must abort the fetch
+  //    immediately; only the outcome label differs.
   let timedOut = false;
+  let outerAborted = false;
+  let outerTimedOut = false;
   const onAbort = (): void => {
-    if (signal?.reason === TOOL_TIMEOUT_REASON || timedOut) return;
+    // The inner timer already stopped this request; a later caller abort is a
+    // repeat of that stop and must not relabel the outcome.
+    if (timedOut) return;
+    outerAborted = true;
+    outerTimedOut = signal?.reason === TOOL_TIMEOUT_REASON;
     abort.abort(signal?.reason);
   };
   const timeout = setTimeout(() => {
+    // An outer stop already aborted the fetch; its outcome wins.
+    if (outerAborted) return;
     timedOut = true;
     abort.abort(TOOL_TIMEOUT_REASON);
   }, timeoutMs);
@@ -803,13 +816,24 @@ async function runModelPrompt(
       throw new ToolExecutionError("execution_error", `model request failed (${res.status}): ${(await res.text()).slice(0, 1000)}`);
     }
     const json = await res.json();
-    if (signal?.aborted || timedOut) {
-      throw new ToolExecutionError(timedOut ? "timeout" : "cancelled", timedOut ? "Agent execution timed out" : "Agent execution cancelled");
+    if (timedOut) {
+      throw new ToolExecutionError("timeout", "Agent execution timed out");
     }
+    if (outerAborted) {
+      throw outerTimedOut
+        ? new ToolExecutionError("timeout", "Agent execution timed out")
+        : new ToolExecutionError("cancelled", "Agent execution cancelled");
+    }
+    if (signal?.aborted) throw new ToolExecutionError("cancelled", "Agent execution cancelled");
     return json.choices?.[0]?.message?.content || JSON.stringify(json).slice(0, 12000);
   } catch (error) {
     if (error instanceof ToolExecutionError) throw error;
     if (timedOut) throw new ToolExecutionError("timeout", `Agent execution timed out after ${timeoutMs}ms`);
+    if (outerAborted) {
+      throw outerTimedOut
+        ? new ToolExecutionError("timeout", "Agent execution timed out")
+        : new ToolExecutionError("cancelled", "Agent execution cancelled");
+    }
     if (signal?.aborted) throw new ToolExecutionError("cancelled", "Agent execution cancelled");
     const message = error instanceof Error ? error.message : String(error);
     throw new ToolExecutionError("execution_error", `Agent model request failed: ${message}`, message);

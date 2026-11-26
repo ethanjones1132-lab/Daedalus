@@ -2,7 +2,7 @@ import { describe, test, expect, mock } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { createToolRuntime, makeExecutionContext, type ExecutionContext } from "./tool-runtime";
+import { createToolRuntime, makeExecutionContext, TOOL_TIMEOUT_REASON, ToolExecutionError, type ExecutionContext } from "./tool-runtime";
 import { registerTaskBundle, registerTaskControlBundle } from "./task-bundle";
 import { defaultConfig } from "./config";
 import {
@@ -10,9 +10,63 @@ import {
   MAX_BG_COMMAND_TIMEOUT_MS,
   MIN_BG_COMMAND_TIMEOUT_MS,
   resolveBackgroundCommandTimeoutMs,
+  toolAgent,
   toolTaskGet,
   toolTaskStop,
 } from "./agent-tools";
+
+/** Bound for "the tool must stop promptly", not the request's own timeout. */
+const PROMPT_STOP_BOUND_MS = 2_000;
+
+/** Wait for `promise`, failing (instead of hanging) if it outlives `ms`. */
+async function withinBound<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`tool still running after ${ms}ms`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * A `fetch` stub that accepts the request and never answers, recording the
+ * abort the tool is supposed to deliver to it.
+ */
+function hangingFetch() {
+  const state = {
+    requests: 0,
+    aborted: 0,
+    fetch: undefined as unknown as typeof fetch,
+  };
+  state.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+    state.requests += 1;
+    const signal = init?.signal;
+    return new Promise<Response>((_resolve, reject) => {
+      const onAbort = (): void => {
+        state.aborted += 1;
+        reject(new Error("model request aborted"));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }) as typeof fetch;
+  return state;
+}
+
+function modelCfg() {
+  const cfg = defaultConfig();
+  // Force the native model branch: no Claude CLI spawn in these tests.
+  cfg.claude_cli.enabled = false;
+  return cfg;
+}
 
 function makeRuntime() {
   const rt = createToolRuntime();
@@ -230,4 +284,100 @@ describe("run_background_command tree kill on timeout (live)", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 25_000);
+});
+
+describe("agent model request stop paths (DD-171)", () => {
+  test("a runtime timeout aborts the in-flight model fetch and reports timeout", async () => {
+    // Today the caller's TOOL_TIMEOUT_REASON abort is skipped, so the fetch
+    // keeps running until the request's own (long) timer: this must return
+    // well before PROMPT_STOP_BOUND_MS instead.
+    const cfg = modelCfg();
+    const stub = hangingFetch();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = stub.fetch;
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    try {
+      const pending = toolAgent(
+        { prompt: "dd-171 runtime timeout", timeout_ms: 4_000 },
+        cfg,
+        makeExecutionContext("agent", cfg, { signal: controller.signal }),
+      );
+      // The request is issued synchronously; give it a beat, then time out.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stub.requests).toBe(1);
+      controller.abort(TOOL_TIMEOUT_REASON);
+
+      const outcome = await withinBound(
+        pending.then(() => "resolved" as const, (error: unknown) => error),
+        PROMPT_STOP_BOUND_MS,
+      );
+      expect(outcome).not.toBe("resolved");
+      expect(outcome).toBeInstanceOf(ToolExecutionError);
+      expect((outcome as ToolExecutionError).code).toBe("timeout");
+      expect((outcome as ToolExecutionError).message).toContain("timed out");
+      // The stub saw the abort, and it happened promptly.
+      expect(stub.aborted).toBe(1);
+      expect(Date.now() - startedAt).toBeLessThan(PROMPT_STOP_BOUND_MS);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("a caller cancellation still reports cancelled, not timeout", async () => {
+    const cfg = modelCfg();
+    const stub = hangingFetch();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = stub.fetch;
+    const controller = new AbortController();
+    try {
+      const pending = toolAgent(
+        { prompt: "dd-171 cancel", timeout_ms: 4_000 },
+        cfg,
+        makeExecutionContext("agent", cfg, { signal: controller.signal }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stub.requests).toBe(1);
+      controller.abort();
+
+      const outcome = await withinBound(
+        pending.then(() => "resolved" as const, (error: unknown) => error),
+        PROMPT_STOP_BOUND_MS,
+      );
+      expect(outcome).not.toBe("resolved");
+      expect(outcome).toBeInstanceOf(ToolExecutionError);
+      expect((outcome as ToolExecutionError).code).toBe("cancelled");
+      expect(stub.aborted).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("the request's own timeout_ms still fires", async () => {
+    // Pins the inner timer: a request that outlives its OWN timeout_ms aborts
+    // even when no caller signal ever fires.
+    const cfg = modelCfg();
+    const stub = hangingFetch();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = stub.fetch;
+    const startedAt = Date.now();
+    try {
+      const outcome = await withinBound(
+        toolAgent(
+          { prompt: "dd-171 own timeout", timeout_ms: 250 },
+          cfg,
+          makeExecutionContext("agent", cfg),
+        ).then(() => "resolved" as const, (error: unknown) => error),
+        PROMPT_STOP_BOUND_MS,
+      );
+      expect(outcome).not.toBe("resolved");
+      expect(outcome).toBeInstanceOf(ToolExecutionError);
+      expect((outcome as ToolExecutionError).code).toBe("timeout");
+      expect((outcome as ToolExecutionError).message).toContain("after 250ms");
+      expect(stub.aborted).toBe(1);
+      expect(Date.now() - startedAt).toBeLessThan(PROMPT_STOP_BOUND_MS);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
