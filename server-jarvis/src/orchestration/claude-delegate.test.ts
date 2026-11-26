@@ -2095,6 +2095,94 @@ describe("Claude executor delegate", () => {
     expect(resultErrorExit0.narrative).not.toMatch(/exited without emitting stream events/i);
   });
 
+  test("result frame with an error subtype and no is_error is not appended as the answer", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const base = {
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full" as const,
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      snapshotFactory: { capture: async () => [snapshot] },
+    };
+
+    const subtypeError = await runClaudeDelegate({
+      ...base,
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            result: "execution failed mid-turn",
+          };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    // The error text is failure detail, never the delegate's normal answer.
+    expect(subtypeError.narrative).not.toBe("execution failed mid-turn");
+    expect(subtypeError.narrative).toMatch(/^Claude delegate failed:/);
+
+    // Control: a clean success subtype is still appended as the answer.
+    const clean = await runClaudeDelegate({
+      ...base,
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield { type: "result", subtype: "success", result: "done" };
+        })(),
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(clean.ok).toBe(true);
+    expect(clean.narrative).toBe("done");
+  });
+
+  test("result frame with an error subtype and no is_error fails the turn", async () => {
+    const config = testConfig();
+    const snapshot: DelegateRootSnapshot = {
+      root: "C:\\repo", kind: "git", status: "", diffStat: "", fingerprint: "same", files: {},
+    };
+    const result = await runClaudeDelegate({
+      config,
+      prompt: "change it",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      allowedRoots: ["C:\\repo"],
+      stageRemainingMs: 30_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      snapshotFactory: { capture: async () => [snapshot] },
+      health: new DelegateHealth(),
+      processFactory: async () => ({
+        events: (async function* () {
+          yield {
+            type: "result",
+            subtype: "error_during_execution",
+            result: "execution failed mid-turn",
+          };
+        })(),
+        // Exit 0 must still fail: the result record is the authoritative outcome.
+        exit: Promise.resolve({ code: 0, signal: null }),
+        kill: () => {},
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.terminalStatus).toBe("failed");
+    expect(result.errorCode).toBe("delegate_cli_error");
+    expect(result.narrative).toMatch(/error_during_execution|execution failed mid-turn/i);
+    expect(result.narrative).not.toMatch(/exited without emitting stream events/i);
+  });
+
   test("CLI failure narrative scrubs credential-bearing detail", async () => {
     const config = testConfig();
     const snapshot: DelegateRootSnapshot = {

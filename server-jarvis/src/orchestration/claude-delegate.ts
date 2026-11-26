@@ -1541,16 +1541,21 @@ export async function runClaudeDelegate(input: RunClaudeDelegateInput): Promise<
               input.onTextDelta?.(event.delta.text);
             }
             else if (event.type === "result") {
-              if (event.content) {
-                narrative.push(event.content);
-                input.onTextDelta?.(event.content);
-              }
-              if (event.is_error === true) {
+              // Mirror the native CLI rule (index.ts): the result record is the
+              // authoritative turn outcome, and an `error*` subtype fails the
+              // turn even when `is_error` is unset. Error text is failure
+              // detail, never a normal answer.
+              const resultIsError = event.is_error === true
+                || (typeof event.subtype === "string" && event.subtype.startsWith("error"));
+              if (resultIsError) {
                 const parts = [event.subtype, event.content ?? event.error]
                   .filter((part): part is string => typeof part === "string" && part.length > 0);
                 cliFailureDetail = parts.length > 0
                   ? parts.join(": ")
                   : "result reported is_error";
+              } else if (event.content) {
+                narrative.push(event.content);
+                input.onTextDelta?.(event.content);
               }
             }
             else if (event.type === "error") {
