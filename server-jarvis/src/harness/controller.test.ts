@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { HarnessStore } from "./store";
-import { runHarness, type HarnessSensorBatch, type HarnessStopReason } from "./controller";
+import { MAX_DEADLINE_MS, runHarness, type HarnessSensorBatch, type HarnessStopReason } from "./controller";
 import type { HarnessManifest } from "./manifest";
 
 function manifest(): HarnessManifest {
@@ -152,6 +152,41 @@ describe("runHarness", () => {
     });
     expect(sensorCalls).toBe(0);
     expect(result.rounds).toBe(1);
+  });
+
+  test("clamps a deadline beyond the timer maximum instead of aborting at once", async () => {
+    let admissionSignal: AbortSignal | undefined;
+    let seenDeadlineAt: number | undefined;
+    const setup = deps({
+      now: () => 100,
+      deadline_ms: 3_000_000_000,
+      admission: {
+        acquire: async ({ signal, deadlineAt }) => { admissionSignal = signal; seenDeadlineAt = deadlineAt; return { release() {} }; },
+      },
+      runMaker: async () => { await Bun.sleep(25); return {}; },
+    });
+    const run = runHarness(setup.input);
+    // 2^31-1 ms overflows setTimeout, which then fires on the next tick; with the
+    // clamp the timer must still be pending, so the run cannot abort instantly.
+    await Bun.sleep(10);
+    expect(admissionSignal?.aborted).toBe(false);
+    const result = await run;
+    expect(result.stop_reason).toBe("passed");
+    expect(seenDeadlineAt! - 100).toBe(MAX_DEADLINE_MS);
+  });
+
+  test("keeps an ordinary 30-minute deadline unchanged", async () => {
+    let seenDeadlineAt: number | undefined;
+    const setup = deps({
+      now: () => 100,
+      deadline_ms: 30 * 60 * 1000,
+      admission: {
+        acquire: async ({ deadlineAt }) => { seenDeadlineAt = deadlineAt; return { release() {} }; },
+      },
+    });
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("passed");
+    expect(seenDeadlineAt! - 100).toBe(30 * 60 * 1000);
   });
 
   test("does not call checker when required sensors fail", async () => {

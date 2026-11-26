@@ -19,6 +19,15 @@ export interface HarnessRunResult {
 /** How long an aborted step gets to return before the run records it as abandoned. */
 const DEFAULT_ABANDON_WAIT_MS = 2000;
 
+/**
+ * The longest deadline this controller can schedule: 2^31-1 ms (~24.8 days),
+ * the largest delay a `setTimeout` represents. A longer delay overflows the
+ * timer, which then fires on the next tick and aborts the run instantly. A
+ * manifest asking for more than this gets this documented maximum instead of
+ * an immediate abort; a zero, negative or non-finite deadline is still rejected.
+ */
+export const MAX_DEADLINE_MS = 2 ** 31 - 1;
+
 export interface HarnessSensorBatch {
   counter_vector: HarnessRoundInput["counter_vector"];
   sensors: Array<{
@@ -47,7 +56,7 @@ export interface HarnessControllerInput {
   run_id?: string;
   signal?: AbortSignal;
   now?: () => number;
-  /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes. */
+  /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes; clamped to MAX_DEADLINE_MS. */
   deadline_ms?: number;
   /**
    * Bounded wait for a step that was abandoned by an abort, before its lease is
@@ -117,7 +126,11 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
   }
   const now = input.now ?? Date.now;
   const startedAt = now();
-  const deadlineAt = startedAt + (input.deadline_ms ?? 30 * 60 * 1000);
+  const requestedDeadlineMs = input.deadline_ms ?? 30 * 60 * 1000;
+  if (!Number.isFinite(requestedDeadlineMs) || requestedDeadlineMs <= 0) throw new Error("deadline_ms must be a positive finite duration");
+  // Clamp before scheduling so a request beyond the timer's range becomes the
+  // documented maximum rather than overflowing setTimeout into an instant abort.
+  const deadlineAt = startedAt + Math.min(requestedDeadlineMs, MAX_DEADLINE_MS);
   if (!Number.isFinite(deadlineAt) || deadlineAt <= startedAt) throw new Error("deadline_ms must be a positive finite duration");
   const abandonWaitMs = input.abandon_wait_ms ?? DEFAULT_ABANDON_WAIT_MS;
   if (!Number.isFinite(abandonWaitMs) || abandonWaitMs < 0) throw new Error("abandon_wait_ms must be a non-negative finite duration");
