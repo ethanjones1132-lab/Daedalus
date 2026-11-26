@@ -15,7 +15,7 @@ import {
   VllmProviderRequestError,
   type HttpProviderId,
 } from "./providers";
-import { cloudHelpersAllowed, routableOrchestratorAgents } from "./provider-availability";
+import { cloudHelpersAllowed, isCloudProvider, routableOrchestratorAgents } from "./provider-availability";
 import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall, recordSuccess } from "./model-failure-memory";
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
@@ -591,6 +591,12 @@ interface FallbackResolveOptions {
   taskType?: string;
   cascadeTier?: "cheap" | "strong";
   /**
+   * A resolved agent to try before the stage's pool pick. The harness checker
+   * uses this so the manifest-named agent is actually called; the stage pool
+   * remains the fallback cascade.
+   */
+  primaryAgent?: { provider: HttpProviderId; model_id: string };
+  /**
    * Provider:model keys to drop from the cascade. Used to ADVANCE past a model
    * that returned a semantically-empty 200 (no content + no tool calls) on the
    * previous attempt — retrying the same model would just return empty again.
@@ -710,7 +716,13 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
     cascade.push(entry);
   };
 
-  // 1. Pool agents first — cross-provider, optimal order. The pool is
+  // 0. A caller-pinned agent (the harness checker's resolved agent) goes first,
+  // under the same local-boundary policy as every other cloud candidate.
+  if (options.primaryAgent && (!isCloudProvider(options.primaryAgent.provider) || cloudHelpersAllowed(cfg))) {
+    push(options.primaryAgent);
+  }
+
+  // 1. Pool agents next — cross-provider, optimal order. The pool is
   // already limited to local/self-hosted agents by the local boundary.
   for (const entry of resolvePoolAgents(cfg, options)) push(entry);
 

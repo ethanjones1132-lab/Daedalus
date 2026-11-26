@@ -84,7 +84,7 @@ import { createLifecycleService, validateLifecycleSnapshot, type LifecycleServic
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
-import { createHarnessExecution } from "./harness/execution";
+import { createCheckerModelCall, createHarnessExecution } from "./harness/execution";
 import { handleHarnessRequest, type HarnessExecution } from "./harness/routes";
 import { HarnessStore } from "./harness/store";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
@@ -6915,9 +6915,9 @@ export async function baseFetch(req: Request): Promise<Response> {
  * background admission stays one server-wide lane instead of one per request.
  * The maker reuses the orchestration single-stage executor
  * (`productionExecutorDelegateRuntime` → `runClaudeDelegate`) for one tool-loop
- * turn in the manifest's project root; the checker is a single reviewer-role
- * model call. Each resolves its agent from the manifest id through the
- * orchestration pool (executor / reviewer for the templates' generic ids).
+ * turn in the manifest's project root; the checker is a single model call
+ * pinned to the agent resolved from the manifest id through the orchestration
+ * pool (executor / reviewer for the templates' generic ids), not a fixed role.
  * Binding Inkling as the maker is DD-151.
  */
 let harnessExecution: HarnessExecution | undefined;
@@ -6940,13 +6940,8 @@ function serverHarnessExecution(): HarnessExecution {
       });
       return { ok: result.ok, narrative: result.narrative };
     },
-    callModel: async ({ prompt, signal }) => {
-      const answer = await makeCallModel(normalizeConfig(loadConfig()), "reviewer")(
-        [{ role: "user", content: prompt }],
-        { stageAbort: signal },
-      );
-      return { text: answer.content ?? "" };
-    },
+    callModel: async ({ prompt, agent, signal }) =>
+      createCheckerModelCall(normalizeConfig(loadConfig()), agent)({ prompt, agent, signal }),
   });
   return harnessExecution;
 }

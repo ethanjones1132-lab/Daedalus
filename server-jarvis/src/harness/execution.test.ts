@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { runHarness } from "./controller";
-import { createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
+import { createCheckerModelCall, createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
+import { defaultConfig } from "../config";
+import { clearOpenRouterCache } from "../openrouter";
 import { manifestHash, type HarnessManifest } from "./manifest";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import type { SensorSpawn } from "./sensors";
@@ -333,6 +335,41 @@ describe("harness execution", () => {
     expect(state.checkerPrompts).toHaveLength(1);
     expect(result.stop_reason).toBe("checker_rejected");
     expect(result.stop_reason).not.toBe("passed");
+  });
+
+  test("the checker model call runs on the resolved agent, not the reviewer stage default", async () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+    cfg.orchestrator.agents = [{
+      id: "reviewer-default", provider: "openrouter", model_id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+      capabilities: { code: 0.8, reasoning: 0.95, speed: 0.55, cost: 1, json_reliability: 0.88 },
+      default_for: ["reviewer"], enabled: true,
+    }];
+    const requestedModels: string[] = [];
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      if (typeof body.model === "string") requestedModels.push(body.model);
+      return Response.json({ choices: [{ message: { content: "ACCEPT\nIndependent review." } }] });
+    }) as typeof fetch;
+
+    try {
+      const call = createCheckerModelCall(cfg, {
+        id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free",
+      });
+      const answer = await call({ prompt: "Review the diff.", signal: new AbortController().signal });
+
+      expect(answer.text).toContain("ACCEPT");
+      expect(requestedModels[0]).toBe("google/gemma-4-31b-it:free");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
   });
 
   test("(f) a saved template with a route-recorded approval runs its baseline-free sensor and settles passed", async () => {

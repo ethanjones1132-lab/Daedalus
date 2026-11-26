@@ -1,3 +1,5 @@
+import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "../orchestration/agent-pool";
+import { agentFamily, resolveHarnessAgent } from "./agents";
 import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import type { HarnessRoundInput, HarnessSensorResultInput, HarnessStore } from "./store";
 
@@ -39,6 +41,8 @@ export interface HarnessControllerInput {
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
   runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean } | void>;
   runChecker: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<{ passed: boolean }>;
+  /** Agent pool used to resolve the maker/checker model families. Defaults to the shipped pool. */
+  agents?: readonly OrchestratorAgent[];
   /** Pre-generated run id so a caller can address the run before the loop settles. */
   run_id?: string;
   signal?: AbortSignal;
@@ -93,8 +97,23 @@ function vectorImproved(previous: HarnessRoundInput["counter_vector"] | undefine
 export async function runHarness(input: HarnessControllerInput): Promise<HarnessRunResult> {
   const checked = validateManifest(input.manifest);
   if (!checked.ok) throw new Error(`Invalid harness manifest: ${checked.errors.join("; ")}`);
-  if (input.manifest.checker.enabled && input.manifest.checker.agent_id === input.manifest.maker_agent_id) {
-    throw new Error("checker agent must differ from maker agent");
+  if (input.manifest.checker.enabled) {
+    const makerAgentId = input.manifest.maker_agent_id;
+    const checkerAgentId = input.manifest.checker.agent_id;
+    if (checkerAgentId === makerAgentId) {
+      throw new Error("checker agent must differ from maker agent");
+    }
+    const agents = input.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
+    const maker = resolveHarnessAgent(agents, makerAgentId, "executor");
+    const checker = resolveHarnessAgent(agents, checkerAgentId, "reviewer");
+    const makerFamily = maker ? agentFamily(maker) : "";
+    const checkerFamily = checker ? agentFamily(checker) : "";
+    if (makerFamily && checkerFamily && makerFamily === checkerFamily) {
+      throw new Error(
+        `Invalid harness manifest: checker agent "${checkerAgentId}" and maker agent "${makerAgentId}" ` +
+        `resolve to the same model family "${makerFamily}"`,
+      );
+    }
   }
   const now = input.now ?? Date.now;
   const startedAt = now();

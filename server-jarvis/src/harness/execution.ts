@@ -26,14 +26,16 @@
  */
 
 import { execFile } from "child_process";
+import type { JarvisConfig } from "../config";
+import { makeCallModel } from "../eval/call-model";
 import { OrchestrationAdmissionController } from "../orchestration/admission-controller";
 import {
-  AgentPool,
   DEFAULT_ORCHESTRATOR_AGENTS,
   type OrchestratorAgent,
 } from "../orchestration/agent-pool";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
+import { resolveHarnessAgent, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
 import type { HarnessAdmission, HarnessControllerInput, HarnessSensorBatch } from "./controller";
 import type { HarnessManifest } from "./manifest";
@@ -48,12 +50,7 @@ import type {
 /** Upper bound for the diff handed to the checker, so one huge change cannot fill the window. */
 export const HARNESS_DIFF_MAX_CHARS = 8_000;
 
-/** The pool identity of the agent a harness stage runs as. */
-export interface HarnessAgentRef {
-  id: string;
-  provider: OrchestratorAgent["provider"];
-  model_id: string;
-}
+export type { HarnessAgentRef } from "./agents";
 
 export interface HarnessMakerTurnInput {
   cwd: string;
@@ -134,17 +131,15 @@ function agentRef(agent: OrchestratorAgent): HarnessAgentRef {
 }
 
 /**
- * A named pool id wins; the template's generic ids ("maker",
- * "independent-checker") are roles, so they resolve through the pool's stage
- * default (executor for the maker, reviewer for the checker).
+ * The checker's single model call through the shared `makeCallModel` wiring,
+ * pinned to the agent resolved from the manifest rather than a fixed role.
  */
-function resolveAgent(
-  agents: readonly OrchestratorAgent[],
-  agentId: string,
-  stage: "executor" | "reviewer",
-): OrchestratorAgent | undefined {
-  const pool = new AgentPool([...agents]);
-  return pool.enabled().find((agent) => agent.id === agentId) ?? pool.pickFor(stage, "general");
+export function createCheckerModelCall(cfg: JarvisConfig, agent: HarnessAgentRef): HarnessModelCall {
+  const callModel = makeCallModel(cfg, "reviewer", { agent });
+  return async ({ prompt, signal }) => {
+    const answer = await callModel([{ role: "user", content: prompt }], { stageAbort: signal });
+    return { text: answer.content ?? "" };
+  };
 }
 
 function spawnKey(executable: string, args: readonly string[]): string {
@@ -529,7 +524,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   };
 
   const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal }) => {
-    const agent = resolveAgent(agents, manifest.maker_agent_id, "executor");
+    const agent = resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
     if (!agent) {
       throw new Error(`no executor agent is available for harness maker "${manifest.maker_agent_id}"`);
     }
@@ -550,7 +545,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   // The controller and manifest validation already refuse a checker equal to the
   // maker; that rule is untouched here.
   const runChecker: HarnessControllerInput["runChecker"] = async ({ manifest, signal }) => {
-    const agent = resolveAgent(agents, manifest.checker.agent_id, "reviewer");
+    const agent = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
     }

@@ -9,10 +9,25 @@
 import { type JarvisConfig } from "../config";
 import { chatCompletionWithFallback, isOpenRouterModelSupportsTools } from "../openrouter";
 import { buildTextToolInstructions, extractTextToolCalls, resolveToolCallsFromTurn } from "../text-tools";
-import { AgentPool } from "../orchestration/agent-pool";
+import { AgentPool, type OrchestratorAgent } from "../orchestration/agent-pool";
 import { StageAbortedError } from "../orchestration/stage-abort-link";
 import type { CallModelFn, ChatMessage } from "../orchestration/coordinator";
+import { cloudHelpersAllowed, isCloudProvider, isProviderAvailable } from "../provider-availability";
+import type { HttpProviderId } from "../providers";
 import type { ToolDefinition } from "../tool-types";
+
+/** A pool agent this module can reach over an HTTP provider adapter. */
+export interface CallModelAgent {
+  provider: OrchestratorAgent["provider"];
+  model_id: string;
+}
+
+export interface MakeCallModelOptions {
+  /** Run on this resolved agent instead of the stage's pool pick. */
+  agent?: CallModelAgent;
+}
+
+const HTTP_CALL_PROVIDERS: ReadonlySet<string> = new Set(["openrouter", "opencode_zen", "opencode_go", "vllm"]);
 
 /**
  * Determine whether the agent the pool would actually pick for `stage`
@@ -28,8 +43,34 @@ export function resolveModelSupportsNativeTools(cfg: JarvisConfig, stage: string
   const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
   const agent = pool.pickFor(stage, "general");
   if (!agent) return true;
+  return agentSupportsNativeTools(agent);
+}
+
+/** The same native-vs-text rule, for an explicitly supplied agent. */
+export function agentSupportsNativeTools(agent: CallModelAgent): boolean {
   if (agent.provider === "opencode_zen" || agent.provider === "opencode_go") return false;
   return isOpenRouterModelSupportsTools(agent.model_id);
+}
+
+/**
+ * Fail closed when the manifest-named agent cannot be reached, rather than
+ * silently falling through to the stage role (which is what the harness is
+ * trying to stop).
+ */
+function assertAgentCallable(cfg: JarvisConfig, agent: CallModelAgent): void {
+  if (!HTTP_CALL_PROVIDERS.has(agent.provider)) {
+    throw new Error(
+      `agent "${agent.model_id}" uses provider "${agent.provider}", which the model-call path cannot serve`,
+    );
+  }
+  if (isCloudProvider(agent.provider) && !cloudHelpersAllowed(cfg)) {
+    throw new Error(
+      `agent "${agent.model_id}" is unavailable: provider "${agent.provider}" is cloud and cloud helpers are disabled`,
+    );
+  }
+  if (!isProviderAvailable(cfg, agent.provider)) {
+    throw new Error(`agent "${agent.model_id}" is unavailable on provider "${agent.provider}"`);
+  }
 }
 
 /** Inject the text tool-call protocol instructions into the system message,
@@ -68,10 +109,14 @@ export function stageAbortGuard(options: {
  *  native function calling, use the text tool-call protocol instead of the
  *  `tools` request field so cheap/free models are scored on their real
  *  tool-use behavior rather than being silently marked as tool-call-less. */
-export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
+export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: MakeCallModelOptions = {}): CallModelFn {
+  const pinnedAgent = modelOptions.agent;
+  if (pinnedAgent) assertAgentCallable(cfg, pinnedAgent);
   return async (messages, options) => {
     const tools: ToolDefinition[] = options?.tools ?? [];
-    const useTextTools = tools.length > 0 && !resolveModelSupportsNativeTools(cfg, stage);
+    const useTextTools = tools.length > 0 && !(pinnedAgent
+      ? agentSupportsNativeTools(pinnedAgent)
+      : resolveModelSupportsNativeTools(cfg, stage));
     const effectiveMessages = useTextTools ? withTextToolInstructions(messages, tools) : messages;
 
     // Stage-local cancellation: the caller's stage signal reaches the real
@@ -81,13 +126,16 @@ export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
     const stageAborted = stageAbortGuard({ stage, stageAbort: options?.stageAbort, stageLabel: options?.stageLabel });
     if (stageAborted) throw stageAborted;
 
+    const primaryAgent = pinnedAgent
+      ? { provider: pinnedAgent.provider as HttpProviderId, model_id: pinnedAgent.model_id }
+      : undefined;
     const { response } = await chatCompletionWithFallback(cfg, {
       messages: effectiveMessages,
       temperature: options?.temperature ?? 0.2,
       max_tokens: options?.max_tokens ?? 1024,
       stream: false,
       tools: useTextTools ? undefined : options?.tools,
-    }, options?.stageAbort, { stage });
+    }, options?.stageAbort, { stage, ...(primaryAgent ? { primaryAgent } : {}) });
     const json = await response.json();
     const choice = json.choices?.[0]?.message ?? {};
     const content: string = choice.content ?? "";
@@ -118,7 +166,7 @@ export function makeCallModel(cfg: JarvisConfig, stage: string): CallModelFn {
     // useTextTools is false and the model emitted DSML/bare markup in content).
     // W3.3: pass stage model id when the pool can resolve one.
     const pool = new AgentPool(cfg.orchestrator?.agents ?? []);
-    const stageAgent = pool.pickFor(stage, "general");
+    const stageAgent = pinnedAgent ?? pool.pickFor(stage, "general");
     const resolved = resolveToolCallsFromTurn({
       nativeCalls,
       fullText: content,

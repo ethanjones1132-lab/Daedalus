@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { HarnessStore } from "./store";
 import { runHarness, type HarnessSensorBatch, type HarnessStopReason } from "./controller";
 import type { HarnessManifest } from "./manifest";
@@ -173,6 +174,32 @@ describe("runHarness", () => {
   test("refuses same-agent checker before creating a run", async () => {
     const setup = deps(); setup.input.manifest.checker.agent_id = "maker";
     await expect(runHarness(setup.input)).rejects.toThrow(/differ from maker/);
+  });
+
+  test("refuses a checker in the maker's model family even when the agent ids differ", async () => {
+    const item = manifest();
+    item.maker_agent_id = "maker-agent";
+    item.checker.agent_id = "checker-agent";
+    const agents: OrchestratorAgent[] = [
+      {
+        id: "maker-agent", provider: "opencode_go", model_id: "deepseek-v4-flash",
+        capabilities: { code: 0.9, reasoning: 0.86, speed: 0.82, cost: 0.85, json_reliability: 0.9 },
+        default_for: ["executor"], enabled: true,
+      },
+      {
+        id: "checker-agent", provider: "openrouter", model_id: "deepseek/deepseek-v4-pro",
+        capabilities: { code: 0.93, reasoning: 0.9, speed: 0.7, cost: 0.7, json_reliability: 0.85 },
+        default_for: ["reviewer"], enabled: true,
+      },
+    ];
+    const setup = deps({ manifest: item, agents });
+
+    const error = await runHarness(setup.input).then(() => undefined, (caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/same model family/);
+    expect((error as Error).message).toContain(item.maker_agent_id);
+    expect((error as Error).message).toContain(item.checker.agent_id);
   });
 
   test("records maker failure and admission denial once", async () => {
