@@ -50,20 +50,30 @@ function stoppedToolResult(
 interface ExecutionControl {
   signal: AbortSignal;
   reason: () => "cancelled" | "timeout" | undefined;
+  /**
+   * The enforced `ctx.timeout_ms` value, exposed only when the runtime's own
+   * timer is what stopped execution. `undefined` for caller aborts, so the
+   * result envelope never claims a limit the runtime did not impose.
+   */
+  stoppedByTimerMs: () => number | undefined;
   cleanup: () => void;
 }
 
 function createExecutionControl(ctx: ExecutionContext): ExecutionControl {
   const controller = new AbortController();
   let reason: "cancelled" | "timeout" | undefined;
+  let timerFiredMs: number | undefined;
   const timeoutMs = typeof ctx.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
     ? Math.max(1, Math.floor(ctx.timeout_ms))
     : undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  // The caller's abort reason carries the intent. DD-171 established that
+  // `TOOL_TIMEOUT_REASON` means "the caller's budget expired", so it must be
+  // reported as a timeout here too; any other reason is a plain cancellation.
   const onCallerAbort = (): void => {
     if (reason) return;
-    reason = "cancelled";
+    reason = ctx.signal?.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled";
     controller.abort(ctx.signal?.reason);
   };
 
@@ -75,6 +85,7 @@ function createExecutionControl(ctx: ExecutionContext): ExecutionControl {
     timer = setTimeout(() => {
       if (reason) return;
       reason = "timeout";
+      timerFiredMs = timeoutMs;
       controller.abort(TOOL_TIMEOUT_REASON);
     }, timeoutMs);
   }
@@ -82,6 +93,7 @@ function createExecutionControl(ctx: ExecutionContext): ExecutionControl {
   return {
     signal: controller.signal,
     reason: () => reason,
+    stoppedByTimerMs: () => timerFiredMs,
     cleanup: () => {
       if (timer) clearTimeout(timer);
       ctx.signal?.removeEventListener("abort", onCallerAbort);
@@ -503,22 +515,25 @@ export function createToolRuntime(): ToolRuntime {
       }
     }
     if (ctx.signal?.aborted) {
-      return stoppedToolResult(call, start, "cancelled");
+      // Same label rule as the live abort handler below: a caller that names
+      // TOOL_TIMEOUT_REASON was enforcing a budget, not cancelling.
+      return stoppedToolResult(
+        call,
+        start,
+        ctx.signal.reason === TOOL_TIMEOUT_REASON ? "timeout" : "cancelled",
+      );
     }
 
     const control = createExecutionControl(ctx);
     const executionCtx: ExecutionContext = { ...ctx, signal: control.signal };
-    const timeoutMs = typeof ctx.timeout_ms === "number" && Number.isFinite(ctx.timeout_ms) && ctx.timeout_ms > 0
-      ? Math.max(1, Math.floor(ctx.timeout_ms))
-      : undefined;
 
     try {
       const initialReason = control.reason();
-      if (initialReason) return stoppedToolResult(call, start, initialReason, timeoutMs);
+      if (initialReason) return stoppedToolResult(call, start, initialReason, control.stoppedByTimerMs());
 
       const output = await entry.handler(callArguments, executionCtx);
       const stopReason = control.reason();
-      if (stopReason) return stoppedToolResult(call, start, stopReason, timeoutMs);
+      if (stopReason) return stoppedToolResult(call, start, stopReason, control.stoppedByTimerMs());
       return {
         call_id: call.id,
         name: call.name,
@@ -528,7 +543,7 @@ export function createToolRuntime(): ToolRuntime {
       };
     } catch (e: any) {
       const stopReason = control.reason();
-      if (stopReason) return stoppedToolResult(call, start, stopReason, timeoutMs);
+      if (stopReason) return stoppedToolResult(call, start, stopReason, control.stoppedByTimerMs());
       if (e instanceof WorkspaceSandboxDeniedError) {
         const message = boundedToolText(e.message || "Tool execution failed");
         return {

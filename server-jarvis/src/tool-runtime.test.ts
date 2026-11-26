@@ -4,6 +4,7 @@ import type { JarvisConfig } from "./config";
 import {
   createToolRuntime,
   makeExecutionContext,
+  TOOL_TIMEOUT_REASON,
 } from "./tool-runtime";
 import type { ExecutionContext, ToolDefinition } from "./tool-runtime";
 import * as ToolRuntimeModule from "./tool-runtime";
@@ -690,5 +691,94 @@ describe("ToolRuntime approval callback", () => {
     const result = await runtime.execute({ id: "a4", name: "safe_noask", arguments: {} }, ctx);
     expect(asked).toBe(false);
     expect(result.is_error).toBe(false);
+  });
+});
+
+// ─── DD-172: caller aborts carry their reason into the result envelope ───────
+// The runtime reports its own `ctx.timeout_ms` expiry as `timeout`. A caller
+// that aborts with `TOOL_TIMEOUT_REASON` (its own budget expired) must get the
+// same truthful label; only a plain abort is a `cancelled`.
+
+describe("ToolRuntime caller stop labelling", () => {
+  /**
+   * Register a handler that never settles on its own. It settles only when the
+   * signal it is handed aborts — like `fetch` or a subprocess waiting on
+   * cancellation — so the runtime's stop path is what produces the result.
+   */
+  function registerHangingTool(
+    runtime: ReturnType<typeof createToolRuntime>,
+    name: string,
+  ): void {
+    runtime.register(makeDef(name), (_args, ctx) =>
+      new Promise<string>((_resolve, reject) => {
+        const signal = ctx.signal;
+        if (!signal) return; // no signal → intentionally never settles
+        const stop = () => reject(new Error("tool stopped"));
+        if (signal.aborted) stop();
+        else signal.addEventListener("abort", stop, { once: true });
+      }),
+    );
+  }
+
+  test("a caller abort with TOOL_TIMEOUT_REASON reports error_code timeout", async () => {
+    const runtime = createToolRuntime();
+    registerHangingTool(runtime, "hangs_caller_timeout");
+    const controller = new AbortController();
+    const ctx = makeExecutionContext("chat", cfg, { signal: controller.signal });
+
+    const started = Date.now();
+    const pending = runtime.execute(
+      { id: "stop-timeout", name: "hangs_caller_timeout", arguments: {} },
+      ctx,
+    );
+    setTimeout(() => controller.abort(TOOL_TIMEOUT_REASON), 5);
+    const result = await pending;
+
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("timeout");
+    expect(result.error).toBe("Tool execution timed out");
+    expect(result.output).toBe("Tool execution timed out");
+    expect(typeof result.duration_ms).toBe("number");
+  });
+
+  test("a caller abort with a plain reason reports error_code cancelled", async () => {
+    const runtime = createToolRuntime();
+    registerHangingTool(runtime, "hangs_caller_cancel");
+    const controller = new AbortController();
+    const ctx = makeExecutionContext("chat", cfg, { signal: controller.signal });
+
+    const started = Date.now();
+    const pending = runtime.execute(
+      { id: "stop-cancel", name: "hangs_caller_cancel", arguments: {} },
+      ctx,
+    );
+    setTimeout(() => controller.abort("user_cancelled"), 5);
+    const result = await pending;
+
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("cancelled");
+    expect(result.error).toBe("Tool execution cancelled");
+    expect(typeof result.duration_ms).toBe("number");
+  });
+
+  test("the runtime's own ctx.timeout_ms still reports error_code timeout", async () => {
+    const runtime = createToolRuntime();
+    registerHangingTool(runtime, "hangs_runtime_timeout");
+    // No caller signal: only the inner timer can stop this tool.
+    const ctx = makeExecutionContext("chat", cfg, { timeout_ms: 10 });
+
+    const started = Date.now();
+    const result = await runtime.execute(
+      { id: "stop-runtime-timeout", name: "hangs_runtime_timeout", arguments: {} },
+      ctx,
+    );
+
+    expect(Date.now() - started).toBeLessThan(5000);
+    expect(result.is_error).toBe(true);
+    expect(result.error_code).toBe("timeout");
+    expect(result.error).toBe("Tool execution timed out after 10ms");
+    expect(typeof result.duration_ms).toBe("number");
   });
 });
