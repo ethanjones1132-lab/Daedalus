@@ -6940,8 +6940,8 @@ function serverHarnessExecution(): HarnessExecution {
       });
       return { ok: result.ok, narrative: result.narrative };
     },
-    callModel: async ({ prompt, agent, signal }) =>
-      createCheckerModelCall(normalizeConfig(loadConfig()), agent)({ prompt, agent, signal }),
+    callModel: async ({ prompt, agent, signal, excludeFamilies }) =>
+      createCheckerModelCall(normalizeConfig(loadConfig()), agent, { excludeFamilies })({ prompt, agent, signal }),
   });
   return harnessExecution;
 }

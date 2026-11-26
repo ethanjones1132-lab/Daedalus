@@ -25,6 +25,12 @@ export interface CallModelAgent {
 export interface MakeCallModelOptions {
   /** Run on this resolved agent instead of the stage's pool pick. */
   agent?: CallModelAgent;
+  /**
+   * Model families the fallback cascade must never use. The harness checker
+   * passes the maker's family here so a pinned independent checker can never
+   * silently fall back to a maker-family answer.
+   */
+  excludeFamilies?: readonly string[];
 }
 
 const HTTP_CALL_PROVIDERS: ReadonlySet<string> = new Set(["openrouter", "opencode_zen", "opencode_go", "vllm"]);
@@ -129,13 +135,18 @@ export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: Ma
     const primaryAgent = pinnedAgent
       ? { provider: pinnedAgent.provider as HttpProviderId, model_id: pinnedAgent.model_id }
       : undefined;
+    const excludeFamilies = modelOptions.excludeFamilies?.filter((family) => family.trim().length > 0);
     const { response } = await chatCompletionWithFallback(cfg, {
       messages: effectiveMessages,
       temperature: options?.temperature ?? 0.2,
       max_tokens: options?.max_tokens ?? 1024,
       stream: false,
       tools: useTextTools ? undefined : options?.tools,
-    }, options?.stageAbort, { stage, ...(primaryAgent ? { primaryAgent } : {}) });
+    }, options?.stageAbort, {
+      stage,
+      ...(primaryAgent ? { primaryAgent } : {}),
+      ...(excludeFamilies && excludeFamilies.length > 0 ? { excludeFamilies } : {}),
+    });
     const json = await response.json();
     const choice = json.choices?.[0]?.message ?? {};
     const content: string = choice.content ?? "";

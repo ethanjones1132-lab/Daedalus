@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { runHarness } from "./controller";
 import { createCheckerModelCall, createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
-import { defaultConfig } from "../config";
+import { defaultConfig, type JarvisConfig } from "../config";
 import { clearOpenRouterCache } from "../openrouter";
 import { manifestHash, type HarnessManifest } from "./manifest";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
@@ -27,6 +27,18 @@ const AGENTS: OrchestratorAgent[] = [
     default_for: ["reviewer"], enabled: true,
   },
 ];
+
+/** An OpenRouter config whose reviewer cascade is exactly the supplied pool. */
+function checkerCascadeConfig(agents: OrchestratorAgent[]): JarvisConfig {
+  const cfg = defaultConfig();
+  cfg.active_backend = "openrouter";
+  cfg.openrouter.api_key = "test-or-key";
+  cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+  cfg.openrouter.model = "cohere/north-mini-code:free";
+  cfg.openrouter.max_retries = 0;
+  cfg.orchestrator.agents = agents;
+  return cfg;
+}
 
 function fixtureManifest(overrides: Partial<HarnessManifest> = {}): HarnessManifest {
   return {
@@ -377,6 +389,108 @@ describe("harness execution", () => {
       globalThis.fetch = originalFetch;
       clearOpenRouterCache();
     }
+  });
+
+  test("a pinned checker rejects rather than accepting a maker-family fallback", async () => {
+    const cfg = checkerCascadeConfig([{
+      id: "maker-family-reviewer", provider: "openrouter", model_id: "deepseek/deepseek-v4-flash:free",
+      capabilities: { code: 0.9, reasoning: 0.95, speed: 0.6, cost: 1, json_reliability: 0.9 },
+      default_for: ["reviewer"], enabled: true,
+    }]);
+    const requestedModels: string[] = [];
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      if (typeof body.model === "string") requestedModels.push(body.model);
+      if (body.model === "google/gemma-4-31b-it:free") {
+        return new Response("checker unavailable", { status: 400 });
+      }
+      return Response.json({ choices: [{ message: { content: "MAKER FAMILY ANSWER" } }] });
+    }) as typeof fetch;
+
+    try {
+      const call = createCheckerModelCall(
+        cfg,
+        { id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free" },
+        { excludeFamilies: ["deepseek"] },
+      );
+      await expect(call({ prompt: "Review the diff.", signal: new AbortController().signal }))
+        .rejects.toThrow();
+      expect(requestedModels).toContain("google/gemma-4-31b-it:free");
+      expect(requestedModels).not.toContain("deepseek/deepseek-v4-flash:free");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test("a pinned checker falls through only to a non-maker-family pool entry", async () => {
+    const cfg = checkerCascadeConfig([
+      {
+        id: "maker-family-reviewer", provider: "openrouter", model_id: "deepseek/deepseek-v4-flash:free",
+        capabilities: { code: 0.9, reasoning: 0.95, speed: 0.6, cost: 1, json_reliability: 0.9 },
+        default_for: ["reviewer"], enabled: true,
+      },
+      {
+        id: "independent-fallback", provider: "openrouter", model_id: "qwen/qwen3-coder:free",
+        capabilities: { code: 0.7, reasoning: 0.7, speed: 0.7, cost: 1, json_reliability: 0.7 },
+        default_for: [], enabled: true,
+      },
+    ]);
+    const requestedModels: string[] = [];
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      if (typeof body.model === "string") requestedModels.push(body.model);
+      if (body.model === "google/gemma-4-31b-it:free") {
+        return new Response("checker unavailable", { status: 400 });
+      }
+      if (body.model === "deepseek/deepseek-v4-flash:free") {
+        return Response.json({ choices: [{ message: { content: "MAKER FAMILY ANSWER" } }] });
+      }
+      return Response.json({ choices: [{ message: { content: "ACCEPT\nIndependent review." } }] });
+    }) as typeof fetch;
+
+    try {
+      const call = createCheckerModelCall(
+        cfg,
+        { id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free" },
+        { excludeFamilies: ["deepseek"] },
+      );
+      const answer = await call({ prompt: "Review the diff.", signal: new AbortController().signal });
+
+      expect(answer.text).toContain("ACCEPT");
+      expect(requestedModels).toContain("qwen/qwen3-coder:free");
+      expect(requestedModels).not.toContain("deepseek/deepseek-v4-flash:free");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test("the checker call carries the maker's model family", async () => {
+    const manifest = fixtureManifest();
+    const seen: Array<readonly string[] | undefined> = [];
+    const { execution } = setupHarness({
+      manifest,
+      initialErrors: 0,
+      deps: {
+        callModel: async ({ excludeFamilies }) => {
+          seen.push(excludeFamilies);
+          return { text: "ACCEPT\nIndependent review." };
+        },
+      },
+    });
+
+    await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+    // The maker resolves to `executor-model` ("executor" family); the checker
+    // must receive that family on the call so its cascade can exclude it.
+    expect(seen).toEqual([["executor"]]);
   });
 
   test("(f) a saved template with a route-recorded approval runs its baseline-free sensor and settles passed", async () => {

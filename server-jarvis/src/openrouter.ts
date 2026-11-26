@@ -20,6 +20,7 @@ import { isTemporarilyExcluded, recordHardFailure, recordRateLimit, recordStall,
 import { backendForProvider, recordInferenceAttempt } from "./inference-metrics";
 import { TurnDeadlineExceededError } from "./stream-liveness";
 import { openCodeGoProtocolForModel } from "./orchestration/live-model-catalog";
+import { modelFamily } from "./orchestration/model-family";
 import { countTokens } from "./tokens";
 import type { MemoryAppliedObservation } from "./native-memory";
 import type { PreparedMemoryTurn } from "./memory-contract";
@@ -602,6 +603,14 @@ interface FallbackResolveOptions {
    * previous attempt — retrying the same model would just return empty again.
    */
   excludeModels?: ReadonlySet<string>;
+  /**
+   * Model families (see `modelFamily`) the cascade must never use, e.g. the
+   * harness maker's family when the checker is pinned to an independent agent.
+   * Applied to every entry — pinned primary, pool, and OpenRouter tail — and an
+   * empty cascade after exclusion fails loudly instead of defaulting to a model
+   * the caller excluded.
+   */
+  excludeFamilies?: readonly string[];
   /** Absolute wall-clock deadline shared by the whole server turn. */
   deadlineAt?: number;
   /** Injectable transport for isolated tests and controlled callers. */
@@ -708,10 +717,14 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
   const requested = cfg.openrouter.model || "openrouter/free";
   const seen = new Set<string>();
   const excluded = options.excludeModels ?? new Set<string>();
+  const excludedFamilies = new Set(
+    (options.excludeFamilies ?? []).map((family) => family.trim().toLowerCase()).filter(Boolean),
+  );
   const cascade: CascadeEntry[] = [];
   const push = (entry: CascadeEntry) => {
     const key = `${entry.provider}:${entry.model_id}`;
     if (!entry.model_id || seen.has(key) || excluded.has(key) || excluded.has(`${entry.provider}:*`)) return;
+    if (excludedFamilies.size > 0 && excludedFamilies.has(modelFamily(entry.model_id))) return;
     seen.add(key);
     cascade.push(entry);
   };
@@ -729,7 +742,7 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
   // Local boundary: with a local Inference backend and cloud helpers off,
   // there is no OpenRouter tail. An empty cascade means "no allowed model",
   // which the caller reports instead of silently leaving this machine.
-  if (!cloudHelpersAllowed(cfg)) return cascade;
+  if (!cloudHelpersAllowed(cfg)) return finishFamilyFilter(cascade, excludedFamilies);
 
   // 2. OpenRouter free/configured tail (catalog-aware).
   try {
@@ -760,6 +773,21 @@ async function resolveFallbackCascade(cfg: JarvisConfig, options: FallbackResolv
     }
   }
 
+  return finishFamilyFilter(cascade, excludedFamilies);
+}
+
+/**
+ * A family exclusion is a hard caller requirement (the harness checker must not
+ * reason with the maker's family), so an empty cascade fails here rather than
+ * falling through to `chatCompletionWithFallback`'s unchecked default model.
+ * Callers that pass no families keep the existing empty-cascade behaviour.
+ */
+function finishFamilyFilter(cascade: CascadeEntry[], excludedFamilies: ReadonlySet<string>): CascadeEntry[] {
+  if (excludedFamilies.size > 0 && cascade.length === 0) {
+    throw new Error(
+      `no cascade candidate remains after excluding model families: ${[...excludedFamilies].join(", ")}`,
+    );
+  }
   return cascade;
 }
 

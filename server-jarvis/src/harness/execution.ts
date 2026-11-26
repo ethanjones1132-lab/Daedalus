@@ -35,7 +35,7 @@ import {
 } from "../orchestration/agent-pool";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
-import { resolveHarnessAgent, type HarnessAgentRef } from "./agents";
+import { resolveHarnessAgent, agentFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
 import type { HarnessAdmission, HarnessControllerInput, HarnessSensorBatch } from "./controller";
 import type { HarnessManifest } from "./manifest";
@@ -69,6 +69,12 @@ export interface HarnessModelCallInput {
   prompt: string;
   agent: HarnessAgentRef;
   signal: AbortSignal;
+  /**
+   * Model families the checker's fallback cascade must never use. `runChecker`
+   * supplies the resolved maker's family so a pinned independent checker stays
+   * independent even when its provider call fails and the cascade advances.
+   */
+  excludeFamilies?: readonly string[];
 }
 
 /** One agent call (the checker). Never a tool loop. */
@@ -133,9 +139,18 @@ function agentRef(agent: OrchestratorAgent): HarnessAgentRef {
 /**
  * The checker's single model call through the shared `makeCallModel` wiring,
  * pinned to the agent resolved from the manifest rather than a fixed role.
+ * `excludeFamilies` carries the maker's family so no maker-family entry can
+ * enter the checker's fallback cascade.
  */
-export function createCheckerModelCall(cfg: JarvisConfig, agent: HarnessAgentRef): HarnessModelCall {
-  const callModel = makeCallModel(cfg, "reviewer", { agent });
+export function createCheckerModelCall(
+  cfg: JarvisConfig,
+  agent: HarnessAgentRef,
+  options: { excludeFamilies?: readonly string[] } = {},
+): HarnessModelCall {
+  const callModel = makeCallModel(cfg, "reviewer", {
+    agent,
+    ...(options.excludeFamilies ? { excludeFamilies: options.excludeFamilies } : {}),
+  });
   return async ({ prompt, signal }) => {
     const answer = await callModel([{ role: "user", content: prompt }], { stageAbort: signal });
     return { text: answer.content ?? "" };
@@ -549,6 +564,13 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
     }
+    // The controller already refuses a checker in the maker's family; carry the
+    // maker's family into the model call so a failed checker attempt can never
+    // advance to a maker-family pool/tail entry. Resolved here because this is
+    // the boundary that knows both agents.
+    const maker = resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
+    const makerFamily = maker ? agentFamily(maker) : "";
+    const excludeFamilies = makerFamily ? [makerFamily] : [];
     const base = runBases.get(manifest);
     runBases.delete(manifest);
     const evidence = await collectRunDiff(spawn, manifest.project_root, signal, diffMaxChars, base);
@@ -562,6 +584,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       prompt: checkerPrompt(manifest, evidence.text, briefValues),
       agent: agentRef(agent),
       signal,
+      ...(excludeFamilies.length > 0 ? { excludeFamilies } : {}),
     });
     return { passed: parseReviewerVerdict(answer.text) === "accept" };
   };

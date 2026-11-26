@@ -1062,4 +1062,35 @@ describe("chatCompletionWithFallback AgentPool integration", () => {
     expect(json).not.toContain("prompt");
     expect(json).not.toContain("stall");
   });
+
+  test("excludeFamilies drops maker-family entries and fails loudly when none remain", async () => {
+    const cfg = cfgWithPool();
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.model = "cohere/north-mini-code:free";
+    cfg.openrouter.max_retries = 0;
+    cfg.orchestrator.agents = [{
+      id: "maker-family-reviewer",
+      provider: "openrouter",
+      model_id: "deepseek/deepseek-v4-flash:free",
+      capabilities: { code: 0.9, reasoning: 0.95, speed: 0.6, cost: 1, json_reliability: 0.9 },
+      default_for: ["reviewer"],
+      enabled: true,
+    }];
+
+    const attempted: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+      if (typeof body.model === "string") attempted.push(body.model);
+      return Response.json({ choices: [{ message: { content: "SHOULD NOT RUN" } }] });
+    }) as typeof fetch;
+
+    await expect(chatCompletionWithFallback(
+      cfg,
+      { model: "cohere/north-mini-code:free", messages: [{ role: "user", content: "review" }], stream: true },
+      undefined,
+      { stage: "reviewer", taskType: "general", excludeFamilies: ["deepseek"] },
+    )).rejects.toThrow(/no cascade candidate remains after excluding model families: deepseek/);
+    expect(attempted).toEqual([]);
+  });
 });
