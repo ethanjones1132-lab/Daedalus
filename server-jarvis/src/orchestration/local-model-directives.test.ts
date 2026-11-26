@@ -32,6 +32,16 @@ describe("directiveForModel", () => {
     );
   });
 
+  test("Inkling AgentFast receives tool and verification guidance", () => {
+    const directive = directiveForModel("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+    expect(directiveForModel("inkling-2-mini")).toBe(directive);
+    expect(directive).toContain("Batch");
+    expect(directive).toContain("no-op");
+    expect(directive).toContain("identical");
+    expect(directive).toContain("adjacent test");
+    expect(directive!.length).toBeLessThanOrEqual(600);
+  });
+
   test("unknown model → undefined", () => {
     expect(directiveForModel("totally-unknown-model:latest")).toBeUndefined();
     expect(directiveForModel("qwen3.5:4b")).toBeUndefined();

@@ -16,6 +16,7 @@ const MODEL_FAMILIES: ReadonlyArray<readonly [RegExp, string]> = [
   [/llama/i, "llama"],
   [/gemma/i, "gemma"],
   [/laguna/i, "laguna"],
+  [/inkling/i, "inkling"],
   [/ling/i, "ling"],
   [/mistral|mixtral/i, "mistral"],
   [/claude/i, "claude"],

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { HarnessStore } from "./store";
 import { MAX_DEADLINE_MS, runHarness, type HarnessSensorBatch, type HarnessStopReason } from "./controller";
+import { recordHarnessMakerEvent, withHarnessMakerEvents } from "./inkling-maker";
 import type { HarnessManifest } from "./manifest";
 
 function manifest(): HarnessManifest {
@@ -41,6 +42,17 @@ async function resultWithReason(reason: HarnessStopReason, overrides: Partial<Pa
 }
 
 describe("runHarness", () => {
+  test("a refusal can be recorded before the maker settles, even when the round fails", async () => {
+    const runId = "maker-refusal";
+    const { input, store } = deps({ run_id: runId, runMaker: async () => {
+      recordHarnessMakerEvent({ event_type: "maker_tool_refused", payload: { round: 1, tool: "shell", reason: "no_op" } });
+      return { failed: true };
+    } });
+    const result = await withHarnessMakerEvents(store, runId, () => runHarness(input));
+    expect(result.stop_reason).toBe("maker_failed");
+    expect(store.getRun(runId)?.events.map((event) => event.event_type)).toEqual(["maker_tool_refused", "stopped"]);
+  });
+
   test("passes on round one and runs checker only after computational zero", async () => {
     let checks = 0;
     const { result, store } = await resultWithReason("passed", { runChecker: async () => { checks++; return { passed: true }; } });

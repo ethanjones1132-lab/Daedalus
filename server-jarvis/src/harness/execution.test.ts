@@ -3,6 +3,8 @@ import { runHarness } from "./controller";
 import { createCheckerModelCall, createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
 import { defaultConfig, type JarvisConfig } from "../config";
 import { clearOpenRouterCache } from "../openrouter";
+import { modelFamily } from "./agents";
+import { withHarnessMakerEvents } from "./inkling-maker";
 import { manifestHash, type HarnessManifest } from "./manifest";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import type { SensorSpawn } from "./sensors";
@@ -134,7 +136,9 @@ function setupHarness(options: HarnessFixtureOptions) {
 
   const execution = createHarnessExecution({
     store,
-    agents: AGENTS,
+    // Pin the scripted delegate tests to a named maker. An unbound `maker`
+    // uses the production llama.cpp path.
+    agents: [{ ...AGENTS[0]!, id: "maker" }, ...AGENTS],
     spawn,
     runMakerTurn,
     makerDelegate: pinnedMakerDelegate(),
@@ -159,6 +163,108 @@ function routeRequest(store: HarnessStore, execution?: HarnessExecution) {
       },
     );
 }
+
+test("the built-in maker records a refusal and zero spend without reading the CLI model", async () => {
+  const manifest = fixtureManifest({ max_cost_usd: 0.01 });
+  const replies = [
+    { action: "tool_call", tool: "edit_file", arguments: { path: "app.ts", old_string: "same", new_string: "same" } },
+    { action: "finish", summary: "Probe refused" },
+  ];
+  let configReads = 0;
+  const { state, store, execution } = setupHarness({ manifest, initialErrors: 0, deps: {
+    agents: AGENTS,
+    getConfig: () => { configReads++; return defaultConfig(ROOT); },
+    makerDelegate: {
+      config: () => { throw new Error("the local maker must not read the CLI model"); },
+      isAvailable: async () => { throw new Error("the local maker must not probe the CLI"); },
+    },
+    requestMaker: async (url, init) => {
+      expect(url.href).toBe("http://127.0.0.1:8080/v1/chat/completions");
+      expect(JSON.parse(String(init.body)).model).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+      return Response.json({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(replies.shift()) } }] });
+    },
+    callModel: async ({ excludeFamilies }) => {
+      expect(excludeFamilies).toEqual(["inkling"]);
+      return { text: "ACCEPT" };
+    },
+  } });
+
+  const runId = "local-maker";
+  const result = await withHarnessMakerEvents(store, runId, () => runHarness({ manifest, store, run_id: runId, ...execution }));
+  expect(result.stop_reason).toBe("passed");
+  expect(configReads).toBe(1);
+  expect(state.makerTurns).toEqual([]);
+  const run = store.getRun(runId);
+  expect(run?.cost_usd).toBe(0);
+  expect(run?.events).toContainEqual(expect.objectContaining({
+    event_type: "maker_tool_refused", payload: { round: 1, tool: "edit_file", reason: "no_op" },
+  }));
+  expect(run?.events.find((event) => event.event_type === "maker_round")?.payload).toMatchObject({ cost_usd: 0 });
+});
+
+test("the family gate refuses a different Inkling alias before the local run starts", async () => {
+  const manifest = fixtureManifest();
+  const { state, store, execution } = setupHarness({ manifest, deps: {
+    agents: [AGENTS[0]!, { ...AGENTS[1]!, model_id: "thinkingmachines/inkling-2-small" }],
+    getConfig: () => defaultConfig(ROOT),
+    requestMaker: async () => { throw new Error("the family gate must precede inference"); },
+  } });
+  await expect(runHarness({ manifest, store, ...execution })).rejects.toThrow(/same model family "inkling"/);
+  expect(store.listRuns(ROOT)).toHaveLength(0);
+  expect(state.spawns).toHaveLength(0);
+});
+
+test("an unavailable local maker resolves and charges the CLI fallback only when cloud helpers are allowed", async () => {
+  for (const cloudAllowed of [false, true]) {
+    const manifest = fixtureManifest();
+    const config = defaultConfig(ROOT);
+    config.orchestrator.allow_cloud_helpers = cloudAllowed;
+    config.claude_cli.delegate.model = "auto";
+    const probedModels: string[] = [];
+    let excluded: readonly string[] | undefined;
+    const { state, store, execution } = setupHarness({ manifest, initialErrors: 0, makerCostUsd: 0.25, deps: {
+      agents: AGENTS, getConfig: () => config,
+      makerDelegate: {
+        config: () => config,
+        isAvailable: async (candidate) => { probedModels.push(candidate.claude_cli.delegate.model); return true; },
+      },
+      requestMaker: async () => Response.json({ error: "loading model" }, { status: 503 }),
+      callModel: async ({ excludeFamilies }) => { excluded = excludeFamilies; return { text: "ACCEPT" }; },
+    } });
+    const runId = `fallback-${cloudAllowed}`;
+    const result = await withHarnessMakerEvents(store, runId, () => runHarness({ manifest, store, run_id: runId, ...execution }));
+    expect(result.stop_reason).toBe(cloudAllowed ? "passed" : "maker_failed");
+    expect(state.makerTurns).toHaveLength(cloudAllowed ? 1 : 0);
+    const run = store.getRun(runId);
+    expect(run?.cost_usd).toBe(cloudAllowed ? 0.25 : 0);
+    expect(run?.events.filter((event) => event.event_type === "maker_fallback")).toHaveLength(cloudAllowed ? 1 : 0);
+    if (cloudAllowed) {
+      const model = state.makerTurns[0]!.model;
+      expect(model).not.toBe("auto");
+      expect(probedModels).toContain(model);
+      expect(excluded).toEqual([...new Set(["inkling", "executor", modelFamily(model)])]);
+    } else {
+      expect(probedModels).toHaveLength(0);
+    }
+  }
+});
+
+test("the fallback's concrete CLI family cannot match the pinned checker", async () => {
+  const manifest = fixtureManifest();
+  const config = defaultConfig(ROOT);
+  config.orchestrator.allow_cloud_helpers = true;
+  const { state, store, execution } = setupHarness({ manifest, deps: {
+    agents: [AGENTS[0]!, { ...AGENTS[1]!, model_id: "minimax/minimax-m3" }],
+    getConfig: () => config,
+    requestMaker: async () => new Response(null, { status: 503 }),
+  } });
+  const result = await withHarnessMakerEvents(store, "fallback-family", () => runHarness({
+    manifest, store, run_id: "fallback-family", ...execution,
+  }));
+  expect(result.stop_reason).toBe("maker_failed");
+  expect(state.makerTurns).toHaveLength(0);
+  expect(state.checkerPrompts).toHaveLength(0);
+});
 
 describe("harness execution", () => {
   test("(a) POST start runs the supplied execution and answers 202, not 503", async () => {

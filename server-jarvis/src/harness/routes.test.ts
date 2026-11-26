@@ -3,6 +3,7 @@ import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { createHarnessExecution } from "./execution";
 import { HarnessStore } from "./store";
 import { handleHarnessRequest, type HarnessExecution } from "./routes";
+import { recordHarnessMakerEvent } from "./inkling-maker";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
 import { validateManifest, type HarnessManifest } from "./manifest";
 
@@ -196,6 +197,34 @@ describe("harness routes", () => {
       spy.mockRestore();
     }
   });
+
+  test("persists asynchronous maker events under the run ID returned by each start", async () => {
+    const bothMakersStarted = Promise.withResolvers<void>();
+    const bothEventsRecorded = Promise.withResolvers<void>();
+    let startedMakers = 0;
+    let recordedEvents = 0;
+    const { request } = setup(execution({ runMaker: async ({ manifest, round }) => {
+      if (++startedMakers === 2) bothMakersStarted.resolve();
+      await bothMakersStarted.promise;
+      recordHarnessMakerEvent({ event_type: "maker_tool_refused", payload: { round, tool: manifest.id, reason: "no_op" } });
+      if (++recordedEvents === 2) bothEventsRecorded.resolve();
+      return {};
+    } }));
+    const starts = await Promise.all(["read_file", "edit_file"].map(async (tool) => {
+      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest: manifest(tool) });
+      expect(started?.status).toBe(202);
+      const { run_id } = await payload(started);
+      return { run_id, tool };
+    }));
+
+    await bothEventsRecorded.promise;
+    for (const { run_id, tool } of starts) {
+      const { run } = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
+      expect(run.events.filter((event: { event_type: string }) => event.event_type === "maker_tool_refused")).toMatchObject([
+        { run_id, event_type: "maker_tool_refused", payload: { round: 1, tool, reason: "no_op" } },
+      ]);
+    }
+  }, 3_000);
 
   test("cancels an in-flight run and settles it with the existing cancelled stop reason", async () => {
     const { request } = setup(execution({ runMaker: waitingMaker }));

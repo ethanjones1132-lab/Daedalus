@@ -3,24 +3,9 @@
  * `HarnessExecution`). The loop itself stays in `runHarness`; this module only
  * supplies the sensors, maker, checker and admission boundaries.
  *
- * Maker entry point reused (not copied): `ExecutorDelegateRuntime.run` —
- * `productionExecutorDelegateRuntime` → `runClaudeDelegate` in
- * `orchestration/claude-delegate.ts`, injected here as `deps.runMakerTurn`.
- * Why this one: it is the orchestration layer's single-stage executor for one
- * turn. It takes one prompt, runs the bounded tool loop inside the delegate
- * process, confines itself to the allowed root and returns typed evidence
- * (`ok`, `narrative`, `toolCalls`), and it is already a constructor-injected
- * dependency of `PipelineExecutor` (`ExecutorDelegateRuntime`), so the harness
- * reuses it through the same seam instead of opening a second executor. The
- * alternatives do not fit a single stage: `PipelineExecutor.runExecutorStage`
- * is private to a full planner/executor/reviewer/synthesizer turn, and
- * index.ts's native tool loop is inline in `streamJarvis`.
- *
- * The resolved maker/checker agent is carried on every call so DD-151 can bind
- * the pool's maker (Inkling) without changing this contract. The maker's
- * delegate model is resolved and probed here (shared resolver with the
- * pipeline), so an "auto" pin becomes a concrete id before the CLI launch; no
- * pool default is changed.
+ * The built-in maker uses the llama.cpp tool loop. Named pool Agents and
+ * opt-in fallback use `ExecutorDelegateRuntime.run`. The shared delegate
+ * resolver pins an "auto" model before each delegated turn launches the CLI.
  *
  * Every boundary that reaches the outside world — command spawn, executor turn,
  * model call, clock — is injected so tests run with fakes: no network, GPU or
@@ -28,7 +13,7 @@
  */
 
 import { execFile } from "child_process";
-import type { JarvisConfig } from "../config";
+import { loadConfig, type JarvisConfig } from "../config";
 import { makeCallModel } from "../eval/call-model";
 import { OrchestrationAdmissionController } from "../orchestration/admission-controller";
 import {
@@ -42,9 +27,11 @@ import {
 } from "../orchestration/delegate-model-select";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
-import { resolveHarnessAgent, agentFamily, type HarnessAgentRef } from "./agents";
+import { resolveHarnessAgent, agentFamily, modelFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
 import type { HarnessAdmission, HarnessControllerInput, HarnessSensorBatch } from "./controller";
+import { INKLING_MAKER_ID, recordHarnessMakerEvent, runInklingMaker, type HarnessMakerRequest } from "./inkling-maker";
+import { createHarnessMakerTools } from "./maker-tools";
 import type { HarnessManifest } from "./manifest";
 import type { HarnessExecution } from "./routes";
 import { runSensors, type SensorSpawn, type SensorSpawnResult } from "./sensors";
@@ -111,6 +98,9 @@ export interface HarnessExecutionDeps {
    * unresolved "auto" can never reach the command line.
    */
   makerDelegate: HarnessMakerDelegate;
+  /** Read current llama.cpp settings when a new local run starts. */
+  getConfig?: () => JarvisConfig;
+  requestMaker?: HarnessMakerRequest;
   /** The agent call used for the checker. */
   callModel: HarnessModelCall;
   /** Direct command spawn; defaults to execFile with no shell. */
@@ -150,7 +140,7 @@ const defaultSpawn: SensorSpawn = ({ executable, args, cwd, signal }) =>
         resolve({
           stdout: stdout ?? "",
           stderr: stderr ?? "",
-          exitCode: typeof code === "number" ? code : 1,
+          exitCode: error ? (typeof code === "number" ? code : 1) : 0,
         });
       },
     );
@@ -575,6 +565,9 @@ async function resolveMakerDelegateConfig(maker: HarnessMakerDelegate): Promise<
 export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecution {
   const spawn = deps.spawn ?? defaultSpawn;
   const agents = deps.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
+  const getConfig = deps.getConfig ?? loadConfig;
+  const hasNamedMaker = agents.some((agent) => agent.enabled && agent.id === INKLING_MAKER_ID);
+  const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig; useDelegate: boolean; delegateFamilies: Set<string> }>();
   const briefValues = deps.briefValues ?? {};
   const diffMaxChars = deps.diffMaxChars ?? HARNESS_DIFF_MAX_CHARS;
   // The controller passes the same manifest object to both hooks for a run, so
@@ -584,6 +577,15 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   // earliest execution hook the run reaches, so HEAD is sampled there (before the
   // maker changes anything) and the checker diffs that range on top of HEAD.
   const runBases = new WeakMap<HarnessManifest, RunDiffBase>();
+
+  function localMakerFor(manifest: HarnessManifest, signal: AbortSignal) {
+    if (manifest.maker_agent_id !== INKLING_MAKER_ID || hasNamedMaker) return undefined;
+    const current = localRuns.get(signal);
+    if (current) return current;
+    const run = { config: getConfig(), useDelegate: false, delegateFamilies: new Set<string>() };
+    localRuns.set(signal, run);
+    return run;
+  }
 
   const sensors: HarnessControllerInput["sensors"] = async ({ manifest, signal }) => {
     const batch = await runSensorBatch({
@@ -598,6 +600,27 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   };
 
   const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal }) => {
+    const local = localMakerFor(manifest, signal);
+    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues);
+    if (local && !local.useDelegate) {
+      if (round === 1 && manifest.checker.enabled) {
+        runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
+      }
+      const { config } = local;
+      recordHarnessMakerEvent({ event_type: "maker_selected", payload: { round, provider: "llama_cpp", model_id: config.llama_cpp.model } });
+      const turn = await runInklingMaker({
+        backend: config.llama_cpp, prompt, round, signal,
+        tools: createHarnessMakerTools({
+          config, projectRoot: manifest.project_root, signal,
+          runSensors: () => runSensorBatch({ manifest, signal, store: deps.store, spawn, now: deps.now }),
+        }),
+        request: deps.requestMaker,
+        recordEvent: recordHarnessMakerEvent,
+      });
+      if (turn.ok) return { cost_usd: 0 };
+      if (!turn.unavailable || !config.orchestrator.allow_cloud_helpers || signal.aborted) return { failed: true, cost_usd: 0 };
+    }
+
     const agent = resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
     if (!agent) {
       throw new Error(`no executor agent is available for harness maker "${manifest.maker_agent_id}"`);
@@ -612,10 +635,24 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       );
       throw error;
     });
-    if (round === 1 && manifest.checker.enabled) {
+    if (local) {
+      // The checker must stay independent if the local maker hands the task
+      // off to the delegate. Check before the delegate can produce edits.
+      const families = [agentFamily(agent), modelFamily(config.claude_cli.delegate.model)].filter(Boolean);
+      if (manifest.checker.enabled) {
+        const checker = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
+        if (checker && families.includes(agentFamily(checker))) {
+          throw new Error(`checker agent "${checker.id}" shares a model family with the maker delegate`);
+        }
+      }
+      for (const family of families) local.delegateFamilies.add(family);
+      if (!local.useDelegate) {
+        local.useDelegate = true;
+        recordHarnessMakerEvent({ event_type: "maker_fallback", payload: { round, provider: "claude_cli", reason: "llama_cpp_unavailable" } });
+      }
+    } else if (round === 1 && manifest.checker.enabled) {
       runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
     }
-    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues);
     const turn = await deps.runMakerTurn({
       cwd: manifest.project_root,
       prompt,
@@ -635,13 +672,10 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
     }
-    // The controller already refuses a checker in the maker's family; carry the
-    // maker's family into the model call so a failed checker attempt can never
-    // advance to a maker-family pool/tail entry. Resolved here because this is
-    // the boundary that knows both agents.
-    const maker = resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
-    const makerFamily = maker ? agentFamily(maker) : "";
-    const excludeFamilies = makerFamily ? [makerFamily] : [];
+    const local = localMakerFor(manifest, signal);
+    const maker = local ? undefined : resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
+    const makerFamily = local ? modelFamily(local.config.llama_cpp.model) : maker ? agentFamily(maker) : "";
+    const excludeFamilies = [...new Set([makerFamily, ...(local?.delegateFamilies ?? [])].filter(Boolean))];
     const base = runBases.get(manifest);
     runBases.delete(manifest);
     const evidence = await collectRunDiff(spawn, manifest.project_root, signal, diffMaxChars, base);
@@ -663,6 +697,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   return {
     sensors,
     runMaker,
+    localMakerModel: ({ manifest, signal }) => localMakerFor(manifest, signal)?.config.llama_cpp.model,
     runChecker,
     admission: deps.admission ?? backgroundAdmission(),
     // The pool resolved above is what the maker and checker actually run on, so

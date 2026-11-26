@@ -2,6 +2,7 @@ import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { getHarnessCommand } from "./commands";
 import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessRunResult } from "./controller";
+import { withHarnessMakerEvents } from "./inkling-maker";
 import { validateManifest, type HarnessManifest } from "./manifest";
 import { HarnessStore } from "./store";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
@@ -10,6 +11,7 @@ import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
 export interface HarnessExecution {
   sensors: HarnessControllerInput["sensors"];
   runMaker: HarnessControllerInput["runMaker"];
+  localMakerModel?: HarnessControllerInput["localMakerModel"];
   runChecker: HarnessControllerInput["runChecker"];
   admission: HarnessAdmission;
   /**
@@ -204,8 +206,10 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
       sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
     };
     if (execution.agents) controllerInput.agents = execution.agents;
+    if (execution.localMakerModel) controllerInput.localMakerModel = execution.localMakerModel;
     if (typeof deadline === "number") controllerInput.deadline_ms = deadline;
-    const done = runHarness(controllerInput).finally(() => { activeRuns.delete(runId); });
+    const done = withHarnessMakerEvents(store, runId, () => runHarness(controllerInput))
+      .finally(() => { activeRuns.delete(runId); });
     activeRuns.set(runId, { controller, done });
     // A round-body failure settles the run as `run_failed` and writes its own
     // stop event inside the controller. Only failures before that evidence can

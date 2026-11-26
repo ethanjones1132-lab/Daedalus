@@ -1,5 +1,5 @@
 import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "../orchestration/agent-pool";
-import { agentFamily, resolveHarnessAgent } from "./agents";
+import { agentFamily, modelFamily, resolveHarnessAgent } from "./agents";
 import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import type { HarnessRoundInput, HarnessSensorResultInput, HarnessStore } from "./store";
 
@@ -49,6 +49,8 @@ export interface HarnessControllerInput {
   store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
   runMaker: (input: { manifest: HarnessManifest; round: number; signal: AbortSignal }) => Promise<{ failed?: boolean; continue?: boolean; cost_usd?: number } | void>;
+  /** The actual model for a maker that runs outside the delegate pool. */
+  localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
   runChecker: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<{ passed: boolean }>;
   /** Agent pool used to resolve the maker/checker model families. Defaults to the shipped pool. */
   agents?: readonly OrchestratorAgent[];
@@ -106,6 +108,7 @@ function vectorImproved(previous: HarnessRoundInput["counter_vector"] | undefine
 export async function runHarness(input: HarnessControllerInput): Promise<HarnessRunResult> {
   const checked = validateManifest(input.manifest);
   if (!checked.ok) throw new Error(`Invalid harness manifest: ${checked.errors.join("; ")}`);
+  const abort = new AbortController();
   if (input.manifest.checker.enabled) {
     const makerAgentId = input.manifest.maker_agent_id;
     const checkerAgentId = input.manifest.checker.agent_id;
@@ -113,9 +116,10 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
       throw new Error("checker agent must differ from maker agent");
     }
     const agents = input.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
-    const maker = resolveHarnessAgent(agents, makerAgentId, "executor");
     const checker = resolveHarnessAgent(agents, checkerAgentId, "reviewer");
-    const makerFamily = maker ? agentFamily(maker) : "";
+    const localModel = input.localMakerModel?.({ manifest: input.manifest, signal: abort.signal });
+    const maker = localModel === undefined ? resolveHarnessAgent(agents, makerAgentId, "executor") : undefined;
+    const makerFamily = localModel !== undefined ? modelFamily(localModel) : maker ? agentFamily(maker) : "";
     const checkerFamily = checker ? agentFamily(checker) : "";
     if (makerFamily && checkerFamily && makerFamily === checkerFamily) {
       throw new Error(
@@ -136,7 +140,6 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
   if (!Number.isFinite(abandonWaitMs) || abandonWaitMs < 0) throw new Error("abandon_wait_ms must be a non-negative finite duration");
   const run = input.store.createRun({ id: input.run_id, project_root: input.manifest.project_root,
     manifest_id: input.manifest.id, manifest_hash: manifestHash(input.manifest) });
-  const abort = new AbortController();
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   let reason: HarnessStopReason = "max_rounds";
   let rounds = 0;

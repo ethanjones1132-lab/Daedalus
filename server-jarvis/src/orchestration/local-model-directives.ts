@@ -1,5 +1,5 @@
 /**
- * Per-model corrective directives for local Ollama models.
+ * Per-model corrective directives for local models.
  *
  * Hand-authored from confirmed failure modes (file misattribution, confidence
  * without re-test, no-op edit_file). Wired through OrchestratorAgent.system_prompt
@@ -36,12 +36,19 @@ export const LOCAL_MODEL_DIRECTIVES: Readonly<Record<string, string>> = {
     "Before issuing edit_file, verify old_string and new_string actually differ. " +
     "An edit where old_string === new_string reports success and changes nothing. " +
     "Encode the fix you described; never submit a no-op edit.",
+
+  "inkling-2-mini":
+    "Batch related inspections where the tools allow it. Never issue no-op probes. " +
+    "If an identical call is refused and nothing has changed, stop repeating it and ask for help " +
+    "through a consultant when available. Run the adjacent test and read its real output " +
+    "before claiming progress.",
 };
 
 /** Look up a corrective directive for a local model id, if any. */
 export function directiveForModel(modelId: string): string | undefined {
   if (!modelId || typeof modelId !== "string") return undefined;
-  const key = normalizeModelId(modelId);
+  const normalized = normalizeModelId(modelId);
+  const key = normalized === "inkling-2-mini-ud-iq3_xxs.gguf" ? "inkling-2-mini" : normalized;
   if (!key) return undefined;
   return LOCAL_MODEL_DIRECTIVES[key];
 }
