@@ -164,6 +164,49 @@ describe("runHarness", () => {
     await resultWithReason("checker_rejected", { runChecker: async () => ({ passed: false }) });
   });
 
+  test("a sensor batch that throws settles run_failed with its message", async () => {
+    const setup = deps({ sensors: async () => { throw new Error("sensor crashed"); } });
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("run_failed");
+    expect(result.stop_reason).not.toBe("no_progress");
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "run_failed", rounds: 1, error: "sensor crashed" });
+  });
+
+  test("a checker that throws settles run_failed, not checker_rejected", async () => {
+    const setup = deps({ runChecker: async () => { throw new Error("checker crashed"); } });
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("run_failed");
+    expect(result.stop_reason).not.toBe("checker_rejected");
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "run_failed", rounds: 1, error: "checker crashed" });
+  });
+
+  test("an aborted sensor still settles cancelled, not run_failed", async () => {
+    const abort = new AbortController();
+    let notifyStarted!: () => void;
+    const sensorStarted = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    const setup = deps({
+      signal: abort.signal,
+      abandon_wait_ms: 100,
+      sensors: async ({ signal }) => {
+        notifyStarted();
+        await new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(new Error("sensor stopped")), { once: true }));
+        return zero;
+      },
+    });
+    const run = runHarness(setup.input);
+    await sensorStarted;
+    abort.abort();
+    const result = await run;
+    expect(result.stop_reason).toBe("cancelled");
+    const stopped = setup.store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({ stop_reason: "cancelled", rounds: 1 });
+  });
+
   test("creates the run with a caller-supplied id so it can be addressed while in flight", async () => {
     const setup = deps({ run_id: "run-in-flight" });
     const result = await runHarness(setup.input);

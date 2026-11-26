@@ -306,7 +306,14 @@ describe("harness execution", () => {
       manifest, store, run_id: "run-git-failure",
       sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
     });
-    expect(result.stop_reason).toBe("checker_rejected");
+    // A checker that throws produced no verdict: DD-192 settles it as
+    // run_failed with the thrown message, never as a legitimate rejection.
+    expect(result.stop_reason).toBe("run_failed");
+    const stopped = store.getRun(result.run_id)?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toMatchObject({ stop_reason: "run_failed", rounds: 1 });
+    expect(String((stopped[0]?.payload as { error?: unknown } | undefined)?.error))
+      .toMatch(/harness evidence collection failed/);
     expect(state.checkerPrompts).toHaveLength(0);
     expect(state.checkerPrompts.some((checker) => checker.prompt.includes(noChangesSentence))).toBe(false);
   });

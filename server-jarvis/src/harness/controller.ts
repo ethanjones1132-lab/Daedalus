@@ -163,7 +163,14 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
       if (maker?.failed) { reason = "maker_failed"; break; }
       let batch: HarnessSensorBatch;
       try { batch = await waitWithAbort(track(input.sensors({ manifest: input.manifest, signal: abort.signal })), abort.signal); }
-      catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "no_progress"; break; }
+      catch (error) {
+        // Only an abort or an elapsed deadline is a clean stop; a sensor that
+        // throws is a broken run, and its message is the failure evidence.
+        if (input.signal?.aborted) reason = "cancelled";
+        else if (now() >= deadlineAt) reason = "deadline";
+        else { reason = "run_failed"; failure = error instanceof Error ? error.message : String(error); }
+        break;
+      }
       if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
       const round = input.store.appendRound({ run_id: run.id, round_number: roundNumber, counter_vector: batch.counter_vector });
       for (const result of batch.sensors) {
@@ -203,7 +210,13 @@ export async function runHarness(input: HarnessControllerInput): Promise<Harness
             const checkedByAgent = await waitWithAbort(track(input.runChecker({ manifest: input.manifest, signal: abort.signal })), abort.signal);
             if (input.signal?.aborted || abort.signal.aborted || now() >= deadlineAt) { reason = input.signal?.aborted ? "cancelled" : "deadline"; break; }
             reason = checkedByAgent.passed ? "passed" : "checker_rejected";
-          } catch { reason = input.signal?.aborted ? "cancelled" : now() >= deadlineAt ? "deadline" : "checker_rejected"; }
+          } catch (error) {
+            // A checker that throws produced no verdict; that is a failed run,
+            // not a rejection. Abort and deadline keep their own reasons.
+            if (input.signal?.aborted) reason = "cancelled";
+            else if (now() >= deadlineAt) reason = "deadline";
+            else { reason = "run_failed"; failure = error instanceof Error ? error.message : String(error); }
+          }
         } else reason = "passed";
         break;
       }
