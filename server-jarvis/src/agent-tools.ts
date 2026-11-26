@@ -7,6 +7,7 @@ import { TOOL_TIMEOUT_REASON, type ExecutionContext } from "./tool-runtime";
 import { ToolExecutionError } from "./tool-types";
 import { buildLocalClaudeArgs, buildLocalClaudeEnv, resolveClaudePath } from "./claude-cli";
 import { cloudHelpersAllowed } from "./provider-availability";
+import { terminateProcess } from "./shell-bundle";
 
 type TaskStatus = "running" | "completed" | "failed" | "stopped";
 
@@ -46,6 +47,16 @@ export const MAX_BG_COMMAND_TIMEOUT_MS = 1_800_000;
 
 /** Floor so a typo of 0/negative never disables the kill timer. */
 export const MIN_BG_COMMAND_TIMEOUT_MS = 1_000;
+
+/**
+ * How long the shell gets to exit after the polite tree signal before the
+ * kill timer escalates to a forced tree kill. Same window the foreground
+ * shell uses.
+ */
+export const BG_TREE_KILL_GRACE_MS = 1_000;
+
+/** How long the forced kill gets to be confirmed before it is reported as unconfirmed. */
+export const BG_TREE_KILL_CONFIRM_MS = 2_000;
 
 /**
  * Resolve `timeout_ms` for a background command: default 5 min, clamp to
@@ -109,7 +120,19 @@ function resolvePowerShellExecutable(): string {
     "pwsh",
     "powershell.exe",
   ];
-  return candidates.find(candidate => candidate.includes("/") && existsSync(candidate)) || "pwsh";
+  const found = candidates.find(candidate => candidate.includes("/") && existsSync(candidate));
+  if (found) return found;
+  if (process.platform === "win32") {
+    // PowerShell 7 (pwsh) is a separate install on Windows; a stock box has
+    // only Windows PowerShell. Falling back to a bare "pwsh" made every
+    // background command with powershell: true fail with exit code -4058 on
+    // such a box. Mirror shell-bundle's PowerShell tool, which uses
+    // powershell.exe there.
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const pwsh7 = `${programFiles}\\PowerShell\\7\\pwsh.exe`;
+    return existsSync(pwsh7) ? pwsh7 : "powershell.exe";
+  }
+  return "pwsh";
 }
 
 function wslPathToWindowsUnc(path: string): string {
@@ -176,11 +199,15 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
       proc = spawn(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cwdCommand], {
         cwd: isWindowsPowerShell ? undefined : workspace,
         env: { ...process.env, PATH: process.env.PATH },
+        // Mirror shell-bundle: POSIX needs its own process group so the kill
+        // timer can signal the whole tree with one group signal.
+        detached: process.platform !== "win32",
       });
     } else {
       proc = spawn("bash", ["-c", command], {
         cwd: safePath(cwd, cfg),
         env: { ...process.env, PATH: process.env.PATH },
+        detached: process.platform !== "win32",
       });
     }
   } catch (e: any) {
@@ -226,6 +253,93 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     }
   };
 
+  // ── Process-tree termination on timeout ──
+  // `proc.killed` only reports that a signal was handed to Node; it never
+  // proves the process (or a descendant) exited. Escalation below is driven
+  // purely by the real `exit` event.
+  let exited = false;
+  const exitWaiters = new Set<() => void>();
+  proc.once("exit", () => {
+    exited = true;
+    for (const waiter of exitWaiters) waiter();
+    exitWaiters.clear();
+  });
+
+  const waitForExitWithin = (ms: number): Promise<boolean> => {
+    if (exited) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter = () => {
+        if (timer) clearTimeout(timer);
+        exitWaiters.delete(waiter);
+        resolve(true);
+      };
+      timer = setTimeout(() => {
+        exitWaiters.delete(waiter);
+        resolve(exited);
+      }, ms);
+      exitWaiters.add(waiter);
+    });
+  };
+
+  const processGroupAlive = (pid: number): boolean => {
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      // ESRCH = the group is gone; EPERM = it exists but is not ours to signal.
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+
+  let terminationError: unknown;
+  let terminationWork: Promise<void> = Promise.resolve();
+
+  const terminateBackgroundTree = async (): Promise<void> => {
+    // 1. Polite tree signal: `taskkill /PID <pid> /T /F` on Windows (one call
+    //    removes the whole tree), `SIGTERM` to the process group on POSIX.
+    try {
+      await terminateProcess(proc, "SIGTERM");
+    } catch (error) {
+      // The shell may have exited on its own between the timeout firing and
+      // the signal; that is a clean finish, not an unconfirmed kill.
+      if (exited) return;
+      terminationError = error;
+      console.warn(`[Jarvis] Background command ${taskId}: tree signal failed:`, error);
+      return;
+    }
+    // 2. Wait for the shell's ACTUAL exit, not `proc.killed`.
+    const exitedWithinGrace = await waitForExitWithin(BG_TREE_KILL_GRACE_MS);
+    // 3. Force the surviving tree. POSIX descendants can ignore SIGTERM even
+    //    after the shell is gone, so the group is always swept; on Windows
+    //    `taskkill /T /F` already covered the tree unless the shell survived.
+    if (exitedWithinGrace && process.platform === "win32") return;
+    try {
+      await terminateProcess(proc, "SIGKILL");
+    } catch (error) {
+      terminationError = error;
+      console.warn(`[Jarvis] Background command ${taskId}: forced tree kill failed:`, error);
+      return;
+    }
+    // 4. Confirm: signal delivery is not proof. Wait for the shell's exit on
+    //    Windows, and poll the POSIX process group until it disappears.
+    if (process.platform === "win32") {
+      if (!(await waitForExitWithin(BG_TREE_KILL_CONFIRM_MS))) {
+        terminationError = new Error("shell survived the forced tree kill");
+      }
+      return;
+    }
+    const pid = proc.pid;
+    if (!pid) return;
+    const deadline = Date.now() + BG_TREE_KILL_CONFIRM_MS;
+    while (processGroupAlive(pid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (processGroupAlive(pid)) {
+      terminationError = new Error(`process group ${pid} could not be confirmed empty`);
+    }
+  };
+
   // Per-process kill timer — does not depend on the 60s task monitor poll.
   // This is the load-bearing fix for non-terminating fixture-suite children.
   const killTimer = setTimeout(() => {
@@ -233,21 +347,14 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
     const rt = runningTasks.get(taskId);
     if (!rt?.proc) return;
     console.warn(
-      `[Jarvis] Background command ${taskId} hit timeout_ms=${timeoutMs}; terminating.`,
+      `[Jarvis] Background command ${taskId} hit timeout_ms=${timeoutMs}; ` +
+        `signalling the process tree, waiting ${BG_TREE_KILL_GRACE_MS}ms for exit, ` +
+        `then forcing the kill (confirmed within ${BG_TREE_KILL_CONFIRM_MS}ms).`,
     );
-    try {
-      rt.proc.kill("SIGTERM");
-    } catch {
-      // Process may already be exiting.
-    }
-    // Windows often needs a hard kill if SIGTERM is ignored.
-    setTimeout(() => {
-      try {
-        if (!rt.proc?.killed) rt.proc?.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
-    }, 2_000).unref?.();
+    terminationWork = terminateBackgroundTree().catch((error) => {
+      terminationError = error;
+      console.warn(`[Jarvis] Background command ${taskId}: tree termination failed:`, error);
+    });
   }, timeoutMs);
   killTimer.unref?.();
 
@@ -258,6 +365,8 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
 
   proc.on("close", async (code) => {
     clearKillTimer();
+    // A timeout may only be reported once the tree kill has been confirmed.
+    await terminationWork;
     if (writeTimeout) {
       clearTimeout(writeTimeout);
       writeTimeout = null;
@@ -269,6 +378,10 @@ export async function toolRunBackgroundCommand(args: Record<string, unknown>, cf
       if (timedOut) {
         currentTask.status = "failed";
         currentTask.error = `Background command timed out after ${timeoutMs}ms.`;
+        if (terminationError) {
+          const detail = terminationError instanceof Error ? terminationError.message : String(terminationError);
+          currentTask.error += ` Process tree termination could not be confirmed: ${detail}`;
+        }
       } else {
         currentTask.status = code === 0 ? "completed" : "failed";
         if (code !== 0) {

@@ -1,4 +1,7 @@
 import { describe, test, expect, mock } from "bun:test";
+import { mkdtempSync, rmSync, existsSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { createToolRuntime, makeExecutionContext, type ExecutionContext } from "./tool-runtime";
 import { registerTaskBundle, registerTaskControlBundle } from "./task-bundle";
 import { defaultConfig } from "./config";
@@ -150,4 +153,81 @@ describe("run_background_command timeout (live)", () => {
       expect(status.toLowerCase()).toMatch(/timeout|timed out/);
     }
   }, 15_000);
+});
+
+describe("run_background_command tree kill on timeout (live)", () => {
+  test("kills a grandchild that outlives the shell", async () => {
+    // Regression for DD-169: on timeout only the shell was signalled, so a
+    // child kept running after the task reported "timed out". The command
+    // starts a node child (a grandchild of the tool process on POSIX) that
+    // would write `late` 6s later, while the shell itself stays busy until
+    // timeout_ms. If the whole tree is killed, the child dies long before
+    // its 6s timer and `late` never appears.
+    const dir = mkdtempSync(join(tmpdir(), "jarvis-bg-tree-kill-"));
+    const startMarker = join(dir, "child-started.txt");
+    const lateMarker = join(dir, "child-finished.txt");
+    // One expression, no spaces/quotes/semicolons, so it survives both the
+    // POSIX `bash -c` quoting and PowerShell's `$env:` expansion unchanged.
+    // writeFileSync needs its data argument: a one-argument call throws
+    // ERR_INVALID_ARG_TYPE before either marker is written, which would make
+    // "the late marker is absent" pass for the wrong reason.
+    const childCode =
+      "(require(process.env.DD169_FS).writeFileSync(process.env.DD169_START,'')," +
+      "setTimeout(()=>require(process.env.DD169_FS).writeFileSync(process.env.DD169_LATE,''),6000))";
+    const command = process.platform === "win32"
+      // node runs in the shell's foreground, so it is a real child in the
+      // tree `taskkill /T /F` has to reach, and outlives the shell if only
+      // the shell is killed.
+      ? "node -e $env:DD169_CODE"
+      : "node -e \"$DD169_CODE\" & sleep 30";
+    const previousEnv = {
+      code: process.env.DD169_CODE,
+      fs: process.env.DD169_FS,
+      start: process.env.DD169_START,
+      late: process.env.DD169_LATE,
+    };
+    process.env.DD169_CODE = childCode;
+    process.env.DD169_FS = "fs";
+    process.env.DD169_START = startMarker;
+    process.env.DD169_LATE = lateMarker;
+
+    try {
+      const started = await makeRuntime().execute(
+        call("run_background_command", {
+          command,
+          powershell: process.platform === "win32",
+          timeout_ms: 3_000,
+          description: "tree-kill-for-timeout-test",
+        }),
+        ctx({ requestApproval: async () => true }),
+      );
+      expect(started.is_error).toBe(false);
+      const idMatch = String(started.output).match(/Task ID: (bg_\w+)/);
+      expect(idMatch).toBeTruthy();
+      const taskId = idMatch![1]!;
+
+      // 3s timeout + 1s exit grace + up to 2s kill confirmation, then the
+      // child's 6s write (which must never happen). Leave slack for a slow
+      // shell startup so the assertion is not vacuous.
+      await new Promise((r) => setTimeout(r, 10_000));
+
+      const status = await toolTaskGet({ id: taskId });
+      if (status.includes("running")) {
+        await toolTaskStop({ id: taskId });
+      }
+      // The grandchild really started, so "no late marker" means "killed",
+      // not "never spawned".
+      expect(existsSync(startMarker)).toBe(true);
+      expect(existsSync(lateMarker)).toBe(false);
+      expect(status).toMatch(/failed/);
+      expect(status.toLowerCase()).toMatch(/timed out/);
+    } finally {
+      for (const [key, value] of Object.entries(previousEnv)) {
+        const envKey = `DD169_${key.toUpperCase()}`;
+        if (value === undefined) delete process.env[envKey];
+        else process.env[envKey] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 25_000);
 });

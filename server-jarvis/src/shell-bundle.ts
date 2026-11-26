@@ -191,7 +191,17 @@ function boundedShellText(value: string): string {
   return `${value.slice(0, MAX_SHELL_OUTPUT_CHARS)}… [truncated]`;
 }
 
-function terminateProcess(proc: ChildProcess, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
+/**
+ * Signal a spawned shell's WHOLE process tree.
+ *
+ * Windows has no signal semantics: `taskkill /T /F` removes the process and
+ * every descendant in one call (a direct-child SIGTERM cannot reach
+ * descendants). POSIX targets the process group, which exists only when the
+ * child was spawned `detached`. Resolves when the call has been dispatched —
+ * callers that need proof of exit must watch `exit`/`close`, never
+ * `proc.killed`.
+ */
+export function terminateProcess(proc: ChildProcess, signal: "SIGTERM" | "SIGKILL"): Promise<void> {
   const pid = proc.pid;
   if (pid && process.platform === "win32") {
     const args = ["/PID", String(pid), "/T"];
