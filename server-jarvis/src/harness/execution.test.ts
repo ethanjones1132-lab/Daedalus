@@ -1090,4 +1090,87 @@ describe("harness execution", () => {
     expect(state.spawns).toContain("bun run typecheck");
     expect(store.findApproval("bun_typecheck", ROOT, manifestHash(manifest))).toBeUndefined();
   });
+
+  // DD-206's boundary refusal: a cloud call whose remainder is $0 must fail
+  // before the delegate or checker launches, so the spend is never incurred.
+  // These pin the launch count, not just the returned shape: reverting the
+  // refusal makes the zero cases observe one launched call.
+  describe("cloud budget boundary", () => {
+    const budget = (max_cloud_usd: number) => ({ max_rounds: 3, max_ms: 60_000, max_cloud_usd });
+
+    test("a zero cloud remainder refuses the maker delegate before it launches", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest });
+
+      const result = await execution.runMaker({
+        manifest, round: 1, signal: new AbortController().signal, budget_left: budget(0),
+      });
+
+      expect(result).toEqual({
+        failed: true,
+        cost_usd: 0,
+        failureDetail: "cloud budget exhausted: the run has $0.00 of its max_cloud_usd left, " +
+          "so the maker cloud call was not launched",
+      });
+      expect(state.makerTurns).toHaveLength(0);
+    });
+
+    test("a positive cloud remainder still launches the maker delegate", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest });
+
+      const result = await execution.runMaker({
+        manifest, round: 1, signal: new AbortController().signal, budget_left: budget(0.25),
+      });
+
+      // A launched turn reports what it did; this fake reports no spend, so the
+      // empty result is the "no refusal, nothing invented" shape.
+      expect(result).toEqual({});
+      expect(state.makerTurns).toHaveLength(1);
+    });
+
+    test("a maker turn with no reported budget stays unrestricted", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest });
+
+      const result = await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal });
+
+      expect(result).toEqual({});
+      expect(state.makerTurns).toHaveLength(1);
+    });
+
+    test("a zero cloud remainder refuses the checker before the call is made", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest, initialErrors: 0 });
+
+      await expect(execution.runChecker({
+        manifest, signal: new AbortController().signal, budget_left: budget(0),
+      })).rejects.toThrow(
+        /^cloud budget exhausted: the run has \$0\.00 of its max_cloud_usd left, so the checker cloud call was not launched$/,
+      );
+      expect(state.checkerPrompts).toHaveLength(0);
+    });
+
+    test("a positive cloud remainder still launches the checker", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest, initialErrors: 0 });
+
+      const verdict = await execution.runChecker({
+        manifest, signal: new AbortController().signal, budget_left: budget(0.25),
+      });
+
+      expect(verdict).toEqual({ passed: true });
+      expect(state.checkerPrompts).toHaveLength(1);
+    });
+
+    test("a checker with no reported budget stays unrestricted", async () => {
+      const manifest = fixtureManifest();
+      const { state, execution } = setupHarness({ manifest, initialErrors: 0 });
+
+      const verdict = await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+      expect(verdict).toEqual({ passed: true });
+      expect(state.checkerPrompts).toHaveLength(1);
+    });
+  });
 });
