@@ -14,6 +14,7 @@ export interface HarnessExecution {
   runMaker: HarnessControllerInput["runMaker"];
   localMakerModel?: HarnessControllerInput["localMakerModel"];
   runChecker: HarnessControllerInput["runChecker"];
+  onControl?: HarnessControllerInput["onControl"];
   admission: HarnessAdmission;
   /**
    * The agent pool the run's models actually come from, carried so the
@@ -235,6 +236,7 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
     };
     if (execution.agents) controllerInput.agents = execution.agents;
     if (execution.localMakerModel) controllerInput.localMakerModel = execution.localMakerModel;
+    if (execution.onControl) controllerInput.onControl = execution.onControl;
     if (typeof deadline === "number") controllerInput.deadline_ms = deadline;
     const done = withHarnessMakerEvents(store, runId, () => runHarness(controllerInput))
       .finally(() => { activeRuns.delete(runId); });

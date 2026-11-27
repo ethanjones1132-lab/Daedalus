@@ -1,5 +1,5 @@
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
-import { runEngine } from "./engine";
+import { runEngine, type EngineControl } from "./engine";
 import type { HarnessManifest } from "./manifest";
 import type { RunBudget } from "./module";
 import type { HarnessRoundInput, HarnessStore } from "./store";
@@ -154,6 +154,8 @@ export interface HarnessControllerInput {
   run_id?: string;
   /** Values for this run's brief template, threaded into its maker and checker prompts. */
   briefValues?: HarnessBriefValues;
+  /** Optional control seam for callers that need harness switches and retries. */
+  onControl?: (control: EngineControl) => void;
   signal?: AbortSignal;
   now?: () => number;
   /** Maximum total elapsed time, including admission wait. Defaults to 30 minutes; clamped to MAX_DEADLINE_MS. */
@@ -166,7 +168,11 @@ export interface HarnessControllerInput {
   admission: HarnessAdmission;
 }
 
-/** Run the fixed worker entry point with the existing controller contract. */
+/** Start on the fixed worker; opt out of legacy mode only for control-aware callers. */
 export function runHarness(input: HarnessControllerInput): Promise<HarnessRunResult> {
-  return runEngine({ ...input, initial: { id: "worker" }, legacyWorker: true });
+  return runEngine({
+    ...input,
+    initial: { id: "worker" },
+    legacyWorker: input.onControl === undefined,
+  });
 }

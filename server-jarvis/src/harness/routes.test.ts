@@ -7,6 +7,7 @@ import { handleHarnessRequest, type HarnessExecution } from "./routes";
 import { recordHarnessMakerEvent } from "./inkling-maker";
 import { HARNESS_TEMPLATES, instantiateHarnessTemplate } from "./templates";
 import { validateManifest, type HarnessManifest } from "./manifest";
+import type { EngineControl } from "./engine";
 
 const ROOT = "/known/project";
 function manifest(id = "bug-fix", root = ROOT): HarnessManifest {
@@ -185,6 +186,89 @@ describe("harness routes", () => {
     const read = await payload(await request(`/harness/runs/${run_id}?project_root=${encodeURIComponent(ROOT)}`));
     expect(read.run.id).toBe(run_id);
     expect((await request(`/harness/runs/${run_id}?project_root=%2Fother`))?.status).toBe(404);
+  });
+
+  test("the start route carries onControl through to a suggested planner handoff", async () => {
+    let control!: EngineControl;
+    const attachedAtMaker: Array<{ round: number; id: string; cloudBudget: number }> = [];
+    const { store, request } = setup(execution({
+      onControl: (value) => {
+        control = value;
+        // Reserve through the engine's existing run ledger before the queued
+        // planner round can dispatch.
+        value.chargeCloud(0.05);
+        value.switch("planner", {}, "start planner through the control seam");
+      },
+      runMaker: async ({ round, budget_left }) => {
+        attachedAtMaker.push({
+          round,
+          id: control.state().attached.id,
+          cloudBudget: budget_left?.max_cloud_usd ?? -1,
+        });
+        return {};
+      },
+    }));
+    const item = manifest();
+    item.checker.enabled = false;
+    await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
+
+    const started = await request("/harness/runs", "POST",
+      { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Plan then work" } });
+    expect(started?.status).toBe(202);
+    const { run_id } = await payload(started);
+
+    for (let attempt = 0; attempt < 200 && !store.getRun(run_id)?.events.some((event) => event.event_type === "stopped"); attempt++) {
+      await Bun.sleep(5);
+    }
+    const run = store.getRun(run_id);
+    // The checker is off here, so the worker keeps looping to max_rounds; what
+    // this pins is the handoff: the seam starts the planner and the recorded
+    // switch then puts every later round on the worker.
+    expect(attachedAtMaker.slice(0, 2)).toEqual([
+      { round: 1, id: "planner", cloudBudget: 0.45 },
+      { round: 2, id: "worker", cloudBudget: 0.45 },
+    ]);
+    expect(attachedAtMaker.slice(2).every((entry) => entry.id === "worker")).toBe(true);
+    expect(run?.cost_usd).toBeCloseTo(0.05);
+    expect(run?.events.find((event) => event.event_type === "suggest_switch")?.payload)
+      .toMatchObject({ id: "worker", round: 1 });
+    const switches = run?.events.filter((event) => event.event_type === "switch").map((event) => event.payload) ?? [];
+    expect(switches[0]).toMatchObject({ reason: "start planner through the control seam" });
+    expect(switches.some((payload) => payload.reason === "plan drafted; hand off to the worker for implementation"
+      && payload.detail?.attached?.id === "worker")).toBe(true);
+  });
+
+  test("a start without onControl retains the legacy fixed-worker behavior", async () => {
+    const attached: string[] = [];
+    const { store, request } = setup(execution({ runMaker: async () => { attached.push("worker"); return {}; } }));
+    const item = manifest();
+    item.checker.enabled = false;
+    await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
+
+    const { run_id } = await payload(await request("/harness/runs", "POST",
+      { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Keep legacy behavior" } }));
+    for (let attempt = 0; attempt < 200 && !store.getRun(run_id)?.events.some((event) => event.event_type === "stopped"); attempt++) {
+      await Bun.sleep(5);
+    }
+
+    expect(attached).toEqual(["worker"]);
+    expect(store.getRun(run_id)?.events.filter((event) => event.event_type === "switch")).toHaveLength(0);
+  });
+
+  test("an onControl failure settles as a recorded run_failed result", async () => {
+    const { store, request } = setup(execution({
+      onControl: () => { throw new Error("control registration failed"); },
+    }));
+    const item = manifest();
+    await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
+
+    const { run_id } = await payload(await request("/harness/runs", "POST",
+      { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Fail control registration" } }));
+    for (let attempt = 0; attempt < 200 && !store.getRun(run_id)?.events.some((event) => event.event_type === "stopped"); attempt++) {
+      await Bun.sleep(5);
+    }
+    expect(store.getRun(run_id)?.events.find((event) => event.event_type === "stopped")?.payload)
+      .toMatchObject({ stop_reason: "run_failed", error: "control registration failed" });
   });
 
   test("fills a run's brief template from brief_values in that run's maker prompt", async () => {
