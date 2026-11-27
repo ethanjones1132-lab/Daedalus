@@ -2,6 +2,7 @@ import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { getHarnessCommand } from "./commands";
 import { runHarness, type HarnessAdmission, type HarnessControllerInput, type HarnessRunResult } from "./controller";
+import { harnessPreCreateRefusal } from "./engine";
 import { withHarnessMakerEvents } from "./inkling-maker";
 import { validateManifest, type HarnessManifest } from "./manifest";
 import { HarnessStore } from "./store";
@@ -210,8 +211,22 @@ export async function handleHarnessRequest(req: Request, options: HarnessRouteOp
     } catch (error) {
       return jsonError(error instanceof Error ? error.message : String(error), 400);
     }
-    const runId = crypto.randomUUID();
     const controller = new AbortController();
+    // The engine refuses some starts before it creates a run record (invalid
+    // manifest, dependent maker/checker). Ask it here so those refusals answer
+    // 400 with their reason instead of a 202 naming a run that never exists.
+    try {
+      const refusal = harnessPreCreateRefusal({
+        manifest: candidate,
+        ...(execution.agents ? { agents: execution.agents } : {}),
+        ...(execution.localMakerModel ? { localMakerModel: execution.localMakerModel } : {}),
+        signal: controller.signal,
+      });
+      if (refusal) return jsonError(refusal, 400);
+    } catch (error) {
+      return jsonError(error instanceof Error ? error.message : String(error), 400);
+    }
+    const runId = crypto.randomUUID();
     // runHarness creates the run before its first await, so the id is durable by
     // the time this response is written and the existing GET routes can read it.
     const controllerInput: HarnessControllerInput = {

@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { defaultConfig } from "../config";
 import { createHarnessExecution, type HarnessMakerTurn } from "./execution";
@@ -270,35 +270,26 @@ describe("harness routes", () => {
         default_for: ["reviewer"], enabled: true,
       },
     ];
-    const logged: string[] = [];
-    const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
-      logged.push(args.map((arg) => String(arg)).join(" "));
+    const live = createHarnessExecution({
+      store: new HarnessStore({ dbPath: ":memory:" }),
+      agents: liveAgents,
+      runMakerTurn: async () => ({ ok: true }),
+      callModel: async () => ({ text: "ACCEPT\nLooks independent." }),
     });
-    try {
-      const live = createHarnessExecution({
-        store: new HarnessStore({ dbPath: ":memory:" }),
-        agents: liveAgents,
-        runMakerTurn: async () => ({ ok: true }),
-        callModel: async () => ({ text: "ACCEPT\nLooks independent." }),
-      });
-      const { store, request } = setup(live);
-      await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
+    const { store, request } = setup(live);
+    await request("/harness/manifests", "POST", { manifest: item, expected_revision: 0 });
 
-      const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Fix the bug" } });
+    const started = await request("/harness/runs", "POST", { project_root: ROOT, manifest_id: item.id, brief_values: { task: "Fix the bug" } });
 
-      expect(started?.status).toBe(202);
-      const { run_id } = await payload(started);
-      await Bun.sleep(5);
-      // The family check runs before the run record exists, so a refused pair
-      // leaves no run behind for the GET routes.
-      expect(store.getRun(run_id)).toBeUndefined();
-      const message = logged.join("\n");
-      expect(message).toMatch(/same model family/);
-      expect(message).toContain(item.maker_agent_id);
-      expect(message).toContain(item.checker.agent_id);
-    } finally {
-      spy.mockRestore();
-    }
+    // A refused start answers 400 with the engine's reason. A 202 here would
+    // hand back a run_id that no GET route can ever find.
+    expect(started?.status).toBe(400);
+    const refusal = await payload(started);
+    expect(refusal).not.toHaveProperty("run_id");
+    expect(String(refusal.error)).toMatch(/same model family/);
+    expect(String(refusal.error)).toContain(item.maker_agent_id);
+    expect(String(refusal.error)).toContain(item.checker.agent_id);
+    expect(store.listRuns(ROOT)).toHaveLength(0);
   });
 
   test("persists asynchronous maker events under the run ID returned by each start", async () => {

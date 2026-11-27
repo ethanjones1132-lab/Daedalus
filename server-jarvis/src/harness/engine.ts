@@ -1,4 +1,4 @@
-import { DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-pool";
+import { DEFAULT_ORCHESTRATOR_AGENTS, type OrchestratorAgent } from "../orchestration/agent-pool";
 import { agentFamily, modelFamily, resolveHarnessAgent } from "./agents";
 import type {
   HarnessControllerInput,
@@ -7,7 +7,7 @@ import type {
   HarnessSensorBatch,
   HarnessStopReason,
 } from "./controller";
-import { manifestHash, validateManifest } from "./manifest";
+import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import { getHarness, type EngineEvent, type EngineState, type HarnessRoundPolicy, type RunBudget } from "./module";
 import type { HarnessRoundInput, HarnessSensorResultInput } from "./store";
 
@@ -89,28 +89,50 @@ function vectorImproved(previous: HarnessRoundInput["counter_vector"], current: 
     comparable.some((key) => (current[key] as number) < (previous[key] as number));
 }
 
-export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
+export interface HarnessPreCreateInput {
+  manifest: HarnessManifest;
+  agents?: readonly OrchestratorAgent[];
+  localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
+  signal?: AbortSignal;
+}
+
+/**
+ * The refusals that must land before a run record exists: manifest validity and
+ * the checker's independence from the maker. Shared with the start route so a
+ * refused start can answer 400 with this reason instead of a 202 whose run_id
+ * never becomes readable. Returns the refusal message, or undefined to start.
+ */
+export function harnessPreCreateRefusal(input: HarnessPreCreateInput): string | undefined {
   const checked = validateManifest(input.manifest);
-  if (!checked.ok) throw new Error(`Invalid harness manifest: ${checked.errors.join("; ")}`);
+  if (!checked.ok) return `Invalid harness manifest: ${checked.errors.join("; ")}`;
+  const { manifest } = input;
+  if (!manifest.checker.enabled) return undefined;
+  const makerAgentId = manifest.maker_agent_id;
+  const checkerAgentId = manifest.checker.agent_id;
+  if (checkerAgentId === makerAgentId) return "checker agent must differ from maker agent";
+  const agents = input.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
+  const checker = resolveHarnessAgent(agents, checkerAgentId, "reviewer");
+  const localModel = input.localMakerModel?.({ manifest, signal: input.signal ?? new AbortController().signal });
+  const maker = localModel === undefined ? resolveHarnessAgent(agents, makerAgentId, "executor") : undefined;
+  const makerFamily = localModel !== undefined ? modelFamily(localModel) : maker ? agentFamily(maker) : "";
+  const checkerFamily = checker ? agentFamily(checker) : "";
+  if (makerFamily && checkerFamily && makerFamily === checkerFamily) {
+    return `Invalid harness manifest: checker agent "${checkerAgentId}" and maker agent "${makerAgentId}" ` +
+      `resolve to the same model family "${makerFamily}"`;
+  }
+  return undefined;
+}
+
+export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   const { manifest, store, legacyWorker } = input;
   const abort = new AbortController();
-  if (manifest.checker.enabled) {
-    const makerAgentId = manifest.maker_agent_id;
-    const checkerAgentId = manifest.checker.agent_id;
-    if (checkerAgentId === makerAgentId) throw new Error("checker agent must differ from maker agent");
-    const agents = input.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
-    const checker = resolveHarnessAgent(agents, checkerAgentId, "reviewer");
-    const localModel = input.localMakerModel?.({ manifest, signal: abort.signal });
-    const maker = localModel === undefined ? resolveHarnessAgent(agents, makerAgentId, "executor") : undefined;
-    const makerFamily = localModel !== undefined ? modelFamily(localModel) : maker ? agentFamily(maker) : "";
-    const checkerFamily = checker ? agentFamily(checker) : "";
-    if (makerFamily && checkerFamily && makerFamily === checkerFamily) {
-      throw new Error(
-        `Invalid harness manifest: checker agent "${checkerAgentId}" and maker agent "${makerAgentId}" ` +
-        `resolve to the same model family "${makerFamily}"`,
-      );
-    }
-  }
+  const refusal = harnessPreCreateRefusal({
+    manifest,
+    ...(input.agents ? { agents: input.agents } : {}),
+    ...(input.localMakerModel ? { localMakerModel: input.localMakerModel } : {}),
+    signal: abort.signal,
+  });
+  if (refusal) throw new Error(refusal);
   const now = input.now ?? Date.now;
   const startedAt = now();
   const budget = runBudget(input);
