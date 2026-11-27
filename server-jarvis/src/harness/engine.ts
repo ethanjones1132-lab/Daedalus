@@ -8,6 +8,9 @@ import type {
   HarnessSensorBatch,
   HarnessStopReason,
 } from "./controller";
+import {
+  assessEscalationPlan, noteConsultation, reportSelfReportedStuck, resetEscalation, runConsultation,
+} from "./escalation";
 import { manifestHash, validateManifest, type HarnessManifest } from "./manifest";
 import { getHarness, type EngineEvent, type EngineState, type HarnessRoundPolicy, type RunBudget } from "./module";
 import type { HarnessRoundInput, HarnessSensorResultInput } from "./store";
@@ -32,6 +35,12 @@ export interface EngineInput extends HarnessControllerInput {
   initial: { id: string; params?: unknown };
   onControl?: (control: EngineControl) => void;
   onRound?: (policy: HarnessRoundPolicy, state: EngineState) => void;
+  /**
+   * Opt into the stuck-signal escalation ladder after each round's sensors.
+   * Off by default so the shipped worker loop and every existing run keep
+   * today's stop reasons and round counts.
+   */
+  escalation?: boolean;
   /** Preserve the shipped, non-switchable controller's limits and event contract. */
   legacyWorker?: boolean;
 }
@@ -174,6 +183,12 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   let attached = attachment(input.initial.id, input.initial.params);
   let queued: { attachment: typeof attached; kind: "attach" | "switch"; reason: string } | undefined;
   const run = store.createRun({ id: input.run_id, project_root: manifest.project_root, manifest_id: manifest.id, manifest_hash: manifestHash(manifest) });
+  // The fixed worker controller is the shipped loop. The ladder is opt-in and
+  // never changes what that controller does with its own rounds.
+  const escalations = input.escalation === true && !legacyWorker;
+  if (escalations) resetEscalation(run.id);
+  /** A ladder switch that must hold the next boundary ahead of a scripted one. */
+  let forced: { attachment: ReturnType<typeof attachment>; reason: string } | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timedOut: HarnessStopReason | undefined;
   let reason: HarnessStopReason = "max_rounds";
@@ -270,6 +285,20 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
 
   let lease: { release(): void } | undefined;
   let detach: (() => void) | undefined;
+  const applySelection = (change: { attachment: typeof attached; kind: "attach" | "switch" | "forced_switch"; reason: string }) => {
+    const previousDetach = detach;
+    detach = undefined;
+    previousDetach?.();
+    const from = attached.metadata;
+    attached = change.attachment;
+    attachedRounds = 0;
+    attachedAt = now();
+    attachedSpend = 0;
+    armDeadline();
+    record(change.kind, change.reason, { from });
+    attached.module.onAttach?.(state());
+    detach = () => attached.module.onDetach?.(state());
+  };
   try {
     active = true;
     record("attach", "initial harness");
@@ -300,21 +329,17 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       const stop = elapsedStop() ?? spendStop();
       if (stop) { reason = stop; break; }
       if (rounds >= budget.max_rounds) { reason = "run_budget"; break; }
-      if (queued) {
+      // A forced ladder switch holds this boundary. A switch the maker queued
+      // in the same round stays queued and applies at the following boundary,
+      // so it cannot displace the harness the ladder just forced into place.
+      if (forced) {
+        const change = forced;
+        forced = undefined;
+        applySelection({ attachment: change.attachment, kind: "forced_switch", reason: change.reason });
+      } else if (queued) {
         const change = queued;
         queued = undefined;
-        const previousDetach = detach;
-        detach = undefined;
-        previousDetach?.();
-        const from = attached.metadata;
-        attached = change.attachment;
-        attachedRounds = 0;
-        attachedAt = now();
-        attachedSpend = 0;
-        armDeadline();
-        record(change.kind, change.reason, { from });
-        attached.module.onAttach?.(state());
-        detach = () => attached.module.onDetach?.(state());
+        applySelection({ attachment: change.attachment, kind: change.kind, reason: change.reason });
       }
       if (attachedRounds >= Math.min(manifest.loop.max_rounds, attached.module.limits.max_rounds)) break;
       rounds++;
@@ -353,6 +378,9 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
         };
         break;
       }
+      // A maker that says it cannot continue is the run's own stuck report; the
+      // ladder treats it as evidence rather than silently ignoring the turn.
+      if (escalations && maker?.continue === false) reportSelfReportedStuck(run.id);
       const exhausted = legacyWorker ? undefined : spendStop();
       if (exhausted) { reason = exhausted; break; }
 
@@ -392,6 +420,51 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
         // module suggesting itself cannot spin the run.
         if (!legacyWorker && !queued && decision.id !== attached.metadata.id && !elapsedStop()) {
           queue("switch", decision.id, undefined, decision.why);
+        }
+      }
+
+      // The stuck ladder runs after the module has read the round's sensors. It
+      // nudges with an advisory switch first, then forces the next rung when the
+      // same signal survives a round. `consult` is a bounded model call and
+      // falls through to `stop_report` when DD-152's tools are absent; the ladder
+      // has no orchestration rung.
+      if (escalations) {
+        const plan = assessEscalationPlan(state());
+        if (plan.signal && plan.next) {
+          if (plan.next === "stop_report") {
+            reason = "harness_stop";
+            detail = plan.reason ?? `stuck signal "${plan.signal}" persisted through every escalation step`;
+            break;
+          }
+          if (plan.next === "consult") {
+            const beforeConsult = elapsedStop() ?? spendStop();
+            if (beforeConsult) { reason = beforeConsult; break; }
+            try {
+              const consultation = await wait(runConsultation(state(), plan.signal));
+              const consultCost = consultation.cost_usd;
+              if (typeof consultCost === "number" && Number.isFinite(consultCost) && consultCost > 0) addCost(consultCost);
+              record("request", plan.reason ?? `consult on stuck signal "${plan.signal}"`, {
+                escalation: { signal: plan.signal, step: "consult", force: plan.force },
+                report: consultation.report,
+              });
+              noteConsultation(run.id);
+            } catch (error) { reason = stepFailure(error); break; }
+            const afterConsult = elapsedStop() ?? spendStop();
+            if (afterConsult) { reason = afterConsult; break; }
+          } else if (plan.next !== attached.metadata.id) {
+            if (plan.force && !forced) {
+              forced = {
+                attachment: attachment(plan.next, undefined),
+                reason: plan.reason ?? `forced escalation to ${plan.next} after stuck signal "${plan.signal}"`,
+              };
+            } else if (!plan.force && !queued) {
+              store.appendEvent({ run_id: run.id, event_type: "suggest_switch", payload: {
+                kind: "suggest_switch", id: plan.next, why: plan.reason ?? `stuck signal "${plan.signal}"`,
+                round: rounds, escalation: { signal: plan.signal, step: plan.next, force: false },
+              } });
+              queue("switch", plan.next, undefined, plan.reason ?? `stuck signal "${plan.signal}"`);
+            }
+          }
         }
       }
 
@@ -444,7 +517,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
         break;
       }
       if (rounds >= budget.max_rounds) { reason = "run_budget"; break; }
-      if (!queued && (legacyWorker || !evidenceComplete) && manifest.loop.abort_on_no_progress && previous &&
+      if (!queued && !forced && (legacyWorker || !evidenceComplete) && manifest.loop.abort_on_no_progress && previous &&
         !vectorImproved(previous, batch.counter_vector)) {
         reason = "no_progress";
         break;
@@ -471,6 +544,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
       ...(makerFailure ?? {}),
     } });
+    if (escalations) resetEscalation(run.id);
   }
   return { run_id: run.id, stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}) };
 }
