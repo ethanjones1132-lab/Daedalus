@@ -279,3 +279,42 @@ test("a longer caller deadline does not extend the switchable engine's wall budg
   expect(await runEngine(input)).toMatchObject({ stop_reason: "passed", rounds: 1 });
   expect(admittedUntil).toBe(100 + 1_800_000);
 });
+
+test("each round's round_metrics mirrors its maker turn's usage without charging it twice", async () => {
+  let call = 0;
+  const { input, store } = setup({
+    sensors: async () => ++call === 1 ? failing : zero,
+    runMaker: async () => ({ cost_usd: 0.07, tool_calls: 4 }),
+  });
+  const result = await runEngine(input);
+  expect(result.stop_reason).toBe("passed");
+  expect(result.rounds).toBe(2);
+
+  const run = store.getRun(result.run_id);
+  // The round rows keep the counter vectors they always carried.
+  expect(run?.rounds.map((round) => round.counter_vector)).toEqual([{ tests: 3 }, { tests: 0 }]);
+  // One metrics event per stored round, carrying exactly what the turn reported.
+  expect(run?.events.filter((event) => event.event_type === "round_metrics").map((event) => event.payload)).toEqual([
+    { round: 1, tool_calls: 4, cost_usd: 0.07 },
+    { round: 2, tool_calls: 4, cost_usd: 0.07 },
+  ]);
+  // The events mirror the spend; they never re-charge it.
+  expect(run?.cost_usd).toBeCloseTo(0.07 * 2);
+  // The stop record keeps its existing shape.
+  expect(run?.events.find((event) => event.event_type === "stopped")?.payload)
+    .toMatchObject({ stop_reason: "passed", rounds: 2 });
+});
+
+test("a round from a maker turn that reports no usage records no invented numbers", async () => {
+  const { input, store } = setup({ runMaker: async () => ({}) });
+  const result = await runEngine(input);
+  expect(result.stop_reason).toBe("passed");
+
+  const run = store.getRun(result.run_id);
+  expect(run?.rounds).toHaveLength(1);
+  const metrics = run?.events.filter((event) => event.event_type === "round_metrics") ?? [];
+  expect(metrics).toHaveLength(1);
+  // No zero tool-call count, no zero cost, no token fields: only the round.
+  expect(metrics[0]?.payload).toEqual({ round: 1 });
+  expect(run?.cost_usd).toBe(0);
+});

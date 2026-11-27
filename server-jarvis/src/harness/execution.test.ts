@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { runHarness } from "./controller";
-import { createCheckerModelCall, createHarnessExecution, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
+import { createCheckerModelCall, createHarnessExecution, makerTurnFromDelegateResult, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
 import { defaultConfig, type JarvisConfig } from "../config";
 import { clearOpenRouterCache } from "../openrouter";
 import { modelFamily } from "./agents";
@@ -11,6 +11,7 @@ import type { SensorSpawn } from "./sensors";
 import { HarnessStore } from "./store";
 import { instantiateHarnessTemplate } from "./templates";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
+import type { ExecutorStageOutput } from "../orchestration/stage-output";
 import { __setDelegateWriteScoreboardStoreForTests } from "../orchestration/delegate-model-select";
 import { __resetModelHealthForTests } from "../orchestration/model-health";
 import { SelfTuningStore } from "../self-tuning/store";
@@ -347,6 +348,67 @@ describe("harness execution", () => {
       errorCode: "delegate_timeout", terminalStatus: "timed_out",
       failureDetail: "delegate timed out after 900000ms",
     });
+  });
+
+  test("a production delegate result's observed tool-call count reaches the run's round_metrics", async () => {
+    const manifest = fixtureManifest();
+    // Exactly what `productionExecutorDelegateRuntime.run` reports: the delegate
+    // loop's own tool-call records and the spend the CLI's result frame carried.
+    // It reports no token usage, so no token count exists to forward.
+    const delegateResult: ExecutorStageOutput = {
+      ok: true,
+      narrative: "delegate finished the fix",
+      toolCalls: [
+        { name: "read_file", arguments: { path: "app.ts" }, output: "contents", is_error: false, duration_ms: 5 },
+        { name: "edit_file", arguments: { path: "app.ts" }, output: "applied", is_error: false, duration_ms: 9 },
+      ],
+      cost_usd: 0.03,
+    };
+    // The seam production uses: `index.ts`'s runMakerTurn maps the delegate
+    // result through this exact function before the harness sees the turn.
+    const runMakerTurn: HarnessMakerTurn = async () => makerTurnFromDelegateResult(delegateResult);
+    const { store, execution } = setupHarness({ manifest, initialErrors: 0, deps: { runMakerTurn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-production-usage",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("passed");
+    expect(result.rounds).toBe(1);
+    const run = store.getRun("run-production-usage");
+    // The round keeps its counter vector, and the metrics event mirrors the
+    // turn exactly — no token fields, because the delegate reported none.
+    expect(run?.rounds.map((round) => round.counter_vector)).toEqual([{ typecheck: 0 }]);
+    expect(run?.events.filter((event) => event.event_type === "round_metrics").map((event) => event.payload))
+      .toEqual([{ round: 1, tool_calls: 2, cost_usd: 0.03 }]);
+    // Recorded once and charged once: the event never re-bills the spend.
+    expect(run?.cost_usd).toBeCloseTo(0.03);
+    expect(run?.events.filter((event) => event.event_type === "stopped")).toHaveLength(1);
+    expect(run?.events.filter((event) => event.event_type === "round_metrics")).toHaveLength(1);
+  });
+
+  test("a delegate result reporting no spend records its round without inventing a zero", async () => {
+    const manifest = fixtureManifest();
+    // A completed turn whose loop dispatched no tools and whose result frame
+    // carried no cost: an observed count of zero is a count, an unreported
+    // cost stays absent rather than becoming a charged 0.
+    const runMakerTurn: HarnessMakerTurn = async () => makerTurnFromDelegateResult({
+      ok: true, narrative: "no numbers known", toolCalls: [],
+    });
+    const { store, execution } = setupHarness({ manifest, initialErrors: 0, deps: { runMakerTurn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-no-usage",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("passed");
+    const run = store.getRun("run-no-usage");
+    expect(run?.rounds).toHaveLength(1);
+    expect(run?.events.filter((event) => event.event_type === "round_metrics").map((event) => event.payload))
+      .toEqual([{ round: 1, tool_calls: 0 }]);
+    expect(run?.cost_usd).toBe(0);
   });
 
   test("a run's own brief values override the execution's default values", async () => {

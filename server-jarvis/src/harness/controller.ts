@@ -75,6 +75,19 @@ export interface HarnessMakerFailure {
 }
 
 /**
+ * Usage a maker turn measured about itself. Every field is optional and is
+ * mirrored verbatim into the round's `round_metrics` event: a turn that
+ * reported no usage still records its round, and a count the turn never
+ * observed stays absent instead of becoming a zero a reader would take for a
+ * measurement. The event never changes what the run was charged — spend stays
+ * in the engine's single `addRunCost` call.
+ */
+export interface HarnessMakerUsage {
+  /** Tool calls the turn dispatched, when its own loop counted them. */
+  tool_calls?: number;
+}
+
+/**
  * Who actually produced a checker verdict. The checker's cascade can advance
  * past the pinned agent, so this is the model that answered, not the one the
  * manifest requested. Every field is optional: a boundary that cannot know
@@ -107,7 +120,7 @@ export interface HarnessControllerInput {
   store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
   runMaker: (input: HarnessMakerInput) =>
-    Promise<({ failed?: boolean; continue?: boolean; cost_usd?: number } & HarnessMakerFailure) | void>;
+    Promise<({ failed?: boolean; continue?: boolean; cost_usd?: number } & HarnessMakerUsage & HarnessMakerFailure) | void>;
   /** The actual model for a maker that runs outside the delegate pool. */
   localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
   runChecker: (input: HarnessCheckerInput) => Promise<HarnessCheckerVerdict>;

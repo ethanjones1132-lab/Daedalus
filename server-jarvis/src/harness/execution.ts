@@ -26,10 +26,10 @@ import {
   getBenchedDelegateModels,
 } from "../orchestration/delegate-model-select";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
-import { parseReviewerVerdict } from "../orchestration/stage-output";
+import { parseReviewerVerdict, type ExecutorStageOutput } from "../orchestration/stage-output";
 import { resolveHarnessAgent, agentFamily, modelFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
-import type { HarnessAdmission, HarnessCheckerModel, HarnessControllerInput, HarnessMakerFailure, HarnessSensorBatch } from "./controller";
+import type { HarnessAdmission, HarnessCheckerModel, HarnessControllerInput, HarnessMakerFailure, HarnessMakerUsage, HarnessSensorBatch } from "./controller";
 import { INKLING_MAKER_ID, recordHarnessMakerEvent, runInklingMaker, type HarnessMakerRequest } from "./inkling-maker";
 import { createHarnessMakerTools } from "./maker-tools";
 import type { HarnessManifest } from "./manifest";
@@ -61,13 +61,23 @@ export interface HarnessMakerTurnInput {
 }
 
 /**
+ * What one maker turn reports back: its outcome, the optional delegate failure
+ * cause, the optional provider-reported spend, and the usage the turn itself
+ * measured. Every optional stays optional so a value nobody reported reaches
+ * the run record as absent, never as an invented zero.
+ */
+export type HarnessMakerTurnResult = { ok: boolean; narrative?: string; cost_usd?: number } &
+  HarnessMakerUsage & HarnessMakerFailure;
+
+/**
  * One maker round: an executor tool loop for a turn. `ok: false` fails the
  * round; the optional failure fields carry the delegate's real cause through
- * to the run's `maker_failed` stop.
+ * to the run's `maker_failed` stop, and the optional usage fields carry the
+ * turn's observed tool-call count through to the round's `round_metrics`.
  */
 export type HarnessMakerTurn = (
   input: HarnessMakerTurnInput,
-) => Promise<{ ok: boolean; narrative?: string; cost_usd?: number } & HarnessMakerFailure>;
+) => Promise<HarnessMakerTurnResult>;
 
 export interface HarnessModelCallInput {
   prompt: string;
@@ -612,6 +622,30 @@ function makerFailureOf(result: HarnessMakerFailure): HarnessMakerFailure {
   };
 }
 
+/** Keep only the usage a turn reported; a count it never observed stays absent. */
+function makerUsageOf(result: HarnessMakerTurnResult): HarnessMakerUsage {
+  const toolCalls = result.tool_calls;
+  return typeof toolCalls === "number" && Number.isFinite(toolCalls) ? { tool_calls: toolCalls } : {};
+}
+
+/**
+ * The production delegate result → maker turn seam mapping, shared by the
+ * server's `runMakerTurn` so a regression test can pin exactly what production
+ * forwards: outcome, narrative, the spend the CLI's result frame reported, and
+ * the delegate loop's own tool-call count (`toolCalls` is its record of every
+ * call it dispatched). The delegate reports no token usage, so this mapping
+ * introduces no token field — an unavailable count stays absent.
+ */
+export function makerTurnFromDelegateResult(result: ExecutorStageOutput): HarnessMakerTurnResult {
+  const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls.length : undefined;
+  return {
+    ok: result.ok,
+    narrative: result.narrative,
+    ...(typeof result.cost_usd === "number" ? { cost_usd: result.cost_usd } : {}),
+    ...(toolCalls !== undefined ? { tool_calls: toolCalls } : {}),
+  };
+}
+
 /** Build the server's harness execution boundaries from injected dependencies. */
 export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecution {
   const spawn = deps.spawn ?? defaultSpawn;
@@ -713,7 +747,8 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       config,
     });
     const cost = typeof turn.cost_usd === "number" ? { cost_usd: turn.cost_usd } : {};
-    return turn.ok ? cost : { failed: true, ...makerFailureOf(turn), ...cost };
+    const usage = makerUsageOf(turn);
+    return turn.ok ? { ...usage, ...cost } : { failed: true, ...makerFailureOf(turn), ...usage, ...cost };
   };
 
   // The controller and manifest validation already refuse a checker equal to the

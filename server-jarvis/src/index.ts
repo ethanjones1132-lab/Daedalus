@@ -84,7 +84,7 @@ import { createLifecycleService, validateLifecycleSnapshot, type LifecycleServic
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
-import { createCheckerModelCall, createHarnessExecution } from "./harness/execution";
+import { createCheckerModelCall, createHarnessExecution, makerTurnFromDelegateResult } from "./harness/execution";
 import { handleHarnessRequest, type HarnessExecution } from "./harness/routes";
 import { HarnessStore } from "./harness/store";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
@@ -6915,7 +6915,11 @@ export async function baseFetch(req: Request): Promise<Response> {
  * background admission stays one server-wide lane instead of one per request.
  * The maker reuses the orchestration single-stage executor
  * (`productionExecutorDelegateRuntime` → `runClaudeDelegate`) for one tool-loop
- * turn in the manifest's project root; the checker is a single model call
+ * turn in the manifest's project root; the delegate result reaches the maker
+ * turn seam through `makerTurnFromDelegateResult`, which forwards the observed
+ * tool-call count and the reported spend into the round's `round_metrics` while
+ * spend accounting stays a single charge, and invents no token counts the
+ * delegate never reports; the checker is a single model call
  * pinned to the agent resolved from the manifest id through the orchestration
  * pool (executor / reviewer for the templates' generic ids), not a fixed role.
  * The harness resolves "auto" to a concrete, available delegate model before
@@ -6935,20 +6939,17 @@ function serverHarnessExecution(): HarnessExecution {
       isAvailable: (config) =>
         productionExecutorDelegateRuntime.availability.isAvailable(config),
     },
-    runMakerTurn: async ({ cwd, prompt, config, signal }) => {
-      const result = await productionExecutorDelegateRuntime.run({
-        config,
-        prompt,
-        sessionId: crypto.randomUUID(),
-        allowedRoots: [cwd],
-        stageRemainingMs: 15 * 60_000,
-        profile: "full",
-        writeEffectRequired: true,
-        nativeNoWrite: false,
-        signal,
-      });
-      return { ok: result.ok, narrative: result.narrative, ...(typeof result.cost_usd === "number" ? { cost_usd: result.cost_usd } : {}) };
-    },
+    runMakerTurn: async ({ cwd, prompt, config, signal }) => makerTurnFromDelegateResult(await productionExecutorDelegateRuntime.run({
+      config,
+      prompt,
+      sessionId: crypto.randomUUID(),
+      allowedRoots: [cwd],
+      stageRemainingMs: 15 * 60_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      signal,
+    })),
     callModel: async ({ prompt, agent, signal, excludeFamilies }) =>
       createCheckerModelCall(normalizeConfig(loadConfig()), agent, { excludeFamilies })({ prompt, agent, signal }),
   });

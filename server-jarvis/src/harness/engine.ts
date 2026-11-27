@@ -3,6 +3,7 @@ import { agentFamily, modelFamily, resolveHarnessAgent } from "./agents";
 import type {
   HarnessControllerInput,
   HarnessMakerFailure,
+  HarnessMakerUsage,
   HarnessRunResult,
   HarnessSensorBatch,
   HarnessStopReason,
@@ -81,6 +82,25 @@ function waitWithAbort<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
 
 function isPassingSensorResult(result: HarnessSensorBatch["sensors"][number]): boolean {
   return result.status === "zero" && Number.isInteger(result.counter) && result.counter === 0 && result.exit_code === 0;
+}
+
+/**
+ * One stored round's `round_metrics` payload: the round number plus exactly
+ * the usage its maker turn reported. A value the turn never knew stays out of
+ * the payload — a reader can tell "the turn reported zero tool calls" apart
+ * from "the turn reported no count" — and mirroring `cost_usd` here never
+ * charges it: spend accounting stays in the loop's single `addCost` call.
+ */
+function roundMetricsPayload(
+  round: number,
+  maker: Awaited<ReturnType<EngineInput["runMaker"]>>,
+): { round: number; cost_usd?: number } & HarnessMakerUsage {
+  const payload: { round: number; cost_usd?: number } & HarnessMakerUsage = { round };
+  const toolCalls = maker?.tool_calls;
+  const costUsd = maker?.cost_usd;
+  if (typeof toolCalls === "number" && Number.isFinite(toolCalls)) payload.tool_calls = toolCalls;
+  if (typeof costUsd === "number" && Number.isFinite(costUsd)) payload.cost_usd = costUsd;
+  return payload;
 }
 
 function vectorImproved(previous: HarnessRoundInput["counter_vector"], current: HarnessRoundInput["counter_vector"]): boolean {
@@ -341,6 +361,11 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       if (afterSensors) { reason = afterSensors; break; }
       lastSensors = batch;
       const round = store.appendRound({ run_id: run.id, round_number: rounds, counter_vector: batch.counter_vector });
+      // The round's own usage record, written beside the round row so a run's
+      // cost per solved task is computable from stored events alone. It only
+      // mirrors what the maker turn reported: the spend charged above is
+      // untouched, and so is this round's counter_vector.
+      store.appendEvent({ run_id: run.id, event_type: "round_metrics", payload: roundMetricsPayload(rounds, maker) });
       for (const result of batch.sensors) {
         const status: HarnessSensorResultInput["status"] = isPassingSensorResult(result) ? "passed" :
           result.status === "not_applicable" ? "not_applicable" : "failed";
