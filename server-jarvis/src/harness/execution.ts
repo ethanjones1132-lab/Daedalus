@@ -364,6 +364,7 @@ function makerPrompt(
   round: number,
   failures: readonly string[],
   briefValues: Record<string, string>,
+  instructions?: string,
 ): string {
   const guides = renderHarnessGuides({
     rules: manifest.guides.rules.join("\n"),
@@ -377,7 +378,8 @@ function makerPrompt(
   const status = failures.length > 0
     ? `Latest sensor failures:\n${failures.map((line) => `- ${line}`).join("\n")}`
     : "No sensor results yet: this is the first round, so make the brief true.";
-  return [guides.text, `Harness round ${round} of ${manifest.loop.max_rounds}.`, status].join("\n\n");
+  const policy = instructions?.trim() ? [`[Harness round policy]\n${instructions.trim()}`] : [];
+  return [guides.text, ...policy, `Harness round ${round} of ${manifest.loop.max_rounds}.`, status].join("\n\n");
 }
 
 function checkerPrompt(
@@ -684,9 +686,10 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     return batch;
   };
 
-  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal, briefValues }) => {
+  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal, briefValues, instructions, read_only }) => {
+    const readOnly = read_only === true;
     const local = localMakerFor(manifest, signal);
-    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues ?? defaultBriefValues);
+    const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues ?? defaultBriefValues, instructions);
     if (local && !local.useDelegate) {
       if (round === 1 && manifest.checker.enabled) {
         runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
@@ -696,7 +699,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       const turn = await runInklingMaker({
         backend: config.llama_cpp, prompt, round, signal,
         tools: createHarnessMakerTools({
-          config, projectRoot: manifest.project_root, signal,
+          config, projectRoot: manifest.project_root, signal, read_only: readOnly,
           runSensors: () => runSensorBatch({ manifest, signal, store: deps.store, spawn, now: deps.now }),
         }),
         request: deps.requestMaker,
@@ -704,6 +707,15 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       });
       if (turn.ok) return { cost_usd: 0 };
       if (!turn.unavailable || !config.orchestrator.allow_cloud_helpers || signal.aborted) return { failed: true, cost_usd: 0 };
+    }
+    // The delegate launches the full-profile CLI, which can edit the workspace.
+    // A read-only round has no local maker left to run, so it fails closed
+    // instead of handing workspace authority to the delegate.
+    if (readOnly) {
+      return {
+        failed: true, cost_usd: 0,
+        failureDetail: "a read-only harness round cannot run on the workspace-mutating delegate",
+      };
     }
 
     const agent = resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");

@@ -320,6 +320,10 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       rounds++;
       attachedRounds++;
       const policy = attached.module.beforeRound(state());
+      // Workspace authority comes from the attached module's declaration, not
+      // from any round instruction or model reply. A read-only attachment can
+      // never widen its own surface for a round.
+      const readOnly = attached.module.tool_access === "read_only";
       const focus = policy.sensor_ids === undefined ? undefined : new Set(policy.sensor_ids);
       if (focus && [...focus].some((id) => !declaredSensors.has(id))) throw new Error("Harness selected an undeclared sensor");
       input.onRound?.(structuredClone(policy), state());
@@ -330,6 +334,8 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
         maker = await wait(input.runMaker({
           manifest, round: rounds, signal: abort.signal,
           ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
+          ...(policy.instructions ? { instructions: policy.instructions } : {}),
+          ...(readOnly ? { read_only: true } : {}),
         }));
       } catch { reason = elapsedStop() ?? "maker_failed"; break; }
       const roundCost = maker?.cost_usd;
@@ -381,6 +387,12 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       if (decision.kind === "stop") { reason = "harness_stop"; detail = decision.reason; break; }
       if (decision.kind === "suggest_switch") {
         store.appendEvent({ run_id: run.id, event_type: "suggest_switch", payload: { ...decision, round: rounds } });
+        // A handoff is only real when the engine applies it at the next round
+        // boundary. The target is validated like any other attachment, and a
+        // module suggesting itself cannot spin the run.
+        if (!legacyWorker && !queued && decision.id !== attached.metadata.id && !elapsedStop()) {
+          queue("switch", decision.id, undefined, decision.why);
+        }
       }
 
       // Approvals bind the full manifest hash. A focus can narrow policy evidence,

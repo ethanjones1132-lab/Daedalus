@@ -50,6 +50,14 @@ export interface HarnessMakerInput {
    * execution boundary, so concurrent runs never share a brief.
    */
   briefValues?: HarnessBriefValues;
+  /** The attached module's policy for this round, when it has one. */
+  instructions?: string;
+  /**
+   * The attached module declares read-only workspace authority. The execution
+   * boundary must expose only read tools and must not fall back to a
+   * workspace-mutating delegate.
+   */
+  read_only?: boolean;
 }
 
 export interface HarnessCheckerInput {

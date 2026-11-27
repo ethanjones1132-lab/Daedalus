@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import type { HarnessSensorBatch } from "./controller";
+import { planner } from "./harnesses/planner";
+import { retry } from "./harnesses/retry";
 import { worker } from "./harnesses/worker";
 
 export interface RunBudget { max_rounds: number; max_ms: number; max_cloud_usd: number }
@@ -20,6 +22,12 @@ export type HarnessDecision = { kind: "continue" } | { kind: "stop"; reason: str
 
 export interface HarnessRoundPolicy { instructions: string; sensor_ids?: string[]; skip_checker?: boolean }
 
+/**
+ * The workspace authority a harness may exercise. Declared by the app-owned
+ * module, never by a prompt, and enforced where the maker's tools are composed.
+ */
+export type HarnessToolAccess = "read_only" | "read_write";
+
 export interface HarnessModule {
   id: string;
   version: string;
@@ -28,6 +36,8 @@ export interface HarnessModule {
   bad_for: string[];
   params_schema: Record<string, unknown>;
   limits: HarnessLimits;
+  /** Absent means read_write, preserving every module written before this field. */
+  tool_access?: HarnessToolAccess;
   onAttach?(state: EngineState): void;
   beforeRound(state: EngineState): HarnessRoundPolicy;
   afterSensors(state: EngineState, results: HarnessSensorBatch): HarnessDecision;
@@ -82,3 +92,5 @@ export function getHarness(id: string): RegisteredHarness {
 }
 
 registerHarness(worker);
+registerHarness(planner);
+registerHarness(retry);
