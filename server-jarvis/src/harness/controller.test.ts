@@ -415,6 +415,50 @@ describe("runHarness", () => {
     expect((stopped[0]?.payload as { cost_usd?: number }).cost_usd).toBeCloseTo(0.12);
   });
 
+  test("a run at its cap makes no checker model call", async () => {
+    const item = manifest();
+    item.max_cost_usd = 0.1;
+    let checks = 0;
+    const setup = deps({
+      manifest: item,
+      runMaker: async () => ({ cost_usd: 0.1 }),
+      sensors: async () => zero,
+      runChecker: async () => { checks++; return { passed: true }; },
+    });
+
+    const result = await runHarness(setup.input);
+
+    // The maker's own spend reaches the cap, so the checker — the next model
+    // call — is never bought, instead of spending past it and noticing later.
+    expect(result.stop_reason).toBe("budget_exceeded");
+    expect(result.rounds).toBe(1);
+    expect(checks).toBe(0);
+    expect(setup.store.getRun(result.run_id)?.cost_usd).toBeCloseTo(0.1);
+  });
+
+  test("a checker that crosses the spend cap settles on the budget reason with its spend recorded", async () => {
+    const item = manifest();
+    item.max_cost_usd = 0.1;
+    const setup = deps({
+      manifest: item,
+      runMaker: async () => ({ cost_usd: 0.02 }),
+      sensors: async () => zero,
+      runChecker: async () => ({ passed: true, cost_usd: 0.2 }),
+    });
+
+    const result = await runHarness(setup.input);
+
+    // The verdict was an ACCEPT, but the call that produced it spent past the
+    // cap: the run settles on the existing budget reason, never `passed`.
+    expect(result.stop_reason).toBe("budget_exceeded");
+    expect(result.rounds).toBe(1);
+    const run = setup.store.getRun(result.run_id);
+    expect(run?.cost_usd).toBeCloseTo(0.22);
+    const stopped = run?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped[0]?.payload).toMatchObject({ stop_reason: "budget_exceeded", rounds: 1 });
+    expect((stopped[0]?.payload as { cost_usd?: number }).cost_usd).toBeCloseTo(0.22);
+  });
+
   test("a manifest with no spend cap runs to its round cap and still records spend", async () => {
     const item = manifest();
     item.loop.max_rounds = 2;

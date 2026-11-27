@@ -168,6 +168,71 @@ test.each([
   expect(stopped?.payload).toMatchObject({ stop_reason: reason, rounds: 2, cost_usd: run?.cost_usd });
 });
 
+test("checker spend past the cap stops with the budget reason and makes no further model call", async () => {
+  let makers = 0;
+  let checks = 0;
+  const { input, store } = setup({
+    runMaker: async () => { makers++; return { cost_usd: 0.05 }; },
+    runChecker: async () => { checks++; return { passed: true, cost_usd: 0.60 }; },
+  });
+  input.manifest.max_cost_usd = 0.5;
+  const result = await runEngine(input);
+  // The checker's own spend is charged at the call site, so a verdict that
+  // crossed the cap settles on the existing budget reason, not `passed`.
+  expect(result).toMatchObject({ stop_reason: "budget_exceeded", rounds: 1 });
+  expect(makers).toBe(1);
+  expect(checks).toBe(1);
+  const run = store.getRun(result.run_id);
+  expect(run?.cost_usd).toBeCloseTo(0.65);
+  const stopped = run?.events.find((event) => event.event_type === "stopped");
+  expect(stopped?.payload).toMatchObject({ stop_reason: "budget_exceeded", rounds: 1, cost_usd: run?.cost_usd });
+});
+
+test("checker spend under the cap leaves the run passed and still records the spend", async () => {
+  let makers = 0;
+  const { input, store } = setup({
+    runMaker: async () => { makers++; return { cost_usd: 0.05 }; },
+    runChecker: async () => ({ passed: true, cost_usd: 0.10 }),
+  });
+  input.manifest.max_cost_usd = 0.5;
+  const result = await runEngine(input);
+  expect(result).toMatchObject({ stop_reason: "passed", rounds: 1 });
+  expect(makers).toBe(1);
+  expect(store.getRun(result.run_id)?.cost_usd).toBeCloseTo(0.15);
+});
+
+test("an already-reached cap prevents the next checker call", async () => {
+  let makers = 0;
+  let checks = 0;
+  const { input, store } = setup({
+    runMaker: async () => { makers++; return {}; },
+    sensors: async () => ({ ...zero, cost_usd: 0.6 }),
+    runChecker: async () => { checks++; return { passed: true }; },
+  });
+  input.manifest.max_cost_usd = 0.5;
+  const result = await runEngine(input);
+  expect(result).toMatchObject({ stop_reason: "budget_exceeded", rounds: 1 });
+  expect(makers).toBe(1);
+  // The checker is the next model call and never starts once the sensor pass
+  // has already spent past the cap.
+  expect(checks).toBe(0);
+  expect(store.getRun(result.run_id)?.cost_usd).toBeCloseTo(0.6);
+});
+
+test("a sensor pass that reports its own spend is charged and stops before the next model call", async () => {
+  let makers = 0;
+  const { input, store } = setup({
+    sensors: async () => ({ ...failing, cost_usd: 0.6 }),
+    runMaker: async () => { makers++; return {}; },
+  });
+  input.manifest.max_cost_usd = 0.5;
+  const result = await runEngine(input);
+  expect(result).toMatchObject({ stop_reason: "budget_exceeded", rounds: 1 });
+  // Round two's maker is the next model call and never starts.
+  expect(makers).toBe(1);
+  expect(store.getRun(result.run_id)?.cost_usd).toBeCloseTo(0.6);
+});
+
 test("a failed maker turn records its delegate cause on the maker_failed stop", async () => {
   const { input, store } = setup({
     runMaker: async () => ({

@@ -8,6 +8,11 @@ export interface SensorSpawnResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * Actual spend the spawned check reports, when it can report one. Absent
+   * means unknown; the harness charges only amounts that were really reported.
+   */
+  cost_usd?: number;
 }
 
 /** Spawn a catalog command directly (never through a shell) in the project root. */

@@ -374,6 +374,98 @@ describe("harness execution", () => {
     expect(store.getRun("run-spend")?.cost_usd).toBeCloseTo(0.5);
   });
 
+  test("a checker call's reported spend reaches the run record through the execution seam", async () => {
+    const manifest = fixtureManifest();
+    const { store, execution } = setupHarness({ manifest, deps: {
+      callModel: async () => ({ text: "ACCEPT", cost_usd: 0.25 }),
+    } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-checker-spend",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("passed");
+    expect(result.rounds).toBe(2);
+    expect(store.getRun("run-checker-spend")?.cost_usd).toBeCloseTo(0.25);
+  });
+
+  test("a checker call that reports no spend leaves the run's cost absent of it", async () => {
+    const manifest = fixtureManifest();
+    const { store, execution } = setupHarness({ manifest, deps: {
+      callModel: async () => ({ text: "ACCEPT" }),
+    } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-checker-no-spend",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("passed");
+    expect(store.getRun("run-checker-no-spend")?.cost_usd).toBe(0);
+  });
+
+  test("a checker's provider or_cost reaches the run ledger and a cap-crossing verdict cannot pass", async () => {
+    const manifest = fixtureManifest({ max_cost_usd: 0.05 });
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({
+        choices: [{ message: { content: "ACCEPT\nIndependent review." } }],
+        or_cost: 0.08,
+      });
+    }) as typeof fetch;
+
+    try {
+      const { store, execution } = setupHarness({ manifest, initialErrors: 0, deps: {
+        callModel: createCheckerModelCall(cfg, {
+          id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free",
+        }),
+      } });
+
+      const result = await runHarness({
+        manifest, store, run_id: "run-checker-or-cost",
+        sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+      });
+
+      // The production call read the provider's real or_cost, the engine charged
+      // it, and the ACCEPT that crossed the cap still settles on the budget reason.
+      expect(result.stop_reason).toBe("budget_exceeded");
+      expect(store.getRun("run-checker-or-cost")?.cost_usd).toBeCloseTo(0.08);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test("a sensor spawn that reports spend puts it on the batch for the ledger", async () => {
+    const manifest = fixtureManifest();
+    const spawn: SensorSpawn = async () => ({
+      stdout: "errors: 0", stderr: "", exitCode: 0, cost_usd: 0.03,
+    });
+    const { execution } = setupHarness({ manifest, initialErrors: 0, deps: { spawn } });
+
+    const batch = await execution.sensors({ manifest, signal: new AbortController().signal });
+
+    expect(batch.cost_usd).toBeCloseTo(0.03);
+  });
+
+  test("a sensor spawn that reports no spend leaves the batch cost absent", async () => {
+    const manifest = fixtureManifest();
+    const { execution } = setupHarness({ manifest, initialErrors: 0 });
+
+    const batch = await execution.sensors({ manifest, signal: new AbortController().signal });
+
+    expect(batch.cost_usd).toBeUndefined();
+  });
+
   describe("maker delegate model resolution", () => {
     beforeEach(() => {
       // Keep candidate ranking independent of the host's persisted bench state.
@@ -668,6 +760,66 @@ describe("harness execution", () => {
     }
   });
 
+  test("the production checker call reports the provider's actual or_cost as its spend", async () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({
+        choices: [{ message: { content: "ACCEPT\nIndependent review." } }],
+        or_cost: 0.0125,
+      });
+    }) as typeof fetch;
+
+    try {
+      const call = createCheckerModelCall(cfg, {
+        id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free",
+      });
+      const answer = await call({ prompt: "Review the diff.", signal: new AbortController().signal });
+
+      expect(answer.text).toContain("ACCEPT");
+      expect(answer.cost_usd).toBeCloseTo(0.0125);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test("the production checker call reports no spend when the provider reports none", async () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({ choices: [{ message: { content: "ACCEPT\nIndependent review." } }] });
+    }) as typeof fetch;
+
+    try {
+      const call = createCheckerModelCall(cfg, {
+        id: "checker-agent", provider: "openrouter", model_id: "google/gemma-4-31b-it:free",
+      });
+      const answer = await call({ prompt: "Review the diff.", signal: new AbortController().signal });
+
+      expect(answer.text).toContain("ACCEPT");
+      // No reported amount means no spend, never an invented zero.
+      expect(answer).not.toHaveProperty("cost_usd");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
   test("a pinned checker rejects rather than accepting a maker-family fallback", async () => {
     const cfg = checkerCascadeConfig([{
       id: "maker-family-reviewer", provider: "openrouter", model_id: "deepseek/deepseek-v4-flash:free",
@@ -794,6 +946,19 @@ describe("harness execution", () => {
       passed: true,
       model: { model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true },
     });
+  });
+
+  test("runChecker carries the call's reported spend into its verdict", async () => {
+    const manifest = fixtureManifest();
+    const { execution } = setupHarness({
+      manifest,
+      initialErrors: 0,
+      deps: { callModel: async () => ({ text: "ACCEPT\nIndependent review.", cost_usd: 0.02 }) },
+    });
+
+    const verdict = await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+    expect(verdict).toEqual({ passed: true, cost_usd: 0.02 });
   });
 
   test("a checker call that reports no model leaves the identity absent, not guessed", async () => {

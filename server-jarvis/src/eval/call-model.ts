@@ -33,6 +33,30 @@ export interface MakeCallModelOptions {
   excludeFamilies?: readonly string[];
 }
 
+/**
+ * A call result plus the spend the provider actually reported for it. `_costUsd`
+ * is absent unless the provider returned a finite, non-negative amount: a caller
+ * must never infer or estimate one.
+ */
+export type AttributedCallModelResult = Awaited<ReturnType<CallModelFn>> & {
+  _costUsd?: number;
+};
+
+/** `CallModelFn` that also reports actual provider cost. Assignable to `CallModelFn`. */
+export type AttributedCallModelFn = (
+  messages: Array<ChatMessage>,
+  options?: Parameters<CallModelFn>[1],
+) => Promise<AttributedCallModelResult>;
+
+/**
+ * Accept only an amount a provider actually reported. Missing, malformed,
+ * negative or non-finite values stay absent rather than becoming a fabricated
+ * zero the ledger would then treat as real spend.
+ */
+export function reportedCostUsd(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
 const HTTP_CALL_PROVIDERS: ReadonlySet<string> = new Set(["openrouter", "opencode_zen", "opencode_go", "vllm"]);
 
 /**
@@ -121,8 +145,17 @@ export function stageAbortGuard(options: {
  *  requested), and `_fallbackUsed` is true when the cascade advanced or the
  *  pinned agent was not the one that answered. A caller that must name the
  *  reviewer — the harness checker — reads these instead of asserting the
- *  pinned model answered. */
-export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: MakeCallModelOptions = {}): CallModelFn {
+ *  pinned model answered.
+ *
+ *  `_costUsd` carries the provider-reported spend (`or_cost` on the
+ *  non-streaming response) when the provider gave a finite, non-negative
+ *  amount. It is omitted otherwise: an unreported cost must stay absent rather
+ *  than become a zero a ledger would record as real spend. */
+export function makeCallModel(
+  cfg: JarvisConfig,
+  stage: string,
+  modelOptions: MakeCallModelOptions = {},
+): AttributedCallModelFn {
   const pinnedAgent = modelOptions.agent;
   if (pinnedAgent) assertAgentCallable(cfg, pinnedAgent);
   return async (messages, options) => {
@@ -157,6 +190,9 @@ export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: Ma
       ...(excludeFamilies && excludeFamilies.length > 0 ? { excludeFamilies } : {}),
     });
     const json = await response.json();
+    // OpenRouter reports actual spend as `or_cost` on the response (the same
+    // field its SSE usage block exposes). Other providers simply omit it.
+    const costUsd = reportedCostUsd(json?.or_cost);
     const choice = json.choices?.[0]?.message ?? {};
     const content: string = choice.content ?? "";
 
@@ -211,6 +247,7 @@ export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: Ma
       _fallbackUsed: pinnedAgent
         ? modelUsed !== pinnedAgent.model_id || providerUsed !== pinnedAgent.provider
         : fallbackDepth > 0,
+      ...(costUsd !== undefined ? { _costUsd: costUsd } : {}),
     };
   };
 }

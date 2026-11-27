@@ -18,6 +18,12 @@ export interface HarnessRunResult {
 
 export interface HarnessSensorBatch {
   counter_vector: HarnessRoundInput["counter_vector"];
+  /**
+   * Spend the sensor pass itself reported, when it knows a real amount. The
+   * engine charges it to the run's own ledger like any other model call, so a
+   * harness whose sensors cost money cannot run past `max_cost_usd`.
+   */
+  cost_usd?: number;
   sensors: Array<{
     sensor_id: string;
     status: "zero" | "nonzero" | "failed" | "not_applicable" | "unapproved";
@@ -88,6 +94,12 @@ export interface HarnessCheckerVerdict {
   passed: boolean;
   /** The model that reviewed, when the boundary can report it. */
   model?: HarnessCheckerModel;
+  /**
+   * The checker model call's actual reported spend, in US dollars. Optional
+   * because a boundary that cannot report a real amount must not invent one;
+   * the engine charges it to the run's own ledger and re-checks the cap.
+   */
+  cost_usd?: number;
 }
 
 export interface HarnessControllerInput {

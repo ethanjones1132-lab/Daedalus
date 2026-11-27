@@ -59,6 +59,99 @@ describe("makeCallModel attribution", () => {
     }
   });
 
+  test("reports the provider's actual or_cost as the call's spend", async () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({
+        choices: [{ message: { content: "ACCEPT" } }],
+        or_cost: 0.0042,
+      });
+    }) as typeof fetch;
+
+    try {
+      const call = makeCallModel(cfg, "reviewer", {
+        agent: { provider: "openrouter", model_id: "google/gemma-4-31b-it:free" },
+      });
+      const answer = await call([{ role: "user", content: "Review the diff." }]);
+
+      expect(answer._costUsd).toBeCloseTo(0.0042);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test("leaves spend absent when the provider reports no cost", async () => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({ choices: [{ message: { content: "ACCEPT" } }] });
+    }) as typeof fetch;
+
+    try {
+      const call = makeCallModel(cfg, "reviewer", {
+        agent: { provider: "openrouter", model_id: "google/gemma-4-31b-it:free" },
+      });
+      const answer = await call([{ role: "user", content: "Review the diff." }]);
+
+      expect(answer._costUsd).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
+  test.each([
+    ["a string", "0.0042"],
+    ["a negative number", -0.5],
+    ["null", null],
+    ["a boolean", true],
+  ])("leaves spend absent when or_cost is %s", async (_label, orCost) => {
+    const cfg = defaultConfig();
+    cfg.active_backend = "openrouter";
+    cfg.openrouter.api_key = "test-or-key";
+    cfg.openrouter.base_url = "https://openrouter.ai/api/v1";
+    cfg.openrouter.max_retries = 0;
+
+    const originalFetch = globalThis.fetch;
+    clearOpenRouterCache();
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith("/models")) return Response.json({ data: [] });
+      return Response.json({
+        choices: [{ message: { content: "ACCEPT" } }],
+        or_cost: orCost,
+      });
+    }) as typeof fetch;
+
+    try {
+      const call = makeCallModel(cfg, "reviewer", {
+        agent: { provider: "openrouter", model_id: "google/gemma-4-31b-it:free" },
+      });
+      const answer = await call([{ role: "user", content: "Review the diff." }]);
+
+      // A malformed amount must never become a fabricated zero.
+      expect(answer._costUsd).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearOpenRouterCache();
+    }
+  });
+
   test("reports the pinned model itself when no fallback was needed", async () => {
     const cfg = defaultConfig();
     cfg.active_backend = "openrouter";

@@ -14,7 +14,7 @@
 
 import { execFile } from "child_process";
 import { loadConfig, type JarvisConfig } from "../config";
-import { makeCallModel } from "../eval/call-model";
+import { makeCallModel, reportedCostUsd } from "../eval/call-model";
 import { OrchestrationAdmissionController } from "../orchestration/admission-controller";
 import {
   DEFAULT_ORCHESTRATOR_AGENTS,
@@ -81,10 +81,14 @@ export interface HarnessModelCallInput {
   excludeFamilies?: readonly string[];
 }
 
-/** One agent call (the checker). Never a tool loop. */
+/** One agent call (the checker). Never a tool loop.
+ *
+ *  `cost_usd` is the call's actual provider-reported spend, present only when
+ *  the boundary knows a real amount. The engine charges it to the run's ledger
+ *  and re-checks the cap, so it must never be estimated here. */
 export type HarnessModelCall = (
   input: HarnessModelCallInput,
-) => Promise<{ text: string; model?: HarnessCheckerModel }>;
+) => Promise<{ text: string; model?: HarnessCheckerModel; cost_usd?: number }>;
 
 /** The config source and launch probe the maker's delegate resolution needs. */
 export interface HarnessMakerDelegate {
@@ -168,6 +172,11 @@ function agentRef(agent: OrchestratorAgent): HarnessAgentRef {
  * and whether the cascade fell back (`_fallbackUsed`), so a verdict can be
  * attributed to its real author. When the call reports no model id the
  * identity is omitted rather than filled with the pinned name.
+ *
+ * The result also forwards the call's actual provider-reported spend
+ * (`_costUsd`, from the non-streaming `or_cost`) as `cost_usd`. When the
+ * provider reported no usable amount it stays absent; the engine must not
+ * charge an invented one.
  */
 export function createCheckerModelCall(
   cfg: JarvisConfig,
@@ -187,7 +196,12 @@ export function createCheckerModelCall(
         fallback_used: answer._fallbackUsed === true,
       }
       : undefined;
-    return { text: answer.content ?? "", ...(model ? { model } : {}) };
+    const costUsd = reportedCostUsd(answer._costUsd);
+    return {
+      text: answer.content ?? "",
+      ...(model ? { model } : {}),
+      ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
+    };
   };
 }
 
@@ -276,9 +290,18 @@ async function runSensorBatch(input: {
 
   // runSensors spawns each sensor at most once, in manifest order. Capturing by
   // (executable, argv) recovers the exit code and output for the batch evidence.
+  // A spawn that reports its own real spend is summed for the run ledger; a
+  // boundary that reports nothing leaves the batch cost absent.
   const captured = new Map<string, SensorSpawnResult>();
+  let reportedCost = 0;
+  let costReported = false;
   const recordingSpawn: SensorSpawn = async (spawnInput) => {
     const result = await input.spawn(spawnInput);
+    const cost = reportedCostUsd(result.cost_usd);
+    if (cost !== undefined) {
+      reportedCost += cost;
+      costReported = true;
+    }
     captured.set(spawnKey(spawnInput.executable, spawnInput.args), result);
     return result;
   };
@@ -293,6 +316,7 @@ async function runSensorBatch(input: {
 
   return {
     counter_vector: pass.counter_vector,
+    ...(costReported ? { cost_usd: reportedCost } : {}),
     sensors: pass.sensors.map((entry) => {
       const command = commandForSensor(manifest, entry.sensor_id);
       const attempt = command
@@ -718,9 +742,13 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       signal,
       ...(excludeFamilies.length > 0 ? { excludeFamilies } : {}),
     });
+    // Forward only the spend the call itself reported; the engine owns the
+    // ledger write and the cap check.
+    const costUsd = reportedCostUsd(answer.cost_usd);
     return {
       passed: parseReviewerVerdict(answer.text) === "accept",
       ...(answer.model ? { model: answer.model } : {}),
+      ...(costUsd !== undefined ? { cost_usd: costUsd } : {}),
     };
   };
 

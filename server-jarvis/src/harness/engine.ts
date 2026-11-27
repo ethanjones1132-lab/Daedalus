@@ -333,7 +333,11 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       let batch: HarnessSensorBatch;
       try { batch = await wait(input.sensors({ manifest, signal: abort.signal })); }
       catch (error) { reason = stepFailure(error); break; }
-      const afterSensors = roundStop();
+      // A sensor pass that reports its own spend is charged like any other
+      // model call, so the cap is checked against it before the next call.
+      const sensorCost = batch.cost_usd;
+      if (typeof sensorCost === "number" && Number.isFinite(sensorCost) && sensorCost > 0) addCost(sensorCost);
+      const afterSensors = elapsedStop() ?? spendStop();
       if (afterSensors) { reason = afterSensors; break; }
       lastSensors = batch;
       const round = store.appendRound({ run_id: run.id, round_number: rounds, counter_vector: batch.counter_vector });
@@ -362,6 +366,11 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
           (result.status === "not_applicable" && declaredSensors.get(result.sensor_id)?.kind === "unavailable")) &&
         manifest.sensors.every((sensor) => batch.sensors.some((result) => result.sensor_id === sensor.id));
       if (evidenceComplete && manifest.checker.enabled && !policy.skip_checker) {
+        // The checker is a model call, so the spend stop is taken before it
+        // starts as well as between rounds. A run already at its cap must not
+        // buy one more verdict.
+        const beforeChecker = elapsedStop() ?? spendStop();
+        if (beforeChecker) { reason = beforeChecker; break; }
         try {
           // The trusted execution boundary owns model selection and the independent verdict.
           const verdict = await wait(input.runChecker({
@@ -383,7 +392,12 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
             } : null,
             ...(verdict.model?.model_id ? {} : { model_identity: "unavailable" }),
           } });
-          reason = roundStop() ?? (verdict.passed ? "passed" : "checker_rejected");
+          // Charge the checker's own reported spend at the call site, then take
+          // the spend stop again: a verdict that crossed the cap settles on the
+          // existing budget reason, never on `passed`/`checker_rejected`.
+          const checkerCost = verdict.cost_usd;
+          if (typeof checkerCost === "number" && Number.isFinite(checkerCost) && checkerCost > 0) addCost(checkerCost);
+          reason = elapsedStop() ?? spendStop() ?? (verdict.passed ? "passed" : "checker_rejected");
         } catch (error) { reason = stepFailure(error); }
         break;
       }
