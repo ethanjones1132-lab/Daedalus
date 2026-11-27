@@ -168,6 +168,68 @@ describe("StreamSession terminal guarantee", () => {
     expect(results[0].result).toBe("the answer");
   });
 
+  // ── DD-205: `is_error` is derived from the subtype in one place ──
+  // A caller that only supplies `{ subtype: "error" }` must still produce a
+  // frame the Rust relay can surface as `jarvis://error`; an explicit
+  // `isError` always wins; and the plain success frame is unchanged.
+
+  test("an error subtype with no explicit isError emits is_error true", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s-dd205-error", write: rec.write, isAborted: () => false });
+
+    await session.finish("execution failed mid-turn", { subtype: "error", code: "error_during_execution" });
+
+    const results = rec.events().filter((e) => e.type === "result");
+    expect(results.length).toBe(1);
+    expect(results[0]).toMatchObject({
+      type: "result",
+      subtype: "error",
+      is_error: true,
+      code: "error_during_execution",
+      result: "execution failed mid-turn",
+      session_id: "s-dd205-error",
+    });
+  });
+
+  test("an explicit isError false with a success subtype still emits is_error false", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s-dd205-explicit", write: rec.write, isAborted: () => false });
+
+    await session.finish("the answer", { isError: false, subtype: "success" });
+
+    const results = rec.events().filter((e) => e.type === "result");
+    expect(results.length).toBe(1);
+    expect(results[0]).toMatchObject({ subtype: "success", is_error: false, result: "the answer" });
+  });
+
+  test("a default frame (no subtype, no isError) still emits is_error false and subtype success", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s-dd205-default", write: rec.write, isAborted: () => false });
+
+    await session.finish("the answer");
+
+    const results = rec.events().filter((e) => e.type === "result");
+    expect(results.length).toBe(1);
+    expect(results[0]).toMatchObject({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "the answer",
+      session_id: "s-dd205-default",
+    });
+  });
+
+  test("an explicit isError true without a subtype emits subtype error and is_error true", async () => {
+    const rec = recorder();
+    const session = new StreamSession({ sessionId: "s-dd205-flag", write: rec.write, isAborted: () => false });
+
+    await session.finish("failed", { isError: true });
+
+    const results = rec.events().filter((e) => e.type === "result");
+    expect(results.length).toBe(1);
+    expect(results[0]).toMatchObject({ subtype: "error", is_error: true, result: "failed" });
+  });
+
   test("ensureTerminal emits a terminator when nothing else did (the decode-error fix)", async () => {
     const rec = recorder();
     const session = new StreamSession({ sessionId: "s6", write: rec.write, isAborted: () => false });

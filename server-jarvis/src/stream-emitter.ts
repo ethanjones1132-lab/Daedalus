@@ -216,6 +216,10 @@ export class StreamSession {
    * (a visible banner) instead of injecting the text into the chat bubble
    * as if it were a real answer — which previously made auth failures look
    * like a silent stall.
+   *
+   * `is_error` is derived from the subtype when `isError` is omitted, so
+   * `{ subtype: "error" }` alone marks the frame as an error. An explicit
+   * `isError` always wins (e.g. `{ subtype: "partial", isError: false }`).
    */
   async finish(
     result: string,
@@ -244,8 +248,13 @@ export class StreamSession {
       this.terminalSent = true;
       await this.write(sseFrame({ type: "message_stop", session_id: this.sessionId, ...this.turnTag() }));
     }
-    const isError = opts?.isError ?? false;
-    const subtype = opts?.subtype ?? (isError ? "error" : "success");
+    // `is_error` is derived here, in one place, from the subtype so that a
+    // caller that only passes `{ subtype: "error" }` still produces a frame
+    // the Rust relay can surface as `jarvis://error`. An explicit `isError`
+    // always wins (that is how a degraded-but-usable `partial` frame stays
+    // non-error, and how an explicit `isError: false` overrides a subtype).
+    const subtype = opts?.subtype ?? (opts?.isError ? "error" : "success");
+    const isError = opts?.isError ?? subtype === "error";
     await this.write(sseFrame({
       type: "result",
       subtype,
