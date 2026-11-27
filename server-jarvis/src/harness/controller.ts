@@ -1,6 +1,7 @@
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import { runEngine } from "./engine";
 import type { HarnessManifest } from "./manifest";
+import type { RunBudget } from "./module";
 import type { HarnessRoundInput, HarnessStore } from "./store";
 
 export { MAX_DEADLINE_MS } from "./engine";
@@ -58,6 +59,15 @@ export interface HarnessMakerInput {
    * workspace-mutating delegate.
    */
   read_only?: boolean;
+  /**
+   * The run's remaining budget when this turn was requested, including its
+   * remaining cloud dollars. A boundary that would launch a paid/cloud call
+   * must refuse it when the remaining budget cannot cover it — at minimum when
+   * `max_cloud_usd` is 0 — so a zero-cloud run never spends before the engine
+   * sees the spend. Absent means the caller reported no budget, and the
+   * boundary stays unrestricted.
+   */
+  budget_left?: RunBudget;
 }
 
 export interface HarnessCheckerInput {
@@ -65,6 +75,12 @@ export interface HarnessCheckerInput {
   signal: AbortSignal;
   /** This run's brief values, paired with the maker turn's for the same run. */
   briefValues?: HarnessBriefValues;
+  /**
+   * The run's remaining budget when the verdict was requested. A cloud
+   * checker call must be refused when `max_cloud_usd` is 0 rather than bought
+   * and charged after the fact.
+   */
+  budget_left?: RunBudget;
 }
 
 /**

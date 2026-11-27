@@ -203,6 +203,8 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   let attachedAt = startedAt;
   let cloudSpent = 0;
   let attachedSpend = 0;
+  /** A reported spend was refused because the run had no cloud budget left. */
+  let cloudBudgetRefused = false;
   let lastSensors: HarnessSensorBatch | undefined;
   const history: EngineEvent[] = [];
   const budgetLeft = (): RunBudget => ({
@@ -229,6 +231,19 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   const addCost = (usd: number) => {
     cloudSpent = store.addRunCost({ run_id: run.id, cost_usd: usd });
     attachedSpend += usd;
+  };
+  /**
+   * Spend what a boundary reported for work it already ran, unless the run has
+   * no cloud budget left. A zero cap binds before the first cloud call: the
+   * ledger is not raised and the run's stop record is labelled
+   * `cloud_budget: "exhausted"`. A charge that merely crosses a positive cap
+   * is still written, and the spend stop then settles the run on its existing
+   * budget reason, exactly as before.
+   */
+  const chargeReported = (usd: number | undefined): void => {
+    if (typeof usd !== "number" || !Number.isFinite(usd) || usd <= 0) return;
+    if (cloudSpent >= cloudCap) { cloudBudgetRefused = true; return; }
+    addCost(usd);
   };
   const control: EngineControl = {
     state,
@@ -261,8 +276,10 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   };
   const spendStop = (): HarnessStopReason | undefined => {
     const attachmentCap = attached.module.limits.max_cloud_usd;
-    if (cloudSpent > 0 && cloudSpent >= cloudCap) return cloudStopReason;
-    if (attachedSpend > 0 && attachmentCap !== undefined && attachedSpend >= attachmentCap) return "harness_stop";
+    // A cap of zero is a run that may spend nothing, so there is nothing for
+    // it to have exhausted before its first call. Only a positive cap stops.
+    if (cloudCap > 0 && cloudSpent >= cloudCap) return cloudStopReason;
+    if (attachmentCap !== undefined && attachmentCap > 0 && attachedSpend >= attachmentCap) return "harness_stop";
   };
   const roundStop = () => elapsedStop() ?? (legacyWorker ? undefined : spendStop());
   const stepFailure = (error: unknown): HarnessStopReason => {
@@ -357,14 +374,14 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       let maker: Awaited<ReturnType<typeof input.runMaker>>;
       try {
         maker = await wait(input.runMaker({
-          manifest, round: rounds, signal: abort.signal,
+          manifest, round: rounds, signal: abort.signal, budget_left: budgetLeft(),
           ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
           ...(policy.instructions ? { instructions: policy.instructions } : {}),
           ...(readOnly ? { read_only: true } : {}),
         }));
       } catch { reason = elapsedStop() ?? "maker_failed"; break; }
       const roundCost = maker?.cost_usd;
-      if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) addCost(roundCost);
+      if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) chargeReported(roundCost);
       const afterMaker = elapsedStop();
       if (afterMaker) { reason = afterMaker; break; }
       if (maker?.failed) {
@@ -390,7 +407,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       // A sensor pass that reports its own spend is charged like any other
       // model call, so the cap is checked against it before the next call.
       const sensorCost = batch.cost_usd;
-      if (typeof sensorCost === "number" && Number.isFinite(sensorCost) && sensorCost > 0) addCost(sensorCost);
+      if (typeof sensorCost === "number" && Number.isFinite(sensorCost) && sensorCost > 0) chargeReported(sensorCost);
       const afterSensors = elapsedStop() ?? spendStop();
       if (afterSensors) { reason = afterSensors; break; }
       lastSensors = batch;
@@ -484,7 +501,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
         try {
           // The trusted execution boundary owns model selection and the independent verdict.
           const verdict = await wait(input.runChecker({
-            manifest, signal: abort.signal,
+            manifest, signal: abort.signal, budget_left: budgetLeft(),
             ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
           }));
           // Who reviewed, not just whether it passed. A checker cascade can
@@ -506,7 +523,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
           // the spend stop again: a verdict that crossed the cap settles on the
           // existing budget reason, never on `passed`/`checker_rejected`.
           const checkerCost = verdict.cost_usd;
-          if (typeof checkerCost === "number" && Number.isFinite(checkerCost) && checkerCost > 0) addCost(checkerCost);
+          if (typeof checkerCost === "number" && Number.isFinite(checkerCost) && checkerCost > 0) chargeReported(checkerCost);
           reason = elapsedStop() ?? spendStop() ?? (verdict.passed ? "passed" : "checker_rejected");
         } catch (error) { reason = stepFailure(error); }
         break;
@@ -541,6 +558,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
     record("stop", detail ?? reason, { stop_reason: reason, abandoned, ...(makerFailure ?? {}) });
     store.appendEvent({ run_id: run.id, event_type: "stopped", payload: {
       stop_reason: reason, rounds, ...(cloudSpent > 0 ? { cost_usd: cloudSpent } : {}),
+      ...(cloudBudgetRefused ? { cloud_budget: "exhausted" } : {}),
       ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
       ...(makerFailure ?? {}),
     } });

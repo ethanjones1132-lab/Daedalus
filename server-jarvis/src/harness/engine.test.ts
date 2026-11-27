@@ -233,6 +233,79 @@ test("a sensor pass that reports its own spend is charged and stops before the n
   expect(store.getRun(result.run_id)?.cost_usd).toBeCloseTo(0.6);
 });
 
+test("a zero cloud budget does not stop the run for budget before its first round", async () => {
+  let makers = 0;
+  let control!: EngineControl;
+  const { input, store } = setup({
+    // Failing sensors keep the run going round after round, so a zero cap is
+    // tested across the boundary where the old guard read "at the cap".
+    sensors: async () => failing,
+    runMaker: async () => { makers++; },
+  });
+  input.budget = { max_cloud_usd: 0 };
+  const result = await runEngine({ ...input, onControl: (value) => { control = value; } });
+  expect(result).toMatchObject({ stop_reason: "max_rounds", rounds: 5 });
+  expect(makers).toBe(5);
+  expect(control.state().budget_left.max_cloud_usd).toBe(0);
+  expect(store.getRun(result.run_id)?.cost_usd).toBe(0);
+});
+
+test("a zero-budget run refuses a maker's reported cloud spend and labels the run cloud-budget exhausted", async () => {
+  const { input, store } = setup({
+    runMaker: async ({ budget_left }) => {
+      expect(budget_left?.max_cloud_usd).toBe(0);
+      return { cost_usd: 0.25 };
+    },
+  });
+  input.budget = { max_cloud_usd: 0 };
+  const result = await runEngine(input);
+  expect(result).toMatchObject({ stop_reason: "passed", rounds: 1 });
+
+  const run = store.getRun(result.run_id);
+  // The turn's report is mirrored on the round, but the ledger is not raised.
+  expect(run?.events.find((event) => event.event_type === "round_metrics")?.payload)
+    .toEqual({ round: 1, cost_usd: 0.25 });
+  expect(run?.cost_usd).toBe(0);
+  const stopped = run?.events.find((event) => event.event_type === "stopped");
+  expect(stopped?.payload).toMatchObject({ stop_reason: "passed", rounds: 1, cloud_budget: "exhausted" });
+  expect((stopped?.payload as { cost_usd?: number }).cost_usd).toBeUndefined();
+});
+
+test("chargeCloud allows no charge on a zero cap and still charges under a positive cap", async () => {
+  let zeroControl!: EngineControl;
+  const zeroRun = setup({
+    runMaker: async () => { expect(() => zeroControl.chargeCloud(0.01)).toThrow(/cloud budget/); },
+  });
+  zeroRun.input.budget = { max_cloud_usd: 0 };
+  const zeroResult = await runEngine({ ...zeroRun.input, onControl: (value) => { zeroControl = value; } });
+  expect(zeroResult).toMatchObject({ stop_reason: "passed", rounds: 1 });
+  expect(zeroRun.store.getRun(zeroResult.run_id)?.cost_usd).toBe(0);
+
+  let paidControl!: EngineControl;
+  const paidRun = setup({ runMaker: async () => { paidControl.chargeCloud(0.40); } });
+  paidRun.input.budget = { max_cloud_usd: 0.50 };
+  const paidResult = await runEngine({ ...paidRun.input, onControl: (value) => { paidControl = value; } });
+  expect(paidResult).toMatchObject({ stop_reason: "passed", rounds: 1 });
+  expect(paidRun.store.getRun(paidResult.run_id)?.cost_usd).toBeCloseTo(0.40);
+});
+
+test("a positive cloud cap still stops once the cap is reached, on the same budget reason", async () => {
+  let makers = 0;
+  const { input, store } = setup({
+    sensors: async () => failing,
+    runMaker: async () => { makers++; return { cost_usd: 0.05 }; },
+  });
+  input.budget = { max_cloud_usd: 0.05 };
+  const result = await runEngine(input);
+  expect(result).toMatchObject({ stop_reason: "run_budget", rounds: 1 });
+  expect(makers).toBe(1);
+  const run = store.getRun(result.run_id);
+  expect(run?.cost_usd).toBeCloseTo(0.05);
+  const stopped = run?.events.find((event) => event.event_type === "stopped");
+  expect(stopped?.payload).toMatchObject({ stop_reason: "run_budget", rounds: 1, cost_usd: 0.05 });
+  expect(stopped?.payload).not.toMatchObject({ cloud_budget: "exhausted" });
+});
+
 test("a failed maker turn records its delegate cause on the maker_failed stop", async () => {
   const { input, store } = setup({
     runMaker: async () => ({

@@ -27,6 +27,7 @@ import {
 } from "../orchestration/delegate-model-select";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict, type ExecutorStageOutput } from "../orchestration/stage-output";
+import { isCloudProvider } from "../provider-availability";
 import { resolveHarnessAgent, agentFamily, modelFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
 import type { HarnessAdmission, HarnessCheckerModel, HarnessControllerInput, HarnessMakerFailure, HarnessMakerUsage, HarnessSensorBatch } from "./controller";
@@ -630,6 +631,29 @@ function makerUsageOf(result: HarnessMakerTurnResult): HarnessMakerUsage {
   return typeof toolCalls === "number" && Number.isFinite(toolCalls) ? { tool_calls: toolCalls } : {};
 }
 
+/** The cloud dollars the run had left when it asked for a call, when it said. */
+function cloudBudgetLeft(budget: { max_cloud_usd: number } | undefined): number | undefined {
+  const remaining = budget?.max_cloud_usd;
+  return typeof remaining === "number" && Number.isFinite(remaining) ? Math.max(0, remaining) : undefined;
+}
+
+/**
+ * Why a cloud call may not launch, or undefined when it may. A zero cap binds
+ * before the call rather than after it: the spend the engine would only see in
+ * the result is never incurred. The call's own price is not known before it
+ * runs, so only an exhausted budget is decidable here; a positive remainder is
+ * spent by the call and charged by the engine from the provider's report.
+ */
+function cloudBudgetRefusal(
+  remaining: number | undefined,
+  provider: string | undefined,
+  call: string,
+): string | undefined {
+  if (remaining === undefined || remaining > 0 || !isCloudProvider(provider)) return undefined;
+  return `cloud budget exhausted: the run has $${remaining.toFixed(2)} of its max_cloud_usd left, ` +
+    `so the ${call} cloud call was not launched`;
+}
+
 /**
  * The production delegate result → maker turn seam mapping, shared by the
  * server's `runMakerTurn` so a regression test can pin exactly what production
@@ -686,7 +710,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     return batch;
   };
 
-  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal, briefValues, instructions, read_only }) => {
+  const runMaker: HarnessControllerInput["runMaker"] = async ({ manifest, round, signal, briefValues, instructions, read_only, budget_left }) => {
     const readOnly = read_only === true;
     const local = localMakerFor(manifest, signal);
     const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues ?? defaultBriefValues, instructions);
@@ -722,6 +746,13 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (!agent) {
       throw new Error(`no executor agent is available for harness maker "${manifest.maker_agent_id}"`);
     }
+    // The local maker above is the only free path. Once it cannot run, a
+    // delegate turn would spend before the engine's cap check, so a run with
+    // no cloud budget left ends the round with its cause instead of launching
+    // it. The label reuses the maker failure detail the stop record already
+    // carries; no new event kind is introduced.
+    const budgetRefusal = cloudBudgetRefusal(cloudBudgetLeft(budget_left), agent.provider, "maker");
+    if (budgetRefusal) return { failed: true, cost_usd: 0, failureDetail: budgetRefusal };
     // Resolve before the first side effect of the turn so a missing model is a
     // clear failure, not a CLI launch with "--model auto". The message is also
     // logged because the controller records only the maker_failed stop reason.
@@ -765,11 +796,17 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
 
   // The controller and manifest validation already refuse a checker equal to the
   // maker; that rule is untouched here.
-  const runChecker: HarnessControllerInput["runChecker"] = async ({ manifest, signal, briefValues }) => {
+  const runChecker: HarnessControllerInput["runChecker"] = async ({ manifest, signal, briefValues, budget_left }) => {
     const agent = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
     if (!agent) {
       throw new Error(`no reviewer agent is available for harness checker "${manifest.checker.agent_id}"`);
     }
+    // A consultant verdict costs money too, so an exhausted cloud budget
+    // refuses the call before the prompt and evidence are built. The engine
+    // records the cause on `run_failed`; a verdict is never invented for a
+    // call that did not happen.
+    const budgetRefusal = cloudBudgetRefusal(cloudBudgetLeft(budget_left), agent.provider, "checker");
+    if (budgetRefusal) throw new Error(budgetRefusal);
     const local = localMakerFor(manifest, signal);
     const maker = local ? undefined : resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
     const makerFamily = local ? modelFamily(local.config.llama_cpp.model) : maker ? agentFamily(maker) : "";
