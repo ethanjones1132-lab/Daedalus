@@ -714,6 +714,52 @@ fn llama_cpp_server_args_with_probe(
     crate::jarvis::gpu_fit::fit_with_probe(config, probe).server_args(mtp_head_exists)
 }
 
+// Keep this aligned with server-jarvis/src/config.ts llamaCppSetupIssues.
+const LLAMA_CPP_SERVER_PATH_REFUSAL: &str =
+    "llama.cpp server_path is not configured: set llama_cpp.server_path in Settings or the {env} environment variable to llama-server from Unsloth's llama.cpp b12651 build (engine directory llama-unsloth-b12651), with cudart64_*.dll and cublas64_*.dll beside it; mainline llama-server cannot load Inkling-2-Mini. Alternatively, point the llama.cpp base URL at an already-running llama.cpp server and leave the path blank, or choose an already-configured Inference backend (Ollama, OpenRouter or Claude Code CLI).";
+
+#[cfg(test)]
+mod llama_cpp_setup_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn blank_server_path_refusal_matches_the_first_run_setup_guidance() {
+        let refusal = LLAMA_CPP_SERVER_PATH_REFUSAL.replace(
+            "{env}",
+            crate::jarvis::types::LLAMA_SERVER_PATH_ENV,
+        );
+
+        for required in [
+            "set llama_cpp.server_path in Settings",
+            "JARVIS_LLAMA_SERVER_PATH environment variable",
+            "llama-server from Unsloth's llama.cpp b12651 build",
+            "cudart64_*.dll",
+            "cublas64_*.dll",
+            "point the llama.cpp base URL at an already-running llama.cpp server and leave the path blank",
+            "choose an already-configured Inference backend (Ollama, OpenRouter or Claude Code CLI)",
+        ] {
+            assert!(
+                refusal.contains(required),
+                "the first-run refusal must include {required:?}: {refusal}"
+            );
+        }
+
+        // Keep the detailed sentence scoped to the existing blank-path guard.
+        // The needle is assembled at compile time so this test's own source
+        // does not become a second copy of it: other tests locate the starter
+        // by scanning lib.rs, and an earlier copy would shadow the real one.
+        const SOURCE: &str = include_str!("lib.rs");
+        let guard = concat!(
+            "if config.server_path.trim().is_empty() {",
+            "\n        return Err(LLAMA_CPP_SERVER_PATH_REFUSAL.replace(",
+        );
+        assert!(
+            SOURCE.contains(guard),
+            "the setup refusal must remain under the blank server_path guard"
+        );
+    }
+}
+
 /// Start the configured local llama.cpp server with the placement, speculation
 /// and reasoning budget from `LlamaCppConfig::server_args`. The Child is owned by
 /// the shared lifecycle manager, so switching backends or exiting Daedalus
@@ -745,9 +791,7 @@ pub(crate) async fn start_llama_cpp_server(
     }
 
     if config.server_path.trim().is_empty() {
-        return Err(format!(
-            "llama.cpp server_path is not configured: set llama_cpp.server_path in Settings or the {LLAMA_SERVER_PATH_ENV} environment variable to the llama-server executable"
-        ));
+        return Err(LLAMA_CPP_SERVER_PATH_REFUSAL.replace("{env}", LLAMA_SERVER_PATH_ENV));
     }
     if config.model_path.trim().is_empty() {
         return Err(format!(
