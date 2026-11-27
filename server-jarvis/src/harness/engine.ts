@@ -1,6 +1,12 @@
 import { DEFAULT_ORCHESTRATOR_AGENTS } from "../orchestration/agent-pool";
 import { agentFamily, modelFamily, resolveHarnessAgent } from "./agents";
-import type { HarnessControllerInput, HarnessRunResult, HarnessSensorBatch, HarnessStopReason } from "./controller";
+import type {
+  HarnessControllerInput,
+  HarnessMakerFailure,
+  HarnessRunResult,
+  HarnessSensorBatch,
+  HarnessStopReason,
+} from "./controller";
 import { manifestHash, validateManifest } from "./manifest";
 import { getHarness, type EngineEvent, type EngineState, type HarnessRoundPolicy, type RunBudget } from "./module";
 import type { HarnessRoundInput, HarnessSensorResultInput } from "./store";
@@ -131,6 +137,8 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   let reason: HarnessStopReason = "max_rounds";
   let detail: string | undefined;
   let failure: string | undefined;
+  /** The failed maker turn's own cause, when it carried one. */
+  let makerFailure: HarnessMakerFailure | undefined;
   let abandoned = false;
   let active = false;
   let rounds = 0;
@@ -286,7 +294,17 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) addCost(roundCost);
       const afterMaker = elapsedStop();
       if (afterMaker) { reason = afterMaker; break; }
-      if (maker?.failed) { reason = "maker_failed"; break; }
+      if (maker?.failed) {
+        reason = "maker_failed";
+        // The delegate's real cause, never a replacement for `maker_failed`:
+        // `delegate_timeout` stays visible as its own code.
+        makerFailure = {
+          ...(maker.errorCode !== undefined ? { errorCode: maker.errorCode } : {}),
+          ...(maker.terminalStatus !== undefined ? { terminalStatus: maker.terminalStatus } : {}),
+          ...(maker.failureDetail !== undefined ? { failureDetail: maker.failureDetail } : {}),
+        };
+        break;
+      }
       const exhausted = legacyWorker ? undefined : spendStop();
       if (exhausted) { reason = exhausted; break; }
 
@@ -359,10 +377,11 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
       reason = "run_failed";
       failure ??= error instanceof Error ? error.message : String(error);
     }
-    record("stop", detail ?? reason, { stop_reason: reason, abandoned });
+    record("stop", detail ?? reason, { stop_reason: reason, abandoned, ...(makerFailure ?? {}) });
     store.appendEvent({ run_id: run.id, event_type: "stopped", payload: {
       stop_reason: reason, rounds, ...(cloudSpent > 0 ? { cost_usd: cloudSpent } : {}),
       ...(abandoned ? { abandoned: true } : {}), ...(failure !== undefined ? { error: failure } : {}),
+      ...(makerFailure ?? {}),
     } });
   }
   return { run_id: run.id, stop_reason: reason, rounds, ...(abandoned ? { abandoned: true } : {}) };

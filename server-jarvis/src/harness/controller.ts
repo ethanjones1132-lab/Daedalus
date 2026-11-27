@@ -53,11 +53,27 @@ export interface HarnessCheckerInput {
   briefValues?: HarnessBriefValues;
 }
 
+/**
+ * Why a failed maker turn stopped. Carried with the turn result so a
+ * `maker_failed` stop records the delegate's real cause instead of only the
+ * stop reason. Every field is optional: a turn that fails without a known
+ * cause, and every successful turn, records exactly what it did before.
+ */
+export interface HarnessMakerFailure {
+  /** Stable delegate failure code, e.g. `delegate_timeout`. */
+  errorCode?: string;
+  /** The delegate's terminal status, e.g. `timed_out`. */
+  terminalStatus?: string;
+  /** Bounded exception/detail text for the failure. */
+  failureDetail?: string;
+}
+
 export interface HarnessControllerInput {
   manifest: HarnessManifest;
   store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
   sensors: (input: { manifest: HarnessManifest; signal: AbortSignal }) => Promise<HarnessSensorBatch>;
-  runMaker: (input: HarnessMakerInput) => Promise<{ failed?: boolean; continue?: boolean; cost_usd?: number } | void>;
+  runMaker: (input: HarnessMakerInput) =>
+    Promise<({ failed?: boolean; continue?: boolean; cost_usd?: number } & HarnessMakerFailure) | void>;
   /** The actual model for a maker that runs outside the delegate pool. */
   localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
   runChecker: (input: HarnessCheckerInput) => Promise<{ passed: boolean }>;

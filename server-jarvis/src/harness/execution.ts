@@ -29,7 +29,7 @@ import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
 import { resolveHarnessAgent, agentFamily, modelFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
-import type { HarnessAdmission, HarnessControllerInput, HarnessSensorBatch } from "./controller";
+import type { HarnessAdmission, HarnessControllerInput, HarnessMakerFailure, HarnessSensorBatch } from "./controller";
 import { INKLING_MAKER_ID, recordHarnessMakerEvent, runInklingMaker, type HarnessMakerRequest } from "./inkling-maker";
 import { createHarnessMakerTools } from "./maker-tools";
 import type { HarnessManifest } from "./manifest";
@@ -60,10 +60,14 @@ export interface HarnessMakerTurnInput {
   config: JarvisConfig;
 }
 
-/** One maker round: an executor tool loop for a turn. `ok: false` fails the round. */
+/**
+ * One maker round: an executor tool loop for a turn. `ok: false` fails the
+ * round; the optional failure fields carry the delegate's real cause through
+ * to the run's `maker_failed` stop.
+ */
 export type HarnessMakerTurn = (
   input: HarnessMakerTurnInput,
-) => Promise<{ ok: boolean; narrative?: string; cost_usd?: number }>;
+) => Promise<{ ok: boolean; narrative?: string; cost_usd?: number } & HarnessMakerFailure>;
 
 export interface HarnessModelCallInput {
   prompt: string;
@@ -561,6 +565,15 @@ async function resolveMakerDelegateConfig(maker: HarnessMakerDelegate): Promise<
   return resolution.config;
 }
 
+/** Keep only the failure fields a failed turn actually knows; never add empty keys. */
+function makerFailureOf(result: HarnessMakerFailure): HarnessMakerFailure {
+  return {
+    ...(result.errorCode !== undefined ? { errorCode: result.errorCode } : {}),
+    ...(result.terminalStatus !== undefined ? { terminalStatus: result.terminalStatus } : {}),
+    ...(result.failureDetail !== undefined ? { failureDetail: result.failureDetail } : {}),
+  };
+}
+
 /** Build the server's harness execution boundaries from injected dependencies. */
 export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecution {
   const spawn = deps.spawn ?? defaultSpawn;
@@ -662,7 +675,7 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       config,
     });
     const cost = typeof turn.cost_usd === "number" ? { cost_usd: turn.cost_usd } : {};
-    return turn.ok ? cost : { failed: true, ...cost };
+    return turn.ok ? cost : { failed: true, ...makerFailureOf(turn), ...cost };
   };
 
   // The controller and manifest validation already refuse a checker equal to the

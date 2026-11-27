@@ -168,6 +168,42 @@ test.each([
   expect(stopped?.payload).toMatchObject({ stop_reason: reason, rounds: 2, cost_usd: run?.cost_usd });
 });
 
+test("a failed maker turn records its delegate cause on the maker_failed stop", async () => {
+  const { input, store } = setup({
+    runMaker: async () => ({
+      failed: true,
+      errorCode: "delegate_timeout",
+      terminalStatus: "timed_out",
+      failureDetail: "delegate exceeded its 900000ms budget",
+    }),
+  });
+  const result = await runEngine(input);
+  expect(result.stop_reason).toBe("maker_failed");
+  expect(result.rounds).toBe(1);
+
+  const events = store.getRun(result.run_id)?.events ?? [];
+  const stopped = events.find((event) => event.event_type === "stopped");
+  expect(stopped?.payload).toEqual({
+    stop_reason: "maker_failed", rounds: 1,
+    errorCode: "delegate_timeout", terminalStatus: "timed_out",
+    failureDetail: "delegate exceeded its 900000ms budget",
+  });
+  const stop = events.find((event) => event.event_type === "stop");
+  expect((stop?.payload as { detail?: Record<string, unknown> } | undefined)?.detail).toMatchObject({
+    stop_reason: "maker_failed", abandoned: false,
+    errorCode: "delegate_timeout", terminalStatus: "timed_out",
+    failureDetail: "delegate exceeded its 900000ms budget",
+  });
+});
+
+test("a failed maker turn without a cause keeps the stop payload unchanged", async () => {
+  const { input, store } = setup({ runMaker: async () => ({ failed: true }) });
+  const result = await runEngine(input);
+  expect(result.stop_reason).toBe("maker_failed");
+  expect(store.getRun(result.run_id)?.events.find((event) => event.event_type === "stopped")?.payload)
+    .toEqual({ stop_reason: "maker_failed", rounds: 1 });
+});
+
 test("a longer caller deadline does not extend the switchable engine's wall budget", async () => {
   let admittedUntil: number | undefined;
   const { input } = setup({

@@ -323,6 +323,32 @@ describe("harness execution", () => {
     expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
   });
 
+  test("a delegate failure's cause reaches the maker_failed stop evidence", async () => {
+    const manifest = fixtureManifest();
+    const runMakerTurn: HarnessMakerTurn = async () => ({
+      ok: false,
+      errorCode: "delegate_timeout",
+      terminalStatus: "timed_out",
+      failureDetail: "delegate timed out after 900000ms",
+    });
+    const { store, execution } = setupHarness({ manifest, deps: { runMakerTurn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-maker-failure",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("maker_failed");
+    expect(result.rounds).toBe(1);
+    const stopped = store.getRun("run-maker-failure")?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({
+      stop_reason: "maker_failed", rounds: 1,
+      errorCode: "delegate_timeout", terminalStatus: "timed_out",
+      failureDetail: "delegate timed out after 900000ms",
+    });
+  });
+
   test("a run's own brief values override the execution's default values", async () => {
     const manifest = fixtureManifest();
     manifest.guides.brief_template = "Do {{task}}";
