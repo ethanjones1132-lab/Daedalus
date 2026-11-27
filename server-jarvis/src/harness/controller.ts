@@ -68,6 +68,28 @@ export interface HarnessMakerFailure {
   failureDetail?: string;
 }
 
+/**
+ * Who actually produced a checker verdict. The checker's cascade can advance
+ * past the pinned agent, so this is the model that answered, not the one the
+ * manifest requested. Every field is optional: a boundary that cannot know
+ * records nothing rather than inventing a model name.
+ */
+export interface HarnessCheckerModel {
+  /** The cascade entry's model id that answered the call. */
+  model_id?: string;
+  /** The provider that served it. */
+  provider?: string;
+  /** True when the cascade replaced the requested checker model. */
+  fallback_used?: boolean;
+}
+
+export interface HarnessCheckerVerdict {
+  /** The verdict. The only decision field. */
+  passed: boolean;
+  /** The model that reviewed, when the boundary can report it. */
+  model?: HarnessCheckerModel;
+}
+
 export interface HarnessControllerInput {
   manifest: HarnessManifest;
   store: Pick<HarnessStore, "createRun" | "appendRound" | "appendSensorResult" | "appendEvent" | "addRunCost">;
@@ -76,7 +98,7 @@ export interface HarnessControllerInput {
     Promise<({ failed?: boolean; continue?: boolean; cost_usd?: number } & HarnessMakerFailure) | void>;
   /** The actual model for a maker that runs outside the delegate pool. */
   localMakerModel?: (input: { manifest: HarnessManifest; signal: AbortSignal }) => string | undefined;
-  runChecker: (input: HarnessCheckerInput) => Promise<{ passed: boolean }>;
+  runChecker: (input: HarnessCheckerInput) => Promise<HarnessCheckerVerdict>;
   /** Agent pool used to resolve the maker/checker model families. Defaults to the shipped pool. */
   agents?: readonly OrchestratorAgent[];
   /** Pre-generated run id so a caller can address the run before the loop settles. */

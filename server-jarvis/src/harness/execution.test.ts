@@ -658,6 +658,10 @@ describe("harness execution", () => {
 
       expect(answer.text).toContain("ACCEPT");
       expect(requestedModels[0]).toBe("google/gemma-4-31b-it:free");
+      // The single-model check names the model that answered, without a fallback.
+      expect(answer.model).toEqual({
+        model_id: "google/gemma-4-31b-it:free", provider: "openrouter", fallback_used: false,
+      });
     } finally {
       globalThis.fetch = originalFetch;
       clearOpenRouterCache();
@@ -739,6 +743,11 @@ describe("harness execution", () => {
       expect(answer.text).toContain("ACCEPT");
       expect(requestedModels).toContain("qwen/qwen3-coder:free");
       expect(requestedModels).not.toContain("deepseek/deepseek-v4-flash:free");
+      // The verdict names the model that actually answered through the cascade,
+      // and says the pinned checker was replaced.
+      expect(answer.model).toEqual({
+        model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true,
+      });
     } finally {
       globalThis.fetch = originalFetch;
       clearOpenRouterCache();
@@ -764,6 +773,42 @@ describe("harness execution", () => {
     // The maker resolves to `executor-model` ("executor" family); the checker
     // must receive that family on the call so its cascade can exclude it.
     expect(seen).toEqual([["executor"]]);
+  });
+
+  test("runChecker carries the model that answered into its verdict", async () => {
+    const manifest = fixtureManifest();
+    const { execution } = setupHarness({
+      manifest,
+      initialErrors: 0,
+      deps: {
+        callModel: async () => ({
+          text: "ACCEPT\nIndependent review.",
+          model: { model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true },
+        }),
+      },
+    });
+
+    const verdict = await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+    expect(verdict).toEqual({
+      passed: true,
+      model: { model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true },
+    });
+  });
+
+  test("a checker call that reports no model leaves the identity absent, not guessed", async () => {
+    const manifest = fixtureManifest();
+    const { execution } = setupHarness({
+      manifest,
+      initialErrors: 0,
+      // A boundary that cannot name its model says nothing rather than
+      // claiming the manifest's checker agent answered.
+      deps: { callModel: async () => ({ text: "ACCEPT\nIndependent review." }) },
+    });
+
+    const verdict = await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+    expect(verdict).toEqual({ passed: true });
   });
 
   test("(f) a saved template with a route-recorded approval runs its baseline-free sensor and settles passed", async () => {

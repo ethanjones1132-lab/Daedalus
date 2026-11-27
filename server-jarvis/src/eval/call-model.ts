@@ -114,7 +114,14 @@ export function stageAbortGuard(options: {
  *  which agent the pool would pick for `stage`, and if it doesn't support
  *  native function calling, use the text tool-call protocol instead of the
  *  `tools` request field so cheap/free models are scored on their real
- *  tool-use behavior rather than being silently marked as tool-call-less. */
+ *  tool-use behavior rather than being silently marked as tool-call-less.
+ *
+ *  Each successful call also reports who answered: `_modelUsed`/`_provider`
+ *  are the cascade entry that produced the response (not necessarily the one
+ *  requested), and `_fallbackUsed` is true when the cascade advanced or the
+ *  pinned agent was not the one that answered. A caller that must name the
+ *  reviewer — the harness checker — reads these instead of asserting the
+ *  pinned model answered. */
 export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: MakeCallModelOptions = {}): CallModelFn {
   const pinnedAgent = modelOptions.agent;
   if (pinnedAgent) assertAgentCallable(cfg, pinnedAgent);
@@ -136,7 +143,9 @@ export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: Ma
       ? { provider: pinnedAgent.provider as HttpProviderId, model_id: pinnedAgent.model_id }
       : undefined;
     const excludeFamilies = modelOptions.excludeFamilies?.filter((family) => family.trim().length > 0);
-    const { response } = await chatCompletionWithFallback(cfg, {
+    const {
+      response, model_used: modelUsed, provider_used: providerUsed, fallback_depth: fallbackDepth,
+    } = await chatCompletionWithFallback(cfg, {
       messages: effectiveMessages,
       temperature: options?.temperature ?? 0.2,
       max_tokens: options?.max_tokens ?? 1024,
@@ -193,6 +202,15 @@ export function makeCallModel(cfg: JarvisConfig, stage: string, modelOptions: Ma
     return {
       content: cleaned,
       tool_calls: resolved.calls.length > 0 ? resolved.calls : undefined,
+      // The cascade entry that actually answered, so a caller can attribute
+      // the response to the model that produced it rather than the one it
+      // asked for. With a pinned agent the entry is normally cascade[0]; if
+      // the pin was dropped the used model differs even at depth 0.
+      _modelUsed: modelUsed,
+      _provider: providerUsed,
+      _fallbackUsed: pinnedAgent
+        ? modelUsed !== pinnedAgent.model_id || providerUsed !== pinnedAgent.provider
+        : fallbackDepth > 0,
     };
   };
 }

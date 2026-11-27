@@ -29,7 +29,7 @@ import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict } from "../orchestration/stage-output";
 import { resolveHarnessAgent, agentFamily, modelFamily, type HarnessAgentRef } from "./agents";
 import { getHarnessCommand } from "./commands";
-import type { HarnessAdmission, HarnessControllerInput, HarnessMakerFailure, HarnessSensorBatch } from "./controller";
+import type { HarnessAdmission, HarnessCheckerModel, HarnessControllerInput, HarnessMakerFailure, HarnessSensorBatch } from "./controller";
 import { INKLING_MAKER_ID, recordHarnessMakerEvent, runInklingMaker, type HarnessMakerRequest } from "./inkling-maker";
 import { createHarnessMakerTools } from "./maker-tools";
 import type { HarnessManifest } from "./manifest";
@@ -82,7 +82,9 @@ export interface HarnessModelCallInput {
 }
 
 /** One agent call (the checker). Never a tool loop. */
-export type HarnessModelCall = (input: HarnessModelCallInput) => Promise<{ text: string }>;
+export type HarnessModelCall = (
+  input: HarnessModelCallInput,
+) => Promise<{ text: string; model?: HarnessCheckerModel }>;
 
 /** The config source and launch probe the maker's delegate resolution needs. */
 export interface HarnessMakerDelegate {
@@ -161,6 +163,11 @@ function agentRef(agent: OrchestratorAgent): HarnessAgentRef {
  * pinned to the agent resolved from the manifest rather than a fixed role.
  * `excludeFamilies` carries the maker's family so no maker-family entry can
  * enter the checker's fallback cascade.
+ *
+ * The result names the model that actually answered (`_modelUsed`/`_provider`)
+ * and whether the cascade fell back (`_fallbackUsed`), so a verdict can be
+ * attributed to its real author. When the call reports no model id the
+ * identity is omitted rather than filled with the pinned name.
  */
 export function createCheckerModelCall(
   cfg: JarvisConfig,
@@ -173,7 +180,14 @@ export function createCheckerModelCall(
   });
   return async ({ prompt, signal }) => {
     const answer = await callModel([{ role: "user", content: prompt }], { stageAbort: signal });
-    return { text: answer.content ?? "" };
+    const model: HarnessCheckerModel | undefined = answer._modelUsed
+      ? {
+        model_id: answer._modelUsed,
+        ...(answer._provider !== undefined ? { provider: answer._provider } : {}),
+        fallback_used: answer._fallbackUsed === true,
+      }
+      : undefined;
+    return { text: answer.content ?? "", ...(model ? { model } : {}) };
   };
 }
 
@@ -704,7 +718,10 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
       signal,
       ...(excludeFamilies.length > 0 ? { excludeFamilies } : {}),
     });
-    return { passed: parseReviewerVerdict(answer.text) === "accept" };
+    return {
+      passed: parseReviewerVerdict(answer.text) === "accept",
+      ...(answer.model ? { model: answer.model } : {}),
+    };
   };
 
   return {

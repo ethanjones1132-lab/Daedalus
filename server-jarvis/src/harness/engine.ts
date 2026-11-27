@@ -368,6 +368,21 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
             manifest, signal: abort.signal,
             ...(input.briefValues !== undefined ? { briefValues: input.briefValues } : {}),
           }));
+          // Who reviewed, not just whether it passed. A checker cascade can
+          // advance past the manifest's agent, so the event pairs the requested
+          // agent with the model that actually answered. An unreported identity
+          // stays null instead of borrowing the requested name.
+          store.appendEvent({ run_id: run.id, event_type: "checker_verdict", payload: {
+            round: rounds,
+            passed: verdict.passed,
+            requested_agent_id: manifest.checker.agent_id,
+            model: verdict.model?.model_id ? {
+              model_id: verdict.model.model_id,
+              ...(verdict.model.provider !== undefined ? { provider: verdict.model.provider } : {}),
+              fallback_used: verdict.model.fallback_used === true,
+            } : null,
+            ...(verdict.model?.model_id ? {} : { model_identity: "unavailable" }),
+          } });
           reason = roundStop() ?? (verdict.passed ? "passed" : "checker_rejected");
         } catch (error) { reason = stepFailure(error); }
         break;

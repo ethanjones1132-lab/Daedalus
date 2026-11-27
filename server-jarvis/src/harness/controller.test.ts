@@ -211,6 +211,41 @@ describe("runHarness", () => {
     await resultWithReason("checker_rejected", { runChecker: async () => ({ passed: false }) });
   });
 
+  test("records the model that answered the checker on the verdict event", async () => {
+    const setup = deps({
+      runChecker: async () => ({
+        passed: true,
+        model: { model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true },
+      }),
+    });
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("passed");
+    const verdicts = setup.store.getRun(result.run_id)?.events
+      .filter((event) => event.event_type === "checker_verdict") ?? [];
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0]?.payload).toEqual({
+      round: 1,
+      passed: true,
+      requested_agent_id: "checker",
+      model: { model_id: "qwen/qwen3-coder:free", provider: "openrouter", fallback_used: true },
+    });
+  });
+
+  test("a checker that reports no model says the identity is unavailable, never the requested name", async () => {
+    const setup = deps({ runChecker: async () => ({ passed: false }) });
+    const result = await runHarness(setup.input);
+    expect(result.stop_reason).toBe("checker_rejected");
+    const verdict = setup.store.getRun(result.run_id)?.events
+      .find((event) => event.event_type === "checker_verdict");
+    expect(verdict?.payload).toEqual({
+      round: 1,
+      passed: false,
+      requested_agent_id: "checker",
+      model: null,
+      model_identity: "unavailable",
+    });
+  });
+
   test("a sensor batch that throws settles run_failed with its message", async () => {
     const setup = deps({ sensors: async () => { throw new Error("sensor crashed"); } });
     const result = await runHarness(setup.input);
