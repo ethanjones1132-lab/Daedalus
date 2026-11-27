@@ -151,6 +151,67 @@ export interface LlamaCppConfig {
 }
 
 /**
+ * Inkling-2-Mini needs Unsloth's llama.cpp fork. Mainline `llama-server` cannot
+ * load it, and the b12651 portable zip ships without the CUDA runtime DLLs, so
+ * a fresh install has three artifacts to provide before the default backend
+ * can start. DD-164: these constants exist so the save warnings and the
+ * backend-start refusal name the same parts.
+ */
+export const LLAMA_CPP_REQUIRED_BUILD = "b12651";
+/** Engine directory name of that Unsloth build, as shipped by the release. */
+export const LLAMA_CPP_ENGINE_DIR = "llama-unsloth-b12651";
+/** CUDA runtime DLLs the portable zip omits; both belong beside `llama-server.exe`. */
+export const LLAMA_CPP_REQUIRED_RUNTIME_DLLS = ["cudart64_*.dll", "cublas64_*.dll"] as const;
+/** Model artifact a fresh install has to provide; also the shipped serving alias. */
+export const LLAMA_CPP_DEFAULT_MODEL_FILE = "Inkling-2-Mini-UD-IQ3_XXS.gguf";
+
+/**
+ * DD-164: one actionable sentence per unset llama.cpp artifact path.
+ *
+ * These are warnings rather than errors because the native shell also reads
+ * `JARVIS_LLAMA_SERVER_PATH` / `JARVIS_LLAMA_MODEL_PATH`, and an already-running
+ * server needs neither path. Each sentence says what the missing part is (the
+ * Unsloth b12651 build with its CUDA DLLs, the model GGUF), where the path comes
+ * from, and the two artifact-free ways out. `llamaCppStartRefusal` returns the
+ * first of these for the backend start, so the user sees one message set.
+ */
+export function llamaCppSetupIssues(llama: LlamaCppConfig | undefined): string[] {
+  const modelFile = llama?.model?.trim() || LLAMA_CPP_DEFAULT_MODEL_FILE;
+  const alternative =
+    "Alternatively, point the llama.cpp base URL at an already-running llama.cpp server and leave the path blank, " +
+    "or choose an already-configured Inference backend (Ollama, OpenRouter or Claude Code CLI).";
+  const issues: string[] = [];
+  if (!llama?.server_path?.trim()) {
+    issues.push(
+      `llama.cpp server_path is not configured: set llama_cpp.server_path in Settings or the JARVIS_LLAMA_SERVER_PATH environment variable ` +
+        `to llama-server from Unsloth's llama.cpp ${LLAMA_CPP_REQUIRED_BUILD} build (engine directory ${LLAMA_CPP_ENGINE_DIR}), ` +
+        `with ${LLAMA_CPP_REQUIRED_RUNTIME_DLLS[0]} and ${LLAMA_CPP_REQUIRED_RUNTIME_DLLS[1]} beside it; ` +
+        `mainline llama-server cannot load Inkling-2-Mini. ${alternative}`,
+    );
+  }
+  if (!llama?.model_path?.trim()) {
+    issues.push(
+      `llama.cpp model_path is not configured: set llama_cpp.model_path in Settings or the JARVIS_LLAMA_MODEL_PATH environment variable ` +
+        `to the ${modelFile} model file. ${alternative}`,
+    );
+  }
+  return issues;
+}
+
+/**
+ * The refusal a backend start must return before it would spawn anything.
+ *
+ * DD-164: Native's `start_llama_cpp_server` already refuses on these same blank
+ * fields before it spawns, then adds the "path is not a file" checks for
+ * configured paths. This is the blank-path sentence it should return: it names
+ * the missing setting (`llama_cpp.server_path` / `llama_cpp.model_path`) instead
+ * of handing a blank path to a spawn, and it matches the save warnings above.
+ */
+export function llamaCppStartRefusal(llama: LlamaCppConfig | undefined): string | null {
+  return llamaCppSetupIssues(llama)[0] ?? null;
+}
+
+/**
  * OpenAI-compatible secondary provider (OpenCode Zen / OpenCode Go).
  * These route through their own base_url + api_key — NOT OpenRouter's — but
  * speak the same `/chat/completions` SSE protocol, so the existing stream
@@ -1469,13 +1530,10 @@ export function validateConfig(cfg: JarvisConfig): ConfigValidation {
     if (!cfg.llama_cpp?.model) errors.push("llama.cpp model is required");
     // Warnings, not errors: the native shell can also take these from the
     // JARVIS_LLAMA_* environment variables, and an already-running server
-    // needs neither.
-    if (!cfg.llama_cpp?.server_path?.trim()) {
-      warnings.push("llama.cpp server_path is not set; Jarvis can only use an already-running server unless JARVIS_LLAMA_SERVER_PATH is set");
-    }
-    if (!cfg.llama_cpp?.model_path?.trim()) {
-      warnings.push("llama.cpp model_path is not set; Jarvis can only use an already-running server unless JARVIS_LLAMA_MODEL_PATH is set");
-    }
+    // needs neither. DD-164: both the warning and the backend-start refusal
+    // come from `llamaCppSetupIssues`, so an unconfigured install is told the
+    // same missing parts and the same two ways out wherever it is read.
+    warnings.push(...llamaCppSetupIssues(cfg.llama_cpp));
   } else if (cfg.active_backend === "claude_cli") {
     if (!cfg.claude_cli.path) errors.push("Claude CLI path is required");
   }

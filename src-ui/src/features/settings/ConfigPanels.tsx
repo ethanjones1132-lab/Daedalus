@@ -4,6 +4,7 @@ import { Badge, Button, Field, Input, Panel, PanelHeader, Select, Switch, Textar
 import { OPENROUTER_MODELS, type JarvisBackend, type JarvisConfig } from '../../domain/types';
 import { BACKENDS } from '../models/backends';
 import { ChoiceCards } from './ChoiceCards';
+import LlamaCppSetupNotice from './LlamaCppSetupNotice';
 import { OrchestrationPanel } from './OrchestrationPanel';
 import {
   DEFAULT_BRIDGE_PORT,
@@ -258,6 +259,10 @@ export function ConfigPanels({
           </div>
         ) : draft.active_backend === 'llama_cpp' ? (
           <div className="grid gap-4">
+            <LlamaCppSetupNotice
+              serverPath={draft.llama_cpp?.server_path}
+              modelPath={draft.llama_cpp?.model_path}
+            />
             <Field label="Model alias">
               {(id) => (
                 <Input

@@ -145,12 +145,37 @@ describe('Settings Inference backend selector', () => {
     await open();
     fireEvent.click(screen.getByRole('button', { name: /^llama\.cpp/ }));
     fireEvent.change(screen.getByRole('textbox', { name: 'llama.cpp server_path' }), { target: { value: '/opt/llama/llama-server' } });
+    // The setup notice stays while the second required path is still blank.
+    expect(screen.getByRole('note', { name: 'llama.cpp setup' })).toBeInTheDocument();
     fireEvent.change(screen.getByRole('textbox', { name: 'llama.cpp model_path' }), { target: { value: '/models/gemma.gguf' } });
+    // A configured install renders as it did before DD-164: fields and status only.
+    expect(screen.queryByRole('note', { name: 'llama.cpp setup' })).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: 'llama.cpp mtp_path' })).toBeInTheDocument();
     expect(screen.getByText(/Server: http:\/\/localhost:8080\/v1 · context 16384 · reasoning budget 1536/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Save Config' }));
     await screen.findByRole('button', { name: 'Saved' });
     expect(savedConfig().llama_cpp).toEqual({ ...baseConfig.llama_cpp, server_path: '/opt/llama/llama-server', model_path: '/models/gemma.gguf' });
+  });
+
+  it('lists the missing llama.cpp parts, their sources and both next steps on a fresh install', async () => {
+    await open();
+    fireEvent.click(screen.getByRole('button', { name: /^llama\.cpp/ }));
+    const setup = screen.getByRole('note', { name: 'llama.cpp setup' });
+
+    // What is missing: the Unsloth fork build, its CUDA DLLs and the model.
+    expect(setup).toHaveTextContent('llama_cpp.server_path');
+    expect(setup).toHaveTextContent('llama_cpp.model_path');
+    expect(setup).toHaveTextContent("Unsloth's llama.cpp b12651 build");
+    expect(setup).toHaveTextContent('llama-unsloth-b12651');
+    expect(setup).toHaveTextContent('cudart64_*.dll');
+    expect(setup).toHaveTextContent('cublas64_*.dll');
+    expect(setup).toHaveTextContent('Inkling-2-Mini-UD-IQ3_XXS.gguf');
+    // Where the required paths come from.
+    expect(setup).toHaveTextContent('JARVIS_LLAMA_SERVER_PATH');
+    expect(setup).toHaveTextContent('JARVIS_LLAMA_MODEL_PATH');
+    // Both ways out of the dead end.
+    expect(setup).toHaveTextContent('already-running llama.cpp server');
+    expect(setup).toHaveTextContent('Ollama, OpenRouter or Claude Code CLI');
   });
 });
 

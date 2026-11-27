@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { InvalidConfigError, defaultConfig, loadConfig, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
+import { InvalidConfigError, defaultConfig, loadConfig, llamaCppSetupIssues, llamaCppStartRefusal, normalizeConfig, normalizeSettingMutation, saveConfig, validateConfig, ensureWorkspaceDirectory } from "./config";
 import { hasStageRouteOverride, resolveStageRoute, validateStageRouteConfig } from "./orchestration/stage-route-policy";
 
 describe("normalizeSettingMutation", () => {
@@ -324,6 +324,43 @@ describe("llama.cpp artifact paths", () => {
     expect(validation.errors).toEqual([]);
     expect(validation.warnings.some((w) => w.includes("JARVIS_LLAMA_SERVER_PATH"))).toBe(true);
     expect(validation.warnings.some((w) => w.includes("JARVIS_LLAMA_MODEL_PATH"))).toBe(true);
+    // DD-164: the warning has to name what is missing (the Unsloth b12651
+    // build with both CUDA DLLs, the model GGUF) and the alternatives, or a
+    // first run is a dead end even though it "warns".
+    const serverWarning = validation.warnings.find((w) => w.includes("llama_cpp.server_path"));
+    const modelWarning = validation.warnings.find((w) => w.includes("llama_cpp.model_path"));
+    expect(serverWarning).toContain("Unsloth's llama.cpp b12651 build");
+    expect(serverWarning).toContain("llama-unsloth-b12651");
+    expect(serverWarning).toContain("cudart64_*.dll");
+    expect(serverWarning).toContain("cublas64_*.dll");
+    expect(serverWarning).toContain("already-running llama.cpp server");
+    expect(serverWarning).toContain("Ollama, OpenRouter or Claude Code CLI");
+    expect(modelWarning).toContain("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+    expect(modelWarning).toContain("already-running llama.cpp server");
+    expect(modelWarning).toContain("Ollama, OpenRouter or Claude Code CLI");
+  });
+
+  test("an unspawnable llama.cpp start is refused by name, not spawned blank", () => {
+    // DD-164: the backend start must not hand a blank path to a spawn. The
+    // refusal names the missing setting and where its path comes from.
+    const refusal = llamaCppStartRefusal(defaultConfig().llama_cpp);
+    expect(refusal).not.toBeNull();
+    expect(refusal ?? "").toContain("llama_cpp.server_path");
+    expect(refusal ?? "").toContain("JARVIS_LLAMA_SERVER_PATH");
+    expect(refusal ?? "").toContain("llama-unsloth-b12651");
+
+    // A configured pair has nothing to refuse; a blank model_path is refused
+    // next, naming that setting rather than the server executable.
+    expect(llamaCppSetupIssues({
+      ...defaultConfig().llama_cpp,
+      server_path: "X:/llama/llama-server.exe",
+      model_path: "X:/models/inkling.gguf",
+    })).toEqual([]);
+    expect(llamaCppStartRefusal({
+      ...defaultConfig().llama_cpp,
+      server_path: "X:/llama/llama-server.exe",
+    }) ?? "").toContain("llama_cpp.model_path");
+    expect(llamaCppStartRefusal(undefined) ?? "").toContain("llama_cpp.server_path");
   });
 
   test("configured llama.cpp paths survive normalization of a stored config", () => {
