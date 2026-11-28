@@ -379,7 +379,16 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
           ...(policy.instructions ? { instructions: policy.instructions } : {}),
           ...(readOnly ? { read_only: true } : {}),
         }));
-      } catch { reason = elapsedStop() ?? "maker_failed"; break; }
+      } catch (error) {
+        // A timeout or cancellation is the boundary's own verdict and keeps its
+        // stop reason. Only an actual maker failure records the thrown cause,
+        // so the stopped event says why the turn failed, not just that it did.
+        reason = elapsedStop() ?? "maker_failed";
+        if (reason === "maker_failed") {
+          makerFailure = { failureDetail: error instanceof Error ? error.message : String(error) };
+        }
+        break;
+      }
       const roundCost = maker?.cost_usd;
       if (typeof roundCost === "number" && Number.isFinite(roundCost) && roundCost > 0) chargeReported(roundCost);
       const afterMaker = elapsedStop();

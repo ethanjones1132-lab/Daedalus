@@ -590,6 +590,45 @@ describe("harness execution", () => {
     });
   });
 
+  test("a production delegate result's own cause reaches the maker_failed stop through the seam", async () => {
+    const manifest = fixtureManifest();
+    // A failing delegate result as production reports it: the stage output
+    // already names its failure code, terminal status and bounded detail.
+    const delegateResult: ExecutorStageOutput = {
+      ok: false,
+      narrative: "delegate timed out",
+      toolCalls: [],
+      errorCode: "delegate_timeout",
+      terminalStatus: "timed_out",
+      failureDetail: "delegate timed out after 900000ms",
+    };
+    // The seam changes nothing else: ok, narrative and the observed count of
+    // zero tool calls survive beside the forwarded cause.
+    expect(makerTurnFromDelegateResult(delegateResult)).toEqual({
+      ok: false, narrative: "delegate timed out", tool_calls: 0,
+      errorCode: "delegate_timeout", terminalStatus: "timed_out",
+      failureDetail: "delegate timed out after 900000ms",
+    });
+
+    const runMakerTurn: HarnessMakerTurn = async () => makerTurnFromDelegateResult(delegateResult);
+    const { store, execution } = setupHarness({ manifest, deps: { runMakerTurn } });
+
+    const result = await runHarness({
+      manifest, store, run_id: "run-seam-failure",
+      sensors: execution.sensors, runMaker: execution.runMaker, runChecker: execution.runChecker, admission: execution.admission,
+    });
+
+    expect(result.stop_reason).toBe("maker_failed");
+    expect(result.rounds).toBe(1);
+    const stopped = store.getRun("run-seam-failure")?.events.filter((event) => event.event_type === "stopped") ?? [];
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]?.payload).toEqual({
+      stop_reason: "maker_failed", rounds: 1,
+      errorCode: "delegate_timeout", terminalStatus: "timed_out",
+      failureDetail: "delegate timed out after 900000ms",
+    });
+  });
+
   test("a production delegate result's observed tool-call count reaches the run's round_metrics", async () => {
     const manifest = fixtureManifest();
     // Exactly what `productionExecutorDelegateRuntime.run` reports: the delegate

@@ -342,6 +342,27 @@ test("a failed maker turn without a cause keeps the stop payload unchanged", asy
     .toEqual({ stop_reason: "maker_failed", rounds: 1 });
 });
 
+test("a maker that throws records the thrown message on the maker_failed stop", async () => {
+  const { input, store } = setup({
+    runMaker: async () => { throw new Error("delegate lane crashed before its first turn"); },
+  });
+  const result = await runEngine(input);
+  expect(result.stop_reason).toBe("maker_failed");
+  expect(result.rounds).toBe(1);
+
+  const events = store.getRun(result.run_id)?.events ?? [];
+  const stopped = events.find((event) => event.event_type === "stopped");
+  expect(stopped?.payload).toEqual({
+    stop_reason: "maker_failed", rounds: 1,
+    failureDetail: "delegate lane crashed before its first turn",
+  });
+  const stop = events.find((event) => event.event_type === "stop");
+  expect((stop?.payload as { detail?: Record<string, unknown> } | undefined)?.detail).toMatchObject({
+    stop_reason: "maker_failed", abandoned: false,
+    failureDetail: "delegate lane crashed before its first turn",
+  });
+});
+
 test("a longer caller deadline does not extend the switchable engine's wall budget", async () => {
   let admittedUntil: number | undefined;
   const { input } = setup({

@@ -675,10 +675,12 @@ function cloudBudgetRefusal(
 /**
  * The production delegate result → maker turn seam mapping, shared by the
  * server's `runMakerTurn` so a regression test can pin exactly what production
- * forwards: outcome, narrative, the spend the CLI's result frame reported, and
- * the delegate loop's own tool-call count (`toolCalls` is its record of every
- * call it dispatched). The delegate reports no token usage, so this mapping
- * introduces no token field — an unavailable count stays absent.
+ * forwards: outcome, narrative, the spend the CLI's result frame reported, the
+ * delegate loop's own tool-call count (`toolCalls` is its record of every call
+ * it dispatched), and the delegate's own failure cause (code, terminal status,
+ * bounded detail) when the result carries one. The delegate reports no token
+ * usage, so this mapping introduces no token field — an unavailable count stays
+ * absent.
  */
 export function makerTurnFromDelegateResult(result: ExecutorStageOutput): HarnessMakerTurnResult {
   const toolCalls = Array.isArray(result.toolCalls) ? result.toolCalls.length : undefined;
@@ -687,6 +689,7 @@ export function makerTurnFromDelegateResult(result: ExecutorStageOutput): Harnes
     narrative: result.narrative,
     ...(typeof result.cost_usd === "number" ? { cost_usd: result.cost_usd } : {}),
     ...(toolCalls !== undefined ? { tool_calls: toolCalls } : {}),
+    ...makerFailureOf(result),
   };
 }
 
