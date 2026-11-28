@@ -20,11 +20,15 @@ import {
   DEFAULT_ORCHESTRATOR_AGENTS,
   type OrchestratorAgent,
 } from "../orchestration/agent-pool";
-import { resolveAvailableDelegateModel } from "../orchestration/delegate-model-resolve";
+import { delegateConfigForModel, resolveAvailableDelegateModel } from "../orchestration/delegate-model-resolve";
 import {
   enumerateDelegateModelCandidates,
   getBenchedDelegateModels,
+  getDelegateThrashCount,
+  isDelegateThrashOutcome,
+  recordDelegateThrash,
 } from "../orchestration/delegate-model-select";
+import type { ExecutorDelegateRuntime } from "../orchestration/pipeline";
 import { renderHarnessGuides } from "../orchestration/harness-guides";
 import { parseReviewerVerdict, type ExecutorStageOutput } from "../orchestration/stage-output";
 import { isCloudProvider } from "../provider-availability";
@@ -54,9 +58,16 @@ export interface HarnessMakerTurnInput {
   round: number;
   signal: AbortSignal;
   /**
+   * True when the manifest named a concrete pool agent rather than the generic
+   * "maker" role. A named agent's model is the lane the turn must launch; a
+   * role keeps the resolver's concrete auto pick.
+   */
+  named_agent: boolean;
+  /**
    * The delegate config this turn must launch with. Its
-   * `claude_cli.delegate.model` is always a concrete id: an "auto" pin was
-   * resolved and probed before the turn reached this boundary.
+   * `claude_cli.delegate.model` is already pinned to the resolved agent when
+   * `named_agent` is true; otherwise it is the resolver's concrete id (an
+   * "auto" pin resolved and probed, or the operator's own pin).
    */
   config: JarvisConfig;
 }
@@ -585,19 +596,26 @@ function backgroundAdmission(): HarnessAdmission {
 }
 
 /**
- * Resolve the maker's delegate config before a turn launches the CLI. A
- * concrete pin passes through untouched (existing behaviour); "auto" or an
- * empty pin is enumerated through the shared selection rules and probed, so the
- * runtime only ever receives a concrete, available id. When nothing is
- * available the turn fails with the tried ids instead of launching "auto".
+ * Resolve the maker's delegate config before a turn launches the CLI. A named
+ * pool agent pins its own model. For the generic "maker" role a concrete pin
+ * passes through untouched (existing behaviour); "auto" or an empty pin is
+ * enumerated through the shared selection rules and probed, so the runtime only
+ * ever receives a concrete, available id. When nothing is available the turn
+ * fails with the tried ids instead of launching "auto".
  */
-async function resolveMakerDelegateConfig(maker: HarnessMakerDelegate): Promise<JarvisConfig> {
+async function resolveMakerDelegateConfig(
+  maker: HarnessMakerDelegate,
+  input: { thrashCount: number; agent?: HarnessAgentRef },
+): Promise<JarvisConfig> {
   const config = maker.config();
+  // A named pool agent is the lane: its model wins over whatever the delegate
+  // pin or "auto" would otherwise select.
+  if (input.agent) return delegateConfigForModel(config, input.agent.model_id);
   const configured = config.claude_cli.delegate.model.trim();
   if (configured && configured.toLowerCase() !== "auto") return config;
   const candidates = enumerateDelegateModelCandidates({
     configuredModel: config.claude_cli.delegate.model,
-    thrashCount: 0,
+    thrashCount: input.thrashCount,
     hasOpenCodeGoKey: Boolean(config.opencode_go.api_key?.trim()),
     proxyAvailable: true,
     benchedModels: getBenchedDelegateModels(),
@@ -672,13 +690,60 @@ export function makerTurnFromDelegateResult(result: ExecutorStageOutput): Harnes
   };
 }
 
+/**
+ * The production maker turn. It launches the agent the manifest resolved
+ * (`delegateConfigForModel` pins that model), refuses to fall back to the
+ * config's old delegate pin when that lane cannot serve the turn, and maps the
+ * delegate result through the shared seam. A generic "maker" role keeps the
+ * resolver's concrete auto pick, so `named_agent` is the only branch that
+ * replaces it.
+ */
+export function createDelegateMakerTurn(
+  runtime: Pick<ExecutorDelegateRuntime, "availability" | "run">,
+): HarnessMakerTurn {
+  return async ({ cwd, prompt, agent, config, signal, named_agent }) => {
+    const lane = named_agent ? delegateConfigForModel(config, agent.model_id) : config;
+    let available = false;
+    try {
+      available = await runtime.availability.isAvailable(lane);
+    } catch {
+      available = false;
+    }
+    if (!available) {
+      return {
+        ok: false,
+        failureDetail: `the ${agent.provider}:${lane.claude_cli.delegate.model} delegate lane ` +
+          `for agent "${agent.id}" cannot serve this turn`,
+      };
+    }
+    return makerTurnFromDelegateResult(await runtime.run({
+      config: lane,
+      prompt,
+      sessionId: crypto.randomUUID(),
+      allowedRoots: [cwd],
+      stageRemainingMs: 15 * 60_000,
+      profile: "full",
+      writeEffectRequired: true,
+      nativeNoWrite: false,
+      signal,
+    }));
+  };
+}
+
 /** Build the server's harness execution boundaries from injected dependencies. */
 export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecution {
   const spawn = deps.spawn ?? defaultSpawn;
   const agents = deps.agents ?? DEFAULT_ORCHESTRATOR_AGENTS;
   const getConfig = deps.getConfig ?? loadConfig;
-  const hasNamedMaker = agents.some((agent) => agent.enabled && agent.id === INKLING_MAKER_ID);
-  const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig; useDelegate: boolean; delegateFamilies: Set<string> }>();
+  // A pool id that happens to be the word "maker" is not the Inkling maker: the
+  // local maker is only displaced by an enabled Inkling agent.
+  const hasNamedMaker = agents.some(
+    (agent) => agent.enabled && agent.id === INKLING_MAKER_ID && agentFamily(agent) === "inkling",
+  );
+  const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig; delegateFamilies: Set<string> }>();
+  // Delegate thrash follows one run (the controller uses one signal per run)
+  // so a failed lane rotates on the next round without leaking across runs.
+  const thrashKeys = new WeakMap<AbortSignal, string>();
   const defaultBriefValues = deps.briefValues ?? {};
   const diffMaxChars = deps.diffMaxChars ?? HARNESS_DIFF_MAX_CHARS;
   // The controller passes the same manifest object to both hooks for a run, so
@@ -693,9 +758,17 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (manifest.maker_agent_id !== INKLING_MAKER_ID || hasNamedMaker) return undefined;
     const current = localRuns.get(signal);
     if (current) return current;
-    const run = { config: getConfig(), useDelegate: false, delegateFamilies: new Set<string>() };
+    const run = { config: getConfig(), delegateFamilies: new Set<string>() };
     localRuns.set(signal, run);
     return run;
+  }
+
+  function thrashKeyFor(signal: AbortSignal): string {
+    const current = thrashKeys.get(signal);
+    if (current) return current;
+    const key = `harness:${crypto.randomUUID()}`;
+    thrashKeys.set(signal, key);
+    return key;
   }
 
   const sensors: HarnessControllerInput["sensors"] = async ({ manifest, signal }) => {
@@ -714,7 +787,9 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     const readOnly = read_only === true;
     const local = localMakerFor(manifest, signal);
     const prompt = makerPrompt(manifest, round, latestFailures.get(manifest) ?? [], briefValues ?? defaultBriefValues, instructions);
-    if (local && !local.useDelegate) {
+    // Every round tries the local maker again: one unavailable backend must not
+    // pin the rest of the run to the delegate after it recovers.
+    if (local) {
       if (round === 1 && manifest.checker.enabled) {
         runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
       }
@@ -753,16 +828,34 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     // carries; no new event kind is introduced.
     const budgetRefusal = cloudBudgetRefusal(cloudBudgetLeft(budget_left), agent.provider, "maker");
     if (budgetRefusal) return { failed: true, cost_usd: 0, failureDetail: budgetRefusal };
+    // A manifest that names a specific agent id runs that agent, not the
+    // delegate's old pin. The generic "maker" role (including the local
+    // fallback) keeps the resolver's concrete auto pick.
+    const namedAgent = manifest.maker_agent_id !== INKLING_MAKER_ID;
+    const thrashKey = thrashKeyFor(signal);
     // Resolve before the first side effect of the turn so a missing model is a
     // clear failure, not a CLI launch with "--model auto". The message is also
     // logged because the controller records only the maker_failed stop reason.
-    const config = await resolveMakerDelegateConfig(deps.makerDelegate).catch((error) => {
+    const config = await resolveMakerDelegateConfig(deps.makerDelegate, {
+      thrashCount: getDelegateThrashCount(thrashKey),
+      ...(namedAgent ? { agent: agentRef(agent) } : {}),
+    }).catch((error) => {
       console.error(
         `[Harness] maker delegate resolution failed: ` +
         `${error instanceof Error ? error.message : String(error)}`,
       );
       throw error;
     });
+    const namedLaneAvailable = namedAgent
+      ? await deps.makerDelegate.isAvailable(config).catch(() => false)
+      : true;
+    if (!namedLaneAvailable) {
+      return {
+        failed: true, cost_usd: 0,
+        failureDetail: `the ${agent.provider}:${config.claude_cli.delegate.model} delegate lane ` +
+          `for agent "${agent.id}" cannot serve this turn`,
+      };
+    }
     if (local) {
       // The checker must stay independent if the local maker hands the task
       // off to the delegate. Check before the delegate can produce edits.
@@ -774,21 +867,34 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
         }
       }
       for (const family of families) local.delegateFamilies.add(family);
-      if (!local.useDelegate) {
-        local.useDelegate = true;
-        recordHarnessMakerEvent({ event_type: "maker_fallback", payload: { round, provider: "claude_cli", reason: "llama_cpp_unavailable" } });
-      }
+      recordHarnessMakerEvent({ event_type: "maker_fallback", payload: { round, provider: "claude_cli", reason: "llama_cpp_unavailable" } });
     } else if (round === 1 && manifest.checker.enabled) {
       runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
     }
+    recordHarnessMakerEvent({
+      event_type: "maker_selected",
+      payload: { round, provider: "claude_cli", model_id: config.claude_cli.delegate.model },
+    });
     const turn = await deps.runMakerTurn({
       cwd: manifest.project_root,
       prompt,
       agent: agentRef(agent),
       round,
       signal,
+      named_agent: namedAgent,
       config,
     });
+    if (!turn.ok) {
+      // Rotate the lane the next auto resolution will pick; the shared helper
+      // owns which failures count as thrash.
+      if (isDelegateThrashOutcome({
+        ok: false,
+        hasVerifiedWrite: false,
+        ...(turn.errorCode !== undefined ? { errorCode: turn.errorCode } : {}),
+      })) {
+        recordDelegateThrash(thrashKey);
+      }
+    }
     const cost = typeof turn.cost_usd === "number" ? { cost_usd: turn.cost_usd } : {};
     const usage = makerUsageOf(turn);
     return turn.ok ? { ...usage, ...cost } : { failed: true, ...makerFailureOf(turn), ...usage, ...cost };

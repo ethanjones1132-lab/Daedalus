@@ -1,6 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { runHarness } from "./controller";
-import { createCheckerModelCall, createHarnessExecution, makerTurnFromDelegateResult, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
+import { createCheckerModelCall, createDelegateMakerTurn, createHarnessExecution, makerTurnFromDelegateResult, type HarnessAgentRef, type HarnessExecutionDeps, type HarnessMakerTurn, type HarnessModelCall } from "./execution";
 import { defaultConfig, type JarvisConfig } from "../config";
 import { clearOpenRouterCache } from "../openrouter";
 import { modelFamily } from "./agents";
@@ -12,7 +12,7 @@ import { HarnessStore } from "./store";
 import { instantiateHarnessTemplate } from "./templates";
 import type { OrchestratorAgent } from "../orchestration/agent-pool";
 import type { ExecutorStageOutput } from "../orchestration/stage-output";
-import { __setDelegateWriteScoreboardStoreForTests } from "../orchestration/delegate-model-select";
+import { __resetDelegateThrashForTests, __setDelegateWriteScoreboardStoreForTests } from "../orchestration/delegate-model-select";
 import { __resetModelHealthForTests } from "../orchestration/model-health";
 import { SelfTuningStore } from "../self-tuning/store";
 
@@ -137,9 +137,9 @@ function setupHarness(options: HarnessFixtureOptions) {
 
   const execution = createHarnessExecution({
     store,
-    // Pin the scripted delegate tests to a named maker. An unbound `maker`
-    // uses the production llama.cpp path.
-    agents: [{ ...AGENTS[0]!, id: "maker" }, ...AGENTS],
+    // Pin the scripted delegate tests to a named Inkling maker. A pool id that
+    // is merely the word `maker` must not displace the local llama.cpp maker.
+    agents: [{ ...AGENTS[0]!, id: "maker", model_id: "Inkling-2-Mini-UD-IQ3_XXS.gguf" }, ...AGENTS],
     spawn,
     runMakerTurn,
     makerDelegate: pinnedMakerDelegate(),
@@ -267,6 +267,166 @@ test("the fallback's concrete CLI family cannot match the pinned checker", async
   expect(state.checkerPrompts).toHaveLength(0);
 });
 
+test("a named maker turn launches the resolved agent's model instead of the delegate pin", async () => {
+  const manifest = fixtureManifest({ maker_agent_id: "executor-agent" });
+  const { state, execution } = setupHarness({ manifest, deps: {
+    makerDelegate: {
+      config: () => {
+        const config = defaultConfig();
+        config.claude_cli.delegate.model = "minimax-m3";
+        return config;
+      },
+      isAvailable: async () => true,
+    },
+  } });
+
+  await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal });
+
+  expect(state.makerTurns).toHaveLength(1);
+  expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
+  expect(state.makerTurns[0]?.model).toBe("executor-model");
+  expect(state.makerTurns[0]?.config.claude_cli.delegate.model).toBe("executor-model");
+});
+
+test("a named maker lane that cannot serve the turn fails without launching the pinned delegate", async () => {
+  const manifest = fixtureManifest({ maker_agent_id: "executor-agent" });
+  const { state, execution } = setupHarness({ manifest, deps: {
+    makerDelegate: {
+      config: () => {
+        const config = defaultConfig();
+        config.claude_cli.delegate.model = "minimax-m3";
+        return config;
+      },
+      isAvailable: async (config) => config.claude_cli.delegate.model !== "executor-model",
+    },
+  } });
+
+  const result = await execution.runMaker({ manifest, round: 1, signal: new AbortController().signal }) as
+    { failed?: boolean; failureDetail?: string };
+
+  expect(result.failed).toBe(true);
+  expect(result.failureDetail).toContain("executor-model");
+  expect(state.makerTurns).toHaveLength(0);
+});
+
+test("the production delegate maker turn refuses a lane it cannot serve before running", async () => {
+  let launched = false;
+  const turn = createDelegateMakerTurn({
+    availability: { isAvailable: async () => false },
+    run: async () => {
+      launched = true;
+      throw new Error("the unavailable lane must not launch");
+    },
+  });
+  const config = defaultConfig();
+  config.claude_cli.delegate.model = "minimax-m3";
+
+  const result = await turn({
+    cwd: ROOT,
+    prompt: "Fix it",
+    agent: { id: "executor-agent", provider: "opencode_go", model_id: "executor-model" },
+    round: 1,
+    signal: new AbortController().signal,
+    named_agent: true,
+    config,
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.failureDetail).toContain("executor-model");
+  expect(launched).toBe(false);
+});
+
+test("the production delegate maker turn launches the resolved agent's model", async () => {
+  const seen: string[] = [];
+  const turn = createDelegateMakerTurn({
+    availability: {
+      isAvailable: async (config) => {
+        seen.push(config.claude_cli.delegate.model);
+        return true;
+      },
+    },
+    run: async (input) => {
+      seen.push(input.config.claude_cli.delegate.model);
+      return { ok: true, narrative: "done", toolCalls: [] };
+    },
+  });
+  const config = defaultConfig();
+  config.claude_cli.delegate.model = "minimax-m3";
+
+  const result = await turn({
+    cwd: ROOT,
+    prompt: "Fix it",
+    agent: { id: "executor-agent", provider: "opencode_go", model_id: "executor-model" },
+    round: 1,
+    signal: new AbortController().signal,
+    named_agent: true,
+    config,
+  });
+
+  expect(result.ok).toBe(true);
+  expect(seen).toEqual(["executor-model", "executor-model"]);
+});
+
+test("a later maker round retries the local maker after one unavailable round", async () => {
+  const manifest = fixtureManifest();
+  const config = defaultConfig(ROOT);
+  config.orchestrator.allow_cloud_helpers = true;
+  let localRequests = 0;
+  const { state, execution } = setupHarness({ manifest, deps: {
+    agents: AGENTS,
+    getConfig: () => config,
+    requestMaker: async () => {
+      localRequests += 1;
+      if (localRequests === 1) return new Response(null, { status: 503 });
+      return Response.json({
+        choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ action: "finish", summary: "backend recovered" }) } }],
+      });
+    },
+  } });
+  const signal = new AbortController().signal;
+
+  const first = await execution.runMaker({ manifest, round: 1, signal }) as { failed?: boolean };
+  const second = await execution.runMaker({ manifest, round: 2, signal }) as { failed?: boolean };
+
+  expect(first.failed).toBeFalsy();
+  expect(second.failed).toBeFalsy();
+  expect(state.makerTurns).toHaveLength(1);
+  expect(localRequests).toBe(2);
+});
+
+test("a pool agent whose id is maker but is not the Inkling maker does not disable the local maker", async () => {
+  const manifest = fixtureManifest();
+  const signal = new AbortController().signal;
+  const { state, execution } = setupHarness({ manifest, deps: {
+    agents: [{ ...AGENTS[0]!, id: "maker", model_id: "executor-model" }],
+    getConfig: () => defaultConfig(ROOT),
+    requestMaker: async () => Response.json({
+      choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ action: "finish", summary: "local maker ran" }) } }],
+    }),
+  } });
+
+  const result = await execution.runMaker({ manifest, round: 1, signal }) as { failed?: boolean };
+
+  expect(result.failed).toBeFalsy();
+  expect(state.makerTurns).toHaveLength(0);
+  expect(execution.localMakerModel?.({ manifest, signal })).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
+});
+
+test("the delegate branch records the maker it actually selected", async () => {
+  const manifest = fixtureManifest();
+  const runId = "delegate-selected";
+  const { store, execution } = setupHarness({ manifest });
+  store.createRun({
+    id: runId, project_root: ROOT, manifest_id: manifest.id, manifest_hash: manifestHash(manifest),
+  });
+
+  await withHarnessMakerEvents(store, runId, () =>
+    execution.runMaker({ manifest, round: 1, signal: new AbortController().signal }));
+
+  const selected = store.getRun(runId)?.events.find((event) => event.event_type === "maker_selected");
+  expect(selected?.payload).toMatchObject({ round: 1, provider: "claude_cli", model_id: "minimax-m3" });
+});
+
 describe("harness execution", () => {
   test("(a) POST start runs the supplied execution and answers 202, not 503", async () => {
     const manifest = fixtureManifest();
@@ -321,7 +481,7 @@ describe("harness execution", () => {
     expect(state.makerTurns[0]?.prompt).toContain("No sensor results yet");
     expect(state.makerTurns[1]?.prompt).toContain("Harness round 2 of 3.");
     expect(state.makerTurns[1]?.prompt).toContain("typecheck (nonzero, counter 1)");
-    expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
+    expect(state.makerTurns[0]?.agent.model_id).toBe("Inkling-2-Mini-UD-IQ3_XXS.gguf");
   });
 
   test("a delegate failure's cause reaches the maker_failed stop evidence", async () => {
@@ -532,12 +692,14 @@ describe("harness execution", () => {
     beforeEach(() => {
       // Keep candidate ranking independent of the host's persisted bench state.
       __resetModelHealthForTests();
+      __resetDelegateThrashForTests();
       __setDelegateWriteScoreboardStoreForTests(new SelfTuningStore(":memory:"));
     });
 
     afterEach(() => {
       // Restore the default store so no later test file inherits this one.
       __setDelegateWriteScoreboardStoreForTests(null);
+      __resetDelegateThrashForTests();
       __resetModelHealthForTests();
     });
 
@@ -619,6 +781,39 @@ describe("harness execution", () => {
 
       expect(probes).toBe(0);
       expect(state.makerTurns[0]?.model).toBe("deepseek-v4-pro");
+    });
+
+    test("a failed delegate lane advances the thrash count so the next resolution rotates", async () => {
+      const manifest = fixtureManifest();
+      const autoConfig = defaultConfig();
+      autoConfig.orchestrator.allow_cloud_helpers = true;
+      autoConfig.claude_cli.delegate.model = "auto";
+      const launches: string[] = [];
+      const runMakerTurn: HarnessMakerTurn = async ({ config }) => {
+        launches.push(config.claude_cli.delegate.model);
+        return launches.length === 1
+          ? { ok: false, errorCode: "delegate_exit_nonzero" }
+          : { ok: true };
+      };
+      const { execution } = setupHarness({
+        manifest,
+        deps: {
+          agents: AGENTS,
+          getConfig: () => autoConfig,
+          requestMaker: async () => new Response(null, { status: 503 }),
+          makerDelegate: { config: () => autoConfig, isAvailable: async () => true },
+          runMakerTurn,
+        },
+      });
+      const signal = new AbortController().signal;
+
+      // Two maker turns on the same run: the first lane fails, so the second
+      // resolution must not return the same model.
+      await execution.runMaker({ manifest, round: 1, signal });
+      await execution.runMaker({ manifest, round: 1, signal });
+
+      expect(launches).toHaveLength(2);
+      expect(launches[1]).not.toBe(launches[0]);
     });
   });
 
@@ -984,9 +1179,10 @@ describe("harness execution", () => {
 
     await execution.runChecker({ manifest, signal: new AbortController().signal });
 
-    // The maker resolves to `executor-model` ("executor" family); the checker
-    // must receive that family on the call so its cascade can exclude it.
-    expect(seen).toEqual([["executor"]]);
+    // The maker resolves to the fixture's named Inkling maker ("inkling"
+    // family); the checker must receive that family on the call so its cascade
+    // can exclude it.
+    expect(seen).toEqual([["inkling"]]);
   });
 
   test("runChecker carries the model that answered into its verdict", async () => {

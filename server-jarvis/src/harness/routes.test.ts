@@ -55,7 +55,9 @@ const waitingMaker: HarnessExecution["runMaker"] = async ({ signal }) => {
 /** A live execution whose maker turn records every prompt it receives. */
 const promptAgents: OrchestratorAgent[] = [
   {
-    id: "maker", provider: "opencode_go", model_id: "executor-model",
+    // The named Inkling maker: a pool id that is merely "maker" must not
+    // displace the local llama.cpp maker.
+    id: "maker", provider: "opencode_go", model_id: "Inkling-2-Mini-UD-IQ3_XXS.gguf",
     capabilities: { code: 8, reasoning: 7, speed: 6, cost: 5, json_reliability: 7 },
     default_for: ["executor"], enabled: true,
   },

@@ -84,7 +84,7 @@ import { createLifecycleService, validateLifecycleSnapshot, type LifecycleServic
 import { createBoundaryProjectionStore } from "./activation-boundary";
 import { handleAgentRequest, isAgentRoute, reportAgentsRoot } from "./agent-routes";
 import { handleTuningProposalsRequest } from "./tuning-routes";
-import { createCheckerModelCall, createHarnessExecution, makerTurnFromDelegateResult } from "./harness/execution";
+import { createCheckerModelCall, createDelegateMakerTurn, createHarnessExecution } from "./harness/execution";
 import { handleHarnessRequest, type HarnessExecution } from "./harness/routes";
 import { HarnessStore } from "./harness/store";
 import { handleChatStreamRequest, type ChatStreamOptions } from "./chat-routes";
@@ -6939,17 +6939,10 @@ function serverHarnessExecution(): HarnessExecution {
       isAvailable: (config) =>
         productionExecutorDelegateRuntime.availability.isAvailable(config),
     },
-    runMakerTurn: async ({ cwd, prompt, config, signal }) => makerTurnFromDelegateResult(await productionExecutorDelegateRuntime.run({
-      config,
-      prompt,
-      sessionId: crypto.randomUUID(),
-      allowedRoots: [cwd],
-      stageRemainingMs: 15 * 60_000,
-      profile: "full",
-      writeEffectRequired: true,
-      nativeNoWrite: false,
-      signal,
-    })),
+    // Launches the agent the manifest resolved, not the config's old delegate
+    // pin: createDelegateMakerTurn pins that agent's model and fails the turn
+    // when its lane cannot serve it.
+    runMakerTurn: createDelegateMakerTurn(productionExecutorDelegateRuntime),
     callModel: async ({ prompt, agent, signal, excludeFamilies }) =>
       createCheckerModelCall(normalizeConfig(loadConfig()), agent, { excludeFamilies })({ prompt, agent, signal }),
   });
