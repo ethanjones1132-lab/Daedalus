@@ -740,7 +740,12 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
   const hasNamedMaker = agents.some(
     (agent) => agent.enabled && agent.id === INKLING_MAKER_ID && agentFamily(agent) === "inkling",
   );
-  const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig; delegateFamilies: Set<string> }>();
+  const localRuns = new WeakMap<AbortSignal, { config: JarvisConfig }>();
+  // The families a run's maker actually launched, recorded on every maker path
+  // (the local fallback and the delegate the config pin resolves to). Keyed by
+  // the manifest both hooks receive, so the checker can exclude them even when
+  // the local maker's own run record is not the one in play.
+  const launchedMakerFamilies = new WeakMap<HarnessManifest, Set<string>>();
   // Delegate thrash follows one run (the controller uses one signal per run)
   // so a failed lane rotates on the next round without leaking across runs.
   const thrashKeys = new WeakMap<AbortSignal, string>();
@@ -758,9 +763,17 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     if (manifest.maker_agent_id !== INKLING_MAKER_ID || hasNamedMaker) return undefined;
     const current = localRuns.get(signal);
     if (current) return current;
-    const run = { config: getConfig(), delegateFamilies: new Set<string>() };
+    const run = { config: getConfig() };
     localRuns.set(signal, run);
     return run;
+  }
+
+  function recordedMakerFamilies(manifest: HarnessManifest): Set<string> {
+    const current = launchedMakerFamilies.get(manifest);
+    if (current) return current;
+    const families = new Set<string>();
+    launchedMakerFamilies.set(manifest, families);
+    return families;
   }
 
   function thrashKeyFor(signal: AbortSignal): string {
@@ -856,17 +869,20 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
           `for agent "${agent.id}" cannot serve this turn`,
       };
     }
-    if (local) {
-      // The checker must stay independent if the local maker hands the task
-      // off to the delegate. Check before the delegate can produce edits.
-      const families = [agentFamily(agent), modelFamily(config.claude_cli.delegate.model)].filter(Boolean);
-      if (manifest.checker.enabled) {
-        const checker = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
-        if (checker && families.includes(agentFamily(checker))) {
-          throw new Error(`checker agent "${checker.id}" shares a model family with the maker delegate`);
-        }
+    // The checker must stay independent of the model this turn launches, on
+    // every maker path: the local maker's delegate fallback and the delegate the
+    // config pin resolves to. The agent's family and the launched lane's family
+    // are recorded before the turn can edit anything, and a checker in either is
+    // refused here rather than after edits exist for it to approve.
+    const families = [agentFamily(agent), modelFamily(config.claude_cli.delegate.model)].filter(Boolean);
+    if (manifest.checker.enabled) {
+      const checker = resolveHarnessAgent(agents, manifest.checker.agent_id, "reviewer");
+      if (checker && families.includes(agentFamily(checker))) {
+        throw new Error(`checker agent "${checker.id}" shares a model family with the maker delegate`);
       }
-      for (const family of families) local.delegateFamilies.add(family);
+    }
+    for (const family of families) recordedMakerFamilies(manifest).add(family);
+    if (local) {
       recordHarnessMakerEvent({ event_type: "maker_fallback", payload: { round, provider: "claude_cli", reason: "llama_cpp_unavailable" } });
     } else if (round === 1 && manifest.checker.enabled) {
       runBases.set(manifest, await captureRunBase(spawn, manifest.project_root, signal));
@@ -916,7 +932,12 @@ export function createHarnessExecution(deps: HarnessExecutionDeps): HarnessExecu
     const local = localMakerFor(manifest, signal);
     const maker = local ? undefined : resolveHarnessAgent(agents, manifest.maker_agent_id, "executor");
     const makerFamily = local ? modelFamily(local.config.llama_cpp.model) : maker ? agentFamily(maker) : "";
-    const excludeFamilies = [...new Set([makerFamily, ...(local?.delegateFamilies ?? [])].filter(Boolean))];
+    // Every family the maker actually launched on this run: the local model, the
+    // recorded delegate lanes, and the fallback's own resolution. A checker in
+    // any of them would be reviewing its own family's work.
+    const excludeFamilies = [
+      ...new Set([makerFamily, ...(launchedMakerFamilies.get(manifest) ?? [])].filter(Boolean)),
+    ];
     const base = runBases.get(manifest);
     runBases.delete(manifest);
     const evidence = await collectRunDiff(spawn, manifest.project_root, signal, diffMaxChars, base);

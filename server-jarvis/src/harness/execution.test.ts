@@ -267,6 +267,41 @@ test("the fallback's concrete CLI family cannot match the pinned checker", async
   expect(state.checkerPrompts).toHaveLength(0);
 });
 
+test("the local fallback keeps every launched family for the run's checker", async () => {
+  const manifest = fixtureManifest();
+  const config = defaultConfig(ROOT);
+  config.orchestrator.allow_cloud_helpers = true;
+  config.claude_cli.delegate.model = "minimax-m3";
+  const seen: Array<readonly string[] | undefined> = [];
+  const { state, execution } = setupHarness({ manifest, deps: {
+    // No Inkling pool id, so the local llama.cpp maker runs this round and then
+    // hands it to the configured delegate pin when the local backend is down.
+    agents: [AGENTS[0]!, { ...AGENTS[1]!, model_id: "qwen/qwen3-coder" }],
+    getConfig: () => config,
+    requestMaker: async () => new Response(null, { status: 503 }),
+    callModel: async ({ excludeFamilies }) => {
+      seen.push(excludeFamilies);
+      return { text: "ACCEPT\nIndependent review." };
+    },
+  } });
+  const signal = new AbortController().signal;
+
+  const maker = await execution.runMaker({ manifest, round: 1, signal }) as { failed?: boolean };
+  expect(maker.failed).toBeFalsy();
+  expect(state.makerTurns[0]?.model).toBe("minimax-m3");
+
+  // Current behaviour: the local model's family and the delegate lane's family
+  // are both excluded. The record belongs to the run, so a later checker
+  // invocation on a new boundary signal still sees the same set.
+  await execution.runChecker({ manifest, signal });
+  await execution.runChecker({ manifest, signal: new AbortController().signal });
+
+  expect(seen).toEqual([
+    ["inkling", "executor", "minimax"],
+    ["inkling", "executor", "minimax"],
+  ]);
+});
+
 test("a named maker turn launches the resolved agent's model instead of the delegate pin", async () => {
   const manifest = fixtureManifest({ maker_agent_id: "executor-agent" });
   const { state, execution } = setupHarness({ manifest, deps: {
@@ -286,6 +321,51 @@ test("a named maker turn launches the resolved agent's model instead of the dele
   expect(state.makerTurns[0]?.agent.model_id).toBe("executor-model");
   expect(state.makerTurns[0]?.model).toBe("executor-model");
   expect(state.makerTurns[0]?.config.claude_cli.delegate.model).toBe("executor-model");
+});
+
+test("a named maker on the pinned delegate is refused when the checker shares that family", async () => {
+  // The pool's `maker` is the Inkling agent, so the local llama.cpp maker is
+  // displaced and this round launches the delegate's config pin. The agent's own
+  // family ("inkling") differs from that pin ("minimax"), so only the family of
+  // the model actually launched can catch the minimax checker.
+  const manifest = fixtureManifest();
+  const { state, execution } = setupHarness({ manifest, deps: {
+    agents: [
+      { ...AGENTS[0]!, id: "maker", model_id: "Inkling-2-Mini-UD-IQ3_XXS.gguf" },
+      { ...AGENTS[1]!, model_id: "minimax/minimax-m3" },
+    ],
+  } });
+
+  await expect(execution.runMaker({ manifest, round: 1, signal: new AbortController().signal }))
+    .rejects.toThrow(/shares a model family with the maker delegate/);
+  // Refused before the turn could edit and before any evidence command ran.
+  expect(state.makerTurns).toHaveLength(0);
+  expect(state.spawns).toHaveLength(0);
+});
+
+test("a checker outside the launched delegate's family still reviews the named maker's run", async () => {
+  const manifest = fixtureManifest();
+  const seen: Array<readonly string[] | undefined> = [];
+  const { state, execution } = setupHarness({ manifest, deps: {
+    agents: [
+      { ...AGENTS[0]!, id: "maker", model_id: "Inkling-2-Mini-UD-IQ3_XXS.gguf" },
+      { ...AGENTS[1]!, model_id: "qwen/qwen3-coder" },
+    ],
+    callModel: async ({ excludeFamilies }) => {
+      seen.push(excludeFamilies);
+      return { text: "ACCEPT\nIndependent review." };
+    },
+  } });
+  const signal = new AbortController().signal;
+
+  await execution.runMaker({ manifest, round: 1, signal });
+  const verdict = await execution.runChecker({ manifest, signal });
+
+  expect(state.makerTurns).toHaveLength(1);
+  expect(verdict.passed).toBe(true);
+  // The agent's family and the pinned delegate's family are both excluded, so
+  // the checker's own cascade cannot fall back onto the maker's lane either.
+  expect(seen).toEqual([["inkling", "minimax"]]);
 });
 
 test("a named maker lane that cannot serve the turn fails without launching the pinned delegate", async () => {
