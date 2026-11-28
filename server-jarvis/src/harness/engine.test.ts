@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import type { HarnessControllerInput, HarnessSensorBatch } from "./controller";
 import { runEngine, type EngineControl, type EngineInput } from "./engine";
+import { installConsultantTools } from "./escalation";
 import { registerHarness, type HarnessModule } from "./module";
 import { HarnessStore } from "./store";
 
@@ -269,6 +270,60 @@ test("a zero-budget run refuses a maker's reported cloud spend and labels the ru
   const stopped = run?.events.find((event) => event.event_type === "stopped");
   expect(stopped?.payload).toMatchObject({ stop_reason: "passed", rounds: 1, cloud_budget: "exhausted" });
   expect((stopped?.payload as { cost_usd?: number }).cost_usd).toBeUndefined();
+});
+
+test("a zero-budget run refuses the consultation before it is bought and records the exhausted budget", async () => {
+  let consults = 0;
+  installConsultantTools({
+    consult: async ({ signal }) => { consults++; return { report: `advice on ${signal}`, cost_usd: 0.05 }; },
+  });
+  try {
+    const { input, store } = setup({
+      // The planner rung puts the ladder one step from consult, and the maker's
+      // own `continue: false` is the stuck signal that would trigger it.
+      runMaker: async () => ({ continue: false }),
+    });
+    input.initial = { id: "planner" };
+    input.escalation = true;
+    input.budget = { max_cloud_usd: 0 };
+    const result = await runEngine(input);
+
+    expect(result).toMatchObject({ stop_reason: "run_budget", rounds: 1 });
+    // The consultant is never called and its spend is never booked.
+    expect(consults).toBe(0);
+    const run = store.getRun(result.run_id);
+    expect(run?.cost_usd).toBe(0);
+    const events = run?.events ?? [];
+    // No request event: a refused call has no report and no verdict.
+    expect(events.some((event) => event.event_type === "request")).toBe(false);
+    const stopped = events.find((event) => event.event_type === "stopped");
+    expect(stopped?.payload).toMatchObject({ stop_reason: "run_budget", rounds: 1, cloud_budget: "exhausted" });
+    expect((stopped?.payload as { cost_usd?: number }).cost_usd).toBeUndefined();
+  } finally {
+    installConsultantTools(undefined);
+  }
+});
+
+test("a positive cloud budget still consults and charges the reported spend", async () => {
+  let consults = 0;
+  installConsultantTools({
+    consult: async ({ signal }) => { consults++; return { report: `advice on ${signal}`, cost_usd: 0.05 }; },
+  });
+  try {
+    const { input, store } = setup({ runMaker: async () => ({ continue: false }) });
+    input.initial = { id: "planner" };
+    input.escalation = true;
+    input.budget = { max_cloud_usd: 0.10 };
+    const result = await runEngine(input);
+
+    expect(consults).toBe(1);
+    const run = store.getRun(result.run_id);
+    expect(run?.cost_usd).toBeCloseTo(0.05);
+    expect(run?.events.find((event) => event.event_type === "request")?.payload)
+      .toMatchObject({ detail: { escalation: { step: "consult" }, report: expect.stringContaining("advice on") } });
+  } finally {
+    installConsultantTools(undefined);
+  }
 });
 
 test("chargeCloud allows no charge on a zero cap and still charges under a positive cap", async () => {

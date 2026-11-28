@@ -203,7 +203,7 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
   let attachedAt = startedAt;
   let cloudSpent = 0;
   let attachedSpend = 0;
-  /** A reported spend was refused because the run had no cloud budget left. */
+  /** The run refused cloud spend because its budget was already exhausted. */
   let cloudBudgetRefused = false;
   let lastSensors: HarnessSensorBatch | undefined;
   const history: EngineEvent[] = [];
@@ -465,10 +465,21 @@ export async function runEngine(input: EngineInput): Promise<HarnessRunResult> {
           if (plan.next === "consult") {
             const beforeConsult = elapsedStop() ?? spendStop();
             if (beforeConsult) { reason = beforeConsult; break; }
+            // A run that may spend nothing cannot buy a consultation. The
+            // refusal settles on the existing exhausted-cloud-budget stop and
+            // labels the run's record; no request is written because no call
+            // was made and there is no report to record.
+            const consultBudget = budgetLeft().max_cloud_usd;
+            if (consultBudget === 0) {
+              cloudBudgetRefused = true;
+              reason = cloudStopReason;
+              detail = `cloud budget exhausted: the run has $${consultBudget.toFixed(2)} of its max_cloud_usd left, ` +
+                `so the consultation was not launched`;
+              break;
+            }
             try {
               const consultation = await wait(runConsultation(state(), plan.signal));
-              const consultCost = consultation.cost_usd;
-              if (typeof consultCost === "number" && Number.isFinite(consultCost) && consultCost > 0) addCost(consultCost);
+              chargeReported(consultation.cost_usd);
               record("request", plan.reason ?? `consult on stuck signal "${plan.signal}"`, {
                 escalation: { signal: plan.signal, step: "consult", force: plan.force },
                 report: consultation.report,
