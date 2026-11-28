@@ -45,6 +45,24 @@ function parseCounter(stdout: string, stderr: string, exitCode: number): Counter
   return { ok: false, error: "command output did not contain a recognized integer counter" };
 }
 
+/** Parse for commands whose clean run legitimately prints no summary.
+ *
+ * `bun run typecheck` (tsc) is silent on success, `cargo fmt --check` prints
+ * nothing when the tree is formatted, and `cargo check` only warns. For those,
+ * exit 0 with no counter and no diagnostic marker means zero findings.
+ * Everything else defers to `parseCounter`, so a non-zero exit, a timeout or a
+ * real diagnostic line can never be reported as zero.
+ */
+function parseZeroOnCleanExit(stdout: string, stderr: string, exitCode: number): CounterParseResult {
+  const parsed = parseCounter(stdout, stderr, exitCode);
+  if (parsed.ok) return parsed;
+  if (exitCode !== 0) return parsed;
+  const combined = `${stdout}\n${stderr}`;
+  if (/\b(?:TIMEOUT|timed out|timeout)\b/i.test(combined)) return parsed;
+  if (/\b(?:error|failed|failure|panic(?:ked)?)\b/i.test(combined)) return parsed;
+  return { ok: true, counter: 0 };
+}
+
 const noArgs = { min_items: 0, max_items: 0 } as const;
 const optionalFilter = {
   min_items: 0,
@@ -53,15 +71,15 @@ const optionalFilter = {
 } as const;
 
 export const HARNESS_COMMANDS: readonly HarnessCommand[] = [
-  { command_id: "bun_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
+  { command_id: "bun_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseZeroOnCleanExit },
   { command_id: "bun_test", executable: "bun", fixed_args: ["test"], args_schema: optionalFilter, default_timeout_ms: 180_000, parse: parseCounter },
   // `npm` and `vitest` are .cmd shims on Windows and execFile cannot launch
   // them without a shell. Bun is a real executable on every platform and runs
   // the package's own `typecheck` script, or provides vitest through `bun x`.
-  { command_id: "npm_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
+  { command_id: "npm_typecheck", executable: "bun", fixed_args: ["run", "typecheck"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseZeroOnCleanExit },
   { command_id: "vitest_run", executable: "bun", fixed_args: ["x", "vitest", "run"], args_schema: optionalFilter, default_timeout_ms: 180_000, parse: parseCounter },
-  { command_id: "cargo_fmt_check", executable: "cargo", fixed_args: ["fmt", "--check"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseCounter },
-  { command_id: "cargo_check", executable: "cargo", fixed_args: ["check"], args_schema: noArgs, default_timeout_ms: 300_000, parse: parseCounter },
+  { command_id: "cargo_fmt_check", executable: "cargo", fixed_args: ["fmt", "--check"], args_schema: noArgs, default_timeout_ms: 120_000, parse: parseZeroOnCleanExit },
+  { command_id: "cargo_check", executable: "cargo", fixed_args: ["check"], args_schema: noArgs, default_timeout_ms: 300_000, parse: parseZeroOnCleanExit },
   { command_id: "cargo_test", executable: "cargo", fixed_args: ["test"], args_schema: optionalFilter, default_timeout_ms: 600_000, parse: parseCounter },
 ];
 
